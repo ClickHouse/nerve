@@ -22,12 +22,18 @@ Two shapes, chosen to cover the branches in ``_build_config_layers``:
 from __future__ import annotations
 
 import re
+import stat
 from pathlib import Path
 
 import pytest
 import yaml
 
 from nerve.bootstrap import SetupChoices, SetupWizard
+from nerve.setup_writer import (
+    write_config_yaml,
+    write_cron_jobs,
+    write_workspace_settings,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "setup_writer"
 
@@ -285,3 +291,99 @@ class TestSecretsLandInExactlyOneLayer:
         assert "password_hash: <bcrypt>" in produced["config.local.yaml"]
         assert "password_hash" not in produced["settings.yaml"]
         assert "password_hash" not in produced["config.yaml"]
+
+
+class TestPublicationNeverTruncates:
+    """A failed write must leave the previous file, not part of the new one.
+
+    ``settings.yaml`` is tracked, shared through git and read by the restart
+    the wizard ends with; ``system.yaml`` is what the scheduler loads. Opening
+    either with ``"w"`` truncates it before a single byte of the replacement
+    is written, so a dump that raises leaves a working install with whatever
+    got through.
+    """
+
+    def _install(self, tmp_path: Path) -> SetupChoices:
+        config_dir = tmp_path / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        choices = personal_choices(tmp_path / "workspace")
+        write_config_yaml(choices, config_dir)
+        write_workspace_settings(choices)
+        write_cron_jobs(choices)
+        return choices
+
+    def test_a_failed_settings_write_leaves_the_original(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nerve import setup_writer
+
+        choices = self._install(tmp_path)
+        settings = tmp_path / "workspace" / "config" / "settings.yaml"
+        before = settings.read_bytes()
+        assert b"agent" in before
+
+        def _explode(*_args, **_kwargs):
+            raise OSError("no room on the device")
+
+        monkeypatch.setattr(setup_writer, "publish_text", _explode)
+        with pytest.raises(OSError):
+            setup_writer.merge_settings_paths(
+                # Not the value the installer already wrote, or the merge is a
+                # no-op and never reaches a writer at all.
+                tmp_path / "workspace", {"timezone": "Pacific/Auckland"},
+            )
+        assert settings.read_bytes() == before
+        assert not settings.with_name("settings.yaml.tmp").exists()
+
+    def test_a_failed_dump_leaves_the_original(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The other half: the failure inside the rendering, before anything
+        is published at all."""
+        from nerve import setup_writer
+
+        self._install(tmp_path)
+        settings = tmp_path / "workspace" / "config" / "settings.yaml"
+        before = settings.read_bytes()
+
+        def _explode(*_args, **_kwargs):
+            raise ValueError("cannot represent that")
+
+        monkeypatch.setattr(setup_writer.yaml, "safe_dump", _explode)
+        with pytest.raises(ValueError):
+            setup_writer.merge_settings_paths(
+                tmp_path / "workspace", {"timezone": "Pacific/Auckland"},
+            )
+        assert settings.read_bytes() == before
+
+    def test_a_failed_cron_publication_leaves_the_original(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nerve import setup_writer
+
+        self._install(tmp_path)
+        system = tmp_path / "workspace" / "config" / "cron" / "system.yaml"
+        before = system.read_bytes()
+
+        plan = setup_writer.plan_optional_crons(
+            tmp_path / "workspace", {"inbox-processor"},
+        )
+        assert plan.changes_anything
+
+        def _explode(*_args, **_kwargs):
+            raise OSError("no room on the device")
+
+        monkeypatch.setattr(setup_writer, "publish_text", _explode)
+        with pytest.raises(OSError):
+            plan.publish()
+        assert system.read_bytes() == before
+
+    def test_publishing_keeps_the_destination_mode(self, tmp_path: Path) -> None:
+        from nerve import setup_writer
+
+        target = tmp_path / "tracked.yaml"
+        target.write_text("first: 1\n", encoding="utf-8")
+        target.chmod(0o644)
+        setup_writer.publish_text(target, "second: 2\n")
+        assert target.read_text(encoding="utf-8") == "second: 2\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644

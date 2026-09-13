@@ -40,6 +40,7 @@ from nerve.gateway.auth import (
 )
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
+from nerve import setup_writer as setup_writer_module
 from nerve.gateway.routes import setup as setup_routes
 from nerve.setup_writer import (
     SetupChoices,
@@ -1706,6 +1707,88 @@ class TestAFailureSaysWhatLanded:
             )
         assert response.status_code == 500
         assert "Nothing was written" in response.json()["detail"]
+
+    async def test_a_publication_failure_after_the_sync_write_says_so(
+        self, claimed, monkeypatch,
+    ):
+        """Parsing failures were fixed last round; this is the rename itself
+        failing after the sync settings have already landed."""
+        real = setup_writer_module.publish_text
+
+        def _explode_on_the_cron_file(path, text):
+            # Only the last target fails, which is the case: the sync settings
+            # have already been published by the time the cron file is renamed.
+            if path.name == "system.yaml":
+                raise OSError("read-only file system")
+            return real(path, text)
+
+        monkeypatch.setattr(
+            setup_writer_module, "publish_text", _explode_on_the_cron_file,
+        )
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/automation", json={
+                "github": True, "crons": ["inbox-processor"],
+            })
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert "sync settings were saved" in detail
+        assert "crons are unchanged" in detail
+
+        # What landed is on disk, and the checklist knows it owes a restart
+        # rather than having lost that with the failure.
+        assert claimed.tracked()["sync"]["github"]["enabled"] is True
+        state = setup_state.load_state()
+        assert state.applied.get("sync.github.enabled") is True
+        assert state.debts
+
+    async def test_a_failed_name_only_profile_leaves_no_marker(
+        self, claimed, monkeypatch,
+    ):
+        """It used to record the step as done *before* the write it depends
+        on, so a failed rename counted towards `finished`."""
+        async def _broken(*args, **kwargs):
+            raise RuntimeError("disk is on fire")
+
+        monkeypatch.setattr(claimed.db, "update_actor_profile", _broken)
+        async with _http(claimed) as http:
+            response = await http.put(
+                "/api/setup/profile", json={"display_name": "Alice Example"},
+            )
+        assert response.status_code == 500
+        state = setup_state.load_state()
+        assert "profile" not in state.done
+        assert "profile" not in state.answered
+
+    async def test_a_successful_rename_comes_back_renamed(self, claimed):
+        """The actor this request resolved with is immutable and carries the
+        old name; rendering from it makes a saved rename look unsaved, and
+        leaves the form's Save button lit over a change that landed."""
+        async with _http(claimed) as http:
+            body = (await http.put(
+                "/api/setup/profile", json={"display_name": "Alice Example"},
+            )).json()
+        assert body["values"]["display_name"] == "Alice Example"
+        assert "Alice Example" in next(
+            s["detail"] for s in body["steps"] if s["id"] == "profile"
+        )
+
+    async def test_choosing_the_default_timezone_is_still_an_answer(self, claimed):
+        """Setting a non-default zone back to UTC is a decision, and nothing
+        on disk can tell it from never having been asked — so it is written
+        down, and it survives the restart."""
+        async with _http(claimed) as http:
+            await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})
+            saved = (await http.put(
+                "/api/setup/profile",
+                json={"timezone": setup_routes.DEFAULT_TIMEZONE},
+            )).json()
+        assert _status_of(saved, "profile") == "done"
+
+        claimed.restarted(timezone=setup_routes.DEFAULT_TIMEZONE)
+        async with _http(claimed) as http:
+            state = (await http.get("/api/setup")).json()
+        assert _status_of(state, "profile") == "done"
+        assert state["restart_pending"] is False
 
     async def test_the_cron_file_is_published_atomically(self, claimed):
         async with _http(claimed) as http:

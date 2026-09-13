@@ -77,6 +77,12 @@ class SetupState:
     #: completion the live configuration can state on its own; see
     #: :func:`retire_transitional`.
     done: set[str] = field(default_factory=set)
+    #: Steps answered in a way nothing on disk can distinguish from never
+    #: having been asked — choosing the default that was already there. A
+    #: *decision*, so it is kept across restarts like a skip, and it is the
+    #: only thing that tells "set the timezone back to UTC" from "nobody ever
+    #: touched the timezone".
+    answered: set[str] = field(default_factory=set)
     #: dotted config path -> the value written (or True/False for a secret).
     #: Only ever this process's writes: an entry that outlived its writer says
     #: nothing a restart has not already answered.
@@ -97,6 +103,7 @@ class SetupState:
             "version": _VERSION,
             "skipped": sorted(self.skipped),
             "done": sorted(self.done),
+            "answered": sorted(self.answered),
             "applied": dict(self.applied),
             "debts": sorted(self.debts),
             "boot": boot.boot_id(),
@@ -160,6 +167,7 @@ def load_state() -> SetupState:
     return SetupState(
         skipped=_string_set(raw.get("skipped")),
         done=_string_set(raw.get("done")),
+        answered=_string_set(raw.get("answered")),
         applied=_string_map(raw.get("applied")),
         debts=_string_set(raw.get("debts")),
         boot=written_by if isinstance(written_by, str) else "",
@@ -179,6 +187,10 @@ def retire_transitional(state: SetupState, transitional_done: set[str]) -> bool:
     restart pending", and a process that has since started *is* the answer.
     Keeping them is how a restart that happened stays reported as pending and
     a credential removed by hand keeps its step green.
+
+    ``answered`` is never retired. It records a decision the instance cannot
+    state for itself — that somebody chose the value that was already there —
+    and a decision is not transitional.
     """
     if state.boot == boot.boot_id():
         return False

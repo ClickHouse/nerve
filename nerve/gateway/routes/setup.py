@@ -37,7 +37,7 @@ import asyncio
 import logging
 import os
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -622,6 +622,7 @@ def _step_status(
         # and the process that reads it.
         answered = (
             step in state.done
+            or step in state.answered
             or bool(context.display_name)
             or config.timezone != DEFAULT_TIMEZONE
         )
@@ -826,6 +827,7 @@ def _record(
     step: str,
     applied: dict[str, Any] | None = None,
     debts: tuple[str, ...] = (),
+    answered: bool = False,
 ) -> str | None:
     """Note that a step was answered, after every write it makes has landed.
 
@@ -843,6 +845,11 @@ def _record(
         setup_state.record_applied(context.state, applied)
     for debt in debts:
         context.state.debts.add(debt)
+    if answered:
+        # A decision the instance cannot state for itself — somebody chose the
+        # value that was already there — so it outlives the process that heard
+        # it, unlike the transitional "done" beside it.
+        context.state.answered.add(step)
     context.state.done.add(step)
     context.state.skipped.discard(step)
     if setup_state.save_state(context.state):
@@ -988,28 +995,46 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 portable_paths=("timezone",),
             )
 
-        # Recorded before the rename, so that a rename which fails cannot take
-        # the timezone's restart debt down with it: the file has changed by
-        # now and the checklist has to know, whatever happens next.
-        warning = _record(context, step=STEP_PROFILE, applied=applied)
-
+        # The rename first, now that the file it might have to answer for has
+        # been written: a *name-only* request that fails must leave no trace at
+        # all, and one that also moved the timezone has to leave the timezone's
+        # restart debt behind whatever happens next.
+        renamed = None
         if account is not None:
             try:
                 await db.update_actor_profile(
                     account["actor_id"], display_name=(display_name.strip() or None),
                 )
+                renamed = display_name.strip() or None
             except Exception as e:  # noqa: BLE001 - said, not swallowed
                 logger.exception("Setup: the display name could not be written")
-                landed = (
-                    "The time zone was saved. " if timezone
-                    else "Nothing was written. "
-                )
+                if timezone:
+                    # Half of it landed, so the checklist has to carry the
+                    # debt for that half before this request is failed.
+                    _record(context, step=STEP_PROFILE, applied=applied,
+                            answered=True)
+                    landed = "The time zone was saved. "
+                else:
+                    landed = "Nothing was written. "
                 raise HTTPException(
                     status_code=500,
                     detail=f"{landed}The display name could not be saved: {e}",
                 ) from e
 
-        return _render(await _context(actor), warning=warning)
+        warning = _record(
+            context, step=STEP_PROFILE, applied=applied,
+            # Choosing the timezone that was already there is an answer, and
+            # nothing on disk can tell it from never having been asked.
+            answered=bool(timezone),
+        )
+
+        # Rendered against the actor as it is *now*. The actor this request
+        # was resolved with is immutable and still carries the old name, so a
+        # successful rename would come back looking unsaved — and the form,
+        # comparing what it sent against what it got, would stay "changed"
+        # with Save still lit.
+        fresh = actor if renamed is None else replace(actor, display_name=renamed)
+        return _render(await _context(fresh), warning=warning)
 
 
 @router.put("/api/setup/channels", response_model=SetupStateOut)
@@ -1139,7 +1164,26 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
 
         debts: tuple[str, ...] = ()
         if plan is not None:
-            debts = await _publish_cron_plan(plan)
+            try:
+                debts = await _publish_cron_plan(plan)
+            except Exception as e:  # noqa: BLE001 - reported with what landed
+                # The sync settings are on disk by now. Publication can still
+                # fail on the rename itself — a full disk, a read-only mount —
+                # and answering with a bare 500 would lose both the record of
+                # what *did* land and the restart it needs.
+                logger.exception("Setup: the cron file could not be published")
+                _record(
+                    context, step=STEP_AUTOMATION, applied=applied,
+                    debts=(_CRON_DEBT,),
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "The sync settings were saved. The cron file could not "
+                        f"be written ({e}), so the crons are unchanged — the "
+                        "checklist records the rest and still asks for a restart."
+                    ),
+                ) from e
             logger.info(
                 "Setup: automation set by account %s (crons on: %s)",
                 actor.account_id, ", ".join(sorted(plan.enabled)) or "none",
