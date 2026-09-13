@@ -266,6 +266,52 @@ class TestASocketHeldAcrossTheClaim:
             socket.send_json({"type": "ping"})
             assert _expect_closed(socket) == server.WS_REVOKED_CODE
 
+    def test_a_claim_between_verifying_and_accepting_does_not_promote_the_token(
+        self, instance, monkeypatch,
+    ):
+        """The handshake window, from the inside.
+
+        The connection's epoch has to be the *credential's*. Reading it back
+        off the account row after the token was verified is a second read, and
+        a claim landing between the two hands the connection the epoch the
+        claim just wrote — promoting the very session the claim exists to end.
+        """
+        import nerve.gateway.auth as gw_auth
+
+        visitor = _passwordless_session(instance)
+        real_authenticate = gw_auth.authenticate_websocket
+        claimed: list[str] = []
+
+        async def _claim_in_the_window(websocket):
+            actor = await real_authenticate(websocket)
+            if not claimed:
+                claimed.append(_claim(instance))
+            return actor
+
+        monkeypatch.setattr(server, "authenticate_websocket", _claim_in_the_window)
+
+        # The token verified a moment before the claim committed, so this
+        # connection belongs to the old epoch and must not be let in.
+        with pytest.raises(Exception):
+            with instance.client.websocket_connect(f"/ws?token={visitor}") as socket:
+                socket.receive_json()
+        assert claimed, "the claim never ran"
+        assert server._live_sockets == {}
+
+    def test_a_claim_just_before_the_handshake_is_caught_after_registration(
+        self, instance, monkeypatch,
+    ):
+        """The other interleaving: the claim commits *before* the connection
+        is in the registry, so the proactive close walks past it. Asking again
+        once it is findable is what closes that side."""
+        visitor = _passwordless_session(instance)
+        _claim(instance)
+
+        with pytest.raises(Exception):
+            with instance.client.websocket_connect(f"/ws?token={visitor}") as socket:
+                socket.receive_json()
+        assert server._live_sockets == {}
+
     def test_the_registry_does_not_leak_connections(self, instance):
         visitor = _passwordless_session(instance)
         with instance.client.websocket_connect(f"/ws?token={visitor}") as socket:
