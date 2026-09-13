@@ -21,7 +21,10 @@ function installStorage(): void {
 }
 installStorage();
 
-const tokenStore = vi.hoisted(() => ({ value: 'tok' as string | null }));
+const tokenStore = vi.hoisted(() => ({
+  value: 'tok' as string | null,
+  revision: 0,
+}));
 
 vi.mock('../../api/client', () => ({
   api: {
@@ -30,15 +33,25 @@ vi.mock('../../api/client', () => ({
     createSession: vi.fn(),
     runLater: vi.fn(),
     authStatus: vi.fn(async () => ({
-      auth_required: true, mode: 'local', login: 'password',
-      setup_pending: false, multiple_accounts: true,
+      auth_required: true, login: 'password',
     })),
     checkAuth: vi.fn(async () => ({ authenticated: true })),
     login: vi.fn(async () => ({ token: 'tok' })),
   },
   getToken: vi.fn(() => tokenStore.value),
-  setToken: vi.fn((token: string) => { tokenStore.value = token; }),
-  clearToken: vi.fn(() => { tokenStore.value = null; }),
+  setToken: vi.fn((token: string) => {
+    tokenStore.value = token;
+    tokenStore.revision += 1;
+    return tokenStore.revision;
+  }),
+  clearToken: vi.fn((expectedRevision?: number) => {
+    if (expectedRevision !== undefined && expectedRevision !== tokenStore.revision) {
+      return false;
+    }
+    tokenStore.value = null;
+    tokenStore.revision += 1;
+    return true;
+  }),
   setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../../stores/helpers/draftStorage', async (orig) => ({
@@ -103,8 +116,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 function accountFor(actorId: string, id = 'acc') {
   return {
     id, actor_id: actorId, username: 'somebody', display_name: null,
-    enabled: true, has_password: true, created_at: 't', updated_at: 't',
-    disabled_at: null, is_self: true,
+    enabled: true, has_password: true, created_at: 't',
   };
 }
 
@@ -116,6 +128,7 @@ beforeEach(() => {
     sessionExpired: false, error: null,
   });
   tokenStore.value = 'tok';
+  tokenStore.revision = 0;
   useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
   listActors.mockResolvedValue({ actors: [alice(), bob(), system()] });
   (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>)
@@ -227,11 +240,11 @@ describe('authentication generations', () => {
     expect(useAuthStore.getState().loading).toBe(false);
   });
 
-  it('does not let Alice\'s stale identity clear Bob\'s newer token', async () => {
+  it('does not let a stale login clear a newer byte-identical token', async () => {
     const slowAlice = deferred<ReturnType<typeof accountFor>>();
     (api.login as unknown as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ token: 'alice-token' })
-      .mockResolvedValueOnce({ token: 'bob-token' });
+      .mockResolvedValueOnce({ token: 'same-token' })
+      .mockResolvedValueOnce({ token: 'same-token' });
     (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>)
       .mockReturnValueOnce(slowAlice.promise)
       .mockResolvedValueOnce(accountFor(BOB, 'acc-bob'));
@@ -248,7 +261,8 @@ describe('authentication generations', () => {
       await aliceLogin;
     });
 
-    expect(clearToken).not.toHaveBeenCalled();
+    expect(clearToken).toHaveBeenCalledWith(1);
+    expect(tokenStore.value).toBe('same-token');
     expect(selfActorId()).toBe(BOB);
   });
 });
