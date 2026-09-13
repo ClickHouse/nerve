@@ -34,6 +34,16 @@ Three things this deliberately does not do:
 One honest limitation, documented in ``docs/setup.md``: a reverse proxy on the
 same host makes every request's peer loopback, which silently makes the token
 optional. ``auth.setup_token_required: true`` forces it for those deployments.
+
+**The one place a header can reach the peer address, and why it is still
+safe.** uvicorn runs ``ProxyHeadersMiddleware`` by default, which rewrites
+``scope["client"]`` from ``X-Forwarded-For`` — but only when the immediate peer
+is already trusted (``127.0.0.1``). A remote caller's header is ignored
+outright, so the rewrite can never turn a remote request into a local one; and
+where it does fire, the peer was loopback anyway. In the deployment this module
+cannot otherwise see through — a proxy on this host — a proxy that forwards the
+real client address makes the guard *stricter* rather than weaker, because the
+peer becomes that remote address. Both directions are pinned by tests.
 """
 
 from __future__ import annotations

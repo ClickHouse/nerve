@@ -82,10 +82,15 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       const claimed = await api.setupClaim(body);
       // Exactly what a login does with the token it is given.
       setToken(claimed.token);
-      // The descriptor decides what the login form collects and where the app
-      // opens; the actor map decides what every name in the app says. Both
-      // just changed.
-      await useAuthStore.getState().refreshStatus();
+      // Then the store's own startup path, rather than a hand-written "you are
+      // signed in now": it validates the token, re-reads the descriptor and
+      // sets the session state that decides whether this tab sees the app or
+      // a login form. The tab that claimed the instance with no session — a
+      // dead token in storage — has to end up *inside*, not back at a prompt
+      // for the password it just set.
+      await useAuthStore.getState().checkAuth();
+      // Names are read per app session and a display name may have just been
+      // set; nothing stores the name it changed.
       await useActorStore.getState().refresh();
       await get().load();
       return true;

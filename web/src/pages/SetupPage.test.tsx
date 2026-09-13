@@ -18,7 +18,7 @@ vi.mock('../api/client', () => ({
     listActors: vi.fn().mockResolvedValue({ actors: [] }),
     authStatus: vi.fn(),
     login: vi.fn(),
-    checkAuth: vi.fn(),
+    checkAuth: vi.fn().mockResolvedValue({ authenticated: true }),
     listAccounts: vi.fn().mockResolvedValue({ accounts: [] }),
   },
   setToken: vi.fn(),
@@ -97,6 +97,9 @@ beforeEach(() => {
     auth_required: true, mode: 'local', login: 'password',
     setup_pending: false, multiple_accounts: false,
   });
+  api.checkAuth.mockResolvedValue({ authenticated: true });
+  (client.getToken as unknown as ReturnType<typeof vi.fn>)
+    .mockReturnValue('a-synthetic-session-token');
 });
 
 describe('claiming an unclaimed instance', () => {
@@ -140,11 +143,14 @@ describe('claiming an unclaimed instance', () => {
     expect(api.setupClaim.mock.calls[0][0]).toMatchObject({
       username: 'alice', password: 'a-real-password',
     });
-    // Exactly what a login does: store the token, then re-read the descriptor
-    // and the actor map, because both just changed.
+    // Exactly what a login does: store the token, then run the auth store's
+    // own startup path so this tab is signed in rather than sent back to a
+    // form for the password it just set.
     expect(client.setToken).toHaveBeenCalledWith('a-synthetic-session-token');
-    await waitFor(() => expect(api.authStatus).toHaveBeenCalled());
+    await waitFor(() => expect(api.checkAuth).toHaveBeenCalled());
+    expect(api.authStatus).toHaveBeenCalled();
     expect(api.listActors).toHaveBeenCalled();
+    expect(useAuthStore.getState().authenticated).toBe(true);
   });
 
   it('sends no token field when none was typed', async () => {

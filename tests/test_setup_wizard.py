@@ -326,6 +326,74 @@ class TestClaimingFromSomewhereElse:
         response = await _claim(install, client=_REMOTE, headers=headers)
         assert response.status_code == 403, headers
 
+    async def test_uvicorn_own_proxy_header_handling_cannot_relax_the_guard(
+        self, install,
+    ):
+        """The one place a header *can* reach the peer address, checked.
+
+        Nerve's guard reads ``scope["client"]`` and no header — but uvicorn
+        runs ``ProxyHeadersMiddleware`` by default, which rewrites that value
+        from ``X-Forwarded-For`` when the immediate peer is trusted
+        (``127.0.0.1``). So the real question is whether that rewrite can ever
+        turn a remote caller into a local one, and the answer has to be no:
+        the rewrite only happens for a peer that was *already* loopback, and
+        for a remote peer the header is ignored outright.
+
+        This drives the endpoint through the real middleware rather than
+        reasoning about it.
+        """
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        await install.token()
+        fronted = ProxyHeadersMiddleware(install.app)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=fronted, client=_REMOTE),
+            base_url="http://nerve-test",
+        ) as http:
+            response = await http.post(
+                "/api/setup/claim",
+                json={"username": "alice", "password": _PASSWORD},
+                headers={"X-Forwarded-For": "127.0.0.1"},
+            )
+        assert response.status_code == 403, response.text
+
+    async def test_a_proxy_that_forwards_the_real_client_makes_it_stricter(
+        self, install,
+    ):
+        """And the same middleware in the deployment the switch exists for.
+
+        With a reverse proxy on this host, the peer is loopback and the guard
+        would let the claim through — that is the documented limitation. When
+        the proxy passes the real client on, uvicorn replaces the peer with it
+        and the token is demanded after all. Worth pinning, because it is the
+        direction that could otherwise regress silently.
+        """
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        token = await install.token()
+        fronted = ProxyHeadersMiddleware(install.app)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=fronted, client=_LOOPBACK),
+            base_url="http://nerve-test",
+        ) as http:
+            refused = await http.post(
+                "/api/setup/claim",
+                json={"username": "alice", "password": _PASSWORD},
+                headers={"X-Forwarded-For": "203.0.113.7"},
+            )
+            accepted = await http.post(
+                "/api/setup/claim",
+                json={
+                    "username": "alice", "password": _PASSWORD,
+                    "setup_token": token,
+                },
+                headers={"X-Forwarded-For": "203.0.113.7"},
+            )
+        assert refused.status_code == 403, refused.text
+        assert accepted.status_code == 200, accepted.text
+
     async def test_with_no_token_stored_a_remote_caller_can_never_claim(self, install):
         """The guard fails closed: nothing to match means nothing matches."""
         assert await setup_token.stored_setup_token(install.db) == ""
@@ -676,6 +744,24 @@ class TestLockdown:
         install.reconfigure(lockdown=True)
         response = await _claim(install)
         assert response.status_code == 200, response.text
+
+    async def test_a_request_for_both_halves_lands_neither(self, claimed):
+        """The name is a database write and the zone is a file write.
+
+        A request that asked for both must not land the name and then answer
+        with the failure of the other — that is a committed write reported as
+        a failure, and the form it leaves behind primes a retry that can only
+        conflict with what already happened.
+        """
+        claimed.reconfigure(lockdown=True)
+        async with _http(claimed) as http:
+            response = await http.put("/api/setup/profile", json={
+                "timezone": "Europe/Berlin", "display_name": "Alice Example",
+            })
+        assert response.status_code == 409
+        ref = await claimed.db.get_actor_ref(await claimed.owner_actor_id())
+        assert ref["display_name"] is None
+        assert claimed.tracked()["timezone"] == "UTC"
 
     async def test_a_display_name_is_still_allowed(self, claimed):
         """It is a database write too — and the one thing the wizard can
