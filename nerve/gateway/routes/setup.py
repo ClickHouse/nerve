@@ -80,7 +80,7 @@ from nerve.setup_writer import (
     merge_machine_paths,
     merge_private_paths,
     merge_settings_paths,
-    set_optional_crons,
+    plan_optional_crons,
     settings_problem,
 )
 
@@ -803,22 +803,18 @@ def _save_or_refuse(context: _Context) -> None:
         )
 
 
-async def _apply_cron_toggles(context: _Context, wanted: set[str]) -> tuple[str, ...]:
-    """Publish the cron selection and hand it to the running scheduler.
+async def _publish_cron_plan(plan) -> tuple[str, ...]:
+    """Publish a prepared cron change and hand it to the running scheduler.
 
-    Returns the debts it left behind: a rewritten ``system.yaml`` the
+    The plan was worked out — and its failures found — before anything else in
+    the step was written; this half is one atomic rename and the reload after
+    it. Returns the debts it left behind: a rewritten ``system.yaml`` the
     scheduler has not picked up is a change that has not happened, and a
     checklist reporting "nothing is waiting" over it would be wrong in the one
     way that matters — nobody would restart, and the crons they asked for
     would never run.
     """
-    outcome = set_optional_crons(Path(context.config.workspace), wanted)
-    if outcome.status == "unreadable":
-        raise HTTPException(
-            status_code=409,
-            detail=f"{outcome.path} could not be read ({outcome.detail}); nothing "
-                   "was changed.",
-        )
+    outcome = plan.publish()
     if outcome.status == "unchanged":
         return ()
 
@@ -900,10 +896,18 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
         context = await _context(actor)
         db = get_deps().db
 
-        # The configuration write first, because it is the one that can fail:
-        # a request for both halves must not rename you and *then* answer with
-        # the failure of the other, which is a committed write reported as a
-        # failure and a form primed for a retry that can only conflict with it.
+        # Everything that can be discovered before writing, first: whether the
+        # instance may be written to at all, and whether there is an account to
+        # rename. A step that answers 404 after changing the timezone is a step
+        # whose error message is a lie.
+        account = None
+        if display_name is not None:
+            if not actor.account_id:  # pragma: no cover - require_account checked
+                raise HTTPException(status_code=403, detail="No account to rename")
+            account = await db.get_account(actor.account_id)
+            if account is None:  # pragma: no cover - resolved a moment ago
+                raise HTTPException(status_code=404, detail="Account not found")
+
         applied: dict[str, Any] = {}
         if timezone:
             applied = _write(
@@ -912,17 +916,27 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_accoun
                 portable_paths=("timezone",),
             )
 
-        if display_name is not None:
-            if not actor.account_id:  # pragma: no cover - require_account checked
-                raise HTTPException(status_code=403, detail="No account to rename")
-            account = await db.get_account(actor.account_id)
-            if account is None:  # pragma: no cover - resolved a moment ago
-                raise HTTPException(status_code=404, detail="Account not found")
-            await db.update_actor_profile(
-                account["actor_id"], display_name=(display_name.strip() or None),
-            )
-
+        # Recorded before the rename, so that a rename which fails cannot take
+        # the timezone's restart debt down with it: the file has changed by
+        # now and the checklist has to know, whatever happens next.
         warning = _record(context, step=STEP_PROFILE, applied=applied)
+
+        if account is not None:
+            try:
+                await db.update_actor_profile(
+                    account["actor_id"], display_name=(display_name.strip() or None),
+                )
+            except Exception as e:  # noqa: BLE001 - said, not swallowed
+                logger.exception("Setup: the display name could not be written")
+                landed = (
+                    "The time zone was saved. " if timezone
+                    else "Nothing was written. "
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"{landed}The display name could not be saved: {e}",
+                ) from e
+
         return _render(await _context(actor), warning=warning)
 
 
@@ -1025,8 +1039,23 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
         if req.telegram is not None:
             portable_paths += ("sync.telegram.enabled",)
 
-        # The fallible writes first; the cron file is published last, because
-        # it is the target there is no way back from.
+        # Everything that can fail is decided *before* anything is written.
+        # The cron file is parsed and its new contents built here; if it is
+        # unreadable this answers without having touched the sync settings,
+        # which is what "nothing was changed" has to mean when it is said.
+        plan = None
+        if req.crons is not None:
+            wanted = {c.strip() for c in req.crons if c.strip()}
+            plan = plan_optional_crons(Path(context.config.workspace), wanted)
+            if not plan.ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{plan.path} could not be read ({plan.problem}); "
+                        "nothing was changed."
+                    ),
+                )
+
         applied = _write(
             context, choices=choices,
             machine_paths=machine_paths,
@@ -1035,12 +1064,11 @@ async def set_automation(req: AutomationRequest, actor: Actor = Depends(require_
         )
 
         debts: tuple[str, ...] = ()
-        if req.crons is not None:
-            wanted = {c.strip() for c in req.crons if c.strip()}
-            debts = await _apply_cron_toggles(context, wanted)
+        if plan is not None:
+            debts = await _publish_cron_plan(plan)
             logger.info(
                 "Setup: automation set by account %s (crons on: %s)",
-                actor.account_id, ", ".join(sorted(wanted)) or "none",
+                actor.account_id, ", ".join(sorted(plan.enabled)) or "none",
             )
 
         warning = _record(context, step=STEP_AUTOMATION, applied=applied, debts=debts)

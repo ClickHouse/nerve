@@ -780,30 +780,20 @@ def _merged_yaml(path: Path, updates: dict[str, Any], header: str) -> str:
     return opening + yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
 
 
-def merge_machine_paths(
-    path: Path, updates: dict[str, Any], *, header: str = "",
-) -> None:
-    """Merge dotted paths into a machine-local file that carries no secret.
+def publish_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically, keeping its mode and owner.
 
-    ``config.yaml`` holds this box's workspace path, its deployment style and
-    which features are on — nothing anyone must not read, and the file an
-    operator edits by hand. So it is republished **at the mode and ownership it
-    already had**, not forced to ``0600``.
+    Temporary beside the destination, then renamed over it: a reader never
+    sees half a file, and a writer that dies half way leaves the previous
+    version rather than a truncated one. The destination's mode and owner are
+    carried onto the temporary *before* the rename, so a container running as
+    root over a bind mount does not leave the host's own user locked out of a
+    file it has to read.
 
-    That distinction is not cosmetic. In the Docker deployment the container
-    runs as root over a bind-mounted checkout, so a wizard write that published
-    a fresh root-owned ``0600`` inode would leave the host's own non-root
-    ``nerve`` unable to read the file it needs to recognise a Docker install at
-    all. Forced ``0600`` is for the file that holds credentials, and
-    :func:`merge_private_paths` is where that lives.
-
-    Atomic all the same: written to a temporary beside the destination and
-    renamed over it, so a reader never sees half a file, and the destination's
-    mode and owner are carried onto the temporary before the rename rather than
-    applied to the published name afterwards.
+    For files that carry no credential. :func:`nerve.paths.write_private_text`
+    is the one for files that do: it forces ``0600`` and refuses rather than
+    writing something other users could read.
     """
-    text = _merged_yaml(path, updates, header or CONFIG_YAML_HEADER)
-
     existing_stat = path.stat() if path.exists() else None
     tmp = path.with_name(path.name + ".tmp")
     tmp.unlink(missing_ok=True)
@@ -837,6 +827,31 @@ def merge_machine_paths(
         raise
     finally:
         os.close(fd)
+
+
+def merge_machine_paths(
+    path: Path, updates: dict[str, Any], *, header: str = "",
+) -> None:
+    """Merge dotted paths into a machine-local file that carries no secret.
+
+    ``config.yaml`` holds this box's workspace path, its deployment style and
+    which features are on — nothing anyone must not read, and the file an
+    operator edits by hand. So it is republished **at the mode and ownership it
+    already had**, not forced to ``0600``.
+
+    That distinction is not cosmetic. In the Docker deployment the container
+    runs as root over a bind-mounted checkout, so a wizard write that published
+    a fresh root-owned ``0600`` inode would leave the host's own non-root
+    ``nerve`` unable to read the file it needs to recognise a Docker install at
+    all. Forced ``0600`` is for the file that holds credentials, and
+    :func:`merge_private_paths` is where that lives.
+
+    Atomic all the same: written to a temporary beside the destination and
+    renamed over it, so a reader never sees half a file, and the destination's
+    mode and owner are carried onto the temporary before the rename rather than
+    applied to the published name afterwards.
+    """
+    publish_text(path, _merged_yaml(path, updates, header or CONFIG_YAML_HEADER))
 
 
 def _current_umask() -> int:
@@ -1037,6 +1052,49 @@ class CronToggleOutcome:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class CronTogglePlan:
+    """A cron change worked out in full, before anything is written.
+
+    Every way this can fail — a missing file, YAML that does not parse, a
+    document that is not a job list — is discovered here, so a caller can find
+    out whether the change is possible *before* it publishes anything else.
+    :meth:`publish` is the part that has no failure mode worth reporting
+    separately: one atomic rename.
+    """
+
+    path: Path
+    text: str | None
+    enabled: tuple[str, ...] = ()
+    disabled: tuple[str, ...] = ()
+    problem: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.problem
+
+    @property
+    def changes_anything(self) -> bool:
+        return self.text is not None
+
+    def publish(self) -> CronToggleOutcome:
+        if self.problem:
+            return CronToggleOutcome(
+                status="missing" if self.problem == "missing" else "unreadable",
+                path=self.path, detail=self.problem,
+            )
+        if self.text is None:
+            return CronToggleOutcome(
+                status="unchanged", path=self.path,
+                enabled=self.enabled, disabled=self.disabled,
+            )
+        publish_text(self.path, self.text)
+        return CronToggleOutcome(
+            status="written", path=self.path,
+            enabled=self.enabled, disabled=self.disabled,
+        )
+
+
 def system_cron_file(workspace: Path) -> Path:
     return Path(workspace) / "config" / "cron" / "system.yaml"
 
@@ -1087,21 +1145,18 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
     ]
 
 
-def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutcome:
-    """Enable exactly ``enabled_ids`` among the optional crons; leave the rest.
+def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePlan:
+    """Work out the cron change without touching anything.
 
-    Idempotent, and re-enterable: it is the state of the list that is set, not
-    a delta applied to it. Jobs the wizard does not own — the core crons, and
-    anything an operator added — keep whatever they say.
+    Split from the publication so a caller writing to several places can find
+    out that the cron file is unreadable *before* it writes the first of them
+    — a step that reports failure after changing configuration is a step whose
+    error message is wrong.
     """
     path = system_cron_file(workspace)
     document, raw, problem = _read_system_crons(workspace)
     if problem or document is None:
-        return CronToggleOutcome(
-            status="missing" if problem == "missing" else "unreadable",
-            path=path,
-            detail=problem,
-        )
+        return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
 
     enabled, disabled = [], []
     changed = False
@@ -1118,17 +1173,25 @@ def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutc
             changed = True
 
     if not changed:
-        return CronToggleOutcome(
-            status="unchanged", path=path,
+        return CronTogglePlan(
+            path=path, text=None,
             enabled=tuple(enabled), disabled=tuple(disabled),
         )
 
     header = leading_comment(raw) or _CRON_FILE_HEADER
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(header)
-        yaml.safe_dump(document, f, default_flow_style=False, sort_keys=False)
-
-    return CronToggleOutcome(
-        status="written", path=path,
+    body = yaml.safe_dump(document, default_flow_style=False, sort_keys=False)
+    return CronTogglePlan(
+        path=path, text=header + body,
         enabled=tuple(enabled), disabled=tuple(disabled),
     )
+
+
+def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutcome:
+    """Enable exactly ``enabled_ids`` among the optional crons; leave the rest.
+
+    Idempotent, and re-enterable: it is the state of the list that is set, not
+    a delta applied to it. Jobs the wizard does not own — the core crons, and
+    anything an operator added — keep whatever they say. Plan and publish in
+    one call, for a caller with nothing else to coordinate.
+    """
+    return plan_optional_crons(workspace, enabled_ids).publish()
