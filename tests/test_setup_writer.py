@@ -49,6 +49,13 @@ _JWT_SECRET = re.compile(r"jwt_secret: [0-9a-f]{64}")
 _PASSWORD_HASH = re.compile(r"password_hash: \$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
 
 # The files the writing path produces, as ``golden name -> path under the run``.
+#
+# The goldens carry a ``.golden`` suffix because ``config.yaml`` and
+# ``config.local.yaml`` are in the repository's .gitignore — an install's own
+# files, named for what they are. Without the suffix the two most important
+# fixtures are never committed, and this whole comparison passes for whoever
+# generated them and fails for everybody else, which is the opposite of what a
+# golden test is for.
 _PRODUCED = {
     "config.yaml": "config/config.yaml",
     "config.local.yaml": "config/config.local.yaml",
@@ -56,6 +63,7 @@ _PRODUCED = {
     "cron-system.yaml": "workspace/config/cron/system.yaml",
     "cron-jobs.yaml": "workspace/config/cron/jobs.yaml",
 }
+_GOLDEN_SUFFIX = ".golden"
 
 
 def personal_choices(workspace: Path) -> SetupChoices:
@@ -141,7 +149,7 @@ def worker(tmp_path: Path) -> dict[str, str]:
 
 def _assert_matches_golden(produced: dict[str, str], shape: str) -> None:
     for name, text in produced.items():
-        golden = FIXTURES / shape / name
+        golden = FIXTURES / shape / (name + _GOLDEN_SUFFIX)
         assert golden.exists(), (
             f"no golden for {shape}/{name} — it was captured from the installer "
             "before the writers moved; see this module's docstring"
@@ -156,6 +164,36 @@ def _assert_matches_golden(produced: dict[str, str], shape: str) -> None:
 
 class TestInstallerOutputIsUnchanged:
     """The whole point of the extraction: `nerve init` writes the same bytes."""
+
+    def test_every_golden_is_committed(self) -> None:
+        """A fixture the repository ignores is a comparison nobody else runs.
+
+        ``config.yaml`` and ``config.local.yaml`` are gitignored by name — they
+        are what a real install calls its own files — so goldens under those
+        names exist only on the machine that generated them, and this file
+        passes there and fails on a clean checkout. Asserted against git rather
+        than against the filesystem, because the filesystem is exactly what
+        cannot tell the difference.
+        """
+        import subprocess
+
+        repo = Path(__file__).parent.parent
+        try:
+            listed = subprocess.run(
+                ["git", "ls-files", "tests/fixtures/setup_writer"],
+                cwd=repo, capture_output=True, text=True, check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as e:
+            # A source export rather than a checkout — the files it has are by
+            # definition the tracked ones, which is what this asks about.
+            pytest.skip(f"not a git work tree: {e}")
+        tracked = listed.stdout.split()
+        expected = {
+            f"tests/fixtures/setup_writer/{shape}/{name}{_GOLDEN_SUFFIX}"
+            for shape in ("personal", "worker")
+            for name in _PRODUCED
+        }
+        assert expected <= set(tracked), sorted(expected - set(tracked))
 
     def test_personal_install(self, personal: dict[str, str]) -> None:
         _assert_matches_golden(personal, "personal")

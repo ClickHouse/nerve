@@ -1,0 +1,14 @@
+# Nerve — Machine-local configuration
+# Settings specific to this box: workspace location,
+# bind address, deployment style, local credentials handles.
+# Shared behaviour lives in <workspace>/config/settings.yaml,
+# which this file overrides. Secrets go in config.local.yaml.
+
+workspace: <root>/workspace
+deployment: server
+telegram:
+  enabled: true
+sync:
+  gmail:
+    accounts:
+    - alice@example.invalid
