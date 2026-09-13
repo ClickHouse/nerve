@@ -37,6 +37,21 @@ export interface SetupCron {
   enabled: boolean;
 }
 
+/** What the checklist's forms open on: the instance's current answers.
+ *  Secrets are reported as present or not — the wizard writes credentials
+ *  and never reads them back. */
+export interface SetupValues {
+  timezone: string;
+  display_name: string | null;
+  has_anthropic_key: boolean;
+  has_openai_key: boolean;
+  has_telegram_token: boolean;
+  sync_github: boolean;
+  sync_gmail: boolean;
+  sync_telegram: boolean;
+  gmail_accounts: string[];
+}
+
 /** `GET /api/setup` — the whole checklist screen in one read. */
 export interface SetupState {
   /** The one account still has no password: anybody who can reach the
@@ -48,9 +63,13 @@ export interface SetupState {
   read_only_reason: string | null;
   restart_pending: boolean;
   restart_pending_paths: string[];
+  /** Waiting on a restart but not a configuration key — a cron file the
+   *  running scheduler has not picked up. Already in words. */
+  restart_pending_reasons: string[];
   finished: boolean;
   steps: SetupStep[];
   crons: SetupCron[];
+  values: SetupValues;
 }
 
 /** What `POST /api/setup/claim` hands back: a session for the account it just
@@ -474,8 +493,11 @@ export const api = {
     method: 'PUT', body: JSON.stringify(body),
   }),
 
+  /** Every field optional: an omitted one is left untouched. Sending a value
+   *  the user did not change is how re-entering a step to turn one cron on
+   *  used to switch off the sync sources configured elsewhere. */
   setupAutomation: (body: {
-    crons: string[]; github?: boolean; gmail?: boolean;
+    crons?: string[]; github?: boolean; gmail?: boolean;
     gmail_accounts?: string[]; telegram?: boolean;
     telegram_api_id?: number; telegram_api_hash?: string;
   }) => request<SetupState>('/setup/automation', {

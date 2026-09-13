@@ -55,6 +55,18 @@ export interface SetupStoreState {
 export const RECONNECT_INTERVAL_MS = 1000;
 export const RECONNECT_TIMEOUT_MS = 120_000;
 
+/**
+ * Whether the checklist still has something to answer.
+ *
+ * `finished` is the server's judgement: the required step done, every other
+ * one answered one way or the other, and nothing still waiting on a restart.
+ * Unknown (nothing loaded, or the read failed) is *not* unfinished — the app
+ * must not grow a permanent nag because one request failed once.
+ */
+export function setupIsUnfinished(state: SetupStoreState): boolean {
+  return state.state !== null && !state.state.finished;
+}
+
 export const useSetupStore = create<SetupStoreState>((set, get) => ({
   state: null,
   loading: true,
@@ -106,6 +118,14 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     set({ busy: step, error: null });
     try {
       set({ state: await run() });
+      if (step === 'profile') {
+        // A display name is a label everywhere else in the app and is stored
+        // nowhere else — nothing carries the name it changed, so without this
+        // every message and session keeps the old one until a reload. It
+        // never rejects, and a failed re-read must not turn a rename that
+        // committed into an error.
+        await useActorStore.getState().refresh();
+      }
       return true;
     } catch (e) {
       set({ error: errorDetail(e, 'Could not save that') });
