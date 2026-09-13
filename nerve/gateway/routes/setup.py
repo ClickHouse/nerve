@@ -41,10 +41,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from nerve import daemon, paths, setup_state
+from nerve import boot, daemon, paths, setup_state
 from nerve.config import get_config
 from nerve.db.accounts import AccountError, NotClaimableError, UsernameTakenError
 from nerve.gateway.auth import (
@@ -106,6 +106,16 @@ _REFUSAL_SECONDS = 0.25
 # checklist reports the restart separately; this keeps the step itself from
 # reading as unanswered and inviting a second write of the same key.
 _WRITTEN_NOT_LIVE = "Saved. It applies when the instance restarts."
+
+# How long the restart helper waits before it signals anything, so the
+# response to the request that asked for it is on the wire first.
+_RESTART_DELAY_SECONDS = 0.75
+
+# One restart per process. The helper takes this process's pid; a second one
+# would race it over the same pid and the same pid file, and there is nothing
+# a second restart could achieve that the first is not already doing.
+_restart_lock = asyncio.Lock()
+_restart_requested = False
 
 _LOCKDOWN_REFUSED = (
     "This instance is in lockdown: its configuration is fleet-managed and is "
@@ -222,6 +232,10 @@ class RestartResponse(BaseModel):
     restarting: bool
     method: str
     message: str
+    # The generation of the process that accepted the request. The client
+    # polls /health until it reports a different one; anything else accepts
+    # the process being replaced, which answers until the moment it stops.
+    boot: str
 
 
 # --------------------------------------------------------------------------- #
@@ -783,25 +797,30 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_account)):
 
 
 @router.post("/api/system/restart", response_model=RestartResponse)
-async def restart_system(
-    background: BackgroundTasks, actor: Actor = Depends(require_account),
-):
+async def restart_system(actor: Actor = Depends(require_account)):
     """Restart the daemon — what ``nerve restart`` does, asked for over HTTP.
 
     ``timezone``, the Telegram token and the gateway socket are restart-only
     (``docs/config.md``), so the wizard cannot apply them live and its last
-    step is this. The browser polls ``/api/auth/status`` until the new process
-    answers and lands **already signed in**: the signing secret is pinned and
-    persisted, nothing here rotates it, so the token in ``localStorage``
-    outlives the process that issued it.
+    step is this. The response carries this process's **boot generation**; the
+    browser polls ``/health`` until that value changes, which is the only
+    honest way to know the *new* process is answering — the old one serves
+    perfectly well while it shuts down, so a client that waits for any answer
+    at all accepts the process it asked to replace.
+
+    The browser lands **already signed in**: the signing secret is pinned and
+    persisted, nothing here rotates it, and the session epoch is per account
+    rather than per process, so the token in ``localStorage`` outlives the
+    process that issued it.
 
     Allowed under lockdown: a restart writes no configuration, and an instance
     that could not be restarted from its own UI would be worse off for it.
 
-    The work happens in a background task so the response is on the wire
-    before the process is signalled — the helper that does the signalling is
-    detached and outlives us, which is the whole reason ``nerve restart`` is
-    built that way.
+    Serialised, and the helper is spawned **here** rather than in a background
+    task: whether a restart was *begun* is knowable synchronously, and a
+    caller told "restarting" for a helper that failed to start would wait for
+    a process that is never coming. The helper holds a short delay before it
+    signals anything, which is what gets this response onto the wire first.
     """
     config = get_config()
     config_dir = Path(config.config_dir) if config.config_dir else paths.nerve_home()
@@ -809,18 +828,39 @@ async def restart_system(
     # be answering the same question less reliably.
     old_pid = os.getpid()
 
-    def _go() -> None:
+    async with _restart_lock:
+        global _restart_requested
+        if _restart_requested:
+            # A second helper would race the first over the same pid and pid
+            # file. One restart is all anybody can want, and it is already
+            # under way.
+            raise HTTPException(
+                status_code=409,
+                detail="A restart is already under way; this page reconnects "
+                       "when the new instance answers.",
+            )
         try:
-            daemon.restart_daemon(config_dir, old_pid=old_pid)
-        except Exception:  # pragma: no cover - logged, nothing left to answer
-            logger.exception("Restart requested from the web UI could not start")
+            outcome = await asyncio.to_thread(
+                daemon.restart_daemon,
+                config_dir,
+                old_pid=old_pid,
+                delay_seconds=_RESTART_DELAY_SECONDS,
+            )
+        except Exception as e:  # noqa: BLE001 - reported, not swallowed
+            logger.exception("Restart requested by account %s could not start", actor.account_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"The restart could not be started: {e}. The instance is "
+                       "still running; see the server log.",
+            ) from e
+        _restart_requested = True
 
-    background.add_task(_go)
-    logger.info("Restart requested by account %s", actor.account_id)
+    logger.info("Restart requested by account %s (%s)", actor.account_id, outcome.method)
     return RestartResponse(
         restarting=True,
-        method="systemd" if daemon.is_systemd_managed() else "helper",
+        method=outcome.method,
         message="Restarting. This page reconnects on its own.",
+        boot=boot.boot_id(),
     )
 
 

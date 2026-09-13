@@ -81,6 +81,7 @@ def restart_daemon(
     verbose: bool = False,
     old_pid: int | None = None,
     systemd: bool | None = None,
+    delay_seconds: float = 0.0,
 ) -> RestartOutcome:
     """Arrange for the daemon to stop and a fresh one to take its place.
 
@@ -89,16 +90,22 @@ def restart_daemon(
     the CLI passes what its own helper decided so that stays patchable in
     tests.
 
-    Under systemd there is nothing to spawn: the unit is ``Restart=always``, so
-    stopping the process *is* the restart. Otherwise a detached helper is
-    started, and this function returns as soon as it exists — by design,
-    because the caller is very often the process the helper is about to kill,
-    and an HTTP response has to be on the wire before that happens.
+    ``delay_seconds`` holds the helper back before it signals anything, which
+    is what a caller *inside* the daemon needs: an HTTP response has to reach
+    the client before the process serving it is stopped. The command-line
+    caller passes 0 and keeps its immediate behaviour. A non-zero delay also
+    forces the systemd path through the same detached helper rather than
+    signalling here, because sleeping in the caller would block the very loop
+    that still has a response to flush.
+
+    Raises ``OSError`` if the helper cannot be started: whether a restart was
+    *begun* is knowable here, and a caller that reports "restarting" for a
+    helper that never existed is lying to the person waiting for it.
     """
     if systemd is None:
         systemd = is_systemd_managed()
 
-    if systemd:
+    if systemd and delay_seconds <= 0:
         if old_pid is not None:
             os.kill(old_pid, signal.SIGTERM)
             return RestartOutcome(
@@ -115,12 +122,17 @@ def restart_daemon(
     # Spawn a detached helper that: waits for old PID to exit, then starts
     # a new daemon.  Written as an inline Python script so we don't need an
     # external shell script on disk.
+    #
+    # Under systemd it starts nothing — the unit does that — so `start_cmd` is
+    # None there and the helper exists only to hold the delay and signal.
+    start_cmd = None if systemd else start_command(config_dir, verbose=verbose)
     helper_script = (
         "import os, signal, subprocess, sys, time\n"
         f"old_pid = {old_pid if old_pid is not None else 'None'}\n"
         f"pid_file = {str(paths.pid_file())!r}\n"
         f"log_file = {str(paths.log_file())!r}\n"
-        f"start_cmd = {start_command(config_dir, verbose=verbose)!r}\n"
+        f"start_cmd = {start_cmd!r}\n"
+        f"time.sleep({max(0.0, float(delay_seconds))!r})\n"
         "if old_pid is not None:\n"
         "    try:\n"
         "        os.kill(old_pid, signal.SIGTERM)\n"
@@ -143,6 +155,8 @@ def restart_daemon(
         "        os.unlink(pid_file)\n"
         "    except FileNotFoundError:\n"
         "        pass\n"
+        "if start_cmd is None:\n"
+        "    sys.exit(0)\n"
         "time.sleep(0.5)\n"
         "log_fd = open(log_file, 'a')\n"
         "proc = subprocess.Popen(\n"
@@ -171,10 +185,14 @@ def restart_daemon(
     finally:
         log_fd.close()
 
-    if old_pid is not None:
+    if systemd:
+        message = f"Restarting Nerve (PID {old_pid})... systemd will respawn."
+    elif old_pid is not None:
         message = (
             f"Restarting Nerve (PID {old_pid})... new instance will start shortly."
         )
     else:
         message = "Starting Nerve... new instance will start shortly."
-    return RestartOutcome(method="helper", message=message, old_pid=old_pid)
+    return RestartOutcome(
+        method="systemd" if systemd else "helper", message=message, old_pid=old_pid,
+    )

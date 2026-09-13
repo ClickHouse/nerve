@@ -14,6 +14,7 @@ vi.mock('../api/client', () => ({
     setupAutomation: vi.fn(),
     setupSkip: vi.fn(),
     restartSystem: vi.fn(),
+    health: vi.fn(),
     me: vi.fn(),
     listActors: vi.fn(),
     authStatus: vi.fn(),
@@ -311,17 +312,17 @@ describe('lockdown', () => {
 });
 
 describe('the restart', () => {
-  it('shows a reconnecting state and comes back on its own', async () => {
+  it('waits for a different process, not for any answer at all', async () => {
     api.restartSystem.mockResolvedValue({
       restarting: true, method: 'helper', message: 'Restarting.',
+      boot: 'the-old-process',
     });
-    // Down once, then up.
-    api.authStatus
+    // Down once; then the *old* process answering as it shuts down; then the
+    // new one. Only the last of those is a restart.
+    api.health
       .mockRejectedValueOnce(new Error('Failed to fetch'))
-      .mockResolvedValue({
-        auth_required: true, mode: 'local', login: 'password',
-        setup_pending: false, multiple_accounts: false,
-      });
+      .mockResolvedValueOnce({ status: 'ok', boot: 'the-old-process' })
+      .mockResolvedValue({ status: 'ok', boot: 'the-new-process' });
 
     renderPage();
     const restart = await screen.findByRole('region', { name: 'Restart' });
@@ -332,15 +333,16 @@ describe('the restart', () => {
 
     await waitFor(
       () => expect(screen.queryByText(/Restarting this instance/)).toBeNull(),
-      { timeout: 5000 },
+      { timeout: 8000 },
     );
+    expect(api.health.mock.calls.length).toBeGreaterThanOrEqual(3);
     // The token was never cleared: the reconnect lands signed in.
     expect(client.clearToken).not.toHaveBeenCalled();
-  }, 10000);
+  }, 15000);
 
   it('reports a restart that could not be started', async () => {
     api.restartSystem.mockRejectedValue(
-      new Error('409: {"detail": "no"}'),
+      new Error('500: {"detail": "no"}'),
     );
     renderPage();
     const restart = await screen.findByRole('region', { name: 'Restart' });
