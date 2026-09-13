@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +31,6 @@ from starlette.websockets import WebSocketDisconnect
 
 from nerve import setup_token
 from nerve.config import AuthConfig, NerveConfig, set_config
-from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import pin_jwt_secret
 
@@ -76,7 +74,7 @@ class _FakeEngine:
 
 
 @pytest.fixture
-def instance(tmp_path, wire_identity_store, monkeypatch):
+def instance(tmp_path, open_identity_db, wire_identity_store, monkeypatch):
     """A real app over a real database, on a passwordless install."""
     config_dir = tmp_path / "config"
     workspace = tmp_path / "workspace"
@@ -90,9 +88,7 @@ def instance(tmp_path, wire_identity_store, monkeypatch):
     pin_jwt_secret(_SECRET)
 
     async def _open():
-        database = Database(Path(tmp_path / "nerve.db"))
-        await database.connect()
-        identity = await database.bootstrap_local_identity(credential_source="none")
+        database, identity = await open_identity_db(tmp_path / "nerve.db")
         # What first start would have published while the instance is unclaimed.
         token = await setup_token.ensure_setup_token(database, unclaimed=True)
         return database, identity, token

@@ -298,7 +298,7 @@ class TestClaim:
     async def test_missing_stored_token_fails_closed(self, install):
         # Exceptional raw state: production only deletes through claim or the
         # startup lifecycle, both of which are covered separately.
-        await install.db.delete_instance_secret(setup_token.SETUP_TOKEN_NAME)
+        await install.db._delete_instance_secret(setup_token.SETUP_TOKEN_NAME)
         response = await _claim(install)
         assert response.status_code == 403
 
@@ -384,14 +384,16 @@ class TestSessionEpoch:
 
 @pytest.mark.asyncio
 class TestStaleHttpWrites:
-    async def _claim_at(self, install, monkeypatch, seam: str):
+    async def _claim_at(
+        self, install, monkeypatch, seam: str, **claim_kwargs,
+    ):
         fired: list[bool] = []
         original = getattr(install.db, seam)
 
         async def claim_then(*args, **kwargs):
             if not fired:
                 fired.append(True)
-                response = await _claim(install)
+                response = await _claim(install, **claim_kwargs)
                 assert response.status_code == 200, response.text
             return await original(*args, **kwargs)
 
@@ -402,7 +404,7 @@ class TestStaleHttpWrites:
         self, install, monkeypatch,
     ):
         visitor = install.session_token()
-        fired = await self._claim_at(install, monkeypatch, "get_account")
+        fired = await self._claim_at(install, monkeypatch, "login_state")
         async with _client(install.app, token=visitor) as http:
             response = await http.put(
                 "/api/accounts/me/password",
@@ -418,7 +420,9 @@ class TestStaleHttpWrites:
         self, install, monkeypatch,
     ):
         visitor = install.session_token()
-        fired = await self._claim_at(install, monkeypatch, "get_actor_ref")
+        fired = await self._claim_at(
+            install, monkeypatch, "create_managed_account",
+        )
         async with _client(install.app, token=visitor) as http:
             response = await http.post("/api/accounts", json={
                 "username": "mallory",
@@ -430,7 +434,7 @@ class TestStaleHttpWrites:
 
     async def test_disable_cannot_outlive_claim(self, install, monkeypatch):
         visitor = install.session_token()
-        fired = await self._claim_at(install, monkeypatch, "get_account")
+        fired = await self._claim_at(install, monkeypatch, "disable_account")
         async with _client(install.app, token=visitor) as http:
             response = await http.post(
                 f"/api/accounts/{install.owner_id}/disable",
@@ -443,20 +447,12 @@ class TestStaleHttpWrites:
         self, install, monkeypatch,
     ):
         visitor = install.session_token()
-        fired: list[bool] = []
-        original = install.db.login_state
-
-        async def claim_then(*args, **kwargs):
-            if not fired:
-                fired.append(True)
-                response = await _claim(
-                    install,
-                    display_name="Alice Example",
-                )
-                assert response.status_code == 200
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(install.db, "login_state", claim_then)
+        fired = await self._claim_at(
+            install,
+            monkeypatch,
+            "login_state",
+            display_name="Alice Example",
+        )
         async with _client(install.app, token=visitor) as http:
             response = await http.patch(
                 f"/api/accounts/{install.owner_id}",
@@ -500,8 +496,8 @@ class TestOnlyClaimSetsTheFirstPassword:
         assert verify_password("next-one-please", account["credential"])
 
     async def test_claim_does_not_rotate_the_signing_secret(self, install):
-        before = await install.db.get_instance_secret(JWT_SECRET_NAME)
+        before = await install.db._get_instance_secret(JWT_SECRET_NAME)
         response = await _claim(install)
-        after = await install.db.get_instance_secret(JWT_SECRET_NAME)
+        after = await install.db._get_instance_secret(JWT_SECRET_NAME)
         assert response.status_code == 200
         assert after == before

@@ -10,7 +10,7 @@ import { useAuthStore } from '../stores/authStore';
 /** Secure the account created by installation; no other setup lives here. */
 export function SetupPage() {
   const navigate = useNavigate();
-  const setupPending = useAuthStore((state) => state.setupPending);
+  const loginMode = useAuthStore((state) => state.loginMode);
   const checkAuth = useAuthStore((state) => state.checkAuth);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -19,7 +19,7 @@ export function SetupPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!setupPending) return <Navigate to="/accounts" replace />;
+  if (loginMode !== 'none') return <Navigate to="/accounts" replace />;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();

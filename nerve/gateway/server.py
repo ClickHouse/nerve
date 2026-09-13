@@ -113,10 +113,10 @@ class WebSocketConnection:
     because re-pointing it would attribute the next message to somebody who
     did not send it.
 
-    ``session_epoch`` is the account's epoch **as it stood at accept**, so the
-    comparison is "has it moved since this socket was let in". ``None`` for a
-    credential with no account behind it (the agent's own system principal),
-    which has no epoch and nothing to revoke.
+    ``session_epoch`` is the credential epoch verified at accept. Comparing it
+    with the account row on every frame revokes credentials minted before a
+    claim or later session reset. ``None`` marks a credential with no account
+    behind it (the agent's own system principal), which has nothing to revoke.
 
     Session selection is deliberately *not* here — the client switches sessions
     over the same socket, so that one is a local variable in the handler.
@@ -1038,9 +1038,9 @@ def create_app() -> FastAPI:
     # WebSocket endpoint
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
-        # Accept, authenticate and resolve the actor — once, here. Nothing
-        # below re-reads identity: this connection acts as `connection.actor`
-        # until it closes.
+        # Accept, authenticate and resolve the actor — once, here. The actor is
+        # immutable for attribution; authority is re-checked below before each
+        # frame, and a stale connection is closed rather than re-pointed.
         connection = await _accept_websocket(websocket)
         if connection is None:
             return

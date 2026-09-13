@@ -25,16 +25,16 @@ async def instance_is_unclaimed(db, config) -> bool:
 async def ensure_setup_token(db, *, unclaimed: bool) -> str | None:
     """Return the persisted token while unclaimed, deleting it otherwise."""
     if not unclaimed:
-        await db.delete_instance_secret(SETUP_TOKEN_NAME)
+        await db._delete_instance_secret(SETUP_TOKEN_NAME)
         return None
-    return await db.ensure_instance_secret(
+    return await db._ensure_instance_secret(
         SETUP_TOKEN_NAME, secrets.token_urlsafe(_TOKEN_BYTES),
     )
 
 
 async def stored_setup_token(db) -> str:
     """Return the token in force, or an empty string. Never generate one."""
-    return await db.get_instance_secret(SETUP_TOKEN_NAME) or ""
+    return await db._get_instance_secret(SETUP_TOKEN_NAME) or ""
 
 
 def token_accepted(supplied: str | None, stored: str) -> bool:
