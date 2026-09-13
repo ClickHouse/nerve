@@ -1,0 +1,59 @@
+# Nerve — Shared configuration
+# Git-tracked and portable: this is the layer that syncs between machines and
+# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
+# which overrides this file. Secrets belong in config.local.yaml or behind an
+# ${ENV_VAR} reference — never here.
+#
+# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
+# does not generate are left alone.
+
+timezone: UTC
+gateway:
+  host: 0.0.0.0
+  port: 8900
+agent:
+  model: eu.anthropic.claude-opus-5
+  cron_model: eu.anthropic.claude-sonnet-4-6
+  max_turns: 50
+  max_concurrent: 32
+  thinking: max
+  effort: max
+  context_1m: true
+  title_model: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+quiet_start: 02:00
+quiet_end: 08:00
+memory:
+  recall_model: eu.anthropic.claude-sonnet-4-6
+  memorize_model: eu.anthropic.claude-sonnet-4-6
+  fast_model: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+  embed_model: text-embedding-3-small
+  categories:
+  - name: task_domain
+    description: 'Domain-specific knowledge: CI systems, APIs, database schemas, repo
+      structure'
+  - name: patterns
+    description: 'Recurring patterns: common failure modes, root causes, known flaky
+      tests, seasonal issues'
+  - name: procedures
+    description: 'How to do things: reproduction steps, debug workflows, fix templates
+      that worked'
+  - name: decisions
+    description: 'Past decisions and outcomes: what was tried, what worked, why approach
+      X over Y'
+  - name: approvals
+    description: What got approved/rejected, approval preferences, risk thresholds
+  - name: contacts
+    description: 'People involved: who owns what, who to notify, escalation paths'
+  - name: infrastructure
+    description: Systems, endpoints, service dependencies, deployment details
+  - name: agent_ops
+    description: 'Operational lessons about the worker itself: tool gotchas, performance
+      observations'
+sessions:
+  sticky_period_minutes: 120
+  archive_after_days: 30
+  max_sessions: 500
+  memorize_interval_minutes: 30
+provider:
+  type: bedrock
+  aws_region: eu-central-1
