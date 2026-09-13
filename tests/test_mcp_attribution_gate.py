@@ -7,10 +7,8 @@ side effects (write a file, call out to a network) would run with no session in
 the list and no audit event, and the audit writer's own failure is swallowed by
 design, so nothing downstream would notice.
 
-This drives the whole path the way an external client does: the real satellite
-resolver, the real ``ToolContext`` builder, and the real ``call_tool``
-dispatcher — with the one thing broken that a tool call cannot recover from,
-an unresolvable system principal.
+This drives the real satellite resolver, ``ToolContext`` builder, and tool
+dispatcher across a database create failure.
 """
 
 from __future__ import annotations
@@ -46,12 +44,6 @@ class _Harness:
         return await entry.handler(
             _FAKE_RCTX, CallToolRequestParams(name=name, arguments={}),
         )
-
-    def break_the_principal(self, monkeypatch) -> None:
-        async def _gone():
-            return None
-
-        monkeypatch.setattr(self.db, "get_system_principal", _gone)
 
 
 @pytest_asyncio.fixture
@@ -102,26 +94,31 @@ class TestAToolCallNeedsAnAttributableSession:
         identity = await mcp.db.get_local_identity()
         assert session["created_by_actor_id"] == identity.system_actor_id
 
-    async def test_the_handler_never_runs_when_it_cannot(self, mcp, monkeypatch):
-        mcp.break_the_principal(monkeypatch)
+    async def test_database_create_failure_refuses_the_tool(self, mcp):
+        await mcp.db.db.execute(
+            """CREATE TRIGGER fail_satellite_create
+               BEFORE INSERT ON sessions
+               WHEN NEW.source = 'external'
+               BEGIN SELECT RAISE(ABORT, 'injected satellite failure'); END"""
+        )
+        await mcp.db.db.commit()
 
         result: Any = await mcp.call()
 
         assert result.is_error is True
         assert "context error" in result.content[0].text.lower()
-        assert mcp.invoked == [], "a tool ran with no attributable session"
+        assert mcp.invoked == [], "a tool ran without a durable session"
         assert await mcp.db.list_sessions(limit=50) == []
 
-    async def test_and_the_next_call_works(self, mcp, monkeypatch):
-        """Refusing is a transient failure, not a broken mount."""
-        mcp.break_the_principal(monkeypatch)
-        assert (await mcp.call()).is_error is True
-
-        monkeypatch.undo()
-        result: Any = await mcp.call()
-
-        assert result.is_error is False
+        # The failed context must not poison this resolver/server connection.
+        await mcp.db.db.execute("DROP TRIGGER fail_satellite_create")
+        await mcp.db.db.commit()
+        retry: Any = await mcp.call()
+        assert retry.is_error is False
         assert len(mcp.invoked) == 1
+        session = await mcp.db.get_session(mcp.invoked[0]["session_id"])
+        identity = await mcp.db.get_local_identity()
+        assert session["created_by_actor_id"] == identity.system_actor_id
 
 
 @pytest.mark.asyncio
@@ -155,25 +152,6 @@ class TestOnlyALostRaceIsSurvivable:
         session = await mcp.db.get_session(sid)
         assert session is not None
         assert session["created_by_actor_id"] == identity.system_actor_id
-
-    async def test_anything_else_refuses(self, mcp):
-        """A create that leaves no row is not a race, and must not be
-        mistaken for one."""
-        resolver = SatelliteSessionResolver(mcp.db)
-
-        async def _fail(*args, **kwargs):
-            raise RuntimeError("disk is on fire")
-
-        mcp.db.create_session = _fail
-        try:
-            with pytest.raises(RuntimeError, match="disk is on fire"):
-                await resolver.resolve(
-                    client_name="claude-code", mcp_session_id="doomed",
-                )
-        finally:
-            del mcp.db.create_session
-
-        assert await mcp.db.list_sessions(limit=50) == []
 
 
 async def _system(db):

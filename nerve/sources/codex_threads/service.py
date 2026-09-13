@@ -40,26 +40,11 @@ logger = logging.getLogger(__name__)
 
 
 class _OriginWorker:
-    """Pairs one origin with its ingester, and checkpoints what was ingested.
+    """Checkpoint only events that the ingester accepted.
 
-    The origin advances its own offset *before* it yields an event (so a
-    consumer that stops mid-stream has a correct cursor), which means
-    ``origin.cursor()`` during a failed ingest already covers work that was
-    never persisted. Saving it there would skip the event permanently: the
-    next scan starts past it and nothing ever replays it.
-
-    So the worker keeps its own ``_checkpoint`` — the cursor as of the last
-    event that actually landed — and that is the only value ever written. On
-    the first failure it stops advancing for the rest of the run, because a
-    later event's cursor also covers the failed one. Ingestion is idempotent
-    (sessions are looked up first, messages are keyed on ``external_id``), so
-    the replay a restart performs is safe, and re-doing work is the only
-    outcome that cannot lose it.
-
-    The trade-off, stated plainly: an event that fails *every* time stalls the
-    checkpoint until it is dealt with, rather than being skipped silently. A
-    stuck sync with an exception in the log is the better failure — the old
-    behaviour dropped the event and left no trace but a gap.
+    The origin advances before yielding, so its live cursor can include a
+    failed event. The worker retains the last successful cursor instead;
+    idempotent ingestion makes replay safe.
     """
 
     def __init__(
@@ -73,8 +58,6 @@ class _OriginWorker:
         self.db = db
         self.task: asyncio.Task | None = None
         self.cursor_key = f"codex:{origin.id}"
-        # The cursor covering only events this worker has ingested. None
-        # until the run starts; never advanced past a failure.
         self._checkpoint: str | None = None
         self._stalled = False
 
@@ -93,8 +76,6 @@ class _OriginWorker:
             return
 
         cursor = await self.db.get_sync_cursor(self.cursor_key)
-        # Start from where the last run left off; until an event lands, that
-        # is also the furthest this run may checkpoint to.
         self._checkpoint = cursor
         self._stalled = False
         try:

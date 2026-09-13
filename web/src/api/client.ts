@@ -42,7 +42,6 @@ export interface ActorRef {
   id: string;
   kind: 'human' | 'system';
   display_name: string | null;
-  profile_version: number;
 }
 
 /** One page of a lazily-loaded sidebar group (Archived / System). */
@@ -412,8 +411,6 @@ export const api = {
   // One row per person plus the system principal, so a single fetch labels a
   // whole list; re-fetch after a rename rather than caching a name anywhere.
   listActors: () => request<{ actors: ActorRef[] }>('/actors'),
-
-  getActor: (id: string) => request<ActorRef>(`/actors/${encodeURIComponent(id)}`),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any

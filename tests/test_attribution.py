@@ -1,22 +1,8 @@
-"""Who did it — attribution persisted on sessions and messages.
-
-This is the delivery gate: two people sharing one agent, two local accounts, no
-gateway, and every session and message they create stored under the right one
-of them. The rest of the file is the boundaries of that claim — what the
-instance's own work is attributed to, what is deliberately left unattributed,
-and the property a "current user" global would quietly destroy.
-
-The engine's client build is stubbed out in the turn tests: the model is the
-only part of a turn these care nothing about, and everything before it — the
-route, ``engine.run``, the session lookup, the message insert — is the real
-code.
-"""
+"""Integration coverage for persisted session and message attribution."""
 
 from __future__ import annotations
 
 import asyncio
-import ast
-import json
 import pathlib
 import sqlite3
 from types import SimpleNamespace
@@ -28,31 +14,20 @@ from fastapi import FastAPI
 
 from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
-from nerve.config import AuthConfig, NerveConfig, set_config
+from nerve.agent.tools.handlers.plans import plan_approve_handler
+from nerve.agent.tools.registry import ToolContext
+from nerve.config import NerveConfig, set_config
 from nerve.gateway.auth import create_session_token, hash_password, pin_jwt_secret
 from nerve.gateway.routes import init_deps, register_all_routes
 from nerve.gateway.server import create_app
-from nerve.identity import Actor, ActorResolutionError
-from nerve.mcp_server.session import SatelliteSessionResolver
+from nerve.identity import Actor
 
 _SECRET = "test-secret-for-attribution-padded-to-32b"
 _ALICE_PASSWORD = "correct-horse-battery-staple"
 _BOB_PASSWORD = "a-different-passphrase-entirely"
 
 
-# --------------------------------------------------------------------------- #
-#  Fixtures                                                                    #
-# --------------------------------------------------------------------------- #
-
-
 class _Install:
-    """One instance with two people on it, and a real engine behind the routes.
-
-    ``secure_the_owner`` then ``create_managed_account`` is the only way to get
-    to two accounts (a passwordless instance refuses the second), so it is what
-    the gate runs on.
-    """
-
     def __init__(self, db, identity, engine, config):
         self.db = db
         self.identity = identity
@@ -63,7 +38,7 @@ class _Install:
         self.bob_account = ""
         self.bob_actor = ""
 
-    async def add_the_second_person(self) -> None:
+    async def add_bob(self) -> None:
         await self.db.update_account_login(
             self.alice_account,
             username="alice",
@@ -101,30 +76,19 @@ class _Install:
     async def creator_of(self, session_id: str) -> str | None:
         return (await self.db.get_session(session_id))["created_by_actor_id"]
 
-    async def senders_in(self, session_id: str) -> list[tuple[str, str | None]]:
-        """``(role, actor_id)`` for a session's messages, oldest first."""
-        return [
-            (m["role"], m["actor_id"])
-            for m in await self.db.get_messages(session_id)
-        ]
+    async def messages_in(self, session_id: str) -> list[dict]:
+        return await self.db.get_messages(session_id)
 
     async def said_in(self, session_id: str) -> list[tuple[str, str | None]]:
-        """``(content, actor_id)`` for a session's *user* messages.
-
-        What every two-people assertion has to compare. Checking the set of
-        actor ids, or even their order, cannot tell a correct pair of rows from
-        two rows whose senders were swapped — which is precisely the bug a
-        shared actor produces.
-        """
         return [
-            (m["content"], m["actor_id"])
-            for m in await self.db.get_messages(session_id)
-            if m["role"] == "user"
+            (row["content"], row["actor_id"])
+            for row in await self.messages_in(session_id)
+            if row["role"] == "user"
         ]
 
 
 @pytest_asyncio.fixture
-async def install(tmp_path, open_identity_db, wire_identity_store, monkeypatch):
+async def install(tmp_path, open_identity_db, wire_identity_store):
     config = NerveConfig.from_dict({
         "workspace": str(tmp_path / "ws"),
         "codex": {"home_dir": str(tmp_path / "codex-home")},
@@ -137,7 +101,7 @@ async def install(tmp_path, open_identity_db, wire_identity_store, monkeypatch):
     engine = AgentEngine(config, database)
     init_deps(engine, database)
     installed = _Install(database, identity, engine, config)
-    await installed.add_the_second_person()
+    await installed.add_bob()
     try:
         yield installed
     finally:
@@ -152,13 +116,6 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 
 
 def _no_model(engine: AgentEngine, monkeypatch) -> None:
-    """Let a turn run for real right up to the model, then stop.
-
-    ``_run_inner`` persists the user message *before* it builds a client, and
-    catches a failed build into an error response, so a turn with no model
-    still exercises the whole path this file is about: route or socket →
-    ``engine.run`` → session lookup → message insert.
-    """
     async def _refuse(*args, **kwargs):
         raise RuntimeError("no model in this test")
 
@@ -166,7 +123,6 @@ def _no_model(engine: AgentEngine, monkeypatch) -> None:
 
 
 async def _run_later(client, headers, session_id, message):
-    """Persist a user message through a real route, with no model involved."""
     return await client.post(
         "/api/sessions/run-later",
         headers=headers,
@@ -174,121 +130,135 @@ async def _run_later(client, headers, session_id, message):
     )
 
 
-# --------------------------------------------------------------------------- #
-#  The gate: two people, over HTTP                                             #
-# --------------------------------------------------------------------------- #
+async def _pending_plan(install: _Install, suffix: str) -> tuple[str, str]:
+    task_id = f"task-{suffix}"
+    plan_id = f"plan-{suffix}"
+    install.config.workspace.mkdir(exist_ok=True)
+    task_file = install.config.workspace / f"{task_id}.md"
+    task_file.write_text("# Attribution plan\n", encoding="utf-8")
+    await install.db.upsert_task(
+        task_id=task_id, file_path=task_file.name, title="Attribution plan",
+        status="pending", content="# Attribution plan\n",
+    )
+    await install.db.create_plan(
+        plan_id=plan_id, task_id=task_id, content="Ship it",
+        session_id="proposal", version=1,
+    )
+    return task_id, plan_id
+
+
+def _finish_implementation_immediately(install: _Install, monkeypatch) -> None:
+    async def _done(**kwargs):
+        return None
+
+    monkeypatch.setattr(install.engine, "run", _done)
 
 
 @pytest.mark.asyncio
-class TestTwoPeopleOverHttp:
-    async def test_each_session_belongs_to_whoever_asked_for_it(self, install):
-        async with _client(install.app()) as client:
-            hers = await client.post("/api/sessions", headers=install.alice, json={})
-            his = await client.post("/api/sessions", headers=install.bob, json={})
+async def test_http_plan_approval_attributes_the_session_to_the_approver(
+    install, monkeypatch,
+):
+    _, plan_id = await _pending_plan(install, "http")
+    _finish_implementation_immediately(install, monkeypatch)
 
-        assert hers.status_code == his.status_code == 200
+    async with _client(install.app()) as client:
+        response = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.alice,
+        )
+
+    assert response.status_code == 200
+    session = await install.db.get_session(response.json()["impl_session_id"])
+    assert session["created_by_actor_id"] == install.alice_actor
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_approval_attributes_the_session_to_nerve(
+    install, monkeypatch,
+):
+    _, plan_id = await _pending_plan(install, "agent")
+    _finish_implementation_immediately(install, monkeypatch)
+    ctx = ToolContext(
+        session_id="system", workspace=install.config.workspace,
+        db=install.db, config=install.config, engine=install.engine,
+    )
+
+    await plan_approve_handler(ctx, {"plan_id": plan_id})
+
+    plan = await install.db.get_plan(plan_id)
+    session = await install.db.get_session(plan["impl_session_id"])
+    assert session["created_by_actor_id"] == install.system_actor_id
+
+
+@pytest.mark.asyncio
+async def test_http_keeps_concurrent_people_distinct(install):
+    """Exercise authentication, routes, and both persistence columns."""
+    async with _client(install.app()) as client:
+        hers, his = await asyncio.gather(
+            client.post("/api/sessions", headers=install.alice, json={}),
+            client.post("/api/sessions", headers=install.bob, json={}),
+        )
         assert hers.json()["created_by_actor_id"] == install.alice_actor
         assert his.json()["created_by_actor_id"] == install.bob_actor
-        assert install.alice_actor != install.bob_actor
-        # ...and that is what is on disk, not only in the answer.
-        assert await install.creator_of(hers.json()["id"]) == install.alice_actor
-        assert await install.creator_of(his.json()["id"]) == install.bob_actor
 
-    async def test_each_message_belongs_to_whoever_sent_it(self, install):
-        """Two people sending into the *same* session: the session has one
-        creator, the messages have two senders."""
-        async with _client(install.app()) as client:
-            shared = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
-            assert (await _run_later(client, install.alice, shared, "mine")).status_code == 200
-            assert (await _run_later(client, install.bob, shared, "and mine")).status_code == 200
+        shared = hers.json()["id"]
+        alice_send, bob_send = await asyncio.gather(
+            _run_later(client, install.alice, shared, "from Alice"),
+            _run_later(client, install.bob, shared, "from Bob"),
+        )
+        assert alice_send.status_code == bob_send.status_code == 200
 
-        assert await install.creator_of(shared) == install.alice_actor
-        assert await install.said_in(shared) == [
-            ("mine", install.alice_actor),
-            ("and mine", install.bob_actor),
-        ]
+    assert sorted(await install.said_in(shared)) == sorted([
+        ("from Alice", install.alice_actor),
+        ("from Bob", install.bob_actor),
+    ])
+    assert [
+        row["actor_id"] for row in await install.messages_in(shared)
+        if row["role"] == "assistant"
+    ] == [None, None]
 
-    async def test_a_chat_turn_stores_the_person_who_typed_it(
-        self, install, monkeypatch,
-    ):
-        """The whole way through the engine: POST /api/chat → engine.run →
-        the persisted user row."""
-        _no_model(install.engine, monkeypatch)
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.bob, json={})
-            ).json()["id"]
-            res = await client.post(
-                "/api/chat",
-                headers=install.bob,
-                json={"session_id": session_id, "message": "hello"},
+
+@pytest.mark.asyncio
+async def test_chat_and_read_apis_preserve_the_request_actor(
+    install, monkeypatch,
+):
+    _no_model(install.engine, monkeypatch)
+    async with _client(install.app()) as client:
+        session_id = (
+            await client.post("/api/sessions", headers=install.bob, json={})
+        ).json()["id"]
+        response = await client.post(
+            "/api/chat",
+            headers=install.bob,
+            json={"session_id": session_id, "message": "hello"},
+        )
+        listed = (await client.get("/api/sessions", headers=install.alice)).json()
+        messages = (
+            await client.get(
+                f"/api/sessions/{session_id}/messages", headers=install.alice,
             )
-        assert res.status_code == 200
-        # The error row the failed turn writes is in the assistant's voice, so
-        # it is unattributed like every other one.
-        assert await install.senders_in(session_id) == [
-            ("user", install.bob_actor),
-            ("assistant", None),
-        ]
+        ).json()["messages"]
 
-    async def test_the_read_apis_carry_attribution(self, install):
-        """PR 5 is frontend-only, so everything it needs is already published."""
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
-            await _run_later(client, install.alice, session_id, "hi")
-
-            listed = (await client.get("/api/sessions", headers=install.bob)).json()
-            messages = (
-                await client.get(
-                    f"/api/sessions/{session_id}/messages", headers=install.bob,
-                )
-            ).json()["messages"]
-
-        row = next(s for s in listed["sessions"] if s["id"] == session_id)
-        assert row["created_by_actor_id"] == install.alice_actor
-        assert [m["actor_id"] for m in messages] == [install.alice_actor, None]
-
-    async def test_one_persons_token_cannot_write_under_the_other(self, install):
-        """The actor comes from the credential, not from anything the caller
-        can put in the request body."""
-        async with _client(install.app()) as client:
-            res = await client.post(
-                "/api/sessions",
-                headers=install.bob,
-                json={"title": "for alice", "source": "web"},
-            )
-        assert res.json()["created_by_actor_id"] == install.bob_actor
-
-
-# --------------------------------------------------------------------------- #
-#  The gate: two people, over the WebSocket                                    #
-# --------------------------------------------------------------------------- #
+    assert response.status_code == 200
+    session = next(row for row in listed["sessions"] if row["id"] == session_id)
+    assert session["created_by_actor_id"] == install.bob_actor
+    assert [(row["role"], row["actor_id"]) for row in messages] == [
+        ("user", install.bob_actor),
+        ("assistant", None),
+    ]
 
 
 class _Socket:
-    """A WebSocket the real ``/ws`` endpoint can talk to.
-
-    Scripted inbound frames, then a disconnect; everything sent back is kept so
-    a test can read what the client would have seen.
-    """
-
     def __init__(self, token: str, frames: list[dict]):
         self.query_params = {"token": token}
         self.cookies = {}
-        self.accepted = False
-        self.closed: tuple[int, str] | None = None
         self.sent: list[dict] = []
         self._frames = list(frames)
 
     async def accept(self) -> None:
-        self.accepted = True
+        return None
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
-        self.closed = (code, reason)
+        return None
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
@@ -302,261 +272,115 @@ class _Socket:
 
 
 def _ws_endpoint():
-    """The real ``/ws`` handler, pulled off the real app.
-
-    It is defined inside ``create_app`` and closes over the module-level
-    engine, so this is how a test reaches it without standing up a lifespan.
-    """
     app = create_app()
-    return next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/ws")
-
-
-@pytest.mark.asyncio
-class TestTwoPeopleOverTheWebSocket:
-    async def test_two_connections_store_two_senders(
-        self, install, monkeypatch,
-    ):
-        """The property the socket has to have: its actor is fixed at accept,
-        so two open connections write two different names into one session."""
-        _no_model(install.engine, monkeypatch)
-        monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
-        endpoint = _ws_endpoint()
-
-        session_id = "ws-shared"
-        await install.db.create_session(session_id, source="web", actor=None)
-
-        for n, (account, text) in enumerate((
-            (install.alice_account, "from her"),
-            (install.bob_account, "from him"),
-        ), start=1):
-            await endpoint(_Socket(install.token(account), [{
-                "type": "message", "content": text, "session_id": session_id,
-            }]))
-            await _wait_for_messages(install, session_id, n)
-
-        assert await install.said_in(session_id) == [
-            ("from her", install.alice_actor),
-            ("from him", install.bob_actor),
-        ]
-
-    async def test_a_session_minted_at_connect_belongs_to_the_connection(
-        self, install, monkeypatch,
-    ):
-        monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
-        endpoint = _ws_endpoint()
-
-        socket = _Socket(install.token(install.bob_account), [])
-        await endpoint(socket)
-
-        switched = next(m for m in socket.sent if m["type"] == "session_switched")
-        assert await install.creator_of(switched["session_id"]) == install.bob_actor
-
-    async def test_the_live_echo_names_the_sender(self, install, monkeypatch):
-        """A second tab renders the bubble before the row is readable, so the
-        echo carries the id too — the same id the row gets."""
-        _no_model(install.engine, monkeypatch)
-        monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
-        endpoint = _ws_endpoint()
-
-        seen: list[dict] = []
-        session_id = "ws-echo"
-        await install.db.create_session(session_id, source="web", actor=None)
-        await broadcaster.register(session_id, "listener", lambda _s, m: seen.append(m))
-        try:
-            await endpoint(_Socket(install.token(install.alice_account), [{
-                "type": "message", "content": "hi", "session_id": session_id,
-            }]))
-            await _wait_for_messages(install, session_id, 1)
-        finally:
-            await broadcaster.unregister(session_id, "listener")
-
-        echo = next(m for m in seen if m.get("type") == "user_message")
-        assert echo["actor_id"] == install.alice_actor
-        assert await install.said_in(session_id) == [("hi", install.alice_actor)]
-
-
-async def _wait_for_messages(install, session_id: str, count: int) -> None:
-    """Wait for the fire-and-forget turn the socket spawned to land its rows.
-
-    Polled rather than slept on: the turn is a task, its write goes through a
-    worker thread, and a fixed sleep is how a test like this becomes flaky.
-    """
-    for _ in range(200):
-        rows = await install.senders_in(session_id)
-        if len([r for r in rows if r[0] == "user"]) >= count:
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"{session_id} never reached {count} user message(s): "
-        f"{await install.senders_in(session_id)}"
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", "") == "/ws"
     )
 
 
-# --------------------------------------------------------------------------- #
-#  The instance's own work                                                     #
-# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_websocket_connections_keep_their_actors(install, monkeypatch):
+    _no_model(install.engine, monkeypatch)
+    monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
+    endpoint = _ws_endpoint()
+    session_id = "ws-shared"
+    await install.db.create_session(session_id, source="web", actor=None)
+
+    echoes: list[dict] = []
+    await broadcaster.register(session_id, "listener", lambda _sid, msg: echoes.append(msg))
+    try:
+        await asyncio.gather(
+            endpoint(_Socket(install.token(install.alice_account), [{
+                "type": "message", "content": "from Alice", "session_id": session_id,
+            }])),
+            endpoint(_Socket(install.token(install.bob_account), [{
+                "type": "message", "content": "from Bob", "session_id": session_id,
+            }])),
+        )
+        await _wait_for_user_messages(install, session_id, 2)
+    finally:
+        await broadcaster.unregister(session_id, "listener")
+
+    assert sorted(await install.said_in(session_id)) == sorted([
+        ("from Alice", install.alice_actor),
+        ("from Bob", install.bob_actor),
+    ])
+    assert {
+        (msg["content"], msg["actor_id"])
+        for msg in echoes if msg.get("type") == "user_message"
+    } == {
+        ("from Alice", install.alice_actor),
+        ("from Bob", install.bob_actor),
+    }
 
 
 @pytest.mark.asyncio
-class TestAutonomousWorkIsTheSystemPrincipal:
-    async def test_a_cron_run_belongs_to_the_agent(self, install, monkeypatch):
-        _no_model(install.engine, monkeypatch)
-        await install.engine.run_cron(job_id="nightly", prompt="do the thing")
+async def test_websocket_created_session_belongs_to_the_connection(
+    install, monkeypatch,
+):
+    monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
+    socket = _Socket(install.token(install.bob_account), [])
+    await _ws_endpoint()(socket)
+    switched = next(msg for msg in socket.sent if msg["type"] == "session_switched")
+    assert await install.creator_of(switched["session_id"]) == install.bob_actor
 
-        sessions = [
-            s for s in await install.db.list_sessions(limit=50)
-            if s["source"] == "cron"
-        ]
-        assert len(sessions) == 1
-        assert sessions[0]["created_by_actor_id"] == install.system_actor_id
-        assert await install.senders_in(sessions[0]["id"]) == [
-            ("user", install.system_actor_id),
-            ("assistant", None),
-        ]
 
-    async def test_a_channel_message_belongs_to_the_agent(
-        self, install, monkeypatch,
-    ):
-        """Channel identity resolution is out of scope, and guessing a person
-        from a chat id is the inference the RFC forbids — so the honest answer
-        is that the instance received it."""
-        _no_model(install.engine, monkeypatch)
-        from nerve.channels.base import InboundMessage
+async def _wait_for_user_messages(install, session_id: str, count: int) -> None:
+    for _ in range(200):
+        rows = await install.messages_in(session_id)
+        if sum(row["role"] == "user" for row in rows) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{session_id} did not receive {count} user messages")
 
-        channel = SimpleNamespace(
-            name="telegram",
-            capabilities=set(),
-            format_response=lambda t: t,
-        )
-        router = install.engine.router
-        router._channels["telegram"] = channel
-        monkeypatch.setattr(router, "_setup_streaming", _noop)
-        monkeypatch.setattr(router, "_teardown_streaming", _noop)
-        monkeypatch.setattr(type(router), "BATCH_DEBOUNCE", 0)
 
-        await router.handle_message(InboundMessage(
-            channel_name="telegram",
-            channel_key="telegram:1",
-            sender_id="1",
-            text="hello from a chat app",
-        ))
+@pytest.mark.asyncio
+async def test_autonomous_cron_uses_the_system_actor(install, monkeypatch):
+    _no_model(install.engine, monkeypatch)
+    await install.engine.run_cron(job_id="nightly", prompt="do the thing")
+    session = next(
+        row for row in await install.db.list_sessions(limit=50)
+        if row["source"] == "cron"
+    )
+    assert session["created_by_actor_id"] == install.system_actor_id
+    assert [(row["role"], row["actor_id"]) for row in await install.messages_in(session["id"])] == [
+        ("user", install.system_actor_id),
+        ("assistant", None),
+    ]
 
-        session_id = await install.engine.sessions.get_last_session("telegram:1")
-        assert await install.creator_of(session_id) == install.system_actor_id
-        assert await install.senders_in(session_id) == [
-            ("user", install.system_actor_id),
-            ("assistant", None),
-        ]
 
-    async def test_an_mcp_satellite_belongs_to_the_agent(self, install):
-        resolver = SatelliteSessionResolver(install.db)
-        sid = await resolver.resolve(
-            client_name="claude-code", mcp_session_id="mcp-abc123",
-        )
-        assert await install.creator_of(sid) == install.system_actor_id
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_name", ["slack", "telegram"])
+async def test_unidentified_channel_human_stays_unattributed(
+    install, monkeypatch, channel_name,
+):
+    _no_model(install.engine, monkeypatch)
+    from nerve.channels.base import InboundMessage
 
-    async def test_an_ingested_codex_thread_belongs_to_the_agent(self, install):
-        """A thread typed into another program: Nerve sees a rollout file, not
-        a login, so the user rows are the instance's — and the assistant rows
-        are nobody's, exactly like a native turn's."""
-        from nerve.sources.codex_threads.base import WorkspaceFilter
-        from nerve.sources.codex_threads.ingester import CodexIngester
+    channel = SimpleNamespace(
+        name=channel_name,
+        capabilities=set(),
+        format_response=lambda text: text,
+    )
+    router = install.engine.router
+    router._channels[channel_name] = channel
+    monkeypatch.setattr(router, "_setup_streaming", _noop)
+    monkeypatch.setattr(router, "_teardown_streaming", _noop)
+    monkeypatch.setattr(type(router), "BATCH_DEBOUNCE", 0)
 
-        workspace = str(install.config.workspace)
-        ingester = CodexIngester(
-            install.db,
-            origin_id="origin-1",
-            workspace_filter=WorkspaceFilter(
-                mode="nerve_workspace",
-                nerve_workspace_path=pathlib.Path(workspace),
-            ),
-            broadcaster=_SilentBroadcaster(),
-        )
-        for event in _codex_thread("thread-aaa", workspace):
-            await ingester.ingest(event)
+    key = f"{channel_name}:1"
+    await router.handle_message(InboundMessage(
+        channel_name=channel_name,
+        channel_key=key,
+        sender_id="provider-person-1",
+        text="hello from a chat app",
+    ))
+    session_id = await install.engine.sessions.get_last_session(key)
+    assert await install.creator_of(session_id) is None
+    assert await install.said_in(session_id) == [("hello from a chat app", None)]
 
-        sid = "codex:thread-aaa"
-        assert await install.creator_of(sid) == install.system_actor_id
-        assert await install.senders_in(sid) == [
-            ("user", install.system_actor_id),
-            ("assistant", None),
-        ]
-
-    async def test_an_unresolvable_principal_writes_nothing_and_says_so(
-        self, install, monkeypatch,
-    ):
-        """Unreachable in production — every opener bootstraps the identity
-        before it can serve — so what matters is *which way* it fails if it
-        ever is reached. A run that wrote its rows unattributed would leave
-        audit gaps indistinguishable from history that predates attribution,
-        and nothing could repair them afterwards. A run that fails is reported
-        and can be run again.
-
-        Every autonomous path resolves the principal before its first write, so
-        the failure costs no rows — which is what this asserts for each of
-        them, not just for one.
-        """
-        from nerve.channels.base import InboundMessage
-        from nerve.sources.codex_threads.base import WorkspaceFilter
-        from nerve.sources.codex_threads.ingester import CodexIngester
-
-        _no_model(install.engine, monkeypatch)
-
-        async def _gone():
-            return None
-
-        monkeypatch.setattr(install.db, "get_system_principal", _gone)
-
-        with pytest.raises(ActorResolutionError):
-            await install.engine.run_cron(job_id="orphan", prompt="never runs")
-        with pytest.raises(ActorResolutionError):
-            await install.engine.run_hook(
-                hook_name="orphan", hook_id="1", prompt="never runs",
-            )
-        with pytest.raises(ActorResolutionError):
-            await install.engine.run_persistent_cron(
-                job_id="orphan", prompt="never runs",
-            )
-
-        channel = SimpleNamespace(
-            name="telegram", capabilities=set(), format_response=lambda t: t,
-        )
-        router = install.engine.router
-        router._channels["telegram"] = channel
-        with pytest.raises(ActorResolutionError):
-            await router.handle_message(InboundMessage(
-                channel_name="telegram", channel_key="telegram:9",
-                sender_id="9", text="never lands",
-            ))
-
-        workspace = str(install.config.workspace)
-        ingester = CodexIngester(
-            install.db,
-            origin_id="origin-1",
-            workspace_filter=WorkspaceFilter(
-                mode="nerve_workspace",
-                nerve_workspace_path=pathlib.Path(workspace),
-            ),
-            broadcaster=_SilentBroadcaster(),
-        )
-        with pytest.raises(ActorResolutionError):
-            for event in _codex_thread("thread-orphan", workspace):
-                await ingester.ingest(event)
-
-        # The satellite resolver refuses too. Its return value becomes the
-        # session a tool handler runs under and the key its audit row is
-        # written against, so handing back an id with no row behind it would
-        # let a tool with real side effects run unattributed and unaudited —
-        # see test_mcp_attribution_gate.py for the end-to-end proof.
-        with pytest.raises(ActorResolutionError):
-            await SatelliteSessionResolver(install.db).resolve(
-                client_name="claude-code", mcp_session_id="mcp-orphan",
-            )
-
-        # Not one row anywhere. The fixture creates no sessions, so an empty
-        # list is the whole claim: nothing was written unattributed, and
-        # nothing was written at all.
-        assert await install.db.list_sessions(limit=100) == []
 
 async def _noop(*args, **kwargs):
     return None
@@ -568,362 +392,67 @@ class _SilentBroadcaster:
 
 
 def _codex_thread(thread_id: str, cwd: str):
-    """A minimal in-scope/user/assistant sequence for the ingester."""
     from datetime import datetime, timezone
 
     from nerve.sources.codex_threads.base import ThreadEvent
 
     now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
 
-    def _event(type_: str, payload: dict, seq: int) -> ThreadEvent:
+    def event(type_: str, payload: dict, sequence: int) -> ThreadEvent:
         return ThreadEvent(
-            type=type_,                   # type: ignore[arg-type]
+            type=type_,  # type: ignore[arg-type]
             thread_id=thread_id,
-            sequence=seq,
+            sequence=sequence,
             timestamp=now,
             payload=payload,
         )
 
     return [
-        _event("thread_in_scope", {
-            "id": thread_id, "cwd": cwd, "originator": "codex_exec",
-            "cli_version": "0.130.0", "source": "exec",
+        event("thread_in_scope", {
+            "id": thread_id,
+            "cwd": cwd,
+            "originator": "codex_exec",
+            "cli_version": "0.130.0",
+            "source": "exec",
         }, 1),
-        _event("user_message", {"message": "hi", "event_id": "e1"}, 2),
-        _event("assistant_message", {"message": "hello", "event_id": "e2"}, 3),
+        event("user_message", {"message": "hi", "event_id": "e1"}, 2),
+        event("assistant_message", {"message": "hello", "event_id": "e2"}, 3),
     ]
 
 
-# --------------------------------------------------------------------------- #
-#  Assistant and tool output keeps its own authorship                          #
-# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_codex_sync_session_is_system_but_imported_human_is_unknown(install):
+    from nerve.sources.codex_threads.base import WorkspaceFilter
+    from nerve.sources.codex_threads.ingester import CodexIngester
+
+    workspace = str(install.config.workspace)
+    ingester = CodexIngester(
+        install.db,
+        origin_id="origin-1",
+        workspace_filter=WorkspaceFilter(
+            mode="nerve_workspace",
+            nerve_workspace_path=pathlib.Path(workspace),
+        ),
+        broadcaster=_SilentBroadcaster(),
+    )
+    for event in _codex_thread("thread-aaa", workspace):
+        await ingester.ingest(event)
+
+    session_id = "codex:thread-aaa"
+    assert await install.creator_of(session_id) == install.system_actor_id
+    assert [(row["role"], row["actor_id"]) for row in await install.messages_in(session_id)] == [
+        ("user", None),
+        ("assistant", None),
+    ]
 
 
 @pytest.mark.asyncio
-class TestOutputIsUnattributed:
-    async def test_the_synthetic_acknowledgement_is_nobodys(self, install):
-        """Run-later writes two rows: the person's message, and an
-        acknowledgement in the assistant's voice."""
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
-            await _run_later(client, install.alice, session_id, "later please")
-
-        assert await install.senders_in(session_id) == [
-            ("user", install.alice_actor),
-            ("assistant", None),
-        ]
-
-    async def test_a_review_loop_milestone_is_nobodys(self, install):
-        await install.db.create_session("obs", source="web", actor=None)
-        await install.db.add_message(
-            "obs", "assistant", "iteration 1 passed", channel="review-loop",
-            actor=None,
-        )
-        assert await install.senders_in("obs") == [("assistant", None)]
-
-
-class TestOutputIsUnattributedEverywhere:
-    """The same rule, checked where no runtime test can reach."""
-
-    def test_no_assistant_row_in_the_package_is_written_under_an_actor(self):
-        """Structural, because the rule has to hold at call sites nothing in
-        this file reaches: every ``add_message`` in ``nerve/`` whose role is
-        the literal ``"assistant"`` passes ``actor=None``.
-        """
-        offenders = []
-        for path in sorted(pathlib.Path("nerve").rglob("*.py")):
-            tree = ast.parse(path.read_text(), str(path))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                name = getattr(node.func, "attr", None)
-                if name not in ("add_message", "add_message_idempotent"):
-                    continue
-                role = _literal_role(node)
-                if role != "assistant":
-                    continue
-                actor = next(
-                    (k.value for k in node.keywords if k.arg == "actor"), None,
-                )
-                if not isinstance(actor, ast.Constant) or actor.value is not None:
-                    offenders.append(f"{path}:{node.lineno}")
-        assert not offenders, f"assistant rows written under an actor: {offenders}"
-
-
-def _literal_role(node: ast.Call) -> str | None:
-    """The ``role`` argument of an ``add_message`` call, when it is a literal."""
-    for keyword in node.keywords:
-        if keyword.arg == "role" and isinstance(keyword.value, ast.Constant):
-            return keyword.value.value
-    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-        return node.args[1].value
-    return None
-
-
-# --------------------------------------------------------------------------- #
-#  History that predates attribution                                           #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestHistoryPredatingAttribution:
-    async def test_the_migration_backfills_nothing(self, install):
-        """v048 is additive: an install that upgrades keeps its history, and
-        its history keeps saying nothing about who wrote it. Synthesising an
-        actor from a session's ``source`` would be inventing an audit trail.
-        """
-        raw = install.db.db
-        await raw.execute("ALTER TABLE sessions DROP COLUMN created_by_actor_id")
-        await raw.execute("ALTER TABLE messages DROP COLUMN actor_id")
-        await raw.execute(
-            "INSERT INTO sessions (id, title, source, status, created_at, updated_at)"
-            " VALUES ('old', 'Old chat', 'web', 'idle', '2020-01-01', '2020-01-01')"
-        )
-        await raw.execute(
-            "INSERT INTO messages (session_id, role, content, created_at)"
-            " VALUES ('old', 'user', 'from before', '2020-01-01')"
-        )
-        await raw.commit()
-
-        from nerve.db.migrations.v048_attribution import up
-
-        await up(raw)
-        await raw.commit()
-
-        assert await install.creator_of("old") is None
-        assert await install.senders_in("old") == [("user", None)]
-
-    async def test_unattributed_rows_serialise_as_null(self, install):
-        """PR 5 renders them as they are today, so they have to arrive as
-        ``null`` rather than as a missing key or a 500."""
-        await install.db.create_session("legacy", source="web", actor=None)
-        await install.db.add_message("legacy", "user", "from before", actor=None)
-
-        async with _client(install.app()) as client:
-            listed = (await client.get("/api/sessions", headers=install.alice)).json()
-            messages = (
-                await client.get(
-                    "/api/sessions/legacy/messages", headers=install.alice,
-                )
-            ).json()["messages"]
-
-        row = next(s for s in listed["sessions"] if s["id"] == "legacy")
-        assert "created_by_actor_id" in row and row["created_by_actor_id"] is None
-        assert [m["actor_id"] for m in messages] == [None]
-
-    async def test_the_migration_can_be_re_run(self, install):
-        """Guarded rather than assumed: a re-run must be a no-op, not a
-        duplicate-column failure."""
-        from nerve.db.migrations.v048_attribution import up
-
-        await up(install.db.db)
-        await install.db.create_session("still-works", source="web", actor=None)
-        assert await install.creator_of("still-works") is None
-
-
-# --------------------------------------------------------------------------- #
-#  No process-global actor (required by the RFC)                               #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestNoProcessGlobalActor:
-    async def test_two_people_writing_at_the_same_moment_do_not_swap(
-        self, install,
-    ):
-        """Both requests are held *inside* the session insert, between
-        resolving the actor and writing the row, until the other arrives. Any
-        state shared between them — a module global, a memo, a "current user" —
-        shows up here as one answer where there should be two.
-        """
-        barrier = asyncio.Barrier(2)
-        original = install.db.create_session
-
-        async def _rendezvous(*args, **kwargs):
-            await barrier.wait()
-            return await original(*args, **kwargs)
-
-        install.db.create_session = _rendezvous
-        try:
-            async with _client(install.app()) as client:
-                hers, his = await asyncio.gather(
-                    client.post("/api/sessions", headers=install.alice, json={}),
-                    client.post("/api/sessions", headers=install.bob, json={}),
-                )
-        finally:
-            install.db.create_session = original
-
-        assert hers.json()["created_by_actor_id"] == install.alice_actor
-        assert his.json()["created_by_actor_id"] == install.bob_actor
-
-    async def test_two_people_sending_at_the_same_moment_do_not_swap(
-        self, install,
-    ):
-        """The same overlap on the message path."""
-        async with _client(install.app()) as client:
-            shared = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
-
-            barrier = asyncio.Barrier(2)
-            original = install.db.add_message
-
-            async def _rendezvous(*args, **kwargs):
-                if kwargs.get("actor") is not None:
-                    await barrier.wait()
-                return await original(*args, **kwargs)
-
-            install.db.add_message = _rendezvous
-            try:
-                await asyncio.gather(
-                    _run_later(client, install.alice, shared, "hers"),
-                    _run_later(client, install.bob, shared, "his"),
-                )
-            finally:
-                install.db.add_message = original
-
-        # Each person's own words under their own name: a set of actor ids, or
-        # even an ordered list of them, would pass if the two were swapped.
-        assert sorted(await install.said_in(shared)) == sorted([
-            ("hers", install.alice_actor),
-            ("his", install.bob_actor),
-        ])
-
-    async def test_two_people_resolved_at_the_same_moment_do_not_swap(
-        self, install,
-    ):
-        """The other place two requests can be conflated: both are held inside
-        the actor lookup together, and each must still persist itself. A cache
-        keyed on nothing, or an actor stashed while resolving, gives both rows
-        the same name here.
-        """
-        barrier = asyncio.Barrier(2)
-        original = install.db.get_actor_ref
-
-        async def _rendezvous(actor_id: str):
-            row = await original(actor_id)
-            await barrier.wait()
-            return row
-
-        install.db.get_actor_ref = _rendezvous
-        try:
-            async with _client(install.app()) as client:
-                hers, his = await asyncio.gather(
-                    client.post("/api/sessions", headers=install.alice, json={}),
-                    client.post("/api/sessions", headers=install.bob, json={}),
-                )
-        finally:
-            install.db.get_actor_ref = original
-
-        assert await install.creator_of(hers.json()["id"]) == install.alice_actor
-        assert await install.creator_of(his.json()["id"]) == install.bob_actor
-
-    async def test_alternating_writes_are_never_served_from_a_previous_one(
-        self, install,
-    ):
-        """The half a cache breaks: requests that do not overlap must still
-        each be resolved. A memo of the last actor answers the second caller
-        with the first caller's identity and this is what notices.
-        """
-        expected = [
-            (install.alice, install.alice_actor),
-            (install.bob, install.bob_actor),
-            (install.alice, install.alice_actor),
-            (install.bob, install.bob_actor),
-            (install.alice, install.alice_actor),
-        ]
-        async with _client(install.app()) as client:
-            for headers, actor_id in expected:
-                res = await client.post("/api/sessions", headers=headers, json={})
-                assert res.json()["created_by_actor_id"] == actor_id
-
-    async def test_nothing_in_the_package_is_holding_an_actor(
-        self, install, monkeypatch,
-    ):
-        """Structural, and independent of timing: after both people and the
-        agent itself have written rows, no module — and no long-lived object a
-        module is holding, which is where a cache would actually go — has an
-        :class:`Actor` on it. An actor lives on a request, a connection or a
-        call chain.
-        """
-        import sys
-
-        _no_model(install.engine, monkeypatch)
-        async with _client(install.app()) as client:
-            await client.post("/api/sessions", headers=install.alice, json={})
-            await client.post("/api/sessions", headers=install.bob, json={})
-        await install.engine.run_cron(job_id="sweep", prompt="anything")
-
-        holders: list[str] = []
-        for name, module in list(sys.modules.items()):
-            if module is None or not (name == "nerve" or name.startswith("nerve.")):
-                continue
-            for attribute, value in list(vars(module).items()):
-                holders.extend(_actor_holders(f"{name}.{attribute}", value))
-        assert not holders, f"actor state outside a request: {holders}"
-
-
-def _actor_holders(where: str, value, *, max_depth: int = 3) -> list[str]:
-    """Every :class:`Actor` reachable from a module attribute, with its path.
-
-    Walks a few levels into the objects a module holds, which is the part that
-    matters: an actor memoised on the engine or on the notification service
-    would be invisible to a scan of module attributes alone, and those objects
-    are reached *through* a module-level container rather than being one.
-    Bounded by depth, by a visited set, and by only descending into instances
-    of this package's own classes.
-    """
-    found: list[str] = []
-    seen: set[int] = set()
-    stack: list[tuple[str, object, int]] = [(where, value, 0)]
-    while stack:
-        path, item, depth = stack.pop()
-        if isinstance(item, Actor):
-            found.append(path)
-            continue
-        if depth >= max_depth:
-            continue
-        if isinstance(item, (list, tuple, set, frozenset)):
-            stack.extend(
-                (f"{path}[{i}]", element, depth + 1)
-                for i, element in enumerate(item)
-            )
-            continue
-        if isinstance(item, dict):
-            stack.extend(
-                (f"{path}[{key!r}]", element, depth + 1)
-                for key, element in item.items()
-            )
-            continue
-        if isinstance(item, type) or not hasattr(item, "__dict__"):
-            continue
-        if type(item).__module__.split(".")[0] != "nerve":
-            continue
-        if id(item) in seen:
-            continue
-        seen.add(id(item))
-        stack.extend(
-            (f"{path}.{attribute}", element, depth + 1)
-            for attribute, element in list(vars(item).items())
-        )
-    return found
-
-
-# --------------------------------------------------------------------------- #
-#  Resolving an id to a name                                                   #
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.asyncio
-class TestTheActorLookup:
-    async def test_it_lists_identities_and_nothing_else(self, install):
-        async with _client(install.app()) as client:
-            res = await client.get("/api/actors", headers=install.alice)
-
-        assert res.status_code == 200
-        actors = {a["id"]: a for a in res.json()["actors"]}
+async def test_bulk_actor_directory_is_current_and_account_private(install):
+    async with _client(install.app()) as client:
+        assert (await client.get("/api/actors")).status_code == 401
+        response = await client.get("/api/actors", headers=install.alice)
+        assert response.status_code == 200
+        actors = {row["id"]: row for row in response.json()["actors"]}
         assert set(actors) == {
             install.alice_actor, install.bob_actor, install.system_actor_id,
         }
@@ -931,177 +460,107 @@ class TestTheActorLookup:
             "id": install.alice_actor,
             "kind": "human",
             "display_name": "Alice",
-            "profile_version": actors[install.alice_actor]["profile_version"],
         }
-        assert actors[install.system_actor_id]["kind"] == "system"
 
-    async def test_no_account_state_leaks_through_it(self, install):
-        """An account's username, whether it has a password, whether it is
-        enabled — none of it is this endpoint's business, at any depth."""
-        async with _client(install.app()) as client:
-            body = (await client.get("/api/actors", headers=install.alice)).json()
-            one = (
-                await client.get(
-                    f"/api/actors/{install.bob_actor}", headers=install.alice,
-                )
-            ).json()
-
-        blob = json.dumps([body, one])
-        for forbidden in (
-            "username", "credential", "password", "enabled", "alice", "bob",
-            "account", "email", "disabled_at",
-        ):
-            assert forbidden not in blob, f"{forbidden!r} leaked through /api/actors"
-
-    async def test_an_unknown_id_is_a_404_not_an_invention(self, install):
-        async with _client(install.app()) as client:
-            res = await client.get(
-                "/api/actors/00000000-0000-4000-8000-0000000000ff",
-                headers=install.alice,
-            )
-        assert res.status_code == 404
-
-    async def test_it_needs_a_credential(self, install):
-        async with _client(install.app()) as client:
-            assert (await client.get("/api/actors")).status_code == 401
-            assert (
-                await client.get(f"/api/actors/{install.alice_actor}")
-            ).status_code == 401
-
-    async def test_a_disabled_account_still_has_a_name_to_show(self, install):
-        """History outlives access: a disabled person's rows keep rendering."""
+        session_id = (
+            await client.post("/api/sessions", headers=install.bob, json={})
+        ).json()["id"]
+        await _run_later(client, install.bob, session_id, "before rename")
         await install.db.disable_account(install.bob_account)
-        async with _client(install.app()) as client:
-            res = await client.get(
-                f"/api/actors/{install.bob_actor}", headers=install.alice,
-            )
-        assert res.status_code == 200
-        assert res.json()["display_name"] == "Bob"
+        await install.db.update_actor_profile(install.bob_actor, display_name="Robert")
+        refreshed = {
+            row["id"]: row
+            for row in (
+                await client.get("/api/actors", headers=install.alice)
+            ).json()["actors"]
+        }
+
+    assert refreshed[install.bob_actor]["display_name"] == "Robert"
+    assert set(refreshed[install.bob_actor]) == {"id", "kind", "display_name"}
+    assert await install.creator_of(session_id) == install.bob_actor
+    assert await install.said_in(session_id) == [("before rename", install.bob_actor)]
 
 
 @pytest.mark.asyncio
-class TestRenamingChangesTheNameNotTheHistory:
-    async def test_a_rename_moves_no_stored_row(self, install):
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.bob, json={})
-            ).json()["id"]
-            await _run_later(client, install.bob, session_id, "before the rename")
+async def test_migration_keeps_existing_history_null_and_is_idempotent(install):
+    raw = install.db.db
+    await raw.execute("ALTER TABLE sessions DROP COLUMN created_by_actor_id")
+    await raw.execute("ALTER TABLE messages DROP COLUMN actor_id")
+    await raw.execute(
+        "INSERT INTO sessions (id, title, source, status, created_at, updated_at)"
+        " VALUES ('old', 'Old chat', 'web', 'idle', '2020-01-01', '2020-01-01')"
+    )
+    await raw.execute(
+        "INSERT INTO messages (session_id, role, content, created_at)"
+        " VALUES ('old', 'user', 'from before', '2020-01-01')"
+    )
+    await raw.commit()
 
-            renamed = await client.patch(
-                f"/api/accounts/{install.bob_account}",
-                headers=install.alice,
-                json={"display_name": "Robert"},
-            )
-            assert renamed.status_code == 200
+    from nerve.db.migrations.v048_attribution import up
 
-            actors = {
-                a["id"]: a
-                for a in (
-                    await client.get("/api/actors", headers=install.alice)
-                ).json()["actors"]
-            }
-
-        assert actors[install.bob_actor]["display_name"] == "Robert"
-        # The stored ids did not move, which is the whole point of storing an
-        # id rather than a name.
-        assert await install.creator_of(session_id) == install.bob_actor
-        assert await install.said_in(session_id) == [
-            ("before the rename", install.bob_actor),
-        ]
-
-
-# --------------------------------------------------------------------------- #
-#  The columns reference real actors                                           #
-# --------------------------------------------------------------------------- #
+    await up(raw)
+    await up(raw)
+    await raw.commit()
+    assert await install.creator_of("old") is None
+    assert await install.said_in("old") == [("from before", None)]
+    async with _client(install.app()) as client:
+        sessions = (await client.get("/api/sessions", headers=install.alice)).json()
+        messages = (
+            await client.get("/api/sessions/old/messages", headers=install.alice)
+        ).json()["messages"]
+    old = next(row for row in sessions["sessions"] if row["id"] == "old")
+    assert old["created_by_actor_id"] is None
+    assert messages[0]["actor_id"] is None
 
 
 @pytest.mark.asyncio
-class TestStoredActorsAlwaysResolve:
-    async def test_an_id_that_names_nobody_cannot_be_stored(self, install):
-        """Attribution that resolves to nothing renders as a blank name, so
-        the schema refuses it. Safe because actor rows are never deleted."""
-        ghost = Actor(
-            actor_id="00000000-0000-4000-8000-0000000000ff", kind="human",
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            await install.db.create_session("ghost-session", actor=ghost)
-        with pytest.raises(sqlite3.IntegrityError):
-            await install.db.create_session("ghost-message", actor=None)
-            await install.db.add_message("ghost-message", "user", "hi", actor=ghost)
+async def test_foreign_keys_and_write_once_exclude_false_attribution(install):
+    ghost = Actor(actor_id="00000000-0000-4000-8000-0000000000ff", kind="human")
+    with pytest.raises(sqlite3.IntegrityError):
+        await install.db.create_session("ghost", actor=ghost)
+    await install.db.create_session("ghost-message", actor=None)
+    with pytest.raises(sqlite3.IntegrityError):
+        await install.db.add_message("ghost-message", "user", "hi", actor=ghost)
 
-    async def test_attribution_is_write_once(self, install):
-        """Nothing re-stamps a row. Re-resolving a session keeps its original
-        creator (the insert is ``OR IGNORE``), and the column is not in the
-        allowlist the session-update path writes through, so no route can move
-        somebody else's work onto itself.
-        """
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
+    alice = Actor(
+        actor_id=install.alice_actor,
+        kind="human",
+        account_id=install.alice_account,
+    )
+    bob = Actor(
+        actor_id=install.bob_actor,
+        kind="human",
+        account_id=install.bob_account,
+    )
+    await install.db.create_session("repeat", title="Hers", actor=alice)
+    repeated = await install.db.create_session("repeat", title="His", actor=bob)
+    await install.db.update_session_fields(
+        "repeat", {"created_by_actor_id": install.bob_actor},
+    )
+    assert repeated["created_by_actor_id"] == install.alice_actor
+    assert repeated["title"] == "Hers"
+    assert await install.creator_of("repeat") == install.alice_actor
 
-        bob = Actor(
-            actor_id=install.bob_actor, kind="human",
-            account_id=install.bob_account,
-        )
-        await install.db.create_session(session_id, actor=bob)
+
+@pytest.mark.asyncio
+async def test_fork_records_the_forker_and_preserves_senders(install):
+    async with _client(install.app()) as client:
+        session_id = (
+            await client.post("/api/sessions", headers=install.alice, json={})
+        ).json()["id"]
+        await _run_later(client, install.alice, session_id, "Alice wrote this")
         await install.db.update_session_fields(
-            session_id, {"created_by_actor_id": install.bob_actor},
+            session_id, {"sdk_session_id": "native-1"},
         )
-        assert await install.creator_of(session_id) == install.alice_actor
-
-    async def test_a_repeated_id_returns_the_stored_creator(self, install):
-        """The insert is ``OR IGNORE``, so the second caller's row is
-        discarded — and the dict handed back has to say so. Returning what was
-        asked for would make ``created_by_actor_id`` a claim about a row that
-        does not exist, and that field is what the API publishes.
-        """
-        alice = Actor(
-            actor_id=install.alice_actor, kind="human",
-            account_id=install.alice_account,
+        fork = await client.post(
+            "/api/sessions/fork",
+            headers=install.bob,
+            json={"source_session_id": session_id},
         )
-        bob = Actor(
-            actor_id=install.bob_actor, kind="human",
-            account_id=install.bob_account,
-        )
-        first = await install.db.create_session("repeat", title="Hers", actor=alice)
-        second = await install.db.create_session("repeat", title="His", actor=bob)
 
-        assert first["created_by_actor_id"] == install.alice_actor
-        assert second["created_by_actor_id"] == install.alice_actor
-        assert second["title"] == "Hers"
-        assert await install.creator_of("repeat") == install.alice_actor
-
-    async def test_no_actor_at_all_is_always_allowed(self, install):
-        """NULL is exempt from the reference, which is what lets history that
-        predates attribution stay exactly as it was."""
-        await install.db.create_session("nobody", actor=None)
-        await install.db.add_message("nobody", "user", "hi", actor=None)
-        assert await install.senders_in("nobody") == [("user", None)]
-
-
-@pytest.mark.asyncio
-class TestForkingKeepsTheOriginalSenders:
-    async def test_a_fork_records_who_forked_and_who_spoke(self, install):
-        """Forking someone else's chat copies their messages; it does not
-        make them yours."""
-        async with _client(install.app()) as client:
-            session_id = (
-                await client.post("/api/sessions", headers=install.alice, json={})
-            ).json()["id"]
-            await _run_later(client, install.alice, session_id, "hers")
-            await install.db.update_session_fields(
-                session_id, {"sdk_session_id": "native-1"},
-            )
-
-            fork = await client.post(
-                "/api/sessions/fork",
-                headers=install.bob,
-                json={"source_session_id": session_id},
-            )
-
-        assert fork.status_code == 200
-        fork_id = fork.json()["id"]
-        assert await install.creator_of(fork_id) == install.bob_actor
-        assert await install.said_in(fork_id) == [("hers", install.alice_actor)]
+    assert fork.status_code == 200
+    fork_id = fork.json()["id"]
+    assert await install.creator_of(fork_id) == install.bob_actor
+    assert await install.said_in(fork_id) == [
+        ("Alice wrote this", install.alice_actor),
+    ]

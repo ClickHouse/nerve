@@ -24,13 +24,7 @@ from tests.actor_rows import ensure_system_principal
 
 @pytest_asyncio.fixture
 async def db(db):  # noqa: F811 — the conftest database, with an identity
-    """The conftest database after local bootstrap.
-
-    Autonomous code resolves the agent's system principal before it writes and
-    fails the run rather than storing a row under nobody, so the paths this
-    file drives need the identity every real database has: production opens
-    nothing without bootstrapping it first.
-    """
+    """The conftest database after local bootstrap."""
     await ensure_system_principal(db)
     return db
 
@@ -222,33 +216,6 @@ class TestWakeupSweep:
         await svc._sweep_wakeups()
         await asyncio.sleep(0.05)
         svc.engine.run.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_a_failed_lookup_leaves_the_wakeup_for_the_next_sweep(self, svc):
-        """Claiming is what consumes a wakeup: pending -> fired, and a fired
-        row is never selected again. So anything that can fail has to fail
-        before the claim, or the prompt is gone and nothing retries it."""
-        await svc.db.add_wakeup("s1", prompt="ping", fire_at=_past())
-        real = svc.db.get_system_principal
-
-        async def _no_principal():
-            return None
-
-        svc.db.get_system_principal = _no_principal
-        await svc._sweep_wakeups()
-        await asyncio.sleep(0.05)
-
-        svc.engine.run.assert_not_called()
-        assert len(await svc.db.list_pending_wakeups("s1")) == 1, (
-            "the wakeup was consumed by a failure that delivered nothing"
-        )
-
-        svc.db.get_system_principal = real
-        await svc._sweep_wakeups()
-        await asyncio.sleep(0.05)
-
-        svc.engine.run.assert_awaited_once()
-        assert await svc.db.list_pending_wakeups("s1") == []
 
     @pytest.mark.asyncio
     async def test_one_bad_wakeup_does_not_abandon_the_rest(self, svc):

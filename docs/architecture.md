@@ -223,8 +223,8 @@ To add a new migration: create `nerve/db/migrations/v017_your_feature.py` with a
 ### Schema
 
 SQLite with WAL mode (schema version 16):
-- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist (NULL on rows that predate attribution)
-- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL for assistant and tool output, whose authorship is `role`, and for history recorded before attribution existed. Nothing is backfilled — see [Accounts and identity](accounts.md)
+- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
+- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
 - `session_events` — Append-only lifecycle audit log (created, started, idle, stopped, archived, error)
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
