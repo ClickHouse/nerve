@@ -124,6 +124,33 @@ let sessionEstablished = false;
  */
 let statusGeneration = 0;
 
+/**
+ * Which authentication session the app is in.
+ *
+ * Every sign-in and every startup check decides an outcome across several
+ * awaits, and the decision is committed at the end. If the session it was
+ * deciding for has ended by then, the commit has to be dropped rather than
+ * applied: the overlay's log-out button stays live while an unlock is in
+ * flight, so "sign in, then sign out" can otherwise finish by signing you back
+ * in — after the sign-out already purged the drafts and read state that made
+ * staying signed in worth anything.
+ *
+ * This never changes *what* is decided, only whether a decision that has been
+ * superseded is allowed to land. The confirmed-match rule below is untouched.
+ */
+let authGeneration = 0;
+
+/** Start a new authentication session, abandoning whatever the last one was
+ *  still deciding. */
+function beginAuthSession(): number {
+  return ++authGeneration;
+}
+
+/** Whether `generation` is still the session the app is in. */
+function isCurrentAuthSession(generation: number): boolean {
+  return generation === authGeneration;
+}
+
 function identityOf(account: Account): SignedInAccount {
   return { id: account.id, username: account.username, actor_id: account.actor_id };
 }
@@ -147,6 +174,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   account: null,
 
   login: async (password: string, username?: string) => {
+    const generation = beginAuthSession();
     const previous = get().account;
     const wasExpired = get().sessionExpired;
     set({ loading: true, error: null });
@@ -162,6 +190,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     }
     setToken(token);
     const identity = await loadIdentity();
+    // Signed out while this was in flight. The token is discarded rather than
+    // installed, so the attempt leaves nothing behind.
+    if (!isCurrentAuthSession(generation)) {
+      clearToken();
+      return;
+    }
 
     if (wasExpired) {
       // Unlocking a *mounted* application — one still holding the previous
@@ -203,6 +237,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
+    // Whatever a sign-in or a startup check was still deciding is about a
+    // session that no longer exists; it must not be allowed to commit.
+    beginAuthSession();
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
     // browser. Only on a *deliberate* logout — an expired session must never
@@ -223,6 +260,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   checkAuth: async () => {
+    const authSession = beginAuthSession();
     const token = getToken();
     const generation = ++statusGeneration;
     // Both at once. Nothing renders until both have answered — that is what
@@ -237,6 +275,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
     applyStatus(generation, status);
+
+    if (!isCurrentAuthSession(authSession)) return;
 
     if (token && identityOutcome.status === 'fulfilled' && identityOutcome.value) {
       sessionEstablished = true;
@@ -263,10 +303,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       try {
         const { token: fresh } = await api.login('');
         setToken(fresh);
+        // The identity read needs the token, so it has to follow it; the guard
+        // then has a token to discard if this session ended meanwhile.
+        const identity = await loadIdentity();
+        if (!isCurrentAuthSession(authSession)) {
+          clearToken();
+          return;
+        }
         sessionEstablished = true;
         set({
           authenticated: true, ready: true, sessionExpired: false,
-          account: await loadIdentity(),
+          account: identity,
         });
         return;
       } catch {

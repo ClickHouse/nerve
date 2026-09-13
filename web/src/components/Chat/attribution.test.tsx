@@ -48,7 +48,7 @@ vi.mock('../../api/client', () => ({
       setup_pending: false, multiple_accounts: true,
     })),
     checkAuth: vi.fn(async () => ({ authenticated: true })),
-    login: vi.fn(),
+    login: vi.fn(async () => ({ token: 'tok' })),
   },
   getToken: vi.fn(() => 'tok'),
   setToken: vi.fn(),
@@ -67,7 +67,8 @@ vi.mock('../../api/websocket', () => ({
   ws: { sendMessage: vi.fn(() => 'sent'), switchSession: vi.fn(), send: vi.fn(), connect: vi.fn() },
 }));
 
-const { api } = await import('../../api/client');
+const client = await import('../../api/client');
+const { api } = client;
 const { useActorStore } = await import('../../stores/actorStore');
 const { useAuthStore, selfActorId } = await import('../../stores/authStore');
 const { useChatStore } = await import('../../stores/chatStore');
@@ -75,6 +76,13 @@ const { handleUserMessage } = await import('../../stores/handlers/sessionHandler
 const { MessageList } = await import('./MessageList');
 
 const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
+
+/** A response this test decides when to deliver. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let release!: (value: T) => void;
+  const promise = new Promise<T>((r) => { release = r; });
+  return { promise, resolve: release };
+}
 
 const ALICE = 'actor-alice';
 const BOB = 'actor-bob';
@@ -428,6 +436,110 @@ describe('the signed-in actor', () => {
 
     await act(async () => { await useAuthStore.getState().checkAuth(); });
 
+    expect(selfActorId()).toBeNull();
+  });
+});
+
+/**
+ * An identity read is a request whose answer can outlive its question.
+ *
+ * The failure is not a missing label, which is merely disappointing — it is
+ * Bob's message carrying Alice's actor and being shown to everyone else as
+ * hers, a false statement written into the column this branch exists to make
+ * trustworthy.
+ *
+ * Most of the guarantee comes from the auth store's own shape: identity is
+ * read *before* a session is announced as authenticated, and committed in the
+ * same update, so there is no window in which the app is usable and who you are
+ * is unknown. What these cover is the remaining edge — a decision that is still
+ * being made when the session it belongs to ends.
+ */
+describe('identity across an auth boundary', () => {
+  const getOwnAccount = () => api.getOwnAccount as unknown as ReturnType<typeof vi.fn>;
+  const login = () => api.login as unknown as ReturnType<typeof vi.fn>;
+  const accountFor = (actorId: string, id = 'acc') => ({
+    id, actor_id: actorId, username: 'somebody', display_name: null,
+    enabled: true, has_password: true, created_at: 't', updated_at: 't',
+    disabled_at: null, is_self: true,
+  });
+
+  it('does not sign you back in when a sign-in lands after a sign-out', async () => {
+    // The overlay's log-out button stays live while an unlock is in flight, so
+    // this ordering is a thing a person can actually do.
+    const slowIdentity = deferred<ReturnType<typeof accountFor>>();
+    getOwnAccount().mockReturnValueOnce(slowIdentity.promise);
+
+    let signIn!: Promise<void>;
+    act(() => { signIn = useAuthStore.getState().login('pw', 'alice'); });
+    act(() => useAuthStore.getState().logout());
+
+    await act(async () => {
+      slowIdentity.resolve(accountFor(ALICE));
+      await signIn;
+    });
+
+    expect(useAuthStore.getState().authenticated).toBe(false);
+    expect(selfActorId()).toBeNull();
+  });
+
+  it('does not restore a session that a sign-out ended mid-startup', async () => {
+    const slowIdentity = deferred<ReturnType<typeof accountFor>>();
+    getOwnAccount().mockReturnValueOnce(slowIdentity.promise);
+
+    let startup!: Promise<void>;
+    act(() => { startup = useAuthStore.getState().checkAuth(); });
+    act(() => useAuthStore.getState().logout());
+
+    await act(async () => {
+      slowIdentity.resolve(accountFor(ALICE));
+      await startup;
+    });
+
+    expect(selfActorId()).toBeNull();
+  });
+
+  it('knows who you are before it lets the app be used', async () => {
+    // The window round 2 was worried about — sending before identity is known —
+    // cannot open: `login` resolves identity first and commits both together.
+    getOwnAccount().mockResolvedValue(accountFor(ALICE));
+
+    await act(async () => { await useAuthStore.getState().login('pw', 'alice'); });
+
+    expect(useAuthStore.getState().authenticated).toBe(true);
+    expect(selfActorId()).toBe(ALICE);
+
+    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null });
+    await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
+
+    expect(useChatStore.getState().messages[0].actor_id).toBe(ALICE);
+  });
+
+  it('still sends when identity can never be read', async () => {
+    getOwnAccount().mockRejectedValue(new Error('403: not an account'));
+    await act(async () => { await useAuthStore.getState().login('pw', 'alice'); });
+
+    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null });
+    await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
+
+    // Not knowing who you are must never become a way to lose a message.
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().messages[0].actor_id).toBeNull();
+  });
+
+  it('takes the actor from whoever actually unlocked the app', async () => {
+    // A different person answering the expired-session overlay is a sign-out,
+    // not a sign-in — so nothing of the previous one, the actor included,
+    // survives to stamp their messages.
+    useAuthStore.setState({
+      account: { id: 'acc-1', username: 'alice', actor_id: ALICE },
+      sessionExpired: true, authenticated: false,
+    });
+    login().mockResolvedValue({ token: 'bobs-token' });
+    getOwnAccount().mockResolvedValue(accountFor(BOB, 'acc-2'));
+
+    await act(async () => { await useAuthStore.getState().login('pw', 'bob'); });
+
+    expect(useAuthStore.getState().authenticated).toBe(false);
     expect(selfActorId()).toBeNull();
   });
 });
