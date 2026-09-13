@@ -29,7 +29,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, setup_state, setup_token
-from nerve.config import AuthConfig, NerveConfig, set_config
+from nerve.config import AuthConfig, GatewayConfig, NerveConfig, set_config
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
     JWT_ALGORITHM,
@@ -82,11 +82,20 @@ def _app() -> FastAPI:
     return app
 
 
-def _client(app: FastAPI, *, client=_LOOPBACK, token: str = "") -> httpx.AsyncClient:
+# What a browser on the machine actually addresses. Not a made-up name: the
+# claim's tokenless path checks the Host header against the addresses this
+# instance answers on (DNS rebinding), so a synthetic host would be testing a
+# request no browser makes.
+_BASE_URL = "http://127.0.0.1:8900"
+
+
+def _client(
+    app: FastAPI, *, client=_LOOPBACK, token: str = "", base_url: str = _BASE_URL,
+) -> httpx.AsyncClient:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, client=client),
-        base_url="http://nerve-test",
+        base_url=base_url,
         headers=headers,
     )
 
@@ -595,6 +604,100 @@ class TestClaimingEndsTheSessionsBeforeIt:
         )
         async with _client(claimed.app, token=token) as http:
             assert (await http.get("/api/auth/check")).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+#  Whose page is asking                                                        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestALocalBrowserIsNotAnyLocalPage:
+    """Rule three of the cutover.
+
+    Loopback says the caller is on this machine. It does not say who wrote the
+    page: a browser here runs whatever site its owner visited, and Nerve's CORS
+    policy is `allow_origins=["*"]`, so `https://evil.example` can post to
+    `http://127.0.0.1:8900` and pick the password for an unclaimed instance.
+
+    So a *tokenless* claim must also come from a page this instance served. The
+    token remains the way through from anywhere else — whoever holds it read it
+    off this machine's own log.
+    """
+
+    async def test_a_hostile_origin_cannot_claim_without_the_token(self, install):
+        await install.token()
+        response = await _claim(
+            install, headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 403, response.text
+        assert await setup_token.instance_is_unclaimed(
+            install.db, install.reconfigure(),
+        ) is True
+
+    async def test_a_hostile_origin_with_the_token_is_fine(self, install):
+        """The token is proof of access to the machine's own log, which is a
+        stronger statement than any header makes."""
+        token = await install.token()
+        response = await _claim(
+            install,
+            body={"setup_token": token},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 200, response.text
+
+    async def test_a_cross_site_fetch_cannot_claim_without_the_token(self, install):
+        """Browsers that send `Sec-Fetch-Site` say it outright, including the
+        ones that omit `Origin`."""
+        await install.token()
+        response = await _claim(install, headers={"Sec-Fetch-Site": "cross-site"})
+        assert response.status_code == 403, response.text
+
+    async def test_the_instances_own_page_claims_with_nothing(self, install):
+        response = await _claim(install, headers={
+            "Origin": "http://127.0.0.1:8900", "Sec-Fetch-Site": "same-origin",
+        })
+        assert response.status_code == 200, response.text
+
+    async def test_a_request_with_no_origin_at_all_still_claims(self, install):
+        """curl on the machine sends no Origin and no Sec-Fetch-Site. It is
+        not a page, and the peer address is the whole story for it."""
+        response = await _claim(install)
+        assert response.status_code == 200, response.text
+
+    async def test_a_rebound_name_cannot_claim_without_the_token(self, install):
+        """DNS rebinding: a name the attacker controls resolves to loopback,
+        so the peer is local and the page is same-origin *with itself*. The
+        Host header is the only thing that gives it away."""
+        await install.token()
+        async with _client(install.app, base_url="http://evil.example:8900") as http:
+            response = await http.post("/api/setup/claim", json={
+                "username": "mallory", "password": "a-password-of-their-own",
+            })
+        assert response.status_code == 403, response.text
+        assert await setup_token.instance_is_unclaimed(
+            install.db, install.reconfigure(),
+        ) is True
+
+    async def test_a_configured_hostname_is_this_instance(self, install):
+        """An operator who bound the gateway to a name reaches it by that
+        name, and their own page is not cross-origin."""
+        install.reconfigure(gateway=GatewayConfig(host="nerve.internal", port=8900))
+        async with _client(install.app, base_url="http://nerve.internal:8900") as http:
+            response = await http.post("/api/setup/claim", json={
+                "username": "alice", "password": _PASSWORD,
+            })
+        assert response.status_code == 200, response.text
+
+    async def test_the_origin_check_cannot_make_a_remote_caller_local(self, install):
+        """It only ever *removes* the exemption. A claim from another machine
+        needs the token however friendly its headers are."""
+        await install.token()
+        response = await _claim(
+            install, client=_REMOTE,
+            headers={"Origin": "http://127.0.0.1:8900", "Sec-Fetch-Site": "same-origin"},
+        )
+        assert response.status_code == 403, response.text
 
 
 # --------------------------------------------------------------------------- #
