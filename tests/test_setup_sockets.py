@@ -273,3 +273,25 @@ class TestASocketHeldAcrossTheClaim:
             assert len(server._live_sockets) == 1
         # Closed by the client: the handler's cleanup drops it.
         assert server._live_sockets == {}
+
+    def test_a_handshake_that_fails_leaves_no_entry_behind(
+        self, instance, monkeypatch,
+    ):
+        """The registry is written before the handshake finishes — it has to
+        be, or a claim during the handshake would miss the connection — so the
+        cleanup has to cover the handshake too. Otherwise a client that closes
+        the tab mid-handshake leaves an entry naming a socket nobody will ever
+        close."""
+        async def _broken(*_args, **_kwargs):
+            raise RuntimeError("no session for you")
+
+        monkeypatch.setattr(
+            server._engine.router, "get_last_session", _broken, raising=False,
+        )
+        visitor = _passwordless_session(instance)
+        try:
+            with instance.client.websocket_connect(f"/ws?token={visitor}"):
+                pass
+        except Exception:
+            pass  # the handshake failed, which is the case under test
+        assert server._live_sockets == {}
