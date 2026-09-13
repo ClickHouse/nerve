@@ -61,6 +61,7 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.accounts import require_account
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
 from nerve.setup_state import SetupState
+from nerve.setup_origin import same_origin
 from nerve.setup_token import (
     instance_is_unclaimed,
     invalidate_setup_token,
@@ -352,6 +353,14 @@ async def claim(req: ClaimRequest, request: Request):
 
     The guard is evaluated *before* the instance state, so a caller who fails
     it learns nothing here that ``/api/auth/status`` does not already say.
+
+    **Two questions, not one.** The peer address says whether the caller is on
+    this machine; it does not say who wrote the page doing the asking. A
+    tokenless claim therefore also has to be same-origin (see
+    :mod:`nerve.setup_origin`), because a browser on the machine will happily
+    post to it on behalf of any site its owner visited. With the token,
+    provenance stops mattering — whoever holds it read it off this machine's
+    own log.
     """
     config = get_config()
 
@@ -369,7 +378,22 @@ async def claim(req: ClaimRequest, request: Request):
         )
 
     host = peer_host(request.scope)
-    if token_is_required(host, config):
+    needs_token = token_is_required(host, config)
+    if not needs_token:
+        # Locality says the *machine* is this one. It says nothing about who
+        # wrote the page that is asking: a browser here runs whatever site its
+        # owner visited, and Nerve's CORS policy lets any of them post to it.
+        # So the exemption also requires the request to have come from a page
+        # this instance served — otherwise `https://evil.example` picks the
+        # password for an unclaimed instance on the machine of anybody who
+        # visits it. The token remains the way through from anywhere else.
+        ok, why_not = same_origin(request.headers, config)
+        if not ok:
+            needs_token = True
+            logger.warning(
+                "Setup claim from a local peer will need the token: %s", why_not,
+            )
+    if needs_token:
         stored = await stored_setup_token(store)
         if not token_accepted(req.setup_token, stored):
             await asyncio.sleep(_REFUSAL_SECONDS)
