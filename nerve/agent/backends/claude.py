@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import stat
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -51,6 +52,7 @@ from claude_agent_sdk.types import (
 )
 
 from nerve.agent.backends import events as ev
+from nerve.agent.credential_store import file_store_env
 from nerve.agent.backends.base import (
     AgentClient,
     BackendCapabilities,
@@ -705,6 +707,24 @@ class ClaudeBackend:
         # is the flag's only route into the CLI. See agent.agent_teams.
         if config.agent.agent_teams:
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        # Credential-store pin (macOS): put the ``security`` shim first on the
+        # CLI subprocess PATH so the CLI's Keychain probes fail the way a
+        # locked keychain does and it keeps its OAuth tokens (own login + MCP
+        # plugins) in ~/.claude/.credentials.json in every launch context —
+        # the store no longer flips with whoever started the gateway. See
+        # nerve.agent.credential_store and agent.claude_credential_store.
+        if (
+            getattr(config.agent, "claude_credential_store", "auto") == "file"
+            and sys.platform == "darwin"
+        ):
+            try:
+                env.update(file_store_env(os.environ.get("PATH")))
+            except OSError as e:
+                logger.warning(
+                    "Could not install the Claude credential-store shim (%s); "
+                    "the CLI keeps its default store selection",
+                    e,
+                )
         if config.provider.is_bedrock:
             env["CLAUDE_CODE_USE_BEDROCK"] = "1"
             if config.provider.aws_region:

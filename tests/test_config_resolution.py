@@ -277,6 +277,33 @@ class TestAgentTeams:
         assert validate_config_keys({"agent": {"agent_teams": False}}) == []
 
 
+class TestClaudeCredentialStore:
+    """agent.claude_credential_store — pins the CLI's OAuth store."""
+
+    def test_default_is_auto(self):
+        from nerve.config import AgentConfig
+
+        assert AgentConfig.from_dict({}).claude_credential_store == "auto"
+
+    def test_file_accepted_and_normalized(self):
+        from nerve.config import AgentConfig
+
+        cfg = AgentConfig.from_dict({"claude_credential_store": " File "})
+        assert cfg.claude_credential_store == "file"
+
+    def test_unknown_value_falls_back_to_auto(self, caplog):
+        from nerve.config import AgentConfig
+
+        cfg = AgentConfig.from_dict({"claude_credential_store": "keychain"})
+        assert cfg.claude_credential_store == "auto"
+        assert "claude_credential_store" in caplog.text
+
+    def test_key_recognized_by_validator(self):
+        assert validate_config_keys(
+            {"agent": {"claude_credential_store": "file"}}
+        ) == []
+
+
 class TestClaudeModels:
     """config.claude_models — the composer's selectable Claude model list."""
 
