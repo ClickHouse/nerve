@@ -896,12 +896,42 @@ class AgentConfig:
     # message teammates that no longer exist. Set False to restore the CLI
     # default (no SendMessage, no teams).
     agent_teams: bool = True
+    # Where the Claude CLI subprocess keeps OAuth credentials (its own login
+    # and every MCP plugin's tokens). "auto" = the CLI's own choice: the macOS
+    # Keychain when the process can read the login keychain, otherwise
+    # ~/.claude/.credentials.json. That choice is inherited from whoever
+    # launched Nerve (Terminal → Keychain; SSH / agent / background context →
+    # file), and a refresh-token rotation in one store invalidates the other
+    # store's copy — so a gateway restarted from a different context finds
+    # stale tokens, the CLI deletes them, and every session reports "needs
+    # authentication". "file" pins the CLI to the file store in every launch
+    # context by putting a `security` shim first on the subprocess PATH
+    # (macOS only; a no-op elsewhere, where the CLI has no keychain store).
+    # See nerve/agent/credential_store.py. Re-authorize plugins with the shim
+    # on PATH so the grant lands in the file store:
+    #   PATH="$NERVE_HOME/bin:$PATH" claude mcp login <server-name>
+    claude_credential_store: str = "auto"
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
 
     @property
     def resolved_cron_backend(self) -> str:
         """Backend used for new cron/hook sessions."""
         return self.cron_backend or self.backend
+
+    @staticmethod
+    def _parse_credential_store(value: object) -> str:
+        """Normalize ``claude_credential_store``; unknown values fall back to
+        ``auto`` (the CLI's own behaviour) with a warning rather than failing
+        the whole config load."""
+        store = str(value or "auto").strip().lower()
+        if store in ("auto", "file"):
+            return store
+        logger.warning(
+            "agent.claude_credential_store %r is not one of ('auto', 'file') — "
+            "using 'auto'",
+            value,
+        )
+        return "auto"
 
     @classmethod
     @_coerced
@@ -937,6 +967,9 @@ class AgentConfig:
             ),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
+            claude_credential_store=cls._parse_credential_store(
+                d.get("claude_credential_store")
+            ),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
         )
 

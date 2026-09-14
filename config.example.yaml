@@ -77,6 +77,18 @@ agent:
   # a full context window each; the CLI cannot restore in-process teammates
   # when a session's client is recycled (idle timeout, restart, crash retry).
   agent_teams: true
+  # Where the Claude CLI keeps OAuth credentials (its own login + every MCP
+  # plugin's tokens). auto = the CLI's own choice per process: the macOS
+  # Keychain when it can read the login keychain, else
+  # ~/.claude/.credentials.json — inherited from whoever launched Nerve, and a
+  # token refresh in one store makes the other store's copy stale, so a
+  # gateway restarted from a different context (Terminal vs SSH/agent) loses
+  # its plugin logins. file = pin the CLI to the file store in every launch
+  # context via a `security` shim on the subprocess PATH (macOS only; a no-op
+  # elsewhere). Re-authorize plugins with the shim on PATH so the grant lands
+  # in the file store:
+  #   PATH="$HOME/.nerve/bin:$PATH" claude mcp login <server-name>
+  # claude_credential_store: auto
   # First-prompt rewrite — the web UI can refine the opening message of a
   # new chat with a fast model, preview it, and send only after approval.
   prompt_rewrite:
