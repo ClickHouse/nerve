@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import jwt
@@ -680,7 +680,7 @@ class TestWebSocketActorIsFixedAtAccept:
         assert isinstance(connection, WebSocketConnection)
         assert socket.accepted and socket.closed is None
         assert connection.actor.account_id == install.account_id
-        assert connection.client_id
+        assert UUID(connection.client_id).version == 4
 
     async def test_a_refused_socket_is_closed_and_yields_nothing(self, install):
         await install.set_enabled(False)

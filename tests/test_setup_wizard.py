@@ -28,11 +28,29 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
+from nerve.gateway import server
 
 _SECRET = "test-secret-for-the-setup-claim-padded-32b"
 _PASSWORD = "correct-horse-battery-staple"
 _LOCAL = ("127.0.0.1", 41000)
 _REMOTE = ("203.0.113.7", 41000)
+
+
+@pytest.mark.asyncio
+async def test_validation_errors_never_echo_the_setup_token():
+    """A malformed claim response must not reflect its credential input."""
+    token = "live-setup-token-that-must-not-appear"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.create_app()),
+        base_url="http://nerve-test",
+    ) as http:
+        response = await http.post("/api/setup/claim", json={
+            "password": _PASSWORD,
+            "setup_token": token,
+        })
+    assert response.status_code == 422
+    assert token not in response.text
+    assert all("input" not in error for error in response.json()["detail"])
 
 
 def _legacy_token(secret: str = _SECRET) -> str:
@@ -360,7 +378,7 @@ class TestSessionEpoch:
         async with _client(install.app, token=token) as http:
             assert (await http.get("/api/auth/check")).status_code == 401
 
-    async def test_epoch_moves_once_and_only_on_claim(self, install):
+    async def test_epoch_moves_on_claim_and_password_change(self, install):
         async def epoch() -> int:
             account = await install.db.get_account(install.owner_id)
             return int(account["session_epoch"])
@@ -379,7 +397,7 @@ class TestSessionEpoch:
                 "new_password": "a-third-passphrase",
             })
         assert changed.status_code == 200
-        assert await epoch() == 1
+        assert await epoch() == 2
 
 
 @pytest.mark.asyncio

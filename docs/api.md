@@ -96,7 +96,7 @@ not change when the username changes.
 | `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
 | `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
 | `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
-| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
+| `PUT /api/accounts/me/password` | Change your password using `{current_password?, new_password}`; revokes other sessions and returns a replacement in `X-Nerve-Token` |
 
 Failures:
 

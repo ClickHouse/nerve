@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from nerve.config import get_config
@@ -34,6 +34,8 @@ from nerve.db.accounts import (
 )
 from nerve.gateway.auth import (
     PasswordTooLongError,
+    create_session_token,
+    effective_jwt_secret,
     hash_password,
     password_length_problem,
     require_auth,
@@ -338,7 +340,9 @@ async def enable_account(account_id: str, actor: Actor = Depends(require_account
 
 @router.put("/api/accounts/me/password", response_model=AccountOut)
 async def change_own_password(
-    req: PasswordChangeRequest, actor: Actor = Depends(require_account),
+    req: PasswordChangeRequest,
+    request: Request,
+    actor: Actor = Depends(require_account),
 ):
     """Set your own password. Nobody can set anyone else's.
 
@@ -354,7 +358,9 @@ async def change_own_password(
     hand.
 
     Setting a password moves the account to its own credential, after which
-    ``auth.password_hash`` no longer applies to it.
+    ``auth.password_hash`` no longer applies to it. It also advances the
+    account's session epoch: every older HTTP token and open WebSocket is
+    revoked, while this response supplies the calling tab a replacement token.
 
     **While the instance is unclaimed this endpoint refuses.** The one case
     that needs no current password is exactly the state a passwordless install
@@ -392,6 +398,7 @@ async def change_own_password(
             # the snapshot says "no password to prove" about an account that
             # now has one, and the write would hand the instance back.
             expected_session_epoch=actor.session_epoch,
+            revoke_sessions=True,
         )
     except _CONFLICT as e:
         # A stale session is a fact about the *instance* (it was claimed under
@@ -401,7 +408,31 @@ async def change_own_password(
         raise HTTPException(status_code=400, detail=str(e)) from e
     if updated is None:  # pragma: no cover - removed between two reads
         raise HTTPException(status_code=404, detail="Account not found")
-    logger.info("Account %s changed its own password", account["id"])
+    # Keep the tab that proved the old password signed in while revoking every
+    # other credential minted at the old epoch. The ordinary response
+    # middleware publishes this through X-Nerve-Token and the API client adopts
+    # it under the same request-revision guard as a sliding refresh.
+    request.state.refreshed_token = create_session_token(
+        effective_jwt_secret(config),
+        updated["id"],
+        session_epoch=updated["session_epoch"],
+    )
+
+    # Per-frame checks stop a stale socket acting. Close it now as well so it
+    # cannot continue receiving broadcasts while it stays silent.
+    try:
+        from nerve.gateway.server import close_revoked_sockets
+
+        await close_revoked_sockets()
+    except Exception as e:  # noqa: BLE001 - the password change already committed
+        logger.warning(
+            "Password change: open sockets could not be closed: %s", e,
+        )
+
+    logger.info(
+        "Account %s changed its own password and revoked prior sessions",
+        account["id"],
+    )
     return await _render(db, updated)
 
 

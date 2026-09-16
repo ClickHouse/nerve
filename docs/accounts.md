@@ -29,6 +29,11 @@ Account management follows these rules:
 - Before adding a second account, the existing account must have a username and
   the installation must have a password.
 
+A successful password change advances that account's session epoch. Every
+older HTTP token becomes stale and every open WebSocket is best-effort closed;
+the response carries a replacement token for the tab that proved the current
+password. This is the incident-response path for revoking a copied session.
+
 ### Usernames
 
 Usernames are trimmed, converted to lowercase, and compared case-insensitively.
