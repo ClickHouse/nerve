@@ -43,9 +43,13 @@ class _OriginWorker:
     """Checkpoint only events that the ingester accepted.
 
     The origin advances before yielding, so its live cursor can include a
-    failed event. The worker retains the last successful cursor instead;
-    idempotent ingestion makes replay safe.
+    failed event. The worker therefore retries that event in place with bounded
+    exponential backoff and advances its checkpoint only after it lands.
+    Idempotent ingestion makes both an in-process retry and crash replay safe.
     """
+
+    _RETRY_INITIAL_SECONDS = 0.25
+    _RETRY_MAX_SECONDS = 30.0
 
     def __init__(
         self,
@@ -59,7 +63,6 @@ class _OriginWorker:
         self.task: asyncio.Task | None = None
         self.cursor_key = f"codex:{origin.id}"
         self._checkpoint: str | None = None
-        self._stalled = False
 
     async def run(self) -> None:
         try:
@@ -77,7 +80,6 @@ class _OriginWorker:
 
         cursor = await self.db.get_sync_cursor(self.cursor_key)
         self._checkpoint = cursor
-        self._stalled = False
         try:
             async for event in self.origin.stream(cursor):
                 await self._handle(event)
@@ -94,25 +96,29 @@ class _OriginWorker:
                 logger.exception("Codex origin %s close() failed", self.origin.id)
 
     async def _handle(self, event: ThreadEvent) -> None:
-        try:
-            await self.ingester.ingest(event)
-        except Exception:
-            logger.exception(
-                "Codex ingest failed (origin=%s thread=%s seq=%d type=%s) — "
-                "the cursor stays where it was, so a restart replays it",
-                self.origin.id, event.thread_id, event.sequence, event.type,
-            )
-            self._stalled = True
-            return
+        delay = self._RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                await self.ingester.ingest(event)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Codex ingest failed (origin=%s thread=%s seq=%d type=%s) — "
+                    "retrying in %.2fs; the cursor remains before this event",
+                    self.origin.id, event.thread_id, event.sequence, event.type,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._RETRY_MAX_SECONDS)
         # Checkpoint after every event that landed — cheap (one row update),
         # and now it means what it says.
         self._advance_checkpoint()
         await self._save_cursor()
 
     def _advance_checkpoint(self) -> None:
-        """Take the origin's cursor as the new checkpoint, unless stalled."""
-        if self._stalled:
-            return
+        """Take the origin's cursor as the new successful checkpoint."""
         try:
             self._checkpoint = self.origin.cursor()
         except Exception:

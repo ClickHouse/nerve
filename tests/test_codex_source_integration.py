@@ -11,6 +11,8 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -22,7 +24,9 @@ from nerve.config import (
     NerveConfig,
 )
 from nerve.sources.codex_threads import build_service
+from nerve.sources.codex_threads.base import ThreadEvent
 from nerve.sources.codex_threads.ingester import codex_session_id
+from nerve.sources.codex_threads.service import _OriginWorker
 
 from tests.actor_rows import ensure_system_principal
 
@@ -35,6 +39,32 @@ async def db(db):  # noqa: F811 — the conftest database, with an identity
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codex" / "rollouts" / "in_scope.jsonl"
 TEST_WORKSPACE = Path("/tmp/nerve-test-ws")
+
+
+@pytest.mark.asyncio
+async def test_a_transient_ingest_failure_retries_without_a_restart(monkeypatch):
+    origin = SimpleNamespace(id="retry", cursor=lambda: "after-event")
+    ingester = SimpleNamespace(
+        ingest=AsyncMock(side_effect=[RuntimeError("transient"), None]),
+    )
+    database = SimpleNamespace(set_sync_cursor=AsyncMock())
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    worker = _OriginWorker(origin, ingester, database)
+
+    await worker._handle(ThreadEvent(
+        type="user_message",
+        thread_id="thread-1",
+        sequence=7,
+        timestamp=None,
+        payload={"text": "hello"},
+    ))
+
+    assert ingester.ingest.await_count == 2
+    sleep.assert_awaited_once_with(worker._RETRY_INITIAL_SECONDS)
+    database.set_sync_cursor.assert_awaited_once_with(
+        "codex:retry", "after-event",
+    )
 
 
 @pytest.mark.asyncio
