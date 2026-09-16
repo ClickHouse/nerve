@@ -594,8 +594,9 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
 too). The token is resolved to an actor at admission. A credential that names
-nobody is refused with close code `4001`; a stale admitted socket is closed on
-its next frame after an account is disabled or setup is claimed.
+nobody is refused with close code `4001`. Once admitted, both identity and
+authority remain fixed until the socket reconnects; account changes are checked
+at the next connection.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token
