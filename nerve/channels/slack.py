@@ -83,6 +83,10 @@ _NAME_CACHE_MAX = 500
 _INBOUND_TS_MAX = 500
 _EDIT_CLOCK_MAX = 500
 _NAME_CACHE_TTL = 600.0
+# A lookup that failed is held for much less. Caching it at all stops a rate
+# limit from drawing one call per message, but holding it for the full TTL
+# keeps refusing a member long after Slack answers again.
+_NAME_CACHE_FAIL_TTL = 30.0
 # Concurrent dispatch tasks. The router serialises per session, so this only
 # bounds envelopes not yet routed — including ones headed for a refusal.
 _MAX_INFLIGHT = 100
@@ -755,6 +759,7 @@ class SlackChannel(BaseChannel):
         cached = self._name_cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
             return cached[0]
+        ttl = _NAME_CACHE_TTL
         try:
             info = await self._web.users_info(user=user_id)
             user = info.get("user") or {}
@@ -789,9 +794,10 @@ class SlackChannel(BaseChannel):
         except Exception as e:
             logger.warning("Slack users.info failed for %s: %s", user_id, e)
             identity = Identity(id=user_id, complete=False)
+            ttl = _NAME_CACHE_FAIL_TTL
         self._remember(
             self._name_cache, cache_key,
-            (identity, time.monotonic() + _NAME_CACHE_TTL), _NAME_CACHE_MAX,
+            (identity, time.monotonic() + ttl), _NAME_CACHE_MAX,
         )
         return identity
 
@@ -806,6 +812,7 @@ class SlackChannel(BaseChannel):
         cached = self._name_cache.get(f"c:{channel_id}")
         if cached and cached[1] > time.monotonic():
             return cached[0]
+        ttl = _NAME_CACHE_TTL
         try:
             info = await self._web.conversations_info(channel=channel_id)
             channel = info.get("channel") or {}
@@ -825,10 +832,11 @@ class SlackChannel(BaseChannel):
                 e,
             )
             identity = Identity(id=channel_id, complete=False)
+            ttl = _NAME_CACHE_FAIL_TTL
         self._remember(
             self._name_cache,
             f"c:{channel_id}",
-            (identity, time.monotonic() + _NAME_CACHE_TTL),
+            (identity, time.monotonic() + ttl),
             _NAME_CACHE_MAX,
         )
         return identity
@@ -907,6 +915,7 @@ class SlackChannel(BaseChannel):
         cached = self._name_cache.get(cache_key)
         if cached and cached[1] > time.monotonic():
             return bool(cached[0])
+        ttl = _NAME_CACHE_TTL
         try:
             info = await self._web.users_info(user=user_id)
             is_bot = bool((info.get("user") or {}).get("is_bot"))
@@ -917,9 +926,10 @@ class SlackChannel(BaseChannel):
                 user_id, event.get("bot_id"), e,
             )
             is_bot = True
+            ttl = _NAME_CACHE_FAIL_TTL
         self._remember(
             self._name_cache, cache_key,
-            (is_bot, time.monotonic() + _NAME_CACHE_TTL), _NAME_CACHE_MAX,
+            (is_bot, time.monotonic() + ttl), _NAME_CACHE_MAX,
         )
         return is_bot
 
@@ -1218,18 +1228,26 @@ class SlackChannel(BaseChannel):
     async def send(self, message: OutboundMessage) -> None:
         """Send a complete message, split to fit Slack's render limit.
 
+        The limit counts what Slack receives, so the text is converted before
+        it is measured: ``&``, ``<`` and ``>`` each grow to an entity of four
+        or five characters, and a chunk of markup or a stack trace can gain
+        more than the margin ``MAX_MSG_LEN`` leaves. Slack cuts the excess.
+
+        What goes in the message cache is the plain form, because a reaction
+        quotes it back to the agent, and mrkdwn would reach it as entities.
+
         Propagates a failure so StreamAdapter can fall back to editing the
         streaming placeholder; swallowing it loses the whole turn. An
         unavailable channel is one of those failures.
         """
         self._available_web()
-        for chunk in split_message(message.text, MAX_MSG_LEN):
-            ts = await self._post(message.target, _md_to_slack(chunk))
+        for chunk in split_message(_md_to_slack(message.text), MAX_MSG_LEN):
+            ts = await self._post(message.target, chunk)
             if ts:
-                self._cache_message(ts, message.target, chunk)
+                self._cache_message(ts, message.target, slack_to_plain(chunk))
 
     def format_response(self, text: str) -> str:
-        """Return text unchanged — :meth:`send` splits and converts it."""
+        """Return text unchanged — :meth:`send` converts and splits it."""
         return text
 
     # ------------------------------------------------------------------ #

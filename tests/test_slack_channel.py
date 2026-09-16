@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.channels import slack as slack_module
 from nerve.channels.base import ChannelCapability, OutboundMessage
 from nerve.channels.slack import (
     MAX_MSG_LEN,
     SlackChannel,
     SlackUnavailable,
+    _NAME_CACHE_FAIL_TTL,
     _md_to_slack,
     build_sessions_blocks,
     format_target,
@@ -56,6 +60,18 @@ def _channel(**slack_kwargs) -> SlackChannel:
     channel.router.handle_message = AsyncMock(return_value="done")
     channel.router.get_last_session = AsyncMock(return_value=None)
     return channel
+
+
+def _advance(monkeypatch, seconds: float) -> None:
+    """Hold the clock the channel's caches read at *seconds* from now.
+
+    ``slack.py`` takes only ``monotonic`` from ``time``, so replacing the
+    module's own reference keeps the event loop on the real clock.
+    """
+    later = time.monotonic() + seconds
+    monkeypatch.setattr(
+        slack_module, "time", SimpleNamespace(monotonic=lambda: later),
+    )
 
 
 def _with_credentials(
@@ -147,6 +163,14 @@ class TestSplitMessage:
 
     def test_an_overlong_single_line_is_cut(self):
         assert split_message("a" * 10, 4) == ["aaaa", "aaaa", "aa"]
+
+    def test_a_hard_cut_keeps_an_entity_whole(self):
+        # The text handed to split_message is already Slack mrkdwn, and a cut
+        # through &amp; sends both halves as literal text.
+        assert split_message("x" * 38 + "&amp;y", 40) == ["x" * 38, "&amp;y"]
+
+    def test_a_limit_shorter_than_an_entity_still_makes_progress(self):
+        assert "".join(split_message("&amp;" * 3, 2)) == "&amp;" * 3
 
     def test_every_chunk_respects_the_limit(self):
         text = "\n".join("line %d" % i for i in range(500))
@@ -360,6 +384,29 @@ class TestAuthorization:
         )
         await channel._authorize("U1", "D1", "im")
         await channel._authorize("U1", "D1", "im")
+        assert channel._web.users_info.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_is_retried_within_seconds(self, monkeypatch):
+        # A rate limit or a 5xx refuses the message, and caching that keeps
+        # one blip from drawing a lookup per message. Holding it as long as a
+        # resolved name would refuse the member for ten minutes.
+        channel = _channel(allow_users=["alex"], allow_direct_messages=True)
+        channel._web.users_info = AsyncMock(
+            side_effect=RuntimeError("ratelimited"),
+        )
+        assert not await channel._authorize("U1", "D1", "im")
+        assert not await channel._authorize("U1", "D1", "im")
+        assert channel._web.users_info.await_count == 1
+
+        _advance(monkeypatch, _NAME_CACHE_FAIL_TTL + 1)
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"name": "alex", "profile": {}}},
+        )
+        assert await channel._authorize("U1", "D1", "im")
+        # The name that did resolve outlives the failure window.
+        _advance(monkeypatch, 2 * (_NAME_CACHE_FAIL_TTL + 1))
+        assert await channel._authorize("U1", "D1", "im")
         assert channel._web.users_info.await_count == 1
 
     @pytest.mark.asyncio
@@ -700,6 +747,22 @@ class TestOutbound:
             c.kwargs["text"] for c in channel._web.chat_postMessage.await_args_list
         )
         assert sent == body
+
+    @pytest.mark.asyncio
+    async def test_escaping_cannot_push_a_chunk_over_the_limit(self):
+        # Splitting before conversion measured the wrong text: each & < >
+        # grows to an entity, so a chunk of markup crossed the limit and
+        # Slack cut the excess.
+        channel = _channel()
+        body = "\n".join("<a> & <b>" for _ in range(600))
+        await channel.send(OutboundMessage(target="C1", text=body))
+        posted = [
+            c.kwargs["text"]
+            for c in channel._web.chat_postMessage.await_args_list
+        ]
+        assert posted
+        assert all(len(text) <= MAX_MSG_LEN for text in posted)
+        assert "\n".join(posted) == _md_to_slack(body)
 
     @pytest.mark.asyncio
     async def test_threads_in_one_channel_share_the_edit_budget(self):
@@ -1353,6 +1416,26 @@ class TestOwnMessageDetection:
         assert await channel._is_another_app_talking(event)
         assert await channel._is_another_app_talking(event)
         assert channel._web.users_info.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unresolved_verdict_is_retried_within_seconds(
+        self, monkeypatch,
+    ):
+        # Reading an unresolved sender as an app is the safe answer, but
+        # keeping it for the full name TTL ignores a person for ten minutes.
+        channel = self._ch()
+        channel._web.users_info = AsyncMock(
+            side_effect=RuntimeError("ratelimited"),
+        )
+        event = self._event(bot_id="B0INTEGRATION", user="U-human")
+        assert await channel._is_another_app_talking(event)
+        assert channel._web.users_info.await_count == 1
+
+        _advance(monkeypatch, _NAME_CACHE_FAIL_TTL + 1)
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"is_bot": False, "profile": {}}},
+        )
+        assert not await channel._is_another_app_talking(event)
 
 
 class TestAmpersandEscaping:
