@@ -101,34 +101,39 @@ describe('LoginPage', () => {
 
 describe('SessionExpiredOverlay', () => {
   it('unlocks the account whose app is on screen, and no other', async () => {
-    // Everything underneath belongs to that person. A form that took any
-    // username would let somebody else walk up to a colleague's expired tab,
-    // sign in, and inherit their drafts and loaded state.
+    // The username is only a mutable lookup key. The store checks the returned
+    // account id before it lets the login unlock this person's mounted app.
     useAuthStore.setState({
       loginMode: 'username_password',
       account: { id: 'acc-1', username: 'alice' },
     });
     render(<SessionExpiredOverlay />);
 
-    // The username is shown, not asked for.
-    expect(screen.getByLabelText('Signed in as')).toHaveValue('alice');
-    expect(screen.getByLabelText('Signed in as')).toBeDisabled();
-    expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Username')).toHaveValue('alice');
+
+    // Another tab renamed this same account after the session expired.
+    await userEvent.clear(screen.getByLabelText('Username'));
+    await userEvent.type(screen.getByLabelText('Username'), 'alice-renamed');
 
     await userEvent.type(screen.getByLabelText('Password'), 'another-passphrase');
     await userEvent.click(screen.getByRole('button', { name: 'Unlock' }));
 
-    expect(login).toHaveBeenCalledWith('another-passphrase', 'alice');
+    expect(login).toHaveBeenCalledWith('another-passphrase', 'alice-renamed');
   });
 
-  it('keeps the single-account shape unchanged', () => {
-    // No username on the account at all — the upgrade case. Nothing to show,
-    // nothing to send, and the server resolves the only account there is.
-    useAuthStore.setState({ account: { id: 'acc-1', username: null } });
+  it('omits a stale username when the server has one account', async () => {
+    // The cached label may have been renamed elsewhere. Password-only login
+    // resolves the sole account without depending on that mutable key.
+    useAuthStore.setState({
+      loginMode: 'password',
+      account: { id: 'acc-1', username: 'old-alice' },
+    });
     render(<SessionExpiredOverlay />);
-    expect(screen.queryByLabelText('Signed in as')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Signed in as')).toHaveValue('old-alice');
     expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Password'), 'another-passphrase');
+    await userEvent.click(screen.getByRole('button', { name: 'Unlock' }));
+    expect(login).toHaveBeenCalledWith('another-passphrase', undefined);
   });
 
   it('offers only a sign-out when the account cannot be confirmed', async () => {
