@@ -23,7 +23,12 @@ Set these test-only environment variables:
 | `NERVE_SLACK_TEST_APP_TOKEN` | App token (`xapp-…`) with `connections:write` | All live tests |
 | `NERVE_SLACK_TEST_CHANNEL` | Test channel ID (`C…`) | All live tests |
 | `NERVE_SLACK_TEST_USER_TOKEN` | User token (`xoxp-…`) | Inbound tests |
-| `NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL` | Bot token without `users:read.email` | One scope test |
+| `NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL` | Bot token without `users:read.email` | One scope test, beside the user token |
+
+The scope test asks both bot tokens about the user token's owner, because a
+bot user has no `profile.email` for either of them. CI has no second bot
+token, so that test skips there — run it locally when the deny-list premise
+changes.
 
 These variables do not configure Nerve itself. See [config.md](config.md#slack)
 for production configuration.

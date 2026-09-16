@@ -375,6 +375,20 @@ class RecordingRouter:
     async def get_last_session(self, channel_key: str) -> str | None:
         return self._sessions.get(channel_key)
 
+    # The registry half of ChannelRouter, which SlackRuntime uses: it
+    # refuses to start while a channel is already registered, and hands
+    # the one it builds to the router itself.
+
+    def get_channel(self, _name: str) -> Any:
+        return self.channel
+
+    def register(self, channel: Any) -> None:
+        self.channel = channel
+
+    def unregister(self, channel: Any) -> None:
+        if self.channel is channel:
+            self.channel = None
+
     def _matching(self, marker: str) -> list[Any]:
         return [m for m in self.messages if marker in (m.text or "")]
 
@@ -741,13 +755,8 @@ def ignore_stale_events(channel) -> None:
     listeners[:] = [drop_stale]
 
 
-def build_channel(
-    router: RecordingRouter,
-    diagnostics_label: str | None = None,
-    **slack_kwargs,
-):
-    """A SlackChannel wired to the live workspace with the given guardrails."""
-    from nerve.channels.slack import SlackChannel
+def live_config(**slack_kwargs):
+    """A NerveConfig on the live workspace with the given guardrails."""
     from nerve.config import NerveConfig, SlackConfig
 
     cfg = NerveConfig()
@@ -757,22 +766,44 @@ def build_channel(
         app_token=APP_TOKEN,
         **slack_kwargs,
     )
+    return cfg
+
+
+def instrument_channel(channel, diagnostics_label: str) -> SocketDiagnostics:
+    """Observe every socket *channel* builds from here on.
+
+    The wrapper sits on the instance, so a socket the channel rebuilds
+    later is observed too — which is what a reconnect test reads.
+    """
+    diagnostics = SocketDiagnostics(diagnostics_label)
+    build_socket_client = channel._build_socket_client
+
+    def build_instrumented_socket(
+        *, app_token: str | None = None, web_client=None,
+    ):
+        socket = build_socket_client(
+            app_token=app_token,
+            web_client=web_client,
+        )
+        diagnostics.attach(socket)
+        return socket
+
+    channel._build_socket_client = build_instrumented_socket
+    channel._live_diagnostics = diagnostics
+    return diagnostics
+
+
+def build_channel(
+    router: RecordingRouter,
+    diagnostics_label: str | None = None,
+    **slack_kwargs,
+):
+    """A SlackChannel wired to the live workspace with the given guardrails."""
+    from nerve.channels.slack import SlackChannel
+
+    cfg = live_config(**slack_kwargs)
     channel = SlackChannel(cfg, router)
     router.channel = channel
     if diagnostics_label:
-        diagnostics = SocketDiagnostics(diagnostics_label)
-        build_socket_client = channel._build_socket_client
-
-        def build_instrumented_socket(
-            *, app_token: str | None = None, web_client=None,
-        ):
-            socket = build_socket_client(
-                app_token=app_token,
-                web_client=web_client,
-            )
-            diagnostics.attach(socket)
-            return socket
-
-        channel._build_socket_client = build_instrumented_socket
-        channel._live_diagnostics = diagnostics
+        instrument_channel(channel, diagnostics_label)
     return channel, cfg
