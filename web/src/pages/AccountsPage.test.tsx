@@ -11,6 +11,7 @@ vi.mock('../api/client', () => ({
     updateAccount: vi.fn(),
     setAccountEnabled: vi.fn(),
     changeOwnPassword: vi.fn(),
+    getOwnAccount: vi.fn(),
     authStatus: vi.fn().mockResolvedValue({
       auth_required: true, login: 'password',
     }),
@@ -56,12 +57,14 @@ beforeEach(() => {
   api.createAccount.mockReset();
   api.setAccountEnabled.mockReset();
   api.changeOwnPassword.mockReset();
+  api.getOwnAccount.mockReset();
   api.updateAccount.mockReset();
   api.authStatus.mockResolvedValue({
     auth_required: true, login: 'password',
   });
   useAccountStore.setState({ accounts: [], loading: true, busyId: null, error: null });
   useAuthStore.setState({
+    authenticated: true,
     loginMode: null,
     account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
   });
@@ -99,6 +102,42 @@ describe('the list', () => {
     api.listAccounts.mockRejectedValue(new Error('500: {"detail": "nope"}'));
     renderPage();
     expect(await screen.findByRole('alert')).toHaveTextContent('nope');
+  });
+
+  it('repairs the signed-in identity after its startup read failed', async () => {
+    useAuthStore.setState({ authenticated: true, account: null });
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    api.getOwnAccount
+      .mockRejectedValueOnce(new Error('network'))
+      .mockResolvedValue(account());
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('network');
+    expect(screen.queryByText('you')).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Your password' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('you')).toBeInTheDocument();
+    expect(screen.getByRole('form', { name: 'Your password' })).toBeInTheDocument();
+    expect(useAuthStore.getState().account).toEqual({
+      id: 'acc-1', username: 'alice', actor_id: 'actor-1',
+    });
+  });
+
+  it('does not restore identity after that auth session was replaced', async () => {
+    useAuthStore.setState({ authenticated: true, account: null });
+    api.listAccounts.mockResolvedValue({ accounts: [account()] });
+    let finishIdentity!: (value: Account) => void;
+    api.getOwnAccount.mockReturnValue(new Promise<Account>((resolve) => {
+      finishIdentity = resolve;
+    }));
+
+    const loading = useAccountStore.getState().load();
+    useAuthStore.getState().logout();
+    finishIdentity(account());
+    await loading;
+
+    expect(useAuthStore.getState().account).toBeNull();
   });
 
 });

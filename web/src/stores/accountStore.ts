@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api, type Account } from '../api/client';
 import { useActorStore } from './actorStore';
-import { useAuthStore } from './authStore';
+import { bindAuthSession, useAuthStore } from './authStore';
 
 /**
  * The server's message, out of the error the API layer throws.
@@ -55,8 +55,8 @@ function upsert(accounts: Account[], account: Account): Account[] {
 }
 
 /**
- * Re-read the list, `/api/auth/status`, and the actor map. Returns the failure,
- * or `null`.
+ * Re-read the list, signed-in identity, `/api/auth/status`, and the actor map.
+ * Returns the failure, or `null`.
  *
  * The status half is not laziness: both of the things this screen does —
  * setting the first password, adding the second account — change how the *login
@@ -77,24 +77,49 @@ function upsert(accounts: Account[], account: Account): Account[] {
 async function resync(
   set: (partial: Partial<AccountState>) => void,
 ): Promise<unknown | null> {
-  // All three, independently. They answer different questions of different
+  // All four, independently. They answer different questions of different
   // servers' worth of state, and the list failing used to skip the status
   // refresh entirely — so an install that had just set its first password or
   // added its second account could be left with `loginMode`
   // describing the instance it was five seconds ago, purely because a list
   // request happened to fail. A rename whose label never updated because the
   // list redraw failed is the same bug wearing different clothes.
-  const [listOutcome] = await Promise.allSettled([
+  // `/accounts/me` repairs the reachable state where startup authenticated a
+  // token but its identity read failed transiently. Bind the late result to
+  // the auth generation that asked for it so logout or another login cannot
+  // install the previous session's account over the new one.
+  const authSession = bindAuthSession();
+  const identity = useAuthStore.getState().account;
+  const [listOutcome, identityOutcome] = await Promise.allSettled([
     api.listAccounts(),
+    identity ? Promise.resolve(identity) : api.getOwnAccount(),
     // Both of these swallow their own failures and keep the last known answer.
     useAuthStore.getState().refreshStatus(),
     useActorStore.getState().refresh(),
   ]);
+  const auth = useAuthStore.getState();
+  if (
+    !identity
+    && identityOutcome.status === 'fulfilled'
+    && identityOutcome.value
+    && auth.authenticated
+    && !auth.account
+    && authSession.stillCurrent()
+  ) {
+    useAuthStore.setState({
+      account: {
+        id: identityOutcome.value.id,
+        username: identityOutcome.value.username,
+        actor_id: identityOutcome.value.actor_id,
+      },
+    });
+  }
   if (listOutcome.status === 'rejected') {
     set({ loading: false });
     return listOutcome.reason;
   }
   set({ accounts: listOutcome.value.accounts, loading: false });
+  if (identityOutcome.status === 'rejected') return identityOutcome.reason;
   return null;
 }
 

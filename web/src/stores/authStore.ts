@@ -123,11 +123,17 @@ function isCurrentAuthSession(generation: number): boolean {
   return generation === authGeneration;
 }
 
+/** Bind delayed work to the login/logout generation that started it. */
+export function bindAuthSession(): { stillCurrent: () => boolean } {
+  const generation = authGeneration;
+  return { stillCurrent: () => isCurrentAuthSession(generation) };
+}
+
 /** Bind delayed optimistic work to the actor and auth session that requested it. */
 export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
-  const generation = authGeneration;
+  const authSession = bindAuthSession();
   const actorId = useAuthStore.getState().account?.actor_id ?? null;
-  return { actorId, stillCurrent: () => isCurrentAuthSession(generation) };
+  return { actorId, stillCurrent: authSession.stillCurrent };
 }
 
 function identityOf(account: Account): SignedInAccount {
