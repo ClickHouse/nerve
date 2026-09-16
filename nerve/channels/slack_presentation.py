@@ -70,6 +70,9 @@ _APPROVAL_STYLES: dict[str, str] = {
 }
 
 _BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt);)")
+# The trailing part of an entity this module writes, with its ``;`` still to
+# come: ``&``, ``&a``, ``&am``, ``&amp``, ``&l``, ``&lt``, ``&g`` or ``&gt``.
+_ENTITY_TAIL_RE = re.compile(r"&(?:amp|am|a|lt|l|gt|g)?$")
 
 
 def _escape_ampersands(text: str) -> str:
@@ -139,6 +142,18 @@ def slack_to_plain(text: str, bot_user_id: str = "") -> str:
     return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").strip()
 
 
+def _entity_safe_cut(line: str, limit: int) -> int:
+    """Where to cut *line* so the cut stays outside an escaped entity.
+
+    A line long enough to need a hard cut is measured after conversion, and
+    a cut through ``&amp;``, ``&lt;`` or ``&gt;`` sends both halves as
+    literal text. Backing up to the ``&`` keeps the entity whole. A cut at
+    the very start is kept, since a shorter one would make no progress.
+    """
+    match = _ENTITY_TAIL_RE.search(line[:limit])
+    return match.start() if match and match.start() else limit
+
+
 def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     """Split text under *limit*, preferring line boundaries."""
     if len(text) <= limit:
@@ -151,8 +166,9 @@ def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.append(line[:limit])
-            line = line[limit:]
+            cut = _entity_safe_cut(line, limit)
+            chunks.append(line[:cut])
+            line = line[cut:]
         if not current:
             current = line
         elif len(current) + 1 + len(line) <= limit:
