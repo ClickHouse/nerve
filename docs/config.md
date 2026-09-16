@@ -1262,6 +1262,22 @@ Mode delivers an event to only one connection per app, so each instance needs
 its **own app** — a second instance sharing one app's tokens would take events
 away from the first rather than run beside it.
 
+### Notifications
+
+Question and approval cards go to Slack by default.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+
+`notifications.channels` replaces the default rather than adding to it, so
+list every transport you want. A name nothing delivers to is skipped with a
+warning. Slack in the list costs nothing while Slack is off.
+
+Names and globs are not resolved for the `slack_channel_id` fallback. Without
+a literal channel ID, delivery is skipped with a warning.
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
