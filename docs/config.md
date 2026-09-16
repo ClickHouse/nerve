@@ -1288,8 +1288,9 @@ and `slack.allow_channels` then bounds where it may go. The target must be a lit
 | `slack.allow_outbound` | bool | `false` | Let an agent post to a conversation it names |
 
 While no channel is both enabled and outbound-enabled, the tool is not offered
-to the agent at all. The check reads live config per session, so a reload adds
-or removes it.
+to the agent at all: it is absent from the system prompt and from the tool
+list, whichever backend runs the session. The check reads live config per
+session, so a reload adds or removes it.
 
 Three differences from the inbound policy:
 
