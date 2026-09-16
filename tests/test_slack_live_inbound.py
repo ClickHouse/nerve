@@ -50,6 +50,8 @@ from tests.slack_live import (
     SOCKET_DRAIN_SECONDS,
     build_channel,
     direct_message_guardrails,
+    instrument_channel,
+    live_config,
     make_client,
     wait_until_quiet,
     ignore_stale_events,
@@ -409,35 +411,61 @@ class TestReconnectWatchdog:
         reconnect briefly overlaps the module's shared socket, and Slack may
         hand an event to either connection, so running this test earlier can
         perturb an otherwise-correct inbound assertion.
+
+        Two separate things can restore the socket, and only one of them is
+        ours. The SDK reconnects a session it finds closed, so a test that
+        only asks "is it connected again" passes whatever the watchdog does.
+        The SDK's reconnect is therefore turned off here, which leaves
+        ``SlackRuntime._watchdog`` as the only thing that can recover the
+        connection, and the evidence is a rebuilt transport rather than a
+        reconnected one: the watchdog replaces the client object, the SDK
+        keeps it.
+
+        The runtime is what owns the watchdog, so the channel is built
+        through ``reconcile`` rather than on its own.
         """
-        import nerve.channels.slack as slack_module
+        import nerve.channels.slack_runtime as runtime_module
 
         router = RecordingRouter()
-        channel, _ = build_channel(
-            router,
-            diagnostics_label="watchdog",
-            allow_users=["U0000000"],
-        )
-        await channel.start()
-        original = slack_module.WATCHDOG_INTERVAL
-        slack_module.WATCHDOG_INTERVAL = 1
+        original = runtime_module.WATCHDOG_INTERVAL
+        # Set before the task exists: the loop sleeps first, and reads the
+        # module attribute on each pass.
+        runtime_module.WATCHDOG_INTERVAL = 1
+        runtime = runtime_module.SlackRuntime(router)
+        diagnostics = None
         try:
-            await channel._client.disconnect()
-            await asyncio.sleep(0.5)
-            assert not await channel._client.is_connected()
+            assert await runtime.reconcile(
+                live_config(allow_users=["U0000000"]),
+            ) == "enabled"
+            channel = runtime.channel
+            diagnostics = instrument_channel(channel, "watchdog")
 
+            broken = channel._client
+            broken.auto_reconnect_enabled = False
+            await broken.disconnect()
+            await asyncio.sleep(0.5)
+            assert not await broken.is_connected()
+
+            # Both conditions, because rebuild_transport publishes the new
+            # client before it connects it.
             deadline = time.monotonic() + EVENT_TIMEOUT
             while time.monotonic() < deadline:
-                if await channel._client.is_connected():
+                current = channel._client
+                if current is not broken and await current.is_connected():
                     break
                 await asyncio.sleep(0.5)
+            assert channel._client is not broken, (
+                "the socket stayed down; the watchdog did not rebuild the "
+                "transport"
+            )
             assert await channel._client.is_connected(), (
-                "the socket stayed down; the watchdog did not recover it"
+                "the watchdog rebuilt the transport but it never connected"
             )
         finally:
-            slack_module.WATCHDOG_INTERVAL = original
-            await channel.stop()
-            channel._live_diagnostics.emit_summary()
+            runtime_module.WATCHDOG_INTERVAL = original
+            await runtime.shutdown()
+            if diagnostics is not None:
+                diagnostics.emit_summary()
             # Let Slack drop this connection before module fixture cleanup
             # relies on the shared socket receiving every deletion event.
             await asyncio.sleep(SOCKET_DRAIN_SECONDS)

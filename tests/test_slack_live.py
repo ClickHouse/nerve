@@ -46,6 +46,7 @@ from tests.slack_live import (
     build_channel,
     direct_message_guardrails,
     make_client,
+    requires_inbound,
     requires_no_email_token,
     requires_outbound,
     start_event_sink,
@@ -457,10 +458,11 @@ class TestSlackAcceptsWhatWeSend:
 
 
 @requires_outbound
+@requires_inbound
 @requires_no_email_token
 class TestScopeOmission:
     async def test_users_info_omits_email_without_the_scope_instead_of_failing(
-        self, bot,
+        self, bot, human,
     ):
         """A token without ``users:read.email`` still gets a 200.
 
@@ -468,15 +470,20 @@ class TestScopeOmission:
         the absent field looks exactly like a user who has no email, so the
         rule matches nothing and would admit the person it names. The channel
         refuses instead, and this test is what says that premise is real.
+
+        The subject has to be a person. A bot user carries no
+        ``profile.email`` for either token, so comparing two answers about
+        one says nothing about the scope — which is why the user token's
+        owner is the subject, and why this needs the inbound credential.
         """
-        auth = await bot.auth_test()
-        with_scope = await bot.users_info(user=auth["user_id"])
+        subject = (await human.auth_test())["user_id"]
+        with_scope = await bot.users_info(user=subject)
         assert with_scope["user"]["profile"].get("email"), (
             "the main bot token needs users:read.email for this comparison"
         )
 
         limited = make_client(NO_EMAIL_BOT_TOKEN)
-        response = await limited.users_info(user=auth["user_id"])
+        response = await limited.users_info(user=subject)
         assert response["ok"], "expected a successful response, not an error"
         assert not response["user"]["profile"].get("email"), (
             "the no-email token returned an email; it still has the scope"
