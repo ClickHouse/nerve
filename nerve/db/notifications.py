@@ -142,6 +142,31 @@ class NotificationStore:
             )
         return True
 
+    async def claim_pending_approval(self, notification_id: str) -> bool:
+        """Take a pending approval, so one presser acts on it.
+
+        An approval runs its dispatcher before the row is settled, and that
+        can take seconds, so reading the status first cannot decide who
+        acts: two presses arriving together both see a pending row. This
+        write decides. It stamps ``answered_at`` only while the row is
+        pending and unstamped, so exactly one caller sees a row change and
+        the action behind the card runs once.
+
+        The row stays pending, because the dispatcher may answer with a
+        snooze and keep it that way. ``answered_at`` alone is the claim, so
+        :meth:`snooze_notification` clears it and the card that resurfaces
+        can be pressed again. A claim left behind by a process that died
+        mid-dispatch refuses later presses until the expiry sweep takes the
+        row, which is what an approval nobody answers does in any case.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        result = await self._write(
+            """UPDATE notifications SET answered_at = ?
+               WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
+            (now, notification_id),
+        )
+        return result.rowcount == 1
+
     async def record_notification_delivery(
         self,
         notification_id: str,
@@ -322,6 +347,10 @@ class NotificationStore:
         ``redeliver_at`` again — each snooze buys another cycle, up to
         ``config.notifications.max_redeliveries``.
 
+        Clearing ``answered_at`` releases the claim
+        :meth:`claim_pending_approval` took, so the card that resurfaces
+        can be pressed again.
+
         Returns True on success, False if the row is not pending.
         """
         async with self._atomic():
@@ -332,7 +361,8 @@ class NotificationStore:
                 if not await cursor.fetchone():
                     return False
             await self.db.execute(
-                """UPDATE notifications SET redeliver_at = ?, expires_at = ?
+                """UPDATE notifications
+                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL
                    WHERE id = ?""",
                 (redeliver_at, new_expires_at, notification_id),
             )

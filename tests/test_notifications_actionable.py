@@ -273,6 +273,41 @@ class TestSchemaAndStore:
             "n1", redeliver_at, new_expiry,
         ) is False
 
+    async def test_a_pending_approval_is_claimed_once(self, db: Database):
+        await db.create_session("s1")
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="approval", title="t",
+        )
+        assert await db.claim_pending_approval("n1") is True
+        assert await db.claim_pending_approval("n1") is False
+        notif = await db.get_notification("n1")
+        assert notif["status"] == "pending"
+        assert notif["answered_at"] is not None
+
+    async def test_a_settled_approval_cannot_be_claimed(self, db: Database):
+        await db.create_session("s1")
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="approval", title="t",
+        )
+        await db.answer_notification("n1", "approve", "web")
+        assert await db.claim_pending_approval("n1") is False
+
+    async def test_a_snooze_releases_the_claim(self, db: Database):
+        await db.create_session("s1")
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="approval", title="t",
+        )
+        assert await db.claim_pending_approval("n1") is True
+        assert await db.snooze_notification(
+            "n1",
+            (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+            (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+        ) is True
+        notif = await db.get_notification("n1")
+        assert notif["answered_at"] is None
+        # The card resurfaces answerable, which is the point of a snooze.
+        assert await db.claim_pending_approval("n1") is True
+
 
 # ----------------------------------------------------------------------
 #  propose_action

@@ -477,11 +477,12 @@ class NotificationService:
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
 
-        - For ``type=approval`` rows: look up the dispatcher in the
-          handler registry, run it, audit-log the outcome, then flip
-          the row's status. Snooze answers keep the row pending and
-          stamp ``redeliver_at`` so the periodic maintenance tick
-          (:meth:`redeliver_due`) fans it out again with a fresh card.
+        - For ``type=approval`` rows: claim the row, look up the
+          dispatcher in the handler registry, run it, audit-log the
+          outcome, then flip the row's status. Snooze answers keep the
+          row pending and stamp ``redeliver_at`` so the periodic
+          maintenance tick (:meth:`redeliver_due`) fans it out again
+          with a fresh card.
         - For ``type=question`` rows (legacy): persist the answer,
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
@@ -580,11 +581,26 @@ class NotificationService:
         answered_by: str,
         actor: str | None = None,
     ) -> bool:
-        """Route an approval answer through the dispatcher registry."""
+        """Route an approval answer through the dispatcher registry.
+
+        Claims the row before the dispatcher runs. The status read in
+        :meth:`handle_answer` cannot decide who acts, because the dispatch
+        it precedes takes long enough for a second press to pass the same
+        read, and the action behind an approval card is not repeatable. A
+        card in a shared channel has as many pressers as the channel has
+        members, so the claim is what keeps one decision to one action.
+        """
         notification_id = notif["id"]
         session_id = notif["session_id"]
         target_kind = notif.get("target_kind") or ""
         target_id = notif.get("target_id") or ""
+
+        if not await self.db.claim_pending_approval(notification_id):
+            logger.info(
+                "approval %s is already claimed; the %r press from %s is "
+                "ignored", notification_id, answer, actor or answered_by,
+            )
+            return False
 
         dispatcher = _handlers.get(target_kind) if target_kind else None
         if dispatcher is None:
@@ -675,9 +691,15 @@ class NotificationService:
             await self.db.snooze_notification(
                 notification_id, snooze_until, new_expires_at,
             )
-        else:
-            await self.db.answer_notification(
-                notification_id, answer, answered_by, actor=actor,
+        elif not await self.db.answer_notification(
+            notification_id, answer, answered_by, actor=actor,
+        ):
+            # The expiry sweep can take a claimed row while its dispatcher
+            # runs, which leaves the action done and the row expired.
+            logger.warning(
+                "approval %s stopped being pending during its dispatch; the "
+                "%r decision ran but the row does not record it",
+                notification_id, answer,
             )
 
         from nerve.agent.streaming import broadcaster

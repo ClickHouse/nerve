@@ -711,6 +711,92 @@ class TestExpiryReporting:
 
 
 # ----------------------------------------------------------------------
+#  Concurrent presses
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConcurrentPresses:
+    """An approval card in a shared channel has many pressers.
+
+    Every Socket Mode envelope is dispatched as its own task, so two
+    members pressing inside the same second run two answers at once.
+    """
+
+    async def test_two_presses_dispatch_the_action_once(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace,
+    ):
+        decisions: list[str] = []
+
+        async def dispatch(notification, target_id, decision, config):
+            decisions.append(decision)
+            # Hold the dispatch open, which is where the second press
+            # arrives: a real one runs a shell script.
+            await asyncio.sleep(0.05)
+            return _handlers.DispatchResult(
+                ok=True,
+                audit_event={
+                    "event": "approval-acted",
+                    "notification_id": notification.get("id", ""),
+                    "target_kind": "concurrency-test",
+                    "target_id": target_id,
+                    "decision": decision,
+                    "ok": True,
+                },
+            )
+
+        _handlers.register("concurrency-test", dispatch)
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1")
+        nid = await _make_approval(svc, db, target_kind="concurrency-test")
+
+        alice, bob = await asyncio.gather(
+            svc.handle_answer(nid, "approve", "slack", actor="U-alice"),
+            svc.handle_answer(nid, "approve", "slack", actor="U-bob"),
+        )
+
+        assert sorted([alice, bob]) == [False, True]
+        assert decisions == ["approve"]
+        records = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        acted = [r for r in records if r.get("event") == "approval-acted"]
+        assert len(acted) == 1
+        assert (await db.get_notification(nid))["status"] == "answered"
+
+    async def test_a_snooze_leaves_the_card_answerable(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # A snooze releases the claim, so the claim refuses a press for one
+        # round only, not for the life of the card.
+        def dispatch(notification, target_id, decision, config):
+            return _handlers.DispatchResult(
+                ok=True,
+                audit_event={
+                    "event": "approval-acted",
+                    "target_kind": "claim-release-test",
+                    "decision": decision,
+                    "ok": True,
+                },
+                snooze_until=_iso(24) if decision.startswith("snooze") else None,
+            )
+
+        _handlers.register("claim-release-test", dispatch)
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1")
+        nid = await _make_approval(
+            svc, db, target_kind="claim-release-test", expiry_hours=2,
+        )
+
+        assert await svc.handle_answer(nid, "snooze_24h", "web") is True
+        assert await svc.handle_answer(nid, "approve", "web") is True
+        notif = await db.get_notification(nid)
+        assert notif["status"] == "answered"
+        assert notif["answer"] == "approve"
+
+
+# ----------------------------------------------------------------------
 #  Answer attribution
 # ----------------------------------------------------------------------
 
