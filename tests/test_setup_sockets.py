@@ -311,6 +311,7 @@ class TestASocketHeldAcrossTheClaim:
         with instance.client.websocket_connect(f"/ws?token={visitor}") as socket:
             socket.receive_json()
             assert len(server._live_sockets) == 1
+            assert all(len(client_id) == 36 for client_id in server._live_sockets)
         # Closed by the client: the handler's cleanup drops it.
         assert server._live_sockets == {}
 

@@ -113,7 +113,7 @@ where the hash lives is not.
 | `PATCH /api/accounts/{id}` | `{username?, display_name?}`. A rename moves no stored attribution |
 | `POST /api/accounts/{id}/disable` | idempotent |
 | `POST /api/accounts/{id}/enable` | idempotent |
-| `PUT /api/accounts/me/password` | `{current_password?, new_password}`. Own account only |
+| `PUT /api/accounts/me/password` | `{current_password?, new_password}`. Own account only; revokes its other sessions and returns this tab's replacement in `X-Nerve-Token` |
 
 Failures:
 

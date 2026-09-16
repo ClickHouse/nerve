@@ -14,16 +14,18 @@ import asyncio
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.gateway.auth import (
+    SESSION_TOKEN_HEADER,
     create_session_token,
     create_system_token,
     hash_password,
     pin_jwt_secret,
     verify_password,
 )
+from nerve.gateway import server
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
 
@@ -36,6 +38,15 @@ _PASSWORD = "correct-horse-battery-staple"
 
 def _app() -> FastAPI:
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _return_replacement_token(request: Request, call_next):
+        response = await call_next(request)
+        token = getattr(request.state, "refreshed_token", None)
+        if token:
+            response.headers[SESSION_TOKEN_HEADER] = token
+        return response
+
     app.include_router(auth_routes.router)
     app.include_router(accounts_routes.router)
     return app
@@ -550,6 +561,52 @@ class TestOwnPassword:
         assert right.status_code == 200
         account = await install.db.get_account(install.owner_id)
         assert verify_password("another-one", account["credential"])
+
+    async def test_a_change_revokes_old_sessions_and_replaces_the_calling_one(
+        self, install: _Install,
+    ):
+        await install.secure_the_owner()
+        old_token = install.token()
+
+        class _OpenSocket:
+            closed: tuple[int, str] | None = None
+
+            async def close(self, code: int, reason: str) -> None:
+                self.closed = (code, reason)
+
+        socket = _OpenSocket()
+        actor = await server.actor_for_account(
+            install.db, install.owner_id, session_epoch=0,
+        )
+        connection = server.WebSocketConnection(
+            client_id="stolen-session", actor=actor, session_epoch=0,
+        )
+        server._live_sockets[connection.client_id] = (connection, socket)
+        try:
+            async with _client(install.app) as client:
+                changed = await client.put(
+                    "/api/accounts/me/password",
+                    json={
+                        "current_password": _PASSWORD,
+                        "new_password": "another-one",
+                    },
+                    headers=_bearer(old_token),
+                )
+                assert changed.status_code == 200, changed.text
+                replacement = changed.headers[SESSION_TOKEN_HEADER]
+                assert replacement and replacement != old_token
+                assert socket.closed == (
+                    server.WS_REVOKED_CODE, server.WS_REVOKED_REASON,
+                )
+
+                assert (await client.get(
+                    "/api/accounts/me", headers=_bearer(old_token),
+                )).status_code == 401
+                assert (await client.get(
+                    "/api/accounts/me", headers=_bearer(replacement),
+                )).status_code == 200
+        finally:
+            server._live_sockets.pop(connection.client_id, None)
 
     async def test_a_configured_password_counts_as_the_current_one(self, install: _Install):
         """A ``config``-source account has a password — in configuration — so it

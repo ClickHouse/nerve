@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -164,7 +166,7 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
         await websocket.close(code=4001, reason="Unauthorized")
         return None
     return WebSocketConnection(
-        client_id=str(uuid.uuid4())[:8],
+        client_id=str(uuid.uuid4()),
         actor=actor,
         session_epoch=actor.session_epoch,
     )
@@ -992,6 +994,23 @@ def create_app() -> FastAPI:
     @app.exception_handler(SkillIdError)
     async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # FastAPI includes the rejected request value in validation errors. That is
+    # useful for ordinary fields but can reflect credentials verbatim — notably
+    # the setup token when another required claim field is absent. Preserve the
+    # location, message, type and validation context while never echoing input.
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(  # noqa: ANN001
+        request, exc: RequestValidationError,
+    ):
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
 
     # Sliding session tokens. `require_auth` re-mints a session token once it
     # is past half its lifetime and stashes it on request.state; hand it back

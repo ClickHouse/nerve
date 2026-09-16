@@ -135,6 +135,11 @@ account that already has one must supply it, so a stolen session token is not on
 its own enough to take the account over. An unclaimed account must use the
 setup-token-protected claim endpoint instead.
 
+A successful password change advances that account's session epoch. Every
+older HTTP token becomes stale and every open WebSocket is best-effort closed;
+the response carries a replacement token for the tab that proved the current
+password. This is the incident-response path for revoking a copied session.
+
 ### Usernames
 
 A username is a **lookup key, not an identity**. The identity is the actor id,

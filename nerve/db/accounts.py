@@ -440,6 +440,7 @@ class AccountStore:
         username: str | object = _UNSET,
         credential: str | object = _UNSET,
         expected_session_epoch: int | None = None,
+        revoke_sessions: bool = False,
     ) -> dict | None:
         """Change a username and/or move its password to the account row.
 
@@ -447,6 +448,12 @@ class AccountStore:
         still being at the epoch the caller's credential named — so a password
         change authorised before a claim cannot land after it. Raises
         :class:`StaleSessionError` when they have diverged.
+
+        ``revoke_sessions`` advances that epoch in the same transaction as a
+        credential change. The caller that changed its own password can mint a
+        replacement at the returned epoch; every previously issued session is
+        stale. It is invalid without ``credential`` because non-credential
+        profile edits must not unexpectedly sign devices out.
 
         Returns the updated row, or ``None`` if there is no such account.
         """
@@ -462,6 +469,10 @@ class AccountStore:
             sets.append("credential_source = 'local'")
             sets.append("credential = ?")
             params.append(credential)
+        if revoke_sessions:
+            if credential is _UNSET:
+                raise ValueError("revoking sessions requires a credential change")
+            sets.append("session_epoch = session_epoch + 1")
         if not sets:
             return await self.get_account(account_id)
 
