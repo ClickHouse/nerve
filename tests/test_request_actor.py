@@ -38,6 +38,7 @@ from nerve.gateway.auth import (
     SESSION_TOKEN_HEADER,
     TOKEN_TYPE_CLAIM,
     TOKEN_TYPE_SESSION,
+    TOKEN_TYPE_SYSTEM,
     create_external_mcp_token,
     create_mcp_session_token,
     create_session_token,
@@ -784,4 +785,15 @@ class TestFailsClosedWithoutAStore:
         with pytest.raises(ActorResolutionError):
             await resolve_actor_from_claims(
                 install.db, {"sub": None, TOKEN_TYPE_CLAIM: TOKEN_TYPE_SESSION},
+            )
+
+    async def test_a_corrupt_system_principal_is_a_resolution_failure(self, install):
+        """External mutation after startup must keep the ingress error-shaped."""
+        async def _corrupt_principal():
+            raise RuntimeError("cached system actor no longer satisfies its invariant")
+
+        install.db.get_system_principal = _corrupt_principal
+        with pytest.raises(ActorResolutionError, match="no valid system principal"):
+            await resolve_actor_from_claims(
+                install.db, {"sub": "agent-system", TOKEN_TYPE_CLAIM: TOKEN_TYPE_SYSTEM},
             )

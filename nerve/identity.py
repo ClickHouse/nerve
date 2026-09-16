@@ -97,7 +97,16 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
 
 async def system_actor(store: "AccountStore") -> Actor:
     """Resolve the account-less principal used for autonomous work."""
-    row = await store.get_system_principal()
+    try:
+        row = await store.get_system_principal()
+    except RuntimeError as e:
+        # AccountStore validates this singleton when the database opens and
+        # raises if later external mutation breaks the cached invariant. Turn
+        # that storage failure into the same fail-closed resolution error every
+        # authenticated ingress already knows how to render.
+        raise ActorResolutionError(
+            "This instance has no valid system principal"
+        ) from e
     if row is None:
         raise ActorResolutionError(
             "This instance has no system principal; identity bootstrap has not run"

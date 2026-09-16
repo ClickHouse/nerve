@@ -89,8 +89,10 @@ Two consequences worth knowing:
   A token issued before the change is still signed and unexpired, so the
   account row is the only thing that can stop it — and it does, at every door:
   HTTP, a new WebSocket, and the MCP endpoint.
-- **A WebSocket's identity is fixed when it connects.** Renaming does not
-  rewrite it; disabling the account closes the stale socket on its next frame.
+- **A WebSocket's identity and authority are fixed when it connects.** Renaming
+  does not rewrite it, and disabling the account takes effect when that socket
+  reconnects. HTTP, MCP, and new WebSocket connections re-check the account
+  immediately.
 
 Autonomous work — cron jobs, channel traffic, background agents, and the
 instance talking to itself — acts as the **system principal** rather than as
