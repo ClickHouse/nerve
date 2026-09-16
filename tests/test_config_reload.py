@@ -767,6 +767,310 @@ class TestTighteningActuallyTightens:
         assert "new-secret" not in summary["restart_required"]
 
 
+class TestSlackLifecycleReload:
+    @staticmethod
+    def _body(bot_token, app_token, allow_user=None):
+        allow = f"  allow_users: [{allow_user}]\n" if allow_user else ""
+        return (
+            "slack:\n"
+            "  enabled: true\n"
+            f"  bot_token: {bot_token}\n"
+            f"  app_token: {app_token}\n"
+            f"{allow}"
+        )
+
+    @classmethod
+    def _running_channel(
+        cls, config_dir, workspace, monkeypatch,
+        bot_token="xoxb-old", app_token="xapp-old", allow_user=None,
+    ):
+        import nerve.config as cfgmod
+        from nerve.channels.slack import SlackChannel
+
+        _write_config(
+            config_dir, workspace,
+            cls._body(bot_token, app_token, allow_user),
+        )
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        channel = SlackChannel(cfgmod.get_config(), router=MagicMock())
+        channel._active_bot_token = bot_token
+        channel._active_app_token = app_token
+        channel._state = "running"
+        channel._web = object()
+        return channel
+
+    @staticmethod
+    def _engine(channel, notification_service=None):
+        from nerve.channels.slack_runtime import SlackRuntime
+
+        state = {"channel": channel}
+        router = MagicMock()
+        router.get_channel.side_effect = lambda name: (
+            state["channel"] if name == "slack" else None
+        )
+
+        def register(candidate):
+            state["channel"] = candidate
+
+        def unregister(candidate):
+            if state["channel"] is not candidate:
+                return False
+            state["channel"] = None
+            return True
+
+        router.register.side_effect = register
+        router.unregister.side_effect = unregister
+        if channel is not None:
+            channel.router = router
+        runtime = SlackRuntime(router, notification_service)
+        runtime._channel = channel
+        runtime._active_config = channel.config if channel is not None else None
+        engine = SimpleNamespace(
+            router=router,
+            notification_service=notification_service,
+            reload_mcp_config=AsyncMock(return_value=[]),
+            _skill_manager=None,
+        )
+        engine.get_channel_runtime = lambda name: runtime if name == "slack" else None
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_changed_tokens_rotate_the_running_transport(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+
+        async def rotate(config):
+            channel._active_bot_token = config.slack.bot_token
+            channel._active_app_token = config.slack.app_token
+            channel.apply_config(config)
+
+        channel.reload_credentials = AsyncMock(side_effect=rotate)
+        engine = self._engine(channel)
+
+        _write_config(
+            config_dir,
+            ws,
+            self._body("xoxb-new", "xapp-new"),
+        )
+        summary = await reload_all(engine, None, config_dir)
+
+        channel.reload_credentials.assert_awaited_once()
+        desired = channel.reload_credentials.await_args.args[0]
+        assert desired.slack.bot_token == "xoxb-new"
+        assert desired.slack.app_token == "xapp-new"
+        assert summary["slack"] == "credentials reloaded"
+        assert "slack.bot_token" not in summary.get("restart_required", "")
+        assert "slack.app_token" not in summary.get("restart_required", "")
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_enabling_starts_wires_and_registers_the_channel(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.config as cfgmod
+        from nerve.channels.slack import SlackChannel
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws)
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+
+        started = []
+
+        async def start(channel):
+            started.append(channel)
+            channel._state = "running"
+            channel._web = object()
+
+        monkeypatch.setattr(SlackChannel, "start", start)
+        notifications = object()
+        engine = self._engine(None, notifications)
+
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+        summary = await reload_all(engine, None, config_dir)
+
+        channel = engine.router.get_channel("slack")
+        assert started == [channel]
+        assert channel._notification_service is notifications
+        engine.router.register.assert_called_once_with(channel)
+        assert summary["slack"] == "enabled"
+        assert "restart_required" not in summary
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_disabling_unregisters_and_drains_the_channel(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+        channel.stop = AsyncMock()
+        engine = self._engine(channel)
+
+        _write_config(config_dir, ws, "slack:\n  enabled: false\n")
+        summary = await reload_all(engine, None, config_dir)
+
+        engine.router.unregister.assert_called_once_with(channel)
+        channel.stop.assert_awaited_once_with(drain=True)
+        assert engine.router.get_channel("slack") is None
+        assert summary["slack"] == "disabled"
+        assert "restart_required" not in summary
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_disable_cleanup_failure_is_reported_after_unregister(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+        channel.stop = AsyncMock(side_effect=RuntimeError("socket stuck"))
+        engine = self._engine(channel)
+
+        _write_config(config_dir, ws, "slack:\n  enabled: false\n")
+        summary = await reload_all(engine, None, config_dir)
+
+        assert engine.router.get_channel("slack") is None
+        assert reload_failures(summary)["slack"] == "socket stuck"
+
+    @pytest.mark.asyncio
+    async def test_a_disable_failure_redacts_the_generation_it_stopped(
+        self, tmp_path, monkeypatch,
+    ):
+        # The desired generation carries no tokens once the operator removes
+        # them, so redacting against it alone left the live token in a
+        # message that reload_all returns over HTTP.
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(
+            config_dir, ws, monkeypatch,
+            bot_token="xoxb-live-secret", app_token="xapp-live-secret",
+        )
+        channel.stop = AsyncMock(
+            side_effect=RuntimeError(
+                "close failed for xoxb-live-secret and xapp-live-secret",
+            ),
+        )
+        engine = self._engine(channel)
+
+        _write_config(config_dir, ws, "slack:\n  enabled: false\n")
+        summary = await reload_all(engine, None, config_dir)
+
+        failure = reload_failures(summary)["slack"]
+        assert "xoxb-live-secret" not in failure
+        assert "xapp-live-secret" not in failure
+        assert failure == "close failed for <redacted> and <redacted>"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_enable_stays_absent_and_retries(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.config as cfgmod
+        from nerve.channels.slack import SlackChannel
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws)
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+
+        attempts = 0
+
+        async def start(channel):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("bad xoxb-new")
+            channel._state = "running"
+            channel._web = object()
+
+        monkeypatch.setattr(SlackChannel, "start", start)
+        engine = self._engine(None)
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+
+        first = await reload_all(engine, None, config_dir)
+        second = await reload_all(engine, None, config_dir)
+
+        assert reload_failures(first)["slack"] == "bad <redacted>"
+        assert second["slack"] == "enabled"
+        assert engine.router.get_channel("slack") is not None
+        assert attempts == 2
+
+    @pytest.mark.asyncio
+    async def test_enabling_without_both_tokens_stays_absent(
+        self, tmp_path, monkeypatch,
+    ):
+        import nerve.config as cfgmod
+
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        _write_config(config_dir, ws)
+        monkeypatch.setattr(cfgmod, "_config", cfgmod.load_config(config_dir))
+        engine = self._engine(None)
+
+        _write_config(
+            config_dir, ws,
+            "slack:\n  enabled: true\n  bot_token: xoxb-only\n",
+        )
+        summary = await reload_all(engine, None, config_dir)
+
+        assert engine.router.get_channel("slack") is None
+        assert "both bot_token and app_token" in reload_failures(summary)["slack"]
+        engine.router.register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_guardrail_only_reload_does_not_reconnect(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(
+            config_dir, ws, monkeypatch,
+            "xoxb-same", "xapp-same", "U0000001",
+        )
+        channel.reload_credentials = AsyncMock()
+
+        _write_config(config_dir, ws, self._body(
+            "xoxb-same", "xapp-same", "U0000002",
+        ))
+        summary = await reload_all(self._engine(channel), None, config_dir)
+
+        channel.reload_credentials.assert_not_awaited()
+        assert "slack" not in summary
+        assert reload_failures(summary) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rotation_is_redacted_and_retryable(
+        self, tmp_path, monkeypatch,
+    ):
+        config_dir, ws = tmp_path / "cfg", tmp_path / "ws"
+        ws.mkdir()
+        channel = self._running_channel(config_dir, ws, monkeypatch)
+        channel.reload_credentials = AsyncMock(side_effect=RuntimeError(
+            "could not use xoxb-new with xapp-new",
+        ))
+        engine = self._engine(channel)
+
+        _write_config(
+            config_dir, ws, self._body("xoxb-new", "xapp-new"),
+        )
+        first = await reload_all(engine, None, config_dir)
+        second = await reload_all(engine, None, config_dir)
+
+        assert channel.reload_credentials.await_count == 2
+        for summary in (first, second):
+            failure = reload_failures(summary)["slack"]
+            assert "xoxb-new" not in failure
+            assert "xapp-new" not in failure
+            assert failure == "could not use <redacted> with <redacted>"
+
+
 class TestReloadRoute:
     @pytest.mark.asyncio
     async def test_route_returns_summary(self, tmp_path, monkeypatch):
@@ -801,9 +1105,12 @@ class TestReloadRoute:
         monkeypatch.setattr(route_mod, "get_deps", lambda: SimpleNamespace(engine=None))
         monkeypatch.setattr(
             "nerve.config_reload.reload_all",
-            AsyncMock(return_value={
-                "config": "error: bad yaml", "cron": {"enabled": 3},
-            }),
+            AsyncMock(
+                return_value={
+                    "config": "error: bad yaml",
+                    "cron": {"enabled": 3},
+                }
+            ),
         )
         result = await route_mod.reload_config_route(user={})
         assert result["ok"] is False
