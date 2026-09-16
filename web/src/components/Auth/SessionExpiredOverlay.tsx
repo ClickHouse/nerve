@@ -13,17 +13,18 @@ import { Button, TextField } from '../ui';
  *
  * **It unlocks one account: the one whose app is on screen.** Everything
  * underneath — drafts, which notifications have been read, the loaded session
- * list — belongs to that person, and a form that took any username would let
- * somebody else walk up to a colleague's expired tab, sign in, and inherit all
- * of it (and then send a draft they never wrote, under their own name). So the
- * username is shown rather than asked for, and switching accounts goes through
- * "log out", which is the action that purges.
+ * list — belongs to that person. The account id read after login must match the
+ * cached one before the app unlocks; a different account is signed straight
+ * back out and the account-scoped state is purged. That lets the username stay
+ * editable here, because another tab may have renamed the same account while
+ * this session was expired.
  */
 export function SessionExpiredOverlay() {
   const [password, setPassword] = useState('');
   const {
     login, loading, error, logout, loginMode, refreshStatus, account,
   } = useAuthStore();
+  const [username, setUsername] = useState(account?.username ?? '');
 
   // The session has been open for a while; the instance may have gained its
   // second account in that time. Here that only decides what to display — the
@@ -32,10 +33,11 @@ export function SessionExpiredOverlay() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    // Always this account, never something typed. On a single-account install
-    // there is no username to send and the server resolves the only account
-    // there is, which is the same one.
-    login(password, account?.username ?? undefined);
+    // A single-account login deliberately omits the mutable username; the
+    // server resolves the sole account. With multiple accounts the current
+    // lookup key is needed, and the store verifies the returned account id
+    // before it unlocks the mounted app.
+    login(password, loginMode === 'username_password' ? username : undefined);
   };
 
   // Which account this was cannot always be established — the call that reads
@@ -66,7 +68,17 @@ export function SessionExpiredOverlay() {
             <p className="text-sm text-text-muted mb-6 text-center">
               Your work is still here — log back in to continue.
             </p>
-            {account.username && (
+            {loginMode === 'username_password' ? (
+              <TextField
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Username"
+                aria-label="Username"
+                autoComplete="username"
+                className="mb-3"
+              />
+            ) : account.username ? (
               <TextField
                 type="text"
                 value={account.username}
@@ -75,7 +87,7 @@ export function SessionExpiredOverlay() {
                 disabled
                 className="mb-3"
               />
-            )}
+            ) : null}
             <TextField
               type="password"
               value={password}
