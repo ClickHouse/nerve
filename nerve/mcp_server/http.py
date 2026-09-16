@@ -33,6 +33,7 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
+from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.tools import ToolContext, ToolRegistry
 from nerve.gateway.auth import MCP_WORKER_CLAIM
 from nerve.mcp_server.audit import build_audit_writer
@@ -234,6 +235,11 @@ def build_manager(
         ctx_resolver=ctx_resolver,
         audit_writer=audit_writer,
         include_hoa=config.mcp_endpoint.include_hoa,
+        # Read off the engine's live config, not the snapshot above: a
+        # Codex session takes its nerve tools from this endpoint, and its
+        # tool list has to agree with the system prompt the same config
+        # builds. Satellite clients read one list per connection.
+        excluded=lambda: config_excluded_tools(engine.config),
     )
     return StreamableHTTPSessionManager(
         app=server,

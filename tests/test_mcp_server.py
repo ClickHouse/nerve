@@ -112,6 +112,35 @@ class TestBuildMcpServer:
         names = {t.name for t in result.tools}
         assert names == {"regular", "hoa_execute"}
 
+    async def test_list_tools_hides_what_the_config_cannot_serve(self):
+        # A satellite session reads its tools from here, so a name the
+        # config leaves nothing to serve has to be absent from this list
+        # as well as from the prompt.
+        registry = ToolRegistry()
+        registry.register(_make_spec("alpha"))
+        registry.register(_make_spec("beta"))
+        server = build_mcp_server(
+            registry, ctx_resolver=_ctx_resolver(), excluded=lambda: {"beta"},
+        )
+
+        result = await _invoke_list_tools(server)
+        assert {t.name for t in result.tools} == {"alpha"}
+
+    async def test_the_exclusions_are_read_per_request(self):
+        # This endpoint is built once at startup, so a config reload can
+        # only reach it through the call.
+        registry = ToolRegistry()
+        registry.register(_make_spec("alpha"))
+        hidden: set[str] = {"alpha"}
+        server = build_mcp_server(
+            registry, ctx_resolver=_ctx_resolver(), excluded=lambda: hidden,
+        )
+
+        assert (await _invoke_list_tools(server)).tools == []
+        hidden.clear()
+        result = await _invoke_list_tools(server)
+        assert {t.name for t in result.tools} == {"alpha"}
+
 
 # mcp 2.x dispatches through `get_request_handler(method)`, keyed by method
 # string, and hands the handler the request context plus a params model. The
@@ -191,6 +220,21 @@ class TestCallToolDispatch:
         call_result: CallToolResult = result
         assert call_result.is_error is True
         assert "not available" in call_result.content[0].text
+
+    async def test_an_excluded_tool_is_refused_by_name(self):
+        # A client holding an older tool list can still name the tool, and
+        # the handler behind it has nothing to serve.
+        seen: list[dict] = []
+        registry = ToolRegistry()
+        registry.register(_make_spec("alpha", seen=seen))
+        server = build_mcp_server(
+            registry, ctx_resolver=_ctx_resolver(), excluded=lambda: {"alpha"},
+        )
+
+        result = await _invoke_call_tool(server, "alpha")
+        assert result.is_error is True
+        assert "not available" in result.content[0].text
+        assert seen == []
 
     async def test_audit_writer_called_on_success(self):
         registry = ToolRegistry()

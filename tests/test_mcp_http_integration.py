@@ -185,6 +185,47 @@ def test_mcp_list_tools(app_with_mcp):
         assert not any(n.startswith("hoa_") for n in names)
 
 
+def test_mcp_list_tools_drops_what_the_config_cannot_serve(app_with_mcp):
+    """A Codex session takes its nerve tools from this endpoint.
+
+    ``send_channel_message`` can only refuse while no channel accepts
+    outbound delivery, and the system prompt built from the same config
+    does not name it, so the list must not either. Flipping the config on
+    the running app also shows the check is read per request rather than
+    frozen when the endpoint was built.
+    """
+    from nerve.config import get_config
+
+    config = get_config()
+    with TestClient(app_with_mcp) as client:
+        init_resp = _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.1"},
+            },
+        })
+        sid = init_resp.headers["mcp-session-id"]
+        _post_jsonrpc(client, {
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        }, session_id=sid)
+
+        def _tool_names() -> set[str]:
+            resp = _post_jsonrpc(client, {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            }, session_id=sid)
+            assert resp.status_code == 200, resp.text
+            body = _parse_response(resp)
+            return {t["name"] for t in body["result"]["tools"]}
+
+        assert "send_channel_message" not in _tool_names()
+
+        config.slack.enabled = True
+        config.slack.allow_outbound = True
+        assert "send_channel_message" in _tool_names()
+
+
 def test_mcp_call_tool_attributes_to_satellite_session(app_with_mcp):
     """``tools/call`` over real HTTP, asserting satellite attribution.
 
