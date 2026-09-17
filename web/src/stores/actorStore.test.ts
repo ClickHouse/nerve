@@ -5,7 +5,7 @@ import type { ActorRef } from '../api/client';
 vi.mock('../api/client', () => ({
   api: {
     listActors: vi.fn(), listAccounts: vi.fn(), updateAccount: vi.fn(),
-    authStatus: vi.fn(),
+    authStatus: vi.fn(), getOwnAccount: vi.fn(),
   },
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
   setUnauthorizedHandler: vi.fn(),
@@ -48,6 +48,10 @@ beforeEach(() => {
     .mockResolvedValue({ accounts: [] });
   (api.authStatus as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
     auth_required: true, login: 'password',
+  });
+  (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: 'acc-1', actor_id: ALICE, username: 'alice', display_name: 'Alice',
+    enabled: true, has_password: true, created_at: 't',
   });
 });
 
