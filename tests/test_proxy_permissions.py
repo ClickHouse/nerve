@@ -6,13 +6,16 @@ prompt text. All of it must be readable only by the owner even though it lives
 under Nerve's shared state dir. These tests pin that contract:
 
 * the files Nerve writes itself (config, log) are created — and repaired — at
-  0600, and the directories it manages (auth dir, ``<auth-dir>/logs``) at 0700,
-  regardless of how permissive the daemon's umask is;
-* the children Nerve launches (proxy, login) run under a 0077 umask so the
-  files *they* create land owner-only too, without disturbing the daemon's own
-  umask or the proxy's process group;
-* the tightening stays scoped — shared parents and symlink targets are left
-  alone, and a chmod that fails does not abort start-up.
+  0600, and the auth directory it manages at 0700, regardless of how permissive
+  the daemon's umask is;
+* the children Nerve launches (proxy, login) run under a native 0077 umask so
+  the files *they* create land owner-only too, without disturbing the daemon's
+  own umask; the proxy additionally gets its own process group while login
+  keeps the caller's;
+* the directory tightening stays scoped — a shared parent is left alone, a
+  symlinked auth directory's target is not chased, and a chmod that fails does
+  not abort start-up. (The config/log writers do follow a symlinked path to its
+  target, like a normal write; this module does not claim otherwise.)
 
 Everything here is Linux/POSIX and uses synthetic credentials + fake children;
 no real login or daemon is involved.
@@ -20,11 +23,12 @@ no real login or daemon is involved.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import stat
-import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -34,14 +38,12 @@ from nerve.config import NerveConfig
 from nerve.proxy.service import (
     ProxyService,
     _ensure_private_dir,
-    _login_preexec,
     _open_private_append_log,
-    _proxy_preexec,
 )
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
-    reason="POSIX permission bits / preexec_fn are not meaningful on Windows",
+    reason="POSIX permission bits / umask / process groups are not meaningful on Windows",
 )
 
 
@@ -69,6 +71,23 @@ def _current_umask() -> int:
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _wait_own_group(pid: int, timeout: float = 2.0) -> bool:
+    """Wait until ``pid`` leads its own process group.
+
+    ``process_group=0`` is applied in the forked child, which can lag the
+    parent's return from subprocess creation by a few instructions.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if os.getpgid(pid) == pid:
+                return True
+        except ProcessLookupError:
+            return False
+        time.sleep(0.02)
+    return False
 
 
 # ------------------------------------------------------------------ #
@@ -102,7 +121,7 @@ class TestEnsurePrivateDir:
         assert _mode(auth) == 0o700
         assert _mode(shared) == 0o755  # parent preserved
 
-    def test_symlink_target_not_followed(self, tmp_path: Path) -> None:
+    def test_symlinked_dir_target_not_chased(self, tmp_path: Path) -> None:
         # chmod follows symlinks; a symlinked auth dir must not silently
         # re-permission whatever unrelated target it points at.
         real_target = tmp_path / "unrelated"
@@ -123,7 +142,7 @@ class TestEnsurePrivateDir:
             raise PermissionError("nope")
 
         monkeypatch.setattr(os, "chmod", boom)
-        # Must not raise — the files inside are still owner-only via umask +
+        # Must not raise — new files inside are still owner-only via umask +
         # explicit file modes, so start-up should survive a chmod refusal.
         _ensure_private_dir(target)
         assert target.is_dir()
@@ -161,7 +180,7 @@ class TestOpenPrivateAppendLog:
 
 
 # ------------------------------------------------------------------ #
-#  _write_proxy_config (config file + managed directories)            #
+#  _write_proxy_config (config file + managed auth directory)         #
 # ------------------------------------------------------------------ #
 
 
@@ -181,13 +200,12 @@ def _service(tmp_path: Path) -> ProxyService:
 
 
 class TestWriteProxyConfig:
-    def test_config_and_dirs_owner_only_under_permissive_umask(self, tmp_path: Path) -> None:
+    def test_config_and_auth_dir_owner_only_under_permissive_umask(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)
         with permissive_umask(0o000):
             written = svc._write_proxy_config()
         assert _mode(written) == 0o600
         assert _mode(tmp_path / "auth") == 0o700
-        assert _mode(tmp_path / "auth" / "logs") == 0o700
 
     def test_existing_world_readable_config_repaired(self, tmp_path: Path) -> None:
         svc = _service(tmp_path)
@@ -203,48 +221,51 @@ class TestWriteProxyConfig:
 
 
 # ------------------------------------------------------------------ #
-#  Child umask preexec functions                                      #
+#  Native launch arguments (umask / process_group), not preexec_fn    #
 # ------------------------------------------------------------------ #
 
 
-def _spawn_child_creating(tmp_path: Path, preexec) -> subprocess.Popen:
-    """Launch a short-lived child that creates a file and a dir, then sleeps.
-
-    The sleep keeps the child alive long enough to read its process group
-    before it exits and gets reaped.
+class TestNativeLaunchArgs:
+    """The proxy and login children are launched with native subprocess
+    ``umask``/``process_group`` arguments instead of a ``preexec_fn`` callback
+    (which the stdlib documents as unsafe in a threaded process). These fake
+    children confirm the arguments Nerve passes actually yield owner-only files
+    and the intended process group.
     """
-    script = 'touch "$1/childfile"; mkdir "$1/childdir"; sleep 1'
-    return subprocess.Popen(
-        ["sh", "-c", script, "sh", str(tmp_path)],
-        preexec_fn=preexec,
-    )
 
+    async def _spawn_fake_child(self, tmp_path: Path, *, own_group: bool):
+        script = 'touch "$1/childfile"; mkdir "$1/childdir"; sleep 1'
+        kwargs: dict = {"umask": 0o077}
+        if own_group:
+            kwargs["process_group"] = 0
+        return await asyncio.create_subprocess_exec(
+            "sh", "-c", script, "sh", str(tmp_path), **kwargs,
+        )
 
-class TestChildUmaskPreexec:
-    def test_proxy_preexec_owner_only_files_and_own_group(self, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_proxy_style_owner_only_and_own_group(self, tmp_path: Path) -> None:
         with permissive_umask(0o022):
-            proc = _spawn_child_creating(tmp_path, _proxy_preexec)
+            proc = await self._spawn_fake_child(tmp_path, own_group=True)
             try:
-                # setpgrp() put the child in its own process group.
-                assert os.getpgid(proc.pid) == proc.pid
+                # process_group=0 puts the child in its own process group.
+                assert _wait_own_group(proc.pid)
+                # The child's umask did not touch the daemon's own umask.
+                assert _current_umask() == 0o022
             finally:
-                proc.wait()
-            # The daemon's own umask was not touched by the child's preexec.
-            assert _current_umask() == 0o022
-
+                await proc.wait()
         # umask(0o077) in the child made everything it created owner-only.
         assert _mode(tmp_path / "childfile") == 0o600
         assert _mode(tmp_path / "childdir") == 0o700
 
-    def test_login_preexec_owner_only_but_keeps_process_group(self, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_login_style_owner_only_but_keeps_process_group(self, tmp_path: Path) -> None:
         with permissive_umask(0o022):
-            proc = _spawn_child_creating(tmp_path, _login_preexec)
+            proc = await self._spawn_fake_child(tmp_path, own_group=False)
             try:
-                # No setpgrp(): login stays in the caller's process group.
+                # No process_group: login stays in the caller's process group.
                 assert os.getpgid(proc.pid) == os.getpgrp()
             finally:
-                proc.wait()
-
+                await proc.wait()
         assert _mode(tmp_path / "childfile") == 0o600
         assert _mode(tmp_path / "childdir") == 0o700
 
@@ -258,7 +279,8 @@ class TestStartLifecycleHardening:
     @pytest.mark.asyncio
     async def test_start_hardens_paths_and_preserves_process_group(self, tmp_path: Path) -> None:
         # A fake binary that ignores its args and just lives, so start()/stop()
-        # exercise the real subprocess + preexec + log-open path without a proxy.
+        # exercise the real subprocess + native launch args + log-open path
+        # without a proxy.
         binary = tmp_path / "cli-proxy-api"
         binary.write_bytes(b"#!/bin/sh\nexec sleep 30\n")
         binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
@@ -281,14 +303,12 @@ class TestStartLifecycleHardening:
 
         try:
             assert svc._process is not None
-            pid = svc._process.pid
-            # Own process group preserved (was preexec_fn=os.setpgrp).
-            assert os.getpgid(pid) == pid
+            # process_group=0 gives the proxy its own group (was preexec setpgrp).
+            assert _wait_own_group(svc._process.pid)
             # Every secret is owner-only despite the wide-open umask.
             assert _mode(tmp_path / "proxy.log") == 0o600
             assert _mode(tmp_path / "proxy-config.yaml") == 0o600
             assert _mode(tmp_path / "auth") == 0o700
-            assert _mode(tmp_path / "auth" / "logs") == 0o700
         finally:
             await svc.stop()
 
