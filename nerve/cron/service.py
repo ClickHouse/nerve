@@ -26,6 +26,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
+from nerve.identity import Actor, system_actor
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -852,12 +853,22 @@ class CronService:
                 return key
         return None
 
-    async def _start_new_generation(self, job_id: str) -> str:
-        """Create a fresh chat session for a persistent job and map it."""
+    async def _start_new_generation(
+        self, job_id: str, actor: Actor | None = None,
+    ) -> str:
+        """Create a fresh chat session for a persistent job and map it.
+
+        ``actor`` lets a caller that retires the previous generation first
+        resolve the principal *before* that retirement, so a lookup failure
+        cannot leave a job with a retired chat and no replacement.
+        """
         ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         session_id = f"cron:{job_id}:{ts}"
+        if actor is None:
+            actor = await system_actor(self.db)
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
+            actor=actor,
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -989,6 +1000,13 @@ class CronService:
         current = await self._current_persistent_session_id(job.id)
         rotated = False
 
+        # Resolved once, up front: retiring the current generation cancels its
+        # wakeups and stamps it rotated, and the replacement is what the run
+        # then uses. Resolving only at the replacement would leave a failed
+        # rotation with a retired chat and nothing in its place until the next
+        # run redid the whole thing.
+        actor = await system_actor(self.db)
+
         if current and (job.context_rotate_at or job.context_rotate_hours > 0):
             session = await self.db.get_session(current)
             if session:
@@ -1001,7 +1019,7 @@ class CronService:
                     rotated = True
 
         if current is None:
-            current = await self._start_new_generation(job.id)
+            current = await self._start_new_generation(job.id, actor)
         return current, rotated
 
     # -- End persistent session generations ----------------------------------
@@ -1324,18 +1342,35 @@ class CronService:
             if self.engine.sessions.is_running(session_id):
                 continue
             try:
+                # Resolve the actor BEFORE claiming. Claiming flips
+                # pending -> fired, and a fired row is never selected again,
+                # so anything that fails after it consumes the wakeup without
+                # delivering it: the prompt is gone and no sweep retries it.
+                # Resolved first, a failure leaves the row pending and the
+                # next sweep picks it up.
+                actor = await system_actor(self.db)
                 claimed = await self.db.claim_wakeup(wakeup["id"])
+                if not claimed:
+                    continue
+                self._dispatch_wakeup(session_id, wakeup, actor)
             except Exception as e:
+                # Per wakeup, so one bad row cannot abandon the ones after it.
                 logger.error(
-                    "Failed to claim wakeup %s: %s", wakeup["id"], e,
+                    "Wakeup %s not dispatched: %s", wakeup["id"], e,
+                    exc_info=True,
                 )
                 continue
-            if not claimed:
-                continue
-            self._dispatch_wakeup(session_id, wakeup)
 
-    def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
-        """Spawn the engine run for a claimed wakeup with error logging."""
+    def _dispatch_wakeup(
+        self, session_id: str, wakeup: dict, actor: Actor,
+    ) -> None:
+        """Spawn the engine run for a claimed wakeup with error logging.
+
+        Takes the actor rather than resolving one: the resolution has to
+        happen before the claim above, and doing it inside the spawned task
+        would also put an ``await`` in front of ``engine.run``'s per-session
+        lock, letting two due wakeups land out of order.
+        """
         prompt = _resolve_wakeup_prompt(wakeup["prompt"])
         # "Run later" deferrals are scheduled dispatches — fire them through
         # the cron source so they mirror plan_service/cron-dispatched runs;
@@ -1345,12 +1380,17 @@ class CronService:
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
+        # The actor is the instance's own: a model-scheduled wakeup, or a
+        # deferral this service is delivering. Who wrote a run-later message
+        # is already recorded on the row the route persisted when they
+        # composed it.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
                 user_message=prompt,
                 source=source,
                 internal=True,
+                actor=actor,
                 # A run-later deferral is a message the user wrote and asked
                 # to be delivered now, so it belongs back at the top of the
                 # sidebar. A model's own ScheduleWakeup tick is the session
@@ -1426,8 +1466,10 @@ class CronService:
         rotated = False
         new_session_id: str | None = None
         if session_id and session:
+            # Same ordering as the automatic rotation above.
+            actor = await system_actor(self.db)
             await self._retire_session(job_id, session_id, "manual")
-            new_session_id = await self._start_new_generation(job_id)
+            new_session_id = await self._start_new_generation(job_id, actor)
             rotated = True
 
         logger.info(

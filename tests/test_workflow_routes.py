@@ -18,6 +18,15 @@ import pytest_asyncio
 
 from nerve.db import Database
 
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
+
 
 class FakeSessionManager:
     """Records get_or_create calls; the service passes backend/model/cwd.
@@ -38,7 +47,7 @@ class FakeSessionManager:
             source=kwargs.get("source", "workflow"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
 
 

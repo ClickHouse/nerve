@@ -142,13 +142,13 @@ class TestBroadcastEnvelope:
 @pytest.mark.asyncio
 class TestMergeWorkflowIntoCall:
     async def test_merges_snapshot_onto_matching_block(self, db: Database):
-        await db.create_session("wf-sess", title="wf", source="web")
+        await db.create_session("wf-sess", title="wf", source="web", actor=None)
         await db.add_message(
             "wf-sess", "assistant", "",
             blocks=[
                 {"type": "text", "content": "running a workflow"},
                 {"type": "tool_call", "tool": "Workflow", "tool_use_id": "wf-1", "input": {}},
-            ],
+            ], actor=None,
         )
         snap = {"name": "deep-research", "status": "completed", "phases": [], "agents": []}
         msg_id = await db.merge_workflow_into_call("wf-sess", "wf-1", snap)
@@ -159,9 +159,9 @@ class TestMergeWorkflowIntoCall:
         assert tool_block["workflow"] == snap
 
     async def test_returns_none_when_no_matching_block(self, db: Database):
-        await db.create_session("wf-sess2", title="wf2", source="web")
+        await db.create_session("wf-sess2", title="wf2", source="web", actor=None)
         await db.add_message(
             "wf-sess2", "assistant", "",
-            blocks=[{"type": "tool_call", "tool": "Bash", "tool_use_id": "other", "input": {}}],
+            blocks=[{"type": "tool_call", "tool": "Bash", "tool_use_id": "other", "input": {}}], actor=None,
         )
         assert await db.merge_workflow_into_call("wf-sess2", "missing-id", {"x": 1}) is None

@@ -18,6 +18,7 @@ from nerve.db import Database
 from nerve.identity import Actor
 from nerve.gateway.routes._deps import init_deps
 from nerve.gateway.routes.sessions import RunLaterRequest, run_later
+from tests.actor_rows import ensure_actor_row
 
 # `require_auth` hands a route the actor the request resolved to. These tests
 # call the route functions directly, so they supply one; no route here reads
@@ -30,6 +31,13 @@ _ACTOR = Actor(
 )
 
 
+async def _install(db: Database, engine) -> None:
+    """Wire the deps and give ``_ACTOR`` the ``actor_refs`` row the pending
+    user message's ``actor_id`` will reference."""
+    init_deps(engine=engine, db=db)
+    await ensure_actor_row(db, _ACTOR)
+
+
 def _fake_engine() -> MagicMock:
     engine = MagicMock()
     engine.run = AsyncMock()  # must never be awaited by run-later
@@ -39,8 +47,8 @@ def _fake_engine() -> MagicMock:
 @pytest.mark.asyncio
 async def test_run_later_timed_schedules_one_shot_wakeup(db: Database):
     engine = _fake_engine()
-    init_deps(engine=engine, db=db)
-    await db.create_session("rl-timed", source="web", backend="claude")
+    await _install(db, engine)
+    await db.create_session("rl-timed", source="web", backend="claude", actor=None)
 
     res = await run_later(
         RunLaterRequest(session_id="rl-timed", message="do the thing", delay="30m"),
@@ -72,8 +80,8 @@ async def test_run_later_timed_schedules_one_shot_wakeup(db: Database):
 async def test_run_later_24h_uses_full_delay_unclamped(db: Database):
     """The 24h option must not be clamped to the 1h wakeup-tool ceiling."""
     engine = _fake_engine()
-    init_deps(engine=engine, db=db)
-    await db.create_session("rl-24h", source="web", backend="claude")
+    await _install(db, engine)
+    await db.create_session("rl-24h", source="web", backend="claude", actor=None)
 
     await run_later(
         RunLaterRequest(session_id="rl-24h", message="tomorrow", delay="24h"),
@@ -91,8 +99,8 @@ async def test_run_later_24h_uses_full_delay_unclamped(db: Database):
 @pytest.mark.asyncio
 async def test_run_later_just_accept_schedules_nothing(db: Database):
     engine = _fake_engine()
-    init_deps(engine=engine, db=db)
-    await db.create_session("rl-manual", source="web", backend="claude")
+    await _install(db, engine)
+    await db.create_session("rl-manual", source="web", backend="claude", actor=None)
 
     res = await run_later(
         RunLaterRequest(session_id="rl-manual", message="later", delay="none"),
@@ -117,8 +125,8 @@ async def test_run_later_persists_all_attachments(db: Database):
     carried into the deferred session's pending user message, not just
     image blocks."""
     engine = _fake_engine()
-    init_deps(engine=engine, db=db)
-    await db.create_session("rl-files", source="web", backend="claude")
+    await _install(db, engine)
+    await db.create_session("rl-files", source="web", backend="claude", actor=None)
     await db.save_uploaded_file(
         "img1", "rl-files", "pic.png", "image/png", "image", 10, "/tmp/pic.png",
     )

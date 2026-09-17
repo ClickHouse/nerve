@@ -55,7 +55,7 @@ class TestSessionParentPatch:
         """Create a web session. By default move it out of 'created' so it is
         nestable — mirrors any session that has run at least once (the only
         kind the sidebar exposes as a stable, draggable row)."""
-        await setup.sm.get_or_create(sid, source="web")
+        await setup.sm.get_or_create(sid, source="web", actor=None)
         if started:
             await setup.db.update_session_fields(sid, {"status": "idle"})
 

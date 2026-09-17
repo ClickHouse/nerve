@@ -7,8 +7,9 @@ shutdown.
 
 Cursor persistence reuses the existing ``sync_cursors`` table — each
 origin gets its own row keyed on ``codex:<origin_id>``. The service
-saves the cursor on every event so a crash never loses more than one
-event of progress.
+saves the cursor after every **successfully ingested** event, so a crash
+never loses more than one event of progress and a failure never skips one:
+see :class:`_OriginWorker`.
 """
 
 from __future__ import annotations
@@ -39,7 +40,16 @@ logger = logging.getLogger(__name__)
 
 
 class _OriginWorker:
-    """Pairs one :class:`CodexOrigin` with its dedicated :class:`CodexIngester`."""
+    """Checkpoint only events that the ingester accepted.
+
+    The origin advances before yielding, so its live cursor can include a
+    failed event. The worker therefore retries that event in place with bounded
+    exponential backoff and advances its checkpoint only after it lands.
+    Idempotent ingestion makes both an in-process retry and crash replay safe.
+    """
+
+    _RETRY_INITIAL_SECONDS = 0.25
+    _RETRY_MAX_SECONDS = 30.0
 
     def __init__(
         self,
@@ -52,6 +62,7 @@ class _OriginWorker:
         self.db = db
         self.task: asyncio.Task | None = None
         self.cursor_key = f"codex:{origin.id}"
+        self._checkpoint: str | None = None
 
     async def run(self) -> None:
         try:
@@ -68,6 +79,7 @@ class _OriginWorker:
             return
 
         cursor = await self.db.get_sync_cursor(self.cursor_key)
+        self._checkpoint = cursor
         try:
             async for event in self.origin.stream(cursor):
                 await self._handle(event)
@@ -84,25 +96,39 @@ class _OriginWorker:
                 logger.exception("Codex origin %s close() failed", self.origin.id)
 
     async def _handle(self, event: ThreadEvent) -> None:
-        try:
-            await self.ingester.ingest(event)
-        except Exception:
-            logger.exception(
-                "Codex ingest failed (origin=%s thread=%s seq=%d type=%s)",
-                self.origin.id, event.thread_id, event.sequence, event.type,
-            )
-        # Persist cursor after every event — cheap (one row update) and
-        # the safest place to checkpoint.
+        delay = self._RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                await self.ingester.ingest(event)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Codex ingest failed (origin=%s thread=%s seq=%d type=%s) — "
+                    "retrying in %.2fs; the cursor remains before this event",
+                    self.origin.id, event.thread_id, event.sequence, event.type,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._RETRY_MAX_SECONDS)
+        # Checkpoint after every event that landed — cheap (one row update),
+        # and now it means what it says.
+        self._advance_checkpoint()
         await self._save_cursor()
 
-    async def _save_cursor(self) -> None:
+    def _advance_checkpoint(self) -> None:
+        """Take the origin's cursor as the new successful checkpoint."""
         try:
-            cursor = self.origin.cursor()
+            self._checkpoint = self.origin.cursor()
         except Exception:
             logger.exception("Codex origin %s cursor() failed", self.origin.id)
+
+    async def _save_cursor(self) -> None:
+        if self._checkpoint is None:
             return
         try:
-            await self.db.set_sync_cursor(self.cursor_key, cursor)
+            await self.db.set_sync_cursor(self.cursor_key, self._checkpoint)
         except Exception:
             logger.exception(
                 "Codex origin %s set_sync_cursor failed", self.origin.id,

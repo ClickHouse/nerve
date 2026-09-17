@@ -29,7 +29,7 @@ async def _make_session(
     starred: int = 0,
     last_memorized_at: str | None = None,
 ) -> None:
-    await db.create_session(sid, status=status)
+    await db.create_session(sid, status=status, actor=None)
     fields: dict = {"starred": starred}
     if last_memorized_at is not None:
         fields["last_memorized_at"] = last_memorized_at
@@ -49,7 +49,7 @@ async def _add_msg(
         content=content,
         thinking="internal reasoning",
         blocks=[{"type": "text", "text": content}],
-        created_at=created_at,
+        created_at=created_at, actor=None,
     )
 
 
@@ -173,7 +173,7 @@ class TestCompaction:
 
 async def _seed_telemetry(db: Database, ts: str) -> None:
     """Insert one row at timestamp ``ts`` into each telemetry table."""
-    await db.create_session("tel", status="idle")
+    await db.create_session("tel", status="idle", actor=None)
     await db.db.execute(
         "INSERT INTO session_events (session_id, event_type, created_at) "
         "VALUES (?, ?, ?)",
@@ -248,7 +248,7 @@ class TestTelemetryPrune:
 @pytest.mark.asyncio
 class TestFileSnapshotPrune:
     async def test_deletes_old_keeps_new(self, db: Database):
-        await db.create_session("s1", status="idle")
+        await db.create_session("s1", status="idle", actor=None)
         await db.db.execute(
             "INSERT INTO session_file_snapshots "
             "(session_id, file_path, original_content, created_at) "
