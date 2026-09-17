@@ -20,7 +20,6 @@ from nerve.config_reload import reload_failures
 from nerve.config_validate import ValidationResult
 from nerve.sync_service import sync_workspace
 
-
 def _cp(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
@@ -840,7 +839,7 @@ class TestApplySync:
             return {"config": "error: ConfigError: nope"}
 
         monkeypatch.setattr(sync, "_apply_sync", _failing_apply)
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["ok"] is False
         assert body["changed"] is True and body["applied"] is False
         assert body["apply_error"] == "ConfigError: nope"
@@ -876,7 +875,7 @@ class TestApplySync:
             return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
 
         monkeypatch.setattr(sync, "_apply_sync", _partial_apply)
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["ok"] is True  # the merged config itself is in effect
         assert body["applied"] is False  # ...but not everywhere
         assert body["apply_error"] is None
@@ -991,7 +990,7 @@ class TestNeverRaises:
             lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("kaboom")),
         )
         with pytest.raises(HTTPException) as ei:
-            await route_mod.sync_workspace_route(user={})
+            await route_mod.sync_workspace_route()
         assert ei.value.status_code == 400
 
 class _FakeClock:
@@ -1262,7 +1261,7 @@ class TestSyncRoute:
             lambda *a, **k: SyncResult(ok=False, message="bad", validation_errors=["e"]),
         )
         with pytest.raises(HTTPException) as ei:
-            await route_mod.sync_workspace_route(user={})
+            await route_mod.sync_workspace_route()
         assert ei.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -1297,7 +1296,7 @@ class TestSyncRoute:
             return {"config": "reloaded"}
 
         monkeypatch.setattr(sync, "_apply_sync", _fake_apply)
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["ok"] and body["changed"] and body["applied"]
         assert body["status"] == "applied"
         assert applied == [tmp_path / "cfg"]
@@ -1330,7 +1329,7 @@ class TestSyncRoute:
             sync, "sync_workspace",
             lambda *a, **k: SyncResult(ok=True, changed=False, message="up to date"),
         )
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["applied"] is False and body["status"] == "up-to-date"
 
         monkeypatch.setattr(
@@ -1342,14 +1341,14 @@ class TestSyncRoute:
             return {"config": "error: ConfigError: nope"}
 
         monkeypatch.setattr(sync, "_apply_sync", _no_subsystem_took_it)
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["applied"] is False and body["status"] == "not-applied"
 
         async def _cron_refused(engine, cron_service, config_dir):
             return {"config": "reloaded", "cron": "error: bad jobs.yaml"}
 
         monkeypatch.setattr(sync, "_apply_sync", _cron_refused)
-        body = await route_mod.sync_workspace_route(user={})
+        body = await route_mod.sync_workspace_route()
         assert body["applied"] is False and body["status"] == "partial"
 
 
@@ -1706,7 +1705,7 @@ class TestSyncStatusRoute:
             reload_errors={"cron": "bad jobs.yaml"},
             ok=False, message="fetched bbbbbbbb but ...", checked_at=time.time(),
         ))
-        body = await route_mod.sync_status_route(user={})
+        body = await route_mod.sync_status_route()
         assert body["checked"] is True and body["blocked"] is True
         assert body["blocked_paths"] == ["?? skills/backdoor/SKILL.md"]
         assert body["applied_rev"] == "a" * 40
@@ -1721,6 +1720,6 @@ class TestSyncStatusRoute:
         fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=False)
         monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
         monkeypatch.setattr(sync, "_last_sync", None)
-        body = await route_mod.sync_status_route(user={})
+        body = await route_mod.sync_status_route()
         assert body["checked"] is False and body["enabled"] is False
         assert "blocked" not in body  # no answer, rather than a false negative

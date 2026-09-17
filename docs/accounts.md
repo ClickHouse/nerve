@@ -56,6 +56,64 @@ in [Configuration](config.md): writable or uninspectable state is refused
 before opening, repairable read exposure is tightened and verified, and every
 production database opener follows the same migration/bootstrap path.
 
+## Sessions and the actor on the request
+
+A signature proves a token was minted by this instance. It does not say who is
+holding it. So every token says what it is in a `typ` claim, and **every
+authenticated request resolves that against the database, on the request
+itself**:
+
+| Token | `sub` | `typ` | Acts as |
+|---|---|---|---|
+| a login session | the account's id | `session` | that account's actor |
+| the instance's own calls — `nerve reload`, starting or stopping a session from the CLI, the agent calling its own API | `agent-system` | `system` | the agent's system principal |
+| MCP credentials for the agent's own subprocesses and their Ultracode workers | `backend-agent` | `system`, with `aud: nerve-mcp` | the agent's system principal |
+| MCP credentials for a client you launched — `nerve codex token`, and the one the installer prints | `external-agent-mcp` | `system`, with `aud: nerve-mcp` | the agent's system principal |
+
+Tokens are opaque to the browser; the claims above are an implementation
+detail and will change again.
+
+`agent-system`, `backend-agent` and `external-agent-mcp` are **labels, not
+identity keys**. They say which minter issued the credential, and nothing looks
+them up: the system principal is read from the database, so those strings never
+have to match anything stored. A login session's `sub` is the one that is an
+identifier, and it is an account id.
+
+MCP credentials issued before this version carry the audience but no `typ`.
+They keep working until they expire, because the audience is what the resolver
+reads first.
+
+Two consequences worth knowing:
+
+- **Disabling an account takes effect at its next request, not retroactively.**
+  A token issued before the change is still signed and unexpired, so the
+  account row is the only thing that can stop it — and it does, at every door:
+  HTTP, a new WebSocket, and the MCP endpoint.
+- **A WebSocket's identity and authority are fixed when it connects.** Renaming
+  does not rewrite it, and disabling the account takes effect when that socket
+  reconnects. HTTP, MCP, and new WebSocket connections re-check the account
+  immediately.
+
+Autonomous work — cron jobs, channel traffic, background agents, and the
+instance talking to itself — acts as the **system principal** rather than as
+whoever happens to have an account. That keeps "the agent did this" and "a
+person asked for this" apart, and keeps it true after an account is renamed or
+removed.
+
+### Sessions that predate this version
+
+Browsers may hold 30-day session tokens issued before accounts existed. They
+name no account, so they are handled narrowly:
+
+- with **exactly one account**, such a token resolves to that account, and the
+  reply carries a proper per-account token in the `X-Nerve-Token` header, which
+  the browser stores. One request per tab and the old shape is gone;
+- with **two or more accounts** it is refused (`401`) rather than resolved to
+  whichever account sorts first; those tabs must log in again.
+
+The acceptance is temporary and is removed in a later release. Nothing mints
+that shape any more.
+
 ## Backup and restore
 
 `nerve.db` is included in backups, so account and actor IDs and the signing

@@ -46,6 +46,39 @@ class AccountStore:
         ) as cursor:
             return [_account(row) async for row in cursor]
 
+    async def _account_identity(self, account_id: str) -> dict | None:
+        """The request-resolution fields for one account, or ``None``."""
+        async with self.db.execute(
+            """SELECT a.id AS account_id, a.enabled,
+                      r.id AS actor_id, r.kind AS actor_kind, r.display_name
+                 FROM accounts a
+                 LEFT JOIN actor_refs r ON r.id = a.actor_id
+                WHERE a.id = ?""",
+            (account_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["enabled"] = bool(value["enabled"])
+        return value
+
+    async def _sole_account_identity(self) -> dict | None:
+        """The request-resolution fields when exactly one account exists."""
+        async with self.db.execute(
+            """SELECT a.id AS account_id, a.enabled,
+                      r.id AS actor_id, r.kind AS actor_kind, r.display_name
+                 FROM accounts a
+                 LEFT JOIN actor_refs r ON r.id = a.actor_id
+                ORDER BY a.created_at, a.id
+                LIMIT 2"""
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        if len(rows) != 1:
+            return None
+        rows[0]["enabled"] = bool(rows[0]["enabled"])
+        return rows[0]
+
     async def _bootstrap_first_account(
         self, *, credential_source: str, display_name: str | None = None,
     ) -> BootstrapAccount:

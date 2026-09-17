@@ -1,6 +1,7 @@
 """JWT authentication for the gateway.
 
-Password login, HS256 session tokens, bcrypt hashing.
+Password login, HS256 session tokens, bcrypt hashing, and the resolution of a
+verified token into the :class:`~nerve.identity.Actor` the request acts as.
 
 **The signing secret.** Tokens are signed with :func:`effective_jwt_secret`,
 which returns the secret *pinned* at startup by the identity bootstrap:
@@ -11,12 +12,16 @@ external MCP endpoint, the CLI — must go through that function rather than
 read ``config.auth.jwt_secret`` directly: the config object is rebuilt on every
 reload, and the secret is restart-only. With no secret in force every check
 fails closed; there is no unauthenticated mode.
+
+Every ingress also resolves verified claims against the database on that
+request; a signature alone is not an identity.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import bcrypt
@@ -24,6 +29,16 @@ import jwt
 from fastapi import Depends, HTTPException, Request, WebSocket
 
 from nerve.config import NerveConfig, get_config
+from nerve.identity import (
+    Actor,
+    ActorResolutionError,
+    actor_for_account,
+    actor_for_sole_account,
+    system_actor,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nerve.db import Database
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +66,43 @@ SESSION_TOKEN_HEADER = "X-Nerve-Token"
 # so the HTTP, MCP and worker-token paths agree, and so a test can match it.
 NO_SECRET_DETAIL = "No signing secret is in force; the gateway has not completed startup"
 
+# The same, for the other half of an authenticated request: a verified token
+# still has to be resolved to an account, and until the lifespan has wired the
+# database there is nothing to resolve it against. Fail closed, like the above.
+NO_IDENTITY_DETAIL = (
+    "Identity storage is not available; the gateway has not completed startup"
+)
+
 # Audience claim on session-bound MCP tokens (see create_mcp_session_token).
 MCP_AUDIENCE = "nerve-mcp"
 # Claim carrying the bound nerve session id on MCP tokens.
 MCP_SESSION_CLAIM = "nerve_session_id"
 MCP_WORKER_CLAIM = "nerve_worker_id"
+
+# Claim naming what a token is. Present on everything this version mints; its
+# absence is what identifies a token minted before per-account sessions existed
+# (see LEGACY_SUBJECT). Authorization does not vary by type — every account has
+# full permissions (0.4) — but *attribution* does, and so does sliding.
+TOKEN_TYPE_CLAIM = "typ"
+# A person's web session. ``sub`` is the account id; these slide (see
+# maybe_refresh_token).
+TOKEN_TYPE_SESSION = "session"
+# The instance acting on its own behalf: the CLI talking to its daemon, the
+# agent calling its own API, backend agent subprocesses. Resolves to the agent
+# system principal (0.6). Never slides — each one is minted for a single use.
+TOKEN_TYPE_SYSTEM = "system"
+
+# Subject of a system token. A label, not a lookup key: the system principal is
+# read from the database, so this string never has to match anything stored.
+SYSTEM_SUBJECT = "agent-system"
+
+# Subject of the web-session tokens minted *before* this version, which sit in
+# browsers' localStorage with 30-day expiries. They still verify — same secret,
+# same expiry — so they are accepted and resolved to the sole account while
+# exactly one exists, and upgraded in place on first use (see require_auth).
+# This is the ONLY place the subject string is given a meaning; a later
+# contract PR deletes this constant and is_legacy_session_token with it.
+LEGACY_SUBJECT = "user"
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -131,31 +178,57 @@ def effective_jwt_secret(config: NerveConfig | None = None) -> str:
     return cfg.auth.jwt_secret or ""
 
 
-def create_token(jwt_secret: str, expiry_hours: int | None = None) -> str:
-    """Create a web-session JWT token."""
+def create_session_token(
+    jwt_secret: str, account_id: str, expiry_hours: int | None = None,
+) -> str:
+    """Create a typed web-session JWT whose subject is an account id."""
+    if not account_id:
+        raise ValueError("a session token must name an account")
     hours = max(1, int(expiry_hours)) if expiry_hours else session_expiry_hours()
     now = datetime.now(timezone.utc)
     payload = {
         "exp": now + timedelta(hours=hours),
         "iat": now,
-        "sub": "user",
+        "sub": account_id,
+        TOKEN_TYPE_CLAIM: TOKEN_TYPE_SESSION,
     }
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def create_system_token(jwt_secret: str, *, ttl_seconds: int = 3600) -> str:
+    """Mint a short-lived token for the instance acting on its own behalf."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iat": now,
+        "exp": now + timedelta(seconds=max(60, int(ttl_seconds))),
+        "jti": uuid4().hex,
+        "sub": SYSTEM_SUBJECT,
+        TOKEN_TYPE_CLAIM: TOKEN_TYPE_SYSTEM,
+    }
+    return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def is_legacy_session_token(payload: dict) -> bool:
+    """Match the exact aud-less, pre-``typ`` browser-session shape."""
+    return (
+        not payload.get("aud")
+        and payload.get(TOKEN_TYPE_CLAIM) is None
+        and payload.get("sub") == LEGACY_SUBJECT
+    )
 
 
 def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
     """Re-mint a session token that is past its refresh threshold.
 
-    Sliding expiry: each authenticated request carries the session further
-    into the future, so a tab in continuous use never hits the wall. Returns
-    ``None`` while the token is still fresh — the common case, and the reason
-    this costs nothing on most requests.
-
-    Only ordinary web-session tokens slide. Audience-scoped tokens (MCP
-    session/worker credentials) are minted per-process with deliberately
-    short TTLs and must expire on schedule.
+    Only ``typ=session`` slides; short-lived system and MCP credentials do not.
+    The replacement retains the verified token's account subject. The request
+    resolves that same subject before reaching this helper, so a separate actor
+    override could only construct an impossible mismatch.
     """
-    if payload.get("aud") or payload.get("sub") != "user":
+    if payload.get("aud") or payload.get(TOKEN_TYPE_CLAIM) != TOKEN_TYPE_SESSION:
+        return None
+    account_id = payload.get("sub")
+    if not account_id:
         return None
     iat, exp = payload.get("iat"), payload.get("exp")
     if not isinstance(iat, (int, float)) or not isinstance(exp, (int, float)):
@@ -166,7 +239,7 @@ def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
     age = datetime.now(timezone.utc).timestamp() - iat
     if age < lifetime * REFRESH_AFTER_RATIO:
         return None
-    return create_token(jwt_secret)
+    return create_session_token(jwt_secret, account_id)
 
 
 def create_mcp_session_token(
@@ -192,6 +265,7 @@ def create_mcp_session_token(
         "exp": now + timedelta(seconds=max(60, int(ttl_seconds))),
         "jti": uuid4().hex,
         "sub": "backend-agent",
+        TOKEN_TYPE_CLAIM: TOKEN_TYPE_SYSTEM,
         "aud": MCP_AUDIENCE,
         MCP_SESSION_CLAIM: session_id,
     }
@@ -218,6 +292,7 @@ def create_external_mcp_token(
         "exp": now + timedelta(seconds=max(60, int(ttl_seconds))),
         "jti": uuid4().hex,
         "sub": "external-agent-mcp",
+        TOKEN_TYPE_CLAIM: TOKEN_TYPE_SYSTEM,
         "aud": MCP_AUDIENCE,
     }
     return jwt.encode(payload, jwt_secret, algorithm=JWT_ALGORITHM)
@@ -264,8 +339,49 @@ def get_token_from_request(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Not authenticated")
 
 
-async def require_auth(request: Request) -> dict:
-    """FastAPI dependency: require valid authentication."""
+def identity_store() -> "Database | None":
+    """Return the request-path database, or ``None`` before it is wired.
+
+    The local import avoids a routes/auth import cycle. Callers fail closed on
+    ``None``.
+    """
+    from nerve.gateway.routes._deps import get_deps
+
+    try:
+        deps = get_deps()
+    except RuntimeError:
+        return None
+    return getattr(deps, "db", None)
+
+
+async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
+    """Resolve verified claims from the database without caching.
+
+    Audience-first dispatch preserves pre-``typ`` MCP credentials; session
+    subjects are account ids. Unresolvable credentials raise.
+    """
+    if claims.get("aud") == MCP_AUDIENCE:
+        # MCP and backend-agent credentials. Minted by this instance for its
+        # own subprocesses and for clients the operator launched; they act as
+        # the agent, not as a person (0.6).
+        return await system_actor(store)
+
+    token_type = claims.get(TOKEN_TYPE_CLAIM)
+    if token_type == TOKEN_TYPE_SYSTEM:
+        return await system_actor(store)
+    if token_type == TOKEN_TYPE_SESSION:
+        return await actor_for_account(store, claims.get("sub"))
+    if is_legacy_session_token(claims):
+        # Grandfathered: a tab that logged in before per-account sessions
+        # existed. Bounded to the single-account case — with two accounts the
+        # token names nobody in particular and actor_for_sole_account refuses.
+        return await actor_for_sole_account(store)
+
+    raise ActorResolutionError("This credential names no actor")
+
+
+async def require_auth(request: Request) -> Actor:
+    """Authenticate an HTTP request and return its request-local actor."""
     secret = effective_jwt_secret(get_config())
     if not secret:
         # Fail closed. Startup pins a secret before the gateway serves — the
@@ -277,41 +393,58 @@ async def require_auth(request: Request) -> dict:
 
     token = get_token_from_request(request)
     payload = decode_token(token, secret)
-    # Slide the session forward. Stashed on request.state rather than returned
-    # so every existing caller of this dependency is unaffected; the gateway's
-    # http middleware picks it up and emits SESSION_TOKEN_HEADER.
-    refreshed = maybe_refresh_token(payload, secret)
-    if refreshed:
-        request.state.refreshed_token = refreshed
-    return payload
+
+    store = identity_store()
+    if store is None:
+        # A good signature is not an identity. With no store there is nothing
+        # to resolve it against, so refuse rather than admit an actor-less
+        # request.
+        raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
+    try:
+        actor = await resolve_actor_from_claims(store, payload)
+    except ActorResolutionError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+
+    # Hand a fresh token back where one is due. Stashed on request.state rather
+    # than returned so the response shape of every route is unchanged; the
+    # gateway's http middleware picks it up and emits SESSION_TOKEN_HEADER.
+    if is_legacy_session_token(payload) and actor.account_id:
+        # Upgrade rather than slide: the tab keeps working and stops carrying
+        # the legacy shape after its first call, so the grandfather clause
+        # drains itself instead of lingering for 30 days. (The sole account
+        # always has an id; without one there is simply nothing to upgrade to,
+        # and the request is served on the token it came with.)
+        request.state.refreshed_token = create_session_token(secret, actor.account_id)
+    else:
+        refreshed = maybe_refresh_token(payload, secret)
+        if refreshed:
+            request.state.refreshed_token = refreshed
+    return actor
 
 
-async def authenticate_websocket(websocket: WebSocket) -> bool:
-    """Validate WebSocket authentication.
+async def authenticate_websocket(websocket: WebSocket) -> Actor | None:
+    """Resolve a WebSocket actor at admission, returning ``None`` on failure.
 
-    Checks token from query parameter or first message.
-    Returns True if authenticated, False otherwise.
+    The connection fixes the returned actor; WebSockets cannot return slid
+    tokens in response headers.
     """
     secret = effective_jwt_secret(get_config())
     if not secret:
-        return False  # fail closed, locked or not — see require_auth
+        return None  # fail closed, locked or not — see require_auth
 
-    # Check query parameter
-    token = websocket.query_params.get("token")
-    if token:
-        try:
-            decode_token(token, secret)
-            return True
-        except HTTPException:
-            return False
+    token = websocket.query_params.get("token") or websocket.cookies.get("nerve_token")
+    if not token:
+        return None
+    try:
+        payload = decode_token(token, secret)
+    except HTTPException:
+        return None
 
-    # Check cookie
-    token = websocket.cookies.get("nerve_token")
-    if token:
-        try:
-            decode_token(token, secret)
-            return True
-        except HTTPException:
-            return False
-
-    return False
+    store = identity_store()
+    if store is None:
+        return None
+    try:
+        return await resolve_actor_from_claims(store, payload)
+    except ActorResolutionError as e:
+        logger.info("WebSocket refused: %s", e)
+        return None

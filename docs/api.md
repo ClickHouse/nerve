@@ -21,6 +21,28 @@ generated on first start when that is unset (see
 [Accounts and identity](accounts.md)); `503` means no signing secret exists
 yet, which only happens before the gateway has completed its first start.
 
+The result is a **session token**: `sub` is the account's id and `typ` is
+`session`. Treat it as opaque — the claims are the server's business. Password-
+only login is valid while exactly one account exists, and a disabled account
+cannot log in (`401`).
+
+#### Authenticated requests
+
+Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
+or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+
+Every request resolves its token to an account actor or the system principal.
+Unknown and disabled accounts fail with `401`; unavailable startup identity
+state fails with `503`. See [Accounts and identity](accounts.md) for token
+types and legacy-session compatibility.
+
+**`X-Nerve-Token` on the response.** Once a session token is past half its
+life, the reply carries a fresh one under this header; swap it in and a tab in
+continuous use never expires, which turns `auth.jwt_expiry_hours` into an idle
+timeout. The same header carries the replacement for a session issued before
+per-account logins existed — those are upgraded on their first request rather
+than slid. The header is CORS-exposed, so a browser can read it cross-origin.
+
 #### `GET /api/auth/status`
 Whether a password is required to log in. No auth required.
 
@@ -572,7 +594,15 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 ## WebSocket Protocol
 
-Connect to `ws[s]://host:port/ws?token=<jwt>`.
+Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
+too). The token is resolved to an actor at admission. A credential that names
+nobody is refused with close code `4001`. Once admitted, both identity and
+authority remain fixed until the socket reconnects; account changes are checked
+at the next connection.
+
+Unlike REST, a WebSocket never hands back a refreshed token — it has no
+response headers. The browser's ordinary REST traffic keeps the stored token
+fresh.
 
 ### Client → Server
 

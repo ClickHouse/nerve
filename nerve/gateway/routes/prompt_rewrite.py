@@ -20,7 +20,7 @@ from nerve.gateway.auth import require_auth
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 # Prompts longer than this are returned unchanged — rewriting walls of
 # text adds latency and risks dropping details for little benefit.
@@ -63,7 +63,7 @@ def _effective_model(config) -> str:
 
 
 @router.get("/api/prompt-rewrite/status")
-async def prompt_rewrite_status(user: dict = Depends(require_auth)):
+async def prompt_rewrite_status():
     """Feature discovery for the web UI — is the rewrite offered, and by whom."""
     config = get_config()
     return {
@@ -73,7 +73,7 @@ async def prompt_rewrite_status(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/prompt-rewrite")
-async def rewrite_prompt(req: RewriteRequest, user: dict = Depends(require_auth)):
+async def rewrite_prompt(req: RewriteRequest):
     """Rewrite a draft prompt with a fast model.
 
     Returns {rewritten, changed, model}. `changed` is False when the
