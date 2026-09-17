@@ -1,5 +1,38 @@
 const API_BASE = '/api';
 
+/**
+ * What the login form has to collect. `none` is a passwordless install, which
+ * is only ever one account; `password` is one account with a credential, which
+ * needs no username; `username_password` is two or more.
+ */
+export type LoginKind = 'none' | 'password' | 'username_password';
+
+/**
+ * `GET /api/auth/status` — unauthenticated, so it carries no username and no
+ * account count. The browser derives first-run routing from `login` itself.
+ */
+export interface AuthStatus {
+  /** Kept for older clients; `login !== 'none'`. */
+  auth_required: boolean;
+  login: LoginKind;
+}
+
+/** One local account, as `/api/accounts` returns it. Never carries a credential. */
+export interface Account {
+  id: string;
+  /**
+   * The permanent identity behind the login, and what attribution is written
+   * against — a different column from `id`, and the one that outlives every
+   * rename. This is how a view that has a message's author id finds a person.
+   */
+  actor_id: string;
+  username: string | null;
+  display_name: string | null;
+  enabled: boolean;
+  has_password: boolean;
+  created_at: string;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -313,15 +346,55 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Auth
-  login: (password: string) =>
+  /**
+   * `username` is optional while exactly one account exists and required once
+   * there are two or more: the account an upgrade created has none, so the
+   * server accepts a password on its own while there is exactly one. A username
+   * that does resolve is accepted at any time. Which shape to collect is what
+   * `authStatus().login` says.
+   */
+  login: (password: string, username?: string) =>
     request<{ token: string }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, username: username?.trim() || null }),
     }),
 
   checkAuth: () => request<{ authenticated: boolean }>('/auth/check'),
 
-  authStatus: () => request<{ auth_required: boolean }>('/auth/status'),
+  authStatus: () => request<AuthStatus>('/auth/status'),
+
+  // Accounts
+  listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
+
+  /**
+   * The signed-in account. Doubles as the authentication check at startup: it
+   * needs a valid session *and* answers which account the session belongs to,
+   * which is what binds a re-authentication to the person whose app is on
+   * screen. `403` for the instance's own system credential, which has no
+   * account — a browser never holds one.
+   */
+  getOwnAccount: () => request<Account>('/accounts/me'),
+
+  createAccount: (body: { username: string; password: string; display_name?: string }) =>
+    request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
+
+  updateAccount: (id: string, body: { username?: string; display_name?: string }) =>
+    request<Account>(`/accounts/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  setAccountEnabled: (id: string, enabled: boolean) =>
+    request<Account>(
+      `/accounts/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    ),
+
+  changeOwnPassword: (body: { current_password?: string; new_password: string }) =>
+    request<Account>('/accounts/me/password', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any

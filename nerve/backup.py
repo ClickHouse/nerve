@@ -6,9 +6,13 @@ snapshot of everything that makes a Nerve instance *this* instance:
 
 - ``nerve.db``   — sessions, messages, tasks index, notifications, plans, usage,
   accounts and actor identity (so the bootstrapped identity ids survive a
-  restore). With ``--no-secrets`` its ``instance_secrets`` table — the JWT
-  signing secret generated for installs without ``auth.jwt_secret`` — is
-  emptied in the snapshot, since that flag promises no credential travels.
+  restore). With ``--no-secrets`` the two credentials it carries are emptied in
+  the snapshot, since that flag promises no credential travels: the JWT signing
+  secret in ``instance_secrets`` and every account's password hash in
+  ``accounts.credential`` (see :func:`_scrub_snapshot_secrets`). The same flag
+  rewrites the workspace's ``config/*.yaml`` on the way into the stage, because
+  a tracked ``auth.password_hash`` the startup migration was right not to touch
+  is still a verifier (see :func:`_sanitised_config`).
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -56,6 +60,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Callable, Iterator
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 # Bundle format revision — bump if the on-disk layout changes incompatibly.
@@ -82,9 +88,9 @@ STATE_FILES: tuple[str, ...] = (
 )
 
 # Secret members (relative to the bundle root) — omitted with --no-secrets
-# and re-chmod'd to 0600 on restore. The one credential that is not a member
-# of its own — the JWT signing secret kept inside nerve.db — is handled by
-# :func:`_scrub_instance_secrets` instead.
+# and re-chmod'd to 0600 on restore. The credentials that are not members of
+# their own — the JWT signing secret and the account password hashes, both rows
+# inside nerve.db — are handled by :func:`_scrub_snapshot_secrets` instead.
 SECRET_MEMBERS: frozenset[str] = frozenset({
     "state/certs",
     "state/mcp-token",
@@ -373,9 +379,163 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         conn.close()
 
 
+def _scrub_account_credentials(snapshot: Path) -> None:
+    """Empty ``accounts.credential`` in a *snapshot* copy of nerve.db.
+
+    Every account's password lives on its row from this release on (the startup
+    migration off ``credential_source = 'config'``), so a bundle that carries
+    ``nerve.db`` carries the password hashes with it. ``--no-secrets`` promises
+    it does not.
+
+    **Every** account, not only the ones holding a hash. A row still on the
+    transitional ``config`` source carries no credential of its own — it reads
+    ``auth.password_hash`` — and ``config.local.yaml`` is omitted from this
+    bundle, so leaving it on ``config`` restores an account that can neither
+    authenticate nor be recognised as passwordless: the one state with no way
+    out. Reachable by taking a ``--no-secrets`` backup between an upgrade and
+    the first start that migrates, which is not an exotic moment.
+
+    The row's ``credential_source`` moves to ``none`` in the same statement,
+    because the schema refuses a ``local`` account with no credential — and
+    because it is the truth about the scrubbed row. The restored instance is
+    therefore passwordless in the same way a ``--no-secrets`` restore already
+    left it: the bundle omits ``config.local.yaml`` too, so ``auth.password_hash``
+    does not come back either. With one account that is the ordinary
+    passwordless state; with two or more, nobody can log in until a password is
+    configured or a bundle *with* secrets is restored — which is the honest
+    consequence of restoring a backup that deliberately carries no credential.
+
+    Edits the snapshot after it is taken and before it is checksummed; the live
+    database is never touched. ``secure_delete`` makes SQLite overwrite the
+    freed pages rather than merely unlink them. A snapshot from before the table
+    existed is left alone.
+    """
+    conn = _connect(snapshot)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+        ).fetchone()
+        if not exists:
+            return
+        conn.execute("PRAGMA secure_delete=ON")
+        conn.execute(
+            "UPDATE accounts SET credential = NULL, credential_source = 'none'"
+        )
+        conn.commit()
+        left = conn.execute(
+            "SELECT COUNT(*) FROM accounts "
+            "WHERE credential IS NOT NULL OR credential_source != 'none'"
+        ).fetchone()[0]
+        if left:  # pragma: no cover - an UPDATE that reported success and did not
+            raise BackupError(
+                f"could not scrub account credentials from {snapshot}: "
+                f"{left} row(s) still carry one, or still read the configured one"
+            )
+    finally:
+        conn.close()
+
+
+# Configuration files in the bundle that are rewritten rather than copied when
+# ``--no-secrets`` is in force. Everything under the workspace's ``config/``:
+# ``settings.yaml`` and the cron job files, whose env blocks are as good a place
+# for a credential as any.
+def _is_sanitisable_config(arcname: str) -> bool:
+    head, _, rest = arcname.partition("/")
+    return head == "config" and bool(rest) and arcname.endswith((".yaml", ".yml"))
+
+
+def _sanitised_config(src: Path) -> str | None:
+    """``src`` with every secret leaf replaced by a ``${VAR}`` placeholder.
+
+    ``None`` when it parsed and there was nothing to rewrite, in which case the
+    caller copies the file as it stands. :class:`BackupError` when it could not
+    be *inspected* — the two used to be the same answer, so a file that would
+    not parse was copied into a bundle documented as carrying no credential,
+    which is the one thing a parse failure cannot rule out.
+
+    The tracked workspace configuration is *supposed* to hold references rather
+    than values, and mostly does. But the startup migration deliberately leaves
+    ``auth.password_hash`` alone when it finds it in a tracked or fleet-managed
+    file (there is no safe way to rewrite somebody else's configuration), so a
+    live bcrypt verifier can legitimately be sitting in a file this bundle
+    otherwise copies verbatim — and ``--no-secrets`` promises it does not carry
+    one. Anything else the scrubber already recognises goes with it.
+    """
+    from nerve.migrate import _scrub_secrets
+
+    try:
+        raw = yaml.safe_load(src.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        raise BackupError(
+            f"Backup: {src} could not be parsed, so a --no-secrets bundle cannot "
+            f"promise it carries no credential ({e}). Fix the file, or take the "
+            f"backup with secrets and keep it as private as the instance."
+        ) from e
+    if not isinstance(raw, dict):
+        raise BackupError(
+            f"Backup: {src} is not a configuration mapping, so a --no-secrets "
+            f"bundle cannot promise it carries no credential. Fix the file, or "
+            f"take the backup with secrets and keep it as private as the instance."
+        )
+    tracked, _secrets, moved = _scrub_secrets(raw)
+    if not moved:
+        return None
+    logger.info(
+        "Backup: scrubbed %d credential-shaped value(s) from %s (--no-secrets)",
+        len(moved), src.name,
+    )
+    return (
+        "# Nerve backup: taken with --no-secrets. Credential-shaped values were\n"
+        "# replaced with ${ENV_VAR} placeholders and are NOT in this archive.\n\n"
+        + yaml.safe_dump(tracked, default_flow_style=False, sort_keys=False)
+    )
+
+
+def _stage_config_file(src: Path, dst: Path, *, include_secrets: bool) -> None:
+    """Put one configuration file in the stage, sanitised if it has to be.
+
+    A rewritten file is *created* owner-only and written through that same
+    descriptor, like everything else in the stage that could carry a credential:
+    the point of rewriting it is that the original had one in it, so the copy
+    must not exist at a wider mode even briefly.
+    """
+    text = None if include_secrets else _sanitised_config(src)
+    if text is None:
+        shutil.copy2(src, dst)
+        return
+    fd = _secure_create(dst, "Backup")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        _verify_still_the_created_file(fd, dst, "Backup")
+    finally:
+        os.close(fd)
+
+
+def _scrub_snapshot_secrets(snapshot: Path) -> None:
+    """Take every credential out of a ``--no-secrets`` snapshot of nerve.db.
+
+    One call site, two credentials: the signing secret and the account password
+    hashes. Anything added to the database that is a credential belongs here as
+    well — ``--no-secrets`` is a promise about the bundle, not about one table.
+    """
+    _scrub_instance_secrets(snapshot)
+    _scrub_account_credentials(snapshot)
+
+
 def _mode_is_private(st_mode: int) -> bool:
     """True when no group/world bit is set on a stat mode."""
     return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
+def _scrub_db_credentials(db_file: Path) -> None:
+    """Take every credential out of a database file that could not be made
+    private, and verify. The restore fails either way; this is about what is
+    left on disk when it does."""
+    _scrub_db_secret(db_file)
+    _scrub_account_credentials(db_file)
 
 
 def _scrub_db_secret(db_file: Path) -> None:
@@ -689,15 +849,17 @@ def _secure_install_db(src: Path, dst: Path) -> None:
     """Install the restored ``nerve.db`` — accounts, actors, history and the
     stored signing secret — through :func:`_secure_install_file`.
 
-    The last resort, should the installed file read back wide, is to scrub the
-    signing secret from it (itself verified, see :func:`_scrub_db_secret`) so
-    no usable key is left readable; the restore fails either way.
+    The last resort, should the installed file read back wide, is to scrub every
+    credential out of it — the signing secret and the account password hashes,
+    each verified (see :func:`_scrub_db_credentials`) — so nothing usable is
+    left readable; the restore fails either way.
     """
     _secure_install_file(
-        src, dst, what="Restore", last_resort=_scrub_db_secret,
+        src, dst, what="Restore", last_resort=_scrub_db_credentials,
         exposed_detail=(
-            " The stored JWT signing secret was scrubbed from it so no usable key "
-            "is exposed, but the accounts and history remain readable."
+            " The stored JWT signing secret and the account password hashes were "
+            "scrubbed from it so no usable credential is exposed, but the "
+            "accounts and history remain readable."
         ),
     )
 
@@ -996,7 +1158,7 @@ def create_backup(
                 _verify_still_the_created_file(stage_fd, stage, "Backup")
                 _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
                 if db_name == "nerve.db" and not include_secrets:
-                    _scrub_instance_secrets(snapshot)
+                    _scrub_snapshot_secrets(snapshot)
                     _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
             else:
                 logger.warning("state DB missing, skipping: %s", src)
@@ -1035,7 +1197,10 @@ def create_backup(
             for src, arc in ws_files:
                 dst = ws_root / arc
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+                if _is_sanitisable_config(arc):
+                    _stage_config_file(src, dst, include_secrets=include_secrets)
+                else:
+                    shutil.copy2(src, dst)
                 try:
                     workspace_bytes += src.stat().st_size
                 except OSError:

@@ -183,7 +183,9 @@ class TestLoginRoute:
         claims = _claims(res.json()["token"], _CONFIGURED)
         assert claims["sub"] == client.account_id
         assert claims[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SESSION
-        assert client.get("/api/auth/status").json() == {"auth_required": True}
+        assert client.get("/api/auth/status").json() == {
+            "auth_required": True, "login": "password",
+        }
 
     def test_password_checked_and_token_signed_with_the_generated_secret(self, client, config):
         """An install that never configured auth.jwt_secret used to skip the
@@ -203,13 +205,17 @@ class TestLoginRoute:
             warnings.simplefilter("ignore")
             with pytest.raises(jwt.InvalidSignatureError):
                 _claims(token, "dev-secret")
-        assert client.get("/api/auth/status").json() == {"auth_required": True}
+        assert client.get("/api/auth/status").json() == {
+            "auth_required": True, "login": "password",
+        }
 
     def test_passwordless_admits_any_password_with_a_real_secret(self, client, config):
         """0.5 / 0.7: a passwordless install stays passwordless; every admitted
         caller resolves to the single account. The token is a real one."""
         pin_jwt_secret(_GENERATED)
-        assert client.get("/api/auth/status").json() == {"auth_required": False}
+        assert client.get("/api/auth/status").json() == {
+            "auth_required": False, "login": "none",
+        }
         res = client.post("/api/auth/login", json={"password": "anything at all"})
         assert res.status_code == 200
         token = res.json()["token"]
