@@ -207,11 +207,12 @@ describe('who the session belongs to', () => {
 
     await useAuthStore.getState().checkAuth();
 
-    expect(useAuthStore.getState().account).toEqual({ id: 'acc-7', username: 'bob' });
+    expect(useAuthStore.getState().account)
+      .toEqual({ id: 'acc-7', username: 'bob', actor_id: 'actor-1' });
   });
 
   it('is cleared on logout, along with everything account-scoped', async () => {
-    useAuthStore.setState({ account: { id: 'acc-1', username: 'alice' } });
+    useAuthStore.setState({ account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' } });
     api.authStatus.mockResolvedValue(status());
 
     useAuthStore.getState().logout();
@@ -227,7 +228,7 @@ describe('who the session belongs to', () => {
       // the belt. If it ever happens, nothing of the previous account may
       // survive, so it is a sign-out and not a sign-in.
       useAuthStore.setState({
-        account: { id: 'acc-1', username: 'alice' },
+        account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
         sessionExpired: true,
         authenticated: false,
       });
@@ -249,7 +250,7 @@ describe('who the session belongs to', () => {
     // submitted can have come to name somebody else since it was read. With no
     // answer, the token is discarded and the overlay stays up.
     useAuthStore.setState({
-      account: { id: 'acc-1', username: 'alice' },
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
       sessionExpired: true,
       authenticated: false,
     });
@@ -269,7 +270,7 @@ describe('who the session belongs to', () => {
 
   it('keeps the app when the same account unlocks it', async () => {
     useAuthStore.setState({
-      account: { id: 'acc-1', username: 'alice' },
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
       sessionExpired: true,
       authenticated: false,
     });

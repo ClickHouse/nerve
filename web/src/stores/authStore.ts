@@ -3,6 +3,7 @@ import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
   type Account, type LoginKind,
 } from '../api/client';
+import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -10,6 +11,8 @@ import { clearAllReads } from './helpers/readStorage';
 export interface SignedInAccount {
   id: string;
   username: string | null;
+  /** Stable author identity; account id and display names may change. */
+  actor_id: string;
 }
 
 /**
@@ -20,6 +23,8 @@ export interface SignedInAccount {
 function purgeAccountScopedState(): void {
   clearAllDrafts();
   clearAllReads();
+  // Do not let a name snapshot outlive the session that read it.
+  useActorStore.getState().reset();
 }
 
 /**
@@ -107,8 +112,32 @@ let sessionEstablished = false;
  */
 let statusGeneration = 0;
 
+/** Drops login/startup decisions superseded by logout or another auth session. */
+let authGeneration = 0;
+
+function beginAuthSession(): number {
+  return ++authGeneration;
+}
+
+function isCurrentAuthSession(generation: number): boolean {
+  return generation === authGeneration;
+}
+
+/** Bind delayed work to the login/logout generation that started it. */
+export function bindAuthSession(): { stillCurrent: () => boolean } {
+  const generation = authGeneration;
+  return { stillCurrent: () => isCurrentAuthSession(generation) };
+}
+
+/** Bind delayed optimistic work to the actor and auth session that requested it. */
+export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
+  const authSession = bindAuthSession();
+  const actorId = useAuthStore.getState().account?.actor_id ?? null;
+  return { actorId, stillCurrent: authSession.stillCurrent };
+}
+
 function identityOf(account: Account): SignedInAccount {
-  return { id: account.id, username: account.username };
+  return { id: account.id, username: account.username, actor_id: account.actor_id };
 }
 
 /** The signed-in account, or `null` if it cannot be read right now. */
@@ -130,6 +159,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   account: null,
 
   login: async (password: string, username?: string) => {
+    const generation = beginAuthSession();
     const previous = get().account;
     const wasExpired = get().sessionExpired;
     set({ loading: true, error: null });
@@ -137,14 +167,25 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       ({ token } = await api.login(password, username));
     } catch (e: any) {
+      if (!isCurrentAuthSession(generation)) return;
       set({ error: e.message || 'Login failed', loading: false });
       // A refused sign-in is a good moment to find out the form was asking for
       // the wrong thing, which is what a stale descriptor looks like from here.
       void get().refreshStatus();
       return;
     }
-    setToken(token);
+    // Never install a credential for a session logout already ended.
+    if (!isCurrentAuthSession(generation)) return;
+
+    const tokenRevision = setToken(token);
     const identity = await loadIdentity();
+    // Take back only this attempt's token revision. JWTs minted for the same
+    // account in one second can be byte-identical, so string equality cannot
+    // distinguish this stale attempt from a newer login.
+    if (!isCurrentAuthSession(generation)) {
+      clearToken(tokenRevision);
+      return;
+    }
 
     if (wasExpired) {
       // Unlocking a *mounted* application — one still holding the previous
@@ -186,13 +227,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
+    beginAuthSession();
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
     // browser. Only on a *deliberate* logout — an expired session must never
     // take your unsent work with it.
     purgeAccountScopedState();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    set({ authenticated: false, sessionExpired: false, error: null, account: null });
+    set({
+      authenticated: false, loading: false, sessionExpired: false,
+      error: null, account: null,
+    });
     void get().refreshStatus();
   },
 
@@ -206,6 +251,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   checkAuth: async () => {
+    const authSession = beginAuthSession();
     const token = getToken();
     const generation = ++statusGeneration;
     // Both at once. Nothing renders until both have answered — that is what
@@ -220,6 +266,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
     applyStatus(generation, status);
+
+    if (!isCurrentAuthSession(authSession)) return;
 
     if (token && identityOutcome.status === 'fulfilled' && identityOutcome.value) {
       sessionEstablished = true;
@@ -246,11 +294,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (status?.login === 'none') {
       try {
         const { token: fresh } = await api.login('');
-        setToken(fresh);
+        if (!isCurrentAuthSession(authSession)) return;
+        const tokenRevision = setToken(fresh);
+        const identity = await loadIdentity();
+        if (!isCurrentAuthSession(authSession)) {
+          clearToken(tokenRevision);
+          return;
+        }
         sessionEstablished = true;
         set({
           authenticated: true, ready: true, sessionExpired: false,
-          account: await loadIdentity(),
+          account: identity,
         });
         return;
       } catch {
@@ -306,3 +360,8 @@ setUnauthorizedHandler(() => {
   // takes — a second account, most of all. Ask before drawing the form.
   void useAuthStore.getState().refreshStatus();
 });
+
+/** Stable actor for optimistic rows; null for callers without an account row. */
+export function selfActorId(): string | null {
+  return useAuthStore.getState().account?.actor_id ?? null;
+}

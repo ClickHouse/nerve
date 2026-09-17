@@ -20,7 +20,7 @@ vi.mock('../api/client', () => ({
   },
   setToken: vi.fn(),
   clearToken: vi.fn(),
-  getToken: vi.fn(),
+  getToken: vi.fn(() => 'session-token'),
   setUnauthorizedHandler: vi.fn(),
 }));
 
@@ -33,7 +33,6 @@ const { useAccountStore, errorDetail, blockedReason } = await import('../stores/
 const { useAuthStore } = await import('../stores/authStore');
 
 const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
-const getToken = client.getToken as unknown as ReturnType<typeof vi.fn>;
 
 function account(overrides: Partial<Account> = {}): Account {
   return {
@@ -63,11 +62,11 @@ beforeEach(() => {
   api.authStatus.mockResolvedValue({
     auth_required: true, login: 'password',
   });
-  getToken.mockReturnValue('session-token');
   useAccountStore.setState({ accounts: [], loading: true, busyId: null, error: null });
   useAuthStore.setState({
+    authenticated: true,
     loginMode: null,
-    account: { id: 'acc-1', username: 'alice' },
+    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
   });
 });
 
@@ -105,7 +104,7 @@ describe('the list', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('nope');
   });
 
-  it('recovers the signed-in identity after its startup read failed', async () => {
+  it('repairs the signed-in identity after its startup read failed', async () => {
     useAuthStore.setState({ authenticated: true, account: null });
     api.listAccounts.mockResolvedValue({ accounts: [account()] });
     api.getOwnAccount
@@ -120,9 +119,12 @@ describe('the list', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('you')).toBeInTheDocument();
     expect(screen.getByRole('form', { name: 'Your password' })).toBeInTheDocument();
+    expect(useAuthStore.getState().account).toEqual({
+      id: 'acc-1', username: 'alice', actor_id: 'actor-1',
+    });
   });
 
-  it('does not restore an identity from a session that has been replaced', async () => {
+  it('does not restore identity after that auth session was replaced', async () => {
     useAuthStore.setState({ authenticated: true, account: null });
     api.listAccounts.mockResolvedValue({ accounts: [account()] });
     let finishIdentity!: (value: Account) => void;
@@ -131,12 +133,13 @@ describe('the list', () => {
     }));
 
     const loading = useAccountStore.getState().load();
-    getToken.mockReturnValue('replacement-session-token');
+    useAuthStore.getState().logout();
     finishIdentity(account());
     await loading;
 
     expect(useAuthStore.getState().account).toBeNull();
   });
+
 });
 
 describe('adding a person', () => {

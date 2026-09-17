@@ -20,6 +20,11 @@ export function hydrateMessage(raw: any): ChatMessage {
       channel: raw.channel,
       created_at: raw.created_at,
       native_turn_id: raw.native_turn_id,
+      // Who sent it, as an id to resolve against the actor map at render time —
+      // never a name, so a rename changes the label without touching this row.
+      // `null` (history, and anything an ingress did not attribute) is the
+      // common case and renders as it always has.
+      actor_id: raw.actor_id ?? null,
     };
   }
 
@@ -71,6 +76,10 @@ export function hydrateMessage(raw: any): ChatMessage {
     blocks.push({ type: 'text', content: raw.content });
   }
 
+  // Deliberately no `actor_id`: an assistant row's authorship is its `role`,
+  // the column is always NULL on one, and leaving the field off entirely means
+  // an assistant message cannot carry attribution even if a future backend
+  // started sending it.
   return {
     id: raw.id,
     role: 'assistant',

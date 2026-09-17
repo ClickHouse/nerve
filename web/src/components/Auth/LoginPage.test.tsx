@@ -51,7 +51,7 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'password',
-    account: { id: 'acc-1', username: 'alice' },
+    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
     login,
     refreshStatus,
   });
@@ -105,7 +105,7 @@ describe('SessionExpiredOverlay', () => {
     // account id before it lets the login unlock this person's mounted app.
     useAuthStore.setState({
       loginMode: 'username_password',
-      account: { id: 'acc-1', username: 'alice' },
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
     });
     render(<SessionExpiredOverlay />);
 
@@ -126,7 +126,7 @@ describe('SessionExpiredOverlay', () => {
     // resolves the sole account without depending on that mutable key.
     useAuthStore.setState({
       loginMode: 'password',
-      account: { id: 'acc-1', username: 'old-alice' },
+      account: { id: 'acc-1', username: 'old-alice', actor_id: 'actor-1' },
     });
     render(<SessionExpiredOverlay />);
     expect(screen.getByLabelText('Signed in as')).toHaveValue('old-alice');
@@ -150,7 +150,7 @@ describe('SessionExpiredOverlay', () => {
 
   it('routes a deliberate account switch through log out', async () => {
     useAuthStore.setState({
-      account: { id: 'acc-1', username: 'alice' }, logout,
+      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' }, logout,
     });
     render(<SessionExpiredOverlay />);
     await userEvent.click(
