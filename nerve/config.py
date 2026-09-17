@@ -822,8 +822,11 @@ class AgentConfig:
     # resolve there).
     models: list[str] = field(default_factory=list)
     # Ask the Anthropic Models API (GET /v1/models) which models the
-    # configured credentials can reach, and offer those in the picker, so a
-    # newly released model needs no code change or config edit. Best-effort:
+    # configured credentials' catalog endpoint advertises, and offer those in
+    # the picker, so a newly released model needs no code change or config
+    # edit. Catalog membership is not a serving guarantee — an advertised ID
+    # can still fail on send, and discovery runs no serving probe (see
+    # `model_discovery_excluded_models` to prune such entries). Best-effort:
     # ignored when `models` above is set explicitly, on Bedrock, without an
     # API key, or when the API is unreachable — the built-in list applies.
     model_discovery: bool = True
@@ -978,7 +981,16 @@ class AgentConfig:
         resolved = (model or "").lower()
         if not resolved:
             return False
-        for tok in self.model_discovery_excluded_models:
+        patterns = self.model_discovery_excluded_models
+        # Guard a malformed non-list value (e.g. a YAML mapping such as
+        # ``{haiku: false}``, which the coercion layer leaves untouched and
+        # warns about): iterating a dict would turn its keys into active
+        # patterns. Only a genuine list carries exclusions — anything else is
+        # invalid for this field and matches nothing. (A ``${VAR}`` reference
+        # is already coerced to a one-element list before this runs.)
+        if not isinstance(patterns, list):
+            return False
+        for tok in patterns:
             pattern = str(tok or "").strip().lower()
             if pattern and pattern in resolved:
                 return True
@@ -2745,9 +2757,10 @@ class NerveConfig:
         from the first source that has anything to say:
 
         1. ``agent.models`` — an explicit list always wins,
-        2. *discovered* — what the Anthropic Models API reports the
-           credentials can reach (see :mod:`nerve.models_catalog`), minus any
-           entry matching ``agent.model_discovery_excluded_models``,
+        2. *discovered* — what the Anthropic Models API catalog advertises for
+           the configured credentials (see :mod:`nerve.models_catalog`; catalog
+           membership does not validate servability), minus any entry matching
+           ``agent.model_discovery_excluded_models``,
         3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
 
         Bedrock model IDs are region-prefixed, so neither discovery nor the

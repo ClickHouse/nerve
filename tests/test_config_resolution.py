@@ -398,6 +398,26 @@ class TestModelDiscoveryExclusions:
         discovered = ["claude-opus-5", "claude-fable-5"]
         assert cfg.selectable_claude_models(discovered) == discovered
 
+    def test_malformed_mapping_value_matches_nothing(self):
+        # Regression: a YAML mapping is invalid for this list-typed field, and
+        # the coercion layer leaves it in place (with a warning). Its keys must
+        # NOT become active exclusion patterns — {haiku: false} once pruned the
+        # haiku model because the matcher iterated the dict by key.
+        from nerve.config import AgentConfig, NerveConfig
+
+        agent = AgentConfig.from_dict({
+            "model": "claude-opus-5",
+            "model_discovery_excluded_models": {"haiku": False},
+        })
+        cfg = NerveConfig(agent=agent)
+        discovered = [
+            "claude-opus-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6",
+        ]
+        assert cfg.selectable_claude_models(discovered) == discovered
+        assert agent.is_model_discovery_excluded(
+            "claude-haiku-4-5-20251001"
+        ) is False
+
     def test_configured_default_is_never_pruned(self):
         # The default leads the picker even when it matches an exclusion.
         cfg = self._cfg(model="claude-opus-5", excluded=["opus"])
