@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from nerve import paths
+from nerve.utils.fs import atomic_write_text
 
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
@@ -51,6 +52,80 @@ def _detect_asset_suffix() -> str:
         if mapped:
             return mapped
     raise RuntimeError(f"Unsupported platform: {system}/{machine}")
+
+
+# ---------------------------------------------------------------------------- #
+#  Owner-only creation of the proxy's credential + log files                    #
+# ---------------------------------------------------------------------------- #
+#
+# The proxy config embeds an API key, the auth dir holds OAuth token JSON, and
+# both the stdout/stderr log and the proxy's own per-request error logs can
+# contain prompt/response text. All of it must be readable only by the owner,
+# even though it lives under Nerve's state dir, which is shared with non-secret
+# files (databases, the PID file) and is not itself owner-only.
+#
+# The proxy and login children are launched with native, child-only ``umask``
+# and ``process_group`` subprocess arguments rather than a ``preexec_fn``
+# callback: running arbitrary Python between fork and exec is documented as
+# unsafe in a process that has threads (which the daemon does), so the callback
+# is avoided in favour of the equivalent kwargs the stdlib runs in C.
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Ensure ``path`` is an owner-only (0700) directory, creating it if absent.
+
+    Used for the proxy's auth directory, which holds OAuth token JSON. It sits
+    under Nerve's shared state dir, so it must not inherit that dir's
+    group/other-readable mode.
+
+    Deliberately narrow, so the blast radius stays on the proxy's own directory:
+
+    * Only this directory is touched. Missing parents are created like
+      ``mkdir -p`` but never re-permissioned — tightening a shared parent such
+      as ``~/.nerve`` would reach far beyond the proxy.
+    * A symlinked *directory* is not chased. ``chmod`` acts on a link's target,
+      so a symlinked auth dir would silently re-permission whatever it points
+      at — possibly a shared directory the operator linked in on purpose. We
+      leave it untouched, with a warning. (This is specific to the directory;
+      the config and log writers do follow a symlinked path to its target, the
+      way a normal write would.)
+    * Failing to ``chmod`` our own directory is logged, not raised: newly
+      created files inside it are still owner-only via the child umask, and a
+      directory already at 0700 is unaffected. This is not a promise that
+      pre-existing contents are private — only that start-up need not abort.
+    """
+    if path.is_symlink():
+        logger.warning(
+            "Proxy directory %s is a symlink; leaving its target's permissions "
+            "untouched. Point it at an owner-only (0700) directory.", path,
+        )
+        return
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError as exc:
+        logger.warning("Could not set 0700 on proxy directory %s: %s", path, exc)
+
+
+def _open_private_append_log(path: Path) -> io.TextIOWrapper:
+    """Open ``path`` for appending as an owner-only (0600) file.
+
+    The proxy's stdout/stderr can carry request and response fragments, so its
+    log is treated like the credential files. ``os.open`` applies the mode only
+    when it *creates* the file, so an existing log left at a looser mode by an
+    earlier run is tightened explicitly with ``fchmod``. A ``chmod`` failure is
+    raised rather than swallowed — writing secrets into a log whose privacy we
+    could not establish is exactly what this guards against. The parent (Nerve's
+    state dir) is created if missing but never re-permissioned.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "a")
 
 
 class ProxyService:
@@ -142,7 +217,11 @@ class ProxyService:
     def _write_proxy_config(self) -> Path:
         """Write the proxy's own config.yaml and return its path."""
         auth_dir = self.config.proxy.auth_dir.expanduser()
-        auth_dir.mkdir(parents=True, exist_ok=True)
+        # Create the auth directory owner-only *before* the proxy writes any
+        # OAuth token JSON into it. The proxy's own files — token JSON, and the
+        # error logs it writes (whose exact location varies by proxy version) —
+        # are further constrained to owner-only by the child umask set at launch.
+        _ensure_private_dir(auth_dir)
 
         proxy_cfg: dict[str, Any] = {
             "host": self.config.proxy.host,
@@ -160,9 +239,13 @@ class ProxyService:
         if ollama_provider is not None:
             proxy_cfg["openai-compatibility"] = [ollama_provider]
 
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._config_path, "w") as f:
-            yaml.safe_dump(proxy_cfg, f, default_flow_style=False, sort_keys=False)
+        # The config embeds the local proxy API key, so write it owner-only and
+        # atomically: the bytes are created 0600 before any content lands, and a
+        # crash can never leave a half-written or briefly world-readable file.
+        # Passing an explicit mode also repairs a config left at a looser mode by
+        # an earlier run, since the file is re-created as a fresh 0600 inode.
+        content = yaml.safe_dump(proxy_cfg, default_flow_style=False, sort_keys=False)
+        atomic_write_text(self._config_path, content, mode=0o600)
 
         return self._config_path
 
@@ -213,20 +296,26 @@ class ProxyService:
 
         log_file = self.config.proxy.log_file.expanduser()
 
-        def _open_log():
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            return open(log_file, "a")  # noqa: SIM115
+        log_fd = await asyncio.to_thread(_open_private_append_log, log_file)
 
-        log_fd = await asyncio.to_thread(_open_log)
-
-        self._process = await asyncio.create_subprocess_exec(
-            str(binary),
-            "--config", str(config_path),
-            stdout=log_fd,
-            stderr=log_fd,
-            # Detach from parent's process group so it doesn't get random signals.
-            preexec_fn=os.setpgrp,
-        )
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                str(binary),
+                "--config", str(config_path),
+                stdout=log_fd,
+                stderr=log_fd,
+                # Native, child-only launch policy (no preexec_fn — unsafe in a
+                # threaded process): its own process group so signals aimed at
+                # Nerve's group miss the proxy, and a 0077 umask so the token
+                # JSON and error logs the proxy creates land owner-only. The
+                # daemon's own umask and process group are untouched.
+                umask=0o077,
+                process_group=0,
+            )
+        finally:
+            # The child has its own inherited dup of the log fd; the parent's
+            # copy is no longer needed, whether or not the launch succeeded.
+            log_fd.close()
         logger.info(
             "CLIProxyAPI started (pid=%d, port=%d)",
             self._process.pid, self.config.proxy.port,
@@ -319,6 +408,10 @@ class ProxyService:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Native, child-only 0077 umask (no preexec_fn) so the OAuth token
+            # JSON is written owner-only. Process group is left as-is: login runs
+            # in the foreground and streams the OAuth URL to the operator.
+            umask=0o077,
         )
 
         # Stream output so the user can see the OAuth URL.
