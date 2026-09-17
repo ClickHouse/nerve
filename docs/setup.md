@@ -220,6 +220,43 @@ nerve start              # Start the server
 # Open http://localhost:8900
 ```
 
+## Claiming an instance from a browser
+
+A headless install with no `NERVE_PASSWORD` starts with one passwordless
+account. Until it is claimed, every caller who reaches the gateway is admitted
+as that account. Open `/setup` to name it, set its password, and optionally
+set its display name in one atomic operation.
+
+Every claim requires the setup token. Read it locally with:
+
+```bash
+nerve status
+```
+
+The token is generated once, persisted in `nerve.db` across restarts, and
+invalidated when the claim succeeds. It is sent only in the claim request body:
+Nerve never places it in a URL, response, server log, or browser storage.
+
+The setup token is a bearer credential. For remote setup, protect it and the
+new password in transit by serving Nerve over HTTPS or reaching it through a
+trusted encrypted tunnel. Do not expose a plaintext remote setup page.
+
+The claim updates the existing account rather than creating another, so earlier
+attribution keeps its identity. Exactly one concurrent claimant can win. It
+also advances the account's session epoch: pre-claim HTTP sessions become
+unauthorized, open WebSockets are rechecked and closed, and the successful
+response carries the one new client session token. The browser refreshes
+`/api/auth/status`, `/api/accounts/me`, and the actor directory before
+routing to chat.
+
+Browser setup ends there. Provider credentials, profile configuration,
+channels, automation, and daemon lifecycle remain in `nerve init`, the CLI,
+configuration files, and their dedicated product surfaces.
+
+Claiming is the only way to set the first password.
+`PUT /api/accounts/me/password` refuses while the instance is unclaimed, so a
+passwordless session cannot bypass the setup token.
+
 ## HTTPS Setup
 
 ```bash
