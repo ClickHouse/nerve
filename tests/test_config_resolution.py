@@ -350,6 +350,147 @@ class TestClaudeModels:
         assert validate_config_keys(merged) == []
 
 
+class TestModelDiscoveryExclusions:
+    """agent.model_discovery_excluded_models — prune stale/unservable IDs that
+    discovery advertises but the serving route cannot use, without a denylist
+    that rots. Exercised through selectable_claude_models(discovered=...)."""
+
+    def _cfg(self, *, model="claude-opus-5", excluded=None, models=None):
+        from nerve.config import AgentConfig, NerveConfig
+
+        agent = {"model": model}
+        if excluded is not None:
+            agent["model_discovery_excluded_models"] = excluded
+        if models is not None:
+            agent["models"] = models
+        return NerveConfig(agent=AgentConfig.from_dict(agent))
+
+    def test_substring_prunes_matching_discovered_id(self):
+        # The concrete case: a retired haiku the proxy still advertises.
+        cfg = self._cfg(excluded=["claude-3-5-haiku"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_exact_id_prunes_only_that_id(self):
+        cfg = self._cfg(excluded=["claude-3-5-haiku-20241022"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022",
+        ])
+        assert got == ["claude-opus-5"]
+
+    def test_matching_is_case_insensitive(self):
+        cfg = self._cfg(excluded=["CLAUDE-3-5-HAIKU"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022",
+        ])
+        assert got == ["claude-opus-5"]
+
+    def test_empty_and_whitespace_patterns_match_nothing(self):
+        # An empty pattern must never be treated as "contained in everything".
+        cfg = self._cfg(excluded=["", "   ", None])
+        discovered = ["claude-opus-5", "claude-fable-5", "claude-sonnet-4-6"]
+        assert cfg.selectable_claude_models(discovered) == discovered
+
+    def test_no_patterns_is_a_noop(self):
+        cfg = self._cfg(excluded=[])
+        discovered = ["claude-opus-5", "claude-fable-5"]
+        assert cfg.selectable_claude_models(discovered) == discovered
+
+    def test_malformed_mapping_value_matches_nothing(self):
+        # Regression: a YAML mapping is invalid for this list-typed field, and
+        # the coercion layer leaves it in place (with a warning). Its keys must
+        # NOT become active exclusion patterns — {haiku: false} once pruned the
+        # haiku model because the matcher iterated the dict by key.
+        from nerve.config import AgentConfig, NerveConfig
+
+        agent = AgentConfig.from_dict({
+            "model": "claude-opus-5",
+            "model_discovery_excluded_models": {"haiku": False},
+        })
+        cfg = NerveConfig(agent=agent)
+        discovered = [
+            "claude-opus-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6",
+        ]
+        assert cfg.selectable_claude_models(discovered) == discovered
+        assert agent.is_model_discovery_excluded(
+            "claude-haiku-4-5-20251001"
+        ) is False
+
+    def test_configured_default_is_never_pruned(self):
+        # The default leads the picker even when it matches an exclusion.
+        cfg = self._cfg(model="claude-opus-5", excluded=["opus"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_all_discovered_excluded_keeps_only_default(self):
+        # Not a discovery failure: must NOT fall back to the built-in list
+        # (which would re-introduce IDs) — just the configured default.
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        cfg = self._cfg(model="claude-opus-5", excluded=["claude"])
+        got = cfg.selectable_claude_models([
+            "claude-3-5-haiku-20241022", "claude-2.1",
+        ])
+        assert got == ["claude-opus-5"]
+        assert not (set(DEFAULT_CLAUDE_MODELS) - {"claude-opus-5"}) & set(got)
+
+    def test_explicit_models_are_not_filtered(self):
+        # An explicit agent.models list is authoritative: exclusions do not
+        # apply, so config can intentionally override an exclusion.
+        cfg = self._cfg(
+            model="claude-opus-5",
+            models=["claude-3-5-haiku-20241022"],
+            excluded=["claude-3-5-haiku"],
+        )
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-3-5-haiku-20241022"]
+
+    def test_builtin_fallback_is_not_filtered(self):
+        # With no discovery (discovered=None), the built-in list stands
+        # untouched — exclusions target discovery only.
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        cfg = self._cfg(excluded=["haiku"])
+        assert cfg.claude_models == cfg.selectable_claude_models()
+        for model_id in DEFAULT_CLAUDE_MODELS:
+            assert model_id in cfg.claude_models
+
+    def test_bedrock_configured_models_are_not_filtered(self):
+        from nerve.config import AgentConfig, NerveConfig, ProviderConfig
+
+        cfg = NerveConfig(
+            provider=ProviderConfig(type="bedrock"),
+            agent=AgentConfig.from_dict({
+                "model": "us.anthropic.claude-opus-5",
+                "models": ["us.anthropic.claude-3-5-haiku-20241022"],
+                "model_discovery_excluded_models": ["haiku"],
+            }),
+        )
+        assert cfg.claude_models == [
+            "us.anthropic.claude-opus-5",
+            "us.anthropic.claude-3-5-haiku-20241022",
+        ]
+
+    def test_order_and_dedup_preserved_after_filtering(self):
+        cfg = self._cfg(model="claude-opus-5", excluded=["fable"])
+        got = cfg.selectable_claude_models([
+            "claude-sonnet-4-6", "claude-fable-5", "claude-opus-5",
+            "claude-sonnet-4-6",  # duplicate
+        ])
+        # Default first; discovery order otherwise; fable pruned; deduped.
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_key_recognized_by_validator(self):
+        merged = {"agent": {"model_discovery_excluded_models": ["haiku"]}}
+        assert validate_config_keys(merged) == []
+
+
 class TestBlankPathSettingsMeanUnset:
     """A path setting left blank must fall back to its default, not to ".".
 
