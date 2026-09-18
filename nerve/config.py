@@ -2262,6 +2262,29 @@ class UltracodeConfig:
 
 
 @dataclass
+class CodexLifecycleConfig:
+    """Cgroup containment for Codex workflow runs.
+
+    ``mode``: ``disabled`` (default; launch unchanged) or ``strict`` (launch the
+    workflow app-server inside a systemd user scope so its descendants can be
+    reaped; fails before exec where the host can't contain). Codex workflow runs
+    only. See ``nerve/agent/backends/codex/lifecycle.py``.
+    """
+
+    mode: str = "disabled"
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, raw: dict | None) -> "CodexLifecycleConfig":
+        return cls(mode=str((raw or {}).get("mode") or "disabled").strip().lower())
+
+    def validate(self) -> list[str]:
+        if self.mode not in ("disabled", "strict"):
+            return [f"codex.lifecycle.mode must be 'disabled' or 'strict', got {self.mode!r}"]
+        return []
+
+
+@dataclass
 class CodexConfig:
     """OpenAI Codex backend (``codex app-server``) settings.
 
@@ -2301,6 +2324,7 @@ class CodexConfig:
     # Arbitrary codex config-override passthrough (-c key=value at spawn)
     extra_config: dict[str, Any] = field(default_factory=dict)
     ultracode: UltracodeConfig = field(default_factory=UltracodeConfig)
+    lifecycle: CodexLifecycleConfig = field(default_factory=CodexLifecycleConfig)
 
     @classmethod
     @_coerced
@@ -2353,6 +2377,7 @@ class CodexConfig:
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
             ultracode=UltracodeConfig.from_dict(d.get("ultracode")),
+            lifecycle=CodexLifecycleConfig.from_dict(d.get("lifecycle")),
         )
 
     def validate(self) -> list[str]:
@@ -2374,6 +2399,7 @@ class CodexConfig:
                 f"got {self.sandbox!r}"
             )
         problems.extend(self.ultracode.validate())
+        problems.extend(self.lifecycle.validate())
         return problems
 
 
