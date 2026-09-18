@@ -738,11 +738,9 @@ class WorkflowRunService:
     # ------------------------------------------------------------------ #
 
     async def _reconcile_codex_lifecycle(self) -> None:
-        """Reap cgroup scopes left by a previous daemon incarnation. Records of
-        the current generation belong to live runs and are skipped inside
-        ``reconcile``. Best effort — never blocks the monitor loop."""
-        if self.config.codex.lifecycle.mode != codex_lifecycle.MODE_STRICT:
-            return
+        """Reap cgroup scopes recorded by a previous run. Runs regardless of the
+        current mode so disabling containment does not strand a crashed run's
+        scope. Best effort — never blocks the monitor loop."""
         try:
             results = await asyncio.to_thread(
                 codex_lifecycle.reconcile, self.runs_dir(),
@@ -760,9 +758,16 @@ class WorkflowRunService:
     async def _reap_codex_lifecycle(self, run_id: str) -> None:
         """Reap one terminal run's contained descendants from its record."""
         try:
-            await asyncio.to_thread(codex_lifecycle.reap, self.runs_dir() / run_id)
+            receipt = await asyncio.to_thread(codex_lifecycle.reap, self.runs_dir() / run_id)
         except Exception:  # noqa: BLE001
             logger.exception("codex lifecycle reap failed for %s", run_id)
+            return
+        if receipt.outcome not in ("complete", "no_scope"):
+            logger.warning(
+                "codex lifecycle reap for %s did not complete (%s: %s); "
+                "the next startup reconciliation will retry",
+                run_id, receipt.outcome, receipt.error,
+            )
 
     # ------------------------------------------------------------------ #
     #  Budget monitor                                                     #

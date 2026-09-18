@@ -188,7 +188,7 @@ class CodexAppServerClient:
         # returns the scope-wrapped argv; it raises before exec if the host
         # can't contain the run.
         containment = self._containment
-        if containment is not None and containment.enabled:
+        if containment is not None:
             try:
                 args, self._lifecycle_record = await asyncio.to_thread(
                     lifecycle.prepare_launch, containment, args,
@@ -218,7 +218,7 @@ class CodexAppServerClient:
 
         # Record the scope's InvocationID + resolved cgroup now that systemd-run
         # created it.
-        if containment is not None and containment.enabled and self._lifecycle_record is not None:
+        if containment is not None and self._lifecycle_record is not None:
             try:
                 self._lifecycle_record = await asyncio.to_thread(
                     lifecycle.record_launched,
@@ -255,9 +255,9 @@ class CodexAppServerClient:
             await self.close()
             raise
 
-        # Confirm the app-server is inside its scope cgroup before dispatching.
+        # Verify the app-server is inside its scope cgroup before returning.
         if (
-            containment is not None and containment.enabled
+            containment is not None
             and self._lifecycle_record is not None
             and self._proc is not None and self._proc.pid is not None
         ):

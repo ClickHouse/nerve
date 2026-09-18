@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""Real escaping-descendant fixture for Codex lifecycle tests (no model, no net).
+"""Escaping-descendant fixture for Codex lifecycle tests (no model, no network).
 
-Mirrors the incident shape: a process ``setsid``\\ s into its own session/group
-and double-forks a grandchild that lingers, so ``killpg`` on the launcher's
-group cannot reach it — only a cgroup-scoped reap can. Every process carries a
-unique ``ESCAPER_TOKEN`` in its environment (and leaves carry it in argv) so the
-test's belt-and-braces cleanup only ever signals its own fixtures, by pidfd,
-never by name/pgrep/killall.
+Run as the main command of a systemd ``--scope``, it setsid+double-forks a
+sleeper grandchild that outlives the scope's main process — the escape a
+single ``killpg`` cannot reach. Every process carries a unique ``ESCAPER_TOKEN``
+so cleanup only ever signals this fixture's own processes, by pidfd.
 
-Commands (each is meant to run as the main command of a systemd ``--scope``):
-
-  spawn-escapee <outdir>            setsid + double-fork a sleeper grandchild
-  spawn-escapee-nested <outdir>     …then migrate the grandchild into a child
-                                    cgroup it mkdirs under the delegated scope
-                                    (root cgroup.procs empties; recursive
-                                    cgroup.events populated stays 1)
-  spawn-escapee-igterm <outdir>     grandchild ignores SIGTERM (forces KILL)
-  sleeper                           sleep (a leaf)
-  sweep <token>                     identity-checked pidfd cleanup of the token
+Commands: ``spawn-escapee <outdir>`` (plain), ``spawn-escapee-nested <outdir>``
+(migrate the grandchild into a child cgroup so the scope root empties but
+recursive ``cgroup.events populated`` stays 1), ``sleeper``, ``sweep <token>``.
 """
 
 from __future__ import annotations
@@ -148,8 +139,6 @@ def _double_fork_grandchild(token: str, outdir: str, variant: str) -> None:
                     fh.write(str(os.getpid()))
             except OSError:
                 pass  # non-fatal: fall back to plain containment
-    elif variant == "igterm":
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     _write(outdir, "grandchild.pid", str(os.getpid()))
     _become_sleeper(token, "grandchild", outdir)
@@ -187,8 +176,6 @@ def main() -> int:
         return _spawn("plain", sys.argv[2:])
     if cmd == "spawn-escapee-nested":
         return _spawn("nested", sys.argv[2:])
-    if cmd == "spawn-escapee-igterm":
-        return _spawn("igterm", sys.argv[2:])
     if cmd == "sweep":
         token = os.environ.get("ESCAPER_TOKEN") or (sys.argv[2] if len(sys.argv) > 2 else "")
         print(sweep(token))
