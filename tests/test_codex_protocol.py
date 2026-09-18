@@ -253,13 +253,9 @@ def test_backend_notes_appended_to_developer_instructions(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Per-turn usage: cumulative-total delta (not `last`).                         #
-#                                                                              #
-# The app-server emits one thread/tokenUsage/updated per API response within a #
-# turn. `total` is the monotonic per-thread cumulative counter; `last` is only #
-# the most recent single response. A turn's usage is the delta of `total`      #
-# across the turn — reading `last` alone drops every response but the last of  #
-# a multi-step (tool-calling) turn and undercounts it.                         #
+# Per-turn usage = cumulative-`total` delta over the turn.                      #
+# `total` is the per-thread cumulative counter, `last` a single response; the   #
+# turn-start baseline is `total - last` on the turn's first notification.       #
 # --------------------------------------------------------------------------- #
 
 
@@ -349,8 +345,8 @@ async def test_resume_does_not_overcount_full_thread_total(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fallback_to_last_when_total_absent(tmp_path):
-    # Legacy app-server sends only `last` (no cumulative `total`): preserve the
-    # previous single-response behaviour rather than dropping usage.
+    # Only `last` present (no cumulative `total`): usage comes from that
+    # single response.
     client = _client(tmp_path)
     assert await client._map_notification("thread/tokenUsage/updated", {
         "tokenUsage": {"last": _tok(10, 4, 2), "modelContextWindow": 400_000},
