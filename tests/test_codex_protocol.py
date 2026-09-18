@@ -250,3 +250,181 @@ def test_backend_notes_appended_to_developer_instructions(tmp_path):
     assert "Native Codex skills keep their normal" in flat_instructions
     assert params["approvalPolicy"] == "never"
     assert params["sandbox"] == "danger-full-access"
+
+
+# --------------------------------------------------------------------------- #
+# Per-turn usage = cumulative-`total` delta over the turn.                      #
+# `total` is the per-thread cumulative counter, `last` a single response; the   #
+# turn-start baseline is `total - last` on the turn's first notification.       #
+# --------------------------------------------------------------------------- #
+
+
+def _tok(inp, cached, out):
+    return {"inputTokens": inp, "cachedInputTokens": cached, "outputTokens": out}
+
+
+async def _feed_usage(client, total, last, window=None):
+    """Deliver one thread/tokenUsage/updated notification."""
+    payload = {"total": total, "last": last}
+    if window is not None:
+        payload["modelContextWindow"] = window
+    assert await client._map_notification(
+        "thread/tokenUsage/updated", {"tokenUsage": payload},
+    ) == []  # retained for the turn, never emitted as an event
+
+
+def _complete(client, status="completed", error=None):
+    turn = {"id": "t", "status": status}
+    if error is not None:
+        turn["error"] = {"message": error}
+    return client._map_turn_completed({"turn": turn})
+
+
+@pytest.mark.asyncio
+async def test_single_step_turn_uses_total_delta(tmp_path):
+    # Fresh thread, one response: total == last, so the turn-start baseline is
+    # zero and the turn equals the full total (cached split out disjoint).
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 20, 10), _tok(100, 20, 10))
+    done = _complete(client)
+    assert done.usage.input_tokens == 80        # 100 - 20 cached
+    assert done.usage.cache_read_tokens == 20
+    assert done.usage.output_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_multi_step_turn_uses_total_not_last(tmp_path):
+    # Two responses in one turn. The final `last` (200/50/60) must NOT be the
+    # recorded usage — the turn is the cumulative total delta (300/50/100).
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 0, 40), _tok(100, 0, 40))   # response 1
+    await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))  # response 2
+    done = _complete(client)
+    assert done.usage.output_tokens == 100      # not 60 (final `last`)
+    assert done.usage.input_tokens == 250       # 300 - 50 cached, not 200-based
+    assert done.usage.cache_read_tokens == 50
+
+
+@pytest.mark.asyncio
+async def test_second_turn_deltas_off_first_turn_end(tmp_path):
+    # Turn 2's baseline is derived from the live stream (total - last of its
+    # first notification), which equals turn 1's ending total — so turn 2 counts
+    # only its own increment, never the accumulated thread history.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 0, 40), _tok(100, 0, 40))
+    await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))
+    _complete(client)                                   # turn 1 ended at 300/50/100
+    client._reset_turn_usage_accounting()               # what start_turn() does
+    await _feed_usage(client, _tok(450, 80, 150), _tok(150, 30, 50))
+    done = _complete(client)
+    assert done.usage.output_tokens == 50               # 150 - 100
+    assert done.usage.input_tokens == 120               # (450-300) - (80-50)
+    assert done.usage.cache_read_tokens == 30           # 80 - 50
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_overcount_full_thread_total(tmp_path):
+    # Resume/reconnect: a fresh client object (baseline None) attaches to a
+    # native thread whose `total` continues at ~66M and does NOT reset. The
+    # first post-resume turn must count only its own response, NOT the whole
+    # accumulated history. The baseline is recovered from (total - last) of the
+    # first notification, so the delta is tiny even though `total` is huge.
+    client = _client(tmp_path)
+    await _feed_usage(
+        client,
+        _tok(66_000_000, 64_000_000, 300_000),   # continuing thread total
+        _tok(132_000, 130_000, 40),               # this turn's single response
+    )
+    done = _complete(client)
+    assert done.usage.input_tokens == 2_000       # 132_000 - 130_000, NOT ~2M
+    assert done.usage.cache_read_tokens == 130_000
+    assert done.usage.output_tokens == 40
+    # Guard against a regression to "no baseline => full total" (would be ~2M).
+    assert done.usage.input_tokens < 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_last_when_total_absent(tmp_path):
+    # Only `last` present (no cumulative `total`): usage comes from that
+    # single response.
+    client = _client(tmp_path)
+    assert await client._map_notification("thread/tokenUsage/updated", {
+        "tokenUsage": {"last": _tok(10, 4, 2), "modelContextWindow": 400_000},
+    }) == []
+    assert client._turn_total_base is None        # nothing to anchor a delta to
+    done = _complete(client)
+    assert done.usage.input_tokens == 6           # 10 - 4 cached
+    assert done.usage.cache_read_tokens == 4
+    assert done.usage.output_tokens == 2
+    assert done.context_window == 400_000
+
+
+@pytest.mark.asyncio
+async def test_reset_turn_accounting_clears_state(tmp_path):
+    # start_turn()'s reset must clear the baseline and the native-child marker
+    # so nothing bleeds from the previous turn.
+    client = _client(tmp_path)
+    await client._map_notification("item/started", {"item": {
+        "id": "c1", "type": "collabAgentToolCall", "tool": "Agent", "prompt": "go",
+    }})
+    await _feed_usage(client, _tok(100, 0, 10), _tok(100, 0, 10))
+    assert client._turn_total_base is not None and client._turn_has_native_child
+    client._reset_turn_usage_accounting()
+    assert client._turn_usage is None
+    assert client._turn_total_base is None
+    assert client._turn_has_native_child is False
+
+
+@pytest.mark.asyncio
+async def test_error_turn_still_records_partial_usage(tmp_path):
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(200, 0, 50), _tok(200, 0, 50))
+    done = _complete(client, status="failed", error="boom")
+    assert done.status == "failed" and done.error == "boom"
+    assert done.usage.input_tokens == 200
+    assert done.usage.output_tokens == 50
+
+
+@pytest.mark.asyncio
+async def test_native_child_flags_cost_lower_bound(tmp_path):
+    # A native collaboration child ran: its separate-thread tokens are not yet
+    # attributed here, so the turn's cost must be marked a lower bound.
+    client = _client(tmp_path)
+    await client._map_notification("item/started", {"item": {
+        "id": "c1", "type": "collabAgentToolCall", "tool": "Researcher",
+        "prompt": "investigate",
+    }})
+    await _feed_usage(client, _tok(500, 100, 60), _tok(500, 100, 60))
+    done = _complete(client)
+    assert done.usage.input_tokens == 400              # parent still counted
+    assert done.usage.raw.get("cost_is_lower_bound") is True
+    assert done.usage.raw.get("native_children_unattributed") is True
+
+
+@pytest.mark.asyncio
+async def test_native_child_only_turn_records_lower_bound(tmp_path):
+    # Turn completes with a native child but no parent tokenUsage notification:
+    # a zero-parent usage is still recorded, carrying the lower-bound marker so
+    # the child cost is not silently dropped.
+    client = _client(tmp_path)
+    await client._map_notification("item/started", {"item": {
+        "id": "c1", "type": "collabAgentToolCall", "tool": "Agent", "prompt": "x",
+    }})
+    done = _complete(client)
+    assert done.usage is not None
+    assert done.usage.input_tokens == 0
+    assert done.usage.raw.get("cost_is_lower_bound") is True
+
+
+@pytest.mark.asyncio
+async def test_dropped_mid_turn_notification_self_heals(tmp_path):
+    # If a mid-turn notification is lost, the cumulative `total` on the NEXT
+    # notification still includes the missing response, so the total-delta
+    # recovers it — a sum-of-`last` scheme would have undercounted.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 0, 30), _tok(100, 0, 30))  # response 1
+    # (response 2's notification dropped — never delivered)
+    await _feed_usage(client, _tok(600, 0, 130), _tok(300, 0, 60))  # response 3
+    done = _complete(client)
+    assert done.usage.input_tokens == 600      # full cumulative, incl. the gap
+    assert done.usage.output_tokens == 130
