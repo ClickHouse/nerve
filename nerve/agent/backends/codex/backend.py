@@ -1358,8 +1358,9 @@ class CodexClient(AgentClient):
 
         usage = self._normalize_usage(self._turn_usage, self._turn_total_base)
         if usage is None and (self._ultracode_usage or self._turn_has_native_child):
-            # No parent tokenUsage this turn: emit a zero record to carry the
-            # Ultracode child totals and/or the native-child lower-bound marker.
+            # A turn can complete before app-server emits a parent tokenUsage
+            # notification. Emit a zero record so the Ultracode child totals
+            # and/or the native-child lower-bound marker are still recorded.
             usage = ev.NormalizedUsage()
         if usage is not None and self._ultracode_usage:
             child = self._ultracode_usage
@@ -1461,16 +1462,17 @@ class CodexClient(AgentClient):
         usage: dict | None,
         turn_total_base: dict | None = None,
     ) -> ev.NormalizedUsage | None:
-        """``thread/tokenUsage/updated`` → NormalizedUsage for one turn.
+        """``thread/tokenUsage/updated`` → NormalizedUsage.
 
         The turn's usage is the cumulative-``total`` delta over the turn:
         ``total`` minus ``turn_total_base`` (the turn-start cumulative
         counters). When no cumulative ``total`` is present, ``last`` — the most
         recent single response — is used instead.
 
-        OpenAI's ``inputTokens`` includes the cached subset; nerve keeps them
-        disjoint (input = full-price only), so the cached count is subtracted
-        out here — the pricing module and the usage-dict contract rely on it.
+        OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
+        Anthropic-style accounting keeps them disjoint (input = full
+        price only), so the cached count is subtracted out here — the
+        pricing module and the usage-dict contract both rely on it.
         """
         if not usage:
             return None
