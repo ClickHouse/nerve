@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.agent.backends.codex import lifecycle as codex_lifecycle
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
-from nerve.db.workflow_runs import ACTIVE_STATUSES, TERMINAL_STATUSES
+from nerve.db.workflow_runs import ACTIVE_STATUSES
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -160,10 +160,8 @@ class WorkflowRunService:
                 "survive the restart; restart them explicitly if still needed.",
                 priority="high",
             )
-        # R4 ordering: the interrupted-active→failed pass above has already run,
-        # so every prior-generation run is terminal here. Reap any Codex
-        # workflow-run cgroup scopes their (now-gone) clients left behind,
-        # before the monitor loop can dispatch anything new.
+        # Reap Codex workflow-run cgroup scopes left by a previous incarnation,
+        # before the monitor loop dispatches anything new.
         await self._reconcile_codex_lifecycle()
         interval = max(5, int(self.config.workflows.poll_interval_seconds))
         self._monitor_task = asyncio.create_task(self._monitor_loop(interval))
@@ -721,10 +719,8 @@ class WorkflowRunService:
                 logger.exception(
                     "workflow run completion listener failed for %s", run_id,
                 )
-        # Authoritatively reap any contained Codex descendants for this run,
-        # independent of the in-memory client (works from the durable record).
-        # Detached so it never blocks the terminal path; no-ops unless the run
-        # recorded strict/observe containment.
+        # Reap this run's contained descendants from its durable record,
+        # detached so it never blocks the terminal path (no-op without a record).
         if str(run.get("engine") or "") == ENGINE_CODEX:
             self._spawn_detached(
                 self._reap_codex_lifecycle(run_id),
@@ -742,122 +738,31 @@ class WorkflowRunService:
     # ------------------------------------------------------------------ #
 
     async def _reconcile_codex_lifecycle(self) -> None:
-        """Startup reconciliation of Codex workflow-run cgroup scopes.
-
-        Reaps contained descendants of terminal/abandoned prior-generation runs
-        from their durable records — independent of the in-memory client, which
-        did not survive the restart. Never touches a run this daemon generation
-        still owns (the generation fence lives in ``reconcile_run``). Best
-        effort: a failure here must not block the monitor loop from starting.
-        """
-        lc = self.config.codex.lifecycle
-        if lc.mode != codex_lifecycle.MODE_STRICT:
+        """Reap cgroup scopes left by a previous daemon incarnation. Records of
+        the current generation belong to live runs and are skipped inside
+        ``reconcile``. Best effort — never blocks the monitor loop."""
+        if self.config.codex.lifecycle.mode != codex_lifecycle.MODE_STRICT:
             return
-        runs_dir = self.runs_dir()
-        try:
-            records = await asyncio.to_thread(
-                codex_lifecycle.list_records, runs_dir,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("codex lifecycle record scan failed")
-            return
-        if not records:
-            return
-        # Snapshot business terminality on the loop (DB access), then reap
-        # off-thread. A run whose row is gone is treated terminal.
-        terminal_ids: dict[str, bool] = {}
-        for run_id, _rec in records:
-            run = await self.db.get_workflow_run(run_id)
-            terminal_ids[run_id] = (
-                run is None or run.get("status") in TERMINAL_STATUSES
-            )
-
-        def _is_terminal(run_id: str) -> bool:
-            return terminal_ids.get(run_id, True)
-
         try:
             results = await asyncio.to_thread(
-                codex_lifecycle.reconcile_all, runs_dir, _is_terminal,
-                term_grace_seconds=lc.term_grace_seconds,
-                stop_timeout_seconds=lc.stop_timeout_seconds,
+                codex_lifecycle.reconcile, self.runs_dir(),
             )
         except Exception:  # noqa: BLE001
             logger.exception("codex lifecycle reconciliation failed")
             return
-        for run_id, receipt in results:
-            self._journal_lifecycle(run_id, "reconcile", receipt)
-        retry_owed = [rid for rid, rc in results if rc.needs_retry()]
-        if retry_owed:
+        stuck = [rid for rid, rc in results if not rc.is_complete()]
+        if stuck:
             logger.warning(
-                "codex lifecycle reconciliation left %d run(s) needing a reap "
-                "retry (nerve codex reap-descendants <run>): %s",
-                len(retry_owed), ", ".join(retry_owed),
-            )
-        attention = [rid for rid, rc in results if rc.needs_attention()]
-        if attention:
-            logger.warning(
-                "codex lifecycle reconciliation refused %d run(s) whose scope "
-                "was replaced by a foreign unit: %s",
-                len(attention), ", ".join(attention),
+                "codex lifecycle reconciliation could not confirm cleanup for: %s",
+                ", ".join(stuck),
             )
 
     async def _reap_codex_lifecycle(self, run_id: str) -> None:
-        """Terminal-path reap for one run. No-ops unless it recorded a scope."""
-        lc = self.config.codex.lifecycle
-        run_dir = self.runs_dir() / run_id
+        """Reap one terminal run's contained descendants from its record."""
         try:
-            receipt = await asyncio.to_thread(
-                codex_lifecycle.reap, run_dir,
-                term_grace_seconds=lc.term_grace_seconds,
-                stop_timeout_seconds=lc.stop_timeout_seconds,
-            )
+            await asyncio.to_thread(codex_lifecycle.reap, self.runs_dir() / run_id)
         except Exception:  # noqa: BLE001
             logger.exception("codex lifecycle reap failed for %s", run_id)
-            return
-        if receipt.outcome != "no_scope":
-            self._journal_lifecycle(run_id, "reap", receipt)
-
-    async def retry_lifecycle_reap(self, run_id: str) -> dict:
-        """The one supported, narrowly-scoped retry trigger (service entry).
-
-        Re-attempts a ``pending_retry`` reap from the durable record and
-        returns the resulting receipt. Idempotent; never fabricates success.
-        A run with no record yields ``no_scope``.
-        """
-        run_dir = self.runs_dir() / run_id
-        lc = self.config.codex.lifecycle
-        receipt = await asyncio.to_thread(
-            codex_lifecycle.retry, run_dir,
-            term_grace_seconds=lc.term_grace_seconds,
-            stop_timeout_seconds=lc.stop_timeout_seconds,
-        )
-        if receipt.outcome != "no_scope":
-            self._journal_lifecycle(run_id, "reap_retry", receipt)
-        from dataclasses import asdict as _asdict
-
-        return _asdict(receipt)
-
-    def _journal_lifecycle(self, run_id: str, event: str, receipt: Any) -> None:
-        """Append a lifecycle receipt summary to the run's journal.
-
-        Receipt fields carry no argv/credentials/environment — only outcome,
-        method, and identity-verification booleans.
-        """
-        from dataclasses import asdict as _asdict
-
-        journal_dir = self.runs_dir() / run_id
-        try:
-            path = journal_dir / "events.ndjson"
-            if not journal_dir.is_dir():
-                return
-            line = json.dumps({
-                "ts": utc_now_iso(), "run_id": run_id,
-                "event": f"lifecycle_{event}", **_asdict(receipt),
-            })
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            logger.debug("lifecycle journal write failed for %s", run_id)
 
     # ------------------------------------------------------------------ #
     #  Budget monitor                                                     #

@@ -184,10 +184,9 @@ class CodexAppServerClient:
             args.extend(["--config", kv])
         args.extend(["app-server", "--listen", "stdio://"])
 
-        # Workflow-run containment: in strict mode `prepare_launch` returns the
-        # scope-wrapped argv so the whole descendant tree is contained *before*
-        # the command execs (and raises, un-launched, if containment can't be
-        # established). In observe mode it records intent but leaves argv as-is.
+        # For a contained workflow run, `prepare_launch` records the owner and
+        # returns the scope-wrapped argv; it raises before exec if the host
+        # can't contain the run.
         containment = self._containment
         if containment is not None and containment.enabled:
             try:
@@ -217,15 +216,9 @@ class CodexAppServerClient:
                 f"Failed to spawn codex app-server ({self._bin_path}): {e}"
             ) from e
 
-        # Record the scope's immutable identity (InvocationID + resolved
-        # cgroup) now that systemd-run has created it. Failure here means the
-        # contained launch cannot be verified — fail the session (the scope,
-        # already created, is still reapable from the persisted intent).
-        if (
-            containment is not None
-            and containment.mode == lifecycle.MODE_STRICT
-            and self._lifecycle_record is not None
-        ):
+        # Record the scope's InvocationID + resolved cgroup now that systemd-run
+        # created it.
+        if containment is not None and containment.enabled and self._lifecycle_record is not None:
             try:
                 self._lifecycle_record = await asyncio.to_thread(
                     lifecycle.record_launched,
@@ -262,34 +255,21 @@ class CodexAppServerClient:
             await self.close()
             raise
 
-        # Membership handshake: confirm the app-server is actually inside its
-        # scope cgroup before any work is dispatched. Registration is made
-        # durable so a crash after here is reconcilable.
+        # Confirm the app-server is inside its scope cgroup before dispatching.
         if (
-            containment is not None
-            and containment.mode == lifecycle.MODE_STRICT
+            containment is not None and containment.enabled
             and self._lifecycle_record is not None
-            and self._proc is not None
-            and self._proc.pid is not None
+            and self._proc is not None and self._proc.pid is not None
         ):
-            record = self._lifecycle_record
             member = await asyncio.to_thread(
-                lifecycle.verify_membership, record.control_group, self._proc.pid,
+                lifecycle.verify_membership,
+                self._lifecycle_record.control_group, self._proc.pid,
             )
             if not member:
                 await self.close()
                 raise TransportDiedError(
                     "codex app-server is not contained in its cgroup scope"
                 )
-            try:
-                self._lifecycle_record = await asyncio.to_thread(
-                    lifecycle.record_registered, containment.run_dir, record,
-                )
-            except (lifecycle.LifecycleError, OSError) as e:
-                await self.close()
-                raise TransportDiedError(
-                    f"codex workflow scope registration failed: {e}"
-                ) from e
         return response
 
     def is_alive(self) -> bool:

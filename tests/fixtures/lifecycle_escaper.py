@@ -16,8 +16,6 @@ Commands (each is meant to run as the main command of a systemd ``--scope``):
                                     (root cgroup.procs empties; recursive
                                     cgroup.events populated stays 1)
   spawn-escapee-igterm <outdir>     grandchild ignores SIGTERM (forces KILL)
-  spawn-escapee-forker <outdir>     grandchild forks 3 more sleepers on SIGTERM
-                                    (fork-during-teardown; all in the cgroup)
   sleeper                           sleep (a leaf)
   sweep <token>                     identity-checked pidfd cleanup of the token
 """
@@ -152,12 +150,6 @@ def _double_fork_grandchild(token: str, outdir: str, variant: str) -> None:
                 pass  # non-fatal: fall back to plain containment
     elif variant == "igterm":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    elif variant == "forker":
-        def _spawn_more(_sig, _frm):
-            for _ in range(3):
-                if os.fork() == 0:
-                    _become_sleeper(token, "forked", outdir)
-        signal.signal(signal.SIGTERM, _spawn_more)
 
     _write(outdir, "grandchild.pid", str(os.getpid()))
     _become_sleeper(token, "grandchild", outdir)
@@ -197,8 +189,6 @@ def main() -> int:
         return _spawn("nested", sys.argv[2:])
     if cmd == "spawn-escapee-igterm":
         return _spawn("igterm", sys.argv[2:])
-    if cmd == "spawn-escapee-forker":
-        return _spawn("forker", sys.argv[2:])
     if cmd == "sweep":
         token = os.environ.get("ESCAPER_TOKEN") or (sys.argv[2] if len(sys.argv) > 2 else "")
         print(sweep(token))

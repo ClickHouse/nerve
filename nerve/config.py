@@ -2263,57 +2263,25 @@ class UltracodeConfig:
 
 @dataclass
 class CodexLifecycleConfig:
-    """Descendant containment for Codex **workflow** runs (cgroup v2 scope).
+    """Cgroup containment for Codex workflow runs.
 
-    A completed/cancelled/crashed workflow run can leave ``codex-linux-sandbox``
-    descendants alive: they ``setsid`` into their own process group and escape
-    the single-group ``killpg`` teardown. This opt-in feature launches a
-    workflow run's app-server inside a delegated systemd user scope so the
-    whole tree can be reaped, with a durable receipt. See
-    ``nerve/agent/backends/codex/lifecycle.py``.
-
-    ``mode``:
-
-    * ``disabled`` (default) — inert; launch behaviour is unchanged.
-    * ``observe`` — UNENFORCED: records intent for staged-rollout visibility
-      but does **not** contain the launch and never claims a cleanup it did not
-      perform.
-    * ``strict`` — launches inside a cgroup scope created before the command
-      execs; if containment cannot be established the launch **fails before
-      exec** (no silent downgrade). Codex workflow runs only.
+    ``mode``: ``disabled`` (default; launch unchanged) or ``strict`` (launch the
+    workflow app-server inside a systemd user scope so its descendants can be
+    reaped; fails before exec where the host can't contain). Codex workflow runs
+    only. See ``nerve/agent/backends/codex/lifecycle.py``.
     """
 
     mode: str = "disabled"
-    term_grace_seconds: int = 5
-    stop_timeout_seconds: int = 20
 
     @classmethod
     @_coerced
     def from_dict(cls, raw: dict | None) -> "CodexLifecycleConfig":
-        d = raw or {}
-        return cls(
-            mode=str(d.get("mode") or "disabled").strip().lower(),
-            term_grace_seconds=_lenient_int(d.get("term_grace_seconds"), 5),
-            stop_timeout_seconds=_lenient_int(d.get("stop_timeout_seconds"), 20),
-        )
+        return cls(mode=str((raw or {}).get("mode") or "disabled").strip().lower())
 
     def validate(self) -> list[str]:
-        problems: list[str] = []
-        if self.mode not in ("disabled", "observe", "strict"):
-            problems.append(
-                "codex.lifecycle.mode must be 'disabled', 'observe', or "
-                f"'strict', got {self.mode!r}"
-            )
-        if self.term_grace_seconds < 1:
-            problems.append("codex.lifecycle.term_grace_seconds must be >= 1")
-        if self.stop_timeout_seconds < 1:
-            problems.append("codex.lifecycle.stop_timeout_seconds must be >= 1")
-        if self.stop_timeout_seconds <= self.term_grace_seconds:
-            problems.append(
-                "codex.lifecycle.stop_timeout_seconds must exceed "
-                "term_grace_seconds (stop waits out the TERM grace, then KILL)"
-            )
-        return problems
+        if self.mode not in ("disabled", "strict"):
+            return [f"codex.lifecycle.mode must be 'disabled' or 'strict', got {self.mode!r}"]
+        return []
 
 
 @dataclass

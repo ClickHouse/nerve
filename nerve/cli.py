@@ -1623,40 +1623,6 @@ def codex() -> None:
     """Inspect and authenticate the Codex integration."""
 
 
-@codex.command("reap-descendants")
-@click.argument("run_id")
-@click.option("--json-output", is_flag=True, help="Emit machine-readable JSON.")
-@click.pass_context
-def codex_reap_descendants(ctx: click.Context, run_id: str, json_output: bool) -> None:
-    """Retry the cgroup reap of a Codex workflow run's contained descendants.
-
-    The supported, idempotent retry trigger for a ``pending_retry`` lifecycle
-    reap (see codex/lifecycle.py). Reads only the run's durable record; never
-    fabricates success. A run with no record reports ``no_scope``.
-    """
-    import json as _json
-    from pathlib import Path
-
-    from nerve.agent.backends.codex import lifecycle
-
-    config = ctx.obj["config"]
-    lc = config.codex.lifecycle
-    run_dir = Path(config.workflows.runs_dir).expanduser() / run_id
-    receipt = lifecycle.retry(
-        run_dir,
-        term_grace_seconds=lc.term_grace_seconds,
-        stop_timeout_seconds=lc.stop_timeout_seconds,
-    )
-    from dataclasses import asdict
-
-    if json_output:
-        click.echo(_json.dumps(asdict(receipt), indent=2, sort_keys=True))
-    else:
-        verdict = "complete" if receipt.is_complete() else receipt.outcome
-        click.echo(f"[{verdict}] {run_id}: {receipt.outcome}"
-                   + (f" — {receipt.error}" if receipt.error else ""))
-
-
 @codex.command("token")
 @click.option(
     "--hours", type=click.IntRange(1, 24), default=8, show_default=True,
