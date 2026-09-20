@@ -7,8 +7,8 @@ work, with no warning. Session tokens now carry a configurable lifetime
 turns the window into an idle timeout.
 
 Covers: the configured TTL is honoured, a fresh token is left alone, a
-half-spent one is renewed, and audience-scoped (MCP) tokens — which are
-deliberately short-lived — never slide. What decides is the ``typ`` claim: the
+half-spent one is renewed, and short-lived audience-scoped MCP tokens never
+slide. What decides is the ``typ`` claim: the
 gate used to read ``sub``, which stopped meaning anything the moment ``sub``
 became an account id.
 """

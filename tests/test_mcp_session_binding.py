@@ -97,9 +97,8 @@ class TestTokenShapes:
         assert bound_session_id(payload) is None  # satellite attribution
 
     def test_mcp_tokens_say_what_they_are(self):
-        """Every token this version mints carries ``typ``. The MCP shapes are
-        the instance acting on its own behalf, so they say ``system`` — which
-        is also why they never slide."""
+        """New MCP tokens carry ``typ=system`` because they represent the
+        instance acting on its own behalf. System tokens never slide."""
         bound = decode_mcp_token(create_mcp_session_token(SECRET, "sess-42"), SECRET)
         assert bound[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SYSTEM
         from nerve.gateway.auth import create_external_mcp_token
@@ -109,11 +108,9 @@ class TestTokenShapes:
         assert MCP_SESSION_CLAIM not in external
 
     def test_a_credential_minted_before_typ_still_decodes_and_binds(self):
-        """The tokens already out there when this version starts. Nothing about
-        them changes: the bound one still names its engine session, the
-        external one still goes to satellite attribution, and neither is a web
-        session, so neither slides — even one four hours into its eight-hour
-        life, which is past the refresh threshold a session would slide at."""
+        """Legacy tokens without ``typ`` retain their existing behavior: bound
+        tokens name an engine session, external tokens use satellite
+        attribution, and neither slides like a web session."""
         bound = decode_mcp_token(pre_typ_mcp_token(session_id="sess-42"), SECRET)
         assert TOKEN_TYPE_CLAIM not in bound
         assert bound["aud"] == MCP_AUDIENCE

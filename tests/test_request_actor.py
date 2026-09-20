@@ -110,9 +110,7 @@ class _Install:
         return create_session_token(secret, account_id or self.account_id)
 
     def legacy_token(self, secret: str = _SECRET) -> str:
-        """What a browser that logged in before this version is holding: the
-        fixed subject, no type claim. Built by hand — nothing mints these now.
-        """
+        """Build a legacy browser token with a fixed subject and no type claim."""
         from datetime import datetime, timedelta, timezone
 
         now = datetime.now(timezone.utc)
@@ -637,11 +635,9 @@ class TestNoProcessGlobalActor:
                 assert res.json()["actor_id"] == actor_id
 
     async def test_no_module_keeps_an_actor_after_serving_requests(self, install):
-        """Structural, and the check that does not depend on timing: after two
-        people and the agent itself have been served, no module in the package
-        is holding an :class:`Actor`. An actor lives on the request, the
-        connection or the call chain — never on a module.
-        """
+        """After serving two people and the system principal, no module retains
+        an :class:`Actor`; actors live only on requests, connections, and call
+        chains."""
         import sys
 
         bob_account, _ = await install.add_account("Bob")

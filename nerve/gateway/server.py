@@ -95,14 +95,14 @@ def get_codex_thread_sync():
 class WebSocketConnection:
     """What a live WebSocket is, fixed at accept and never rewritten.
 
-    Frozen on purpose. A socket stays open for hours, so anything mutable here
-    is an identity that can change halfway through a conversation: the actor
+    The record is frozen because a socket may stay open for hours. Mutable
+    identity could change halfway through a conversation: the actor
     resolved at accept is the actor every message on this connection is
     attributed to. Account admission state may close a stale socket, but never
     rewrites the actor stored here; a new connection resolves from scratch.
 
-    Session selection is deliberately *not* here — the client switches sessions
-    over the same socket, so that one is a local variable in the handler.
+    Session selection stays in the handler because clients switch sessions over
+    the same socket.
     """
 
     client_id: str
