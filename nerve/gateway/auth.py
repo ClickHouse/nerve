@@ -60,42 +60,20 @@ SYSTEM_SUBJECT = "agent-system"
 LEGACY_SUBJECT = "user"
 
 
-# bcrypt hashes at most this many *bytes* of a password. Up to and including
-# 4.x the library silently ignored the rest; 5.0 raises instead, which turns a
-# long or emoji-laden password into a 500 unless something upstream says no
-# first. That something is here, once, rather than at each caller.
+# bcrypt accepts at most 72 bytes. Validate before calling it.
 PASSWORD_MAX_BYTES = 72
 
-# The bcrypt work factor every hash this release writes is created at.
-#
-# Pinned rather than left to ``bcrypt.gensalt()``'s default so that the cost is
-# this project's decision and not the library's to change under us — and so
-# there is one number to point at when the policy is discussed.
-#
-# **Cost policy.** Hashes are *stored* at this cost. Hashes are *accepted* at
-# any cost, because a configured password copied onto an account row by the
-# startup migration carries whatever work factor produced it, possibly years
-# ago, and refusing it would lock out an upgrading install. A stored hash at any
-# other cost is re-hashed at this one the next time its owner logs in
-# successfully (see :func:`needs_rehash`), so an install converges without
-# anybody being asked to do anything. Until it does, failed logins are padded to
-# a common response budget, because otherwise the comparison time says which
-# work factor an account uses and therefore that the account exists.
+# Work factor for new hashes. Existing hashes are accepted and upgraded after a
+# successful login.
 BCRYPT_COST = 12
 
 
 class PasswordTooLongError(ValueError):
-    """A password longer than bcrypt will hash. Ingress turns it into a 4xx."""
+    """The password exceeds bcrypt's byte limit."""
 
 
 def password_length_problem(plain: str) -> str | None:
-    """Why this password cannot be stored, or ``None``.
-
-    Measured in **UTF-8 bytes, not characters**: nineteen emoji are nineteen
-    characters and seventy-six bytes, and it is the bytes bcrypt counts. Said in
-    the message too, because "too long" on a password a user can see is twelve
-    characters long is not a usable error.
-    """
+    """Return a validation error for a password, or ``None``."""
     if not plain:
         return "A password is required"
     size = len(plain.encode("utf-8"))
@@ -109,20 +87,9 @@ def password_length_problem(plain: str) -> str | None:
 
 
 def hash_password(plain: str) -> str:
-    """bcrypt-hash a password for storage on an account row.
+    """Hash a valid password for storage.
 
-    The same construction the installer uses for ``auth.password_hash``
-    (:mod:`nerve.bootstrap`), at bcrypt's default cost, so a hash produced here
-    and one produced there are interchangeable — which is what lets PR 3's
-    startup migration *copy* the configured hash onto the account row instead of
-    re-hashing it and changing somebody's password.
-
-    Raises :class:`PasswordTooLongError` rather than letting bcrypt's own
-    ``ValueError`` escape as a 500. The ingress that collects a password checks
-    :func:`password_length_problem` first and answers `400`; this is the
-    backstop for anything that does not (a later wizard, a script), and it
-    refuses rather than truncating, because a stored credential whose last bytes
-    were silently dropped is a password that is not the one its owner set.
+    Raises :class:`PasswordTooLongError` instead of truncating overlong input.
     """
     problem = password_length_problem(plain)
     if problem:
@@ -133,12 +100,7 @@ def hash_password(plain: str) -> str:
 
 
 def bcrypt_cost(hashed: str) -> int | None:
-    """The work factor a bcrypt hash was produced at, or ``None``.
-
-    Read out of the modular-crypt prefix (``$2b$12$...``) rather than by
-    hashing anything. ``None`` for a string that is not a bcrypt hash — a
-    configured value an operator typed by hand, say.
-    """
+    """Return a bcrypt hash's work factor, or ``None`` if invalid."""
     parts = (hashed or "").split("$")
     if len(parts) < 4 or not parts[1].startswith("2"):
         return None
@@ -149,62 +111,22 @@ def bcrypt_cost(hashed: str) -> int | None:
 
 
 def needs_rehash(hashed: str) -> bool:
-    """Whether this stored hash should be replaced at the current cost.
-
-    True when the work factor differs from :data:`BCRYPT_COST` — lower (an old
-    or hand-made hash, which is weaker than the policy) or higher (slower than
-    the policy, and the thing that makes a failed login against it take a
-    distinguishable amount of time). An unparseable hash is left alone: there is
-    nothing to compare, and re-hashing it would need a password it never
-    accepted.
-    """
+    """Return whether a valid hash uses a different work factor."""
     cost = bcrypt_cost(hashed)
     return cost is not None and cost != BCRYPT_COST
 
 
 def source_authenticates(credential_source: str, *, configured_password: bool) -> bool:
-    """Whether an account on this ``credential_source`` can be logged into.
-
-    The one statement of where a credential lives, so that nothing else has to
-    restate it and get it subtly different: ``nerve doctor`` used to call an
-    account passwordless whenever its row said ``none``, and then tell the
-    operator that their ``auth.password_hash`` did nothing — while the login
-    route was still honouring it, and removing it would have opened the
-    instance.
-
-    ``local`` carries its own hash. **Both** ``config`` and ``none`` read
-    ``auth.password_hash``: the startup mirror keeps the row in step with that
-    key, but it only runs at startup, and a reload that adds a password has to
-    take effect before the next restart re-derives the row.
-    """
+    """Return whether the account has a local or configured credential."""
     return credential_source == "local" or configured_password
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash.
+    """Verify a password, returning ``False`` for malformed hashes.
 
-    ``False`` — never an exception — when ``hashed`` is not a bcrypt hash at
-    all. An operator can put anything in ``auth.password_hash``, and a
-    credential that cannot be parsed must read as "does not match" rather than
-    as a 500 that tells the caller their guess was interesting.
-
-    **An empty candidate is compared, not refused.** Returning early for an
-    empty password made an unknown-username probe return in microseconds while a
-    known one paid for a full comparison — username enumeration with an empty
-    string — and it rejected the unusual but previously valid case of a
-    configured hash *of* an empty password, which an upgrade has to keep
-    honouring. Only a missing *hash* short-circuits, because there is then
-    nothing to compare against at all.
-
-    **An over-long candidate is truncated to bcrypt's 72 bytes rather than
-    refused**, which is the asymmetry with :func:`hash_password` and is
-    deliberate. Every hash that reaches this function from before bcrypt 5 was
-    made from the first 72 bytes of whatever was typed, because that is what the
-    library did; refusing the full password now would lock out anybody whose
-    password is longer than that and who could log in yesterday — and this
-    release's whole premise is that an upgrade preserves authentication. It
-    weakens nothing: the bytes past 72 were already not part of that hash, and
-    no hash this release *creates* can have any, since hashing refuses them.
+    Candidates are truncated to 72 bytes to preserve hashes created by bcrypt
+    versions that silently truncated overlong passwords. New hashes reject such
+    passwords in :func:`hash_password`.
     """
     if not hashed:
         return False

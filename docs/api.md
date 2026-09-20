@@ -2,43 +2,30 @@
 
 ## REST API
 
-All endpoints require JWT authentication via `Authorization: Bearer <token>` header or `nerve_token` cookie.
+Unless noted otherwise, endpoints require a JWT in the `Authorization: Bearer
+<token>` header or `nerve_token` cookie.
 
 ### Auth
 
 #### `POST /api/auth/login`
-Log in, receive a JWT.
+Log in and receive a session token. Authentication is not required.
 
 ```json
 Request:  { "password": "...", "username": "alice" }
 Response: { "token": "eyJ..." }
 ```
 
-`username` is **optional while exactly one account exists and required once
-there are two or more.** The account an upgrade created has none, so requiring
-one would lock that install out; supplying a username that does resolve is
-accepted at any time, so a client that always sends one keeps working the moment
-the account is named. Ask `GET /api/auth/status` which shape to collect rather
-than guessing.
+`username` is optional when one account exists and required when there are two
+or more. Use `GET /api/auth/status` to determine which fields to show. On a
+passwordless installation, any password is accepted for the sole account.
 
-With no password anywhere — none on the account row and no `auth.password_hash`
-— the install is passwordless: any password is accepted and the token resolves
-to the single local account. That state exists only while there is exactly one
-account.
-
-Tokens are signed with `auth.jwt_secret`, or with the secret the gateway
-generated on first start when that is unset (see
-[Accounts and identity](accounts.md)); `503` means no signing secret exists
-yet, which only happens before the gateway has completed its first start.
-
-The result is a **session token**: `sub` is the account's id and `typ` is
-`session`. Treat it as opaque — the claims are the server's business.
+Treat the returned token as opaque.
 
 | Outcome | Response |
 |---|---|
-| wrong password, unknown username, or no username where one is required | `401` `Invalid username or password` — identical in all three cases, and identical in how long it takes: a username that names nobody still costs a password comparison, an empty password is compared rather than refused early, and every refusal waits out a response budget calibrated from the slowest hash the install stores, so that no account's work factor is visible in the timing |
-| correct password, account disabled | `401` naming the reason, and only after the password checked out |
-| no signing secret, or identity storage not wired yet | `503` |
+| Invalid credentials or missing required username | `401` `Invalid username or password` |
+| Valid credentials for a disabled account | `401` |
+| Authentication is not ready | `503` |
 
 #### Authenticated requests
 
@@ -50,15 +37,12 @@ Unknown and disabled accounts fail with `401`; unavailable startup identity
 state fails with `503`. See [Accounts and identity](accounts.md) for token
 types and legacy-session compatibility.
 
-**`X-Nerve-Token` on the response.** Once a session token is past half its
-life, the reply carries a fresh one under this header; swap it in and a tab in
-continuous use never expires, which turns `auth.jwt_expiry_hours` into an idle
-timeout. The same header carries the replacement for a session issued before
-per-account logins existed — those are upgraded on their first request rather
-than slid. The header is CORS-exposed, so a browser can read it cross-origin.
+When a session is more than halfway to expiry, the response includes a refreshed
+token in `X-Nerve-Token`. Replace the current token with it. The header also
+upgrades sessions created before per-account login and is exposed through CORS.
 
 #### `GET /api/auth/status`
-How to log in. No auth required.
+Return the required login fields. Authentication is not required.
 
 ```json
 Response: {
@@ -69,68 +53,11 @@ Response: {
 
 | Field | Meaning |
 |---|---|
-| `login` | what the form must collect: `none` (passwordless — send any password), `password` (one account, no username), `username_password` (two or more) |
-| `auth_required` | kept for older clients; equals `login != "none"` |
+| `login` | `none`, `password`, or `username_password` |
+| `auth_required` | Compatibility field; equivalent to `login != "none"` |
 
-Standalone passwordless installs auto-login and open Accounts; other signed-in
-sessions open the app, and signed-out sessions open the login page. **Auto-login
-with an empty password is correct for `none` and for nothing else** — with two
-accounts it names nobody and the server refuses it.
-
-Nothing here identifies anybody: no username, and not the number of accounts.
-Before the gateway has finished starting the answer is the fail-closed one
-(`login: "username_password"`, `auth_required: true`), which asks rather than
-assumes.
-
-### Accounts
-
-Every account may manage accounts — there are no roles — so these need only a
-valid session; an account is a person, so the credentials the instance mints for
-itself (`typ: system`) are refused with `403`. **No response ever carries a
-credential**, or says where one is stored.
-
-An account is:
-
-```json
-{
-  "id": "…", "actor_id": "…", "username": "alice", "display_name": "Alice",
-  "enabled": true, "has_password": true,
-  "created_at": "…"
-}
-```
-
-`id` is the login; `actor_id` is the person. They are different columns on the
-same row, and only `actor_id` is permanent — it is what attribution is recorded
-against and what survives a rename, so it is the id to resolve a displayed
-author through. `has_password` is the only thing published about the credential;
-where the hash lives is not.
-
-| Endpoint | Does |
-|---|---|
-| `GET /api/accounts` | `{ "accounts": [...] }`, oldest first, disabled ones included |
-| `GET /api/accounts/me` | the signed-in account |
-| `POST /api/accounts` | `{username, password, display_name?}` → `201` and the new account |
-| `PATCH /api/accounts/{id}` | `{username?, display_name?}`. A rename moves no stored attribution |
-| `POST /api/accounts/{id}/disable` | idempotent |
-| `POST /api/accounts/{id}/enable` | idempotent |
-| `PUT /api/accounts/me/password` | `{current_password?, new_password}`. Own account only |
-
-Failures:
-
-| Response | When |
-|---|---|
-| `400` | the username is malformed or reserved, or the password is longer than bcrypt's 72 **bytes** (accented letters and emoji cost two to four each) — all facts about the request |
-| `403` | the system principal; or a password change without the current password |
-| `404` | no such account |
-| `409` | the username is taken; the instance is passwordless; an existing account has no username; this is the last enabled account. All four describe the *instance*, and the message says what to do first |
-
-The guards behind the `409`s are enforced inside the database transaction that
-would otherwise break them, so two concurrent calls cannot both win — there is
-no window in which two callers each disable the other's account and leave
-nobody.
-
-Disabling takes effect at the account's **next** request, not retroactively, and
-an open WebSocket keeps the identity it was accepted with until it reconnects.
+The response does not expose usernames or the account count. Before
+authentication is ready, it returns the fail-closed `username_password` state.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -138,6 +65,50 @@ Verify current authentication.
 ```json
 Response: { "authenticated": true }
 ```
+
+### Accounts
+
+Every signed-in account can manage accounts. System credentials cannot. Account
+responses never include password hashes or their storage location.
+
+An account is:
+
+```json
+{
+  "id": "…",
+  "actor_id": "…",
+  "username": "alice",
+  "display_name": "Alice",
+  "enabled": true,
+  "has_password": true,
+  "created_at": "…"
+}
+```
+
+`id` identifies the account. `actor_id` is the stable attribution ID and does
+not change when the username changes.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
+| `GET /api/accounts/me` | the signed-in account |
+| `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
+| `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
+| `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
+| `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
+| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
+
+Failures:
+
+| Response | When |
+|---|---|
+| `400` | Invalid username or password longer than 72 UTF-8 bytes |
+| `403` | System credential, or current password not supplied or incorrect |
+| `404` | Account not found |
+| `409` | Username or account-state conflict; the response explains the conflict |
+
+Disabling an account affects its next request. An existing WebSocket keeps its
+accepted identity until it reconnects.
 
 ### Sessions
 

@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` is read per request and follows a reload (it governs tokens minted *after* it; already-issued tokens keep the window they were signed with until they next slide). `auth.password_hash` follows a reload as well: an account whose `credential_source` is `config` **or `none`** reads it on every login, so adding the key to a passwordless install secures it at the next login rather than at the next restart — and removing it opens that install again just as quickly. Only an account on `local` (which is what every account becomes at the first start on this version) ignores it. `auth.jwt_secret` is pinned at startup for the web gateway and MCP endpoint (see the restart table) |
+| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -1266,8 +1266,8 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.password_hash` | string | - | **Deprecated, and migrated away automatically.** bcrypt hash for login. The first start on this version copies it onto the local account, moves the account to its own credential and removes the key from `config.yaml`/`config.local.yaml` — nobody's password changes. A lockdown install is not rewritten (fleet-managed configuration) and is warned that the value no longer authenticates anybody. Still *read* for one release so a downgrade authenticates; the key goes away in the release after. Passwords are managed on the accounts screen. Unset and no account password means passwordless: every caller who can reach the gateway acts as the owner, which is only sensible on a loopback or otherwise private bind. See [Accounts and identity](accounts.md) |
-| `auth.jwt_secret` | string | - | JWT signing secret. Optional: when unset, one is generated on first start and kept in `nerve.db` (never written into a config file). A configured value wins at startup and **retires** any stored one, so setting it later rotates the secret at the next restart (every tab logs in once) and the old stored key can never come back into force. Pinned for the life of the process — a reload cannot change or remove it (see the restart table). A generated secret is only ever kept in a database readable by this user alone: if `nerve.db` cannot be made `0600` (a filesystem without modes), startup refuses to generate one, and setting `auth.jwt_secret` here or in the environment is the way through — nothing secret is then stored in the database. See [Accounts and identity](accounts.md) |
+| `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
+| `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)
 
