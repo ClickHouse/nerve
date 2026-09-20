@@ -30,11 +30,7 @@ async def login(req: LoginRequest):
     config = get_config()
     secret = effective_jwt_secret(config)
     if not secret:
-        # No secret in configuration and none stored yet. The identity bootstrap
-        # generates one before the gateway serves, so this only fires when it
-        # has not run. It used to mint a token signed with the literal string
-        # "dev-secret" — and skip the password check while at it — which made
-        # a missing secret an open instance. Refuse instead.
+        # Startup normally generates or loads the signing secret.
         raise HTTPException(
             status_code=503,
             detail="No session signing secret is available yet; restart the "
@@ -44,9 +40,7 @@ async def login(req: LoginRequest):
     if config.auth.password_hash:
         if not verify_password(req.password, config.auth.password_hash):
             raise HTTPException(status_code=401, detail="Invalid password")
-    # Otherwise passwordless: every admitted caller resolves to the single
-    # local account, so any password is accepted. Valid only while exactly one
-    # account exists; creating a second one requires setting a password first.
+    # A sole passwordless account accepts any password.
 
     return LoginResponse(token=create_token(secret))
 

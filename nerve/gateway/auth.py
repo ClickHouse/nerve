@@ -1,16 +1,7 @@
-"""JWT authentication for the gateway.
+"""Gateway password and token authentication.
 
-Password login, HS256 session tokens, bcrypt hashing.
-
-**The signing secret.** Tokens are signed with :func:`effective_jwt_secret`,
-which returns the secret *pinned* at startup by the identity bootstrap:
-``auth.jwt_secret`` when configuration supplied one, otherwise the secret the
-bootstrap generated on first start and keeps in the database
-(``instance_secrets``). Every consumer — this module, the login route, the
-external MCP endpoint, the CLI — must go through that function rather than
-read ``config.auth.jwt_secret`` directly: the config object is rebuilt on every
-reload, and the secret is restart-only. With no secret in force every check
-fails closed; there is no unauthenticated mode.
+Signing uses the secret pinned at startup. Authentication fails closed until a
+secret is available.
 """
 
 from __future__ import annotations
@@ -29,31 +20,17 @@ logger = logging.getLogger(__name__)
 
 JWT_ALGORITHM = "HS256"
 
-# Fallback web-session lifetime, used only when the config can't be read.
-# The real value is ``auth.jwt_expiry_hours`` (default 720h / 30 days).
-#
-# Session tokens *slide*: ``require_auth`` re-mints one that is past
-# REFRESH_AFTER_RATIO of its lifetime and the gateway hands the fresh token
-# back on the response, so continuous use never expires. The configured
-# window is therefore an idle timeout — the old fixed 24h constant logged
-# you out mid-work exactly one day after login no matter what you were doing.
+# Fallback used only when auth.jwt_expiry_hours cannot be read.
 DEFAULT_JWT_EXPIRY_HOURS = 720
 
-# Re-mint once a token is this far into its lifetime. At 0.5 an active
-# session is refreshed about every half-window (so it never dies), while a
-# fresh token costs no crypto on the vast majority of requests.
+# Session expiry acts as an idle timeout by refreshing active sessions.
 REFRESH_AFTER_RATIO = 0.5
 
-# Response header carrying a slid session token back to the browser.
 SESSION_TOKEN_HEADER = "X-Nerve-Token"
 
-# What every fail-closed check says when no signing secret is in force. Shared
-# so the HTTP, MCP and worker-token paths agree, and so a test can match it.
 NO_SECRET_DETAIL = "No signing secret is in force; the gateway has not completed startup"
 
-# Audience claim on session-bound MCP tokens (see create_mcp_session_token).
 MCP_AUDIENCE = "nerve-mcp"
-# Claim carrying the bound nerve session id on MCP tokens.
 MCP_SESSION_CLAIM = "nerve_session_id"
 MCP_WORKER_CLAIM = "nerve_worker_id"
 
@@ -72,25 +49,12 @@ def session_expiry_hours() -> int:
     return max(1, hours)
 
 
-# The signing secret in force for this process. Fixed once at startup by the
-# identity bootstrap (nerve.migrate.ensure_jwt_secret): auth.jwt_secret when
-# configuration supplied one, else the secret kept in the database. Pinned here
-# rather than read from the config object per request because the secret is
-# restart-only: a reload rebuilds that object from disk, and an edit that
-# removed or changed the key must neither reopen the instance nor swap the key
-# under live sessions. `restart_required` reports such a change; the next
-# restart applies it.
+# Keep signing stable across configuration reloads. A restart applies changes.
 _pinned_jwt_secret: str = ""
 
 
 def pin_jwt_secret(secret: str) -> None:
-    """Fix the signing secret for the rest of this process's life.
-
-    The first pin wins. A later call offering a *different* value is ignored
-    with a warning rather than honoured, because a swap after startup is
-    exactly what pinning exists to rule out; the same value is a no-op, which
-    is what the CLI pass followed by the gateway's own bootstrap produces.
-    """
+    """Pin the first non-empty signing secret for this process."""
     global _pinned_jwt_secret
     secret = secret or ""
     if not secret:
@@ -105,26 +69,18 @@ def pin_jwt_secret(secret: str) -> None:
 
 
 def unpin_jwt_secret() -> None:
-    """Forget the pinned secret. For tests, which are each their own "process";
-    a running daemon never does this."""
+    """Clear the pinned secret for tests."""
     global _pinned_jwt_secret
     _pinned_jwt_secret = ""
 
 
 def pinned_jwt_secret() -> str:
-    """The secret pinned to this process, or ``""`` before startup pinned one."""
+    """Return the process signing secret, or ``""`` before startup."""
     return _pinned_jwt_secret
 
 
 def effective_jwt_secret(config: NerveConfig | None = None) -> str:
-    """The secret tokens are signed and verified with.
-
-    Once startup has pinned one, that — whatever the config object says by
-    now. Before that (a CLI process, the installer, tests) it is
-    ``auth.jwt_secret`` from the given configuration, or nothing; every
-    consumer treats nothing as fail-closed, so an instance that has not
-    completed startup refuses rather than admits.
-    """
+    """Return the pinned secret, or the configured secret before startup."""
     if _pinned_jwt_secret:
         return _pinned_jwt_secret
     cfg = config if config is not None else get_config()
@@ -144,17 +100,7 @@ def create_token(jwt_secret: str, expiry_hours: int | None = None) -> str:
 
 
 def maybe_refresh_token(payload: dict, jwt_secret: str) -> str | None:
-    """Re-mint a session token that is past its refresh threshold.
-
-    Sliding expiry: each authenticated request carries the session further
-    into the future, so a tab in continuous use never hits the wall. Returns
-    ``None`` while the token is still fresh — the common case, and the reason
-    this costs nothing on most requests.
-
-    Only ordinary web-session tokens slide. Audience-scoped tokens (MCP
-    session/worker credentials) are minted per-process with deliberately
-    short TTLs and must expire on schedule.
-    """
+    """Refresh a browser session after its refresh threshold."""
     if payload.get("aud") or payload.get("sub") != "user":
         return None
     iat, exp = payload.get("iat"), payload.get("exp")
@@ -176,16 +122,7 @@ def create_mcp_session_token(
     ttl_seconds: int = 8 * 60 * 60,
     worker_id: str | None = None,
 ) -> str:
-    """Mint a session-bound MCP token for a backend-managed agent process.
-
-    Carries ``aud=nerve-mcp`` + the bound session id so the external MCP
-    endpoint attributes every tool call to the real engine session
-    (instead of a satellite). The token is deliberately short-lived.
-    Backend clients are normally
-    idle-swept within an hour and receive a fresh token when recreated;
-    Ultracode children exchange the parent token for still-shorter worker
-    tokens so calls can be attributed without persisting secrets.
-    """
+    """Mint a short-lived MCP token bound to a Nerve session."""
     now = datetime.now(timezone.utc)
     payload = {
         "iat": now,
@@ -205,13 +142,7 @@ def create_external_mcp_token(
     *,
     ttl_seconds: int = 8 * 60 * 60,
 ) -> str:
-    """Mint a short-lived MCP-only token for a user-launched client.
-
-    Unlike backend session tokens this intentionally has no bound Nerve
-    session; the MCP resolver creates/reuses a satellite session. The MCP
-    audience prevents this credential from authenticating to ordinary web
-    routes.
-    """
+    """Mint an MCP-only token without a bound Nerve session."""
     now = datetime.now(timezone.utc)
     payload = {
         "iat": now,
@@ -226,13 +157,10 @@ def create_external_mcp_token(
 def decode_token(
     token: str, jwt_secret: str, audience: str | None = None,
 ) -> dict:
-    """Decode and validate a JWT token.
+    """Decode a JWT for the expected audience.
 
-    ``audience=None`` (the default) accepts only aud-less tokens — PyJWT
-    rejects any token carrying an ``aud`` claim unless the caller
-    verifies it, so audience-scoped tokens (MCP session tokens) never
-    pass ordinary web-UI auth by accident. Callers that accept scoped
-    tokens pass the expected ``audience`` explicitly.
+    The default accepts only tokens without an audience, keeping MCP tokens out
+    of web authentication.
     """
     try:
         return jwt.decode(
@@ -268,18 +196,11 @@ async def require_auth(request: Request) -> dict:
     """FastAPI dependency: require valid authentication."""
     secret = effective_jwt_secret(get_config())
     if not secret:
-        # Fail closed. Startup pins a secret before the gateway serves — the
-        # configured one, or one generated into the database — so this is only
-        # reachable before startup has completed. An empty secret must never
-        # mean an open instance, locked or not: inferring "no auth" from a
-        # missing credential is the class of bug this seam exists to end.
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
 
     token = get_token_from_request(request)
     payload = decode_token(token, secret)
-    # Slide the session forward. Stashed on request.state rather than returned
-    # so every existing caller of this dependency is unaffected; the gateway's
-    # http middleware picks it up and emits SESSION_TOKEN_HEADER.
+    # Middleware emits this without changing route response models.
     refreshed = maybe_refresh_token(payload, secret)
     if refreshed:
         request.state.refreshed_token = refreshed
@@ -287,11 +208,7 @@ async def require_auth(request: Request) -> dict:
 
 
 async def authenticate_websocket(websocket: WebSocket) -> bool:
-    """Validate WebSocket authentication.
-
-    Checks token from query parameter or first message.
-    Returns True if authenticated, False otherwise.
-    """
+    """Validate WebSocket authentication."""
     secret = effective_jwt_secret(get_config())
     if not secret:
         return False  # fail closed, locked or not — see require_auth

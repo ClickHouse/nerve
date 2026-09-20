@@ -2,27 +2,25 @@
 
 ## REST API
 
-All endpoints require JWT authentication via `Authorization: Bearer <token>` header or `nerve_token` cookie.
+Unless noted otherwise, endpoints require a JWT in the `Authorization: Bearer
+<token>` header or `nerve_token` cookie.
 
 ### Auth
 
 #### `POST /api/auth/login`
-Login with password, receive JWT.
+Log in and receive a session token. Authentication is not required.
 
 ```json
 Request:  { "password": "..." }
 Response: { "token": "eyJ..." }
 ```
 
-With no `auth.password_hash` configured the install is passwordless: any
-password is accepted and the token resolves to the single local account.
-Tokens are signed with `auth.jwt_secret`, or with the secret the gateway
-generated on first start when that is unset (see
-[Accounts and identity](accounts.md)); `503` means no signing secret exists
-yet, which only happens before the gateway has completed its first start.
+When `auth.password_hash` is unset, any password is accepted for the sole local
+account. Treat the returned token as opaque. A `503` response means startup has
+not selected a signing secret yet.
 
 #### `GET /api/auth/status`
-Whether a password is required to log in. No auth required.
+Return whether login requires a password. Authentication is not required.
 
 ```json
 Response: { "auth_required": true }
