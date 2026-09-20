@@ -15,7 +15,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
 
 # ``actor_refs.kind``. A human is a person with a local account; the system
-# principal is what the agent's own autonomous work acts as (0.6).
+# principal is the identity used for the agent's autonomous work.
 ACTOR_KIND_HUMAN = "human"
 ACTOR_KIND_SYSTEM = "system"
 ACTOR_KINDS = (ACTOR_KIND_HUMAN, ACTOR_KIND_SYSTEM)

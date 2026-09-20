@@ -110,9 +110,8 @@ def _deterministic_umask():
 
 # The actor a test that is not about authentication runs as. Obviously
 # synthetic ids, UUID-shaped like the real ones, and NOT rows in ``actor_refs``
-# — nothing in this version stores an actor, so nothing checks. See the PR 2
-# handoff: the day an actor id becomes a foreign key, tests using this have to
-# create the row.
+# — these fixtures do not store actor ids, so no foreign key checks them. Tests
+# that persist an actor id must create the corresponding ``actor_refs`` row.
 TEST_ACTOR = Actor(
     actor_id="00000000-0000-4000-8000-00000000ac70",
     kind="human",

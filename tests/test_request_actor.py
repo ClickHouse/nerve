@@ -11,8 +11,8 @@ the request itself. This file is about that resolution and its failure modes:
 * a session minted before per-account logins existed resolves to the sole
   account while there is exactly one, and is refused once there are two;
 * a WebSocket's actor is fixed at accept and does not drift;
-* two people calling at the same moment each see themselves, which is the
-  property a process-global "current user" would quietly destroy (0.7).
+* two people calling at the same moment each see themselves; a process-global
+  "current user" would make their identities race.
 """
 
 from __future__ import annotations
@@ -576,11 +576,10 @@ class TestLoginAdmission:
 @pytest.mark.asyncio
 class TestNoProcessGlobalActor:
     async def test_concurrent_requests_each_see_their_own_actor(self, install):
-        """Required by 0.7. Both requests are inside actor resolution at the
-        same moment — a barrier in the middle of the database lookup holds the
-        first one there until the second arrives — so anything shared between
-        them (a module global, a cache, a "current user") shows up as one
-        answer where there should be two.
+        """Both requests resolve their actors concurrently. A barrier in the
+        database lookup holds the first until the second arrives, so shared
+        request identity (a module global, cache, or "current user") would make
+        one request return the other request's actor.
         """
         bob_account, bob_actor = await install.add_account("Bob")
         await install.rename_actor(install.actor_id, "Alice")
@@ -721,9 +720,8 @@ class TestWebSocketActorIsFixedAtAccept:
             connection.client_id = "hijacked"
 
     async def test_the_endpoint_authenticates_exactly_once(self):
-        """Structural, because the drift the spec rules out is a *second*
-        resolution mid-stream: the handler must have no way to re-authenticate
-        after the accept helper returns."""
+        """Reject a second token-to-actor resolution path. The handler must
+        not re-authenticate after the accept helper returns."""
         from nerve.gateway import server as gw
 
         source = inspect.getsource(gw)
