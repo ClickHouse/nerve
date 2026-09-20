@@ -281,11 +281,6 @@ async def require_auth(request: Request) -> Actor:
     """Authenticate an HTTP request and return its request-local actor."""
     secret = effective_jwt_secret(get_config())
     if not secret:
-        # Fail closed. Startup pins a secret before the gateway serves — the
-        # configured one, or one generated into the database — so this is only
-        # reachable before startup has completed. An empty secret must never
-        # mean an open instance, locked or not: inferring "no auth" from a
-        # missing credential is the class of bug this seam exists to end.
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
 
     token = get_token_from_request(request)

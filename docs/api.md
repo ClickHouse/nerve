@@ -19,10 +19,8 @@ When `auth.password_hash` is unset, any password is accepted for the sole local
 account. Treat the returned token as opaque. A `503` response means startup has
 not selected a signing secret yet.
 
-The result is a **session token**: `sub` is the account's id and `typ` is
-`session`. Treat it as opaque — the claims are the server's business. Password-
-only login is valid while exactly one account exists, and a disabled account
-cannot log in (`401`).
+The token identifies the sole local account. Disabled accounts cannot log in
+(`401`).
 
 #### Authenticated requests
 
@@ -34,12 +32,10 @@ Unknown and disabled accounts fail with `401`; unavailable startup identity
 state fails with `503`. See [Accounts and identity](accounts.md) for token
 types and legacy-session compatibility.
 
-**`X-Nerve-Token` on the response.** Once a session token is past half its
-life, the reply carries a fresh one under this header; swap it in and a tab in
-continuous use never expires, which turns `auth.jwt_expiry_hours` into an idle
-timeout. The same header carries the replacement for a session issued before
-per-account logins existed — those are upgraded on their first request rather
-than slid. The header is CORS-exposed, so a browser can read it cross-origin.
+When a session is more than halfway to expiry, the response includes a refreshed
+token in `X-Nerve-Token`. Replace the current token with it. The header also
+upgrades sessions created before account-based tokens and is exposed through
+CORS.
 
 #### `GET /api/auth/status`
 Return whether login requires a password. Authentication is not required.

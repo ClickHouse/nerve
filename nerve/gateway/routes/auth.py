@@ -42,8 +42,6 @@ async def login(req: LoginRequest):
 
     store = identity_store()
     if store is None:
-        # Nothing to mint a token *for*. A session token names an account, and
-        # without the database there is no account to name.
         raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
 
     if config.auth.password_hash:

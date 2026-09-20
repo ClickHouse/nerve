@@ -41,63 +41,25 @@ The database and its directory must be private to the owner. Nerve repairs the
 modes when it can and refuses to open the database when another user could
 have changed it. See [State-file permissions](config.md#state-file-permissions).
 
-## Sessions and the actor on the request
+## Request identity
 
-A signature proves a token was minted by this instance. It does not say who is
-holding it. So every token says what it is in a `typ` claim, and **every
-authenticated request resolves that against the database, on the request
-itself**:
+Nerve resolves every authenticated request to either a human actor or the
+installation's system actor.
 
-| Token | `sub` | `typ` | Acts as |
-|---|---|---|---|
-| a login session | the account's id | `session` | that account's actor |
-| the instance's own calls — `nerve reload`, starting or stopping a session from the CLI, the agent calling its own API | `agent-system` | `system` | the agent's system principal |
-| MCP credentials for the agent's own subprocesses and their Ultracode workers | `backend-agent` | `system`, with `aud: nerve-mcp` | the agent's system principal |
-| MCP credentials for a client you launched — `nerve codex token`, and the one the installer prints | `external-agent-mcp` | `system`, with `aud: nerve-mcp` | the agent's system principal |
+| Credential | Acts as |
+|---|---|
+| Login session | The account's human actor |
+| Nerve CLI and internal API token | The system actor |
+| Backend and external MCP token | The system actor |
 
-Tokens are opaque to the browser; the claims above are an implementation
-detail and will change again.
+Disabled accounts are rejected on their next HTTP or MCP request and on new
+WebSocket connections. An existing WebSocket keeps the identity it received at
+connection time. Autonomous work, including cron jobs and background agents,
+uses the system actor rather than a human account.
 
-`agent-system`, `backend-agent` and `external-agent-mcp` are **labels, not
-identity keys**. They say which minter issued the credential, and nothing looks
-them up: the system principal is read from the database, so those strings never
-have to match anything stored. A login session's `sub` is the one that is an
-identifier, and it is an account id.
-
-MCP credentials issued before this version carry the audience but no `typ`.
-They keep working until they expire, because the audience is what the resolver
-reads first.
-
-Two consequences worth knowing:
-
-- **Disabling an account takes effect at its next request, not retroactively.**
-  A token issued before the change is still signed and unexpired, so the
-  account row is the only thing that can stop it — and it does, at every door:
-  HTTP, a new WebSocket, and the MCP endpoint.
-- **A WebSocket's identity and authority are fixed when it connects.** Renaming
-  does not rewrite it, and disabling the account takes effect when that socket
-  reconnects. HTTP, MCP, and new WebSocket connections re-check the account
-  immediately.
-
-Autonomous work — cron jobs, channel traffic, background agents, and the
-instance talking to itself — acts as the **system principal** rather than as
-whoever happens to have an account. That keeps "the agent did this" and "a
-person asked for this" apart, and keeps it true after an account is renamed or
-removed.
-
-### Sessions that predate this version
-
-Browsers may hold 30-day session tokens issued before accounts existed. They
-name no account, so they are handled narrowly:
-
-- with **exactly one account**, such a token resolves to that account, and the
-  reply carries a proper per-account token in the `X-Nerve-Token` header, which
-  the browser stores. One request per tab and the old shape is gone;
-- with **two or more accounts** it is refused (`401`) rather than resolved to
-  whichever account sorts first; those tabs must log in again.
-
-The acceptance is temporary and is removed in a later release. Nothing mints
-that shape any more.
+Browser sessions created before account-based tokens are accepted only while
+one account exists. The next authenticated response replaces them through the
+`X-Nerve-Token` header. They are rejected after a second account is added.
 
 ## Backup and restore
 
