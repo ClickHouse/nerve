@@ -454,8 +454,8 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
     The file holds API keys, so it is created ``0600`` atomically
     (``O_CREAT|O_EXCL`` with the mode, read back through the descriptor before
     a byte is written) and renamed into place; a filesystem that ignores the
-    mode, or any write failure, leaves no checkpoint behind and returns False,
-    so a caller that promises the user their answers were kept tells the truth.
+    mode, or any write failure, leaves no checkpoint behind and returns False.
+    Callers report recoverable answers only after a successful checkpoint.
     """
     import dataclasses
     from datetime import datetime

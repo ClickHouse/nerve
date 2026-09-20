@@ -1,4 +1,4 @@
-"""``/pair`` tells the truth about what was saved.
+"""``/pair`` reports whether authorization was persisted.
 
 Pairing authorizes a Telegram user in memory *and* writes them into
 ``telegram.allowed_users`` in ``config.local.yaml``. That file also holds the

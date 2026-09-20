@@ -594,10 +594,8 @@ class TestRestoreNeverLeavesAReadableKey:
     def test_a_temporary_that_cannot_be_created_owner_only_aborts_before_the_copy(
         self, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """The no-op chmod case, at the point it now matters: the temp is
-        created with mode 0600 and the descriptor reads back wide (a
-        filesystem without modes). Nothing has been copied yet — and nothing
-        is."""
+        """Abort before copying when the temporary file's 0600 mode does not
+        take effect."""
         bundle = self._bundle(tmp_path, workspace, config_dir)
         nd2 = tmp_path / "restored_nerve"
         copies: list[int] = []

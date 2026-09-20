@@ -284,10 +284,9 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         # The wizard cleared its checkpoint when it applied the configuration,
         # and the name it collected exists nowhere else. Put the answers back so
         # a re-run resumes at the review step with the same name, and fail
-        # loudly: the gateway's own bootstrap at first start would otherwise
-        # create the owner unnamed and nobody would know why. Only promise the
-        # answers were kept if the checkpoint actually wrote — the same
-        # unwritable state filesystem can fail both the bootstrap and the save.
+        # loudly. Otherwise the gateway would create an unnamed owner on first
+        # start. The recovery message depends on whether checkpointing also
+        # succeeds; the same state-filesystem error can make both writes fail.
         saved = wizard.checkpoint() if wizard is not None else False
         if wizard is None:
             remedy = " Fix the cause and run 'nerve init --non-interactive' again."

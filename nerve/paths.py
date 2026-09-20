@@ -196,9 +196,8 @@ class InsecureFileError(RuntimeError):
     """A credential-bearing file could not be created owner-only.
 
     Raised by :func:`write_private_text` *before* any content is written, so
-    nothing secret reaches a file other users could read. Not an ``OSError``
-    subclass on purpose: the generic ``except OSError`` a writer wraps its I/O
-    in must not be able to swallow this one.
+    nothing secret reaches a file other users could read. This does not inherit
+    from ``OSError``, so generic I/O error handlers cannot swallow it.
     """
 
 

@@ -151,11 +151,8 @@ class TestInstallerDisplayName:
 
 
 class TestInstallerBootstrapFailure:
-    """The wizard clears its checkpoint when it applies the configuration, and
-    the name it collected exists nowhere else. If creating the owner then
-    fails, the installer must not shrug: it saves the answers back and exits
-    non-zero, so a re-run resumes with the same name instead of the gateway
-    quietly creating an unnamed owner at first start."""
+    """If owner creation fails after the wizard clears its checkpoint, restore
+    the answers and exit non-zero so a retry retains the owner's name."""
 
     def test_a_failed_bootstrap_keeps_the_answers_and_exits_non_zero(
         self, tmp_path, monkeypatch,

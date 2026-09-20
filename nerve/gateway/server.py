@@ -601,7 +601,7 @@ async def lifespan(app: FastAPI):
             from datetime import datetime, timezone
             while True:
                 interval_minutes = get_config().sessions.memorize_interval_minutes
-                # Keep the diagnostics figure honest about the cadence in force.
+                # Report the current reloadable interval in diagnostics.
                 _memorize_stats["interval_minutes"] = interval_minutes
                 await asyncio.sleep(interval_minutes * 60)
                 try:
