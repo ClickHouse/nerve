@@ -442,10 +442,9 @@ class TestClaimingTheSoleAccount:
     async def test_two_connections_racing_to_claim_leave_one_winner(
         self, db: Database, tmp_path,
     ):
-        """The reason this exists rather than get_sole_account() +
-        update_account_login(): those are two transactions, so the second caller
-        reads "one account, no password" before the first commits and quietly
-        replaces its password with its own."""
+        """Claiming must be one transaction. Separate read and update
+        transactions let both callers observe an unclaimed account and the
+        second overwrite the first password."""
         import asyncio
 
         await self._unclaimed(db)

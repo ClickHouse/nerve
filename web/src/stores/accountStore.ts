@@ -61,11 +61,10 @@ function upsert(accounts: Account[], account: Account): Account[] {
  * form* behaves, and a stale descriptor would leave a tab auto-logging-in or
  * asking for the wrong fields.
  *
- * Deliberately **not** part of any mutation's error path. A refresh that fails
- * after a write that committed is a redraw problem, and reporting it as a
- * failed write is how a caller ends up retrying a create that already happened
- * (username taken) or a password change with a current password that is no
- * longer current.
+ * A refresh failure is not a mutation failure. Once the write has committed,
+ * reporting a redraw problem as a failed write can make the caller retry a
+ * create that already happened or a password change whose current password has
+ * changed.
  */
 async function resync(
   set: (partial: Partial<AccountState>) => void,

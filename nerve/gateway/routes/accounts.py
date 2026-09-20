@@ -1,11 +1,8 @@
 """Account management routes.
 
-Every local account has full permissions: any account may list, create,
-rename, disable and re-enable accounts, and the consequence is worth stating
-rather than discovering — **adding a person gives them the power to remove
-you.** That is the chosen property for a trusted-team self-hosted install, not
-an oversight. The only guard is that the last enabled account cannot be
-disabled, which is what stops an install locking everybody out.
+Every local account may list, create, rename, disable, and re-enable accounts.
+Adding a person therefore lets them disable your account. The last enabled
+account cannot be disabled.
 
 Three rules are enforced in the data layer rather than here, because they are
 read-then-write and this is where a check-then-act race would live (see
@@ -168,9 +165,8 @@ async def require_account(actor: Actor = Depends(require_auth)) -> Actor:
 async def list_accounts(actor: Actor = Depends(require_account)):
     """Every account, oldest first — disabled ones included.
 
-    A disabled account is still a row on purpose: it is the tombstone that keeps
-    an install which once had two accounts from sliding back into the
-    single-account relaxations (see ``nerve.db.accounts``).
+    Disabled rows remain as tombstones, so an install that once had multiple
+    accounts cannot regain single-account login behavior.
     """
     db = get_deps().db
     accounts = await db.list_accounts()

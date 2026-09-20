@@ -33,8 +33,8 @@ export function SessionExpiredOverlay() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    // A single-account login deliberately omits the mutable username; the
-    // server resolves the sole account. With multiple accounts the current
+    // Single-account login omits the mutable username and lets the server
+    // resolve the sole account. With multiple accounts the current
     // lookup key is needed, and the store verifies the returned account id
     // before it unlocks the mounted app.
     login(password, loginMode === 'username_password' ? username : undefined);
@@ -110,10 +110,8 @@ export function SessionExpiredOverlay() {
             </Button>
           </>
         )}
-        {/* The way to use a different account, and deliberately the only way:
-            it is what discards this one's unsent drafts and read state before
-            anybody else gets in. `ghost` says "the quieter of the two" when
-            there are two. */}
+        {/* Logging out is the only path to another account because it clears
+            this account's unsent drafts and loaded state first. */}
         <Button
           variant={unknownAccount ? 'primary' : 'ghost'}
           fullWidth

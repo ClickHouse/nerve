@@ -213,10 +213,9 @@ class TestTheScrub:
         """The retirement only fires when *no* account reads the value, and a
         `none` row reads it too (see routes.accounts.account_credential).
 
-        Called below the mirror on purpose: the mirror moves every `none` row to
-        `config` while a hash is configured and credential migration copies it,
-        so this state does not survive a whole `bootstrap_identity`. This guard
-        keeps the file safe if that order ever changes."""
+        Call this below the mirror to exercise the guard directly. A full
+        `bootstrap_identity` moves `none` to `config` and then copies the hash,
+        so it cannot preserve this intermediate state."""
         from nerve.migrate import MigrationReport, _migrate_config_credentials
 
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
@@ -365,7 +364,7 @@ class TestTheStaleValueWarning:
         assert any("no account uses it" in r.getMessage() for r in caplog.records)
 
 # --------------------------------------------------------------------------- #
-#  The whole point: nobody's password changes                                  #
+#  Existing passwords remain valid                                            #
 # --------------------------------------------------------------------------- #
 
 

@@ -1219,7 +1219,7 @@ def _retire_config_password(
 ) -> list[Path]:
     """Take the now-dead ``auth.password_hash`` out of configuration, or say why not.
 
-    Two environments, deliberately different:
+    Behavior depends on who manages the configuration:
 
     * **ordinary install** — the key is removed from this box's own
       ``config.yaml`` / ``config.local.yaml``. Both are machine-local and
@@ -1460,8 +1460,7 @@ async def bootstrap_identity(
     #
     # It also settles the passwordless guard before anything evaluates it: an
     # install whose password lives in configuration is `local` by the time the
-    # gateway serves, so "this instance is passwordless" is read off a row that
-    # already tells the truth.
+    # gateway serves, so passwordless state is derived from the migrated row.
     await _migrate_config_credentials(
         db, config, report, dry_run=dry_run, pending_config_rows=pending_config_rows,
     )

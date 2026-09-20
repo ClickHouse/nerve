@@ -239,9 +239,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (hadToken) clearToken();
     set({ account: null });
 
-    // Auto-login only for the one state where there is genuinely nothing to
-    // ask for: a passwordless install, which by construction has exactly one
-    // account. It must not survive into a multi-account install, where an
+    // Auto-login only when the server reports a passwordless install. That
+    // state requires exactly one account; a multi-account install requires an
     // empty password names nobody and the server refuses it.
     if (status?.login === 'none') {
       try {

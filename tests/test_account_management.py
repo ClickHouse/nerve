@@ -29,8 +29,7 @@ from nerve.gateway.routes import auth as auth_routes
 
 _SECRET = "test-secret-for-account-management-pad-32b"
 
-# Obviously synthetic, and a real bcrypt hash so verify_password can be asked
-# about it: this is the password the fixtures log in with.
+# Synthetic password used by fixtures and real bcrypt verification.
 _PASSWORD = "correct-horse-battery-staple"
 
 
@@ -525,8 +524,8 @@ class TestOwnPassword:
         assert verify_password("another-one", account["credential"])
 
     async def test_there_is_no_way_to_set_someone_elses(self, install: _Install):
-        """Only own-password change exists. Resetting a colleague's password is
-        deliberately not a thing any account can do."""
+        """The API exposes own-password changes but no password reset for other
+        accounts."""
         await install.secure_the_owner()
         async with _client(install.app) as client:
             bob = (await client.post(

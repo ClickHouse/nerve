@@ -374,27 +374,15 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
 def _scrub_account_credentials(snapshot: Path) -> None:
     """Empty ``accounts.credential`` in a *snapshot* copy of nerve.db.
 
-    Account password hashes are stored in ``nerve.db``, so a bundle containing
-    the database also contains those hashes. ``--no-secrets`` promises it does
-    not.
+    ``--no-secrets`` removes every account hash and sets each
+    ``credential_source`` to ``none``. Changing the source also handles
+    transitional ``config`` rows whose hash lived in the omitted
+    ``config.local.yaml``; leaving them on ``config`` would restore an account
+    that cannot authenticate but is not considered passwordless.
 
-    **Every** account, not only the ones holding a hash. A row still on the
-    transitional ``config`` source carries no credential of its own — it reads
-    ``auth.password_hash`` — and ``config.local.yaml`` is omitted from this
-    bundle, so leaving it on ``config`` restores an account that can neither
-    authenticate nor be recognised as passwordless: the one state with no way
-    out. Reachable by taking a ``--no-secrets`` backup between an upgrade and
-    the first start that migrates, which is not an exotic moment.
-
-    The row's ``credential_source`` moves to ``none`` in the same statement,
-    because the schema refuses a ``local`` account with no credential — and
-    because it is the truth about the scrubbed row. The restored instance is
-    therefore passwordless in the same way a ``--no-secrets`` restore already
-    left it: the bundle omits ``config.local.yaml`` too, so ``auth.password_hash``
-    does not come back either. With one account that is the ordinary
-    passwordless state; with two or more, nobody can log in until a password is
-    configured or a bundle *with* secrets is restored — which is the honest
-    consequence of restoring a backup that deliberately carries no credential.
+    A restored single-account database is passwordless. With multiple accounts,
+    nobody can log in until credentials are restored from a secrets-bearing
+    backup.
 
     Edits the snapshot after it is taken and before it is checksummed; the live
     database is never touched. ``secure_delete`` makes SQLite overwrite the
@@ -438,19 +426,14 @@ def _is_sanitisable_config(arcname: str) -> bool:
 def _sanitised_config(src: Path) -> str | None:
     """``src`` with every secret leaf replaced by a ``${VAR}`` placeholder.
 
-    ``None`` when it parsed and there was nothing to rewrite, in which case the
-    caller copies the file as it stands. :class:`BackupError` when it could not
-    be *inspected* — the two used to be the same answer, so a file that would
-    not parse was copied into a bundle documented as carrying no credential,
-    which is the one thing a parse failure cannot rule out.
+    Returns ``None`` when the file parses and contains no secret values, so the
+    caller may copy it unchanged. Raises :class:`BackupError` when the file
+    cannot be inspected because a no-secrets bundle cannot safely copy an
+    unparseable configuration file.
 
-    The tracked workspace configuration is *supposed* to hold references rather
-    than values, and mostly does. But the startup migration deliberately leaves
-    ``auth.password_hash`` alone when it finds it in a tracked or fleet-managed
-    file (there is no safe way to rewrite somebody else's configuration), so a
-    live bcrypt verifier can legitimately be sitting in a file this bundle
-    otherwise copies verbatim — and ``--no-secrets`` promises it does not carry
-    one. Anything else the scrubber already recognises goes with it.
+    Tracked or fleet-managed configuration may still contain
+    ``auth.password_hash`` because startup does not rewrite those files. The
+    scrubber removes it and every other recognized secret.
     """
     from nerve.migrate import _scrub_secrets
 
@@ -485,10 +468,9 @@ def _sanitised_config(src: Path) -> str | None:
 def _stage_config_file(src: Path, dst: Path, *, include_secrets: bool) -> None:
     """Put one configuration file in the stage, sanitised if it has to be.
 
-    A rewritten file is *created* owner-only and written through that same
-    descriptor, like everything else in the stage that could carry a credential:
-    the point of rewriting it is that the original had one in it, so the copy
-    must not exist at a wider mode even briefly.
+    A rewritten file is created owner-only and written through the same
+    descriptor, so sanitized secret-bearing input is never staged at a wider
+    mode.
     """
     text = None if include_secrets else _sanitised_config(src)
     if text is None:
@@ -508,9 +490,8 @@ def _stage_config_file(src: Path, dst: Path, *, include_secrets: bool) -> None:
 def _scrub_snapshot_secrets(snapshot: Path) -> None:
     """Take every credential out of a ``--no-secrets`` snapshot of nerve.db.
 
-    One call site, two credentials: the signing secret and the account password
-    hashes. Anything added to the database that is a credential belongs here as
-    well — ``--no-secrets`` is a promise about the bundle, not about one table.
+    Removes the signing secret and account password hashes. Add any future
+    database credential to this function.
     """
     _scrub_instance_secrets(snapshot)
     _scrub_account_credentials(snapshot)

@@ -1332,10 +1332,9 @@ def test_gzip_fallback_roundtrip(nerve_dir, workspace, config_dir, tmp_path):
 #  --no-secrets and the tracked configuration                                  #
 # --------------------------------------------------------------------------- #
 
-# A real bcrypt verifier's shape, obviously synthetic. The startup migration
-# deliberately leaves a hash like this alone when it is in tracked or
-# fleet-managed configuration — there is no safe way to rewrite somebody else's
-# file — so it can legitimately still be there when a backup is taken.
+# Synthetic bcrypt verifier with a production-compatible shape. Startup does
+# not rewrite tracked or fleet-managed configuration, so this hash may still be
+# present when a backup is taken.
 _TRACKED_HASH = "$2b$12$tracked-password-hash-left-by-the-migration"
 
 
@@ -1390,9 +1389,8 @@ def test_a_config_file_with_nothing_secret_in_it_is_copied_unchanged(
 def test_a_no_secrets_backup_refuses_a_config_file_it_cannot_inspect(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
-    """"Nothing to rewrite" and "could not look" used to be the same answer, so
-    a file that would not parse was copied into a bundle documented as carrying
-    no credential — which is the one thing a parse failure cannot rule out."""
+    """Refuse a no-secrets backup when a configuration file cannot be inspected
+    for credentials."""
     cfg = workspace / "config"
     cfg.mkdir(parents=True, exist_ok=True)
     marker = "$2b$12$MARKER-inside-a-file-that-will-not-parse"
@@ -1462,14 +1460,13 @@ def test_the_rewritten_file_is_staged_owner_only(
 def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
-    """The promise, checked as a promise rather than a list of mechanisms.
-
-    A distinct marker is planted in every place a credential can live — the two
+    """Search the finished archive for markers planted in every credential
+    location: the two
     inside nerve.db, the machine-local overlay, the tracked workspace config, a
     cron job's environment, and the state files that are omitted by name — and
     then the finished bundle is searched for every one of them, in the extracted
     members and in the compressed bytes. Anything added to the backup later that
-    carries a credential fails here without anyone having to remember to look.
+    carries a credential fails here without updating a mechanism-specific test.
     """
     markers = {
         "jwt secret in nerve.db": "MARKER-jwt-secret-in-the-database",
