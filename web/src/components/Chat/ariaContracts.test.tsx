@@ -16,8 +16,7 @@ vi.mock('../../api/client', () => ({
     uploadFiles: vi.fn(),
     getOwnAccount: vi.fn(async () => { throw new Error("403"); }),
   },
-  // The chat store stamps an optimistic message with the signed-in actor, so it
-  // now reaches authStore, which reads these two at module load.
+  // chatStore reads these authStore dependencies when it stamps optimistic rows.
   getToken: vi.fn(),
   setUnauthorizedHandler: vi.fn(),
 }));

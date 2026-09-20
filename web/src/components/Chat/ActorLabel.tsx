@@ -13,7 +13,7 @@ interface Attribution {
   ambiguous: boolean;
 }
 
-/** What to say about an actor, given whatever the map currently knows. */
+/** Resolve an actor id to its current display label. */
 function useAttribution(actorId: string | null | undefined): Attribution {
   const actors = useActorStore((s) => s.actors);
   const resolve = useActorStore((s) => s.resolve);

@@ -58,13 +58,8 @@ function upsert(accounts: Account[], account: Account): Account[] {
  * Re-read the list, signed-in identity, `/api/auth/status`, and the actor map.
  * Returns the failure, or `null`.
  *
- * The status half is not laziness: both of the things this screen does —
- * setting the first password, adding the second account — change how the *login
- * form* behaves, and a stale descriptor would leave a tab auto-logging-in or
- * asking for the wrong fields.
- *
- * Refreshing the actor map makes a renamed account visible in chat without a
- * page reload; messages store actor ids rather than names.
+ * Auth status updates the login form after the first password or second account
+ * is added. The actor map updates renamed labels; messages store ids, not names.
  *
  * A refresh failure is not a mutation failure. Once the write has committed,
  * reporting a redraw problem as a failed write can make the caller retry a
@@ -74,23 +69,15 @@ function upsert(accounts: Account[], account: Account): Account[] {
 async function resync(
   set: (partial: Partial<AccountState>) => void,
 ): Promise<unknown | null> {
-  // All four, independently. They answer different questions of different
-  // servers' worth of state, and the list failing used to skip the status
-  // refresh entirely — so an install that had just set its first password or
-  // added its second account could be left with `loginMode`
-  // describing the instance it was five seconds ago, purely because a list
-  // request happened to fail. A rename whose label never updated because the
-  // list redraw failed is the same bug wearing different clothes.
-  // `/accounts/me` repairs the reachable state where startup authenticated a
-  // token but its identity read failed transiently. Bind the late result to
-  // the auth generation that asked for it so logout or another login cannot
-  // install the previous session's account over the new one.
+  // Run each refresh independently so a list failure cannot block login mode,
+  // identity, or actor-label updates. Bind a delayed identity response to this
+  // auth session so it cannot overwrite a later login.
   const authSession = bindAuthSession();
   const identity = useAuthStore.getState().account;
   const [listOutcome, identityOutcome] = await Promise.allSettled([
     api.listAccounts(),
     identity ? Promise.resolve(identity) : api.getOwnAccount(),
-    // Both of these swallow their own failures and keep the last known answer.
+    // These retain their last known values on failure.
     useAuthStore.getState().refreshStatus(),
     useActorStore.getState().refresh(),
   ]);

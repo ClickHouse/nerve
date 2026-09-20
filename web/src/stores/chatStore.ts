@@ -1163,11 +1163,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // deferred prompt into the current chat (fresh, virtual, or existing).
     // If a composer model/backend pick is in flight for a new chat, carry it
     // onto the created row so the header badge is right from the first render.
-    // Bound now, not read at the end. Two requests happen in between, and
-    // whoever is signed in when they come back is not necessarily whoever
-    // asked: sign out mid-flight and the row would be labelled with the next
-    // person while the server's copy kept the first, so a reload would change
-    // the answer — the one thing attribution must never do.
+    // Bind before the requests so the optimistic row uses the same actor as the
+    // server even if the tab signs out or changes account while they run.
     const sender = bindSender();
     const vs = get().virtualSession;
     const effBackend = get().newChatBackend ?? null;
@@ -1177,9 +1174,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const real: Session = await api.createSession(
       undefined, effBackend, undefined, null, pickedModel,
     );
-    // The session belongs to whoever asked and stays on the server for them;
-    // what is abandoned here is this tab's optimistic view of it, which now
-    // belongs to somebody else.
+    // If auth changed, keep the server row but do not show it in this tab.
     if (!sender.stillCurrent()) return;
     const res = await api.runLater(real.id, content, delay, fileIds, imageBlocks);
     if (!sender.stillCurrent()) return;
@@ -1204,9 +1199,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' as const },
         messages: [
-          // The deferred prompt is this person's; the acknowledgement beside it
-          // is Nerve's own voice and stays unattributed, which is exactly how
-          // the route stores the two rows.
+          // Attribute the deferred prompt to the requester; the Nerve-generated
+          // acknowledgement has no actor_id.
           { role: 'user' as const, blocks: buildBlocks(), created_at: now, actor_id: sender.actorId },
           { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
         ],
