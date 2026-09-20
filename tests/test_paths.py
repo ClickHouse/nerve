@@ -150,7 +150,7 @@ class TestWritePrivateText:
     def test_a_filesystem_that_ignores_modes_gets_no_bytes_at_all(
         self, tmp_path, monkeypatch,
     ):
-        """F25: the descriptor is `fstat`ed before a single byte is written, so
+        """The descriptor is `fstat`ed before a single byte is written, so
         a mode that did not take effect stops the write instead of being
         reported after the secrets are already on disk."""
         target = tmp_path / "config.local.yaml"

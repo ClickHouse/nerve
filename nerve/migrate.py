@@ -1026,8 +1026,8 @@ def _retire_action(dry_run: bool) -> str:
 
 # The exception lives with the policy that raises it first (Database.connect
 # refuses writable/uninspectable state before opening); the bootstrap raises the
-# same class for the confidentiality case. Re-exported here, with the round-2
-# name kept as an alias, so callers keep importing it from this module.
+# same class for the confidentiality case. The old name remains as an alias so
+# callers can keep importing it from this module.
 from nerve.db.base import InsecureStateStorage  # noqa: E402
 
 InsecureSecretStorage = InsecureStateStorage
@@ -1040,7 +1040,7 @@ def _refuse_insecure_secret_storage(db: "Database", config: NerveConfig, *, log:
 
     * **Writable or uninspectable** database files or directory → always fatal,
       regardless of ``auth.jwt_secret``. Another user could replace ``nerve.db``
-      or rewrite the accounts, actors and history later PRs trust; a configured
+      or rewrite the accounts, actors and history stored there; a configured
       JWT protects none of that. Raises :class:`InsecureStateStorage`.
     * **Readable** database files, no configured ``auth.jwt_secret`` → fatal: a
       generated secret would sit in a file other users can read. Raises. Any
@@ -1108,8 +1108,8 @@ async def bootstrap_identity(
     schema is current (``db`` is connected, so v047 has applied) and before
     anything mints or verifies a token. Idempotent and cheap on a re-run:
     finds the same rows, changes nothing that exists, and returns the same
-    ids. Only ``accounts`` being empty creates an account (1.5 of the
-    sequence); ``display_name`` is applied to that new owner only. The
+    ids. Only an empty ``accounts`` table creates an account;
+    ``display_name`` is applied to that new owner only. The
     interactive installer passes the name it collected ("Your name") — it
     runs this in-process before exiting, since nothing it writes carries the
     answer — while the gateway's own pass at startup has none to give, so an

@@ -4,7 +4,7 @@ The lifespan's shutdown half only runs after the ``yield``, so anything that
 raised before it used to leak whatever had already started. The proxy is the
 one that hurts: :meth:`ProxyService.start` detaches its subprocess into its own
 process group, so an orphan keeps the port and the operator has to hunt it down
-before the next start (F28). The database now has a failure mode that reaches
+before the next start. The database now has a failure mode that reaches
 exactly this path — ``Database.connect`` refuses state other users can write to.
 
 Two guarantees are pinned here:
@@ -143,14 +143,13 @@ async def test_a_failure_after_the_proxy_stops_it_again(harness, monkeypatch):
     # And the engine is shut down even though *it* is what failed: initialize()
     # starts memU's dedicated thread before its last database writes, so a
     # half-initialised engine is precisely the case that needs stopping — a
-    # non-daemon thread keeps the process alive instead of letting it exit
-    # (F34).
+    # non-daemon thread keeps the process alive instead of letting it exit.
     assert harness["engine"].shutdown.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
-    """F32: the detached process exists from ``create_subprocess_exec``, while
+    """The detached process exists from ``create_subprocess_exec`` while
     ``start()`` is still polling for health. A cancellation there used to
     escape registration entirely — the cleanup was appended only once start()
     *returned* — and the subprocess outlived the daemon holding its port."""
@@ -179,7 +178,7 @@ async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
 
 @pytest.mark.asyncio
 async def test_cancellation_inside_initialize_still_shuts_the_engine_down(harness):
-    """F34: memU's thread is started partway through ``initialize()``. A
+    """memU's thread is started partway through ``initialize()``. A
     cancellation after that point must still reach ``shutdown()``, which is
     why the cleanup is registered before the await rather than after it."""
     started = asyncio.Event()

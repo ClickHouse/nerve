@@ -1,7 +1,7 @@
 """The signing secret is pinned at startup and resolved through one seam.
 
-Covers 1.6 of the local multi-user sequence: a configured ``auth.jwt_secret``
-keeps being used, a generated one is honoured by every consumer, the old
+A configured ``auth.jwt_secret`` keeps being used, a generated one is honoured
+by every consumer, the old
 ``"dev-secret"`` login path — mint a token signed with a literal string and
 skip the password check whenever the secret was empty — is gone, and there is
 no unauthenticated mode left anywhere: with no secret in force HTTP, the
@@ -182,8 +182,8 @@ class TestLoginRoute:
         assert client.get("/api/auth/status").json() == {"auth_required": True}
 
     def test_passwordless_admits_any_password_with_a_real_secret(self, client, config):
-        """0.5 / 0.7: a passwordless install stays passwordless; every admitted
-        caller resolves to the single account. The token is a real one."""
+        """A passwordless install admits each caller as its single account
+        using a normally signed token."""
         pin_jwt_secret(_GENERATED)
         assert client.get("/api/auth/status").json() == {"auth_required": False}
         res = client.post("/api/auth/login", json={"password": "anything at all"})

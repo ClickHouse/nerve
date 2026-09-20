@@ -335,7 +335,7 @@ class TestConfigLocalPermissions:
     def test_setup_fails_rather_than_write_secrets_a_filesystem_will_not_protect(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        """F25: a filesystem that ignores the mode gets no secrets file at all.
+        """A filesystem that ignores the mode gets no secrets file at all.
 
         The instance would otherwise start perfectly well with its API keys,
         password hash and signing secret readable by every local user, which is

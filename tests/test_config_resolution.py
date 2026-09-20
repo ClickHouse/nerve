@@ -239,9 +239,9 @@ class TestAppendTelegramAllowedUser:
     def test_it_raises_rather_than_rewrite_the_secrets_file_wide(
         self, tmp_path, monkeypatch,
     ):
-        """F25/F29: the file it rewrites holds the password hash and the
-        signing secret. On a filesystem that will not keep it owner-only
-        nothing is written — and the failure *raises* rather than becoming the
+        """The file holds the password hash and signing secret. On a
+        filesystem that will not keep it owner-only, nothing is written — and
+        the failure *raises* rather than becoming the
         ``False`` that means "this id was already there", which a caller can
         (and did) mistake for success."""
         from nerve import paths as paths_mod

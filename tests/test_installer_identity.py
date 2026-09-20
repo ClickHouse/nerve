@@ -188,7 +188,7 @@ class TestInstallerBootstrapFailure:
     def test_a_failed_checkpoint_tells_the_truth_instead_of_promising_a_save(
         self, tmp_path, monkeypatch,
     ):
-        """F15: if the answers could not be saved either, the installer must not
+        """If the answers could not be saved, the installer must not
         claim they were — it says so and names the collected name."""
         import nerve.migrate as migrate_mod
         from nerve.cli import main
@@ -231,7 +231,7 @@ class TestInstallerBootstrapFailure:
     def test_the_real_checkpoint_reports_failure_when_the_mode_is_not_honoured(
         self, tmp_path, monkeypatch,
     ):
-        """F22: the checkpoint is created 0600 and the mode is read back through
+        """The checkpoint is created 0600 and the mode is read back through
         the descriptor before a byte is written. A filesystem that accepts the
         mode and ignores it — the no-op chmod case — yields no checkpoint
         rather than a readable one, and the wizard is told so."""

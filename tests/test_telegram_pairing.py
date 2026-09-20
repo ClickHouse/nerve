@@ -5,7 +5,7 @@ Pairing authorizes a Telegram user in memory *and* writes them into
 password hash and the signing secret, so the writer refuses to rewrite it on a
 filesystem that will not keep it owner-only — and then nothing was saved. A
 handler that replies "✓ Paired" anyway costs the user their access at the next
-restart, with nothing to explain it (F29).
+restart, with nothing to explain it.
 """
 
 from __future__ import annotations

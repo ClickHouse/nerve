@@ -558,7 +558,7 @@ def test_restore_installs_the_database_owner_only(workspace, config_dir, tmp_pat
 
 
 class TestRestoreNeverLeavesAReadableKey:
-    """F18: the order of operations, each step verified before the next. The
+    """Each restore step is verified before the next. The
     destination directory is secured (0700, stat-verified) before anything
     lands in it; the temporary is *created* 0600 and its mode read back through
     the descriptor before a byte is copied; the rename is atomic; scrubbing the
@@ -685,7 +685,7 @@ class TestScrubIsVerified:
 
 
 class TestStagingIsOutOfReach:
-    """F27: the staged snapshot of ``nerve.db`` is every account and the
+    """The staged snapshot of ``nerve.db`` contains every account and the
     signing secret, in the clear — ``--no-secrets`` scrubs it only *after* the
     snapshot exists. It used to be staged under the caller's output directory,
     where another user could rename the ``0700`` staging directory away and
@@ -739,7 +739,7 @@ class TestStagingIsOutOfReach:
     def test_a_temp_directory_owned_by_someone_else_is_refused(
         self, tmp_path, monkeypatch,
     ):
-        """F30: sticky is necessary but not sufficient. The *owner* of a
+        """A sticky bit is not sufficient. The *owner* of a
         directory may rename anything inside it whatever the mode says, so a
         foreign-owned ``1777`` TMPDIR is exactly the trap — and the state dir
         here is unusable, so there is nowhere else to go."""
@@ -844,7 +844,7 @@ class TestStagingIsOutOfReach:
     def test_a_swap_after_the_first_verification_is_caught_too(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
     ):
-        """F30: the swap moved later — *after* the staging directory passed its
+        """This swaps the directory *after* it passed its
         first check, while the snapshot is being taken. The snapshot is created
         and written through a descriptor of its own, so the planted directory
         receives nothing, and the checks before the archive refuse to go on."""
@@ -901,7 +901,7 @@ class TestTheBundleItselfIsOwnerOnly:
         That is the realistic split — a normal state directory, a bundle
         written to an exotic mount — and it is the only way to reach the
         bundle's own check, since the staging directory and the snapshot are
-        verified before it (F27). The file is still created exclusively, as a
+        verified before it. The file is still created exclusively, as a
         mode-less filesystem does: it is the mode that fails to stick."""
         real_create = backup_mod._exclusive_create
 
@@ -944,7 +944,7 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_the_no_secrets_fallback_still_writes_through_its_own_descriptor(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """F31: tolerating a wide *mode* must not mean tolerating a wide
+        """Tolerating a wide *mode* must not mean tolerating a wide
         *name*. The fallback used to reopen the path, so a symlink planted in
         the gap had its target truncated and overwritten with the bundle — any
         file the Nerve user could write, including live state. Now the bytes go
@@ -993,7 +993,7 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_the_bundle_is_written_through_the_descriptor_it_verified(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """F26: the tar goes into the *descriptor* that was checked, never into
+        """The tar goes into the checked *descriptor*, never into
         the pathname reopened. Another user with write access to the output
         directory (a shared or mounted backup target) who replaces the
         temporary with a symlink must not receive the bundle."""
@@ -1010,7 +1010,7 @@ class TestTheBundleItselfIsOwnerOnly:
             created and verified. Code that then reopened the *name* would
             write the bundle straight into their file. Only the bundle
             temporary is swapped — the staged snapshot is a different file in
-            a directory this attacker cannot reach (F27)."""
+            a directory this attacker cannot reach."""
             fd, private = real_create(path, what)
             if path.parent == out:
                 path.unlink()

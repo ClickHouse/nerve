@@ -188,7 +188,7 @@ async def test_hardening_is_idempotent_across_reconnects(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-#  F17 — writable or uninspectable state is refused at open, unrepaired        #
+#  Writable or uninspectable state is refused at open, unrepaired             #
 # --------------------------------------------------------------------------- #
 
 
@@ -265,9 +265,8 @@ class TestRefusesToOpenWritableState:
         assert _mode(wal) == 0o666
 
     async def test_a_configured_secret_does_not_excuse_writable_state(self, tmp_path):
-        """Round 3 established this at bootstrap; it now holds at open, where
-        no configuration exists to consult. The bootstrap check stays as the
-        backstop and agrees."""
+        """Writable state is refused both when the database opens and at the
+        bootstrap backstop, even when a signing secret is configured."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path, 0o666)
@@ -393,7 +392,7 @@ class TestUninspectableIsRefused:
 
 
 # --------------------------------------------------------------------------- #
-#  F11 — a key exposed while the file was readable is rotated                  #
+#  A key exposed while the file was readable is rotated                       #
 # --------------------------------------------------------------------------- #
 
 
@@ -474,7 +473,7 @@ class TestExposedKeyIsRotated:
 
 
 # --------------------------------------------------------------------------- #
-#  F20 — rotation reaches the process pin                                      #
+#  Rotation reaches the process pin                                           #
 # --------------------------------------------------------------------------- #
 
 
@@ -538,7 +537,7 @@ class TestRotationReachesThePin:
 
 @pytest.mark.asyncio
 class TestAFailedConnectLeavesNothingOpen:
-    """F32: ``aiosqlite.connect`` starts a non-daemon thread. Anything that
+    """``aiosqlite.connect`` starts a non-daemon thread. Anything that
     fails after it — a migration, the permission backstop, a cancellation — has
     to close the connection, or the caller gets an exception *and* a thread
     that keeps the process alive, with a retry opening another one."""

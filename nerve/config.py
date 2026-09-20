@@ -418,8 +418,8 @@ def _require_auth_mapping(value: Any, where: str) -> None:
 
     A malformed ``auth:`` (a string, a list, a number) must never be read as
     "no auth" — replacing it with an empty mapping would turn a broken or
-    tampered configuration push into a passwordless instance, the exact
-    downgrade 0.1 forbids. It is a hard error, at load and in validation.
+    tampered configuration push into a passwordless instance. It is a hard
+    error at load time and during validation.
     """
     if value is not None and not isinstance(value, dict):
         raise ConfigError(
@@ -442,9 +442,8 @@ def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
     below it rather than merging into it: an ``auth:`` typed into
     ``config.local.yaml`` (or left behind by hand-editing or by scrubbing
     secrets out of a file) would erase a tracked ``password_hash`` and
-    ``jwt_secret`` and leave a passwordless instance — the silent downgrade 0.1
-    forbids. Normalised per layer, an empty section overlays nothing and every
-    key underneath survives.
+    ``jwt_secret`` and leave a passwordless instance. Normalised per layer, an
+    empty section overlays nothing and every key underneath survives.
 
     Only ``auth`` is treated this way. Every other section keeps the merge
     semantics it has always had, where a null overlay clears what is below it;
