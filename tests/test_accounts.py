@@ -287,7 +287,7 @@ async def test_account_actor_ids_are_distinct_and_usernames_casefold(db: Databas
             "UPDATE actor_refs SET kind = 'system' WHERE id = ?", (first,)
         )
 class TestUsernameNormalisation:
-    """Character set, case folding and the reserved list (PR 3). Pure
+    """Character set, case folding and the reserved list. Pure
     function — no database, so no asyncio mark."""
 
     @pytest.mark.parametrize("raw,expected", [
@@ -317,8 +317,8 @@ class TestUsernameNormalisation:
             normalise_username(raw)
 
     def test_the_legacy_token_subject_is_reserved(self):
-        """PR 2's grandfather clause gives the literal string a meaning in
-        tokens, so it must never also be somebody's login."""
+        """The legacy token subject has a fixed meaning, so it must never also
+        be somebody's login."""
         from nerve.gateway.auth import LEGACY_SUBJECT
 
         assert LEGACY_SUBJECT in RESERVED_USERNAMES

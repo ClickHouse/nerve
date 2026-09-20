@@ -88,7 +88,7 @@ class TestInstallerDisplayName:
         )
         # The wizard's password hash lands on the account row rather than
         # staying in configuration: `nerve init` bootstraps in-process, and the
-        # 3.5 migration runs in the same pass.
+        # credential migration runs in the same pass.
         assert rows == [("alice", "human", "local", None)]
         assert "copied auth.password_hash" in result.output
         local_yaml = (config_dir / "config.local.yaml").read_text(encoding="utf-8")

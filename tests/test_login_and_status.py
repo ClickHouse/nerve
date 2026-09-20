@@ -158,8 +158,7 @@ class TestSingleAccountLogin:
         assert bad.status_code == 401
 
     async def test_a_configured_password_still_authenticates(self, install):
-        """``credential_source = 'config'`` stays readable for one release, so a
-        downgrade to code that only knows ``auth.password_hash`` keeps working."""
+        """A transitional ``config`` account reads ``auth.password_hash``."""
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=hash_password(_PASSWORD),
         )))
@@ -519,8 +518,7 @@ class _CountedComparisons:
 
 
 def _cheap_hash(password: str, rounds: int = 4) -> str:
-    """A hash at a work factor this release would not choose — what an install
-    that copied `auth.password_hash` from an older box ends up with."""
+    """Create a legacy hash with a lower work factor than current policy."""
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=rounds)).decode()
 
 
@@ -552,9 +550,8 @@ class TestFailedLoginsCostTheSame:
         assert for_known == for_unknown == [b""]
 
     async def test_a_configured_empty_password_still_authenticates(self, install):
-        """Unusual, but it was valid before this release and an upgrade does not
-        get to take it away. Nothing can *set* one — hashing refuses an empty
-        password — so this is strictly about honouring what is already there."""
+        """Existing empty-password hashes still verify. New empty passwords are
+        rejected, so this only preserves access to legacy credentials."""
         empty = bcrypt.hashpw(b"", bcrypt.gensalt(rounds=4)).decode()
         await install.set_credential(
             install.owner_id, credential_source="local", credential=empty,

@@ -301,9 +301,8 @@ class AccountStore:
         One read, one predicate — see :class:`LoginState`. ``passwordless``
         keys off ``credential_source = 'none'``; a ``config`` row counts as
         having a credential because the startup mirror keeps that value in step
-        with ``auth.password_hash`` (a row is only left on ``config`` while one
-        is configured), and PR 3's startup migration moves every such row to
-        ``local`` anyway.
+        with ``auth.password_hash``. A row remains on ``config`` only while a
+        configured hash exists, and startup copies that hash to ``local``.
         """
         return login_state_from(await self.list_accounts())
 

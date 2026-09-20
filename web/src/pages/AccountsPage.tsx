@@ -10,8 +10,8 @@ import type { Account } from '../api/client';
 /**
  * Accounts.
  *
- * Every account may do everything here to every other account — there are no
- * roles (0.4) — so the page is flat: one list, one "add someone" form, and
+ * Every account may do everything here to every other account. There are no
+ * roles, so the page is flat: one list, one "add someone" form, and
  * your own password. The two things it refuses are the server's, not the
  * page's: the last enabled account cannot be disabled, and nobody can be added
  * until the existing account has a password and a username. Both come back as

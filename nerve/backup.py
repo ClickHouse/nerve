@@ -374,10 +374,9 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
 def _scrub_account_credentials(snapshot: Path) -> None:
     """Empty ``accounts.credential`` in a *snapshot* copy of nerve.db.
 
-    Every account's password lives on its row from this release on (the startup
-    migration off ``credential_source = 'config'``), so a bundle that carries
-    ``nerve.db`` carries the password hashes with it. ``--no-secrets`` promises
-    it does not.
+    Account password hashes are stored in ``nerve.db``, so a bundle containing
+    the database also contains those hashes. ``--no-secrets`` promises it does
+    not.
 
     **Every** account, not only the ones holding a hash. A row still on the
     transitional ``config`` source carries no credential of its own — it reads

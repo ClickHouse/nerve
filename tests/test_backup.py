@@ -1581,8 +1581,8 @@ def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
 def test_a_transitional_config_account_restores_as_passwordless(
     nerve_dir, workspace, config_dir, tmp_path,
 ):
-    """The shape PR 1 leaves behind, backed up before the first start that
-    migrates it. Its credential lives in config.local.yaml, which this bundle
+    """Restore a transitional account before startup migrates its credential.
+    Its credential lives in config.local.yaml, which this bundle
     omits — so a row left on `config` comes back able to authenticate against
     nothing, and not recognised as passwordless either. That is the one state
     with no way out of it."""

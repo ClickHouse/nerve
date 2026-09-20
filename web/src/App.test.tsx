@@ -146,9 +146,8 @@ describe('startup with a token already in storage', () => {
   });
 
   it('reaches accounts on a real reload, not just with a reset store', async () => {
-    // The same fresh-module path, followed all the way through: a grandfathered
-    // token on a passwordless install is precisely the upgrading install PR 3
-    // has to route to Accounts, and it is the one shape a reset store hides.
+    // Exercise the fresh-module path with a legacy token on a passwordless
+    // install. A reset store hides this upgrade state.
     vi.resetModules();
     authStatus.mockResolvedValue(
       status({ login: 'none', auth_required: false }),

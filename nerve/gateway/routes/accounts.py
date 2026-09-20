@@ -1,6 +1,6 @@
 """Account management routes.
 
-Every local account has full permissions (0.4): any account may list, create,
+Every local account has full permissions: any account may list, create,
 rename, disable and re-enable accounts, and the consequence is worth stating
 rather than discovering — **adding a person gives them the power to remove
 you.** That is the chosen property for a trusted-team self-hosted install, not
@@ -150,7 +150,7 @@ async def require_account(actor: Actor = Depends(require_auth)) -> Actor:
 
     ``require_auth`` also admits the agent's system principal: the credential
     the CLI and the in-process agent tool mint for themselves. Those act
-    autonomously (0.6) and have no account, so "every account may manage
+    autonomously and have no account, so "every account may manage
     accounts" does not reach them — and keeping account administration off that
     credential means a prompt that talks the agent into calling its own API
     cannot mint itself a login.
@@ -199,7 +199,7 @@ async def get_own_account(actor: Actor = Depends(require_account)):
 async def create_account(req: AccountCreateRequest, actor: Actor = Depends(require_account)):
     """Add a person.
 
-    Refused while the instance is passwordless (0.5) or while any existing
+    Refused while the instance is passwordless or while any existing
     account has no username — both 409 with a message saying what to do first,
     because both describe the instance rather than the request.
     """
@@ -229,7 +229,7 @@ async def update_account(
 ):
     """Set a username and/or a display name.
 
-    A username is a lookup key, not an identity (0.7): renaming changes what the
+    A username is a lookup key, not an identity: renaming changes what the
     account logs in as and what is shown, and moves nothing that was stored —
     ``actor_refs.id`` is untouched, so every session and message already
     attributed to this person stays attributed to them.
@@ -341,8 +341,8 @@ def account_credential(account: dict, config) -> str:
     One function so the login route, the status descriptor and the password
     change agree about where an account's credential lives:
 
-    * ``local`` — the hash on the row. What every account has after PR 3's
-      startup migration, and what a password set through the API produces;
+    * ``local`` — the hash on the row. Startup migrates configured passwords to
+      this source, and the API writes new passwords here;
     * ``config`` / ``none`` — both mean "whatever configuration says", so both
       read ``auth.password_hash``. The startup mirror keeps the row's value in
       step with that key, but a config *reload* that adds a password takes
@@ -350,9 +350,8 @@ def account_credential(account: dict, config) -> str:
       is the safe direction: the alternative is an instance that stays
       passwordless for a while after its operator set a password.
 
-    ``config`` is kept readable for one release so a downgrade to code that only
-    knows the configuration value still authenticates; the startup migration
-    empties that case out.
+    ``config`` remains readable for compatibility with transitional account
+    rows; startup copies those credentials to ``local``.
 
     The *gate* — which sources have a credential at all — is
     :func:`nerve.gateway.auth.source_authenticates`, shared with ``nerve
@@ -368,8 +367,8 @@ def account_credential(account: dict, config) -> str:
 def instance_is_passwordless(state, config) -> bool:
     """Whether anyone reaching the gateway is admitted as the one account.
 
-    The 0.5 state: exactly one account, and no credential anywhere — neither on
-    its row nor in configuration. Both halves matter, and both are read here so
+    A passwordless instance has exactly one account and no credential anywhere
+    — neither on its row nor in configuration. Both halves are read here so
     the login route and ``/api/auth/status`` cannot disagree about which state
     the instance is in (a status that says "passwordless" while login wants a
     password is a browser that logs itself out in a loop).

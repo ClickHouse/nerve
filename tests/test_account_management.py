@@ -1,6 +1,6 @@
 """The account-management API.
 
-Every account may manage accounts (0.4), so these tests are mostly about the
+Every account may manage accounts, so these tests are mostly about the
 three things that are *not* allowed — a second account while the instance is
 passwordless, a second account while the first has no username, and disabling
 the last enabled one — plus the rule that no response ever carries a
@@ -206,15 +206,14 @@ class TestNoCredentialEverLeaves:
 
 
 # --------------------------------------------------------------------------- #
-#  Any account may manage accounts (0.4)                                       #
+#  Any account may manage accounts                                             #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
 class TestEveryAccountMayManageAccounts:
     async def test_the_account_you_created_can_disable_you(self, install: _Install):
-        """The stated property of 0.4, tested rather than assumed: adding a
-        person gives them the power to remove you."""
+        """Adding a person gives them the power to disable your account."""
         await install.secure_the_owner()
         async with _client(install.app) as client:
             created = await client.post(
@@ -378,9 +377,8 @@ class TestLastAccountGuard:
 @pytest.mark.asyncio
 class TestDisablementTakesEffectAtTheNextRequest:
     async def test_not_retroactively(self, install: _Install):
-        """The API half of the rule PR 2 proved on the request path: a token
-        minted before the change keeps verifying, and the account row is what
-        stops it — on the *next* call, not the one in flight."""
+        """A token minted before disablement still verifies, but the account
+        row rejects it on the next call. An in-flight call is unaffected."""
         await install.secure_the_owner()
         async with _client(install.app) as client:
             bob = (await client.post(
@@ -440,7 +438,7 @@ class TestUsernamesThroughTheApi:
             assert len(await install.db.list_actor_refs(kind="human")) == 1
 
     async def test_renaming_keeps_the_identity(self, install: _Install):
-        """0.7: a username is a lookup key. Renaming moves nothing stored."""
+        """Renaming a username does not change the account's identity."""
         await install.secure_the_owner("alice")
         actor_before = (await install.db.get_account(install.owner_id))["actor_id"]
         async with _client(install.app) as client:
@@ -556,8 +554,8 @@ class TestOwnPassword:
         self, install: _Install,
     ):
         """Omitting it is "I am not claiming to know it". Sending "" is a claim
-        that the current password is the empty string — which a credential made
-        before this release can legitimately be, so it is compared."""
+        that the current password is the empty string. Existing credentials may
+        legitimately represent an empty password, so it is compared."""
         import bcrypt
 
         empty = bcrypt.hashpw(b"", bcrypt.gensalt(rounds=4)).decode()
@@ -678,8 +676,8 @@ class TestPasswordLength:
     async def test_a_password_hashed_before_bcrypt_5_still_verifies(self):
         """bcrypt used to ignore everything past 72 bytes, so a hash from an
         older install was made from the first 72 of whatever was typed.
-        Refusing the full password now would lock out somebody who could log in
-        yesterday, which is the one thing this release promises not to do."""
+        The full password must still verify against that legacy hash to avoid
+        locking out an existing account."""
         import bcrypt
 
         from nerve.gateway.auth import verify_password

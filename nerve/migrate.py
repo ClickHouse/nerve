@@ -1014,14 +1014,12 @@ def _mirror_action(current: str, expected: str, dry_run: bool) -> str:
 
 
 # --------------------------------------------------------------------------- #
-#  Off the configuration credential (3.5)                                      #
+#  Move credentials out of configuration                                      #
 # --------------------------------------------------------------------------- #
 #
-# `credential_source = 'config'` was always transitional: it is the shape PR 1
-# gave an upgrading install so that nothing was copied and no file was
-# rewritten, which is what made PR 1 reversible. This is where every install
-# leaves it, because this is the first release with somewhere to put an
-# account-owned credential and a UI to manage it.
+# ``credential_source = 'config'`` is transitional. Startup copies the
+# configured hash to the account row, where the accounts API can manage it,
+# then removes the obsolete machine-local configuration value.
 #
 # The hash is already bcrypt, so this is a *copy* and not a re-hash: nobody's
 # password changes, and every open session stays valid. Copy first, scrub
@@ -1107,8 +1105,7 @@ def _scrub_password_action(scrubbed: list[Path], dry_run: bool) -> str:
 
 
 def _orphan_password_warning() -> str:
-    """Spec 1.3: a configured hash that does nothing, and is in no file to remove
-    it from. An hour of somebody's debugging, prevented by one log line."""
+    """Explain a configured hash that no account uses and cannot be removed."""
     return (
         "auth.password_hash is set but no account uses it: every account has its "
         "own password (credential_source=local) or none at all. Editing the "
@@ -1137,7 +1134,7 @@ async def _migrate_config_credentials(
     db: "Database", config: NerveConfig, report: MigrationReport, *,
     dry_run: bool, pending_config_rows: int = 0,
 ) -> None:
-    """Move every account off ``credential_source = 'config'`` (3.5).
+    """Move every account off ``credential_source = 'config'``.
 
     ``pending_config_rows`` counts accounts a *dry run* says would be created on
     ``config`` — they are not in the table yet, and a dry run that showed the
@@ -1306,7 +1303,7 @@ def _retire_config_password(
     elif not scrubbed:
         # Configured, read by nobody, and in none of the files this box owns: a
         # value set programmatically, or arriving by some route this cannot
-        # name. There is nothing to rewrite, so say what it does (spec 1.3).
+        # name. There is nothing to rewrite, so explain that it has no effect.
         warning = _orphan_password_warning()
     if warning:
         report.warnings.append(warning)
@@ -1413,8 +1410,8 @@ async def bootstrap_identity(
     """
     report = MigrationReport(dry_run=dry_run) if report is None else report
     source = _credential_source_for(config)
-    # Accounts a dry run says would be created on the transitional value, so 3.5
-    # can report what it would then do with them (see _migrate_config_credentials).
+    # Include accounts a dry run would create with the transitional source so
+    # credential migration can report what it would do with them.
     pending_config_rows = 0
 
     if dry_run:
@@ -1456,8 +1453,8 @@ async def bootstrap_identity(
                 account["id"], expected_source=current, credential_source=source,
             )
 
-    # Then straight off `config` again (3.5). The order matters in one
-    # direction: the mirror may have *just* put a row on `config` (a passwordless
+    # Then move rows off `config`. The order matters in one direction: the
+    # mirror may have *just* put a row on `config` (a passwordless
     # install that gained auth.password_hash), and this is what finishes the job
     # in the same start rather than leaving a transitional state behind.
     #
@@ -1577,8 +1574,8 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
             report.identity_actions.append(_mirror_action(current, source, dry_run=True))
             settled.append(source)
 
-    # 3.5, modelled: the copy, then the retirement — which is judged on its own
-    # every start, so a dry run reports it whether or not this run would copy.
+    # Model the copy and then the retirement. Retirement is evaluated on every
+    # start, so a dry run reports it even when this run would copy nothing.
     if config.auth.password_hash:
         on_config = [current for current in settled if current == "config"]
         if on_config:

@@ -1,4 +1,4 @@
-"""3.5 — every install moves off ``credential_source = 'config'`` at startup.
+"""Every install moves off ``credential_source = 'config'`` at startup.
 
 The configured hash is *copied* onto the account row (never re-hashed, so
 nobody's password changes) and the now-dead configuration value is then removed
@@ -214,9 +214,9 @@ class TestTheScrub:
         `none` row reads it too (see routes.accounts.account_credential).
 
         Called below the mirror on purpose: the mirror moves every `none` row to
-        `config` while a hash is configured and 3.5 then copies it, so this
-        state does not survive a whole `bootstrap_identity`. This is the guard
-        that keeps the file safe if that order ever changes."""
+        `config` while a hash is configured and credential migration copies it,
+        so this state does not survive a whole `bootstrap_identity`. This guard
+        keeps the file safe if that order ever changes."""
         from nerve.migrate import MigrationReport, _migrate_config_credentials
 
         config = _install(tmp_path, local_yaml=f"auth:\n  password_hash: '{_HASH}'\n")
@@ -353,8 +353,7 @@ class TestTheStaleValueWarning:
     async def test_a_hash_no_account_reads_is_called_out_once(
         self, db: Database, tmp_path, caplog,
     ):
-        """Spec 1.3: a stale auth.password_hash that no longer does anything is
-        exactly what an operator debugs for an hour."""
+        """Warn when ``auth.password_hash`` is set but no account uses it."""
         await _insert_account(db, source="local", credential="$2b$12$own")
         config = NerveConfig(
             auth=AuthConfig(password_hash=_HASH),
