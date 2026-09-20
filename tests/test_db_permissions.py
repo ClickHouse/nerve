@@ -218,9 +218,8 @@ class TestRefusesToOpenWritableState:
         assert f"chmod 700 {db_path.parent}" in msg and f"chmod 600 {db_path}" in msg
 
     async def test_no_migration_runs_on_a_refused_database(self, tmp_path):
-        """A database from older code, left writable: refused *before* the
-        schema is touched, so nothing of this version is written into a file
-        another user may have altered."""
+        """A writable database from older code is refused before migrations
+        can modify a file that another user may have altered."""
         state = tmp_path / "state"
         state.mkdir(mode=0o700)
         old = state / "nerve.db"
