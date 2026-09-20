@@ -211,10 +211,9 @@ class TestNoCredentialEverLeaves:
         async with _client(install.app) as client:
             before = await client.get("/api/accounts/me", headers=install.headers())
             assert before.json()["has_password"] is False
-            # The *first* password is set by the claim endpoint, not here: this
-            # endpoint refuses while the instance is unclaimed (PR 6), because
-            # the case that needs no current password is the case a
-            # passwordless install hands to anybody.
+            # The claim endpoint sets the first password. This endpoint refuses
+            # while the instance is unclaimed because every caller already has
+            # the passwordless session that requires no current password.
             await install.secure_the_owner()
             after = await client.get("/api/accounts/me", headers=install.headers())
             assert after.json()["has_password"] is True
@@ -352,10 +351,8 @@ class TestPasswordlessGuard:
                 headers=install.headers(),
             )).status_code == 409
 
-            # 1. the first account gets a password — which on an unclaimed
-            # instance happens through POST /api/setup/claim (PR 6), so it is
-            # set directly here: this test is about the *second* account's
-            # guards, not about which door the first password comes through.
+            # 1. The claim endpoint normally sets the first password. Set it
+            # directly because this test covers the second account's guards.
             await install.db.update_account_login(
                 install.owner_id, credential=hash_password(_PASSWORD),
             )
@@ -430,9 +427,8 @@ class TestLastAccountGuard:
             assert back.json()["enabled"] is True
 
     async def test_unknown_account(self, install: _Install):
-        # Claimed first: an unclaimed instance refuses every account mutation
-        # before it looks anything up (PR 6's claim cutover), and this is
-        # about what happens to a name that does not exist.
+        # Claim first because an unclaimed instance refuses every account
+        # mutation before looking up the target. This test covers a missing id.
         await install.secure_the_owner()
         async with _client(install.app) as client:
             for path in ("/api/accounts/nope/disable", "/api/accounts/nope/enable"):
@@ -538,7 +534,7 @@ class TestOwnPassword:
     async def test_the_first_password_of_an_unclaimed_instance_is_refused_here(
         self, install: _Install,
     ):
-        """PR 6: there is one door, and it is the guarded one.
+        """Only the guarded claim endpoint may set the first password.
 
         This endpoint needs no current password when the account has none —
         which is exactly the state a passwordless install is in, and a
@@ -795,8 +791,8 @@ class TestTheRouteSurface:
         authenticates through the MCP path instead. Anything else appearing
         here is a hole.
 
-        The fourth is PR 6's claim: the state it ends — one account with no
-        password — already admits every caller, so requiring a session would
+        The fourth is the claim endpoint. Before a claim, the single account
+        has no password and every caller is admitted, so requiring a session would
         protect nothing. What protects it is the mandatory setup token, which
         this scan cannot see; the tests in
         ``test_setup_wizard.py`` are what pin it."""
@@ -876,8 +872,8 @@ class TestPasswordLength:
         (_MULTIBYTE_OVER, 400),
     ])
     async def test_changing_your_own_password(self, install: _Install, password, status):
-        # Claimed first: this endpoint refuses on an unclaimed instance (PR 6),
-        # where the *first* password goes through the guarded claim instead.
+        # Claim first because this endpoint refuses an unclaimed instance,
+        # where the first password must go through the guarded claim instead.
         # The limit is the same on both doors; this one is about the limit.
         await install.secure_the_owner()
         async with _client(install.app) as client:

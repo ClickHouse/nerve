@@ -1,6 +1,6 @@
 """V49: a per-account session epoch, so a claim can end the sessions before it.
 
-A passwordless install hands a session to every caller who reaches it (0.5).
+A passwordless install hands a session to every caller who reaches it.
 Claiming the account ends that state for *new* callers, but the tokens already
 handed out are signed, unexpired and name the same account, so without this
 they keep full owner authority for the rest of their thirty days — which is

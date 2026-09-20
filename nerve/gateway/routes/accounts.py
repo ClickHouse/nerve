@@ -210,8 +210,8 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
             display_name=(req.display_name or None),
             # The epoch this request was *authorised* under, checked inside the
             # transaction: a create admitted while the instance was
-            # passwordless must not leave an account behind if a claim landed
-            # while it was in flight (PR 6's claim cutover).
+            # passwordless must not leave an account behind if a claim lands
+            # while it is in flight.
             acting_account_id=actor.account_id,
             acting_session_epoch=actor.session_epoch,
         )
@@ -242,8 +242,8 @@ async def update_account(
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
 
-    **Refused while the instance is unclaimed** (PR 6's claim cutover): a
-    passwordless install mints a session for anybody, so this is the one
+    **Refused while the instance is unclaimed:** a passwordless install mints
+    a session for anybody, so this is the one
     account mutation a stranger could otherwise reach — the others are already
     refused by the passwordless guard, the last-account guard or the
     first-password rule. The claim sets the first username and password
