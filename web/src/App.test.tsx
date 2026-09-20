@@ -3,15 +3,7 @@ import { MemoryRouter, Outlet } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthStatus } from './api/client';
 
-/**
- * Where a tab lands on startup.
- *
- * The one that matters is the tab that arrives *holding a token*. A token says
- * it may come in; it does not say where. An instance whose sole account has no
- * password belongs on the setup page however the tab arrived, and the app used
- * to render on the token alone — reaching `/chat` before the status descriptor
- * answered, by which time the component that would have redirected was gone.
- */
+/** Startup routing waits for auth status even when a stored token exists. */
 
 vi.mock('./api/client', async () => {
   const actual = await vi.importActual<typeof import('./api/client')>('./api/client');

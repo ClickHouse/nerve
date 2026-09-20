@@ -232,7 +232,7 @@ class TestClaim:
         assert token not in caplog.text
 
     async def test_token_invalidation_rolls_the_claim_back(self, install):
-        """Account and bearer retirement are one transaction, not two promises."""
+        """Roll back the account claim if setup-token deletion fails."""
         await install.db.db.execute(
             """CREATE TRIGGER refuse_setup_token_delete
                  BEFORE DELETE ON instance_secrets
@@ -354,8 +354,8 @@ class TestSessionEpoch:
             assert (await http.get("/api/accounts/me")).status_code == 200
 
     async def test_a_token_from_any_other_epoch_is_refused(self, install):
-        # Equality is deliberate: a restored or rolled-back database must not
-        # accept a token minted against a future copy of the account either.
+        # Reject tokens minted against older or future account state, including
+        # after a database restore or rollback.
         future = install.session_token(epoch=1)
         async with _client(install.app, token=future) as http:
             assert (await http.get("/api/auth/check")).status_code == 401

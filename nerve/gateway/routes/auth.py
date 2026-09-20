@@ -241,9 +241,7 @@ async def login(req: LoginRequest):
     if credential:
         await _maybe_upgrade_hash(store, account, req.password)
 
-    # Minted at the account's current epoch: a login after a claim must be
-    # usable, and a token minted at 0 against a claimed account would be
-    # refused on its first request (v049).
+    # Use the account's current epoch so a post-claim login is immediately valid.
     return LoginResponse(token=create_session_token(
         secret, actor.account_id, session_epoch=account.get("session_epoch") or 0,
     ))

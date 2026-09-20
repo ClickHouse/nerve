@@ -113,12 +113,9 @@ def instance(tmp_path, open_identity_db, wire_identity_store, monkeypatch):
 def _expect_closed(socket, *, within: float = 5.0) -> int:
     """The close code this socket is about to receive, or a failure.
 
-    Read on a **daemon** thread with a deadline. ``receive_json`` blocks
-    forever on a socket that is not closed, so a test asserting a close has to
-    be able to give up — otherwise the run hangs when the behaviour under test
-    is missing, which is the one moment the result has to be readable. The
-    thread is left behind on purpose: it is waiting on a queue nobody will
-    fill, and joining it is exactly the wait being avoided.
+    Read on a daemon thread because ``receive_json`` blocks indefinitely when
+    the socket stays open. The deadline lets the test fail without joining the
+    blocked thread.
     """
     outcome: queue.Queue = queue.Queue(maxsize=1)
 
@@ -183,7 +180,7 @@ class TestASocketHeldAcrossTheClaim:
             )
             assert _expect_closed(socket) == server.WS_REVOKED_CODE
 
-        # ...while the browser that did the claiming connects perfectly well.
+        # The claiming browser can connect with its replacement token.
         with instance.client.websocket_connect(f"/ws?token={claimed}") as fresh:
             assert fresh.receive_json()["type"] == "session_switched"
             fresh.send_json({"type": "ping"})

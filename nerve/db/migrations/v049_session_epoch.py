@@ -16,10 +16,8 @@ table does not already have it. Existing rows land on epoch 0, and tokens
 minted by an earlier build carry no epoch at all, which reads as 0 — so an
 upgrade logs nobody out. Only a claim moves it.
 
-Note what the epoch is *not*: a way to revoke one session. It is per account,
-so bumping it ends every session that account has. That is the right shape for
-the claim (the point is that none of the old ones survive) and the wrong shape
-for "sign out this one device", which nothing here offers.
+The epoch revokes every session for an account, which a claim requires. It
+cannot revoke one device independently.
 """
 
 from __future__ import annotations

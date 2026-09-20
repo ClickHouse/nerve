@@ -282,9 +282,8 @@ async def update_account(
             await db.update_actor_profile(
                 account["actor_id"],
                 display_name=(req.display_name.strip() or None),
-                # Checked inside the write's own transaction, like every other
-                # account mutation: a rename authorised before a claim must not
-                # land after it, least of all over the claimer's own name.
+                # Check the caller's epoch in the write transaction so a rename
+                # authorized before a claim cannot commit after it.
                 acting_account_id=actor.account_id,
                 acting_session_epoch=actor.session_epoch,
             )
@@ -353,21 +352,17 @@ async def change_own_password(
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
-    current password is the empty string, which a credential made before this
-    release can legitimately be, so it is compared rather than rejected out of
-    hand.
+    current password is the empty string. Existing credentials may represent an
+    empty password, so it must be compared.
 
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it. It also advances the
     account's session epoch: every older HTTP token and open WebSocket is
     revoked, while this response supplies the calling tab a replacement token.
 
-    **While the instance is unclaimed this endpoint refuses.** The one case
-    that needs no current password is exactly the state a passwordless install
-    is in, and a passwordless install hands a session to anybody who asks — so
-    leaving this open would be a second, unguarded way to take the instance
-    over, beside the one the setup token protects. There is one door, and it
-    is ``POST /api/setup/claim``.
+    **While the instance is unclaimed this endpoint refuses.** Passwordless
+    sessions are available to every caller, so only ``POST /api/setup/claim``
+    may set the first password, protected by the setup token.
     """
     db = get_deps().db
     config = get_config()
@@ -392,26 +387,21 @@ async def change_own_password(
     try:
         updated = await db.update_account_login(
             account["id"], credential=_hashed(req.new_password),
-            # Conditional on the account still being at the epoch this request
-            # was authorised under. The passwordless branch above read a
-            # snapshot; if a claim committed between that read and this write,
-            # the snapshot says "no password to prove" about an account that
-            # now has one, and the write would hand the instance back.
+            # Check the request's epoch in the write transaction. Otherwise a
+            # concurrent claim could set a password after the passwordless check
+            # and this write could replace it without verification.
             expected_session_epoch=actor.session_epoch,
             revoke_sessions=True,
         )
     except _CONFLICT as e:
-        # A stale session is a fact about the *instance* (it was claimed under
-        # this request), not about the password in the body.
+        # The instance changed after this request was authorized.
         raise HTTPException(status_code=409, detail=str(e)) from e
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if updated is None:  # pragma: no cover - removed between two reads
         raise HTTPException(status_code=404, detail="Account not found")
-    # Keep the tab that proved the old password signed in while revoking every
-    # other credential minted at the old epoch. The ordinary response
-    # middleware publishes this through X-Nerve-Token and the API client adopts
-    # it under the same request-revision guard as a sliding refresh.
+    # Replace the caller's token after revoking credentials at the old epoch.
+    # Response middleware sends it through X-Nerve-Token.
     request.state.refreshed_token = create_session_token(
         effective_jwt_secret(config),
         updated["id"],

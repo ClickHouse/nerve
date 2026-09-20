@@ -330,12 +330,9 @@ class AccountStore:
     ) -> None:
         """Refuse unless ``account_id``'s row still carries ``expected``.
 
-        Called **inside** a write transaction, which is the whole point: the
-        comparison and the write have to be one act, or a claim committing
-        between them lets a request authorised before the claim finish after
-        it. ``None`` for either argument means there is nothing to compare —
-        a credential with no account behind it, or a caller that did not ask
-        for the check.
+        Call inside the write transaction so a claim cannot commit between the
+        comparison and mutation. ``None`` skips the check for credentials with
+        no account or callers that did not request epoch validation.
         """
         if account_id is None or expected is None:
             return

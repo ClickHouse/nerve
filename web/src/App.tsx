@@ -51,16 +51,10 @@ function App() {
     return () => { unsub(); ws.disconnect(); };
   }, [authenticated]);
 
-  // Nothing renders until startup has decided where this tab belongs. A stored
-  // token is not that decision: the instance may still be unset-up, and
-  // rendering on the token alone landed on /chat before the answer arrived.
+  // Wait for auth status before routing. A stored token does not distinguish a
+  // claimed instance from a passwordless one.
   if (!ready) return null;
-  // An instance nobody has claimed yet gets the claim page instead of the login
-  // page, even with no session: the claim endpoint is unauthenticated (the
-  // state it ends admits everybody anyway), and the tab that arrives with a
-  // dead token in storage would otherwise be asked for a password that does
-  // not exist yet. Decided after `ready`, so it is the descriptor's answer
-  // rather than the absence of one.
+  // Route passwordless instances to setup even without a valid session.
   if (!authenticated && loginMode === 'none') return <SetupPage />;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
@@ -116,17 +110,7 @@ function App() {
   );
 }
 
-/**
- * Where the app opens.
- *
- * Chat, unless the instance has never been secured — its one account has no
- * password, so everyone who can reach it is signed in as it — in which case the
- * setup page, so the state gets noticed rather than silently persisting.
- * Naming the account does not settle it; only a password does.
- * Only the *root* redirect moves: a deep link, refresh or bookmark still lands
- * where it says. The passwordless state already admits that browser; the setup
- * token protects the ownership cutover rather than acting as route authority.
- */
+/** Route the root to setup while the account has no password. */
 function Home() {
   const loginMode = useAuthStore((s) => s.loginMode);
   return <Navigate to={loginMode === 'none' ? '/setup' : '/chat'} replace />;

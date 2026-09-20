@@ -7,7 +7,7 @@ import { errorDetail } from '../stores/accountStore';
 import { useActorStore } from '../stores/actorStore';
 import { useAuthStore } from '../stores/authStore';
 
-/** Secure the account created by installation; no other setup lives here. */
+/** Claim the installation's initial account. */
 export function SetupPage() {
   const navigate = useNavigate();
   const loginMode = useAuthStore((state) => state.loginMode);
@@ -32,8 +32,7 @@ export function SetupPage() {
         setup_token: setupToken,
         display_name: displayName.trim() || undefined,
       });
-      // Persist only the client session. The setup token remains form state
-      // and is discarded as soon as the claim response arrives.
+      // Keep the setup token in form state; store only the returned session.
       setSetupToken('');
       setToken(claimed.token);
       await checkAuth();

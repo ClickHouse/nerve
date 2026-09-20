@@ -49,11 +49,9 @@ class Actor:
     account_id: str | None = None
     # Presentation snapshot, never an identity or authorization key.
     display_name: str | None = None
-    # The account's session epoch **as the credential stated it** — not as the
-    # row says now. It is what makes "admitted before the claim" answerable
-    # after the claim: a mutation carries this into its transaction and the row
-    # refuses it if the two have diverged (v049). ``None`` for a credential
-    # with no account behind it, which has no epoch to be stale against.
+    # The epoch from the credential, not the current account row. Mutations
+    # compare it with the stored epoch to reject credentials invalidated by a
+    # claim. ``None`` when the credential has no account.
     session_epoch: int | None = None
 
     def __post_init__(self) -> None:
@@ -105,11 +103,8 @@ def _actor_for_account_row(
         kind=account["actor_kind"],
         account_id=account["account_id"],
         display_name=account["display_name"],
-        # The credential's own epoch where there is one. Reading it back off
-        # the row here instead would hand every request the *current* value —
-        # which is the promotion bug: a session admitted before a claim would
-        # carry the epoch the claim had just written, and every later check
-        # against it would pass.
+        # Preserve the credential's epoch. Replacing it with the current row
+        # value would make a pre-claim session pass post-claim checks.
         session_epoch=(
             session_epoch if session_epoch is not None
             else int(account.get("session_epoch") or 0)

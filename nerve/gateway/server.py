@@ -129,19 +129,11 @@ class WebSocketConnection:
     session_epoch: int | None = None
 
 
-# Every socket this process has open, by client id. Written here rather than
-# inferred from the broadcaster, which holds *callbacks* for a session and
-# cannot say which account is behind one.
-#
-# It exists so authority can be withdrawn without waiting for the connection to
-# say something: claiming an instance has to end the sockets a passwordless
-# install handed out, and a socket that is only checked when it *sends* keeps
-# receiving broadcasts in the meantime.
+# Open sockets indexed by client id. The broadcaster stores callbacks without
+# account identity, so it cannot revoke sockets after a claim or disablement.
 _live_sockets: dict[str, tuple["WebSocketConnection", WebSocket]] = {}
 
-# What a socket is told when its authority ends underneath it. 1008 is the
-# WebSocket protocol's "policy violation", which is what this is: the
-# credential was fine when it was accepted and is not any more.
+# Code 1008 reports a credential that became unauthorized after acceptance.
 WS_REVOKED_CODE = 1008
 WS_REVOKED_REASON = "Session ended; sign in again"
 
@@ -204,10 +196,9 @@ async def _connection_still_authorised(connection: WebSocketConnection) -> bool:
 async def close_revoked_sockets() -> int:
     """Close every open socket whose account has moved on. Returns how many.
 
-    Called when a claim commits: the point of claiming is to end the authority
-    a passwordless install handed out, and a socket that is only re-checked
-    when it *sends* would go on receiving broadcasts — the transcript of
-    whatever the owner does next — until it did.
+    Called after a claim commits. A socket checked only when it sends could keep
+    receiving the new owner's broadcasts, so claims close stale sockets
+    immediately.
 
     The connection's actor is never rewritten. A socket that may no longer act
     is closed, because re-pointing it at somebody else would attribute the next
@@ -1049,20 +1040,13 @@ def create_app() -> FastAPI:
             return
 
         client_id = connection.client_id
-        # Registered before anything can fail, and removed in the `finally`
-        # that covers everything after it: a handshake that dies half way — a
-        # client that closes the tab while the session is being resolved —
-        # would otherwise leave an entry naming a socket nobody will ever
-        # close.
+        # Register before further awaits and remove in the enclosing finally so
+        # a failed handshake cannot leak a socket entry.
         _live_sockets[client_id] = (connection, websocket)
         active_session: str | None = None
         try:
-            # Registered, *then* re-checked. A claim that committed between
-            # verifying the credential and getting here would otherwise have
-            # walked the registry before this entry existed and left the
-            # connection open; asking again once it is findable closes that
-            # window from the other side. Cheap — one indexed read — and it
-            # runs before the connection is given a session or a listener.
+            # Re-check after registration to close the race with a claim that
+            # scanned the registry between authentication and registration.
             if not await _connection_still_authorised(connection):
                 await websocket.close(
                     code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON,
@@ -1115,12 +1099,8 @@ def create_app() -> FastAPI:
 
             while True:
                 data = await websocket.receive_json()
-                # Before anything is *done* with the frame. The credential was
-                # checked at accept, hours ago on a long-lived socket, and the
-                # account row is the only thing that can say it has since
-                # stopped being good — a disabled account, or an instance that
-                # has been claimed out from under a session a passwordless
-                # install handed out.
+                # Re-check before processing every frame because the account may
+                # have been disabled or claimed since socket acceptance.
                 if not await _connection_still_authorised(connection):
                     await websocket.close(
                         code=WS_REVOKED_CODE, reason=WS_REVOKED_REASON,
