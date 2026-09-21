@@ -1,7 +1,6 @@
-"""V48: who created a session, and who sent a message.
+"""V48: record who created a session and who supplied message input.
 
-The expand half of prospective attribution (RFC 10.2 steps 1 and 4). Two
-nullable columns, both holding an ``actor_refs.id``:
+Adds two nullable columns that hold an ``actor_refs.id``:
 
 - ``sessions.created_by_actor_id`` — the principal that caused the session row
   to exist: the person who asked for it, or the agent's system principal for
@@ -9,15 +8,15 @@ nullable columns, both holding an ``actor_refs.id``:
   MCP satellites, and ingested Codex threads). Unidentified external people
   remain ``NULL``.
 - ``messages.actor_id`` — the principal that supplied the message's content as
-  *input*. Assistant and tool output keeps its own authorship in ``role`` and
-  is left ``NULL``; the optional ``caused_by_actor_id`` of RFC section 8 is
-  deliberately not added here.
+  *input*. Assistant and tool output keeps its authorship in ``role`` and is
+  left ``NULL``. Causal attribution to the principal that prompted output is
+  not stored.
 
 **Existing rows stay NULL and nothing is backfilled.** A legacy session's
 ``source`` string and a legacy message's ``channel`` are provenance, not
 identity bindings, so inventing an actor from them would fabricate audit
-history (RFC 10.2 step 3). `NULL` reads as "not recorded", which also covers
-unidentified external people and assistant/tool output.
+history. `NULL` reads as "not recorded", which also covers unidentified
+external people and assistant/tool output.
 
 Both columns reference ``actor_refs(id)``. The reference can never dangle:
 ``actor_refs`` rows are never deleted, and since local accounts are tombstoned

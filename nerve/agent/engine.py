@@ -2275,11 +2275,9 @@ class AgentEngine:
         # Longer workflows that settle after finalize are handled by that merge.
         self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
-        # Store assistant message in DB. Unattributed on purpose: the author
-        # is the model, which is not a principal, and 0.7 keeps assistant and
-        # tool authorship in ``role`` rather than folding it into an actor.
-        # Linking the turn back to whoever prompted it is ``caused_by_actor_id``,
-        # which the RFC makes optional and this release does not add.
+        # Assistant output has no actor_id: ``role`` records model authorship,
+        # while actor_id identifies principals that supplied input. Causal
+        # attribution to the prompting actor is not stored.
         await self.sessions.add_message(
             session_id, "assistant", st.full_response_text,
             channel=channel,
@@ -3394,9 +3392,8 @@ class AgentEngine:
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        # A scheduled run is the instance's own work, whoever wrote the
-        # schedule — the human belongs on the schedule's own mutation, which
-        # 0.7 defers past this gate.
+        # A scheduled run is the instance's own work, regardless of who wrote
+        # the schedule. Human attribution belongs to the schedule mutation.
         actor = await system_actor(self.db)
         session = await self.sessions.create_cron_session(
             job_id, run_id=run_id, actor=actor,

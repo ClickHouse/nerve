@@ -33,9 +33,9 @@ class MessageStore:
         required — keyword-only with no default — so no call site can acquire
         an answer by omission. Pass the person who typed it, the agent's system
         principal for input the instance generated for itself (a cron prompt, a
-        scheduled wakeup), or ``None`` for a row the assistant or a tool
-        authored: their authorship is ``role``, and RFC section 8's optional
-        ``caused_by_actor_id`` is not implemented here. ``channel`` stays
+        scheduled wakeup), or ``None`` for assistant and tool output, whose
+        authorship is already represented by ``role``. Causal attribution to
+        the principal that prompted output is not stored. ``channel`` is
         transport provenance, never identity.
 
         ``created_at`` lets external ingesters preserve original Codex

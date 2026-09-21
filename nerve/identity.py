@@ -12,10 +12,10 @@ on the request, and the data-access layer stores its id. It therefore imports
 neither at runtime — the database handle arrives as an argument and is typed
 only for the checker — so ``nerve.db`` can import this module without a cycle.
 
-Identity vs presentation (RFC 3.3): ``actor_id`` is the identity and is
-permanent. ``display_name`` is a *snapshot* taken when the actor was resolved;
-renaming an account changes what later requests carry and rewrites nothing that
-was stored before. Names are never identity or authorization keys.
+``actor_id`` is permanent identity. ``display_name`` is a presentation snapshot
+taken when the actor was resolved. Renaming an account changes what later
+requests carry and rewrites nothing stored before. Names are never identity or
+authorization keys.
 """
 
 from __future__ import annotations
@@ -110,9 +110,9 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
 async def system_actor(store: "AccountStore") -> Actor:
     """The agent's system principal — the identity autonomous work acts as.
 
-    Scheduled runs, hooks, background agents and the agent's own
-    calls into its API are attributed to this actor rather than to a person
-    (0.6). It has no account and never logs in.
+    Scheduled runs, hooks, background agents and the agent's own calls into its
+    API are attributed to this actor rather than to a person. It has no account
+    and never logs in.
     """
     try:
         row = await store.get_system_principal()

@@ -608,8 +608,9 @@ class SessionManager:
         When run_id is provided, each run gets its own session to prevent
         unbounded message accumulation.
 
-        ``actor`` is the agent's system principal in production: a scheduled
-        run is the instance's own work, whoever wrote the schedule (0.7).
+        ``actor`` is the agent's system principal in production because a
+        scheduled run is the instance's own work, regardless of who wrote the
+        schedule.
         """
         if run_id:
             session_id = f"cron:{job_id}:{run_id}"

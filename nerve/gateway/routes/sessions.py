@@ -507,11 +507,10 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             "from the task-heartbeat registry, then stop."
         )
         try:
-            # The trigger text is Nerve's, not the person's — starring is the
-            # human action, and 0.7 puts the human on that mutation, which is
-            # deferred past this gate. ``internal`` persists no user row
-            # anyway. Inside the guard: an instance that cannot resolve its
-            # own principal must not also fail the star.
+            # Nerve generates this trigger, so it uses the system actor. The
+            # person's star action is separate, and ``internal`` persists no
+            # user message. Failure to resolve the system actor must not make
+            # starring fail.
             hook_actor = await system_actor(deps.db)
             asyncio.create_task(
                 deps.engine.run(

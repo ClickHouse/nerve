@@ -722,9 +722,8 @@ class NotificationService:
         """
         # The text is this service's — an answer relayed into the session, or
         # a redelivery notice. The person who answered is recorded on the
-        # notification itself; putting them on the agent's prompt would be the
-        # wrong claim, and 0.7 defers notification-answer attribution past
-        # this gate anyway.
+        # notification itself. This service generates the prompt, so assigning
+        # the responder as its author would be incorrect.
         if actor is None:
             actor = await system_actor(self.db)
         task = asyncio.create_task(
