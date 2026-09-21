@@ -36,12 +36,11 @@ class SessionStore:
         every call site has to answer the question rather than inherit an
         answer. Pass the request's actor for something a person asked for, the
         agent's system principal (``nerve.identity.system_actor``) for the
-        sessions the instance mints for itself, and ``None`` only where the row
-        is deliberately unattributed. ``source`` stays what it always was:
-        transport provenance, never identity.
+        sessions the instance mints for itself, and ``None`` where attribution
+        is unavailable. ``source`` is transport provenance, never identity.
 
-        Write-once by construction: the insert is ``OR IGNORE``, so
-        re-resolving an existing session never re-stamps its creator.
+        The ``OR IGNORE`` insert makes creator attribution write-once;
+        re-resolving an existing session cannot replace it.
 
         Returns the **stored** row, not the arguments. The distinction only
         shows up when the insert was ignored — a same-id race, or a short-id

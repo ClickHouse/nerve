@@ -994,9 +994,8 @@ def create_app() -> FastAPI:
                     # parallel tabs render the user bubble live (the sender already
                     # showed it optimistically). engine.run persists it, so reloads
                     # get it from history regardless.
-                    # Carries the sender's actor so another tab can label the
-                    # bubble live; the persisted row is the source of truth
-                    # once the page reloads.
+                    # Carry the sender's actor so another tab can label the live
+                    # bubble. After reload, the UI resolves the persisted actor_id.
                     await broadcaster.broadcast(session_id, {
                         "type": "user_message",
                         "session_id": session_id,

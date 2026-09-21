@@ -28,8 +28,8 @@ def actor_out(row: dict) -> dict:
 async def list_actors(actor: Actor = Depends(require_auth)):
     """Every actor this instance knows, for resolving a list of rows at once.
 
-    Small by construction — one row per person plus the system principal — so
-    a client can fetch it once and label a whole session list from it.
+    Returns one row per person plus the system principal, allowing a client to
+    resolve all names in a session list with one request.
     """
     deps = get_deps()
     rows = await deps.db.list_actor_refs()

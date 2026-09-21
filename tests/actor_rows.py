@@ -1,7 +1,7 @@
 """Explicit actor rows for tests that persist synthetic identities.
 
-These helpers are deliberately not autouse: some tests count actor rows, and
-``NULL`` attribution needs no parent row.
+Tests call these helpers explicitly because some count actor rows, and ``NULL``
+attribution needs no parent row.
 """
 
 from __future__ import annotations
