@@ -130,6 +130,10 @@ the newline is flushed.
 }
 ```
 
+An ingestion error stops the origin and appears in `error`. The stored cursor
+remains at the last successful event, so restarting Nerve replays rather than
+skips the failed event.
+
 `null` when the feature is disabled.
 
 ## Convergence with the external MCP server

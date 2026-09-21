@@ -11,6 +11,8 @@ import asyncio
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -22,7 +24,9 @@ from nerve.config import (
     NerveConfig,
 )
 from nerve.sources.codex_threads import build_service
+from nerve.sources.codex_threads.base import ThreadEvent
 from nerve.sources.codex_threads.ingester import codex_session_id
+from nerve.sources.codex_threads.service import CodexThreadSyncService, _OriginWorker
 
 from tests.actor_rows import ensure_system_principal
 
@@ -35,6 +39,48 @@ async def db(db):  # noqa: F811 — the conftest database, with an identity
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codex" / "rollouts" / "in_scope.jsonl"
 TEST_WORKSPACE = Path("/tmp/nerve-test-ws")
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_is_visible_in_diagnostics():
+    event = ThreadEvent(
+        type="user_message", thread_id="thread-1", sequence=7,
+        timestamp=None, payload={"text": "hello"},
+    )
+
+    class Origin:
+        id = "failed"
+
+        async def initialize(self):
+            return None
+
+        async def close(self):
+            return None
+
+        async def stream(self, cursor):
+            yield event
+
+        def cursor(self):
+            return "after-event"
+
+    ingester = SimpleNamespace(
+        ingest=AsyncMock(side_effect=RuntimeError("invalid event")),
+        stats={},
+    )
+    database = SimpleNamespace(
+        get_sync_cursor=AsyncMock(return_value=None),
+        set_sync_cursor=AsyncMock(),
+    )
+    worker = _OriginWorker(Origin(), ingester, database)
+    service = CodexThreadSyncService(database, [worker])
+
+    await service.start()
+    await asyncio.gather(worker.task, return_exceptions=True)
+    status = service.status()["origins"][0]
+
+    assert status["running"] is False
+    assert "RuntimeError('invalid event')" in status["error"]
+    database.set_sync_cursor.assert_not_awaited()
 
 
 @pytest.mark.asyncio

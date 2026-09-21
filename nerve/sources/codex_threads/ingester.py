@@ -171,7 +171,6 @@ class CodexIngester:
             return
 
         self.mark_in_scope(event.thread_id)
-        self.stats["threads_in_scope"] += 1
 
         session_id = await self._session_id_for(event.thread_id)
         existing = await self.db.get_session(session_id)
@@ -179,6 +178,8 @@ class CodexIngester:
             # Already created — MCP server may have got there first.
             # Make sure the metadata reflects this origin.
             await self._merge_origin_metadata(session_id, existing, payload)
+            await self.db.bind_native_thread("codex", event.thread_id, session_id)
+            self.stats["threads_in_scope"] += 1
             return
 
         meta = SessionMeta.from_payload(payload, event.timestamp)
@@ -206,7 +207,8 @@ class CodexIngester:
             # mirrors was started outside Nerve entirely.
             actor=await system_actor(self.db),
         )
-        await self.db.bind_native_thread("codex", meta.thread_id, session_id)
+        await self.db.bind_native_thread("codex", event.thread_id, session_id)
+        self.stats["threads_in_scope"] += 1
         logger.info(
             "Codex thread %s: synced (cwd=%s, origin=%s) → %s",
             meta.thread_id[:8], meta.cwd, self.origin_id, session_id,

@@ -43,8 +43,8 @@ class _OriginWorker:
     """Checkpoint only events that the ingester accepted.
 
     The origin advances before yielding, so its live cursor can include a
-    failed event. The worker retains the last successful cursor instead;
-    idempotent ingestion makes replay safe.
+    failed event. A failure stops this worker without advancing the checkpoint;
+    restarting the service replays the event.
     """
 
     def __init__(
@@ -59,7 +59,6 @@ class _OriginWorker:
         self.task: asyncio.Task | None = None
         self.cursor_key = f"codex:{origin.id}"
         self._checkpoint: str | None = None
-        self._stalled = False
 
     async def run(self) -> None:
         try:
@@ -73,11 +72,10 @@ class _OriginWorker:
             logger.exception(
                 "Codex origin %s failed to initialise", self.origin.id,
             )
-            return
+            raise
 
         cursor = await self.db.get_sync_cursor(self.cursor_key)
         self._checkpoint = cursor
-        self._stalled = False
         try:
             async for event in self.origin.stream(cursor):
                 await self._handle(event)
@@ -85,7 +83,8 @@ class _OriginWorker:
             logger.info("Codex origin %s cancelled", self.origin.id)
             raise
         except Exception:
-            logger.exception("Codex origin %s crashed", self.origin.id)
+            logger.exception("Codex origin %s stopped", self.origin.id)
+            raise
         finally:
             await self._save_cursor()
             try:
@@ -94,25 +93,12 @@ class _OriginWorker:
                 logger.exception("Codex origin %s close() failed", self.origin.id)
 
     async def _handle(self, event: ThreadEvent) -> None:
-        try:
-            await self.ingester.ingest(event)
-        except Exception:
-            logger.exception(
-                "Codex ingest failed (origin=%s thread=%s seq=%d type=%s) — "
-                "the cursor stays where it was, so a restart replays it",
-                self.origin.id, event.thread_id, event.sequence, event.type,
-            )
-            self._stalled = True
-            return
-        # Checkpoint after every event that landed — cheap (one row update),
-        # and now it means what it says.
+        await self.ingester.ingest(event)
         self._advance_checkpoint()
         await self._save_cursor()
 
     def _advance_checkpoint(self) -> None:
-        """Take the origin's cursor as the new checkpoint, unless stalled."""
-        if self._stalled:
-            return
+        """Take the origin's cursor as the new successful checkpoint."""
         try:
             self._checkpoint = self.origin.cursor()
         except Exception:
