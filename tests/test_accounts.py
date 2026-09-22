@@ -152,10 +152,6 @@ async def test_account_schema_guards_identity_and_login_state(db: Database):
     human = await _insert_human(db)
     with pytest.raises(sqlite3.IntegrityError):
         await db._write(
-            "INSERT INTO actor_refs VALUES ('robot', 'robot', NULL, 't')"
-        )
-    with pytest.raises(sqlite3.IntegrityError):
-        await db._write(
             """INSERT INTO accounts
                    (id, actor_id, credential_source, credential, enabled, created_at)
                VALUES ('bad-source', ?, 'ldap', NULL, 1, 't')""",

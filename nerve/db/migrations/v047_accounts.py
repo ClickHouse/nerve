@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 SQL = """
 CREATE TABLE IF NOT EXISTS actor_refs (
     id           TEXT PRIMARY KEY NOT NULL,
-    kind         TEXT NOT NULL CHECK (kind IN ('human', 'system')),
+    -- 'human' or 'system'. There is no CHECK constraint, so a new kind does
+    -- not need a rebuild of this table and of the tables that reference it.
+    kind         TEXT NOT NULL,
     display_name TEXT,
     created_at   TEXT NOT NULL
 );
