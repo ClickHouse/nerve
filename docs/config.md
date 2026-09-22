@@ -932,9 +932,9 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.153.1 and < 0.154.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.156.0
   min_version: 0.153.1
-  max_version: 0.154.0
+  max_version: 0.156.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
