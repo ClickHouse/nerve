@@ -88,6 +88,21 @@ Verify current authentication.
 Response: { "authenticated": true }
 ```
 
+#### `GET /api/auth/me`
+Return the actor this credential acts as, and its local account.
+
+```json
+Response: {
+  "actor": { "id": "…", "kind": "human", "display_name": "Alice" },
+  "account": { "id": "…", "actor_id": "…", "username": "alice", "…": "…" }
+}
+```
+
+`actor` has the shape of one `GET /api/actors` row. `account` has the shape of
+`GET /api/accounts/me`, or is `null` when the credential has no account, such as
+the system principal's. The web UI compares message and session authors with
+`actor.id`.
+
 ### Accounts
 
 Every signed-in account can manage accounts. System credentials cannot. Account

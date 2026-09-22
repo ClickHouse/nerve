@@ -107,7 +107,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
-  const viewerActorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const creatorIds = useMemo(() => [
     ...sessions.map(s => s.created_by_actor_id),
     ...(searchResults ?? []).map(s => s.created_by_actor_id),

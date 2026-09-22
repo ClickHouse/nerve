@@ -8,7 +8,7 @@ vi.mock('../../api/client', async () => {
   );
   return {
     ...actual,
-    api: { authStatus: vi.fn(), login: vi.fn(), getOwnAccount: vi.fn() },
+    api: { authStatus: vi.fn(), login: vi.fn(), getViewer: vi.fn() },
     setToken: vi.fn(),
     clearToken: vi.fn(),
     getToken: vi.fn(() => null),
@@ -51,13 +51,16 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'password',
-    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
+    account: { id: 'acc-1', username: 'alice' },
     login,
     refreshStatus,
   });
-  (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't',
+  (api.getViewer as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: {
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
+      enabled: true, has_password: true, created_at: 't',
+    },
   });
 });
 
@@ -105,7 +108,7 @@ describe('SessionExpiredOverlay', () => {
     // account id before it lets the login unlock this person's mounted app.
     useAuthStore.setState({
       loginMode: 'username_password',
-      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
+      account: { id: 'acc-1', username: 'alice' },
     });
     render(<SessionExpiredOverlay />);
 
@@ -126,7 +129,7 @@ describe('SessionExpiredOverlay', () => {
     // resolves the sole account without depending on that mutable key.
     useAuthStore.setState({
       loginMode: 'password',
-      account: { id: 'acc-1', username: 'old-alice', actor_id: 'actor-1' },
+      account: { id: 'acc-1', username: 'old-alice' },
     });
     render(<SessionExpiredOverlay />);
     expect(screen.getByLabelText('Signed in as')).toHaveValue('old-alice');
@@ -150,7 +153,7 @@ describe('SessionExpiredOverlay', () => {
 
   it('routes a deliberate account switch through log out', async () => {
     useAuthStore.setState({
-      account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' }, logout,
+      account: { id: 'acc-1', username: 'alice' }, logout,
     });
     render(<SessionExpiredOverlay />);
     await userEvent.click(

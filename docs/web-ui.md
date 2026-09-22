@@ -144,7 +144,8 @@ out", which is what discards all of that first.
 
 Messages and sessions store stable actor ids, never names. The UI resolves their
 current names from `GET /api/actors`: Nerve is always labelled, while a human is
-labelled only when their actor id differs from the signed-in viewer. Thus Alice
+labelled only when their actor id differs from the signed-in viewer. The viewer
+is the `actor` from `GET /api/auth/me`, not the account. Thus Alice
 does not see repeated labels on her own history, but Bob sees Alice throughout
 an Alice-only transcript and sidebar. The same rule applies to the open-session
 header; on phones it keeps the name visible and hides only the "Started by"

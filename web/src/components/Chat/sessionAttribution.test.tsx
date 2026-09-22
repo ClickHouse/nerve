@@ -69,7 +69,10 @@ function chat(id: string, created_by_actor_id: string | null): Session {
 }
 
 function viewAs(actorId: string): void {
-  useAuthStore.setState({ account: { id: `account-${actorId}`, username: null, actor_id: actorId } });
+  useAuthStore.setState({
+    viewer: actorRef(actorId),
+    account: { id: `account-${actorId}`, username: null },
+  });
 }
 
 function renderSidebar(sessions: Session[]) {

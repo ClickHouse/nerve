@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
-  type Account, type LoginKind,
+  type Account, type ActorRef, type LoginKind, type Viewer,
 } from '../api/client';
 import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
@@ -11,8 +11,12 @@ import { clearAllReads } from './helpers/readStorage';
 export interface SignedInAccount {
   id: string;
   username: string | null;
-  /** Stable author identity; account id and display names may change. */
-  actor_id: string;
+}
+
+/** What `/api/auth/me` says about this session. */
+export interface Identity {
+  viewer: ActorRef;
+  account: SignedInAccount | null;
 }
 
 /**
@@ -70,10 +74,18 @@ interface AuthState {
    */
   loginMode: LoginKind | null;
   /**
-   * The account this session belongs to, once it is known.
+   * The actor this session acts as, once it is known.
    *
-   * Read at startup and after every sign-in, from `/api/accounts/me`. It is
-   * what binds re-authentication to the person whose app is on screen: the
+   * Read at startup and after every sign-in, from `/api/auth/me`. Attribution
+   * compares message and session authors with this id. It does not depend on
+   * the session having a local account. `null` means unknown.
+   */
+  viewer: ActorRef | null;
+  /**
+   * The local account this session belongs to, once it is known.
+   *
+   * Read with `viewer`, from `/api/auth/me`. It is what binds
+   * re-authentication to the person whose app is on screen: the
    * session-expired overlay sits on top of a *mounted* application holding that
    * person's drafts and loaded state, so it may only be unlocked by them.
    * `null` means unknown — the overlay then offers nothing but a sign-out.
@@ -132,18 +144,25 @@ export function bindAuthSession(): { stillCurrent: () => boolean } {
 /** Bind delayed optimistic work to the actor and auth session that requested it. */
 export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
   const authSession = bindAuthSession();
-  const actorId = useAuthStore.getState().account?.actor_id ?? null;
+  const actorId = useAuthStore.getState().viewer?.id ?? null;
   return { actorId, stillCurrent: authSession.stillCurrent };
 }
 
-function identityOf(account: Account): SignedInAccount {
-  return { id: account.id, username: account.username, actor_id: account.actor_id };
+function accountOf(account: Account): SignedInAccount {
+  return { id: account.id, username: account.username };
 }
 
-/** The signed-in account, or `null` if it cannot be read right now. */
-async function loadIdentity(): Promise<SignedInAccount | null> {
+export function identityOf(viewer: Viewer): Identity {
+  return {
+    viewer: viewer.actor,
+    account: viewer.account ? accountOf(viewer.account) : null,
+  };
+}
+
+/** This session's identity, or `null` if it cannot be read right now. */
+async function loadIdentity(): Promise<Identity | null> {
   try {
-    return identityOf(await api.getOwnAccount());
+    return identityOf(await api.getViewer());
   } catch {
     return null;
   }
@@ -156,6 +175,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   error: null,
   sessionExpired: false,
   loginMode: null,
+  viewer: null,
   account: null,
 
   login: async (password: string, username?: string) => {
@@ -203,7 +223,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         });
         return;
       }
-      if (!previous || identity.id !== previous.id) {
+      if (!previous || identity.account?.id !== previous.id) {
         // A different person, in front of somebody else's mounted application.
         // Nothing of the previous account may survive, so this is a sign-out
         // rather than a sign-in.
@@ -212,7 +232,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         sessionEstablished = false;
         set({
           authenticated: false, loading: false, sessionExpired: false,
-          account: null,
+          viewer: null, account: null,
           error: 'That is a different account. Sign in again to use it.',
         });
         return;
@@ -222,7 +242,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     sessionEstablished = true;
     set({
       authenticated: true, loading: false, sessionExpired: false,
-      account: identity,
+      viewer: identity?.viewer ?? null,
+      account: identity?.account ?? null,
     });
   },
 
@@ -236,7 +257,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
     set({
       authenticated: false, loading: false, sessionExpired: false,
-      error: null, account: null,
+      error: null, viewer: null, account: null,
     });
     void get().refreshStatus();
   },
@@ -256,12 +277,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const generation = ++statusGeneration;
     // Both at once. Nothing renders until both have answered — that is what
     // `ready` means — so asking in sequence would double the blank screen.
-    // `/api/accounts/me` *is* the session check: it needs a valid token and it
-    // says which account the token belongs to, which is one request rather than
-    // two for strictly more than `/api/auth/check` answered.
+    // `/api/auth/me` *is* the session check: it needs a valid token and it
+    // says which actor and account the token belongs to, which is one request
+    // rather than two for strictly more than `/api/auth/check` answered.
     const [statusOutcome, identityOutcome] = await Promise.allSettled([
       api.authStatus(),
-      token ? api.getOwnAccount() : Promise.resolve(null),
+      token ? api.getViewer() : Promise.resolve(null),
     ]);
 
     const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
@@ -273,7 +294,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       sessionEstablished = true;
       set({
         authenticated: true, ready: true,
-        account: identityOf(identityOutcome.value),
+        ...identityOf(identityOutcome.value),
       });
       return;
     }
@@ -285,7 +306,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // login form it did not need and could not use.
     const hadToken = !!token;
     if (hadToken) clearToken();
-    set({ account: null });
+    set({ viewer: null, account: null });
 
     // Auto-login only when the server reports a passwordless install. That
     // state requires exactly one account; a multi-account install requires an
@@ -303,7 +324,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         sessionEstablished = true;
         set({
           authenticated: true, ready: true, sessionExpired: false,
-          account: identity,
+          viewer: identity?.viewer ?? null,
+          account: identity?.account ?? null,
         });
         return;
       } catch {
@@ -360,7 +382,7 @@ setUnauthorizedHandler(() => {
   void useAuthStore.getState().refreshStatus();
 });
 
-/** Stable actor for optimistic rows; null for callers without an account row. */
+/** Stable actor for optimistic rows; null until the viewer is known. */
 export function selfActorId(): string | null {
-  return useAuthStore.getState().account?.actor_id ?? null;
+  return useAuthStore.getState().viewer?.id ?? null;
 }

@@ -29,7 +29,7 @@ const tokenStore = vi.hoisted(() => ({
 vi.mock('../../api/client', () => ({
   api: {
     listActors: vi.fn(),
-    getOwnAccount: vi.fn(),
+    getViewer: vi.fn(),
     createSession: vi.fn(),
     runLater: vi.fn(),
     authStatus: vi.fn(async () => ({
@@ -104,7 +104,10 @@ function labels(): string[] {
 }
 
 function signInAs(actorId: string): void {
-  useAuthStore.setState({ account: { id: `account-${actorId}`, username: null, actor_id: actorId } });
+  useAuthStore.setState({
+    viewer: actorRef(actorId),
+    account: { id: `account-${actorId}`, username: null },
+  });
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -113,10 +116,13 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve: release };
 }
 
-function accountFor(actorId: string, id = 'acc') {
+function viewerFor(actorId: string, id = 'acc') {
   return {
-    id, actor_id: actorId, username: 'somebody', display_name: null,
-    enabled: true, has_password: true, created_at: 't',
+    actor: actorRef(actorId),
+    account: {
+      id, actor_id: actorId, username: 'somebody', display_name: null,
+      enabled: true, has_password: true, created_at: 't',
+    },
   };
 }
 
@@ -124,15 +130,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   useActorStore.getState().reset();
   useAuthStore.setState({
-    account: null, authenticated: false, ready: true, loading: false,
+    viewer: null, account: null, authenticated: false, ready: true, loading: false,
     sessionExpired: false, error: null,
   });
   tokenStore.value = 'tok';
   tokenStore.revision = 0;
   useChatStore.setState({ messages: [], activeSession: '', virtualSession: null });
   listActors.mockResolvedValue({ actors: [alice(), bob(), system()] });
-  (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>)
-    .mockRejectedValue(new Error('403: no account'));
+  (api.getViewer as unknown as ReturnType<typeof vi.fn>)
+    .mockRejectedValue(new Error('401: no session'));
 });
 
 describe('viewer-relative transcript labels', () => {
@@ -241,13 +247,13 @@ describe('authentication generations', () => {
   });
 
   it('does not let a stale login clear a newer byte-identical token', async () => {
-    const slowAlice = deferred<ReturnType<typeof accountFor>>();
+    const slowAlice = deferred<ReturnType<typeof viewerFor>>();
     (api.login as unknown as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({ token: 'same-token' })
       .mockResolvedValueOnce({ token: 'same-token' });
-    (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>)
+    (api.getViewer as unknown as ReturnType<typeof vi.fn>)
       .mockReturnValueOnce(slowAlice.promise)
-      .mockResolvedValueOnce(accountFor(BOB, 'acc-bob'));
+      .mockResolvedValueOnce(viewerFor(BOB, 'acc-bob'));
 
     let aliceLogin!: Promise<void>;
     act(() => { aliceLogin = useAuthStore.getState().login('pw', 'alice'); });
@@ -257,7 +263,7 @@ describe('authentication generations', () => {
     clearToken.mockClear();
 
     await act(async () => {
-      slowAlice.resolve(accountFor(ALICE, 'acc-alice'));
+      slowAlice.resolve(viewerFor(ALICE, 'acc-alice'));
       await aliceLogin;
     });
 

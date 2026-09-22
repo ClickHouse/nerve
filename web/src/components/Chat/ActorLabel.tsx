@@ -57,7 +57,7 @@ export function ActorLabel({ actorId }: { actorId: string | null | undefined }) 
 }
 
 export function SessionCreator({ actorId }: { actorId: string | null | undefined }) {
-  const viewerActorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const visibleActorId = actorId === viewerActorId ? null : actorId;
   const attribution = useAttribution(visibleActorId);
   if (!visibleActorId) return null;

@@ -14,7 +14,7 @@ vi.mock('../../api/client', () => ({
     getModels: vi.fn(async () => ({ models: [], default: null })),
     rewritePrompt: vi.fn(),
     uploadFiles: vi.fn(),
-    getOwnAccount: vi.fn(async () => { throw new Error("403"); }),
+    getViewer: vi.fn(async () => { throw new Error("401"); }),
   },
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
   getToken: vi.fn(),

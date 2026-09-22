@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api, type Account } from '../api/client';
 import { useActorStore } from './actorStore';
-import { bindAuthSession, useAuthStore } from './authStore';
+import { bindAuthSession, identityOf, useAuthStore } from './authStore';
 
 /**
  * The server's message, out of the error the API layer throws.
@@ -76,7 +76,7 @@ async function resync(
   const identity = useAuthStore.getState().account;
   const [listOutcome, identityOutcome] = await Promise.allSettled([
     api.listAccounts(),
-    identity ? Promise.resolve(identity) : api.getOwnAccount(),
+    identity ? Promise.resolve(null) : api.getViewer(),
     // These retain their last known values on failure.
     useAuthStore.getState().refreshStatus(),
     useActorStore.getState().refresh(),
@@ -90,13 +90,7 @@ async function resync(
     && !auth.account
     && authSession.stillCurrent()
   ) {
-    useAuthStore.setState({
-      account: {
-        id: identityOutcome.value.id,
-        username: identityOutcome.value.username,
-        actor_id: identityOutcome.value.actor_id,
-      },
-    });
+    useAuthStore.setState(identityOf(identityOutcome.value));
   }
   if (listOutcome.status === 'rejected') {
     set({ loading: false });

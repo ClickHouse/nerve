@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Account } from '../api/client';
+import type { Account, Viewer } from '../api/client';
 
 vi.mock('../api/client', () => ({
   api: {
@@ -11,7 +11,7 @@ vi.mock('../api/client', () => ({
     updateAccount: vi.fn(),
     setAccountEnabled: vi.fn(),
     changeOwnPassword: vi.fn(),
-    getOwnAccount: vi.fn(),
+    getViewer: vi.fn(),
     authStatus: vi.fn().mockResolvedValue({
       auth_required: true, login: 'password',
     }),
@@ -47,6 +47,13 @@ function account(overrides: Partial<Account> = {}): Account {
   };
 }
 
+function viewer(overrides: Partial<Account> = {}): Viewer {
+  return {
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: account(overrides),
+  };
+}
+
 function renderPage() {
   return render(<MemoryRouter><AccountsPage /></MemoryRouter>);
 }
@@ -57,7 +64,7 @@ beforeEach(() => {
   api.createAccount.mockReset();
   api.setAccountEnabled.mockReset();
   api.changeOwnPassword.mockReset();
-  api.getOwnAccount.mockReset();
+  api.getViewer.mockReset();
   api.updateAccount.mockReset();
   api.authStatus.mockResolvedValue({
     auth_required: true, login: 'password',
@@ -66,7 +73,8 @@ beforeEach(() => {
   useAuthStore.setState({
     authenticated: true,
     loginMode: null,
-    account: { id: 'acc-1', username: 'alice', actor_id: 'actor-1' },
+    viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: { id: 'acc-1', username: 'alice' },
   });
 });
 
@@ -105,11 +113,11 @@ describe('the list', () => {
   });
 
   it('repairs the signed-in identity after its startup read failed', async () => {
-    useAuthStore.setState({ authenticated: true, account: null });
+    useAuthStore.setState({ authenticated: true, viewer: null, account: null });
     api.listAccounts.mockResolvedValue({ accounts: [account()] });
-    api.getOwnAccount
+    api.getViewer
       .mockRejectedValueOnce(new Error('network'))
-      .mockResolvedValue(account());
+      .mockResolvedValue(viewer());
     renderPage();
 
     expect(await screen.findByRole('alert')).toHaveTextContent('network');
@@ -119,24 +127,24 @@ describe('the list', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('you')).toBeInTheDocument();
     expect(screen.getByRole('form', { name: 'Your password' })).toBeInTheDocument();
-    expect(useAuthStore.getState().account).toEqual({
-      id: 'acc-1', username: 'alice', actor_id: 'actor-1',
-    });
+    expect(useAuthStore.getState().account).toEqual({ id: 'acc-1', username: 'alice' });
+    expect(useAuthStore.getState().viewer?.id).toBe('actor-1');
   });
 
   it('does not restore identity after that auth session was replaced', async () => {
-    useAuthStore.setState({ authenticated: true, account: null });
+    useAuthStore.setState({ authenticated: true, viewer: null, account: null });
     api.listAccounts.mockResolvedValue({ accounts: [account()] });
-    let finishIdentity!: (value: Account) => void;
-    api.getOwnAccount.mockReturnValue(new Promise<Account>((resolve) => {
+    let finishIdentity!: (value: Viewer) => void;
+    api.getViewer.mockReturnValue(new Promise<Viewer>((resolve) => {
       finishIdentity = resolve;
     }));
 
     const loading = useAccountStore.getState().load();
     useAuthStore.getState().logout();
-    finishIdentity(account());
+    finishIdentity(viewer());
     await loading;
 
+    expect(useAuthStore.getState().viewer).toBeNull();
     expect(useAuthStore.getState().account).toBeNull();
   });
 

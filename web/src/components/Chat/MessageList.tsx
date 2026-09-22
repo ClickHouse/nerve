@@ -30,7 +30,7 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
 
-  const viewerActorId = useAuthStore((s) => s.account?.actor_id ?? null);
+  const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const namedSenders = useVisibleActorIds(
     messages.map(m => m.actor_id), viewerActorId,
   );

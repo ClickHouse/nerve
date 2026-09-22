@@ -27,7 +27,7 @@ vi.mock('../api/client', () => ({
     listSessions: vi.fn(),
     listArchivedSessions: vi.fn(),
     listSystemSessions: vi.fn(),
-    getOwnAccount: vi.fn(async () => { throw new Error("403"); }),
+    getViewer: vi.fn(async () => { throw new Error("401"); }),
   },
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
   getToken: vi.fn(),

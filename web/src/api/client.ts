@@ -44,6 +44,13 @@ export interface ActorRef {
   display_name: string | null;
 }
 
+/** `GET /api/auth/me`: the actor this session acts as, and its local account.
+ *  `account` is `null` for a credential without an account. */
+export interface Viewer {
+  actor: ActorRef;
+  account: Account | null;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -390,17 +397,16 @@ export const api = {
 
   authStatus: () => request<AuthStatus>('/auth/status'),
 
+  /**
+   * Who this session acts as. Doubles as the authentication check at startup:
+   * it needs a valid session *and* answers which actor and account the session
+   * belongs to. Attribution compares authors with the actor; re-authentication
+   * is bound to the account.
+   */
+  getViewer: () => request<Viewer>('/auth/me'),
+
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
-
-  /**
-   * The signed-in account. Doubles as the authentication check at startup: it
-   * needs a valid session *and* answers which account the session belongs to,
-   * which is what binds a re-authentication to the person whose app is on
-   * screen. `403` for the instance's own system credential, which has no
-   * account — a browser never holds one.
-   */
-  getOwnAccount: () => request<Account>('/accounts/me'),
 
   createAccount: (body: { username: string; password: string; display_name?: string }) =>
     request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),

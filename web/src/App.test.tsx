@@ -17,7 +17,7 @@ vi.mock('./api/client', async () => {
   const actual = await vi.importActual<typeof import('./api/client')>('./api/client');
   return {
     ...actual,
-    api: { authStatus: vi.fn(), getOwnAccount: vi.fn(), login: vi.fn() },
+    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn() },
     setToken: vi.fn(),
     clearToken: vi.fn(),
     getToken: vi.fn(() => null),
@@ -59,14 +59,17 @@ import App from './App';
 import { useAuthStore } from './stores/authStore';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
-const getOwnAccount = api.getOwnAccount as unknown as ReturnType<typeof vi.fn>;
+const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
 const tokenInStorage = getToken as unknown as ReturnType<typeof vi.fn>;
 
 function me() {
   return {
-    id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't',
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: {
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
+      enabled: true, has_password: true, created_at: 't',
+    },
   };
 }
 
@@ -85,7 +88,7 @@ function renderApp() {
 beforeEach(() => {
   vi.clearAllMocks();
   tokenInStorage.mockReturnValue(null);
-  getOwnAccount.mockResolvedValue(me());
+  getViewer.mockResolvedValue(me());
   useAuthStore.setState({
     authenticated: false,
     loading: false,
@@ -93,6 +96,7 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: null,
+    viewer: null,
     account: null,
   });
 });
@@ -100,7 +104,7 @@ beforeEach(() => {
 describe('startup with a token already in storage', () => {
   beforeEach(() => {
     tokenInStorage.mockReturnValue('a-stored-token');
-    getOwnAccount.mockResolvedValue(me());
+    getViewer.mockResolvedValue(me());
   });
 
   it('lands on the accounts page when the instance has no password', async () => {
@@ -166,7 +170,7 @@ describe('startup with a token already in storage', () => {
     // the expiry overlay. A reused module carries the previous test's answer.
     vi.resetModules();
     authStatus.mockResolvedValue(status());
-    getOwnAccount.mockRejectedValue(new Error('401'));
+    getViewer.mockRejectedValue(new Error('401'));
     const { default: FreshApp } = await import('./App');
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
@@ -182,7 +186,7 @@ describe('startup with a token already in storage', () => {
     authStatus.mockResolvedValue(
       status({ login: 'none', auth_required: false }),
     );
-    getOwnAccount.mockRejectedValueOnce(new Error('401'));
+    getViewer.mockRejectedValueOnce(new Error('401'));
     apiLogin.mockResolvedValue({ token: 'a-fresh-token' });
 
     renderApp();
