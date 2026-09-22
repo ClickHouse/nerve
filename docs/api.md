@@ -71,6 +71,21 @@ Verify current authentication.
 Response: { "authenticated": true }
 ```
 
+#### `GET /api/auth/me`
+Return the actor this credential acts as, and its local account.
+
+```json
+Response: {
+  "actor": { "id": "…", "kind": "human", "display_name": "Alice" },
+  "account": { "id": "…", "actor_id": "…", "username": "alice", "…": "…" }
+}
+```
+
+`actor` has the shape of one `GET /api/actors` row. `account` has the shape of
+`GET /api/accounts/me`, or is `null` when the credential has no account, such as
+the system principal's. The web UI compares message and session authors with
+`actor.id`.
+
 ### Accounts
 
 Every signed-in account can manage accounts. System credentials cannot. Account
@@ -142,8 +157,8 @@ Request: { "passwordless": true, "setup_token": "…" }
 
 Send exactly one of `password` and `"passwordless": true`. `display_name` is
 optional. The response token is the client session minted after the claim;
-account identity is read through the canonical `GET /api/accounts/me` endpoint
-and names through the actor directory.
+the actor and account are read through `GET /api/auth/me`, and names through
+the actor directory.
 
 The setup token is read locally with `nerve status`, sent only in the JSON
 body, and invalidated after success. It never appears in a URL, response,
@@ -184,21 +199,6 @@ This is an identity, not an account: nothing from `accounts` appears here (no
 username, no `enabled`, no `has_password`), and an actor need not have an
 account at all — the system principal does not. A disabled person's actor is
 still readable, because their history stays in the UI after their access ends.
-
-#### `GET /api/auth/me`
-Return the actor this credential acts as, and its local account.
-
-```json
-Response: {
-  "actor": { "id": "…", "kind": "human", "display_name": "Alice" },
-  "account": { "id": "…", "actor_id": "…", "username": "alice", "…": "…" }
-}
-```
-
-`actor` has the shape of one `GET /api/actors` row. `account` has the shape of
-`GET /api/accounts/me`, or is `null` when the credential has no account, such as
-the system principal's. The web UI compares message and session authors with
-`actor.id`.
 
 ### Accounts
 

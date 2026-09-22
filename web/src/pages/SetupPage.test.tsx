@@ -9,7 +9,7 @@ vi.mock('../api/client', async () => {
     ...actual,
     api: {
       authStatus: vi.fn(),
-      getOwnAccount: vi.fn(),
+      getViewer: vi.fn(),
       login: vi.fn(),
       setupClaim: vi.fn(),
       listActors: vi.fn(),
@@ -27,21 +27,24 @@ const { SetupPage } = await import('./SetupPage');
 
 const setupClaim = api.setupClaim as unknown as ReturnType<typeof vi.fn>;
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
-const getOwnAccount = api.getOwnAccount as unknown as ReturnType<typeof vi.fn>;
+const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
 const listActors = api.listActors as unknown as ReturnType<typeof vi.fn>;
 
 const CLAIMED = {
   auth_required: true,
   login: 'password',
 };
-const ACCOUNT = {
-  id: 'account-1',
-  actor_id: 'actor-1',
-  username: 'alice',
-  display_name: 'Alice',
-  enabled: true,
-  has_password: true,
-  created_at: 't',
+const VIEWER = {
+  actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+  account: {
+    id: 'account-1',
+    actor_id: 'actor-1',
+    username: 'alice',
+    display_name: 'Alice',
+    enabled: true,
+    has_password: true,
+    created_at: 't',
+  },
 };
 
 function renderPage() {
@@ -67,11 +70,12 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: 'setup',
+    viewer: null,
     account: null,
   });
   setupClaim.mockResolvedValue({ token: 'client-session-token' });
   authStatus.mockResolvedValue(CLAIMED);
-  getOwnAccount.mockResolvedValue(ACCOUNT);
+  getViewer.mockResolvedValue(VIEWER);
   listActors.mockResolvedValue({ actors: [{
     id: 'actor-1',
     kind: 'human',
@@ -108,12 +112,13 @@ describe('first-account claim', () => {
         display_name: 'Alice',
       });
       expect(authStatus).toHaveBeenCalled();
-      expect(getOwnAccount).toHaveBeenCalled();
+      expect(getViewer).toHaveBeenCalled();
       expect(listActors).toHaveBeenCalled();
       expect(localStorage.getItem('nerve_token')).toBe('client-session-token');
       expect(localStorage.getItem('setup_token')).toBeNull();
       expect(JSON.stringify(localStorage)).not.toContain('host-only-token');
       expect(useAuthStore.getState().account?.id).toBe('account-1');
+      expect(useAuthStore.getState().viewer?.id).toBe('actor-1');
     });
 
   it('omits a blank optional display name', async () => {

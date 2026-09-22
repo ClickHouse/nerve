@@ -253,7 +253,7 @@ attribution keeps its identity. Exactly one concurrent claimant can win. It
 also advances the account's session epoch: pre-claim HTTP sessions become
 unauthorized, open WebSockets are rechecked and closed, and the successful
 response carries the one new client session token. The browser refreshes
-`/api/auth/status`, `/api/accounts/me`, and the actor directory before
+`/api/auth/status`, `/api/auth/me`, and the actor directory before
 routing to chat.
 
 Browser setup ends there. Provider credentials, profile configuration,
