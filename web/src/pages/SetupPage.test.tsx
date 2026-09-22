@@ -66,7 +66,7 @@ beforeEach(() => {
     ready: true,
     error: null,
     sessionExpired: false,
-    loginMode: 'none',
+    loginMode: 'setup',
     account: null,
   });
   setupClaim.mockResolvedValue({ token: 'client-session-token' });
@@ -145,9 +145,32 @@ describe('first-account claim', () => {
     expect(JSON.stringify(localStorage)).not.toContain('wrong-token');
   });
 
-  it('routes a claimed instance to accounts', async () => {
-    useAuthStore.setState({ loginMode: 'password' });
+  it('keeps the installation passwordless only by explicit choice', async () => {
     renderPage();
-    expect(await screen.findByText('accounts destination')).toBeInTheDocument();
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText('Keep this installation passwordless'));
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Username')).not.toBeRequired();
+    expect(screen.getByRole('note')).toHaveTextContent(/anyone who can reach/);
+
+    await userEvent.type(screen.getByLabelText('Setup token'), 'host-only-token');
+    await userEvent.click(screen.getByRole('button', { name: 'Claim and sign in' }));
+
+    expect(await screen.findByText('chat destination')).toBeInTheDocument();
+    expect(setupClaim.mock.calls[0][0]).toEqual({
+      username: undefined,
+      passwordless: true,
+      setup_token: 'host-only-token',
+      display_name: undefined,
+    });
+    expect(JSON.stringify(localStorage)).not.toContain('host-only-token');
   });
+
+  it.each(['password', 'none'] as const)(
+    'routes an instance with complete setup (%s) to chat', async (loginMode) => {
+      useAuthStore.setState({ loginMode });
+      renderPage();
+      expect(await screen.findByText('chat destination')).toBeInTheDocument();
+    });
 });

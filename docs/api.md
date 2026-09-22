@@ -25,6 +25,7 @@ Treat the returned token as opaque.
 |---|---|
 | Invalid credentials or missing required username | `401` `Invalid username or password` |
 | Valid credentials for a disabled account | `401` |
+| Setup is not complete (`login` is `setup`) | `409` |
 | Authentication is not ready | `503` |
 
 #### Authenticated requests
@@ -53,8 +54,12 @@ Response: {
 
 | Field | Meaning |
 |---|---|
-| `login` | `none`, `password`, or `username_password` |
+| `login` | `setup`, `none`, `password`, or `username_password` |
 | `auth_required` | Compatibility field; equivalent to `login != "none"` |
+
+`setup` means setup is not complete: login is refused and only
+`POST /api/setup/claim` is permitted. `none` means the operator chose a
+passwordless installation.
 
 The response does not expose usernames or the account count. Before
 authentication is ready, it returns the fail-closed `username_password` state.
@@ -114,9 +119,9 @@ closes an open connection instead of changing its actor.
 
 #### `POST /api/setup/claim`
 
-Name and secure the one account on an unclaimed install. This is the only
-unauthenticated account write; every request must include the persisted setup
-token.
+Complete setup of the one account on an install whose `login` status is
+`setup`. This is the only unauthenticated account write; every request must
+include the persisted setup token.
 
 ```json
 Request: {
@@ -128,25 +133,34 @@ Request: {
 Response: { "token": "eyJ…" }
 ```
 
-`display_name` is optional. The response token is the client session minted
-after the claim; account identity is read through the canonical
-`GET /api/accounts/me` endpoint and names through the actor directory.
+To keep the installation passwordless, send `"passwordless": true` and no
+`password`. `username` is then optional:
+
+```json
+Request: { "passwordless": true, "setup_token": "…" }
+```
+
+Send exactly one of `password` and `"passwordless": true`. `display_name` is
+optional. The response token is the client session minted after the claim;
+account identity is read through the canonical `GET /api/accounts/me` endpoint
+and names through the actor directory.
 
 The setup token is read locally with `nerve status`, sent only in the JSON
 body, and invalidated after success. It never appears in a URL, response,
 server log, or browser storage. Use HTTPS or a protected tunnel when claiming
 remotely.
 
-The claim and session-epoch bump are one database transaction. Of concurrent
-claimants exactly one can win. Every session minted while the instance was
-passwordless becomes stale; open WebSockets are rechecked and closed.
+The claim, the setup completion record and the session-epoch bump are one
+database transaction. Of concurrent claimants exactly one can win. Every
+session minted before the claim becomes stale; open WebSockets are rechecked and
+closed.
 
 | Response | When |
 |---|---|
-| `400` | the username is malformed/reserved, or the password exceeds bcrypt's 72-byte limit |
+| `400` | both or neither of `password` and `"passwordless": true`; a password claim without a username; the username is malformed/reserved; or the password exceeds bcrypt's 72-byte limit |
 | `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
-| `409` | the account is no longer claimable, including a request that passed token validation before a concurrent winner, or a configured password |
-| `422` | the setup token, username, or password is missing/empty |
+| `409` | setup is already complete, including a request that passed token validation before a concurrent winner, or a configured password |
+| `422` | the setup token is missing/empty, the password is empty, or a field has the wrong type |
 | `503` | no signing secret, or identity startup is incomplete |
 
 ### Actors

@@ -155,6 +155,40 @@ class TestNonInteractiveSetup:
         assert (ws / "TASK.md").exists()
         assert "Monitor CI" in (ws / "TASK.md").read_text()
 
+    @pytest.mark.parametrize("password, flag, expected", [
+        ("", "", False),
+        ("", "0", False),
+        ("", "1", True),
+        ("a-password", "", False),
+    ])
+    def test_passwordless_is_an_explicit_choice(
+        self, tmp_path: Path, password: str, flag: str, expected: bool,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+        assert choices.passwordless is expected
+
+    @pytest.mark.parametrize("password, flag", [("a-password", "1"), ("", "yes")])
+    def test_passwordless_flag_conflicts_are_refused(
+        self, tmp_path: Path, password: str, flag: str,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(click.ClickException, match="NERVE_PASSWORD"):
+                run_non_interactive(tmp_path)
+        assert not (tmp_path / "config.local.yaml").exists()
+
     def test_personal_mode_default_crons(self, tmp_path: Path) -> None:
         """Personal non-interactive should enable inbox-processor and task-planner."""
         env = {
@@ -1499,3 +1533,28 @@ class TestPortableSettingsSplit:
         assert cfg.gateway.port == 8900                     # from config.yaml
         assert cfg.agent.thinking == "max"                  # from settings.yaml
         assert cfg.sessions.max_sessions == 500             # from settings.yaml
+
+
+class TestWizardPasswordStep:
+    """An empty password is passwordless only after explicit confirmation."""
+
+    def _run(self, tmp_path: Path, answers: list, confirms: list[bool]):
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step = lambda title: title
+        prompts = iter(answers)
+        decisions = iter(confirms)
+        with patch("click.clear"), \
+                patch("click.prompt", side_effect=lambda *a, **k: next(prompts)), \
+                patch("click.confirm", side_effect=lambda *a, **k: next(decisions)):
+            wizard._step_password()
+        return wizard.choices
+
+    def test_confirmed_empty_answer_is_passwordless(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, [""], [True])
+        assert choices.passwordless is True
+        assert choices.password == ""
+
+    def test_declined_confirmation_asks_for_a_password_again(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, ["", "pw-one", "pw-one"], [False])
+        assert choices.passwordless is False
+        assert choices.password == "pw-one"

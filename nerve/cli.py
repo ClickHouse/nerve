@@ -276,7 +276,9 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
 
     display_name = (choices.user_name or "").strip() or None
     try:
-        report = bootstrap_identity_sync(config, display_name=display_name)
+        report = bootstrap_identity_sync(
+            config, display_name=display_name, passwordless=choices.passwordless,
+        )
     except Exception as e:  # noqa: BLE001 - any failure means there is no account
         # The wizard deleted its checkpoint when it applied the configuration.
         # Save the answers again so a re-run keeps the name, then fail. The
@@ -304,6 +306,16 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    from nerve.db.accounts import read_setup_required
+
+    if read_setup_required(
+        paths.db_path(), configured_password=bool(config.auth.password_hash),
+    ):
+        click.echo(
+            "  Setup is not complete: no password was set and a passwordless "
+            "installation was not chosen. After the gateway starts, run "
+            "'nerve status' to read the setup token, then complete setup at /setup."
+        )
 
 
 @main.command()
@@ -607,8 +619,8 @@ def _echo_setup_token(config) -> None:
         host = "localhost"
     click.echo()
     click.secho(
-        "  This instance has not been claimed. Every browser claim requires "
-        "the setup token below.",
+        "  Setup of this instance is not complete, and sign-in is refused "
+        "until it is. Complete it on the setup page with the token below.",
         fg="yellow",
     )
     click.echo(f"  Setup page: http://{host}:{port}/setup")
@@ -1208,7 +1220,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
-    from nerve.db.accounts import inspect_bootstrap_state
+    from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
     from nerve.gateway.auth import source_authenticates
 
     configured = bool(config.auth.password_hash)
@@ -1222,11 +1234,18 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
+    elif not usable and read_setup_required(
+        paths.db_path(), configured_password=configured,
+    ):
+        warnings.append(
+            "[WARN] Setup is not complete — sign-in is refused until it is. "
+            "Complete it at /setup with the setup token shown by `nerve status` "
+            "on the host"
+        )
     elif not usable:
         warnings.append(
-            "[WARN] No password set — passwordless: anyone who can reach "
-            "the gateway acts as the owner. Claim it at /setup with the "
-            "setup token shown by `nerve status` on the host"
+            "[WARN] No password set — passwordless by choice: anyone who can "
+            "reach the gateway acts as the owner"
         )
     else:
         lines.append(

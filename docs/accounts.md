@@ -54,24 +54,53 @@ empty.
 
 | `login` value | State | Required fields |
 |---|---|---|
-| `none` | One account with no password | None; any password is accepted |
+| `setup` | Setup is not complete | None; login is refused, only the setup claim is permitted |
+| `none` | One account with no password, chosen at setup | None; any password is accepted |
 | `password` | One account with a password | Password |
 | `username_password` | Two or more accounts | Username and password |
 
+Setup state belongs to the installation. Passwords belong to accounts. The two
+are independent:
+
+| Setup complete | Password | State |
+|---|---|---|
+| No | No | Only the setup claim is permitted |
+| Yes | No | Passwordless by choice, one account |
+| Yes | Yes | Password-protected |
+
+A password always completes setup. Nerve records completion in the
+`instance_setup` table of `nerve.db`.
+
 A passwordless installation is safe only when access to the gateway is already
-restricted. Claim it before exposing the gateway to other users or networks.
+restricted. Anyone who can reach it is the owner and can set the first password.
+A password cannot be removed.
+
+### Choosing passwordless
+
+An installation becomes passwordless only by an explicit choice:
+
+- `nerve init` asks for a password. An empty answer asks you to confirm
+  "Keep this installation passwordless".
+- `nerve init --non-interactive` reads `NERVE_PASSWORDLESS=1`. It refuses
+  `NERVE_PASSWORD` and `NERVE_PASSWORDLESS=1` together. With neither, setup
+  stays incomplete, and you complete it in the browser.
+- The browser setup page has a "Keep this installation passwordless" option.
+
+The installer reads these values once. Setup completion is persistent, so
+changing the environment later has no effect.
 
 ### Claiming the first account
 
-A new passwordless installation is unclaimed. Open `/setup` and enter the setup
-token shown by `nerve status` to set the first account's username, password, and
-optional display name. Send the token only in the JSON request body. For a remote
-claim, use HTTPS or a protected tunnel.
+When setup is not complete, open `/setup` and enter the setup token shown by
+`nerve status`. Then either set the first account's username and password, or
+keep the installation passwordless. The display name is optional. Send the token
+only in the JSON request body. For a remote claim, use HTTPS or a protected
+tunnel.
 
 Until the claim succeeds, `POST /api/setup/claim` is the only permitted account
-write. The claim updates the account and increments its session epoch in one
-transaction. Sessions issued while the installation was passwordless are
-invalidated, their open WebSockets are closed, and the response returns the
+write and login is refused. The claim updates the account, records setup as
+complete, and increments the session epoch in one transaction. Earlier sessions
+are invalidated, their open WebSockets are closed, and the response returns the
 replacement token. The setup token is then invalidated.
 
 See [Setup](setup.md#claiming-an-instance-from-a-browser).
@@ -136,6 +165,10 @@ Existing installations keep their password when account management is enabled.
 `auth.password_hash` is deprecated and retained only for compatibility; manage
 passwords from the Accounts page.
 
+An existing installation without a password has setup complete after the
+upgrade, so it stays passwordless. An installation is existing when its
+database has chat sessions from before accounts.
+
 Do not downgrade in place after enabling account management. Older versions do
 not understand account credentials and may treat the installation as
 passwordless. Restore a backup taken before the upgrade instead.
@@ -146,13 +179,14 @@ A normal backup includes `nerve.db`, so it preserves accounts, actor IDs,
 password hashes, and the generated signing secret. Treat the archive as a
 secret.
 
-`--no-secrets` removes account passwords and the signing secret from the database
-snapshot, omits `config.local.yaml`, and replaces credential values in workspace
-configuration with environment-variable placeholders. It fails if a
-configuration file cannot be parsed safely.
+`--no-secrets` removes account passwords, the signing secret and the setup
+completion record from the database snapshot, omits `config.local.yaml`, and
+replaces credential values in workspace configuration with environment-variable
+placeholders. It fails if a configuration file cannot be parsed safely.
 
 After restoring a `--no-secrets` backup:
 
-- an installation with one account is passwordless until a password is set;
+- an installation with one account requires setup again, with a new setup
+  token;
 - an installation with multiple accounts cannot accept a login until a password
   is supplied through `auth.password_hash` or a backup with secrets is restored.

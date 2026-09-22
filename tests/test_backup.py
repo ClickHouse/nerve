@@ -1625,3 +1625,28 @@ def test_a_transitional_config_account_restores_as_passwordless(
     # whose credential was in a file this bundle does not carry.
     assert after.passwordless is True
     assert after.single_account is True
+
+
+def test_no_secrets_scrub_also_clears_setup_completion(tmp_path):
+    """Without credentials, a restored instance must require setup again."""
+    db_path = tmp_path / "nerve.db"
+    _make_nerve_db(db_path)
+    _plant_accounts(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE instance_setup (id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "completed_at TEXT NOT NULL)"
+        )
+        conn.execute("INSERT INTO instance_setup VALUES (1, 't')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    backup_mod._scrub_account_credentials(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM instance_setup").fetchone()[0] == 0
+    finally:
+        conn.close()

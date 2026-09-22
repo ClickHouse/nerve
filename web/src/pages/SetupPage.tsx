@@ -1,25 +1,26 @@
 import { useState, type FormEvent } from 'react';
 import { Navigate, useNavigate } from 'react-router-dom';
 import { ShieldQuestion } from '../components/ui/icons';
-import { Button, TextField } from '../components/ui';
+import { Button, Checkbox, TextField } from '../components/ui';
 import { api, setToken } from '../api/client';
 import { errorDetail } from '../stores/accountStore';
 import { useActorStore } from '../stores/actorStore';
 import { useAuthStore } from '../stores/authStore';
 
-/** Claim the installation's initial account. */
+/** Complete setup of the installation's initial account. */
 export function SetupPage() {
   const navigate = useNavigate();
   const loginMode = useAuthStore((state) => state.loginMode);
   const checkAuth = useAuthStore((state) => state.checkAuth);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [passwordless, setPasswordless] = useState(false);
   const [displayName, setDisplayName] = useState('');
   const [setupToken, setSetupToken] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (loginMode !== 'none') return <Navigate to="/accounts" replace />;
+  if (loginMode !== 'setup') return <Navigate to="/chat" replace />;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -27,8 +28,8 @@ export function SetupPage() {
     setError(null);
     try {
       const claimed = await api.setupClaim({
-        username,
-        password,
+        username: username.trim() || undefined,
+        ...(passwordless ? { passwordless: true } : { password }),
         setup_token: setupToken,
         display_name: displayName.trim() || undefined,
       });
@@ -45,6 +46,8 @@ export function SetupPage() {
     }
   };
 
+  const credentialsReady = passwordless || (!!username && !!password);
+
   return (
     <div className="flex-1 h-full overflow-auto flex items-start justify-center p-6">
       <form
@@ -60,7 +63,8 @@ export function SetupPage() {
 
         <p className="text-sm text-text-muted">
           Choose the username and password for the account this installation
-          already created. The display name is optional.
+          already created, or keep the installation passwordless. The display
+          name is optional.
         </p>
 
         {error && <p role="alert" className="text-error text-sm">{error}</p>}
@@ -68,21 +72,38 @@ export function SetupPage() {
         <TextField
           value={username}
           onChange={(event) => setUsername(event.target.value)}
-          placeholder="Username"
+          placeholder={passwordless ? 'Username (optional)' : 'Username'}
           aria-label="Username"
           autoComplete="username"
           autoFocus
-          required
+          required={!passwordless}
         />
-        <TextField
-          type="password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-          placeholder="Password"
-          aria-label="Password"
-          autoComplete="new-password"
-          required
+        {!passwordless && (
+          <TextField
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="Password"
+            aria-label="Password"
+            autoComplete="new-password"
+            required
+          />
+        )}
+        <Checkbox
+          checked={passwordless}
+          onChange={(event) => setPasswordless(event.target.checked)}
+          label="Keep this installation passwordless"
+          labelSize="sm"
+          labelTone="secondary"
         />
+        {passwordless && (
+          <p role="note" className="text-sm text-hue-amber">
+            Without a password, anyone who can reach this address is the owner:
+            they can use the agent, its tools and its credentials. Keep the
+            gateway on localhost or behind a protected network. You can set a
+            password later.
+          </p>
+        )}
         <TextField
           value={displayName}
           onChange={(event) => setDisplayName(event.target.value)}
@@ -111,7 +132,7 @@ export function SetupPage() {
             type="submit"
             variant="primary"
             size="md"
-            disabled={busy || !username || !password || !setupToken}
+            disabled={busy || !credentialsReady || !setupToken}
           >
             {busy ? 'Claiming…' : 'Claim and sign in'}
           </Button>

@@ -1,6 +1,6 @@
 """Persist and validate the mandatory first-account setup token.
 
-The token is generated once while the sole account is passwordless, stored in
+The token is generated once while setup is not complete, stored in
 ``instance_secrets`` across restarts, and deleted as soon as the claim
 commits. It is accepted only in the claim request body: never in a URL,
 response, log entry, or browser storage.
@@ -16,10 +16,10 @@ _DECOY_TOKEN = secrets.token_urlsafe(_TOKEN_BYTES)
 
 
 async def instance_is_unclaimed(db, config) -> bool:
-    """Whether exactly one account still has no credential anywhere."""
-    from nerve.gateway.routes.accounts import instance_is_passwordless
+    """Whether setup is required; see ``routes.accounts.setup_required``."""
+    from nerve.gateway.routes.accounts import setup_required
 
-    return instance_is_passwordless(await db.login_state(), config)
+    return setup_required(await db.login_state(), config)
 
 
 async def ensure_setup_token(db, *, unclaimed: bool) -> str | None:

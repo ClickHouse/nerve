@@ -102,10 +102,8 @@ describe('startup with a token already in storage', () => {
     getViewer.mockResolvedValue(me());
   });
 
-  it('lands on the setup page when the instance has no password', async () => {
-    authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false }),
-    );
+  it('lands on the setup page while setup is required', async () => {
+    authStatus.mockResolvedValue(status({ login: 'setup' }));
 
     renderApp();
 
@@ -113,7 +111,17 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
-  it('lands on chat when it does', async () => {
+  it('lands on chat when the instance is passwordless by choice', async () => {
+    authStatus.mockResolvedValue(
+      status({ login: 'none', auth_required: false }),
+    );
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('lands on chat when it has a password', async () => {
     authStatus.mockResolvedValue(status());
 
     renderApp();
@@ -140,17 +148,15 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
 
-    answer(status({ login: 'none', auth_required: false }));
+    answer(status({ login: 'setup' }));
     expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
   });
 
   it('reaches setup on a real reload, not just with a reset store', async () => {
-    // Exercise the fresh-module path with a legacy token on a passwordless
-    // install. A reset store hides this upgrade state.
+    // Exercise the fresh-module path with a token on an instance that
+    // requires setup. A reset store hides this state.
     vi.resetModules();
-    authStatus.mockResolvedValue(
-      status({ login: 'none', auth_required: false }),
-    );
+    authStatus.mockResolvedValue(status({ login: 'setup' }));
     const { default: FreshApp } = await import('./App');
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
@@ -174,7 +180,7 @@ describe('startup with a token already in storage', () => {
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
-  it('a dead token on a passwordless install still reaches setup', async () => {
+  it('a dead token on a passwordless install still reaches the app', async () => {
     // The token is useless, which puts this tab exactly where a tab with no
     // token at all stands — so it takes the same path, rather than stopping at
     // a login form a passwordless install has no answer for.
@@ -186,7 +192,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
   });
 
@@ -206,7 +212,7 @@ describe('startup with a token already in storage', () => {
 });
 
 describe('startup with no token', () => {
-  it('auto-logs-in a passwordless install and lands on accounts', async () => {
+  it('auto-logs-in a passwordless install and lands on chat', async () => {
     authStatus.mockResolvedValue(
       status({ login: 'none', auth_required: false }),
     );
@@ -214,8 +220,17 @@ describe('startup with no token', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
     expect(apiLogin).toHaveBeenCalledWith('');
+  });
+
+  it('shows setup and does not log in while setup is required', async () => {
+    authStatus.mockResolvedValue(status({ login: 'setup' }));
+
+    renderApp();
+
+    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(apiLogin).not.toHaveBeenCalled();
   });
 
   it('shows the login page when a password is required', async () => {

@@ -54,8 +54,8 @@ function App() {
   // Wait for auth status before routing. A stored token does not distinguish a
   // claimed instance from a passwordless one.
   if (!ready) return null;
-  // Route passwordless instances to setup even without a valid session.
-  if (!authenticated && loginMode === 'none') return <SetupPage />;
+  // While setup is required, the claim is the only permitted action.
+  if (loginMode === 'setup') return <SetupPage />;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -110,10 +110,8 @@ function App() {
   );
 }
 
-/** Route the root to setup while the account has no password. */
 function Home() {
-  const loginMode = useAuthStore((s) => s.loginMode);
-  return <Navigate to={loginMode === 'none' ? '/setup' : '/chat'} replace />;
+  return <Navigate to="/chat" replace />;
 }
 
 /**

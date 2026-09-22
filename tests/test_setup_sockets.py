@@ -32,7 +32,7 @@ from starlette.websockets import WebSocketDisconnect
 from nerve import setup_token
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.gateway import server
-from nerve.gateway.auth import pin_jwt_secret
+from nerve.gateway.auth import create_session_token, pin_jwt_secret
 
 _SECRET = "test-secret-for-the-socket-claim-tests-32b"
 _PASSWORD = "correct-horse-battery-staple"
@@ -141,12 +141,11 @@ def _expect_closed(socket, *, within: float = 5.0) -> int:
 
 
 def _passwordless_session(instance) -> str:
-    """What any visitor gets on an install nobody has claimed."""
-    response = instance.client.post(
-        "/api/auth/login", json={"password": "anything at all"},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()["token"]
+    """A session at the account's pre-claim epoch.
+
+    Login refuses while setup is required, so the test mints the token.
+    """
+    return create_session_token(_SECRET, instance.owner_id, session_epoch=0)
 
 
 def _claim(instance) -> str:

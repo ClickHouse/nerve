@@ -1,8 +1,9 @@
 """Secure first-account claim.
 
 This is intentionally not an administration wizard. The sole unauthenticated
-write names and secures the account created at install time. Every request must
-carry the persisted setup token in its JSON body.
+write completes setup of the account created at install time: it either sets a
+username and password, or records the choice of a passwordless installation.
+Every request must carry the persisted setup token in its JSON body.
 """
 
 from __future__ import annotations
@@ -39,8 +40,14 @@ _GUARD_REFUSED = (
 
 
 class ClaimRequest(BaseModel):
-    username: str
-    password: str = Field(min_length=1)
+    """Exactly one of ``password`` and ``passwordless: true``.
+
+    ``username`` is required with a password and optional without one.
+    """
+
+    username: str | None = None
+    password: str | None = Field(default=None, min_length=1)
+    passwordless: bool = False
     setup_token: str = Field(min_length=1)
     display_name: str | None = None
 
@@ -53,7 +60,7 @@ class ClaimResponse(BaseModel):
 
 @router.post("/api/setup/claim", response_model=ClaimResponse)
 async def claim(req: ClaimRequest):
-    """Atomically name and secure the sole account, then sign the client in."""
+    """Atomically complete setup of the sole account, then sign the client in."""
     config = get_config()
     secret = effective_jwt_secret(config)
     store = identity_store()
@@ -73,10 +80,18 @@ async def claim(req: ClaimRequest):
     if not token_accepted(req.setup_token, stored):
         raise HTTPException(status_code=403, detail=_GUARD_REFUSED)
 
-    problem = password_length_problem(req.password)
-    if problem:
-        raise HTTPException(status_code=400, detail=problem)
-    credential = hash_password(req.password)
+    if (req.password is None) != req.passwordless:
+        raise HTTPException(
+            status_code=400,
+            detail="Supply a password, or set passwordless to true to keep "
+                   "this installation passwordless. Not both.",
+        )
+    credential = None
+    if req.password is not None:
+        problem = password_length_problem(req.password)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+        credential = hash_password(req.password)
 
     if not await instance_is_unclaimed(store, config):
         raise HTTPException(
@@ -108,9 +123,9 @@ async def claim(req: ClaimRequest):
         logger.warning("Claim: open sockets could not be closed: %s", e)
 
     logger.info(
-        "Instance claimed: account %s now has a password; pre-claim sessions "
-        "were revoked",
+        "Instance claimed: account %s %s; pre-claim sessions were revoked",
         account["id"],
+        "now has a password" if credential else "stays passwordless by choice",
     )
     return ClaimResponse(token=create_session_token(
         secret,

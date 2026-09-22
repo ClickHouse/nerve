@@ -183,6 +183,12 @@ _WORKER_MEMORY_CATEGORIES = [
     {"name": "agent_ops", "description": "Operational lessons about the worker itself: tool gotchas, performance observations"},
 ]
 
+PASSWORDLESS_WARNING = (
+    "Without a password, anyone who can reach the gateway port is the owner: "
+    "they can use the agent, its tools and its credentials. Keep the gateway "
+    "on localhost or behind a protected network."
+)
+
 
 @dataclass
 class SetupChoices:
@@ -205,6 +211,9 @@ class SetupChoices:
     # via `nerve pair` + /pair <code>.
     telegram_allowed_users: list[int] = field(default_factory=list)
     password: str = ""  # plaintext during wizard, hashed at write time
+    # The operator chose a passwordless installation. Without a password and
+    # without this, setup stays incomplete until the setup-token claim.
+    passwordless: bool = False
     enabled_crons: list[str] = field(default_factory=list)
     # sync sources
     github_sync: bool = False
@@ -1178,22 +1187,31 @@ class SetupWizard:
         click.secho(self._next_step("Web UI Password"), fg="cyan", bold=True)
         click.echo()
         click.secho(
-            "The web UI at localhost:8900 requires a password.\n"
-            "Set one now, or press Enter to skip (dev mode — no auth).",
+            "Set a password for the web UI at localhost:8900, or press Enter to\n"
+            "keep this installation passwordless.",
             dim=True,
         )
         click.echo()
 
         while True:
-            pw = click.prompt("Password (Enter to skip)", default="", hide_input=True)
+            pw = click.prompt(
+                "Password (Enter for passwordless)", default="", hide_input=True,
+            )
             if not pw:
                 click.echo()
-                click.secho("  → Skipping — running in dev mode (no password).", fg="yellow")
-                click.secho("    You can set one later in config.local.yaml.", dim=True)
-                break
+                click.secho(f"  {PASSWORDLESS_WARNING}", fg="yellow")
+                if click.confirm("  Keep this installation passwordless?", default=False):
+                    self.choices.password = ""
+                    self.choices.passwordless = True
+                    click.secho("  → Passwordless. You can set a password later "
+                                "in the web UI.", dim=True)
+                    break
+                click.echo()
+                continue
             pw2 = click.prompt("Confirm password", hide_input=True)
             if pw == pw2:
                 self.choices.password = pw
+                self.choices.passwordless = False
                 click.echo()
                 click.secho("  ✓ Password set", fg="green")
                 break
@@ -1612,7 +1630,9 @@ class SetupWizard:
         click.secho(f"  │  Mode:       {self.choices.mode:<33}│")
         click.secho(f"  │  Workspace:  {ws:<33}│")
         click.secho(f"  │  API keys:   {api_status:<33}│")
-        pw_status = "set" if self.choices.password else "none (dev mode)"
+        pw_status = "set" if self.choices.password else (
+            "none (passwordless)" if self.choices.passwordless else "none"
+        )
         click.secho(f"  │  Password:   {pw_status:<33}│")
 
         if self.choices.mode == "personal":
@@ -2630,6 +2650,18 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
                 f"user IDs, got: {allowed_raw!r}"
             )
     choices.password = os.environ.get("NERVE_PASSWORD", "")
+    passwordless_raw = os.environ.get("NERVE_PASSWORDLESS", "").strip()
+    if passwordless_raw not in ("", "0", "1"):
+        raise click.ClickException(
+            f"NERVE_PASSWORDLESS must be 1 or 0, got: {passwordless_raw!r}"
+        )
+    choices.passwordless = passwordless_raw == "1"
+    if choices.password and choices.passwordless:
+        raise click.ClickException(
+            "Set NERVE_PASSWORD or NERVE_PASSWORDLESS=1, not both"
+        )
+    if choices.passwordless:
+        click.secho(PASSWORDLESS_WARNING, fg="yellow")
 
     # Sources — auto-detect from available CLIs
     if choices.mode == "personal":

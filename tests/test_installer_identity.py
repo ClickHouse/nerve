@@ -151,6 +151,40 @@ class TestInstallerDisplayName:
         ) == [(None,)]
         # The headless installer always writes a jwt_secret, so none is generated.
         assert "generated a JWT signing secret" not in result.output
+        # Neither a password nor the passwordless choice: setup is not complete.
+        assert "Setup is not complete" in result.output
+        assert _db_rows(paths.db_path(), "SELECT * FROM instance_setup") == []
+
+
+class TestInstallerSetupChoice:
+    def _init(self, tmp_path, **extra):
+        from nerve.cli import main
+
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-test-key-for-the-headless-path",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TIMEZONE": "UTC",
+            **extra,
+        }
+        return CliRunner().invoke(
+            main, ["-c", str(tmp_path), "init", "--non-interactive"], env=env,
+        )
+
+    def test_passwordless_flag_completes_setup(self, tmp_path):
+        result = self._init(tmp_path, NERVE_PASSWORDLESS="1")
+        assert result.exit_code == 0, result.output
+        assert "recorded a passwordless installation" in result.output
+        assert "Setup is not complete" not in result.output
+        assert len(_db_rows(paths.db_path(), "SELECT * FROM instance_setup")) == 1
+
+    def test_a_password_needs_no_setup(self, tmp_path):
+        result = self._init(tmp_path, NERVE_PASSWORD="correct horse battery staple")
+        assert result.exit_code == 0, result.output
+        assert "Setup is not complete" not in result.output
+        assert _db_rows(
+            paths.db_path(), "SELECT credential_source FROM accounts",
+        ) == [("local",)]
 
 
 class TestInstallerBootstrapFailure:
@@ -167,7 +201,7 @@ class TestInstallerBootstrapFailure:
         stub = _stub_wizard(ws, name="alice", local_yaml=f"auth:\n  jwt_secret: {_SECRET}\n")
         monkeypatch.setattr("nerve.bootstrap.SetupWizard", stub)
 
-        def boom(config, *, display_name=None):
+        def boom(config, *, display_name=None, passwordless=False):
             raise RuntimeError("database is locked")
 
         monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
@@ -200,7 +234,7 @@ class TestInstallerBootstrapFailure:
         )
         monkeypatch.setattr("nerve.bootstrap.SetupWizard", stub)
 
-        def boom(config, *, display_name=None):
+        def boom(config, *, display_name=None, passwordless=False):
             raise RuntimeError("database is locked")
 
         monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
@@ -269,7 +303,7 @@ class TestInstallerBootstrapFailure:
         import nerve.migrate as migrate_mod
         from nerve.cli import main
 
-        def boom(config, *, display_name=None):
+        def boom(config, *, display_name=None, passwordless=False):
             raise RuntimeError("database is locked")
 
         monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)

@@ -110,7 +110,7 @@ class TestLocalTokenDelivery:
 
         report = doctor_report(NerveConfig(workspace=tmp_path / "workspace"))
         assert token not in report
-        assert "passwordless" in report
+        assert "Setup is not complete" in report
         assert "nerve status" in report
 
     async def test_status_prints_the_token_but_never_puts_it_in_a_url(

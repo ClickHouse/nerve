@@ -123,7 +123,7 @@ Dependency installation adapts to the environment: as root (a plain `ubuntu:24.0
 
 The daemon is not started: unattended installs are normally followed by a service manager that owns the process (see [systemd Service](#systemd-service-optional)). Set `NERVE_START=1` to start it from the installer instead.
 
-Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards.
+Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards. `NERVE_PASSWORDLESS` is also read once here: the choice is recorded in `nerve.db`, and changing the variable later has no effect.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -132,7 +132,8 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
-| `NERVE_PASSWORD` | unset | Web UI password. When unset, the installation is passwordless: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)) |
+| `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
+| `NERVE_PASSWORDLESS` | unset | `1` completes setup without a password: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)). Not allowed with `NERVE_PASSWORD`. With neither, setup stays incomplete until the [browser claim](#claiming-an-instance-from-a-browser) |
 | `NERVE_TASK` | unset | Worker mode task description |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
@@ -192,9 +193,9 @@ EOF
 `auth.password_hash` here is a **starting** password, not where the password
 lives. The first start copies it onto the local account and removes the key from
 this file; after that, passwords are managed on the accounts screen in the web
-UI and this key does nothing. Leaving it out is fine too — the install is then
-passwordless until you set a password there, which is what a headless install
-lands as. See [Accounts and identity](accounts.md).
+UI and this key does nothing. If you leave it out, setup is not complete until
+you [claim the instance from a browser](#claiming-an-instance-from-a-browser).
+See [Accounts and identity](accounts.md).
 
 `jwt_expiry_hours` is an **idle** timeout, not a cap on a working session: the
 gateway re-mints the token whenever a request arrives past half its lifetime,
@@ -222,10 +223,16 @@ nerve start              # Start the server
 
 ## Claiming an instance from a browser
 
-A headless install with no `NERVE_PASSWORD` starts with one passwordless
-account. Until it is claimed, every caller who reaches the gateway is admitted
-as that account. Open `/setup` to name it, set its password, and optionally
-set its display name in one atomic operation.
+A headless install with neither `NERVE_PASSWORD` nor `NERVE_PASSWORDLESS=1`
+starts with one account and setup not complete. Until setup is complete, login
+is refused and the claim is the only permitted action. Open `/setup` and do one
+of these in one atomic operation:
+
+- set the account's username and password;
+- select "Keep this installation passwordless". The username is then optional.
+  After this, anyone who reaches the gateway is admitted as the owner.
+
+The display name is optional in both cases.
 
 Every claim requires the setup token. Read it locally with:
 
@@ -253,9 +260,9 @@ Browser setup ends there. Provider credentials, profile configuration,
 channels, automation, and daemon lifecycle remain in `nerve init`, the CLI,
 configuration files, and their dedicated product surfaces.
 
-Claiming is the only way to set the first password.
-`PUT /api/accounts/me/password` refuses while the instance is unclaimed, so a
-passwordless session cannot bypass the setup token.
+While setup is not complete, claiming is the only way to set the first password.
+`PUT /api/accounts/me/password` refuses in that state. After a passwordless
+setup, that endpoint sets the first password. A password cannot be removed.
 
 ## HTTPS Setup
 

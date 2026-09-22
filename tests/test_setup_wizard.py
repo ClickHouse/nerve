@@ -46,6 +46,7 @@ async def test_validation_errors_never_echo_the_setup_token():
     ) as http:
         response = await http.post("/api/setup/claim", json={
             "password": _PASSWORD,
+            "passwordless": "not-a-boolean",
             "setup_token": token,
         })
     assert response.status_code == 422
@@ -337,11 +338,7 @@ class TestSessionEpoch:
     async def test_preclaim_http_and_new_websocket_sessions_are_revoked(
         self, install,
     ):
-        async with _client(install.app) as http:
-            before = (await http.post(
-                "/api/auth/login",
-                json={"password": "anything"},
-            )).json()["token"]
+        before = install.session_token()
         from nerve.gateway.auth import authenticate_websocket
 
         assert await authenticate_websocket(_FakeSocket(before)) is not None
@@ -519,3 +516,119 @@ class TestOnlyClaimSetsTheFirstPassword:
         after = await install.db._get_instance_secret(JWT_SECRET_NAME)
         assert response.status_code == 200
         assert after == before
+
+
+async def _passwordless_claim(install: _Install, **extra) -> httpx.Response:
+    body = {"passwordless": True, "setup_token": install.setup_token, **extra}
+    async with _client(install.app) as http:
+        return await http.post("/api/setup/claim", json=body)
+
+
+async def _status(install: _Install) -> dict:
+    async with _client(install.app) as http:
+        return (await http.get("/api/auth/status")).json()
+
+
+@pytest.mark.asyncio
+class TestSetupState:
+    async def test_setup_required_refuses_login_and_reports_setup(self, install):
+        assert await _status(install) == {"auth_required": True, "login": "setup"}
+        async with _client(install.app) as http:
+            response = await http.post("/api/auth/login", json={"password": ""})
+        assert response.status_code == 409
+        assert "setup token" in response.json()["detail"]
+
+    async def test_passwordless_claim_completes_setup_without_a_password(
+        self, install,
+    ):
+        response = await _passwordless_claim(install)
+        assert response.status_code == 200, response.text
+        claimed = response.json()["token"]
+
+        account = await install.db.get_account(install.owner_id)
+        assert account["credential_source"] == "none"
+        assert account["username"] is None
+        assert account["session_epoch"] == 1
+        assert await install.db.setup_completed()
+        assert await setup_token.stored_setup_token(install.db) == ""
+        assert await _status(install) == {"auth_required": False, "login": "none"}
+
+        async with _client(install.app, token=claimed) as http:
+            assert (await http.get("/api/accounts/me")).status_code == 200
+        async with _client(install.app) as http:
+            login = await http.post("/api/auth/login", json={"password": ""})
+        assert login.status_code == 200
+
+    async def test_passwordless_claim_may_set_a_username(self, install):
+        response = await _passwordless_claim(install, username="Alice")
+        assert response.status_code == 200, response.text
+        account = await install.db.get_account(install.owner_id)
+        assert account["username"] == "alice"
+
+    @pytest.mark.parametrize("body", [
+        {"passwordless": True, "password": _PASSWORD},
+        {"username": "alice"},
+    ])
+    async def test_claim_needs_exactly_one_of_password_and_passwordless(
+        self, install, body,
+    ):
+        body = {**body, "setup_token": install.setup_token}
+        async with _client(install.app) as http:
+            response = await http.post("/api/setup/claim", json=body)
+        assert response.status_code == 400
+        assert not await install.db.setup_completed()
+        assert await setup_token.stored_setup_token(install.db) == install.setup_token
+
+    async def test_a_passwordless_setup_cannot_be_claimed_again(self, install):
+        assert (await _passwordless_claim(install)).status_code == 200
+        # The token is gone, so a replay fails on the token check.
+        assert (await _passwordless_claim(install)).status_code == 403
+        # Even with a token back in place, the store refuses the claim.
+        await install.db._ensure_instance_secret(
+            setup_token.SETUP_TOKEN_NAME, install.setup_token,
+        )
+        assert (await _claim(install)).status_code == 409
+        account = await install.db.get_account(install.owner_id)
+        assert account["credential_source"] == "none"
+
+    async def test_a_password_can_be_added_after_a_passwordless_setup(
+        self, install,
+    ):
+        claimed = (await _passwordless_claim(install)).json()["token"]
+        async with _client(install.app, token=claimed) as http:
+            response = await http.put(
+                "/api/accounts/me/password", json={"new_password": _PASSWORD},
+            )
+        assert response.status_code == 200, response.text
+        assert await _status(install) == {"auth_required": True, "login": "password"}
+
+    async def test_password_claim_records_setup_complete(self, install):
+        assert (await _claim(install)).status_code == 200
+        assert await install.db.setup_completed()
+
+    async def test_a_configured_password_means_setup_is_not_required(
+        self, install,
+    ):
+        set_config(NerveConfig(auth=AuthConfig(
+            jwt_secret=_SECRET, password_hash=hash_password(_PASSWORD),
+        )))
+        assert await _status(install) == {"auth_required": True, "login": "password"}
+
+
+@pytest.mark.asyncio
+class TestInstallerPasswordlessChoice:
+    async def test_it_records_setup_and_deletes_the_token(self, install):
+        assert await install.db.complete_passwordless_setup(
+            invalidate_secret_name=setup_token.SETUP_TOKEN_NAME,
+        )
+        assert await install.db.setup_completed()
+        assert await setup_token.stored_setup_token(install.db) == ""
+
+    async def test_it_does_nothing_to_an_account_with_a_password(self, install):
+        assert (await _claim(install)).status_code == 200
+        await install.db.db.execute("DELETE FROM instance_setup")
+        await install.db.db.commit()
+        assert not await install.db.complete_passwordless_setup()
+        assert not await install.db.setup_completed()
+        account = await install.db.get_account(install.owner_id)
+        assert verify_password(_PASSWORD, account["credential"])

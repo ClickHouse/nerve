@@ -1,11 +1,13 @@
 const API_BASE = '/api';
 
 /**
- * What the login form has to collect. `none` is a passwordless install, which
- * is only ever one account; `password` is one account with a credential, which
- * needs no username; `username_password` is two or more.
+ * What the login form has to collect. `setup` is an install whose setup is not
+ * complete: login is refused and only the setup-token claim is permitted.
+ * `none` is a passwordless install by choice, which is only ever one account;
+ * `password` is one account with a credential, which needs no username;
+ * `username_password` is two or more.
  */
-export type LoginKind = 'none' | 'password' | 'username_password';
+export type LoginKind = 'setup' | 'none' | 'password' | 'username_password';
 
 /**
  * `GET /api/auth/status` — unauthenticated, so it carries no username and no
@@ -18,7 +20,7 @@ export interface AuthStatus {
 }
 
 /** What `POST /api/setup/claim` hands back: a session for the account it just
- *  secured, so the browser never has to re-type the password it set. */
+ *  set up, so the browser never has to re-type the password it set. */
 export interface SetupClaim {
   token: string;
 }
@@ -412,9 +414,10 @@ export const api = {
   getViewer: () => request<Viewer>('/auth/me'),
 
   // The one unauthenticated write. The mandatory setup token is sent only
-  // in this JSON body and is never retained by the API client.
+  // in this JSON body and is never retained by the API client. Send either
+  // `password` or `passwordless: true`.
   setupClaim: (body: {
-    username: string; password: string;
+    username?: string; password?: string; passwordless?: boolean;
     setup_token: string; display_name?: string;
   }) => request<SetupClaim>('/setup/claim', {
     method: 'POST', body: JSON.stringify(body),

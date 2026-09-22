@@ -31,6 +31,7 @@ from nerve.gateway.routes.accounts import (
     _render,
     account_credential,
     instance_is_passwordless,
+    setup_required,
 )
 from nerve.gateway.routes.actors import actor_out
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
@@ -41,10 +42,15 @@ router = APIRouter()
 
 # Do not reveal whether a username exists.
 _INVALID = "Invalid username or password"
+_SETUP_REQUIRED = (
+    "Setup of this instance is not complete. Complete it at /setup with the "
+    "setup token that `nerve status` shows."
+)
 
 LOGIN_NONE = "none"
 LOGIN_PASSWORD = "password"
 LOGIN_USERNAME_PASSWORD = "username_password"
+LOGIN_SETUP = "setup"
 
 # Require both fields until authentication is ready.
 _UNKNOWN_STATUS = {
@@ -207,7 +213,10 @@ async def login(req: LoginRequest):
     prepare_login_timing(config, accounts)
     started_at = time.monotonic()
 
-    state = login_state_from(accounts)
+    state = login_state_from(accounts, setup_complete=await store.setup_completed())
+    if setup_required(state, config):
+        # `/api/auth/status` already says so, so this reveals nothing new.
+        raise HTTPException(status_code=409, detail=_SETUP_REQUIRED)
     passwordless = instance_is_passwordless(state, config)
     username = (req.username or "").strip()
 
@@ -252,7 +261,8 @@ async def auth_status():
     """Describe the login form without identifying accounts.
 
     ``auth_required`` is the legacy spelling of ``login != 'none'``. Missing
-    startup state fails closed to username and password.
+    startup state fails closed to username and password. ``setup`` means that
+    only the setup-token claim is permitted.
     """
     config = get_config()
     store = identity_store()
@@ -260,7 +270,9 @@ async def auth_status():
         return dict(_UNKNOWN_STATUS)
 
     state = await store.login_state()
-    if instance_is_passwordless(state, config):
+    if setup_required(state, config):
+        login_kind = LOGIN_SETUP
+    elif instance_is_passwordless(state, config):
         login_kind = LOGIN_NONE
     elif state.single_account:
         login_kind = LOGIN_PASSWORD

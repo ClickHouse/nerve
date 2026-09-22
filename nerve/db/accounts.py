@@ -108,17 +108,23 @@ class LoginState:
     single_account: bool
     # A named account without a credential is still passwordless.
     passwordless: bool
+    # Whether ``instance_setup`` records a completed setup. A credential also
+    # completes setup; see ``nerve.gateway.routes.accounts.setup_required``.
+    setup_complete: bool
     sole_account_id: str | None = None
 
 
-def login_state_from(accounts: list[dict]) -> LoginState:
+def login_state_from(accounts: list[dict], *, setup_complete: bool) -> LoginState:
     """Build login state from rows a caller may already need for timing."""
     if len(accounts) != 1:
-        return LoginState(single_account=False, passwordless=False)
+        return LoginState(
+            single_account=False, passwordless=False, setup_complete=setup_complete,
+        )
     sole = accounts[0]
     return LoginState(
         single_account=True,
         passwordless=sole["credential_source"] == "none",
+        setup_complete=setup_complete,
         sole_account_id=sole["id"],
     )
 
@@ -323,7 +329,54 @@ class AccountStore:
         with ``auth.password_hash``. A row remains on ``config`` only while a
         configured hash exists, and startup copies that hash to ``local``.
         """
-        return login_state_from(await self.list_accounts())
+        return login_state_from(
+            await self.list_accounts(),
+            setup_complete=await self.setup_completed(),
+        )
+
+    async def setup_completed(self) -> bool:
+        """Whether ``instance_setup`` records a completed setup."""
+        async with self.db.execute("SELECT 1 FROM instance_setup") as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _record_setup_complete(self) -> None:
+        """Mark setup complete. Call inside the caller's write transaction."""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO instance_setup (id, completed_at) VALUES (1, ?)",
+            (_now(),),
+        )
+
+    async def complete_passwordless_setup(
+        self, *, invalidate_secret_name: str | None = None,
+    ) -> bool:
+        """Record the operator's choice of a passwordless installation.
+
+        For the local installer only: it does not check a setup token. Returns
+        ``False`` and changes nothing unless exactly one account exists and it
+        has no credential. A configured ``auth.password_hash`` is the caller's
+        to check.
+        """
+        async with self._atomic():
+            await self.db.execute("BEGIN IMMEDIATE")
+            async with self.db.execute(
+                "SELECT credential_source FROM accounts"
+            ) as cursor:
+                rows = [row[0] async for row in cursor]
+            if rows != ["none"]:
+                return False
+            await self._record_setup_complete()
+            if invalidate_secret_name is not None:
+                await self._secure_delete_secret_in_transaction(invalidate_secret_name)
+        return True
+
+    async def _secure_delete_secret_in_transaction(self, name: str) -> None:
+        await self.db.execute("PRAGMA secure_delete=ON")
+        try:
+            await self.db.execute(
+                "DELETE FROM instance_secrets WHERE name = ?", (name,),
+            )
+        finally:
+            await self.db.execute("PRAGMA secure_delete=OFF")
 
     async def _require_session_epoch(
         self, account_id: str | None, expected: int | None,
@@ -535,17 +588,21 @@ class AccountStore:
     async def claim_sole_account(
         self,
         *,
-        username: str,
-        credential: str,
+        username: str | None,
+        credential: str | None,
         display_name: str | None = None,
         invalidate_secret_name: str | None = None,
     ) -> dict:
-        """Atomically name and secure exactly one unclaimed account.
+        """Atomically complete setup on exactly one unclaimed account.
 
         First-run "claim and secure": the account an install is created with has
         no password and no username, and this is what gives it both. One
         transaction, so a half-claimed account — named but still open, or
         secured but unreachable — never exists, not even between two requests.
+
+        ``credential=None`` is the passwordless choice: the account keeps no
+        password, ``username`` is optional, and setup is recorded as complete.
+        With a credential, ``username`` is required.
 
         The *precondition* is checked inside the transaction as well, which is
         the difference between this and ``get_sole_account()`` followed by
@@ -555,8 +612,8 @@ class AccountStore:
         with its own. Under ``BEGIN IMMEDIATE`` the loser reads the winner's
         committed row and raises :class:`NotClaimableError`.
 
-        Raises :class:`NotClaimableError` unless exactly one account exists and
-        it has no credential, and the username errors of
+        Raises :class:`NotClaimableError` unless exactly one account exists, it
+        has no credential and setup is not complete, and the username errors of
         :func:`normalise_username`. ``display_name`` also renames the account's
         actor, in the same transaction. When ``invalidate_secret_name`` is
         supplied, that instance secret is securely deleted in the transaction
@@ -575,9 +632,12 @@ class AccountStore:
         install admits everybody, so the caller is responsible for the guard
         that makes claiming meaningful (the persisted setup token).
         """
-        username = normalise_username(username)
-        if not credential:
+        if credential is not None and not credential:
             raise AccountError("A password is required")
+        if credential is not None or (username is not None and username.strip()):
+            username = normalise_username(username)
+        else:
+            username = None
 
         async with self._atomic():
             await self.db.execute("BEGIN IMMEDIATE")
@@ -596,16 +656,26 @@ class AccountStore:
                     "This account already has a password, so it has been claimed "
                     "already. Sign in instead."
                 )
-
-            try:
-                await self.db.execute(
-                    """UPDATE accounts
-                          SET username = ?, credential_source = 'local',
-                              credential = ?,
-                              session_epoch = session_epoch + 1
-                        WHERE id = ?""",
-                    (username, credential, account["id"]),
+            if await self.setup_completed():
+                raise NotClaimableError(
+                    "Setup of this instance is already complete. Sign in instead."
                 )
+
+            if credential is not None:
+                sql = """UPDATE accounts
+                            SET username = ?, credential_source = 'local',
+                                credential = ?,
+                                session_epoch = session_epoch + 1
+                          WHERE id = ?"""
+                params: tuple = (username, credential, account["id"])
+            else:
+                sql = """UPDATE accounts
+                            SET username = COALESCE(?, username),
+                                session_epoch = session_epoch + 1
+                          WHERE id = ?"""
+                params = (username, account["id"])
+            try:
+                await self.db.execute(sql, params)
             except sqlite3.IntegrityError as e:  # pragma: no cover - one account
                 raise UsernameTakenError(
                     f"The username '{username}' is already taken"
@@ -615,15 +685,9 @@ class AccountStore:
                     "UPDATE actor_refs SET display_name = ? WHERE id = ?",
                     (display_name or None, account["actor_id"]),
                 )
+            await self._record_setup_complete()
             if invalidate_secret_name is not None:
-                await self.db.execute("PRAGMA secure_delete=ON")
-                try:
-                    await self.db.execute(
-                        "DELETE FROM instance_secrets WHERE name = ?",
-                        (invalidate_secret_name,),
-                    )
-                finally:
-                    await self.db.execute("PRAGMA secure_delete=OFF")
+                await self._secure_delete_secret_in_transaction(invalidate_secret_name)
         return await self.get_account(account["id"])  # type: ignore[return-value]
 
     async def disable_account(
@@ -738,6 +802,28 @@ def read_instance_secret(db_path: Path, name: str) -> str:
         return str(row[0]) if row and row[0] else ""
     except sqlite3.Error:
         return ""
+    finally:
+        conn.close()
+
+
+def read_setup_required(db_path: Path, *, configured_password: bool) -> bool:
+    """Read from another process whether setup is required; ``False`` if unknown.
+
+    The same rule as ``nerve.gateway.routes.accounts.setup_required``.
+    """
+    if configured_password:
+        return False
+    conn = _read_only(db_path)
+    if conn is None:
+        return False
+    try:
+        sources = [
+            row[0] for row in conn.execute("SELECT credential_source FROM accounts")
+        ]
+        complete = conn.execute("SELECT 1 FROM instance_setup").fetchone()
+        return sources == ["none"] and complete is None
+    except sqlite3.Error:
+        return False
     finally:
         conn.close()
 

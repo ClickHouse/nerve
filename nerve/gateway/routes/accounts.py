@@ -242,21 +242,18 @@ async def update_account(
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
 
-    **Refused while the instance is unclaimed:** a passwordless install mints
-    a session for anybody, so this is the one
-    account mutation a stranger could otherwise reach — the others are already
-    refused by the passwordless guard, the last-account guard or the
-    first-password rule. The claim sets the first username and password
-    together, which is what makes it the one door.
+    **Refused while setup is required:** only the setup-token claim may change
+    the account of an unclaimed instance. After a passwordless setup, anyone
+    who reaches the gateway is the account owner and may rename it.
     """
     db = get_deps().db
     config = get_config()
-    if instance_is_passwordless(await db.login_state(), config):
+    if setup_required(await db.login_state(), config):
         raise HTTPException(
             status_code=409,
-            detail="This instance has not been claimed yet. Give the account "
-                   "its username and password together through "
-                   "POST /api/setup/claim with the mandatory setup token.",
+            detail="Setup of this instance is not complete. Complete it "
+                   "through POST /api/setup/claim with the mandatory setup "
+                   "token.",
         )
     account = await db.get_account(account_id)
     if account is None:
@@ -347,8 +344,7 @@ async def change_own_password(
 
     ``current_password`` is required whenever the account already has one —
     from its own row or from ``auth.password_hash`` — so a stolen session token
-    is not on its own enough to take the account over. A passwordless install
-    must instead use the setup-token-protected claim endpoint.
+    is not on its own enough to take the account over.
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
@@ -360,9 +356,10 @@ async def change_own_password(
     account's session epoch: every older HTTP token and open WebSocket is
     revoked, while this response supplies the calling tab a replacement token.
 
-    **While the instance is unclaimed this endpoint refuses.** Passwordless
-    sessions are available to every caller, so only ``POST /api/setup/claim``
-    may set the first password, protected by the setup token.
+    **While setup is required this endpoint refuses.** Only
+    ``POST /api/setup/claim``, protected by the setup token, may set the first
+    password of an unclaimed instance. After a passwordless setup this endpoint
+    sets the first password, and anyone who reaches the gateway may call it.
     """
     db = get_deps().db
     config = get_config()
@@ -370,10 +367,10 @@ async def change_own_password(
     if account is None:  # pragma: no cover - resolved a moment ago
         raise HTTPException(status_code=404, detail="Account not found")
 
-    if instance_is_passwordless(await db.login_state(), config):
+    if setup_required(await db.login_state(), config):
         raise HTTPException(
             status_code=409,
-            detail="This instance has not been claimed yet. Set the first "
+            detail="Setup of this instance is not complete. Set the first "
                    "password through POST /api/setup/claim with the mandatory "
                    "setup token.",
         )
@@ -456,12 +453,22 @@ def account_credential(account: dict, config) -> str:
 
 
 def instance_is_passwordless(state, config) -> bool:
-    """Whether anyone reaching the gateway is admitted as the one account.
+    """Whether the instance has one account and no credential anywhere.
 
-    A passwordless instance has exactly one account and no credential anywhere
-    — neither on its row nor in configuration. Both halves are read here so
+    Neither on its row nor in configuration. Both halves are read here so
     the login route and ``/api/auth/status`` cannot disagree about which state
     the instance is in (a status that says "passwordless" while login wants a
     password is a browser that logs itself out in a loop).
     """
     return state.passwordless and not config.auth.password_hash
+
+
+def setup_required(state, config) -> bool:
+    """Whether only the setup-token claim is permitted.
+
+    True for a passwordless instance whose setup is not complete. A credential
+    completes setup, so an instance with a password never needs setup. A
+    passwordless instance with complete setup admits anyone who reaches the
+    gateway as the one account.
+    """
+    return instance_is_passwordless(state, config) and not state.setup_complete

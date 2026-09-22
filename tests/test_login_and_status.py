@@ -174,6 +174,7 @@ class TestSingleAccountLogin:
             )).status_code == 401
 
     async def test_passwordless_admits_anything(self, install):
+        assert await install.db.complete_passwordless_setup()
         async with _client(install.app) as client:
             response = await client.post(
                 "/api/auth/login", json={"password": "anything at all"},
@@ -395,19 +396,23 @@ class TestTheSecondAccountIsTheTurningPoint:
 
 @pytest.mark.asyncio
 class TestStatusDescriptor:
+    async def test_setup_required(self, install):
+        async with _client(install.app) as client:
+            body = (await client.get("/api/auth/status")).json()
+        assert body == {"auth_required": True, "login": "setup"}
+
     async def test_passwordless(self, install):
+        assert await install.db.complete_passwordless_setup()
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
         assert body == {"auth_required": False, "login": "none"}
 
     async def test_naming_the_account_stays_passwordless(self, install):
-        """The accounts screen can set a username on its own. Doing that first
-        must not stop the instance reporting as unsecured — it still admits
-        every caller, which is the state the wizard exists to end."""
+        """A username alone does not complete setup and is not a credential."""
         await install.db.update_account_login(install.owner_id, username="alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": False, "login": "none"}
+        assert body == {"auth_required": True, "login": "setup"}
 
     async def test_only_a_password_ends_passwordless_login(self, install):
         await install.db.update_account_login(install.owner_id, username="alice")
@@ -674,6 +679,7 @@ class TestFailedLoginsCostTheSame:
         have ended. So it is recomputed every login."""
         _reset_timing()
         await install.db.update_account_login(install.owner_id, username="alice")
+        assert await install.db.complete_passwordless_setup()
 
         async def probe(body) -> float:
             async with _client(install.app) as client:
