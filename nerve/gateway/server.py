@@ -172,11 +172,18 @@ async def _connection_still_authorised(connection: WebSocketConnection) -> bool:
     same check here as they are there, rather than a second implementation of
     the rule that could drift from it.
 
-    A credential with no account behind it (the system principal) has nothing
-    to re-check and stays valid.
+    The system principal has no account and nothing to re-check, so it stays
+    valid. A human actor without an account cannot be re-checked here, so its
+    socket is refused.
     """
-    if not connection.actor.account_id:
+    if connection.actor.is_system:
         return True
+    if not connection.actor.account_id:
+        logger.info(
+            "WebSocket %s is no longer authorised: a human actor with no local "
+            "account cannot be re-checked", connection.client_id,
+        )
+        return False
     store = identity_store()
     if store is None:  # pragma: no cover - fail closed; startup is long done
         return False
