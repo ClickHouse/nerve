@@ -127,8 +127,7 @@ Failures:
 | `404` | Account not found |
 | `409` | Username or account-state conflict; the response explains the conflict |
 
-Disabling an account affects its next request. An existing WebSocket keeps its
-accepted identity until it reconnects.
+Disabling an account affects its next request and closes its open WebSockets.
 
 ### Setup claim
 
@@ -748,9 +747,8 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
 too). The token is resolved to an actor at admission. A credential that names
-nobody is refused with close code `4001`. Once admitted, both identity and
-authority remain fixed until the socket reconnects; account changes are checked
-at the next connection.
+nobody is refused with close code `4001`. The actor stays fixed until the socket
+reconnects. Disabling the account closes the socket with code `1008`.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token

@@ -271,9 +271,10 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
-    what stops it — at every door. An open WebSocket keeps the identity it was
-    accepted with until it reconnects.
+    what stops it — at every door. Its open WebSockets are closed.
     """
+    from nerve.gateway.server import close_account_sockets
+
     db = get_deps().db
     try:
         account = await db.disable_account(account_id)
@@ -281,6 +282,7 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    await close_account_sockets(account_id)
     logger.info("Account %s disabled by account %s", account_id, actor.account_id)
     return await _render(db, account)
 

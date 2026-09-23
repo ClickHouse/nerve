@@ -113,8 +113,7 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection. An existing WebSocket keeps the identity it received when it
-connected. Autonomous work, including cron jobs and background agents, uses the
+connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
 ## Attribution
