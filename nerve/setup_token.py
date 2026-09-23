@@ -39,10 +39,8 @@ async def stored_setup_token(db) -> str:
 
 def token_accepted(supplied: str | None, stored: str) -> bool:
     """Compare in constant time, including when no token is stored."""
-    # ``compare_digest`` rejects non-ASCII ``str`` inputs. Encode explicitly so
-    # arbitrary JSON strings take the ordinary refusal path instead of turning
-    # an unauthenticated bad token into a 500. ``surrogatepass`` also covers a
-    # JSON parser handing us an escaped lone surrogate.
+    # ``compare_digest`` raises on non-ASCII ``str``, so compare bytes.
+    # ``surrogatepass`` accepts a lone surrogate from JSON.
     candidate = (supplied or "").encode("utf-8", "surrogatepass")
     reference = (stored or _DECOY_TOKEN).encode("utf-8", "surrogatepass")
     matched = secrets.compare_digest(candidate, reference)

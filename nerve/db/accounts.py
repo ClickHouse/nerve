@@ -63,18 +63,6 @@ class UnnamedAccountError(AccountError):
     """An existing account needs a username before a second can exist."""
 
 
-class StaleSessionError(AccountError):
-    """The caller was admitted under a session epoch the account has left behind.
-
-    Raised by a mutation that carried the epoch its credential stated into the
-    transaction and found the row somewhere else — which is what claiming an
-    unclaimed instance does to every session that existed before it (``v049``).
-    A refusal, never a retry: the request was authorised by a credential that
-    has since stopped being one, and re-running it would be doing the work the
-    claim was meant to prevent.
-    """
-
-
 class NotClaimableError(AccountError):
     """The claim target is not exactly one unsecured account."""
 
@@ -108,8 +96,7 @@ class LoginState:
     single_account: bool
     # A named account without a credential is still passwordless.
     passwordless: bool
-    # Whether ``instance_setup`` records a completed setup. A credential also
-    # completes setup; see ``nerve.gateway.routes.accounts.setup_required``.
+    # An ``instance_setup`` row exists.
     setup_complete: bool
     sole_account_id: str | None = None
 
@@ -176,21 +163,14 @@ class AccountStore:
         actor_id: str,
         *,
         display_name: str | None | object = _UNSET,
-        acting_account_id: str | None = None,
-        acting_session_epoch: int | None = None,
     ) -> dict | None:
-        """Rename an actor if the acting session is still current."""
+        """Rename an actor without rewriting authorship references."""
         if display_name is _UNSET:
             return await self.get_actor_ref(actor_id)
-        async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
-            await self._require_session_epoch(
-                acting_account_id, acting_session_epoch,
-            )
-            await self.db.execute(
-                "UPDATE actor_refs SET display_name = ? WHERE id = ?",
-                (display_name, actor_id),
-            )
+        await self._write(
+            "UPDATE actor_refs SET display_name = ? WHERE id = ?",
+            (display_name, actor_id),
+        )
         return await self.get_actor_ref(actor_id)
 
     # -- accounts ------------------------------------------------------------
@@ -245,7 +225,7 @@ class AccountStore:
     async def _account_identity(self, account_id: str) -> dict | None:
         """The request-resolution fields for one account, or ``None``."""
         async with self.db.execute(
-            """SELECT a.id AS account_id, a.enabled, a.session_epoch,
+            """SELECT a.id AS account_id, a.enabled,
                       r.id AS actor_id, r.kind AS actor_kind, r.display_name
                  FROM accounts a
                  LEFT JOIN actor_refs r ON r.id = a.actor_id
@@ -262,7 +242,7 @@ class AccountStore:
     async def _sole_account_identity(self) -> dict | None:
         """The request-resolution fields when exactly one account exists."""
         async with self.db.execute(
-            """SELECT a.id AS account_id, a.enabled, a.session_epoch,
+            """SELECT a.id AS account_id, a.enabled,
                       r.id AS actor_id, r.kind AS actor_kind, r.display_name
                  FROM accounts a
                  LEFT JOIN actor_refs r ON r.id = a.actor_id
@@ -349,12 +329,10 @@ class AccountStore:
     async def complete_passwordless_setup(
         self, *, invalidate_secret_name: str | None = None,
     ) -> bool:
-        """Record the operator's choice of a passwordless installation.
+        """Record the installer's passwordless choice. Checks no setup token.
 
-        For the local installer only: it does not check a setup token. Returns
-        ``False`` and changes nothing unless exactly one account exists and it
-        has no credential. A configured ``auth.password_hash`` is the caller's
-        to check.
+        Returns ``False`` unless exactly one account exists and it has no
+        credential. The caller checks ``auth.password_hash``.
         """
         async with self._atomic():
             await self.db.execute("BEGIN IMMEDIATE")
@@ -378,39 +356,12 @@ class AccountStore:
         finally:
             await self.db.execute("PRAGMA secure_delete=OFF")
 
-    async def _require_session_epoch(
-        self, account_id: str | None, expected: int | None,
-    ) -> None:
-        """Refuse unless ``account_id``'s row still carries ``expected``.
-
-        Call inside the write transaction so a claim cannot commit between the
-        comparison and mutation. ``None`` skips the check for credentials with
-        no account or callers that did not request epoch validation.
-        """
-        if account_id is None or expected is None:
-            return
-        async with self.db.execute(
-            "SELECT session_epoch FROM accounts WHERE id = ?", (account_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            raise StaleSessionError(
-                "This session's account no longer exists; sign in again"
-            )
-        if int(row[0] or 0) != int(expected):
-            raise StaleSessionError(
-                "This instance was claimed after your session started, so that "
-                "request was refused. Sign in again."
-            )
-
     async def create_managed_account(
         self,
         *,
         username: str,
         credential: str,
         display_name: str | None = None,
-        acting_account_id: str | None = None,
-        acting_session_epoch: int | None = None,
     ) -> dict:
         """Atomically create a human actor and its password-bearing account."""
         username = normalise_username(username)
@@ -423,13 +374,6 @@ class AccountStore:
             # a deferred transaction would let two callers both read a state
             # that permits the insert and then both perform it.
             await self.db.execute("BEGIN IMMEDIATE")
-
-            # Was the caller still allowed to be doing this when it landed? A
-            # request admitted while the instance was passwordless, arriving
-            # after somebody claimed it, must not leave an account behind.
-            await self._require_session_epoch(
-                acting_account_id, acting_session_epoch,
-            )
 
             async with self.db.execute(
                 "SELECT username, credential_source FROM accounts"
@@ -487,24 +431,8 @@ class AccountStore:
         *,
         username: str | object = _UNSET,
         credential: str | object = _UNSET,
-        expected_session_epoch: int | None = None,
-        revoke_sessions: bool = False,
     ) -> dict | None:
-        """Change a username and/or move its password to the account row.
-
-        ``expected_session_epoch`` makes the change conditional on the account
-        still being at the epoch the caller's credential named — so a password
-        change authorised before a claim cannot land after it. Raises
-        :class:`StaleSessionError` when they have diverged.
-
-        ``revoke_sessions`` advances that epoch in the same transaction as a
-        credential change. The caller that changed its own password can mint a
-        replacement at the returned epoch; every previously issued session is
-        stale. It is invalid without ``credential`` because non-credential
-        profile edits must not unexpectedly sign devices out.
-
-        Returns the updated row, or ``None`` if there is no such account.
-        """
+        """Change a username and/or move its password to the account row."""
         sets: list[str] = []
         params: list = []
         if username is not _UNSET:
@@ -517,10 +445,6 @@ class AccountStore:
             sets.append("credential_source = 'local'")
             sets.append("credential = ?")
             params.append(credential)
-        if revoke_sessions:
-            if credential is _UNSET:
-                raise ValueError("revoking sessions requires a credential change")
-            sets.append("session_epoch = session_epoch + 1")
         if not sets:
             return await self.get_account(account_id)
 
@@ -531,7 +455,6 @@ class AccountStore:
             ) as cursor:
                 if await cursor.fetchone() is None:
                     return None
-            await self._require_session_epoch(account_id, expected_session_epoch)
             params.append(account_id)
             try:
                 await self.db.execute(
@@ -595,42 +518,13 @@ class AccountStore:
     ) -> dict:
         """Atomically complete setup on exactly one unclaimed account.
 
-        First-run "claim and secure": the account an install is created with has
-        no password and no username, and this is what gives it both. One
-        transaction, so a half-claimed account — named but still open, or
-        secured but unreachable — never exists, not even between two requests.
+        ``credential=None`` is the passwordless choice, and then ``username`` is
+        optional. One transaction checks the precondition, writes the account
+        and display name, records setup as complete and deletes
+        ``invalidate_secret_name``. Of two concurrent claims, the loser raises
+        :class:`NotClaimableError`.
 
-        ``credential=None`` is the passwordless choice: the account keeps no
-        password, ``username`` is optional, and setup is recorded as complete.
-        With a credential, ``username`` is required.
-
-        The *precondition* is checked inside the transaction as well, which is
-        the difference between this and ``get_sole_account()`` followed by
-        ``update_account_login()``: those are two transactions, so two callers
-        racing to claim a fresh install can both read "one account, no
-        password" and the second one silently overwrites the first's password
-        with its own. Under ``BEGIN IMMEDIATE`` the loser reads the winner's
-        committed row and raises :class:`NotClaimableError`.
-
-        Raises :class:`NotClaimableError` unless exactly one account exists, it
-        has no credential and setup is not complete, and the username errors of
-        :func:`normalise_username`. ``display_name`` also renames the account's
-        actor, in the same transaction. When ``invalidate_secret_name`` is
-        supplied, that instance secret is securely deleted in the transaction
-        too: the account cannot become claimed while its bearer claim token
-        remains live after a cancellation or database error.
-
-        **It also ends every session that existed before it**, by bumping
-        ``session_epoch`` in the same statement that sets the password. A
-        passwordless install hands a session to everyone who can reach it, and
-        those tokens are signed, unexpired and name this same account — so
-        without the bump the claim would secure the *next* caller and leave the
-        previous ones with owner authority for the rest of their thirty days,
-        which is the window claiming exists to close. See ``v049``.
-
-        Note what this does **not** do: decide who may call it. A passwordless
-        install admits everybody, so the caller is responsible for the guard
-        that makes claiming meaningful (the persisted setup token).
+        The caller must check the setup token first.
         """
         if credential is not None and not credential:
             raise AccountError("A password is required")
@@ -664,14 +558,12 @@ class AccountStore:
             if credential is not None:
                 sql = """UPDATE accounts
                             SET username = ?, credential_source = 'local',
-                                credential = ?,
-                                session_epoch = session_epoch + 1
+                                credential = ?
                           WHERE id = ?"""
                 params: tuple = (username, credential, account["id"])
             else:
                 sql = """UPDATE accounts
-                            SET username = COALESCE(?, username),
-                                session_epoch = session_epoch + 1
+                            SET username = COALESCE(?, username)
                           WHERE id = ?"""
                 params = (username, account["id"])
             try:
@@ -690,19 +582,10 @@ class AccountStore:
                 await self._secure_delete_secret_in_transaction(invalidate_secret_name)
         return await self.get_account(account["id"])  # type: ignore[return-value]
 
-    async def disable_account(
-        self,
-        account_id: str,
-        *,
-        acting_account_id: str | None = None,
-        acting_session_epoch: int | None = None,
-    ) -> dict | None:
+    async def disable_account(self, account_id: str) -> dict | None:
         """Idempotently disable an account unless it is the last enabled one."""
         async with self._atomic():
             await self.db.execute("BEGIN IMMEDIATE")
-            await self._require_session_epoch(
-                acting_account_id, acting_session_epoch,
-            )
             account = await self.get_account(account_id)
             if account is None:
                 return None
@@ -725,19 +608,10 @@ class AccountStore:
                 )
         return await self.get_account(account_id)
 
-    async def enable_account(
-        self,
-        account_id: str,
-        *,
-        acting_account_id: str | None = None,
-        acting_session_epoch: int | None = None,
-    ) -> dict | None:
+    async def enable_account(self, account_id: str) -> dict | None:
         """Re-enable an account. Idempotent; ``None`` if there is no such account."""
         async with self._atomic():
             await self.db.execute("BEGIN IMMEDIATE")
-            await self._require_session_epoch(
-                acting_account_id, acting_session_epoch,
-            )
             account = await self.get_account(account_id)
             if account is None:
                 return None

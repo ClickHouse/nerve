@@ -29,11 +29,6 @@ Account management follows these rules:
 - Before adding a second account, the existing account must have a username and
   the installation must have a password.
 
-A successful password change advances that account's session epoch. Every
-older HTTP token becomes stale and every open WebSocket is best-effort closed;
-the response carries a replacement token for the tab that proved the current
-password. This is the incident-response path for revoking a copied session.
-
 ### Usernames
 
 Usernames are trimmed, converted to lowercase, and compared case-insensitively.
@@ -91,19 +86,11 @@ changing the environment later has no effect.
 
 ### Claiming the first account
 
-When setup is not complete, open `/setup` and enter the setup token shown by
-`nerve status`. Then either set the first account's username and password, or
-keep the installation passwordless. The display name is optional. Send the token
-only in the JSON request body. For a remote claim, use HTTPS or a protected
-tunnel.
-
-Until the claim succeeds, `POST /api/setup/claim` is the only permitted account
-write and login is refused. The claim updates the account, records setup as
-complete, and increments the session epoch in one transaction. Earlier sessions
-are invalidated, their open WebSockets are closed, and the response returns the
-replacement token. The setup token is then invalidated.
-
-See [Setup](setup.md#claiming-an-instance-from-a-browser).
+While setup is not complete, login is refused. Open `/setup`, enter the setup
+token that `nerve status` shows, and set a username and password or keep the
+installation passwordless. The claim updates the existing account, records
+setup as complete and deletes the token, in one transaction. See
+[Setup](setup.md#claiming-an-instance-from-a-browser).
 
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the
@@ -126,9 +113,9 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection. Open WebSockets re-check the account on each frame and close when
-the account is no longer authorized. Autonomous work, including cron jobs and
-background agents, uses the system actor rather than a human account.
+connection. An existing WebSocket keeps the identity it received when it
+connected. Autonomous work, including cron jobs and background agents, uses the
+system actor rather than a human account.
 
 ## Attribution
 

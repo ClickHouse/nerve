@@ -1,14 +1,11 @@
-"""Mandatory-token first-account claim and session cutover."""
+"""Mandatory-token first-account claim."""
 
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import httpx
-import jwt
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -17,9 +14,6 @@ from nerve import setup_token
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.db.accounts import JWT_SECRET_NAME
 from nerve.gateway.auth import (
-    JWT_ALGORITHM,
-    TOKEN_TYPE_CLAIM,
-    TOKEN_TYPE_SESSION,
     create_session_token,
     hash_password,
     pin_jwt_secret,
@@ -54,36 +48,6 @@ async def test_validation_errors_never_echo_the_setup_token():
     assert all("input" not in error for error in response.json()["detail"])
 
 
-def _legacy_token(secret: str = _SECRET) -> str:
-    now = datetime.now(timezone.utc)
-    return jwt.encode(
-        {"iat": now, "exp": now + timedelta(hours=720), "sub": "user"},
-        secret,
-        algorithm=JWT_ALGORITHM,
-    )
-
-
-def _pre_epoch_session_token(account_id: str, secret: str = _SECRET) -> str:
-    """A typed per-account token minted before the ``sep`` claim existed."""
-    now = datetime.now(timezone.utc)
-    return jwt.encode(
-        {
-            "iat": now,
-            "exp": now + timedelta(hours=720),
-            "sub": account_id,
-            TOKEN_TYPE_CLAIM: TOKEN_TYPE_SESSION,
-        },
-        secret,
-        algorithm=JWT_ALGORITHM,
-    )
-
-
-class _FakeSocket:
-    def __init__(self, token: str):
-        self.query_params = {"token": token}
-        self.cookies: dict[str, str] = {}
-
-
 def _app() -> FastAPI:
     app = FastAPI()
     app.include_router(setup_routes.router)
@@ -115,12 +79,8 @@ class _Install:
         account = await self.db.get_account(self.owner_id)
         return account["actor_id"]
 
-    def session_token(self, account_id: str | None = None, epoch: int = 0) -> str:
-        return create_session_token(
-            _SECRET,
-            account_id or self.owner_id,
-            session_epoch=epoch,
-        )
+    def session_token(self, account_id: str | None = None) -> str:
+        return create_session_token(_SECRET, account_id or self.owner_id)
 
 
 @pytest_asyncio.fixture
@@ -321,163 +281,6 @@ class TestClaim:
         response = await _claim(install)
         assert response.status_code == 403
 
-    async def test_socket_cleanup_is_best_effort(self, install, monkeypatch):
-        import nerve.gateway.server as server
-
-        async def explode():
-            raise RuntimeError("already gone")
-
-        monkeypatch.setattr(server, "close_revoked_sockets", explode)
-        response = await _claim(install)
-        assert response.status_code == 200
-        assert await setup_token.stored_setup_token(install.db) == ""
-
-
-@pytest.mark.asyncio
-class TestSessionEpoch:
-    async def test_preclaim_http_and_new_websocket_sessions_are_revoked(
-        self, install,
-    ):
-        before = install.session_token()
-        from nerve.gateway.auth import authenticate_websocket
-
-        assert await authenticate_websocket(_FakeSocket(before)) is not None
-        claimed = (await _claim(install)).json()["token"]
-
-        async with _client(install.app, token=before) as http:
-            assert (await http.get("/api/auth/check")).status_code == 401
-        assert await authenticate_websocket(_FakeSocket(before)) is None
-        async with _client(install.app, token=claimed) as http:
-            assert (await http.get("/api/accounts/me")).status_code == 200
-
-    async def test_a_token_from_any_other_epoch_is_refused(self, install):
-        # Reject tokens minted against older or future account state, including
-        # after a database restore or rollback.
-        future = install.session_token(epoch=1)
-        async with _client(install.app, token=future) as http:
-            assert (await http.get("/api/auth/check")).status_code == 401
-
-    async def test_legacy_tokens_survive_upgrade_then_die_at_claim(self, install):
-        legacy = _legacy_token()
-        async with _client(install.app, token=legacy) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-        await _claim(install)
-        async with _client(install.app, token=legacy) as http:
-            assert (await http.get("/api/auth/check")).status_code == 401
-
-    async def test_pre_epoch_account_tokens_survive_upgrade_then_die_at_claim(
-        self, install,
-    ):
-        token = _pre_epoch_session_token(install.owner_id)
-        async with _client(install.app, token=token) as http:
-            assert (await http.get("/api/auth/check")).status_code == 200
-        await _claim(install)
-        async with _client(install.app, token=token) as http:
-            assert (await http.get("/api/auth/check")).status_code == 401
-
-    async def test_epoch_moves_on_claim_and_password_change(self, install):
-        async def epoch() -> int:
-            account = await install.db.get_account(install.owner_id)
-            return int(account["session_epoch"])
-
-        assert await epoch() == 0
-        claimed = await _claim(install)
-        assert claimed.status_code == 200
-        assert await epoch() == 1
-
-        async with _client(
-            install.app,
-            token=claimed.json()["token"],
-        ) as http:
-            changed = await http.put("/api/accounts/me/password", json={
-                "current_password": _PASSWORD,
-                "new_password": "a-third-passphrase",
-            })
-        assert changed.status_code == 200
-        assert await epoch() == 2
-
-
-@pytest.mark.asyncio
-class TestStaleHttpWrites:
-    async def _claim_at(
-        self, install, monkeypatch, seam: str, **claim_kwargs,
-    ):
-        fired: list[bool] = []
-        original = getattr(install.db, seam)
-
-        async def claim_then(*args, **kwargs):
-            if not fired:
-                fired.append(True)
-                response = await _claim(install, **claim_kwargs)
-                assert response.status_code == 200, response.text
-            return await original(*args, **kwargs)
-
-        monkeypatch.setattr(install.db, seam, claim_then)
-        return fired
-
-    async def test_password_change_cannot_outlive_claim(
-        self, install, monkeypatch,
-    ):
-        visitor = install.session_token()
-        fired = await self._claim_at(install, monkeypatch, "login_state")
-        async with _client(install.app, token=visitor) as http:
-            response = await http.put(
-                "/api/accounts/me/password",
-                json={"new_password": "taken-over"},
-            )
-        assert fired
-        assert response.status_code in (401, 409)
-        account = await install.db.get_account(install.owner_id)
-        assert verify_password(_PASSWORD, account["credential"])
-        assert not verify_password("taken-over", account["credential"])
-
-    async def test_account_creation_cannot_outlive_claim(
-        self, install, monkeypatch,
-    ):
-        visitor = install.session_token()
-        fired = await self._claim_at(
-            install, monkeypatch, "create_managed_account",
-        )
-        async with _client(install.app, token=visitor) as http:
-            response = await http.post("/api/accounts", json={
-                "username": "mallory",
-                "password": "a-second-way-in",
-            })
-        assert fired
-        assert response.status_code in (401, 409)
-        assert await install.db.get_account_by_username("mallory") is None
-
-    async def test_disable_cannot_outlive_claim(self, install, monkeypatch):
-        visitor = install.session_token()
-        fired = await self._claim_at(install, monkeypatch, "disable_account")
-        async with _client(install.app, token=visitor) as http:
-            response = await http.post(
-                f"/api/accounts/{install.owner_id}/disable",
-            )
-        assert fired
-        assert response.status_code in (401, 409)
-        assert (await install.db.get_account(install.owner_id))["enabled"] is True
-
-    async def test_display_name_patch_cannot_outlive_claim(
-        self, install, monkeypatch,
-    ):
-        visitor = install.session_token()
-        fired = await self._claim_at(
-            install,
-            monkeypatch,
-            "login_state",
-            display_name="Alice Example",
-        )
-        async with _client(install.app, token=visitor) as http:
-            response = await http.patch(
-                f"/api/accounts/{install.owner_id}",
-                json={"display_name": "Mallory"},
-            )
-        assert fired
-        assert response.status_code in (401, 409)
-        actor = await install.db.get_actor_ref(await install.owner_actor_id())
-        assert actor["display_name"] == "Alice Example"
-
 
 @pytest.mark.asyncio
 class TestOnlyClaimSetsTheFirstPassword:
@@ -548,7 +351,6 @@ class TestSetupState:
         account = await install.db.get_account(install.owner_id)
         assert account["credential_source"] == "none"
         assert account["username"] is None
-        assert account["session_epoch"] == 1
         assert await install.db.setup_completed()
         assert await setup_token.stored_setup_token(install.db) == ""
         assert await _status(install) == {"auth_required": False, "login": "none"}

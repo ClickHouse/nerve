@@ -223,46 +223,21 @@ nerve start              # Start the server
 
 ## Claiming an instance from a browser
 
-A headless install with neither `NERVE_PASSWORD` nor `NERVE_PASSWORDLESS=1`
-starts with one account and setup not complete. Until setup is complete, login
-is refused and the claim is the only permitted action. Open `/setup` and do one
-of these in one atomic operation:
+If `nerve init` did not get a password or a passwordless choice (for example,
+`--non-interactive` with neither `NERVE_PASSWORD` nor `NERVE_PASSWORDLESS=1`),
+setup is not complete and sign-in is refused. To complete it:
 
-- set the account's username and password;
-- select "Keep this installation passwordless". The username is then optional.
-  After this, anyone who reaches the gateway is admitted as the owner.
+1. On the host, run `nerve status`. It shows the setup page and the setup token.
+2. Open `/setup` and enter the token.
+3. Set a username and password, or select "Keep this installation
+   passwordless". Without a password, anyone who can reach the gateway is the
+   owner.
 
-The display name is optional in both cases.
+The claim signs you in and deletes the token. To add a password after a
+passwordless setup, use the Accounts page. A password cannot be removed.
 
-Every claim requires the setup token. Read it locally with:
-
-```bash
-nerve status
-```
-
-The token is generated once, persisted in `nerve.db` across restarts, and
-invalidated when the claim succeeds. It is sent only in the claim request body:
-Nerve never places it in a URL, response, server log, or browser storage.
-
-The setup token is a bearer credential. For remote setup, protect it and the
-new password in transit by serving Nerve over HTTPS or reaching it through a
-trusted encrypted tunnel. Do not expose a plaintext remote setup page.
-
-The claim updates the existing account rather than creating another, so earlier
-attribution keeps its identity. Exactly one concurrent claimant can win. It
-also advances the account's session epoch: pre-claim HTTP sessions become
-unauthorized, open WebSockets are rechecked and closed, and the successful
-response carries the one new client session token. The browser refreshes
-`/api/auth/status`, `/api/auth/me`, and the actor directory before
-routing to chat.
-
-Browser setup ends there. Provider credentials, profile configuration,
-channels, automation, and daemon lifecycle remain in `nerve init`, the CLI,
-configuration files, and their dedicated product surfaces.
-
-While setup is not complete, claiming is the only way to set the first password.
-`PUT /api/accounts/me/password` refuses in that state. After a passwordless
-setup, that endpoint sets the first password. A password cannot be removed.
+The setup token is a bearer credential. For remote setup, use HTTPS or an
+encrypted tunnel.
 
 ## HTTPS Setup
 

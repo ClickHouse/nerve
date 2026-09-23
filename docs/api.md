@@ -116,7 +116,7 @@ not change when the username changes.
 | `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
 | `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
 | `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
-| `PUT /api/accounts/me/password` | Change your password using `{current_password?, new_password}`; revokes other sessions and returns a replacement in `X-Nerve-Token` |
+| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
 
 Failures:
 
@@ -127,8 +127,8 @@ Failures:
 | `404` | Account not found |
 | `409` | Username or account-state conflict; the response explains the conflict |
 
-Disabling an account affects its next request or WebSocket frame. The server
-closes an open connection instead of changing its actor.
+Disabling an account affects its next request. An existing WebSocket keeps its
+accepted identity until it reconnects.
 
 ### Setup claim
 
@@ -165,10 +165,8 @@ body, and invalidated after success. It never appears in a URL, response,
 server log, or browser storage. Use HTTPS or a protected tunnel when claiming
 remotely.
 
-The claim, the setup completion record and the session-epoch bump are one
-database transaction. Of concurrent claimants exactly one can win. Every
-session minted before the claim becomes stale; open WebSockets are rechecked and
-closed.
+The claim and the setup completion record are one database transaction. Of
+concurrent claimants exactly one can win.
 
 | Response | When |
 |---|---|
@@ -199,50 +197,6 @@ This is an identity, not an account: nothing from `accounts` appears here (no
 username, no `enabled`, no `has_password`), and an actor need not have an
 account at all — the system principal does not. A disabled person's actor is
 still readable, because their history stays in the UI after their access ends.
-
-### Accounts
-
-Every signed-in account can manage accounts. System credentials cannot. Account
-responses never include password hashes or their storage location.
-
-An account is:
-
-```json
-{
-  "id": "…",
-  "actor_id": "…",
-  "username": "alice",
-  "display_name": "Alice",
-  "enabled": true,
-  "has_password": true,
-  "created_at": "…"
-}
-```
-
-`id` identifies the account. `actor_id` is the stable attribution ID and does
-not change when the username changes.
-
-| Endpoint | Does |
-|---|---|
-| `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
-| `GET /api/accounts/me` | the signed-in account |
-| `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
-| `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
-| `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
-| `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
-| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
-
-Failures:
-
-| Response | When |
-|---|---|
-| `400` | Invalid username or password longer than 72 UTF-8 bytes |
-| `403` | System credential, or current password not supplied or incorrect |
-| `404` | Account not found |
-| `409` | Username or account-state conflict; the response explains the conflict |
-
-Disabling an account affects its next request or WebSocket frame. The server
-closes an open connection instead of changing its actor.
 
 ### Sessions
 
@@ -793,11 +747,10 @@ Response: { "status": "ok", "version": "0.1.0" }
 ## WebSocket Protocol
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
-too). The token is resolved to an actor at accept and rechecked before each
-inbound frame. A credential refused at admission closes with code `4001`; a
-stale session epoch or an account disabled after admission closes with policy
-code `1008`. Reconnect after logging in again. The actor is never
-rewritten, so stored attribution remains with the identity that sent it.
+too). The token is resolved to an actor at admission. A credential that names
+nobody is refused with close code `4001`. Once admitted, both identity and
+authority remain fixed until the socket reconnects; account changes are checked
+at the next connection.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token

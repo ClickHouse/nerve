@@ -1,9 +1,7 @@
-"""Secure first-account claim.
+"""First-account claim, the one unauthenticated write.
 
-This is intentionally not an administration wizard. The sole unauthenticated
-write completes setup of the account created at install time: it either sets a
-username and password, or records the choice of a passwordless installation.
-Every request must carry the persisted setup token in its JSON body.
+It gives the install-time account a username and password, or records the
+passwordless choice. Every request must carry the setup token.
 """
 
 from __future__ import annotations
@@ -73,9 +71,7 @@ async def claim(req: ClaimRequest):
                    "or set auth.jwt_secret.",
         )
 
-    # Validate before reading claimability. A caller without the credential
-    # learns nothing here, and an absent stored value still takes the same
-    # constant-time comparison path against the module decoy.
+    # Check the token first, so a caller without it learns nothing.
     stored = await stored_setup_token(store)
     if not token_accepted(req.setup_token, stored):
         raise HTTPException(status_code=403, detail=_GUARD_REFUSED)
@@ -113,22 +109,9 @@ async def claim(req: ClaimRequest):
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    # Closing is best-effort. Per-frame epoch checks independently prevent a
-    # stale socket from acting if proactive closure misses or fails.
-    try:
-        from nerve.gateway.server import close_revoked_sockets
-
-        await close_revoked_sockets()
-    except Exception as e:  # noqa: BLE001 - the claim has already committed
-        logger.warning("Claim: open sockets could not be closed: %s", e)
-
     logger.info(
-        "Instance claimed: account %s %s; pre-claim sessions were revoked",
+        "Instance claimed: account %s %s",
         account["id"],
         "now has a password" if credential else "stays passwordless by choice",
     )
-    return ClaimResponse(token=create_session_token(
-        secret,
-        account["id"],
-        session_epoch=account.get("session_epoch") or 0,
-    ))
+    return ClaimResponse(token=create_session_token(secret, account["id"]))

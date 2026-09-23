@@ -14,18 +14,16 @@ import asyncio
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 
 from nerve.config import AuthConfig, NerveConfig, set_config
 from nerve.gateway.auth import (
-    SESSION_TOKEN_HEADER,
     create_session_token,
     create_system_token,
     hash_password,
     pin_jwt_secret,
     verify_password,
 )
-from nerve.gateway import server
 from nerve.gateway.routes import accounts as accounts_routes
 from nerve.gateway.routes import auth as auth_routes
 
@@ -37,15 +35,6 @@ _PASSWORD = "correct-horse-battery-staple"
 
 def _app() -> FastAPI:
     app = FastAPI()
-
-    @app.middleware("http")
-    async def _return_replacement_token(request: Request, call_next):
-        response = await call_next(request)
-        token = getattr(request.state, "refreshed_token", None)
-        if token:
-            response.headers[SESSION_TOKEN_HEADER] = token
-        return response
-
     app.include_router(auth_routes.router)
     app.include_router(accounts_routes.router)
     return app
@@ -211,9 +200,7 @@ class TestNoCredentialEverLeaves:
         async with _client(install.app) as client:
             before = await client.get("/api/accounts/me", headers=install.headers())
             assert before.json()["has_password"] is False
-            # The claim endpoint sets the first password. This endpoint refuses
-            # while the instance is unclaimed because every caller already has
-            # the passwordless session that requires no current password.
+            # While setup is required, only the claim sets the first password.
             await install.secure_the_owner()
             after = await client.get("/api/accounts/me", headers=install.headers())
             assert after.json()["has_password"] is True
@@ -427,8 +414,7 @@ class TestLastAccountGuard:
             assert back.json()["enabled"] is True
 
     async def test_unknown_account(self, install: _Install):
-        # Claim first because an unclaimed instance refuses every account
-        # mutation before looking up the target. This test covers a missing id.
+        # PATCH refuses while setup is required, before it looks up the id.
         await install.secure_the_owner()
         async with _client(install.app) as client:
             for path in ("/api/accounts/nope/disable", "/api/accounts/nope/enable"):
@@ -534,14 +520,7 @@ class TestOwnPassword:
     async def test_the_first_password_of_an_unclaimed_instance_is_refused_here(
         self, install: _Install,
     ):
-        """Only the guarded claim endpoint may set the first password.
-
-        This endpoint needs no current password when the account has none —
-        which is exactly the state a passwordless install is in, and a
-        passwordless install hands a session to anybody who asks. So while the
-        instance is unclaimed it refuses and points at the claim endpoint,
-        which requires the mandatory setup token.
-        """
+        """While setup is required, only the token-guarded claim sets it."""
         async with _client(install.app) as client:
             response = await client.put(
                 "/api/accounts/me/password", json={"new_password": _PASSWORD},
@@ -555,13 +534,7 @@ class TestOwnPassword:
     async def test_an_account_with_no_password_beside_others_may_still_set_one(
         self, install: _Install,
     ):
-        """The guard is about the *instance*, not about this account.
-
-        Two accounts and one of them has no credential — a restored
-        ``--no-secrets`` bundle — is not the unclaimed state: nobody is being
-        admitted without a password, so the account that has none may set its
-        first one with nothing to prove beyond being signed in.
-        """
+        """The setup guard is about the instance, not this account."""
         await install.secure_the_owner()
         second = await install.db.create_managed_account(
             username="bob", credential=hash_password(_PASSWORD),
@@ -601,52 +574,6 @@ class TestOwnPassword:
         assert right.status_code == 200
         account = await install.db.get_account(install.owner_id)
         assert verify_password("another-one", account["credential"])
-
-    async def test_a_change_revokes_old_sessions_and_replaces_the_calling_one(
-        self, install: _Install,
-    ):
-        await install.secure_the_owner()
-        old_token = install.token()
-
-        class _OpenSocket:
-            closed: tuple[int, str] | None = None
-
-            async def close(self, code: int, reason: str) -> None:
-                self.closed = (code, reason)
-
-        socket = _OpenSocket()
-        actor = await server.actor_for_account(
-            install.db, install.owner_id, session_epoch=0,
-        )
-        connection = server.WebSocketConnection(
-            client_id="stolen-session", actor=actor, session_epoch=0,
-        )
-        server._live_sockets[connection.client_id] = (connection, socket)
-        try:
-            async with _client(install.app) as client:
-                changed = await client.put(
-                    "/api/accounts/me/password",
-                    json={
-                        "current_password": _PASSWORD,
-                        "new_password": "another-one",
-                    },
-                    headers=_bearer(old_token),
-                )
-                assert changed.status_code == 200, changed.text
-                replacement = changed.headers[SESSION_TOKEN_HEADER]
-                assert replacement and replacement != old_token
-                assert socket.closed == (
-                    server.WS_REVOKED_CODE, server.WS_REVOKED_REASON,
-                )
-
-                assert (await client.get(
-                    "/api/accounts/me", headers=_bearer(old_token),
-                )).status_code == 401
-                assert (await client.get(
-                    "/api/accounts/me", headers=_bearer(replacement),
-                )).status_code == 200
-        finally:
-            server._live_sockets.pop(connection.client_id, None)
 
     async def test_a_configured_password_counts_as_the_current_one(self, install: _Install):
         """A ``config``-source account has a password — in configuration — so it
@@ -788,14 +715,9 @@ class TestTheRouteSurface:
 
     def test_only_four_api_endpoints_are_unauthenticated(self):
         """Login and status are the doors themselves; the worker-token exchange
-        authenticates through the MCP path instead. Anything else appearing
-        here is a hole.
-
-        The fourth is the claim endpoint. Before a claim, the single account
-        has no password and every caller is admitted, so requiring a session would
-        protect nothing. What protects it is the mandatory setup token, which
-        this scan cannot see; the tests in
-        ``test_setup_wizard.py`` are what pin it."""
+        authenticates through the MCP path instead. The setup claim is guarded
+        by its token, which ``test_setup_wizard.py`` covers. Anything else
+        appearing here is a hole."""
         open_endpoints = {
             (tuple(methods), path)
             for methods, path, gates in self._endpoints()
@@ -872,9 +794,7 @@ class TestPasswordLength:
         (_MULTIBYTE_OVER, 400),
     ])
     async def test_changing_your_own_password(self, install: _Install, password, status):
-        # Claim first because this endpoint refuses an unclaimed instance,
-        # where the first password must go through the guarded claim instead.
-        # The limit is the same on both doors; this one is about the limit.
+        # This endpoint refuses while setup is required.
         await install.secure_the_owner()
         async with _client(install.app) as client:
             response = await client.put(

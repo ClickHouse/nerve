@@ -250,10 +250,7 @@ async def login(req: LoginRequest):
     if credential:
         await _maybe_upgrade_hash(store, account, req.password)
 
-    # Use the account's current epoch so a post-claim login is immediately valid.
-    return LoginResponse(token=create_session_token(
-        secret, actor.account_id, session_epoch=account.get("session_epoch") or 0,
-    ))
+    return LoginResponse(token=create_session_token(secret, actor.account_id))
 
 
 @router.get("/api/auth/status")

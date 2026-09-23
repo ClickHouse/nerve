@@ -20,13 +20,12 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from nerve.config import get_config
 from nerve.db.accounts import (
     AccountError,
-    StaleSessionError,
     LastAccountError,
     PasswordlessInstanceError,
     UnnamedAccountError,
@@ -34,8 +33,6 @@ from nerve.db.accounts import (
 )
 from nerve.gateway.auth import (
     PasswordTooLongError,
-    create_session_token,
-    effective_jwt_secret,
     hash_password,
     password_length_problem,
     require_auth,
@@ -54,7 +51,7 @@ router = APIRouter()
 # "conflict" means and what tells a UI to re-read and explain rather than to
 # re-validate the form.
 _CONFLICT = (PasswordlessInstanceError, UnnamedAccountError, UsernameTakenError,
-             LastAccountError, StaleSessionError)
+             LastAccountError)
 
 
 class AccountOut(BaseModel):
@@ -208,12 +205,6 @@ async def create_account(req: AccountCreateRequest, actor: Actor = Depends(requi
             username=req.username,
             credential=_hashed(req.password),
             display_name=(req.display_name or None),
-            # The epoch this request was *authorised* under, checked inside the
-            # transaction: a create admitted while the instance was
-            # passwordless must not leave an account behind if a claim lands
-            # while it is in flight.
-            acting_account_id=actor.account_id,
-            acting_session_epoch=actor.session_epoch,
         )
     except _CONFLICT as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -242,9 +233,7 @@ async def update_account(
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
 
-    **Refused while setup is required:** only the setup-token claim may change
-    the account of an unclaimed instance. After a passwordless setup, anyone
-    who reaches the gateway is the account owner and may rename it.
+    Refused while setup is required: only the claim may change that account.
     """
     db = get_deps().db
     config = get_config()
@@ -261,12 +250,7 @@ async def update_account(
 
     if req.username is not None:
         try:
-            account = await db.update_account_login(
-                account_id, username=req.username,
-                expected_session_epoch=(
-                    actor.session_epoch if account_id == actor.account_id else None
-                ),
-            )
+            account = await db.update_account_login(account_id, username=req.username)
         except _CONFLICT as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         except AccountError as e:
@@ -275,17 +259,9 @@ async def update_account(
             raise HTTPException(status_code=404, detail="Account not found")
 
     if req.display_name is not None:
-        try:
-            await db.update_actor_profile(
-                account["actor_id"],
-                display_name=(req.display_name.strip() or None),
-                # Check the caller's epoch in the write transaction so a rename
-                # authorized before a claim cannot commit after it.
-                acting_account_id=actor.account_id,
-                acting_session_epoch=actor.session_epoch,
-            )
-        except StaleSessionError as e:
-            raise HTTPException(status_code=409, detail=str(e)) from e
+        await db.update_actor_profile(
+            account["actor_id"], display_name=(req.display_name.strip() or None),
+        )
     return await _render(db, account)
 
 
@@ -295,20 +271,13 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
-    what stops it — at every door. An open WebSocket is checked the same way
-    before each inbound frame and closed when the row says no, so it ends at
-    the next thing it says rather than at the next time it reconnects. What it
-    already sent keeps the actor it was accepted with; a connection that may no
-    longer act is closed, never re-pointed at somebody else.
+    what stops it — at every door. An open WebSocket keeps the identity it was
+    accepted with until it reconnects.
     """
     db = get_deps().db
     try:
-        account = await db.disable_account(
-            account_id,
-            acting_account_id=actor.account_id,
-            acting_session_epoch=actor.session_epoch,
-        )
-    except (LastAccountError, StaleSessionError) as e:
+        account = await db.disable_account(account_id)
+    except LastAccountError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -320,14 +289,7 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 async def enable_account(account_id: str, actor: Actor = Depends(require_account)):
     """Re-enable an account. Idempotent."""
     db = get_deps().db
-    try:
-        account = await db.enable_account(
-            account_id,
-            acting_account_id=actor.account_id,
-            acting_session_epoch=actor.session_epoch,
-        )
-    except StaleSessionError as e:
-        raise HTTPException(status_code=409, detail=str(e)) from e
+    account = await db.enable_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     logger.info("Account %s enabled by account %s", account_id, actor.account_id)
@@ -336,30 +298,25 @@ async def enable_account(account_id: str, actor: Actor = Depends(require_account
 
 @router.put("/api/accounts/me/password", response_model=AccountOut)
 async def change_own_password(
-    req: PasswordChangeRequest,
-    request: Request,
-    actor: Actor = Depends(require_account),
+    req: PasswordChangeRequest, actor: Actor = Depends(require_account),
 ):
     """Set your own password. Nobody can set anyone else's.
 
     ``current_password`` is required whenever the account already has one —
     from its own row or from ``auth.password_hash`` — so a stolen session token
-    is not on its own enough to take the account over.
+    is not on its own enough to take the account over. An account with no
+    password may set its first one without it.
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
-    current password is the empty string. Existing credentials may represent an
-    empty password, so it must be compared.
+    current password is the empty string, which a credential made before this
+    release can legitimately be, so it is compared rather than rejected out of
+    hand.
 
     Setting a password moves the account to its own credential, after which
-    ``auth.password_hash`` no longer applies to it. It also advances the
-    account's session epoch: every older HTTP token and open WebSocket is
-    revoked, while this response supplies the calling tab a replacement token.
+    ``auth.password_hash`` no longer applies to it.
 
-    **While setup is required this endpoint refuses.** Only
-    ``POST /api/setup/claim``, protected by the setup token, may set the first
-    password of an unclaimed instance. After a passwordless setup this endpoint
-    sets the first password, and anyone who reaches the gateway may call it.
+    Refused while setup is required: only the claim may set that first password.
     """
     db = get_deps().db
     config = get_config()
@@ -384,42 +341,12 @@ async def change_own_password(
     try:
         updated = await db.update_account_login(
             account["id"], credential=_hashed(req.new_password),
-            # Check the request's epoch in the write transaction. Otherwise a
-            # concurrent claim could set a password after the passwordless check
-            # and this write could replace it without verification.
-            expected_session_epoch=actor.session_epoch,
-            revoke_sessions=True,
         )
-    except _CONFLICT as e:
-        # The instance changed after this request was authorized.
-        raise HTTPException(status_code=409, detail=str(e)) from e
     except AccountError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if updated is None:  # pragma: no cover - removed between two reads
         raise HTTPException(status_code=404, detail="Account not found")
-    # Replace the caller's token after revoking credentials at the old epoch.
-    # Response middleware sends it through X-Nerve-Token.
-    request.state.refreshed_token = create_session_token(
-        effective_jwt_secret(config),
-        updated["id"],
-        session_epoch=updated["session_epoch"],
-    )
-
-    # Per-frame checks stop a stale socket acting. Close it now as well so it
-    # cannot continue receiving broadcasts while it stays silent.
-    try:
-        from nerve.gateway.server import close_revoked_sockets
-
-        await close_revoked_sockets()
-    except Exception as e:  # noqa: BLE001 - the password change already committed
-        logger.warning(
-            "Password change: open sockets could not be closed: %s", e,
-        )
-
-    logger.info(
-        "Account %s changed its own password and revoked prior sessions",
-        account["id"],
-    )
+    logger.info("Account %s changed its own password", account["id"])
     return await _render(db, updated)
 
 
@@ -455,10 +382,10 @@ def account_credential(account: dict, config) -> str:
 def instance_is_passwordless(state, config) -> bool:
     """Whether the instance has one account and no credential anywhere.
 
-    Neither on its row nor in configuration. Both halves are read here so
-    the login route and ``/api/auth/status`` cannot disagree about which state
-    the instance is in (a status that says "passwordless" while login wants a
-    password is a browser that logs itself out in a loop).
+    Both the row and configuration are read here so the login route and
+    ``/api/auth/status`` cannot disagree about which state the instance is in
+    (a status that says "passwordless" while login wants a password is a
+    browser that logs itself out in a loop).
     """
     return state.passwordless and not config.auth.password_hash
 
@@ -466,9 +393,7 @@ def instance_is_passwordless(state, config) -> bool:
 def setup_required(state, config) -> bool:
     """Whether only the setup-token claim is permitted.
 
-    True for a passwordless instance whose setup is not complete. A credential
-    completes setup, so an instance with a password never needs setup. A
-    passwordless instance with complete setup admits anyone who reaches the
-    gateway as the one account.
+    True when there is no credential anywhere and setup is not recorded as
+    complete. A credential always completes setup.
     """
     return instance_is_passwordless(state, config) and not state.setup_complete
