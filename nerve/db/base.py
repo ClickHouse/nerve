@@ -37,6 +37,7 @@ from nerve.db.tasks import TaskStore
 from nerve.db.usage import UsageStore
 from nerve.db.wakeups import WakeupStore
 from nerve.db.workflow_runs import WorkflowRunStore
+from nerve.identity import ACTOR_KIND_SYSTEM, Actor
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +338,7 @@ class Database(
         # Per-connection pragmas (see _DEFAULT_PRAGMAS). Copied per instance so
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
-        self._system_actor_id: str | None = None
+        self._system_actor: Actor | None = None
         # The state-file modes connect() found after its repair. The identity
         # bootstrap reads this before it stores a signing secret in the
         # database (nerve.migrate._refuse_insecure_secret_storage).
@@ -411,7 +412,7 @@ class Database(
                     "; ".join(self.state_permissions.readable_hazards), _DB_FILE_MODE,
                 )
             await run_migrations(self._db)
-            await self._cache_system_actor_id()
+            await self._cache_system_actor()
             # After migrations, so the table exists. A key that other users
             # could read is compromised.
             if exposed:
@@ -419,7 +420,7 @@ class Database(
             await self._check_fts_integrity()
         except BaseException:
             db, self._db = self._db, None
-            self._system_actor_id = None
+            self._system_actor = None
             try:
                 await db.close()
             except Exception as e:  # noqa: BLE001 — never mask the real failure
@@ -428,10 +429,10 @@ class Database(
                 )
             raise
 
-    async def _cache_system_actor_id(self) -> None:
+    async def _cache_system_actor(self) -> None:
         """Validate and cache the one system actor created by migrations."""
         async with self.db.execute(
-            "SELECT id FROM actor_refs WHERE kind = 'system'"
+            "SELECT id, display_name FROM actor_refs WHERE kind = 'system'"
         ) as cursor:
             rows = await cursor.fetchall()
         if len(rows) != 1:
@@ -444,14 +445,27 @@ class Database(
             raise IdentityInvariantError(
                 "actor identity is corrupt: the system actor has no invariant id"
             )
-        self._system_actor_id = actor_id
+        self._system_actor = Actor(
+            actor_id=actor_id,
+            kind=ACTOR_KIND_SYSTEM,
+            display_name=rows[0]["display_name"],
+        )
+
+    @property
+    def system_actor(self) -> Actor:
+        """The actor for autonomous work, validated and cached at connect.
+
+        Schema triggers prevent a change to its id or kind, so no caller has to
+        read the row again.
+        """
+        if self._system_actor is None:
+            raise RuntimeError("Database not connected. Call connect() first.")
+        return self._system_actor
 
     @property
     def system_actor_id(self) -> str:
         """The migration-validated system actor id for this connection."""
-        if self._system_actor_id is None:
-            raise RuntimeError("Database not connected. Call connect() first.")
-        return self._system_actor_id
+        return self.system_actor.actor_id
 
     async def _rotate_exposed_signing_secret(self) -> None:
         """Delete a stored signing secret that other users could read, and
@@ -496,7 +510,7 @@ class Database(
         if self._db:
             await self._db.close()
             self._db = None
-            self._system_actor_id = None
+            self._system_actor = None
 
     @property
     def db(self) -> aiosqlite.Connection:

@@ -21,7 +21,6 @@ from nerve.identity import (
     ActorResolutionError,
     actor_for_account,
     actor_for_sole_account,
-    system_actor,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -264,11 +263,11 @@ def identity_store() -> "Database | None":
 async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     """Resolve verified token claims to their current actor."""
     if claims.get("aud") == MCP_AUDIENCE:
-        return await system_actor(store)
+        return store.system_actor
 
     token_type = claims.get(TOKEN_TYPE_CLAIM)
     if token_type == TOKEN_TYPE_SYSTEM:
-        return await system_actor(store)
+        return store.system_actor
     if token_type == TOKEN_TYPE_SESSION:
         return await actor_for_account(store, claims.get("sub"))
     if is_legacy_session_token(claims):

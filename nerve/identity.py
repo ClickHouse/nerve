@@ -2,8 +2,9 @@
 
 This top-level module imports neither the database nor gateway at runtime, so
 both may use :class:`Actor`. Actors are resolved per request and passed down;
-there is no process-global current actor. ``actor_id`` is permanent identity,
-while ``display_name`` is only a presentation snapshot.
+there is no process-global current actor. The system actor cannot change, so
+the database caches it at connect (``Database.system_actor``). ``actor_id`` is
+permanent identity, while ``display_name`` is only a presentation snapshot.
 """
 
 from __future__ import annotations
@@ -93,27 +94,3 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
             "to a single account; sign in again"
         )
     return _actor_for_account_row(account)
-
-
-async def system_actor(store: "AccountStore") -> Actor:
-    """Resolve the account-less principal used for autonomous work."""
-    try:
-        row = await store.get_system_principal()
-    except RuntimeError as e:
-        # AccountStore validates this singleton when the database opens and
-        # raises if later external mutation breaks the cached invariant. Turn
-        # that storage failure into the same fail-closed resolution error every
-        # authenticated ingress already knows how to render.
-        raise ActorResolutionError(
-            "This instance has no valid system principal"
-        ) from e
-    if row is None:
-        raise ActorResolutionError(
-            "This instance has no system principal; identity bootstrap has not run"
-        )
-    return Actor(
-        actor_id=row["id"],
-        kind=row["kind"],
-        account_id=None,
-        display_name=row["display_name"],
-    )
