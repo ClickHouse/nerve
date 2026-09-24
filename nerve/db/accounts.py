@@ -88,16 +88,6 @@ class AccountStore:
             (credential_source, account_id),
         )
 
-    async def get_system_principal(self) -> dict:
-        """Compatibility accessor for the migration-guaranteed system actor."""
-        async with self.db.execute(
-            "SELECT * FROM actor_refs WHERE id = ?", (self.system_actor_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None or row["kind"] != "system":
-            raise RuntimeError("cached system actor no longer satisfies its invariant")
-        return dict(row)
-
     async def _get_instance_secret(self, name: str) -> str | None:
         async with self.db.execute(
             "SELECT value FROM instance_secrets WHERE name = ?", (name,)

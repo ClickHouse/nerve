@@ -77,7 +77,6 @@ async def test_migration_creates_one_stable_system_actor(db: Database):
 
     actor_id = db.system_actor_id
     assert uuid.UUID(actor_id).version == 4
-    assert (await db.get_system_principal())["id"] == actor_id
     await v047_accounts.up(db.db)
     async with db.db.execute(
         "SELECT id FROM actor_refs WHERE kind = 'system'"
@@ -129,7 +128,10 @@ async def test_system_actor_cannot_be_duplicated_deleted_or_reclassified(db: Dat
             "UPDATE OR REPLACE actor_refs SET id = ? WHERE id = ?",
             (db.system_actor_id, human),
         )
-    assert (await db.get_system_principal())["id"] == db.system_actor_id
+    async with db.db.execute(
+        "SELECT id FROM actor_refs WHERE kind = 'system'"
+    ) as cursor:
+        assert [row[0] async for row in cursor] == [db.system_actor_id]
 
 
 @pytest.mark.asyncio

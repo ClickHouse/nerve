@@ -460,7 +460,6 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
                 db.system_actor_id,
                 await db._get_instance_secret(JWT_SECRET_NAME),
                 await db._account_rows(),
-                await db.get_system_principal(),
             )
         finally:
             await db.close()
@@ -475,14 +474,13 @@ def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, 
     )
     assert rep.ok, rep.errors
 
-    found_system_id, found_secret, found_accounts, system = asyncio.run(
+    found_system_id, found_secret, found_accounts = asyncio.run(
         _read_back(nd2 / "nerve.db")
     )
     assert found_system_id == system_id
     assert found_accounts == accounts
     assert found_accounts[0]["id"] == identity.account_id
     assert found_accounts[0]["actor_id"] == identity.actor_id
-    assert system["id"] == system_id
     assert found_secret == secret == "stable-signing-secret"
 
 
