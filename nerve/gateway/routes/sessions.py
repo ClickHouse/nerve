@@ -17,7 +17,7 @@ from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor, system_actor
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -509,13 +509,11 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
         try:
             # Nerve generates this trigger, so it uses the system actor. The
             # person's star action is separate, and ``internal`` persists no
-            # user message. Failure to resolve the system actor must not make
-            # starring fail.
-            hook_actor = await system_actor(deps.db)
+            # user message.
             asyncio.create_task(
                 deps.engine.run(
                     session_id=session_id, user_message=trigger,
-                    source="web", internal=True, actor=hook_actor,
+                    source="web", internal=True, actor=deps.db.system_actor,
                 )
             )
         except Exception as e:  # a hook failure must never break the PATCH

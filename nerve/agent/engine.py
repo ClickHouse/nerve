@@ -66,7 +66,7 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
-from nerve.identity import Actor, system_actor
+from nerve.identity import Actor
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
@@ -1576,6 +1576,11 @@ class AgentEngine:
             )
             return 0
 
+        # Drain the queue up front so a resumed turn that triggers another
+        # restart re-enrolls into a clean file and ids are never double-run.
+        with contextlib.suppress(FileNotFoundError):
+            RESUME_QUEUE_FILE.unlink()
+
         seen: set[str] = set()
         ids: list[str] = []
         for line in raw.splitlines():
@@ -1585,17 +1590,6 @@ class AgentEngine:
                 ids.append(sid)
         if not ids:
             return 0
-
-        # Resolve before the queue file is deleted. Unlinking is what consumes
-        # the enrolment — nothing re-enrols an id afterwards — so a lookup that
-        # failed after it would forget every continuation the operator asked
-        # for, silently, with the sessions still sitting there resumable.
-        actor = await system_actor(self.db)
-
-        # Drain the queue up front so a resumed turn that triggers another
-        # restart re-enrolls into a clean file and ids are never double-run.
-        with contextlib.suppress(FileNotFoundError):
-            RESUME_QUEUE_FILE.unlink()
 
         resumed = 0
         for sid in ids:
@@ -1632,7 +1626,7 @@ class AgentEngine:
                     # it out of the transcript anyway. Whoever was talking to
                     # the session keeps their messages; the continuation is
                     # the assistant's.
-                    actor=actor,
+                    actor=self.db.system_actor,
                 )
                 resumed += 1
             except Exception as e:
@@ -3394,7 +3388,7 @@ class AgentEngine:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         # A scheduled run is the instance's own work, regardless of who wrote
         # the schedule. Human attribution belongs to the schedule mutation.
-        actor = await system_actor(self.db)
+        actor = self.db.system_actor
         session = await self.sessions.create_cron_session(
             job_id, run_id=run_id, actor=actor,
         )
@@ -3437,7 +3431,7 @@ class AgentEngine:
         isolated cron for long background work).
         """
         session_id = session_id or f"cron:{job_id}"
-        actor = await system_actor(self.db)
+        actor = self.db.system_actor
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
         )
@@ -3471,7 +3465,7 @@ class AgentEngine:
         task, in which case it is kept alive so the agent can resume when the
         task completes (see ``_teardown_oneshot_client``).
         """
-        actor = await system_actor(self.db)
+        actor = self.db.system_actor
         session = await self.sessions.create_hook_session(
             hook_name, hook_id, actor=actor,
         )

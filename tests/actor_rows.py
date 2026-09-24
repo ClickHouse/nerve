@@ -7,16 +7,15 @@ attribution needs no parent row.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
 
-from nerve.identity import Actor
+from nerve.identity import ACTOR_KIND_SYSTEM, Actor
 
 # Used only by tests whose database is a mock; never persisted.
-FAKE_SYSTEM_PRINCIPAL = {
-    "id": "00000000-0000-4000-8000-00000000515e",
-    "kind": "system",
-    "display_name": "nerve",
-}
+FAKE_SYSTEM_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000515e",
+    kind=ACTOR_KIND_SYSTEM,
+    display_name="nerve",
+)
 
 
 async def ensure_actor_row(db, *actors: Actor) -> None:
@@ -45,6 +44,6 @@ async def ensure_system_principal(db) -> str:
 
 
 def mock_system_principal(db) -> str:
-    """Configure a ``MagicMock`` database's system actor accessor."""
-    db.get_system_principal = AsyncMock(return_value=dict(FAKE_SYSTEM_PRINCIPAL))
-    return FAKE_SYSTEM_PRINCIPAL["id"]
+    """Configure a ``MagicMock`` database's system actor."""
+    db.system_actor = FAKE_SYSTEM_ACTOR
+    return FAKE_SYSTEM_ACTOR.actor_id

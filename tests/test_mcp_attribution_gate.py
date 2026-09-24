@@ -134,7 +134,7 @@ class TestOnlyALostRaceIsSurvivable:
             # Someone else got there first...
             await real_create(
                 kwargs["session_id"], source="external",
-                actor=await _system(mcp.db),
+                actor=mcp.db.system_actor,
             )
             raise RuntimeError("UNIQUE constraint failed: sessions.id")
 
@@ -149,9 +149,3 @@ class TestOnlyALostRaceIsSurvivable:
         session = await mcp.db.get_session(sid)
         assert session is not None
         assert session["created_by_actor_id"] == mcp.db.system_actor_id
-
-
-async def _system(db):
-    from nerve.identity import system_actor
-
-    return await system_actor(db)

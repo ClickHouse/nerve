@@ -23,7 +23,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
-from nerve.identity import Actor, system_actor
+from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -146,17 +146,6 @@ async def approve_plan(
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
 
-    # The prompt is assembled by Nerve from the task file and the approved
-    # plan — nobody typed it — so the turn is the instance's own work even
-    # though a person's approval started it. The session below carries who
-    # approved.
-    #
-    # Resolved here, before anything is written: the next statement moves the
-    # plan to 'implementing', which the guard above then refuses to approve
-    # again. Failing after that would strand the plan with no implementation
-    # and no way to retry it.
-    impl_actor = await system_actor(deps.db)
-
     # Mark plan as implementing immediately (prevents double-approve)
     await deps.db.update_plan(plan_id, status="implementing", reviewed_at=now)
 
@@ -239,7 +228,11 @@ async def approve_plan(
         try:
             await deps.engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
-                actor=impl_actor,
+                # Nerve assembles the prompt from the task file and the
+                # approved plan, so the turn is the instance's own work even
+                # though a person's approval started it. The session above
+                # carries who approved.
+                actor=deps.db.system_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

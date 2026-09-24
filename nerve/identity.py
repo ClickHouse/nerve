@@ -3,8 +3,9 @@
 An :class:`Actor` is the identity carried through an operation: the person who
 made the request, or the agent's system principal when the work is autonomous
 (cron, hooks, background agents). Human actors are resolved per request and
-passed down the call chain. Only the migration-guaranteed system actor may be
-cached by the database; there is no process-global "current actor".
+passed down the call chain. The system actor cannot change, so the database
+caches it at connect (``Database.system_actor``); there is no process-global
+"current actor".
 
 This module sits at the top level, outside both :mod:`nerve.db` and
 :mod:`nerve.gateway`, because both ends need it: the gateway resolves an actor
@@ -105,32 +106,3 @@ async def actor_for_sole_account(store: "AccountStore") -> Actor:
             "to a single account; sign in again"
         )
     return _actor_for_account_row(account)
-
-
-async def system_actor(store: "AccountStore") -> Actor:
-    """The agent's system principal — the identity autonomous work acts as.
-
-    Scheduled runs, hooks, background agents and the agent's own calls into its
-    API are attributed to this actor rather than to a person. It has no account
-    and never logs in.
-    """
-    try:
-        row = await store.get_system_principal()
-    except RuntimeError as e:
-        # AccountStore validates this singleton when the database opens and
-        # raises if later external mutation breaks the cached invariant. Turn
-        # that storage failure into the same fail-closed resolution error every
-        # authenticated ingress already knows how to render.
-        raise ActorResolutionError(
-            "This instance has no valid system principal"
-        ) from e
-    if row is None:
-        raise ActorResolutionError(
-            "This instance has no system principal; identity bootstrap has not run"
-        )
-    return Actor(
-        actor_id=row["id"],
-        kind=row["kind"],
-        account_id=None,
-        display_name=row["display_name"],
-    )

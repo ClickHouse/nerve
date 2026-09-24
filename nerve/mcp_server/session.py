@@ -18,8 +18,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from nerve.identity import system_actor
-
 if TYPE_CHECKING:
     from nerve.db import Database
 
@@ -146,7 +144,6 @@ class SatelliteSessionResolver:
                 "origin_ids": ["nerve-mcp-detected"],
             }
             title = f"Codex/mcp ({client_session_id[:8]})"
-            actor = await system_actor(self.db)
             try:
                 await self.db.create_session(
                     session_id=sid,
@@ -154,7 +151,7 @@ class SatelliteSessionResolver:
                     source="external",
                     metadata=metadata,
                     status="active",
-                    actor=actor,
+                    actor=self.db.system_actor,
                 )
                 logger.info(
                     "Created Codex satellite session %s via MCP (mcp=%s)",
@@ -178,7 +175,6 @@ class SatelliteSessionResolver:
             "runtime": f"{safe_client}-external",
         }
         title = f"{safe_client} ({mcp_session_id[:8]})"
-        actor = await system_actor(self.db)
         try:
             await self.db.create_session(
                 session_id=sid,
@@ -186,7 +182,7 @@ class SatelliteSessionResolver:
                 source="external",
                 metadata=metadata,
                 status="active",
-                actor=actor,
+                actor=self.db.system_actor,
             )
             logger.info(
                 "Created satellite session %s (client=%s, mcp=%s)",

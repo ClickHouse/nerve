@@ -35,7 +35,7 @@ class SessionStore:
         ``actor`` is required — keyword-only and with no default — so that
         every call site has to answer the question rather than inherit an
         answer. Pass the request's actor for something a person asked for, the
-        agent's system principal (``nerve.identity.system_actor``) for the
+        agent's system principal (``Database.system_actor``) for the
         sessions the instance mints for itself, and ``None`` where attribution
         is unavailable. ``source`` is transport provenance, never identity.
 

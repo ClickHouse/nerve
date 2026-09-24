@@ -16,7 +16,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
-from nerve.identity import system_actor
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -205,7 +204,7 @@ class CodexIngester:
             cwd=meta.cwd,
             # The sync created this row, not a person — the Codex thread it
             # mirrors was started outside Nerve entirely.
-            actor=await system_actor(self.db),
+            actor=self.db.system_actor,
         )
         await self.db.bind_native_thread("codex", event.thread_id, session_id)
         self.stats["threads_in_scope"] += 1

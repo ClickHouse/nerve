@@ -19,7 +19,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nerve.identity import Actor, system_actor
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -442,6 +441,12 @@ class NotificationService:
                 notif, answer, answered_by,
             )
 
+        success = await self.db.answer_notification(
+            notification_id, answer, answered_by,
+        )
+        if not success:
+            return False
+
         session_id = notif["session_id"]
 
         from nerve.agent.streaming import broadcaster
@@ -455,22 +460,6 @@ class NotificationService:
         is_external = bool(
             session_record and session_record.get("source") == "external"
         )
-
-        # Resolve before answering, for a session we are going to inject into.
-        # ``answer_notification`` moves the row out of ``pending``, and this
-        # method refuses a row that is not pending — so once it has run, an
-        # answer that never reached the agent cannot be given again. The UI
-        # would report success on a question the agent is still waiting for.
-        # An external session injects nothing, so it needs no actor.
-        actor = None
-        if not is_external:
-            actor = await system_actor(self.db)
-
-        success = await self.db.answer_notification(
-            notification_id, answer, answered_by,
-        )
-        if not success:
-            return False
 
         if is_external:
             await broadcaster.broadcast("__global__", {
@@ -502,12 +491,11 @@ class NotificationService:
         # dispatcher. The old ``is_running`` skip here silently dropped
         # answers that arrived while the session was busy.
         try:
-            await self._dispatch_into_session(
+            self._dispatch_into_session(
                 session_id,
                 injected_message,
                 source=f"notification:{answered_by}",
                 channel=answered_by,
-                actor=actor,
             )
         except Exception as e:
             logger.error(
@@ -692,7 +680,7 @@ class NotificationService:
                 exc, event.get("event"),
             )
 
-    async def _dispatch_into_session(
+    def _dispatch_into_session(
         self,
         session_id: str,
         message: str,
@@ -700,7 +688,6 @@ class NotificationService:
         source: str,
         channel: str | None = None,
         internal: bool = False,
-        actor: "Actor | None" = None,
     ) -> None:
         """Fire-and-forget ``engine.run()`` into a session.
 
@@ -709,23 +696,11 @@ class NotificationService:
         any in-flight turn and runs when it finishes (FIFO) — the
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
-
-        Async only so the actor can be resolved *before* the task is spawned.
-        Resolving it inside the task would put an ``await`` in front of the
-        lock acquisition, and two answers dispatched in quick succession
-        could then reach the session in the other order — the exact FIFO
-        property this method exists to provide.
-
-        ``actor`` may be passed in by a caller that had to resolve it earlier
-        still — before it consumed something the answer cannot be given
-        again — and is resolved here otherwise.
         """
         # The text is this service's — an answer relayed into the session, or
         # a redelivery notice. The person who answered is recorded on the
         # notification itself. This service generates the prompt, so assigning
         # the responder as its author would be incorrect.
-        if actor is None:
-            actor = await system_actor(self.db)
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -733,7 +708,7 @@ class NotificationService:
                 source=source,
                 channel=channel,
                 internal=internal,
-                actor=actor,
+                actor=self.db.system_actor,
             )
         )
         task.add_done_callback(self._on_answer_task_done)
@@ -1190,19 +1165,12 @@ class NotificationService:
         a ``notification_expired`` broadcast, and the Telegram card is
         edited to show it expired. ``notify``-kind expiry stays silent.
         """
-        # Resolved before the flip. Expiring is one-way, and the note that
-        # tells an asking session its question died can only be produced from
-        # the rows that flip — so a lookup failure here costs one tick, and
-        # the next sweep expires them and reports them together.
-        actor = await system_actor(self.db)
         rows = await self.db.expire_due_notifications()
         if rows:
-            await self._report_expired(rows, actor)
+            await self._report_expired(rows)
         return len(rows)
 
-    async def _report_expired(
-        self, rows: list[dict[str, Any]], actor: "Actor | None" = None,
-    ) -> None:
+    async def _report_expired(self, rows: list[dict[str, Any]]) -> None:
         """Report expired questions/approvals to every interested party.
 
         Silent-by-construction expiry was the bug: the asking session
@@ -1256,13 +1224,10 @@ class NotificationService:
         for notif in questions:
             by_session.setdefault(notif["session_id"], []).append(notif)
         for session_id, session_rows in by_session.items():
-            await self._inject_expiry_note(session_id, session_rows, actor)
+            await self._inject_expiry_note(session_id, session_rows)
 
     async def _inject_expiry_note(
-        self,
-        session_id: str,
-        rows: list[dict[str, Any]],
-        actor: "Actor | None" = None,
+        self, session_id: str, rows: list[dict[str, Any]],
     ) -> None:
         """Inject an expired-unanswered note into the asking session.
 
@@ -1311,12 +1276,11 @@ class NotificationService:
             )
             message = f"[Questions expired unanswered]\n{titles}"
 
-        await self._dispatch_into_session(
+        self._dispatch_into_session(
             session_id,
             message,
             source="notification:expiry",
             internal=True,
-            actor=actor,
         )
 
     async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:

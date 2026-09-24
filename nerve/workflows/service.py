@@ -56,7 +56,6 @@ from typing import TYPE_CHECKING, Any
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
-from nerve.identity import system_actor
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -498,7 +497,7 @@ class WorkflowRunService:
                 f"[{parent_title}] {label}" if parent_title
                 else f"Workflow: {label}"
             )
-            leg_actor = await system_actor(self.db)
+            leg_actor = self.db.system_actor
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=leg_title,
