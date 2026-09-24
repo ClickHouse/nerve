@@ -208,6 +208,7 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             ev.NormalizedUsage.from_anthropic(message.usage)
             if message.usage else None
         )
+        status, error = _result_outcome(message)
         out.append(ev.TurnCompleted(
             native_session_id=message.session_id,
             model=None,  # claude reports the model per AssistantMessage
@@ -218,10 +219,33 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             duration_ms=getattr(message, "duration_ms", None),
             duration_api_ms=getattr(message, "duration_api_ms", None),
             num_turns=getattr(message, "num_turns", None),
-            status="completed",
+            status=status,
+            error=error,
         ))
 
     return out
+
+
+def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
+    reason = getattr(message, "terminal_reason", None)
+    if reason in {"aborted_streaming", "aborted_tools"}:
+        return "interrupted", reason.replace("_", " ")
+
+    subtype = getattr(message, "subtype", "")
+    if not getattr(message, "is_error", False) and subtype == "success":
+        return "completed", None
+
+    errors = getattr(message, "errors", None)
+    if errors:
+        detail = "; ".join(errors)
+    elif reason == "max_turns":
+        turns = getattr(message, "num_turns", None)
+        detail = f"max turns ({turns}) exhausted" if turns is not None else "max turns exhausted"
+    elif status := getattr(message, "api_error_status", None):
+        detail = f"API error (HTTP {status})"
+    else:
+        detail = (reason or subtype or "Claude turn failed").replace("_", " ")
+    return "failed", detail
 
 
 def _translate_tool_result(
@@ -910,10 +934,18 @@ class ClaudeBackend:
         return "4-5" in m or "4-6" in m
 
     @staticmethod
+    def _model_rejects_disabled_thinking(model: str | None) -> bool:
+        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
+        # level. Effort is the only control.
+        return bool(model) and "opus-5-5" in model.lower()
+
+    @staticmethod
     def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
+            if ClaudeBackend._model_rejects_disabled_thinking(model):
+                return {"type": "adaptive"}
             return {"type": "disabled"}
         if v == "adaptive":
             return {"type": "adaptive"}
@@ -940,6 +972,7 @@ class ClaudeBackend:
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
+        "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),

@@ -8,9 +8,13 @@ import pytest
 
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec
-from nerve.agent.backends.codex.backend import CodexBackend, CodexClient
+from nerve.agent.backends.codex.backend import (
+    CodexBackend,
+    CodexClient,
+    clamp_effort,
+)
 from nerve.agent.backends.codex.pricing import compute_cost, match_pricing
-from nerve.config import NerveConfig
+from nerve.config import _DEFAULT_CODEX_PRICING, CodexConfig, NerveConfig
 
 
 def _client(tmp_path, **codex_overrides) -> CodexClient:
@@ -159,6 +163,75 @@ def test_effort_mapping_and_defaults(tmp_path):
     assert backend.map_effort("low") == "minimal"
     assert backend.map_effort("high") == "high"     # default map preserved
     assert backend.map_effort("unknown") is None    # omitted from turn/start
+
+
+def test_default_pricing_covers_gpt_6_astra():
+    assert _DEFAULT_CODEX_PRICING["gpt-6-astra"] == {
+        "input": 10.0, "cached_input": 1.0, "output": 50.0,
+    }
+    usage = ev.NormalizedUsage(
+        input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+    )
+    assert compute_cost("gpt-6-astra", usage, _DEFAULT_CODEX_PRICING) == (
+        pytest.approx(10.0 + 1.0 + 50.0)
+    )
+
+
+def test_clamp_effort_uses_the_catalog_as_a_ceiling():
+    full = ["low", "medium", "high", "xhigh", "max", "ultra"]
+    assert clamp_effort("ultra", full) == "ultra"
+    assert clamp_effort("ultra", ["low", "medium", "high"]) == "high"
+    assert clamp_effort("max", ["low", "medium", "high"]) == "high"
+    assert clamp_effort("medium", ["low", "high"]) == "low"
+    assert clamp_effort("low", ["medium", "high"]) == "low"   # nothing lower: as asked
+    assert clamp_effort("ultra", []) == "ultra"               # unknown catalog: advisory
+    assert clamp_effort("turbo", ["low"]) == "turbo"          # outside the vocabulary
+    assert clamp_effort(None, full) is None
+
+
+def test_catalog_offers_visible_plus_configured_hidden(tmp_path):
+    entries = [
+        {"id": "gpt-5.6-sol", "hidden": False, "supportedReasoningEfforts": [
+            {"reasoningEffort": "low"}, {"reasoningEffort": "ultra"},
+        ]},
+        {"id": "gpt-6-astra", "hidden": True, "supportedReasoningEfforts": [
+            {"reasoningEffort": "max"},
+        ]},
+        {"id": "internal-preview", "hidden": True},
+        {"model": "legacy-shape"},          # id-less shape still identifies
+        {"garbage": True},                  # no identifier: ignored
+    ]
+    backend = _client(tmp_path)._backend    # default codex.models: gpt-6-astra
+    cat = backend.catalog(entries)
+    assert cat["listed"] == [
+        "gpt-5.6-sol", "gpt-6-astra", "internal-preview", "legacy-shape",
+    ]
+    assert cat["offered"] == ["gpt-5.6-sol", "gpt-6-astra", "legacy-shape"]
+    assert cat["hidden"] == ["gpt-6-astra", "internal-preview"]
+    assert cat["allowed"] == cat["listed"]
+    assert cat["efforts"]["gpt-5.6-sol"] == ["low", "ultra"]
+    assert cat["efforts"]["internal-preview"] == []
+
+    # A configured model the catalog does not serve is allowed, never offered.
+    backend = _client(tmp_path, models=["gpt-6-astra", "gpt-7-preview"])._backend
+    cat = backend.catalog(entries[:1])
+    assert cat["offered"] == ["gpt-5.6-sol"]
+    assert cat["allowed"] == ["gpt-5.6-sol", "gpt-6-astra", "gpt-7-preview"]
+    # models: [] opts out of every hidden entry.
+    cat = _client(tmp_path, models=[])._backend.catalog(entries)
+    assert cat["offered"] == ["gpt-5.6-sol", "legacy-shape"]
+    # An empty catalog lists nothing — callers then skip model validation.
+    assert backend.catalog([])["listed"] == []
+
+
+def test_codex_models_config_parsing():
+    assert CodexConfig.from_dict({}).models == ["gpt-6-astra"]
+    assert CodexConfig.from_dict({"models": None}).models == ["gpt-6-astra"]
+    assert CodexConfig.from_dict({"models": []}).models == []
+    assert CodexConfig.from_dict({"models": "gpt-6-astra"}).models == ["gpt-6-astra"]
+    assert CodexConfig.from_dict({"models": ["a", "a", " b ", ""]}).models == ["a", "b"]
+    assert CodexConfig.from_dict({"models": 42}).models == ["gpt-6-astra"]
 
 
 def test_backend_notes_appended_to_developer_instructions(tmp_path):

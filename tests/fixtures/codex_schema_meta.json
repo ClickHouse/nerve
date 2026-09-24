@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.144.1",
+  "codex_cli_version": "0.153.3",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-07-11",
-  "canonical_v2_schema_sha256": "5d8251e1e2f713a3c567c927386f84f2f94692d4721b90d8ff36d0ff92877621",
+  "verified_date": "2026-09-05",
+  "canonical_v2_schema_sha256": "73f9645eb8531f1caaa31b85c59fdd5c2db12cf79928bfb290a672a654fa9a14",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.144.1 -> 0.153.3 was purely additive for every method and notification nerve uses (no removed fields; new: model/list includeHidden + Model.hidden/supportedReasoningEfforts, TokenUsageBreakdown.cacheWriteInputTokens)."
 }

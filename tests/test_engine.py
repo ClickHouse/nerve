@@ -30,6 +30,9 @@ from nerve.config import AgentConfig, NerveConfig
         ("xhigh",  "claude-opus-5",             "xhigh"),
         ("xhigh",  "claude-opus-5-20260720",    "xhigh"),
         ("max",    "us.anthropic.claude-opus-5", "max"),
+        # Opus 5.5 supports the full ladder
+        ("max",    "claude-opus-5-5",           "max"),
+        ("low",    "claude-opus-5-5",           "low"),
         # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
         ("max",    "claude-sonnet-5",           "max"),
         ("xhigh",  "claude-sonnet-5",           "xhigh"),
@@ -72,6 +75,21 @@ def test_effective_effort(value, model, expected):
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
     assert ClaudeBackend._effective_effort("max") == "max"
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # Opus 5.5 rejects thinking.type="disabled"; send adaptive.
+        ("claude-opus-5-5",              {"type": "adaptive"}),
+        ("us.anthropic.claude-opus-5-5", {"type": "adaptive"}),
+        ("claude-opus-5",                {"type": "disabled"}),
+        ("claude-opus-4-8",              {"type": "disabled"}),
+        (None,                           {"type": "disabled"}),
+    ],
+)
+def test_parse_thinking_config_disabled(model, expected):
+    assert ClaudeBackend._parse_thinking_config("disabled", model) == expected
 
 
 @pytest.mark.parametrize(
@@ -202,13 +220,15 @@ def _translated(messages: list) -> list:
     return [event for m in messages for event in translate_message(m)]
 
 
-def _result_msg(session_id: str = "sdk-1") -> ResultMessage:
+def _result_msg(session_id: str = "sdk-1", **overrides) -> ResultMessage:
     """A terminal ResultMessage: translates to one TurnCompleted."""
-    return ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1,
-        is_error=False, num_turns=1, session_id=session_id,
-        total_cost_usd=0.5, usage={"input_tokens": 1},
-    )
+    values = {
+        "subtype": "success", "duration_ms": 1, "duration_api_ms": 1,
+        "is_error": False, "num_turns": 1, "session_id": session_id,
+        "total_cost_usd": 0.5, "usage": {"input_tokens": 1},
+    }
+    values.update(overrides)
+    return ResultMessage(**values)
 
 
 @pytest.mark.asyncio
@@ -410,6 +430,36 @@ async def test_receive_turn_completes_on_result_without_raising():
     assert len(terminal) == 1
     assert terminal[0].status == "completed"
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "status", "error"),
+    [
+        (
+            _result_msg(
+                subtype="error_max_turns", is_error=True,
+                terminal_reason="max_turns", num_turns=50,
+            ),
+            "failed",
+            "max turns (50) exhausted",
+        ),
+        (
+            _result_msg(is_error=True, api_error_status=529),
+            "failed",
+            "API error (HTTP 529)",
+        ),
+        (
+            _result_msg(is_error=True, terminal_reason="aborted_streaming"),
+            "interrupted",
+            "aborted streaming",
+        ),
+    ],
+)
+def test_result_message_preserves_abnormal_terminal_state(message, status, error):
+    event = translate_message(message)[0]
+
+    assert isinstance(event, ev.TurnCompleted)
+    assert (event.status, event.error) == (status, error)
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ as independent asyncio tasks: the reader never blocks, deltas keep
 flowing while an approval is pending, and interrupts stay responsive.
 
 Protocol shapes verified against the schema exported from codex-cli
-0.144.1 (``codex app-server generate-json-schema``); see
+0.153.3 (``codex app-server generate-json-schema``); see
 ``tests/fixtures/codex_schema_meta.json``. Parsing is defensive:
 unknown notifications are debug-logged, unknown server requests get a
 safe response, missing fields never raise.
