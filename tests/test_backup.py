@@ -8,6 +8,7 @@ running server (the CLI and lifespan task are thin wrappers over this module).
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import threading
@@ -425,6 +426,23 @@ def test_restore_refuses_on_live_pidfile(nerve_dir, workspace, config_dir, tmp_p
 
     with pytest.raises(BackupError, match="running"):
         backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
+
+
+def test_restore_refuses_on_held_lock(nerve_dir, workspace, config_dir, tmp_path):
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+    target = tmp_path / "live_nerve"
+    target.mkdir()
+    (target / "nerve.pid").write_text("12345")
+    # Lock through a new descriptor, as the live daemon does.
+    fd = os.open(target / "nerve.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(BackupError, match="running"):
+            backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
+    finally:
+        os.close(fd)
 
 
 def test_restore_refuses_nonempty_without_force(nerve_dir, workspace, config_dir, tmp_path):

@@ -51,6 +51,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from nerve import pidfile
+
 logger = logging.getLogger(__name__)
 
 # Bundle format revision — bump if the on-disk layout changes incompatibly.
@@ -59,7 +61,7 @@ FORMAT_VERSION = 1
 # --- What goes in state/ (everything under ~/.nerve worth keeping) --------- #
 # The two databases are snapshotted via the online-backup API (below); the
 # rest are plain file/dir copies. Anything not named here is excluded by
-# construction — that intentionally drops nerve.log, nerve.pid, the
+# construction — that intentionally drops nerve.log, nerve.pid, nerve.lock, the
 # *-wal/-shm sidecars (folded into the snapshot), bin/, .crates*, and the
 # stale memu.backup*.sqlite copies.
 STATE_DB_FILES: tuple[str, ...] = ("nerve.db", "memu.sqlite")
@@ -784,21 +786,6 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
 # --------------------------------------------------------------------------- #
 
 
-def _pid_is_alive(pid_file: Path) -> int | None:
-    """Return the live PID if the daemon is running, else None."""
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    try:
-        os.kill(pid, 0)
-        return pid
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        return pid  # exists but not ours to signal
-
-
 def _dir_nonempty(d: Path) -> bool:
     try:
         return d.is_dir() and any(d.iterdir())
@@ -832,8 +819,7 @@ def restore_bundle(
     nerve_dir = Path(nerve_dir).expanduser()
     workspace = Path(workspace).expanduser()
 
-    pid_file = nerve_dir / "nerve.pid"
-    live = _pid_is_alive(pid_file)
+    live = pidfile.live_pid(nerve_dir / "nerve.lock", nerve_dir / "nerve.pid")
     if live is not None:
         raise BackupError(
             f"Nerve daemon appears to be running (PID {live}). "
