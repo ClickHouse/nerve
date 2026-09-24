@@ -30,7 +30,7 @@ from pathlib import Path
 
 import click
 
-from nerve import paths
+from nerve import paths, pidfile
 from nerve.config import (
     RESUME_QUEUE_FILE,
     load_config,
@@ -59,31 +59,17 @@ def setup_logging(verbose: bool = False) -> None:
 
 # --- PID file helpers ---
 
-def _read_pid() -> int | None:
-    """Read PID from file. Returns None if no valid PID file."""
-    try:
-        pid = int(paths.pid_file().read_text().strip())
-        return pid
-    except (FileNotFoundError, ValueError):
-        return None
+def _write_pid(config_dir: Path | None = None) -> bool:
+    """Take the daemon lock and write the PID of this process.
 
-
-def _is_running(pid: int) -> bool:
-    """Check if a process with the given PID is alive."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # Process exists but we can't signal it
-
-
-def _write_pid(pid: int, config_dir: Path | None = None) -> None:
+    Returns False if a different process holds the lock.
+    """
     paths.nerve_home().mkdir(parents=True, exist_ok=True)
-    paths.pid_file().write_text(str(pid))
+    if not pidfile.acquire(paths.lock_file(), paths.pid_file()):
+        return False
     if config_dir is not None:
         write_config_pointer(config_dir)
+    return True
 
 
 def _remove_pid() -> None:
@@ -92,14 +78,8 @@ def _remove_pid() -> None:
 
 def _get_daemon_status() -> tuple[bool, int | None]:
     """Returns (is_running, pid)."""
-    pid = _read_pid()
-    if pid is None:
-        return False, None
-    if _is_running(pid):
-        return True, pid
-    # Stale PID file
-    _remove_pid()
-    return False, None
+    pid = pidfile.live_pid(paths.lock_file(), paths.pid_file())
+    return pid is not None, pid
 
 
 # --- Systemd helpers ---
@@ -330,7 +310,10 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     if foreground:
         # Run directly in this process
-        _write_pid(os.getpid(), config_dir=config_dir)
+        if not _write_pid(config_dir=config_dir):
+            click.echo("Nerve is already running")
+            ctx.exit(1)
+            return
         try:
             from nerve.gateway.server import run_server
             click.echo(f"Starting Nerve on {config.gateway.host}:{config.gateway.port}")
@@ -401,7 +384,7 @@ def stop(ctx: click.Context) -> None:
     # Wait for graceful shutdown (up to 15 seconds)
     for i in range(30):
         time.sleep(0.5)
-        if not _is_running(pid):
+        if not pidfile.pid_exists(pid):
             _remove_pid()
             click.echo("Nerve stopped")
             return

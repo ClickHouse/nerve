@@ -137,6 +137,11 @@ def pid_file() -> Path:
     return nerve_path("nerve.pid")
 
 
+def lock_file() -> Path:
+    """The daemon lock file (``~/.nerve/nerve.lock``). Never deleted."""
+    return nerve_path("nerve.lock")
+
+
 def log_file() -> Path:
     """The daemon log file (``~/.nerve/nerve.log``)."""
     return nerve_path("nerve.log")
