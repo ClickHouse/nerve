@@ -49,9 +49,8 @@ RESTART_COMMAND_ENV = "NERVE_RESTART_COMMAND"
 def pid_file_pid() -> int | None:
     """The PID recorded in the pid file, or ``None``. Reads; never writes.
 
-    Deliberately without the stale-file cleanup :func:`nerve.cli._read_pid`'s
-    caller does: this is called from inside the running daemon, where deleting
-    a pid file is how you lose track of the process you are.
+    The PID does not tell if the daemon is running: a dead daemon can leave the
+    file behind. :func:`nerve.pidfile.live_pid` tells that.
     """
     try:
         return int(paths.pid_file().read_text().strip())

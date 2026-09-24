@@ -817,6 +817,7 @@ nerve start -f        # Run in foreground (for debugging)
 ```
 
 **PID file:** `~/.nerve/nerve.pid`
+**Lock file:** `~/.nerve/nerve.lock` (the daemon locks it while it runs)
 **Log file:** `~/.nerve/nerve.log`
 
 `nerve restart` and the setup page's **Restart Nerve** use the same detached
