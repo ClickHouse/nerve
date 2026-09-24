@@ -15,8 +15,8 @@ change. Editing a config file on the box does not apply itself.
 
 Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
 Telegram bot's token and allow-list, the MCP endpoint, the signing secret
-(``auth.jwt_secret`` is pinned at startup for every consumer, web gateway and
-MCP endpoint alike — see :mod:`nerve.gateway.auth`), Langfuse, the memory bridges, the Codex thread-sync service
+(pinned at startup for all consumers, see :mod:`nerve.gateway.auth`),
+Langfuse, the memory bridges, the Codex thread-sync service
 (``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
 and the one place those two names diverge), anything a service derived from
 config at construction, and a background loop that was never started because its

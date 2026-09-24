@@ -401,10 +401,8 @@ def _stored_secrets(db_path: Path) -> list[str]:
 
 
 def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, config_dir, tmp_path):
-    """The generated JWT signing secret lives inside nerve.db, so skipping
-    files is not enough: whoever holds it can mint tokens for the live
-    instance. It must be gone from a --no-secrets snapshot — and only there;
-    the live database is not touched."""
+    """The generated signing secret is a row in nerve.db. A --no-secrets
+    snapshot deletes it; the live database keeps it."""
     _plant_instance_secret(nerve_dir / "nerve.db")
 
     stripped = backup_mod.create_backup(
@@ -428,10 +426,8 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
 
 
 def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
-    """Actor references must stay stable across a restore: sessions and
-    messages will point at these ids for good, so a restored instance has to
-    find the same human, system actor and account — and the same signing
-    secret, so live sessions keep verifying."""
+    """A restore keeps the account, actor and system actor ids that stored
+    rows reference, and the signing secret that live sessions verify with."""
     import asyncio
 
     from nerve.db import Database
@@ -505,8 +501,8 @@ def _stored_secret(db_file: Path) -> str | None:
 
 
 def test_backup_archives_the_database_owner_only(nerve_dir, workspace, config_dir, tmp_path):
-    """The archived nerve.db member is 0600, so extraction on restore yields an
-    owner-only file with no readable window — it carries the signing secret."""
+    """The archived nerve.db member is 0600, so extraction never makes a
+    readable copy of the signing secret."""
     result = backup_mod.create_backup(nerve_dir, workspace, tmp_path / "out", config_dir=config_dir)
     assert _member_mode(result.path, "state/nerve.db") == 0o600
 
@@ -556,12 +552,9 @@ def test_restore_installs_the_database_owner_only(workspace, config_dir, tmp_pat
 
 
 class TestRestoreNeverLeavesAReadableKey:
-    """Each restore step is verified before the next. The
-    destination directory is secured (0700, stat-verified) before anything
-    lands in it; the temporary is *created* 0600 and its mode read back through
-    the descriptor before a byte is copied; the rename is atomic; scrubbing the
-    key from an installed file is a verified last resort whose failure
-    propagates. Nothing here continues past an unverified step."""
+    """Restore verifies each step before the next: the directory is 0700, the
+    temporary is created 0600 and checked before any copy, the rename is
+    atomic, and a failed last-resort key scrub raises."""
 
     @staticmethod
     def _bundle(tmp_path, workspace, config_dir) -> Path:
@@ -613,9 +606,8 @@ class TestRestoreNeverLeavesAReadableKey:
 
     @staticmethod
     def _installed_file_reads_back_wide(monkeypatch) -> None:
-        """The temp verifies twice (so the copy proceeds and is published) and
-        the installed file then reads back wide — the one case the scrub is
-        still for."""
+        """Make both checks on the temporary pass and the installed file read
+        back wide. That is the only case that reaches the scrub."""
         seen = {"files": 0}
 
         def fake(st_mode: int) -> bool:
@@ -631,8 +623,7 @@ class TestRestoreNeverLeavesAReadableKey:
     def test_the_last_resort_scrub_removes_the_key_and_the_restore_still_fails(
         self, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """No success-with-exposure: the key is removed so nothing usable is
-        readable, and the restore is reported as failed all the same."""
+        """The scrub removes the key, and the restore still reports failure."""
         bundle = self._bundle(tmp_path, workspace, config_dir)
         nd2 = tmp_path / "restored_nerve"
         self._installed_file_reads_back_wide(monkeypatch)
@@ -657,9 +648,8 @@ class TestRestoreNeverLeavesAReadableKey:
 
 
 class TestScrubIsVerified:
-    """``_scrub_db_secret`` used to swallow every OperationalError as "older
-    bundle, no table". Now the table's absence is checked explicitly, and a
-    delete that did not happen — or cannot be verified — raises."""
+    """``_scrub_db_secret`` checks for the table explicitly, and raises when the
+    delete fails or cannot be verified."""
 
     def test_a_database_without_the_table_has_nothing_to_scrub(self, tmp_path):
         old = tmp_path / "old.db"
@@ -681,14 +671,10 @@ class TestScrubIsVerified:
 
 
 class TestStagingIsOutOfReach:
-    """The staged snapshot of ``nerve.db`` contains every account and the
-    signing secret, in the clear — ``--no-secrets`` scrubs it only *after* the
-    snapshot exists. It used to be staged under the caller's output directory,
-    where another user could rename the ``0700`` staging directory away and
-    leave a readable one in its place. Staging now happens somewhere the
-    caller does not choose, and the directory's identity is re-checked before
-    anything secret is written into it and again before any of it is read back
-    to be archived."""
+    """The staged snapshot holds every account and the signing secret until
+    ``--no-secrets`` scrubs it. Staging is not in the output directory, where
+    another user could swap the staging directory, and the staging directory
+    is re-checked before the snapshot is written and before it is archived."""
 
     def test_staging_does_not_happen_in_the_output_directory(
         self, nerve_dir, workspace, config_dir, tmp_path,
@@ -707,17 +693,16 @@ class TestStagingIsOutOfReach:
             result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
         finally:
             backup_mod._snapshot_db = real_snapshot
-        # While the database was being copied, the output directory held at
-        # most the bundle temporary — never the staged secrets.
+        # During the copy, the output directory held only the bundle
+        # temporary, never the staged secrets.
         assert seen and all(
             all(name.endswith(".tmp") for name in names) for names in seen
         ), seen
         assert result.path.exists()
 
     def test_the_staging_parent_is_never_the_output_directory(self, tmp_path):
-        """Directly: the chosen parent is the state dir when it is owner-only,
-        and the system temp dir otherwise — never the caller's target, and
-        never left to ``mkdtemp`` to decide from TMPDIR afterwards."""
+        """The parent is the state dir when it is owner-only, else the resolved
+        system temp dir. It is never the output directory."""
         import tempfile
 
         system_temp = Path(tempfile.gettempdir()).resolve()
@@ -735,10 +720,9 @@ class TestStagingIsOutOfReach:
     def test_a_temp_directory_owned_by_someone_else_is_refused(
         self, tmp_path, monkeypatch,
     ):
-        """A sticky bit is not sufficient. The *owner* of a
-        directory may rename anything inside it whatever the mode says, so a
-        foreign-owned ``1777`` TMPDIR is exactly the trap — and the state dir
-        here is unusable, so there is nowhere else to go."""
+        """A sticky bit is not enough: a directory's owner can rename any entry
+        in it. A ``1777`` TMPDIR owned by another user is refused, and with an
+        unusable state dir the backup fails."""
         import tempfile
 
         foreign = tmp_path / "foreign-tmp"
@@ -766,9 +750,8 @@ class TestStagingIsOutOfReach:
     def test_verify_and_restore_stage_in_the_vetted_temp_directory_too(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """The sweep: extracting a bundle puts nerve.db on disk just as staging
-        does, so verify and restore take the same vetted parent rather than
-        whatever ``TMPDIR`` says."""
+        """Extracting a bundle puts nerve.db on disk, so verify and restore
+        use the same vetted temp directory as staging."""
         import tempfile
 
         bundle = backup_mod.create_backup(
@@ -792,8 +775,8 @@ class TestStagingIsOutOfReach:
         assert seen and all(d == vetted for d in seen), seen
 
     def test_an_unsafe_ancestor_is_refused(self, tmp_path, monkeypatch):
-        """The check walks the canonical ancestry: a directory anyone can write
-        to *above* the parent can be swapped for one pointing elsewhere."""
+        """Every ancestor is checked: a writable directory above the parent
+        lets another user swap the path below it."""
         loose = tmp_path / "loose"
         (loose / "tmp").mkdir(parents=True)
         os.chmod(loose, 0o777)  # world-writable and not sticky
@@ -807,16 +790,14 @@ class TestStagingIsOutOfReach:
     def test_a_swapped_staging_directory_is_refused(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
     ):
-        """The reproduction: replace the staging directory after it is created.
-        Both bundle kinds must refuse — ``--no-secrets`` included, since the
-        snapshot carries the key until the scrub runs on it."""
+        """Replacing the staging directory after it is created is refused.
+        ``--no-secrets`` too: the snapshot holds the key until the scrub."""
         attacker = tmp_path / "attacker-stage"
         swapped: list[Path] = []
         real_writable = backup_mod._is_group_world_writable
 
         def swap_then_check(path):
-            """Runs between the staging directory being opened and its first
-            use — the attacker's window."""
+            """Run between opening the staging directory and its first use."""
             if not swapped:
                 for stage in nerve_dir.glob(".nerve-backup-stage-*"):
                     stage.rename(attacker)
@@ -840,10 +821,9 @@ class TestStagingIsOutOfReach:
     def test_a_swap_after_the_first_verification_is_caught_too(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
     ):
-        """This swaps the directory *after* it passed its
-        first check, while the snapshot is being taken. The snapshot is created
-        and written through a descriptor of its own, so the planted directory
-        receives nothing, and the checks before the archive refuse to go on."""
+        """Swap the directory during the snapshot, after its first check. The
+        snapshot is written through its own descriptor, so the planted
+        directory gets nothing, and the check before archiving refuses."""
         attacker = tmp_path / "attacker-stage"
         swapped: list[Path] = []
         real_snapshot = backup_mod._snapshot_db
@@ -868,20 +848,18 @@ class TestStagingIsOutOfReach:
         assert swapped, "the test did not manage to swap the staging directory"
         assert list(swapped[0].iterdir()) == []  # nothing at all landed in theirs
         assert not out.exists() or list(out.iterdir()) == []
-        # The snapshot went to the directory that was verified — the one they
-        # renamed away — and not through the name they planted. That one is
-        # left alone rather than cleaned up by name; ours stays owner-only.
+        # The snapshot went to the verified directory (the one renamed away),
+        # not to the planted name. It is not cleaned up by name, and it stays
+        # owner-only.
         assert (attacker / "state" / "nerve.db").exists()
         assert stat.S_IMODE(os.stat(attacker).st_mode) == 0o700
         assert stat.S_IMODE(os.stat(attacker / "state" / "nerve.db").st_mode) == 0o600
 
 
 class TestTheBundleItselfIsOwnerOnly:
-    """The bundle carries nerve.db (accounts, history, and unless
-    ``--no-secrets`` scrubbed it, the signing secret) and config.local.yaml
-    with the password hash. Hardening the files it is made of and then writing
-    them into a world-readable tarball would hand the same key to the same
-    people, so the bundle is created 0600 before a byte is written."""
+    """The bundle holds nerve.db (with the signing secret unless
+    ``--no-secrets``) and config.local.yaml, so it is created 0600 before any
+    byte is written."""
 
     def test_the_bundle_is_created_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
         result = backup_mod.create_backup(
@@ -892,13 +870,10 @@ class TestTheBundleItselfIsOwnerOnly:
 
     @staticmethod
     def _output_filesystem_ignores_modes(monkeypatch, out: Path) -> None:
-        """Only the *output* directory's filesystem loses the mode.
+        """Make only the output directory's filesystem ignore the mode.
 
-        That is the realistic split — a normal state directory, a bundle
-        written to an exotic mount — and it is the only way to reach the
-        bundle's own check, since the staging directory and the snapshot are
-        verified before it. The file is still created exclusively, as a
-        mode-less filesystem does: it is the mode that fails to stick."""
+        The staging checks run first, so this is the only way to reach the
+        bundle's own check. The file is still created exclusively."""
         real_create = backup_mod._exclusive_create
 
         def fake(path, what):
@@ -910,8 +885,7 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_a_bundle_that_cannot_be_created_owner_only_is_refused(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """Caught while the file is still empty: no bundle, rather than one
-        that leaks the key to every local user."""
+        """The check runs while the file is empty, so no bundle is left."""
         out = tmp_path / "out"
         out.mkdir()
         self._output_filesystem_ignores_modes(monkeypatch, out)
@@ -922,9 +896,8 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_a_no_secrets_bundle_is_still_written_with_a_warning(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
     ):
-        """``--no-secrets`` carries no credential — the signing secret is
-        scrubbed and config.local.yaml is not collected — so the same failure
-        is loud but not fatal: refusing to back up at all would be worse."""
+        """A ``--no-secrets`` bundle holds no credential, so a wide mode only
+        logs a warning."""
         import logging
 
         out = tmp_path / "out"
@@ -940,12 +913,10 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_the_no_secrets_fallback_still_writes_through_its_own_descriptor(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """Tolerating a wide *mode* must not mean tolerating a wide
-        *name*. The fallback used to reopen the path, so a symlink planted in
-        the gap had its target truncated and overwritten with the bundle — any
-        file the Nerve user could write, including live state. Now the bytes go
-        to the descriptor that was created exclusively, and the name is proved
-        before publication."""
+        """A wide mode is accepted, a swapped name is not. The bytes go to the
+        exclusively created descriptor, so a symlink planted at the name does
+        not get its target overwritten, and the name is checked before
+        publication."""
         out = tmp_path / "out"
         out.mkdir()
         target = tmp_path / "precious.db"
@@ -976,8 +947,8 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_a_state_filesystem_that_ignores_modes_refuses_before_the_snapshot(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """And when it is the *staging* filesystem that loses the mode, the
-        refusal comes before the database is copied anywhere at all."""
+        """When the staging filesystem ignores the mode, the backup refuses
+        before the database is copied."""
         monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
         with pytest.raises(BackupError, match="owner-only"):
             backup_mod.create_backup(
@@ -989,10 +960,8 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_the_bundle_is_written_through_the_descriptor_it_verified(
         self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """The tar goes into the checked *descriptor*, never into
-        the pathname reopened. Another user with write access to the output
-        directory (a shared or mounted backup target) who replaces the
-        temporary with a symlink must not receive the bundle."""
+        """The tar is written to the checked descriptor, not to the path. A
+        user who replaces the temporary with a symlink gets nothing."""
         out = tmp_path / "out"
         out.mkdir()
         target = tmp_path / "attacker.tar"
@@ -1002,11 +971,8 @@ class TestTheBundleItselfIsOwnerOnly:
         swapped: list[Path] = []
 
         def swap_right_after_creating_it(path, what):
-            """The attacker's window: the instant after the temporary is
-            created and verified. Code that then reopened the *name* would
-            write the bundle straight into their file. Only the bundle
-            temporary is swapped — the staged snapshot is a different file in
-            a directory this attacker cannot reach."""
+            """Swap the bundle temporary for a symlink right after it is
+            created and verified. The staged snapshot is not touched."""
             fd, private = real_create(path, what)
             if path.parent == out:
                 path.unlink()
@@ -1025,9 +991,8 @@ class TestTheBundleItselfIsOwnerOnly:
     def test_a_swapped_restore_temporary_is_not_published_either(
         self, workspace, config_dir, tmp_path, monkeypatch,
     ):
-        """The same discipline on the restore side: the installed file must be
-        the one whose mode was verified, not whatever the name points at by the
-        time of the rename."""
+        """Restore installs the file whose mode it verified, not whatever the
+        name points at when it renames."""
         nd = _nerve_dir_with_stored_key(tmp_path)
         bundle = backup_mod.create_backup(
             nd, workspace, tmp_path / "out", config_dir=config_dir,
@@ -1055,12 +1020,9 @@ class TestTheBundleItselfIsOwnerOnly:
 
 
 class TestRestoredConfigLocalIsOwnerOnly:
-    """config.local.yaml holds ``auth.password_hash`` and the machine-local
-    secrets, and it lands in an ordinary config directory rather than the state
-    directory restore verifies — so it goes through the same verified 0600
-    temporary as nerve.db, and a failure aborts the restore instead of quietly
-    finishing without it (an instance with no configured password is
-    passwordless, which is not what a restore was asked to do)."""
+    """config.local.yaml holds the password hash and machine-local secrets. It
+    goes through the same verified 0600 temporary as nerve.db, and a failure
+    aborts the restore: without the file the instance would be passwordless."""
 
     def test_it_is_installed_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
         result = backup_mod.create_backup(

@@ -84,8 +84,8 @@ BEGIN
     SELECT RAISE(ABORT, 'the system actor cannot be reclassified');
 END;
 
--- REPLACE conflict handling can delete its victim without firing DELETE
--- triggers, so guard every INSERT/UPDATE shape that could target this row.
+-- REPLACE conflict handling can delete the conflicting row without firing
+-- DELETE triggers, so guard each INSERT and UPDATE that could replace it.
 CREATE TRIGGER IF NOT EXISTS system_actor_cannot_be_replaced
 BEFORE INSERT ON actor_refs
 FOR EACH ROW
@@ -129,8 +129,8 @@ END;
 async def up(db: aiosqlite.Connection) -> None:
     await db.executescript(SQL)
     now = datetime.now(timezone.utc).isoformat()
-    # The SELECT keeps explicit migration replay idempotent without relying on
-    # INSERT OR REPLACE/IGNORE conflict handling around the immutable row.
+    # WHERE NOT EXISTS makes a replay a no-op. INSERT OR IGNORE/REPLACE would
+    # fire the triggers that protect this row.
     await db.execute(
         "INSERT INTO actor_refs (id, kind, display_name, created_at) "
         "SELECT ?, 'system', NULL, ? "

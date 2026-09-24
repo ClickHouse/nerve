@@ -46,9 +46,8 @@ async def mint_worker_token(request: Request):
         raise HTTPException(status_code=400, detail="Invalid Ultracode worker id")
     secret = effective_jwt_secret(deps.engine.config)
     if not secret:
-        # Fail closed: nothing is pinned until startup has completed, there
-        # is no credential to exchange, and an empty token would only be
-        # refused by the endpoint anyway.
+        # No secret is pinned before startup completes, so there is nothing
+        # to sign with.
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
     try:
         payload = authenticate_mcp(request.scope, deps.engine.config)

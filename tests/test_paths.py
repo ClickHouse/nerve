@@ -107,19 +107,14 @@ class TestAccessors:
 
 
 def _pretend_modes_are_ignored(monkeypatch) -> None:
-    """A filesystem that accepts ``0600`` on create and stores ``0644``.
-
-    Patched at ``_mode_is_private`` rather than at ``fstat`` so the test says
-    what it means: every regular file this writer creates reads back wide.
-    """
+    """Make every file the writer creates read back as not owner-only, as on a
+    filesystem that ignores the requested mode."""
     monkeypatch.setattr(paths, "_mode_is_private", lambda st_mode: False)
 
 
 class TestWritePrivateText:
-    """``config.local.yaml`` carries the signing secret, the password hash and
-    the API keys, so it must never exist at a wider mode — not even between a
-    plain write and a chmod, which is how it used to be produced, and not even
-    for the length of one write on a filesystem that ignores the mode."""
+    """``config.local.yaml`` holds the signing secret, the password hash and
+    the API keys, so it never exists at a mode wider than 0600."""
 
     def test_the_file_is_owner_only_and_holds_the_text(self, tmp_path):
         target = tmp_path / "config.local.yaml"
@@ -129,8 +124,8 @@ class TestWritePrivateText:
         assert not target.with_name(target.name + ".tmp").exists()
 
     def test_it_is_never_created_at_a_wider_mode_even_under_umask_000(self, tmp_path):
-        """The mode is the one ``os.open`` applies, so the umask can only take
-        bits away — there is no window at 0666 while the bytes land."""
+        """``os.open`` applies 0600 at create, and the umask can only remove
+        bits."""
         old = os.umask(0o000)
         try:
             target = tmp_path / "secrets.yaml"
@@ -150,9 +145,8 @@ class TestWritePrivateText:
     def test_a_filesystem_that_ignores_modes_gets_no_bytes_at_all(
         self, tmp_path, monkeypatch,
     ):
-        """The descriptor is `fstat`ed before a single byte is written, so
-        a mode that did not take effect stops the write instead of being
-        reported after the secrets are already on disk."""
+        """The mode is checked with ``fstat`` before any byte is written, so a
+        wrong mode stops the write."""
         target = tmp_path / "config.local.yaml"
         _pretend_modes_are_ignored(monkeypatch)
         with pytest.raises(paths.InsecureFileError, match="Nothing was written"):
@@ -163,8 +157,7 @@ class TestWritePrivateText:
     def test_an_existing_file_is_left_untouched_when_the_write_is_refused(
         self, tmp_path, monkeypatch,
     ):
-        """Refusing must not destroy what is already there: the rename never
-        happens, so the previous secrets file survives intact."""
+        """A refused write does not rename, so the existing file is kept."""
         target = tmp_path / "config.local.yaml"
         target.write_text("auth:\n  password_hash: keep-me\n", encoding="utf-8")
         os.chmod(target, 0o600)
@@ -176,8 +169,8 @@ class TestWritePrivateText:
     def test_a_temporary_swapped_for_a_symlink_is_not_published(
         self, tmp_path, monkeypatch,
     ):
-        """Publication is by name, so the name is proved to still be the file
-        that was written (device + inode) before the rename."""
+        """Before the rename, the temporary name is checked (device and inode)
+        to still be the file that was written."""
         target = tmp_path / "config.local.yaml"
         tmp = target.with_name(target.name + ".tmp")
         elsewhere = tmp_path / "attacker.yaml"

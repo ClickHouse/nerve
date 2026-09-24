@@ -142,7 +142,7 @@ class ProxyService:
     def _write_proxy_config(self) -> Path:
         """Write the proxy's own config.yaml and return its path."""
         auth_dir = self.config.proxy.auth_dir.expanduser()
-        paths.ensure_nerve_home()  # the defaults live in the state dir; never create it wide
+        paths.ensure_nerve_home()  # the defaults are in the state dir; create it owner-only
         auth_dir.mkdir(parents=True, exist_ok=True)
 
         proxy_cfg: dict[str, Any] = {
@@ -234,12 +234,9 @@ class ProxyService:
             self._process.pid, self.config.proxy.port,
         )
 
-        # The subprocess exists from here on, in its own process group, so
-        # anything that goes wrong below must stop it — including a
-        # cancellation that arrives while the health poll is waiting. Without
-        # this, a caller that registers its cleanup only *after* start()
-        # returns never learns the process is there, and it outlives the daemon
-        # holding the port.
+        # The subprocess is in its own process group, so any failure from here
+        # on, including a cancellation during the health wait, must stop it.
+        # Otherwise it keeps running and holds the port.
         try:
             healthy = await self._wait_for_healthy(timeout=15)
         except BaseException:

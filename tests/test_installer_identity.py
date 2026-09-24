@@ -1,10 +1,8 @@
 """``nerve init`` names the owner it creates.
 
-The wizard's "Your name" answer exists only while the installer runs —
-nothing it writes carries it, and the checkpoint it keeps for resuming is
-deleted on completion — so the installer creates the local owner account
-in-process, before the answer is thrown away. The gateway's own bootstrap at
-first start then finds that account rather than creating an unnamed one.
+The wizard's "Your name" answer is not written to any file, so the installer
+creates the owner account in-process while it has the answer. The gateway's
+bootstrap at first start then finds that account.
 """
 
 from __future__ import annotations
@@ -34,10 +32,9 @@ def _db_rows(db_path: Path, sql: str) -> list[tuple]:
 
 
 def _stub_wizard(ws: Path, *, name: str, local_yaml: str, checkpoint_ok: bool = True):
-    """Stands in for SetupWizard: writes what the real one would and answers
-    the identity step with ``name``. ``checkpoints`` counts how often the
-    installer asked it to save the answers back; ``checkpoint_ok`` is what that
-    save reports (True = written, False = could not be saved)."""
+    """A SetupWizard stand-in that writes the config and answers ``name``.
+    ``checkpoints`` counts save requests; ``checkpoint_ok`` is what each
+    save returns."""
 
     class StubWizard:
         checkpoints = 0
@@ -96,8 +93,8 @@ class TestInstallerDisplayName:
         ) == [(None,)]
 
     def test_first_start_after_init_keeps_the_named_owner(self, tmp_path, monkeypatch):
-        """The gateway's own bootstrap at first start finds the account the
-        installer made and does not create a second, unnamed one."""
+        """The first-start bootstrap finds the installer's account and does
+        not create a second one."""
         from nerve.cli import main
 
         config_dir, ws = _install_dirs(tmp_path)
@@ -128,8 +125,7 @@ class TestInstallerDisplayName:
         ) == [(None,)]
 
     def test_headless_install_gets_an_unnamed_owner(self, tmp_path):
-        """The headless path reads no name from the environment (there is no
-        such variable), so its owner is unnamed until renamed."""
+        """The headless path collects no name, so its owner is unnamed."""
         from nerve.cli import main
 
         env = {
@@ -185,8 +181,8 @@ class TestInstallerBootstrapFailure:
     def test_a_failed_checkpoint_tells_the_truth_instead_of_promising_a_save(
         self, tmp_path, monkeypatch,
     ):
-        """If the answers could not be saved, the installer must not
-        claim they were — it says so and names the collected name."""
+        """When the answers cannot be saved, the installer says so and prints
+        the collected name."""
         import nerve.migrate as migrate_mod
         from nerve.cli import main
 
@@ -228,10 +224,8 @@ class TestInstallerBootstrapFailure:
     def test_the_real_checkpoint_reports_failure_when_the_mode_is_not_honoured(
         self, tmp_path, monkeypatch,
     ):
-        """The checkpoint is created 0600 and the mode is read back through
-        the descriptor before a byte is written. A filesystem that accepts the
-        mode and ignores it — the no-op chmod case — yields no checkpoint
-        rather than a readable one, and the wizard is told so."""
+        """When the filesystem ignores the 0600 mode, no checkpoint is written
+        and ``checkpoint()`` returns False."""
         import nerve.bootstrap as bootstrap_mod
         from nerve.bootstrap import SetupWizard, _init_state_file, _load_init_state
 

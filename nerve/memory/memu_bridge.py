@@ -1672,7 +1672,7 @@ class MemUBridge:
                 }
 
             resources_dir = paths.nerve_path("memu-resources")
-            paths.ensure_nerve_home()  # never create the state dir with a default mode
+            paths.ensure_nerve_home()  # create the state dir owner-only
             resources_dir.mkdir(parents=True, exist_ok=True)
 
             # Fast model for category summaries and date resolution (Haiku).

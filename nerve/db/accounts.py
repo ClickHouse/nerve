@@ -57,9 +57,8 @@ class AccountStore:
                 f"got {credential_source!r}"
             )
         async with self._atomic():
-            # The emptiness check decides whether an owner exists, so acquire
-            # SQLite's write lock before reading it. Two processes bootstrapping
-            # together must not both observe an empty table.
+            # Take the write lock before the count, so two processes cannot
+            # both see an empty table.
             await self.db.execute("BEGIN IMMEDIATE")
             if await self._count_accounts():
                 return BootstrapAccount(created=False)

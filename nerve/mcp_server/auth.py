@@ -1,17 +1,13 @@
 """Authenticate external MCP requests against the gateway JWT.
 
-The external MCP endpoint reuses Nerve's existing JWT secret (see
-:func:`nerve.gateway.auth.effective_jwt_secret`) and the same token
-mechanism the web UI uses — no separate credential store, no per-client
-token table. A client (Codex, Claude Code, etc.) presents the JWT it
-received from ``POST /api/auth/login`` either as an
-``Authorization: Bearer <jwt>`` header or as a ``?token=<jwt>`` query
-parameter.
+The external MCP endpoint uses the same JWT secret and tokens as the web UI
+(see :func:`nerve.gateway.auth.effective_jwt_secret`); there is no separate
+credential store. A client (Codex, Claude Code, etc.) sends the JWT from
+``POST /api/auth/login`` as an ``Authorization: Bearer <jwt>`` header or a
+``?token=<jwt>`` query parameter.
 
-There is no unauthenticated mode. The secret is pinned at startup by the
-identity bootstrap (a configured ``auth.jwt_secret``, else one generated into
-the database); until that has happened no secret is in force and every request
-is refused, the same way the web gateway refuses.
+There is no unauthenticated mode. Until startup pins a secret, every request
+is refused, as in the web gateway.
 """
 
 from __future__ import annotations
@@ -92,9 +88,7 @@ def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict:
     """Validate the JWT on an incoming MCP request.
 
     Returns the decoded JWT payload. Raises :class:`McpAuthError` on a
-    missing or invalid token — and when no signing secret is in force at
-    all, which only happens before startup has pinned one: the endpoint
-    fails closed rather than open, like ``require_auth``.
+    missing or invalid token, or when no signing secret is pinned yet.
     """
     secret = effective_jwt_secret(config)
     if not secret:

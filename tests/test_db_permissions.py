@@ -1,25 +1,16 @@
-"""State-file security: the directory and database files are owner-only, or the
-instance does not open them.
+"""State-file security: the directory and database files are owner-only.
 
-``nerve.db`` holds accounts, actors and history, and may hold the generated JWT
-signing secret. ``Database.connect`` therefore, on every open and in this order:
+On every open, ``Database.connect``:
 
-* inspects before touching anything, and **refuses to open** — no migration, no
-  repair — when a database file, a sidecar or the state directory is
-  group/world-**writable**, or when a mode cannot be read (**uninspectable**).
-  Another user may have altered the contents; that is evidence the operator
-  acknowledges by fixing the modes by hand, not something to chmod away;
-* repairs **read** exposure: makes the directory ``0700`` and the files ``0600``
-  and *verifies* the result (a ``chmod`` that a mode-less filesystem accepts but
-  ignores is caught). A file that stays readable is fatal at bootstrap unless a
-  configured secret means nothing secret is stored there;
-* rotates a stored signing secret that was readable before repair, because it
-  may already have been copied — on disk *and* in this process's pin, so memory
-  and disk never disagree about which key is live.
+* refuses to open, with no migration and no repair, when the state directory,
+  a database file or a sidecar is group/world-writable or its mode cannot be
+  read;
+* makes the directory 0700 and the files 0600, and verifies the result;
+* deletes a stored signing secret that was readable before the repair, and
+  drops it from the process pin.
 
-The policy lives in ``connect()``, so every opener — the gateway, each CLI
-command, the installer — gets exactly this (the CLI's own refusal is covered in
-``test_cli_openers.py``).
+Every opener goes through ``connect()``. ``test_cli_openers.py`` covers the
+CLI.
 """
 
 from __future__ import annotations
@@ -73,8 +64,8 @@ def permissive_umask(request):
 
 
 async def _make_db(path: Path) -> None:
-    """A secured, migrated, empty database, then closed. Nothing is pinned:
-    only the bootstrap pins, and this never bootstraps."""
+    """Create a secured, migrated, empty database and close it. Nothing is
+    pinned, because only the bootstrap pins."""
     db = Database(path)
     await db.connect()
     await db.close()
@@ -118,19 +109,16 @@ async def test_fresh_database_is_owner_only(tmp_path, permissive_umask):
 async def test_a_directory_created_by_connect_is_owner_only_even_under_umask_000(
     tmp_path, permissive_umask,
 ):
-    """The directory connect() itself creates must not trip its own refusal:
-    it is created 0700, whatever the umask, and a 0777 pre-existing one is
-    judged as found (below)."""
+    """connect() creates a missing state directory 0700 under any umask, so
+    its own refusal does not fire on it."""
     db_path = tmp_path / "state" / "nested" / "nerve.db"
     await _make_db(db_path)
     assert _mode(db_path.parent) == 0o700
 
 
 def test_nerve_creates_its_own_state_directory_owner_only(tmp_path, permissive_umask, monkeypatch):
-    """Every place Nerve creates the state directory goes through this and
-    gets 0700 under any umask, so the refusal below never fires on a
-    directory Nerve made. An existing directory is left as found — judging it
-    is connect()'s job."""
+    """``ensure_nerve_home`` creates the state directory 0700 under any umask
+    and leaves an existing one unchanged; connect() judges that one."""
     from nerve import paths
 
     home = tmp_path / "home" / ".nerve"
@@ -159,8 +147,8 @@ async def test_a_readable_file_is_repaired_to_owner_only(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_0755_directory_is_not_a_hazard(tmp_path):
-    """Read/traverse on the directory is fine; only write on it matters. It is
-    still tightened to 0700 on the way through."""
+    """Group/world read on the directory is accepted and tightened to 0700.
+    Only write access is a hazard."""
     state = tmp_path / "state"
     state.mkdir()
     os.chmod(state, 0o755)  # explicit: a umask of 002 would make it 0775, which *is* a hazard
@@ -194,10 +182,8 @@ async def test_hardening_is_idempotent_across_reconnects(tmp_path):
 
 @pytest.mark.asyncio
 class TestRefusesToOpenWritableState:
-    """Write access by another user is an integrity question, not a mode to
-    fix: nothing is opened, migrated or repaired, whatever ``auth.jwt_secret``
-    says (the configuration is not even consulted — the refusal is in
-    ``connect()``), and the message names the manual remedy."""
+    """Writable state is not opened, migrated or repaired, whatever the
+    configuration says. The message gives the chmod commands."""
 
     @pytest.mark.parametrize("mode", [0o666, 0o660, 0o606], ids=["0666", "group-w", "world-w"])
     async def test_a_writable_database_file_is_refused_before_anything_happens(
@@ -239,9 +225,8 @@ class TestRefusesToOpenWritableState:
         "mode", [0o777, 0o770, 0o707, 0o775], ids=["0777", "group-w", "world-w", "0775-umask-002"],
     )
     async def test_a_writable_directory_is_refused(self, tmp_path, mode):
-        """0775 is what a plain mkdir leaves under a 002 umask — a ~/.nerve an
-        older version created on Ubuntu. Group-writable is writable: refused
-        once, with the chmod as the acknowledgement."""
+        """Group-writable counts as writable. That includes 0775, which a plain
+        mkdir gives under a 002 umask."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path.parent, mode)
@@ -271,8 +256,7 @@ class TestRefusesToOpenWritableState:
         os.chmod(db_path, 0o666)
         with pytest.raises(InsecureStateStorage):
             await Database(db_path).connect()
-        # Same verdict from the bootstrap layer, should anything ever reach it
-        # with the same finding.
+        # The bootstrap backstop refuses the same finding.
         from nerve.migrate import _refuse_insecure_secret_storage
 
         stub = SimpleNamespace(
@@ -302,8 +286,7 @@ class TestRefusesToOpenWritableState:
             await db.close()
 
     async def test_the_package_level_opener_is_covered_too(self, tmp_path):
-        """init_db() is Database.connect() underneath; there is no opener that
-        bypasses the policy."""
+        """init_db() goes through Database.connect(), so it refuses too."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path, 0o666)
@@ -313,9 +296,8 @@ class TestRefusesToOpenWritableState:
 
 @pytest.mark.asyncio
 class TestUninspectableIsRefused:
-    """A mode that cannot be read is not "probably fine": an attacker cannot
-    make a file uninspectable to hide a wide mode, but a transient failure
-    must still fail closed rather than let the open proceed on a guess."""
+    """A mode that cannot be read is treated as unsafe, even when the failure
+    is transient."""
 
     async def test_a_one_shot_stat_failure_refuses_the_open(self, tmp_path):
         db_path = tmp_path / "state" / "nerve.db"
@@ -341,7 +323,7 @@ class TestUninspectableIsRefused:
             base._mode_of = base_mode_of
         assert base._mode_of is real_mode_of
 
-        # It was transient: the next open — after the operator looked — works.
+        # The failure was transient, so the next open works.
         db = Database(db_path)
         await db.connect()
         try:
@@ -364,10 +346,8 @@ class TestUninspectableIsRefused:
     async def test_a_verifying_read_that_fails_after_repair_refuses_too(
         self, tmp_path, monkeypatch,
     ):
-        """The pre-open inspection passed (0644 is read exposure, repairable);
-        the read that *verifies* the chmod then fails. The repair is not
-        trusted: the file is uninspectable, the connection is closed again and
-        the open is refused — the backstop behind the first pass."""
+        """0644 passes the pre-open inspection, but the read that verifies the
+        chmod fails. The open is refused and the connection is closed."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path, 0o644)
@@ -454,9 +434,8 @@ class TestExposedKeyIsRotated:
             await db.close()
 
     async def test_a_readable_db_that_never_held_a_key_is_not_rotated(self, tmp_path):
-        """A fresh 0644 database from old code that never stored a secret is not
-        an exposure: nothing to rotate, and once repaired a secret generates
-        normally."""
+        """A 0644 database with no stored secret has nothing to rotate. After
+        the repair a secret is generated normally."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path, 0o644)
@@ -478,10 +457,8 @@ class TestExposedKeyIsRotated:
 
 @pytest.mark.asyncio
 class TestRotationReachesThePin:
-    """Same process, no ``unpin_jwt_secret()`` between the opens: a verifier
-    that kept the retired key pinned would go on accepting tokens minted with
-    the copy. Retiring the row drops a matching pin, so requests fail closed
-    until the bootstrap pins the replacement."""
+    """Retiring an exposed key also drops a matching process pin, so requests
+    fail closed until the bootstrap pins the replacement."""
 
     async def test_the_pinned_compromised_key_is_unpinned_and_then_replaced(self, tmp_path):
         db_path = tmp_path / "state" / "nerve.db"
@@ -517,9 +494,8 @@ class TestRotationReachesThePin:
             await db2.close()
 
     async def test_a_pin_that_is_not_the_retired_key_is_left_alone(self, tmp_path):
-        """A configured secret is pinned; the database happens to hold a stale
-        stored key that gets exposed. That row is retired; the pin — which
-        never was that key — stays, and requests keep verifying."""
+        """An exposed stored key is retired, but a pinned configured secret
+        that differs from it stays pinned."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db_with_secret(db_path, _S1)
         pin_jwt_secret(_CONFIGURED)
@@ -536,10 +512,8 @@ class TestRotationReachesThePin:
 
 @pytest.mark.asyncio
 class TestAFailedConnectLeavesNothingOpen:
-    """``aiosqlite.connect`` starts a non-daemon thread. Anything that
-    fails after it — a migration, the permission backstop, a cancellation — has
-    to close the connection, or the caller gets an exception *and* a thread
-    that keeps the process alive, with a retry opening another one."""
+    """``aiosqlite.connect`` starts a non-daemon thread, so any failure after
+    it closes the connection. Otherwise the thread keeps the process alive."""
 
     async def test_a_failed_migration_closes_the_connection(self, tmp_path, monkeypatch):
         import asyncio
@@ -566,8 +540,7 @@ class TestAFailedConnectLeavesNothingOpen:
     async def test_the_global_is_not_published_by_a_failed_open(
         self, tmp_path, monkeypatch,
     ):
-        """``init_db`` used to assign the global first, so a refused open left
-        ``get_db()`` handing out a database nobody can use."""
+        """A refused open leaves the global unset, so ``get_db()`` raises."""
         import nerve.db as db_pkg
 
         db_path = tmp_path / "state" / "nerve.db"

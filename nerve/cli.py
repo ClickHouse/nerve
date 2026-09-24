@@ -268,25 +268,20 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     set_config(config)
     ctx.obj["config"] = config
 
-    # Create the local owner account now, while the name the wizard collected
-    # ("Your name") is still in hand: nothing the wizard writes carries it, and
-    # the gateway's own bootstrap at first start would otherwise create the
-    # owner unnamed. Headless installs collect no name and get an unnamed owner
-    # (renameable later). This runs in the process that ran the wizard — inside
-    # the container for a docker install, which is where `--inside-docker` runs;
-    # the host-side wizard for docker never reaches this point.
+    # Create the owner account now, while the wizard's "Your name" answer is
+    # available. No file stores that answer, so the gateway would create the
+    # owner unnamed. Headless installs have no name. For docker, this runs
+    # inside the container (`--inside-docker`), not in the host-side wizard.
     from nerve.migrate import bootstrap_identity_sync
 
     display_name = (choices.user_name or "").strip() or None
     try:
         report = bootstrap_identity_sync(config, display_name=display_name)
-    except Exception as e:  # noqa: BLE001 — anything here means the account is not there
-        # The wizard cleared its checkpoint when it applied the configuration,
-        # and the name it collected exists nowhere else. Put the answers back so
-        # a re-run resumes at the review step with the same name, and fail
-        # loudly. Otherwise the gateway would create an unnamed owner on first
-        # start. The recovery message depends on whether checkpointing also
-        # succeeds; the same state-filesystem error can make both writes fail.
+    except Exception as e:  # noqa: BLE001 - any failure means there is no account
+        # The wizard deleted its checkpoint when it applied the configuration.
+        # Save the answers again so a re-run keeps the name, then fail. The
+        # checkpoint write can fail for the same reason, so the message says
+        # whether it worked.
         saved = wizard.checkpoint() if wizard is not None else False
         if wizard is None:
             remedy = " Fix the cause and run 'nerve init --non-interactive' again."
@@ -321,8 +316,8 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
-    # The same pass bootstraps the local owner account and signing secret in
-    # nerve.db (skipped on a fresh install; the gateway repeats it at startup).
+    # maybe_migrate also runs the identity bootstrap (not on a fresh install;
+    # the gateway runs it again at startup).
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
@@ -1338,14 +1333,11 @@ _WILDCARD_BINDS = ("", "0.0.0.0", "::", "*")
 
 
 def _signing_secret(config) -> str:
-    """The JWT secret this box's daemon signs with, as seen from a CLI process.
+    """The JWT secret the local daemon signs with, read from a CLI process.
 
-    ``auth.jwt_secret`` from the config read here when set; otherwise the
-    secret the daemon generated into ``nerve.db`` on its first start, read
-    straight from the file (a CLI process has no live database, and the
-    daemon keeps the value in memory rather than in any config file). Empty
-    only when there is no secret anywhere yet — the daemon has never started
-    — in which case an unlocked gateway is not asking for a token either.
+    ``auth.jwt_secret`` if set, else the secret the daemon generated into
+    ``nerve.db``, read directly from the file. Empty if the daemon has never
+    started.
     """
     if config.auth.jwt_secret:
         return config.auth.jwt_secret
@@ -1387,10 +1379,8 @@ def reload(ctx: click.Context) -> None:
             f"Config could not be loaded ({ctx.obj.get('config_error')}); "
             "run 'nerve config validate' to see why."
         )
-    # auth.jwt_secret from the config read here, else the secret the daemon
-    # generated into nerve.db on its first start (this shell is on the same box).
-    # With neither there is nothing to sign with, and the gateway refuses every
-    # unauthenticated request, so say so here instead of reporting its refusal.
+    # Without a secret there is nothing to sign with, and the gateway refuses
+    # unauthenticated requests, so fail here with a clear message.
     secret = _signing_secret(config)
     if not secret:
         raise click.ClickException(
@@ -1477,9 +1467,9 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
     Non-destructive (originals kept as *.migrated) and idempotent.
 
-    Also bootstraps the local owner account and, when auth.jwt_secret is not
-    configured, the JWT signing secret in nerve.db — once, on the first run
-    after upgrading; the gateway repeats the check at every start.
+    Also creates the local owner account and, if auth.jwt_secret is not set,
+    a JWT signing secret in nerve.db. The gateway does the same check at
+    every start.
     """
     from nerve.migrate import migrate as run_migrate
 
@@ -1731,9 +1721,7 @@ def codex_token(ctx: click.Context, hours: int) -> None:
 
     secret = _signing_secret(ctx.obj["config"])
     if not secret:
-        # No secret anywhere yet (the daemon has never started), so there is
-        # nothing to sign with — and nothing the endpoint would accept. An
-        # empty value is intentional.
+        # No secret yet (the daemon has never started), so print nothing.
         return
     click.echo(create_external_mcp_token(secret, ttl_seconds=hours * 60 * 60))
 
@@ -1860,8 +1848,6 @@ def sync(ctx: click.Context, source: str) -> None:
         from nerve.migrate import open_production_db
         from nerve.sources.registry import build_source_runners
 
-        # The production opener: state-file policy, migrations, identity
-        # bootstrap — the same state `nerve start` would leave.
         db = await open_production_db(config)
         try:
             engine = AgentEngine(config, db)
@@ -2383,9 +2369,8 @@ def _fmt_bytes(n: int) -> str:
 def _run_against_db(ctx: click.Context, coro):
     """``asyncio.run`` for a command that opens the state database.
 
-    Every opener goes through ``nerve.migrate.open_production_db`` and so
-    through ``Database.connect``'s state-file policy; its refusal to open
-    writable or uninspectable state is an operator message, not a traceback.
+    Prints an :class:`InsecureStateStorage` refusal as an error message
+    instead of a traceback.
     """
     from nerve.migrate import InsecureStateStorage
 

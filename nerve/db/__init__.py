@@ -31,10 +31,8 @@ async def init_db(db_path: Path | None = None, workspace: Path | None = None) ->
         workspace: Workspace root for resolving task file paths during FTS
             reseed. When omitted, the DB falls back to the DB's parent dir.
 
-    The global is published only once the database is open and migrated.
-    Assigning it first meant a ``connect()`` that refused — the state-file
-    policy does refuse — or a migration that failed left the global pointing at
-    a database nobody can use, and ``get_db()`` handing it out.
+    The global is set only after ``connect()`` succeeds, so ``get_db()`` never
+    returns a database that failed to open or migrate.
     """
     global _db
     if db_path is None:

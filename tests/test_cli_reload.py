@@ -172,10 +172,8 @@ class TestReloadCommand:
         assert "Traceback" not in result.output
 
     def test_no_secret_anywhere_refuses_before_calling(self, tmp_path, monkeypatch):
-        """No auth.jwt_secret in the config read here and no generated one in
-        nerve.db means the daemon has never started: there is nothing to sign
-        with, and the gateway refuses unauthenticated requests, so the command
-        says so instead of reporting the gateway's refusal."""
+        """With no configured secret and none in nerve.db, the command has
+        nothing to sign with and refuses before it calls the gateway."""
         calls: list = []
         monkeypatch.setattr(httpx, "post", _post(calls))
         (tmp_path / "config.yaml").write_text("timezone: UTC\n", encoding="utf-8")
@@ -186,9 +184,8 @@ class TestReloadCommand:
         assert not calls
 
     def test_a_password_hash_is_not_a_second_source_of_a_token(self, tmp_path, monkeypatch):
-        """auth.password_hash gates the browser login, which is what mints a token
-        from it. require_auth checks the signing secret alone, so a password
-        neither authenticates this command nor gives it anything to sign with."""
+        """A password hash gives this command nothing to sign with: request
+        auth checks only the signing secret."""
         calls: list = []
         monkeypatch.setattr(httpx, "post", _post(calls))
         (tmp_path / "config.yaml").write_text(
@@ -200,8 +197,8 @@ class TestReloadCommand:
         assert not calls
 
     def test_the_generated_secret_in_nerve_db_is_used(self, tmp_path, monkeypatch):
-        """The daemon has started once with no configured secret: the one it
-        generated into nerve.db is what this shell signs with."""
+        """Without a configured secret, the command signs with the one the
+        daemon generated into nerve.db."""
         import asyncio
 
         from nerve import paths

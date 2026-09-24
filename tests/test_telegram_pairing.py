@@ -1,11 +1,9 @@
 """``/pair`` reports whether authorization was persisted.
 
-Pairing authorizes a Telegram user in memory *and* writes them into
-``telegram.allowed_users`` in ``config.local.yaml``. That file also holds the
-password hash and the signing secret, so the writer refuses to rewrite it on a
-filesystem that will not keep it owner-only — and then nothing was saved. A
-handler that replies "✓ Paired" anyway costs the user their access at the next
-restart, with nothing to explain it.
+Pairing authorizes a Telegram user in memory and adds them to
+``telegram.allowed_users`` in ``config.local.yaml``. The writer refuses when
+the file cannot be kept owner-only. The reply must then say the pairing lasts
+only until restart.
 """
 
 from __future__ import annotations
@@ -65,10 +63,8 @@ async def test_a_saved_pairing_is_reported_as_paired(channel, monkeypatch):
 async def test_a_pairing_the_filesystem_would_not_let_us_save_says_so(
     channel, tmp_path, monkeypatch, caplog,
 ):
-    """End to end through the real persistence call, with the real failure:
-    a filesystem that will not keep the secrets file owner-only. The reply must
-    not claim a permanent pairing the allow-list never got — authorization
-    holds for this run, and the user is told how to make it stick."""
+    """When the secrets file cannot be kept owner-only, the pairing holds for
+    this run only, and the reply says so and how to make it permanent."""
     import logging
 
     monkeypatch.setattr(paths, "_mode_is_private", lambda st_mode: False)

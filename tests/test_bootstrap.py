@@ -310,10 +310,8 @@ class TestConfigLocalPermissions:
         assert mode == "600"
 
     def test_it_is_never_created_at_a_wider_mode(self, tmp_path: Path) -> None:
-        """It holds the signing secret, the password hash and the API keys, so
-        the mode comes from the create — not from a chmod afterwards, which
-        would publish all three for the moment in between. Under a umask of 000
-        a plain write would land 0666."""
+        """The file holds credentials, so it is created 0600, with no chmod
+        afterwards. The test runs under umask 000."""
         wizard = SetupWizard(tmp_path)
         wizard.choices.anthropic_api_key = "sk-ant-api03-test"
         wizard.choices.workspace_path = tmp_path / "workspace"
@@ -335,11 +333,8 @@ class TestConfigLocalPermissions:
     def test_setup_fails_rather_than_write_secrets_a_filesystem_will_not_protect(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        """A filesystem that ignores the mode gets no secrets file at all.
-
-        The instance would otherwise start perfectly well with its API keys,
-        password hash and signing secret readable by every local user, which is
-        not an install that succeeded."""
+        """On a filesystem that ignores the mode, setup writes no secrets file
+        and fails."""
         from nerve import paths as paths_mod
 
         monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)

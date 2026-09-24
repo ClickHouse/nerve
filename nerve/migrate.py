@@ -58,16 +58,12 @@ Callers that must not touch the machine — tests, tooling, a dry run against
 someone else's tree — have to pass ``legacy_cron_dir=`` as well (or set
 ``NERVE_HOME``).
 
-**Identity bootstrap.** This module also owns the configuration-aware half of
-the local accounts migration (:func:`bootstrap_identity`). The schema
-migration (v047) creates empty tables and reads no configuration; whether the
-one bootstrapped account authenticates against ``auth.password_hash`` or is
-passwordless, and whether a JWT signing secret has to be generated because
-``auth.jwt_secret`` is unset, are configuration questions, so they are decided
-here, after the schema is current. It runs from the CLI through
-:func:`migrate` (so ``nerve migrate --dry-run`` shows it before it happens) and
-authoritatively from the gateway at startup. Under ``NERVE_HOME`` — the fourth
-root — since that is where ``nerve.db`` lives.
+**Identity bootstrap.** :func:`bootstrap_identity` is the part of the accounts
+migration that reads configuration. The v047 schema migration creates the
+tables; this step creates the first account and, if ``auth.jwt_secret`` is
+unset, a signing secret. The CLI runs it through :func:`migrate`, so
+``nerve migrate --dry-run`` shows it. The gateway runs it at every start. It
+writes under ``NERVE_HOME``, where ``nerve.db`` is.
 """
 
 from __future__ import annotations
@@ -282,18 +278,16 @@ class MigrationReport:
     # happened: the write order is chosen so an interruption leaves a working,
     # retryable install, not a half-written one.
     error: str | None = None
-    # Identity bootstrap (see :func:`bootstrap_identity`). Kept apart from the
-    # file-layout fields above: it changes rows in nerve.db, not files, and the
-    # callers that reload config after a layout migration have nothing to
-    # reload for it. Phrased in the present tense on a dry run ("create ...")
-    # and the past tense otherwise ("created ..."), so the CLI's "would" prefix
-    # reads correctly.
+    # Identity bootstrap (see :func:`bootstrap_identity`). Separate from the
+    # file-layout fields because it changes rows in nerve.db, not files, so it
+    # gives callers no reason to reload config. Actions use the present tense
+    # on a dry run ("create") and the past tense otherwise ("created").
     identity_actions: list[str] = field(default_factory=list)
     bootstrapped_account: bool = False
     updated_credential_source: bool = False
     generated_jwt_secret: bool = False
-    # A database-held signing secret was (or would be) deleted because a
-    # configured auth.jwt_secret supersedes it.
+    # The stored signing secret was (or would be) deleted because
+    # auth.jwt_secret is configured.
     retired_stored_secret: bool = False
 
     @property
@@ -583,9 +577,8 @@ def migrate(
     directory it cannot write, and a caller that only sees the exception has no
     way to know the files already moved.
 
-    ``config`` is the loaded configuration the identity bootstrap reads; when
-    omitted (or when the layout half just moved files) it is loaded from
-    ``config_dir``.
+    ``config`` is what the identity bootstrap reads. If it is omitted, or the
+    layout half moved files, the bootstrap loads it from ``config_dir``.
     """
     config_dir = Path(config_dir)
     workspace = Path(workspace) if workspace is not None else _resolve_workspace(config_dir)
@@ -892,9 +885,9 @@ def is_migrated(
     workspace: Path | None = None,
     legacy_cron_dir: Path | None = None,
 ) -> bool:
-    """True if there is nothing left to migrate in the *file layout* of
-    ``config_dir``. The identity bootstrap is not part of this answer: it is
-    re-checked on every start and never blocks anything."""
+    """True if the file layout of ``config_dir`` needs no migration.
+
+    The identity bootstrap is not included; it runs again at every start."""
     return not migrate(
         config_dir, workspace=workspace, dry_run=True, legacy_cron_dir=legacy_cron_dir
     ).did_anything
@@ -961,29 +954,24 @@ def maybe_migrate(
 #  Identity bootstrap                                                          #
 # --------------------------------------------------------------------------- #
 #
-# Configuration-aware bootstrap after the v047 schema migration. The migration
-# itself creates the system actor; this step creates only the first human
-# account and, when needed, the signing secret the gateway runs with.
+# Runs after the v047 schema migration, which creates the system actor. This
+# step creates the first human account and, if needed, the signing secret.
 #
-# Rules it keeps:
-#
-# * Acts on the accounts table only while it is empty. A disabled account is a
-#   row, so it is never re-created and disablement stays durable.
-# * Copies no credential. A configured password stays where it is and the row
-#   says credential_source='config'; nothing in any config file is rewritten,
-#   which is what keeps a lockdown install with `${NERVE_PASSWORD_HASH}` working.
-# * Idempotent across restarts: the same rows and ids are found each time, which
-#   backup and restore rely on.
+# * It creates an account only while the accounts table is empty, so a
+#   disabled account is never created again.
+# * It copies no credential. A configured password stays in configuration and
+#   the row says credential_source='config'. No config file is rewritten, so a
+#   lockdown install with `${NERVE_PASSWORD_HASH}` keeps working.
+# * It is idempotent: each run finds the same rows and ids, which backup and
+#   restore rely on.
 
 
 def _credential_source_for(config: NerveConfig) -> str:
-    """Where the bootstrapped account's credential lives, from configuration.
+    """The bootstrapped account's credential source.
 
-    ``config`` while ``auth.password_hash`` is set — the hash is used from
-    there, never copied — and ``none`` (passwordless) otherwise. A fresh
-    install is the passwordless shape until a password is set. ``local`` (a
-    hash on the account row) is never chosen here: only an explicit password
-    change moves an account there.
+    ``config`` when ``auth.password_hash`` is set (the hash stays in
+    configuration), else ``none`` (passwordless). Never ``local``: only a
+    password change moves an account there.
     """
     return "config" if config.auth.password_hash else "none"
 
@@ -1024,36 +1012,24 @@ def _retire_action(dry_run: bool) -> str:
     )
 
 
-# The exception lives with the policy that raises it first (Database.connect
-# refuses writable/uninspectable state before opening); the bootstrap raises the
-# same class for the confidentiality case. The old name remains as an alias so
-# callers can keep importing it from this module.
+# Database.connect raises this for writable or uninspectable state; the
+# bootstrap raises it for readable state. InsecureSecretStorage is an alias.
 from nerve.db.base import InsecureStateStorage  # noqa: E402
 
 InsecureSecretStorage = InsecureStateStorage
 
 
 def _refuse_insecure_secret_storage(db: "Database", config: NerveConfig, *, log: bool) -> bool:
-    """Decide what unsecured state storage means, and stop startup when unsafe.
+    """Raise :class:`InsecureStateStorage` if the state files are unsafe to use.
 
-    Three cases, in order of severity:
+    * Writable or uninspectable files or directory: always raises. Another user
+      could replace the database; ``auth.jwt_secret`` does not prevent that.
+    * Readable files, no ``auth.jwt_secret``: raises, because a generated
+      secret would be readable by other users.
+    * Readable files, ``auth.jwt_secret`` set: logs an error (if ``log``) and
+      returns ``True``. The database holds no secret, so startup continues.
 
-    * **Writable or uninspectable** database files or directory → always fatal,
-      regardless of ``auth.jwt_secret``. Another user could replace ``nerve.db``
-      or rewrite the accounts, actors and history stored there; a configured
-      JWT protects none of that. Raises :class:`InsecureStateStorage`.
-    * **Readable** database files, no configured ``auth.jwt_secret`` → fatal: a
-      generated secret would sit in a file other users can read. Raises. Any
-      key that *was* stored while the file was readable has already been retired
-      on connect (it is compromised), so re-securing the file is necessary but,
-      on its own, does not un-leak the old key — the message says so.
-    * **Readable** database files, ``auth.jwt_secret`` configured → the gateway
-      starts (nothing secret is kept in the database), but an error names the
-      files so the operator fixes them; the database still holds accounts and
-      history worth protecting.
-
-    Returns whether the storage is unsecured (readable-with-configured-secret
-    is the only non-raising unsecured case). Secured → ``False``, no output.
+    Returns ``False`` when the state files are owner-only.
     """
     perms = getattr(db, "state_permissions", None)
     if perms is None or perms.secured:
@@ -1104,28 +1080,17 @@ async def bootstrap_identity(
 ) -> MigrationReport:
     """Create the local owner account and signing secret if they do not exist.
 
-    The configuration-aware step of the accounts migration. Runs after the
-    schema is current (``db`` is connected, so v047 has applied) and before
-    anything mints or verifies a token. Idempotent and cheap on a re-run:
-    finds the same rows, changes nothing that exists, and returns the same
-    ids. Only an empty ``accounts`` table creates an account;
-    ``display_name`` is applied to that new owner only. The
-    interactive installer passes the name it collected ("Your name") — it
-    runs this in-process before exiting, since nothing it writes carries the
-    answer — while the gateway's own pass at startup has none to give, so an
-    owner it creates is unnamed until renamed.
+    Runs after ``db`` is connected (so v047 has applied) and before anything
+    mints or verifies a token. Idempotent. An account is created only when
+    ``accounts`` is empty, and ``display_name`` applies only to that account.
+    The installer passes the name it collected; the gateway passes none.
 
-    One thing is re-derived on every run: while the owner's
-    ``credential_source`` is ``config`` or ``none`` — both meaning "the
-    credential is whatever configuration says" — it is kept in step with
-    whether ``auth.password_hash`` is set. Nothing is created, enabled or
-    disabled by that; a row that has moved to ``local`` (a password of its
-    own) is never touched. It closes the gap between ``nerve start`` running
-    this before the first-run wizard and the wizard then writing a password.
+    On every run, an account with ``credential_source`` ``config`` or ``none``
+    is set to match whether ``auth.password_hash`` is set. This covers a
+    password that the first-run wizard writes after ``nerve start`` has run
+    the bootstrap. ``local`` accounts are not changed.
 
-    Reports through ``report.identity_actions`` and the ``bootstrapped_account``
-    / ``updated_credential_source`` / ``generated_jwt_secret`` flags;
-    ``dry_run`` reports and writes nothing.
+    Results go to ``report``. With ``dry_run``, nothing is written.
     """
     report = MigrationReport(dry_run=dry_run) if report is None else report
     source = _credential_source_for(config)
@@ -1135,14 +1100,11 @@ async def bootstrap_identity(
             report.bootstrapped_account = True
             report.identity_actions.append(_account_action(source, dry_run=True))
     else:
-        # Before anything is written: a database other users can read may not
-        # receive a generated secret, and if that is what this run would have
-        # to do, it stops here rather than after creating the account.
+        # Check before any write, so an unsafe database gets no account either.
         _refuse_insecure_secret_storage(db, config, log=False)
-        # Reported from what the transaction actually did, not from a count
-        # taken before it: two bootstraps racing — a `nerve migrate` beside a
-        # starting daemon — both read zero accounts, but only the one that
-        # wins BEGIN IMMEDIATE creates the owner, and only it may say so.
+        # Report what the transaction did. Two concurrent bootstraps (for
+        # example `nerve migrate` and a starting daemon) can both see zero
+        # accounts, but only the one that wins BEGIN IMMEDIATE creates one.
         account = await db._bootstrap_first_account(
             credential_source=source, display_name=display_name,
         )
@@ -1155,10 +1117,8 @@ async def bootstrap_identity(
                 account.account_id, account.actor_id, source, db.system_actor_id,
             )
 
-    # The mirror runs after the transaction whoever won it, so a caller that
-    # lost the race with a different configuration snapshot still brings the
-    # row in line with its own. For the winner it is a no-op: the account it
-    # just created already carries ``source``.
+    # This also runs when another process created the account, so this
+    # caller's configuration is applied. For the creator it changes nothing.
     for account in await db._account_rows():
         current = account["credential_source"]
         if current == "local" or current == source:
@@ -1181,21 +1141,14 @@ async def ensure_jwt_secret(
 ) -> str:
     """Make sure a JWT signing secret exists, and pin it for this process.
 
-    ``auth.jwt_secret`` in configuration is used as-is when set, so an upgrade
-    keeps every live session — and it *retires* any secret the database still
-    holds from a time it was not configured: a superseded key that stayed on
-    disk would come back into force the day the configured one was removed,
-    which is what key rotation exists to rule out. Otherwise the secret kept
-    in ``nerve.db`` (``instance_secrets``) is used, and generated first if
-    there is none — once, never rotated here, never written into a config
-    file. A database that other users can read never receives one (see
-    :func:`_refuse_insecure_secret_storage`).
+    A configured ``auth.jwt_secret`` wins, and any secret stored in the
+    database is deleted, so a replaced key cannot come back if the setting is
+    removed later. Otherwise the secret in ``instance_secrets`` is used, or
+    generated once if there is none. A database that other users can read
+    never gets one (see :func:`_refuse_insecure_secret_storage`).
 
-    The value in force is pinned via :func:`nerve.gateway.auth.pin_jwt_secret`,
-    so every consumer of :func:`~nerve.gateway.auth.effective_jwt_secret` sees
-    it and keeps seeing it across config reloads; the first pin in a process
-    wins, so a later call with a changed configuration returns what is pinned.
-    Returns the secret in force (``""`` on a dry run that would generate).
+    The first pin in a process wins, so reloads do not change the secret.
+    Returns the secret in force (``""`` on a dry run that would generate one).
     """
     from nerve.db.accounts import JWT_SECRET_NAME
     from nerve.gateway.auth import pin_jwt_secret, pinned_jwt_secret
@@ -1239,32 +1192,25 @@ async def ensure_jwt_secret(
 def _bootstrap_identity_sync(
     config_dir: Path, config: NerveConfig | None, report: MigrationReport,
 ) -> None:
-    """The identity bootstrap from a synchronous caller (the CLI).
+    """Run the identity bootstrap from the CLI.
 
-    Skipped on a fresh install — no ``config.local.yaml`` yet — because what
-    the first-run wizard is about to write (a password, a secret) is what
-    shapes the account, and because ``nerve start -f`` on a docker install
-    runs the wizard on the host and then hands over to the container, so a
-    bootstrap here would leave a stray host-side ``nerve.db``. The gateway
-    runs the bootstrap at startup in every case; this pass exists so
-    ``nerve migrate --dry-run`` can show it first and ``nerve start`` /
-    ``nerve upgrade`` report it.
+    Skipped on a fresh install (no ``config.local.yaml``): the wizard has not
+    yet written the password and secret, and on a docker install a bootstrap
+    here would create a stray ``nerve.db`` on the host. The gateway runs the
+    bootstrap at every start; this pass lets ``nerve migrate --dry-run`` show
+    it and lets ``nerve start`` and ``nerve upgrade`` report it.
 
-    A dry run inspects ``nerve.db`` read-only and never creates it; the real
-    run opens its own short-lived connection (which also applies the schema
-    migration, as any CLI command opening the database does).
+    A dry run reads ``nerve.db`` read-only and never creates it.
     """
     from nerve.bootstrap import is_fresh_install
 
     if is_fresh_install(config_dir):
         return
     if config is None or report.migrated_config:
-        # After the layout half moved files, the caller's object is stale in
-        # general; the auth values it needs did not move, but reloading is
-        # cheap and removes the question.
+        # The layout migration can move config files, so reload.
         try:
             config = load_config(config_dir)
-        except Exception as e:  # noqa: BLE001 — a broken config fails startup on its own
+        except Exception as e:  # noqa: BLE001 - a broken config fails startup anyway
             report.warnings.append(
                 f"identity bootstrap skipped: the config could not be loaded ({e}); "
                 "the gateway runs it at startup"
@@ -1290,8 +1236,7 @@ def _bootstrap_identity_sync(
 
 
 def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationReport) -> None:
-    """Dry-run counterpart of :func:`bootstrap_identity`: read-only, and a
-    missing database is reported as "would create" rather than created."""
+    """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only."""
     from nerve.db.accounts import inspect_bootstrap_state
 
     source = _credential_source_for(config)
@@ -1318,15 +1263,12 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
 def bootstrap_identity_sync(
     config: NerveConfig, *, display_name: str | None = None,
 ) -> MigrationReport:
-    """The identity bootstrap from synchronous code, on a fresh connection.
+    """Run the identity bootstrap on a new connection, for the installer.
 
-    For the installer: ``nerve init`` has the owner's name in hand only while
-    it runs, so it creates the owner here rather than leaving that to the
-    gateway's first start, which would create it unnamed. Unlike the CLI
-    migration pass this does not skip a "fresh" install — the installer has
-    just written the configuration — and it never dry-runs. Raises on
-    failure; the caller decides how loudly to say so, since the gateway
-    repeats the bootstrap at first start regardless.
+    ``nerve init`` has the owner's name only while it runs, so it creates the
+    owner here; the gateway would create it unnamed. This does not skip a
+    fresh install, because the installer has just written the configuration.
+    Raises on failure.
     """
     try:
         asyncio.get_running_loop()
@@ -1366,20 +1308,13 @@ async def open_production_db(
     db_path: Path | None = None,
     display_name: str | None = None,
 ) -> Database:
-    """The one way production code opens the state database.
+    """Open the state database the way the gateway does at startup.
 
-    ``Database.connect`` (state-file policy, then migrations) followed by the
-    configuration-aware identity bootstrap — accounts, system principal,
-    signing secret — exactly what the gateway does at startup. Every CLI
-    command that opens the database goes through here, so a maintenance
-    command that happens to be the first thing run after an upgrade leaves
-    the same state ``nerve start`` would, and refuses the same insecure state.
-    Read-only inspection paths (``nerve migrate --dry-run``, the installer's
-    pre-checks) never open a ``Database`` and are unaffected.
-
-    Returns the open database; the caller closes it. On any failure after
-    the connection is open, the connection is closed before the error
-    propagates.
+    Connects (state-file checks, then migrations) and runs the identity
+    bootstrap. Every CLI command that opens the database uses this, so the
+    first command after an upgrade leaves the same state as ``nerve start``.
+    The caller closes the returned database. If the bootstrap fails, the
+    connection is closed before the error propagates.
     """
     from nerve.db import Database
 

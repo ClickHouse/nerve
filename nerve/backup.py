@@ -5,10 +5,8 @@ Produces a single portable bundle — ``nerve-backup-<host>-<ts>.tar.zst``
 snapshot of everything that makes a Nerve instance *this* instance:
 
 - ``nerve.db``   — sessions, messages, tasks index, notifications, plans, usage,
-  accounts and actor identity (so the bootstrapped identity ids survive a
-  restore). With ``--no-secrets`` its ``instance_secrets`` table — the JWT
-  signing secret generated for installs without ``auth.jwt_secret`` — is
-  emptied in the snapshot, since that flag promises no credential travels.
+  accounts and actor identity. ``--no-secrets`` empties its
+  ``instance_secrets`` table (the generated JWT signing secret) in the snapshot.
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -82,9 +80,8 @@ STATE_FILES: tuple[str, ...] = (
 )
 
 # Secret members (relative to the bundle root) — omitted with --no-secrets
-# and re-chmod'd to 0600 on restore. The one credential that is not a member
-# of its own — the JWT signing secret kept inside nerve.db — is handled by
-# :func:`_scrub_instance_secrets` instead.
+# and re-chmod'd to 0600 on restore. The JWT signing secret inside nerve.db is
+# removed by :func:`_scrub_instance_secrets`.
 SECRET_MEMBERS: frozenset[str] = frozenset({
     "state/certs",
     "state/mcp-token",
@@ -92,19 +89,16 @@ SECRET_MEMBERS: frozenset[str] = frozenset({
     "config/config.local.yaml",
 })
 # Files within the bundle whose mode must be 0600 after restore. nerve.db is
-# among them because it may carry the generated JWT signing secret; the daemon
-# re-tightens it on every start too, but a restored file should not sit
-# world-readable until then.
+# one of them because it can hold the generated JWT signing secret.
 SECRET_FILE_MODE = 0o600
-# Owner-only state directory on restore, mirroring nerve.db.base._STATE_DIR_MODE.
+# Owner-only state directory on restore, as in nerve.db.base._STATE_DIR_MODE.
 _STATE_DIR_MODE = 0o700
-# Group/world write bits. A directory carrying either is one another user can
-# rename or replace entries in, which is what rules it out as a place to stage
-# secrets (see _stage_parent) — the same integrity rule nerve.db.base applies.
+# Group/world write bits. Another user can rename or replace entries in a
+# directory with either bit set, so it cannot hold staged secrets (see
+# :func:`_stage_parent`).
 _GROUP_WORLD_WRITE = 0o022
-# ``nerve.db`` is installed specially (see :func:`_secure_install_db`), so it is
-# not in this generic re-chmod list; the entry is kept only for the test that
-# documents the intent.
+# The re-chmod loop in restore skips ``nerve.db``, because
+# :func:`_secure_install_db` installs it owner-only.
 _SECRET_RESTORE_PATHS: tuple[str, ...] = (
     "nerve.db",
     "mcp-token",
@@ -347,17 +341,13 @@ def _snapshot_db(src: Path, dst: Path) -> None:
 
 
 def _scrub_instance_secrets(snapshot: Path) -> None:
-    """Empty ``instance_secrets`` in a *snapshot* copy of nerve.db.
+    """Empty ``instance_secrets`` in a snapshot copy of nerve.db.
 
-    The JWT signing secret an install without ``auth.jwt_secret`` generates
-    lives in that table. It is exactly what ``--no-secrets`` promises to leave
-    out — anyone holding it can mint tokens for the live instance — but unlike
-    the other secrets it is rows inside a database rather than a file to skip.
-    So the snapshot is edited after it is taken and before it is checksummed;
-    the live database is never touched. ``secure_delete`` makes SQLite
-    overwrite the freed pages rather than merely unlink them. A snapshot from
-    before the table existed is left alone. The restored instance simply
-    generates a fresh secret on its first start.
+    The table holds the generated JWT signing secret, which can mint tokens for
+    the live instance, so ``--no-secrets`` must not carry it. This edits the
+    snapshot before it is checksummed and never touches the live database.
+    ``secure_delete`` overwrites the freed pages. A snapshot without the table
+    is left as is. The restored instance generates a new secret on first start.
     """
     conn = _connect(snapshot)
     try:
@@ -379,13 +369,12 @@ def _mode_is_private(st_mode: int) -> bool:
 
 
 def _scrub_db_secret(db_file: Path) -> None:
-    """Delete the stored JWT signing secret from a database file and verify it
-    is gone. Raises :class:`BackupError` on any failure — a scrub that silently
-    did nothing would install a readable key while claiming otherwise.
+    """Delete the stored JWT signing secret from ``db_file`` and verify it is gone.
 
-    A database that predates the ``instance_secrets`` table (an older bundle)
-    has nothing to scrub; that is checked explicitly rather than inferred from
-    an error, so a real I/O or locking failure is never mistaken for it.
+    Raises :class:`BackupError` on any failure, so a scrub that did nothing is
+    never reported as done. A database without ``instance_secrets`` (an older
+    bundle) is detected by a table lookup, so an I/O or lock error is not
+    mistaken for it.
     """
     try:
         conn = _connect(db_file)
@@ -414,9 +403,11 @@ def _scrub_db_secret(db_file: Path) -> None:
 
 
 def _secure_directory(path: Path) -> None:
-    """Make ``path`` owner-only (0700) and verify it; :class:`BackupError` if
-    any group/world bit remains or the mode cannot be read. Nothing secret is
-    written into a directory this has not passed."""
+    """Make ``path`` 0700 and verify it.
+
+    Raises :class:`BackupError` if a group/world bit remains or the mode cannot
+    be read. Nothing secret is written into a directory that fails this check.
+    """
     try:
         os.chmod(path, _STATE_DIR_MODE)
     except OSError as e:
@@ -435,17 +426,13 @@ def _secure_directory(path: Path) -> None:
 
 
 def _exclusive_create(path: Path, what: str) -> tuple[int, bool]:
-    """Create ``path`` as a brand-new file of our own and return ``(fd, private)``.
+    """Create ``path`` as a new file and return ``(fd, private)``.
 
-    ``O_CREAT|O_EXCL|O_NOFOLLOW`` at mode ``0600``: the file cannot already
-    exist, so a symlink planted at that name makes the *create* fail rather
-    than being followed to somebody else's file. ``private`` is the mode read
-    back through the descriptor — ``False`` means the filesystem did not honour
-    the mode, which is for the caller to judge; what is never negotiable is
-    that the bytes go to this descriptor and to nothing else.
-
-    A failure to create at all raises :class:`BackupError`: without a
-    descriptor there is no safe way to write the file.
+    ``O_CREAT|O_EXCL|O_NOFOLLOW`` at mode 0600 fails if the name exists, so a
+    planted symlink is never followed. ``private`` is the mode read back
+    through the descriptor; ``False`` means the filesystem ignored the mode,
+    and the caller decides what to do. All writes go through ``fd``. Raises
+    :class:`BackupError` if the file cannot be created.
     """
     path.unlink(missing_ok=True)
     try:
@@ -465,11 +452,11 @@ def _exclusive_create(path: Path, what: str) -> tuple[int, bool]:
 
 
 def _secure_create(path: Path, what: str, *, detail: str = "nothing was copied") -> int:
-    """:func:`_exclusive_create`, refusing anything but an owner-only result.
+    """Like :func:`_exclusive_create`, but raise unless the file is owner-only.
 
-    The mode is read back *through the descriptor*, so a filesystem that
-    accepted ``0600`` and ignored it is caught while the file is still empty;
-    on failure nothing has been written and no file is left behind.
+    The check reads the mode through the descriptor while the file is empty,
+    so a filesystem that ignores 0600 is caught before anything is written.
+    On failure no file is left behind.
     """
     fd, private = _exclusive_create(path, what)
     if not private:
@@ -494,18 +481,11 @@ def _is_group_world_writable(path: Path) -> bool:
 def _unsafe_stage_reason(path: Path) -> str | None:
     """Why ``path`` may not hold a staging directory, or ``None`` if it may.
 
-    The question is who can rename or replace an entry in it — that is what
-    turns "the snapshot went into my 0700 directory" into "the snapshot went
-    into theirs". Every component of the *canonical* path is judged, because a
-    directory anyone can write to anywhere above the parent can be swapped for
-    one pointing elsewhere; resolving first also means no symlink in the chain
-    is still a symlink by the time it is checked.
-
-    A component passes when it is a directory owned by this user or by root —
-    the owner of a directory may rename its children whatever its mode says,
-    which is why the sticky bit is necessary but not sufficient — and is either
-    not group/world-writable or sticky (``/tmp``'s ``1777``: writable by all,
-    but only the owner of an entry may rename it).
+    Another user who can rename or replace an entry on the path can redirect
+    the staged snapshot. So every component of the resolved path is checked:
+    it must be a directory owned by this user or by root (an owner can rename
+    children whatever the mode), and either not group/world-writable or sticky
+    (as ``/tmp`` at 1777 is).
     """
     euid = os.geteuid()
     try:
@@ -531,22 +511,15 @@ def _unsafe_stage_reason(path: Path) -> str | None:
 
 
 def _stage_parent(nerve_dir: Path) -> Path:
-    """Where the staging directory goes — somewhere no other user can rename it.
+    """Return a parent for the staging directory that no other user can rename.
 
-    Not the output directory. The caller chooses that, it is routinely a shared
-    or mounted backup target, and staging there means the snapshot of
-    ``nerve.db`` — accounts, history, and the signing secret, which
-    ``--no-secrets`` only scrubs *after* the snapshot exists — is written
-    through a path another user can replace with a directory of their own.
-
-    First choice is the state directory: it already holds those files, it is on
-    their filesystem (so a staging copy that does not fit fails where the data
-    lives rather than halfway through), and it is owner-only. Failing that, the
-    system temp directory — but only when it and its whole canonical ancestry
-    pass :func:`_unsafe_stage_reason`; a sticky ``TMPDIR`` belonging to someone
-    else is exactly the trap that check exists for. The chosen path is returned
-    explicitly (never ``None``, which would let ``mkdtemp`` re-read ``TMPDIR``
-    and pick something this never judged).
+    The output directory is not used: it is often a shared or mounted target,
+    and the staged ``nerve.db`` snapshot holds accounts, history and (until
+    ``--no-secrets`` scrubs it) the signing secret. The state directory is the
+    first choice, because it is owner-only and on the same filesystem as the
+    data. Otherwise the system temp directory is used if it passes
+    :func:`_unsafe_stage_reason`. The path is always explicit, so ``mkdtemp``
+    never reads ``TMPDIR`` again.
     """
     reason = (
         _unsafe_stage_reason(nerve_dir) if nerve_dir.is_dir()
@@ -559,13 +532,11 @@ def _stage_parent(nerve_dir: Path) -> Path:
 
 
 def _vetted_temp_dir(context: str = "") -> Path:
-    """The system temp directory, judged the way a staging parent must be.
+    """Return the resolved system temp directory if it passes the staging check.
 
-    Anything that puts ``nerve.db`` on disk outside the state directory —
-    staging a snapshot, extracting a bundle to verify or restore it — lands
-    here, so it gets the same check rather than trusting ``TMPDIR`` because it
-    is sticky. Returns the resolved path so the caller can hand it to
-    ``mkdtemp`` explicitly. Raises :class:`BackupError`.
+    Staging a snapshot and extracting a bundle both put ``nerve.db`` here, so
+    the directory gets the :func:`_unsafe_stage_reason` check. Raises
+    :class:`BackupError` if it fails.
     """
     temp_dir = Path(tempfile.gettempdir())
     reason = _unsafe_stage_reason(temp_dir)
@@ -581,14 +552,12 @@ def _vetted_temp_dir(context: str = "") -> Path:
 
 
 def _verify_same_file(fd: int, path: Path, what: str) -> None:
-    """Prove ``path`` still names the file open on ``fd``.
+    """Raise :class:`BackupError` unless ``path`` still names the file open on ``fd``.
 
-    Everything here publishes by *name* (``os.replace``), while the bytes went
-    to a descriptor. Between the two, another user with write access to the
-    directory can unlink the temporary and put a symlink of their own in its
-    place — then the rename publishes their file, not ours. Comparing device
-    and inode (with ``follow_symlinks=False``, so a symlink is never resolved)
-    closes that window. Raises :class:`BackupError`.
+    Files are written through a descriptor but published by name with
+    ``os.replace``. In between, a user with write access to the directory can
+    replace the temporary with a symlink. Comparing device and inode, without
+    following symlinks, detects that.
     """
     st = os.fstat(fd)
     try:
@@ -603,12 +572,11 @@ def _verify_same_file(fd: int, path: Path, what: str) -> None:
 
 
 def _verify_still_the_created_file(fd: int, path: Path, what: str) -> None:
-    """:func:`_verify_same_file`, and still owner-only.
+    """:func:`_verify_same_file`, plus a check that the file is still owner-only.
 
-    The mode is re-read through the descriptor, which no path lookup can be
-    tricked about. Used wherever what was written is a credential; the identity
-    check alone is used where a wide mode has already been accepted and
-    reported (a ``--no-secrets`` bundle on a filesystem without modes).
+    The mode is read through the descriptor. Use this for credentials; use
+    :func:`_verify_same_file` alone where a wide mode was already accepted (a
+    ``--no-secrets`` bundle on a filesystem without modes).
     """
     st = os.fstat(fd)
     if not _mode_is_private(st.st_mode):
@@ -627,28 +595,16 @@ def _secure_install_file(
     last_resort: Callable[[Path], None] | None = None,
     exposed_detail: str = "",
 ) -> None:
-    """Install a secret-bearing file at ``dst`` with no readable window.
+    """Install a secret-bearing file at ``dst`` so it is never readable by others.
 
-    Order matters, and each step is verified before the next:
+    1. Create the temporary owner-only and verify it (:func:`_secure_create`).
+    2. Copy the bytes through that descriptor, never through the path.
+    3. Verify the path is still that file and still private, then rename it
+       over ``dst``.
+    4. Check ``dst`` again. If it is wide or its mode cannot be read, run
+       ``last_resort`` on it and fail anyway.
 
-    1. the temporary file is *created* owner-only and verified through its
-       descriptor (:func:`_secure_create`) — if the filesystem did not honour
-       the mode, nothing has been copied yet and the restore aborts;
-    2. the bytes are copied into that descriptor and flushed — never into the
-       pathname reopened, which could by then be someone else's file;
-    3. the pathname is proved to still be that file, device and inode, and
-       still private (:func:`_verify_still_the_created_file`), and only then
-       renamed over ``dst`` atomically, so ``dst`` never exists at a wider
-       mode. The result is verified once more;
-    4. only if that final verification fails — which the earlier checks make
-       all but impossible — ``last_resort`` runs on the installed file (for
-       ``nerve.db``: scrub the signing secret) and the restore **still** fails.
-       A restore that leaves a credential other users can read is not a
-       success, whatever was salvaged.
-
-    A mode that cannot be read at step 3 counts as *not* private: unknown is
-    never treated as safe. A partial temporary is always removed. Failures
-    raise :class:`BackupError`.
+    A partial temporary is always removed. Failures raise :class:`BackupError`.
     """
     tmp = dst.with_name(dst.name + ".restore-tmp")
     fd = _secure_create(tmp, what)
@@ -670,7 +626,7 @@ def _secure_install_file(
     try:
         final: int | None = os.stat(dst).st_mode
     except OSError as e:
-        # Uninspectable is not "probably fine": treat it exactly as exposed.
+        # A mode that cannot be read counts as exposed.
         logger.warning("%s: cannot inspect the mode of %s: %s", what, dst, e)
         final = None
     if final is None or not _mode_is_private(final):
@@ -686,12 +642,10 @@ def _secure_install_file(
 
 
 def _secure_install_db(src: Path, dst: Path) -> None:
-    """Install the restored ``nerve.db`` — accounts, actors, history and the
-    stored signing secret — through :func:`_secure_install_file`.
+    """Install the restored ``nerve.db`` through :func:`_secure_install_file`.
 
-    The last resort, should the installed file read back wide, is to scrub the
-    signing secret from it (itself verified, see :func:`_scrub_db_secret`) so
-    no usable key is left readable; the restore fails either way.
+    If the installed file reads back wide, :func:`_scrub_db_secret` removes the
+    signing secret from it, and the restore still fails.
     """
     _secure_install_file(
         src, dst, what="Restore", last_resort=_scrub_db_secret,
@@ -747,14 +701,11 @@ def _tar_writer(
 ) -> Iterator[tarfile.TarFile]:
     """Open a streaming tar for writing, zstd or gzip.
 
-    ``fileobj`` — an already-open, already-verified binary stream — is written
-    through instead of opening ``path`` by name. That is how the bundle is
-    produced: reopening the pathname a moment after checking it is exactly the
-    window another user with write access to the output directory needs to
-    point it at a file of their own (the tar carries the signing secret and
-    ``config.local.yaml``). The stream is flushed and closed here; the caller
-    keeps the descriptor underneath (``closefd=False``) so it can verify what
-    it wrote before publishing it.
+    If ``fileobj`` is given, write to it and do not open ``path``. The
+    bundle is written this way so the path is not opened again after it was
+    checked, when another user could point it at their own file. The stream is
+    closed here; the caller keeps the descriptor under it (``closefd=False``)
+    to verify the file before publishing it.
     """
     fh = fileobj if fileobj is not None else open(path, "wb")
     try:
@@ -907,13 +858,10 @@ def create_backup(
     """Create a backup bundle and return a :class:`BackupResult`.
 
     Synchronous (the scheduled task wraps this in ``asyncio.to_thread``).
-    Staging happens in a directory only this user can write to — the state
-    directory, or the system temp directory when that is unusable (see
-    :func:`_stage_parent`) — because the staged snapshot is the accounts
-    database with the signing secret still in it. The output filesystem is
-    therefore no longer where a staging copy runs out of room: the target sees
-    the bundle streamed into it, and a full target fails there. The bundle
-    itself is created owner-only and renamed into place atomically.
+    Staging uses a directory only this user can write to (see
+    :func:`_stage_parent`), because the staged snapshot holds the accounts and
+    the signing secret. Only the finished bundle is written to the output
+    directory. It is created owner-only and renamed into place atomically.
     """
     nerve_dir = Path(nerve_dir).expanduser()
     workspace = Path(workspace).expanduser()
@@ -938,16 +886,12 @@ def create_backup(
     final_path = _unique_bundle_path(output_dir, host, stamp, ext)
     final_name = final_path.name
 
-    # Staging goes somewhere the caller does not control (see _stage_parent):
-    # the snapshot of nerve.db is the signing secret and every account, and it
-    # exists in the clear there before --no-secrets scrubs anything. The
-    # directory is kept open so its identity can be re-checked before the
-    # secrets are written into it and again before they are archived.
+    # The staging directory is held open so its identity can be checked again
+    # before secrets are written into it and before they are archived.
     stage = Path(tempfile.mkdtemp(
         prefix=".nerve-backup-stage-", dir=_stage_parent(nerve_dir),
     ))
-    # O_NOFOLLOW: if the name is a symlink by the time it is opened, that is
-    # already someone else's directory, not the one mkdtemp made.
+    # O_NOFOLLOW: a symlink at this name is not the directory mkdtemp made.
     stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     if not _mode_is_private(os.fstat(stage_fd).st_mode):  # mkdtemp promises 0700
         os.close(stage_fd)
@@ -963,26 +907,20 @@ def create_backup(
             "directory anyone can write to is a poor home for backups.", output_dir,
         )
     workspace_bytes = 0
-    # Held open from creation until the archive has been read, so the finally
-    # below can close them whatever happens on the way.
+    # Open until the archive has been read; the finally below closes them.
     snapshot_fds: list[tuple[int, Path]] = []
     try:
-        # Created *relative to the descriptor*, so it cannot land in a
-        # directory that took this one's name; the check right after is what
-        # turns that into a diagnosis instead of a silent detour.
+        # Created relative to the descriptor, so it lands in the verified
+        # directory. The check after it detects a swapped name.
         os.mkdir("state", mode=_STATE_DIR_MODE, dir_fd=stage_fd)
         state_dir = stage / "state"
         _verify_still_the_created_file(stage_fd, stage, "Backup")
 
         # 1. Consistent DB snapshots. The online-backup API opens the
-        # destination by name and would create it at the umask default (0644),
-        # holding the accounts and — until the scrub below — the signing
-        # secret. So the file is created 0600 first, through a descriptor that
-        # is *held open* across the copy, the scrub and the archive read: the
-        # only thing that could redirect those bytes is a swap of the file at
-        # that name, and the descriptor is what proves that did not happen. The
-        # archived member is therefore 0600, and extraction on restore yields
-        # an owner-only file with no readable window.
+        # destination by name and would create it at the umask mode. So the
+        # file is created 0600 first, and its descriptor stays open through
+        # the copy, the scrub and the archive read, to detect a swap of the
+        # file at that name. The archived member is 0600 as a result.
         for db_name in STATE_DB_FILES:
             src = nerve_dir / db_name
             if src.exists():
@@ -990,9 +928,8 @@ def create_backup(
                 snapshot_fd = _secure_create(snapshot, "Backup")
                 snapshot_fds.append((snapshot_fd, snapshot))
                 _snapshot_db(src, snapshot)
-                # SQLite addressed the destination by name, so before anything
-                # else touches it: the directory is still the one that was
-                # verified, and the file in it is still ours and still 0600.
+                # SQLite opened the destination by name: check that the
+                # directory and the file are still ours and still private.
                 _verify_still_the_created_file(stage_fd, stage, "Backup")
                 _verify_still_the_created_file(snapshot_fd, snapshot, "Backup")
                 if db_name == "nerve.db" and not include_secrets:
@@ -1047,10 +984,9 @@ def create_backup(
                     workspace_bytes / (1024 ** 3),
                 )
 
-        # 6. Checksums for every staged file (manifest written last). Before
-        # reading any of it back — and before it is archived — confirm the
-        # staging directory, and each snapshot in it, is still the one that was
-        # created: everything above addressed them by name.
+        # 6. Checksums for every staged file (manifest written last). The
+        # steps above used names, so first confirm the staging directory and
+        # each snapshot are still the ones that were created.
         _verify_still_the_created_file(stage_fd, stage, "Backup")
         for fd, snapshot in snapshot_fds:
             _verify_still_the_created_file(fd, snapshot, "Backup")
@@ -1092,26 +1028,15 @@ def create_backup(
 
         # 8. Build the tar (manifest first for cheap inspection).
         #
-        # The bundle carries nerve.db — accounts, history and, unless
-        # ``--no-secrets`` scrubbed it, the JWT signing secret — plus
-        # config.local.yaml with the password hash. So it is created owner-only
-        # *before* a byte of it is written (verified through the descriptor,
-        # which catches a filesystem that ignores the mode while the file is
-        # still empty), the tar is written **through that descriptor** rather
-        # than by reopening the name, and the name is proved to still be that
-        # file before the rename publishes it. Another user with write access
-        # to the output directory could otherwise swap the temporary for a
-        # symlink and collect the whole bundle. ``os.replace`` keeps the mode.
+        # The bundle can hold the signing secret and config.local.yaml. It is
+        # created exclusively and owner-only, written through its descriptor,
+        # and checked by inode before the rename, so another user with write
+        # access to the output directory cannot swap in a symlink.
+        # ``os.replace`` keeps the mode.
         tmp_bundle = output_dir / (final_name + ".tmp")
-        # There is no path here without a descriptor. Exclusive creation is the
-        # part that cannot be waived: it is what refuses a name somebody else
-        # planted, and writing through the descriptor is what keeps the bytes
-        # in our own file. Only the *mode* is negotiable, and only for a
-        # --no-secrets bundle — the signing secret is scrubbed from its
-        # snapshot and config.local.yaml is not collected, so a wide mode
-        # exposes history rather than a credential, and refusing to back up at
-        # all would be worse. With secrets, a mode that did not take effect
-        # stops the backup while the file is still empty.
+        # A mode the filesystem ignores stops a backup with secrets while the
+        # file is still empty. A --no-secrets bundle holds no credential, so it
+        # continues with a warning.
         fd, private = _exclusive_create(tmp_bundle, "Backup")
         if not private:
             if include_secrets:
@@ -1136,8 +1061,8 @@ def create_backup(
                     p = stage / sub
                     if p.exists():
                         tar.add(p, arcname=sub)
-            # Identity always; the mode too, unless it was already accepted and
-            # reported as wide above.
+            # Always check identity. Check the mode too unless a wide mode was
+            # accepted above.
             if private:
                 _verify_still_the_created_file(fd, tmp_bundle, "Backup")
             else:
@@ -1170,11 +1095,9 @@ def create_backup(
                 os.close(fd)
             except OSError:
                 pass
-        # Removing by name is itself a name operation: if the staging directory
-        # was swapped, that name is somebody else's directory now and deleting
-        # it is not this function's business. Our own, with the snapshot in it,
-        # is still 0700 and owned by us wherever it was moved to — unreadable
-        # to them, and named in the log for whoever cleans up.
+        # Remove the staging directory only if the name still points to it. If
+        # it was swapped, the name is another user's directory; ours stays 0700
+        # wherever it was moved, and the log names it.
         try:
             _verify_same_file(stage_fd, stage, "Backup")
         except BackupError as e:
@@ -1233,11 +1156,8 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
         raise BackupError(f"bundle not found: {path}")
 
     own_tmp = extract_to is None
-    # Extraction puts nerve.db — accounts, and the signing secret unless the
-    # bundle was made with --no-secrets — on disk, so it goes in a directory
-    # vetted the same way staging is (see _stage_parent): a temp parent
-    # somebody else owns can have its children renamed by that owner whatever
-    # the sticky bit says.
+    # Extraction writes nerve.db (and possibly the signing secret) to disk, so
+    # the temp parent gets the same check as staging (see _vetted_temp_dir).
     work = Path(extract_to) if extract_to else Path(
         tempfile.mkdtemp(prefix=".nerve-verify-", dir=_vetted_temp_dir())
     )
@@ -1369,10 +1289,8 @@ def restore_bundle(
             f"existing state to {nerve_dir}.pre-restore-<ts> and restore."
         )
 
-    # Verify into a staging dir we then install from (extract once).
-    # Extracted here first, so the same rule as staging: the bundle contains
-    # nerve.db, and a temp parent somebody else owns can have its children
-    # renamed by that owner however sticky it is.
+    # Verify into a staging dir we then install from (extract once). It holds
+    # nerve.db, so its parent gets the staging check (see _vetted_temp_dir).
     staging = Path(tempfile.mkdtemp(prefix=".nerve-restore-", dir=_vetted_temp_dir()))
     try:
         report = verify_bundle(path, extract_to=staging)
@@ -1390,15 +1308,13 @@ def restore_bundle(
             os.replace(nerve_dir, relocated)
             logger.info("Relocated existing state dir to %s", relocated)
         nerve_dir.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
-        # Owner-only, verified, before any secret-bearing file lands in it.
-        # Fatal if it cannot be: a readable key in a reachable directory is the
-        # exposure this whole path exists to prevent.
+        # Make the directory owner-only before any secret goes into it; fatal
+        # if that fails.
         _secure_directory(nerve_dir)
 
-        # Install state/. nerve.db carries the signing secret and the accounts,
-        # so it goes first and through a verified 0600 temp + atomic rename
-        # (never a readable window at the destination) — first, so a failure
-        # aborts before anything else has been written into the new directory.
+        # Install state/. nerve.db goes first, through a verified 0600
+        # temporary and an atomic rename, so a failure stops the restore before
+        # anything else is written.
         staged_state = staging / "state"
         if staged_state.is_dir():
             entries = sorted(staged_state.iterdir(), key=lambda p: (p.name != "nerve.db", p.name))
@@ -1411,9 +1327,8 @@ def restore_bundle(
                 else:
                     shutil.copy2(entry, dst)
 
-        # Re-tighten the remaining secret files. nerve.db is skipped — it was
-        # already installed owner-only (or scrubbed) above. Warn-only here:
-        # restore runs offline, and the daemon enforces modes on the next start.
+        # Re-tighten the remaining secret files (nerve.db is already done).
+        # Only warn: the daemon enforces the modes on its next start.
         for secret in _SECRET_RESTORE_PATHS:
             if secret == "nerve.db":
                 continue
@@ -1437,13 +1352,9 @@ def restore_bundle(
                         pass
 
         # Install config.local.yaml next to where the pointer says config lives.
-        # It carries auth.password_hash and any machine-local secret, and its
-        # destination is an ordinary config directory rather than the state dir
-        # verified above — so it goes through the same verified 0600 temporary
-        # as nerve.db, with no window at a wider mode. Failure is fatal rather
-        # than a warning: silently finishing without it would leave the restored
-        # instance with no configured password, which is a passwordless
-        # downgrade nobody asked for.
+        # It holds the password hash and machine-local secrets, so it goes
+        # through the same verified 0600 temporary as nerve.db. Failure is
+        # fatal: a restore without it leaves the instance with no password.
         staged_cfg = staging / "config" / "config.local.yaml"
         if staged_cfg.is_file():
             dest_cfg_dir = _resolve_restore_config_dir(

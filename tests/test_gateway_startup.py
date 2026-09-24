@@ -1,17 +1,11 @@
-"""A startup that fails leaves nothing running behind it.
+"""A startup that fails leaves nothing running.
 
-The lifespan's shutdown half only runs after the ``yield``, so anything that
-raised before it used to leak whatever had already started. The proxy is the
-one that hurts: :meth:`ProxyService.start` detaches its subprocess into its own
-process group, so an orphan keeps the port and the operator has to hunt it down
-before the next start. The database now has a failure mode that reaches
-exactly this path — ``Database.connect`` refuses state other users can write to.
+The lifespan's shutdown half runs only after the ``yield``. These tests check
+that:
 
-Two guarantees are pinned here:
-
-* the database is opened and the identity bootstrapped **before** anything is
-  started, so the likeliest failure costs nothing to clean up;
-* whatever *is* up when a later step fails gets stopped, in reverse order.
+* the database opens and the identity bootstraps before anything starts;
+* when a later step fails, everything already started is stopped in reverse
+  order. The proxy matters most: its detached subprocess keeps the port.
 """
 
 from __future__ import annotations
@@ -110,8 +104,8 @@ def harness(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_refused_database_never_starts_the_proxy(harness, monkeypatch):
-    """The database comes first, so the failure the state-file policy produces
-    costs nothing: there is nothing started to leave behind."""
+    """The database opens first, so a state-file refusal leaves nothing to
+    stop."""
     from nerve.db.base import InsecureStateStorage
 
     async def refuse(*a, **k):
@@ -130,8 +124,8 @@ async def test_a_refused_database_never_starts_the_proxy(harness, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_failure_after_the_proxy_stops_it_again(harness, monkeypatch):
-    """And when something later fails — here the engine — everything already
-    started is stopped, in reverse: no orphaned proxy holding its port."""
+    """When the engine fails, everything already started is stopped in
+    reverse order, including the proxy."""
     harness["engine"].initialize.side_effect = RuntimeError("engine exploded")
 
     with pytest.raises(RuntimeError, match="engine exploded"):
@@ -140,19 +134,15 @@ async def test_a_failure_after_the_proxy_stops_it_again(harness, monkeypatch):
 
     assert harness["proxy"].starts == 1 and harness["proxy"].stops == 1
     assert harness["closed"] == ["db"]  # the database was closed too
-    # And the engine is shut down even though *it* is what failed: initialize()
-    # starts memU's dedicated thread before its last database writes, so a
-    # half-initialised engine is precisely the case that needs stopping — a
-    # non-daemon thread keeps the process alive instead of letting it exit.
+    # The failed engine is shut down too: initialize() may already have
+    # started memU's non-daemon thread, which keeps the process alive.
     assert harness["engine"].shutdown.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
-    """The detached process exists from ``create_subprocess_exec`` while
-    ``start()`` is still polling for health. A cancellation there used to
-    escape registration entirely — the cleanup was appended only once start()
-    *returned* — and the subprocess outlived the daemon holding its port."""
+    """The subprocess exists while ``start()`` polls for health. A
+    cancellation during that poll still stops it."""
     started = asyncio.Event()
 
     async def start_then_hang():
@@ -178,9 +168,8 @@ async def test_cancellation_while_the_proxy_is_starting_still_stops_it(harness):
 
 @pytest.mark.asyncio
 async def test_cancellation_inside_initialize_still_shuts_the_engine_down(harness):
-    """memU's thread is started partway through ``initialize()``. A
-    cancellation after that point must still reach ``shutdown()``, which is
-    why the cleanup is registered before the await rather than after it."""
+    """``initialize()`` starts memU's thread partway through, so a
+    cancellation inside it still reaches ``shutdown()``."""
     started = asyncio.Event()
 
     async def initialize_then_hang():
@@ -206,8 +195,7 @@ async def test_cancellation_inside_initialize_still_shuts_the_engine_down(harnes
 
 @pytest.mark.asyncio
 async def test_one_cancelled_cleanup_does_not_abandon_the_rest(harness, monkeypatch):
-    """The unwind catches ``BaseException`` per resource: a stop that is itself
-    cancelled must not leave the ones registered before it running."""
+    """A cancelled stop does not skip the cleanups registered before it."""
     harness["engine"].initialize.side_effect = RuntimeError("engine exploded")
 
     async def cancelled_stop():
@@ -219,15 +207,13 @@ async def test_one_cancelled_cleanup_does_not_abandon_the_rest(harness, monkeypa
         async with harness["server"].lifespan(MagicMock()):
             pass  # pragma: no cover
 
-    # The proxy's stop blew up, and the database — registered before it — was
-    # still closed.
+    # The proxy's stop raised; the database, registered before it, closed.
     assert harness["closed"] == ["db"]
 
 
 @pytest.mark.asyncio
 async def test_a_failing_stop_does_not_hide_the_startup_failure(harness, monkeypatch):
-    """The unwind is best-effort per resource: a stop that raises is logged and
-    the original failure is what propagates."""
+    """A stop that raises is logged, and the startup failure propagates."""
     import logging
 
     harness["engine"].initialize.side_effect = RuntimeError("engine exploded")

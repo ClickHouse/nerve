@@ -81,12 +81,10 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _unpin_jwt_secret():
-    """Forget the signing secret pinned to this process.
+    """Clear the process signing secret before and after each test.
 
-    Startup pins the effective secret once for the life of the daemon; in the
-    suite each test is its own "process", so a test that bootstraps an
-    identity (or pins a secret directly) must not leave it pinned for the
-    tests after it.
+    Startup pins the secret once per process. A test that pins one must not
+    leave it in force for the next test.
     """
     from nerve.gateway.auth import unpin_jwt_secret
 
@@ -99,14 +97,9 @@ def _unpin_jwt_secret():
 def _deterministic_umask():
     """Run the suite under umask 022, whatever the developer's shell has.
 
-    ``Database.connect`` refuses — unrepaired — to open a state directory that
-    other users can write to. A umask of 002 (Ubuntu's default with
-    user-private groups) makes every plain ``mkdir()`` in a test fixture a
-    0775, group-writable directory: a hazard the policy is right to refuse,
-    but not what those fixtures are about. Production never depends on the
-    umask (Nerve creates its state directory 0700 explicitly, see
-    ``paths.ensure_nerve_home``); the tests that *are* about the umask set
-    their own inside the test.
+    ``Database.connect`` refuses a group-writable state directory, and under
+    umask 002 every plain ``mkdir()`` in a fixture makes one. Tests about the
+    umask set their own.
     """
     old = os.umask(0o022)
     yield
@@ -115,14 +108,11 @@ def _deterministic_umask():
 
 @pytest.fixture
 def bypass_auth():
-    """Install a stand-in for ``require_auth`` on a test app.
+    """Replace ``require_auth`` on a test app.
 
-    There is no unauthenticated mode: with no signing secret in force every
-    auth check fails closed. Route tests that are not about authentication
-    therefore override the dependency on the app they build instead of
-    relying on an empty ``auth.jwt_secret``. Yields a function taking the app
-    (returns it, for chaining). Auth tests must not use it — they exercise the
-    real dependency with real tokens.
+    Without a signing secret every auth check fails closed, so route tests
+    that are not about auth use this. Yields a function that takes the app
+    and returns it. Auth tests use the real dependency.
     """
     from nerve.gateway.auth import require_auth
 

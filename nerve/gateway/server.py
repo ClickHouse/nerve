@@ -231,53 +231,42 @@ async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
     global _engine, _mcp_manager
     config = get_config()
-    # The state directory, owner-only, before anything below (the proxy, memU,
-    # the database) creates a file in it — Database.connect refuses a state
-    # directory other users can write to, and one created here never is.
+    # Create the state directory owner-only before anything writes to it.
+    # Database.connect refuses a state directory that other users can write to.
     paths.ensure_nerve_home()
 
     # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
     os.environ.pop("CLAUDECODE", None)
 
-    # Everything from here to the ``yield`` starts something. A failure before
-    # the yield means the shutdown half of this function never runs, so each
-    # resource records how to stop it the moment it is up and the unwind below
-    # runs those in reverse. Without it, a startup that got as far as the proxy
-    # and then failed — the state-file policy can refuse to open the database
-    # at connect() — left that detached subprocess (its own process group, see
-    # ProxyService.start) holding its port, with nothing left to stop it.
+    # If startup fails before the ``yield``, the shutdown code below it does
+    # not run. So each resource registers its stop function as soon as it
+    # starts, and _unwind_startup calls them in reverse order. Otherwise a
+    # failure could leave the detached proxy subprocess holding its port.
     startup_cleanups: list[tuple[str, Callable[[], Any]]] = []
 
     async def _unwind_startup() -> None:
-        # Every cleanup runs, whatever the previous one did. ``BaseException``
-        # rather than ``Exception`` because this often runs *during* a
-        # cancellation: a CancelledError from one stop must not abandon the
-        # ones after it — which, with the proxy registered first, would be
-        # exactly the leak this exists to prevent.
+        # Catch BaseException: this often runs during a cancellation, and a
+        # CancelledError from one stop must not skip the stops after it.
         for label, stop in reversed(startup_cleanups):
             try:
                 result = stop()
                 if inspect.isawaitable(result):
                     await result
-            except BaseException as e:  # noqa: BLE001 — one bad stop, not all of them
+            except BaseException as e:  # noqa: BLE001 - one failed stop must not skip the rest
                 logger.warning("Startup unwind: stopping %s raised: %r", label, e)
 
     try:
-        # The database first: it is the step most likely to refuse (insecure
-        # state, a failed migration, an identity bootstrap that cannot store a
-        # signing secret), and nothing about opening it needs the proxy. Doing
-        # it before anything is started means the common failure stops the
-        # start with nothing yet to clean up.
+        # Open the database first. It is the step most likely to fail (unsafe
+        # state files, a migration, the identity bootstrap), and it does not
+        # need the proxy, so such a failure leaves nothing to clean up.
         db_path = paths.db_path()
         db = await init_db(db_path, workspace=config.workspace)
         startup_cleanups.append(("database", close_db))
         logger.info("Database initialized at %s", db_path)
 
-        # Local identity bootstrap: the owner account and the signing secret.
-        # After the schema migration in init_db() and before anything mints or
-        # checks a token. Idempotent on every start. Not best-effort: without it
-        # an install with no configured auth.jwt_secret would serve open, so a
-        # failure here stops startup.
+        # Create the owner account and signing secret if they do not exist.
+        # This must run before anything mints or checks a token. A failure
+        # stops startup: without a signing secret, authentication cannot work.
         from nerve.migrate import bootstrap_identity
 
         identity_report = await bootstrap_identity(db, config)
@@ -289,13 +278,10 @@ async def lifespan(app: FastAPI):
         if config.proxy.enabled:
             from nerve.proxy.service import ProxyService
             proxy_service = ProxyService(config)
-            # Registered *before* the await: start() creates the detached
-            # subprocess and then polls for health, so a cancellation in
-            # between would otherwise leave a process nothing is tracking.
-            # ``stop()`` is a no-op when there is no process, so registering
-            # early costs nothing if it never starts. (start() also stops its
-            # own process on failure — belt and braces, for callers that do not
-            # register anything.)
+            # Register the stop before the await: start() creates the
+            # subprocess and then waits for health, and a cancellation during
+            # that wait must still stop it. stop() does nothing if no process
+            # exists.
             startup_cleanups.append(("CLIProxyAPI proxy", proxy_service.stop))
             try:
                 await proxy_service.start()
@@ -317,12 +303,10 @@ async def lifespan(app: FastAPI):
         # are logged inside init_langfuse() and never propagate.
         init_langfuse(config)
 
-        # Initialize agent engine. Registered *before* the await, like the
-        # proxy and for the same reason: initialize() starts memU's dedicated
-        # thread and then does fallible database writes, so a failure or a
-        # cancellation in between leaves that thread — and a non-daemon thread
-        # keeps the process alive rather than letting a failed start exit.
-        # shutdown() is a no-op on an engine that never got that far.
+        # Initialize agent engine. Register the shutdown before the await:
+        # initialize() starts memU's non-daemon thread before database writes
+        # that can fail, and that thread would keep a failed process alive.
+        # shutdown() does nothing on an engine that did not start.
         _engine = AgentEngine(config, db)
         startup_cleanups.append(("agent engine", _engine.shutdown))
         await _engine.initialize()
@@ -721,8 +705,8 @@ async def lifespan(app: FastAPI):
         # the engine, notification service and channels are all wired by now.
         asyncio.create_task(_engine.resume_enrolled_sessions())
     except BaseException:
-        # Nothing below the yield will run, so stop what did start — in reverse,
-        # and without letting a failing stop hide the failure that got us here.
+        # The shutdown code after the yield will not run, so stop what started
+        # here, then re-raise the original error.
         logger.error(
             "Startup failed; stopping what had already started", exc_info=True,
         )

@@ -97,8 +97,8 @@ class TestAuthenticateMcp:
             authenticate_mcp(_scope("garbage"), cfg)
 
     def test_no_secret_in_force_fails_closed(self, tmp_path):
-        """There is no dev mode: nothing configured and nothing pinned means
-        the endpoint refuses, with or without a token."""
+        """With no secret configured or pinned, the endpoint refuses, with or
+        without a token."""
         cfg = self._config(tmp_path, "")
         with pytest.raises(McpAuthError, match="No signing secret"):
             authenticate_mcp(_scope(None), cfg)

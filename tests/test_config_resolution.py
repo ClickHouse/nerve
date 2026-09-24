@@ -239,11 +239,8 @@ class TestAppendTelegramAllowedUser:
     def test_it_raises_rather_than_rewrite_the_secrets_file_wide(
         self, tmp_path, monkeypatch,
     ):
-        """The file holds the password hash and signing secret. On a
-        filesystem that will not keep it owner-only, nothing is written — and
-        the failure *raises* rather than becoming the
-        ``False`` that means "this id was already there", which a caller can
-        (and did) mistake for success."""
+        """When the file cannot be kept owner-only, nothing is written and the
+        call raises. ``False`` means only "this id was already there"."""
         from nerve import paths as paths_mod
 
         (tmp_path / "config.local.yaml").write_text(

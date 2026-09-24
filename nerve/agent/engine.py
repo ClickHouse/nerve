@@ -377,8 +377,8 @@ class AgentEngine:
 
         secret = effective_jwt_secret(self.config)
         if not secret:
-            # Nothing pinned yet — only before startup has completed. An empty
-            # token grants nothing: the endpoint fails closed without a secret.
+            # No secret is pinned before startup completes. The endpoint
+            # refuses every request then, so an empty token is enough.
             return ""
         return create_mcp_session_token(secret, session_id)
 

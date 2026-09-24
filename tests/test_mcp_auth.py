@@ -41,12 +41,11 @@ def no_secret_config() -> NerveConfig:
 
 
 def test_no_secret_in_force_fails_closed(no_secret_config):
-    """There is no dev mode: with nothing configured and nothing pinned the
-    endpoint refuses, token or no token."""
+    """With no secret configured or pinned, the endpoint refuses every
+    request, with or without a token."""
     with pytest.raises(McpAuthError, match="No signing secret"):
         authenticate_mcp(_scope(), no_secret_config)
-    # Padded so PyJWT's short-key warning stays out of the run; the token is
-    # only there to be refused.
+    # Padded so PyJWT does not warn about a short key.
     token = create_token("a-secret-nothing-is-pinned-to-padded-to-32b")
     headers = [(b"authorization", f"Bearer {token}".encode())]
     with pytest.raises(McpAuthError, match="No signing secret"):

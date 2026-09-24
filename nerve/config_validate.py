@@ -105,11 +105,8 @@ def validate_config_bundle(
         if layer is not None and p.exists()
     ]
     base, local = layers[0] or {}, layers[1] or {}
-    # Mirror _read_config_sources, *before* the merge it mirrors: a non-mapping
-    # ``auth`` in a layer is invalid (never normalised into "no auth"), and a
-    # null one becomes the empty overlay so it cannot erase the credentials
-    # below it. Checked per layer, so a broken tracked section is reported even
-    # where a machine layer would have merged over it.
+    # Same per-layer ``auth`` check as _read_config_sources, before the merge,
+    # so a broken tracked section is reported even if a machine layer covers it.
     for layer, where in ((base, "config.yaml"), (local, "config.local.yaml")):
         try:
             cfg._normalise_layer_auth(layer, where)

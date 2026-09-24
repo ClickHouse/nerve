@@ -450,12 +450,9 @@ def _private_fd(fd: int) -> bool:
 def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
     """Checkpoint wizard progress. Never breaks the wizard.
 
-    Returns True only when the checkpoint is on disk *and* verified owner-only.
-    The file holds API keys, so it is created ``0600`` atomically
-    (``O_CREAT|O_EXCL`` with the mode, read back through the descriptor before
-    a byte is written) and renamed into place; a filesystem that ignores the
-    mode, or any write failure, leaves no checkpoint behind and returns False.
-    Callers report recoverable answers only after a successful checkpoint.
+    The file holds API keys, so it is created ``0600`` with ``O_EXCL`` and its
+    mode is checked before anything is written. Returns True only when the
+    checkpoint is on disk and owner-only; on any failure no file is left.
     """
     import dataclasses
     from datetime import datetime
@@ -470,8 +467,7 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
             "completed": sorted(completed),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        # The checkpoint lives in the state directory; if this is what creates
-        # it, it is created owner-only (Database.connect refuses a wider one).
+        # Database.connect refuses a state directory that others can write to.
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp.unlink(missing_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -567,13 +563,9 @@ class SetupWizard:
     def checkpoint(self) -> bool:
         """Save the answers so a re-run resumes rather than starting over.
 
-        The wizard clears its checkpoint once it has applied the
-        configuration. The installer calls this if the step after that —
-        creating the local owner account — fails, so the collected answers
-        (the owner's name among them, which is written nowhere else) survive
-        for the re-run. Returns whether the checkpoint was actually written
-        (see :func:`_save_init_state`), so the caller does not claim answers
-        were saved when the state filesystem is full or unwritable.
+        The installer calls this when owner-account creation fails after the
+        wizard has cleared its checkpoint. The owner's name is stored nowhere
+        else. Returns whether the checkpoint was written.
         """
         return _save_init_state(self.choices, self._completed_steps)
 
@@ -2337,12 +2329,9 @@ class SetupWizard:
             auth["password_hash"] = hashed
         local["auth"] = auth
 
-        # The file holds the signing secret, the password hash and every API key
-        # collected above, so it is *created* owner-only rather than written and
-        # chmod'ed afterwards — which left all of that readable for the moment
-        # in between. If the filesystem will not keep it private, nothing is
-        # written and setup fails: an instance whose secrets every local user
-        # can read is not a successful install, and it would start happily.
+        # The file holds the signing secret, the password hash and the API keys,
+        # so it is created owner-only. If the filesystem cannot keep it private,
+        # nothing is written and setup stops.
         local_path = self.config_dir / "config.local.yaml"
         try:
             paths.write_private_text(

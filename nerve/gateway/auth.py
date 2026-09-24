@@ -211,7 +211,7 @@ async def authenticate_websocket(websocket: WebSocket) -> bool:
     """Validate WebSocket authentication."""
     secret = effective_jwt_secret(get_config())
     if not secret:
-        return False  # fail closed, locked or not — see require_auth
+        return False  # fail closed, as require_auth does
 
     # Check query parameter
     token = websocket.query_params.get("token")

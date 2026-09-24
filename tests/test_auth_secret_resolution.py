@@ -1,13 +1,9 @@
 """The signing secret is pinned at startup and resolved through one seam.
 
-A configured ``auth.jwt_secret`` keeps being used, a generated one is honoured
-by every consumer, the old
-``"dev-secret"`` login path — mint a token signed with a literal string and
-skip the password check whenever the secret was empty — is gone, and there is
-no unauthenticated mode left anywhere: with no secret in force HTTP, the
-WebSocket handshake and the MCP endpoint all refuse. The secret is
-restart-only, so a reload that removes or changes the key leaves the pinned
-one in force. Everything else about the routes behaves as before.
+Every consumer uses a configured or generated secret. With no secret in force,
+HTTP, the WebSocket handshake and the MCP endpoint all refuse, and no token
+signed with ``"dev-secret"`` is accepted. A reload does not change the pinned
+secret.
 """
 
 from __future__ import annotations
@@ -37,8 +33,8 @@ from nerve.mcp_server.auth import McpAuthError, authenticate_mcp
 
 _CONFIGURED = "configured-secret-padded-to-thirty-two-bytes!!"
 _GENERATED = "generated-secret-padded-to-thirty-two-bytes!!"
-# A secret nothing was ever signed with. Padded, like the two above, so PyJWT's
-# short-HMAC-key warning does not fire on tokens that exist only to be refused.
+# A secret no accepted token is signed with. Padded, like the two above, so
+# PyJWT does not warn about a short HMAC key.
 _FORGED = "forged-secret-padded-to-thirty-two-bytes!!!!"
 _PASSWORD = "correct horse battery staple"
 _HASH = bcrypt.hashpw(_PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
@@ -104,8 +100,8 @@ class TestEffectiveSecret:
 
 
 class TestFailClosedWithoutASecret:
-    """No secret in force — nothing pinned, nothing configured — means every
-    door is shut, locked or not. There is no dev mode to fall into."""
+    """With no secret pinned or configured, every entry point refuses, locked
+    or not."""
 
     @pytest.mark.parametrize("lockdown", [False, True], ids=["unlocked", "locked"])
     def test_http_refuses(self, client, config, lockdown):
@@ -113,7 +109,7 @@ class TestFailClosedWithoutASecret:
         res = client.get("/api/thing")
         assert res.status_code == 503
         assert res.json()["detail"] == NO_SECRET_DETAIL
-        # A token signed with anything at all changes nothing.
+        # A token signed with any key is refused too.
         assert client.get("/api/thing", headers=_bearer(_FORGED)).status_code == 503
 
     def test_login_refuses_instead_of_minting_a_dev_secret_token(self, client, config):
@@ -162,9 +158,8 @@ class TestLoginRoute:
         assert client.get("/api/auth/status").json() == {"auth_required": True}
 
     def test_password_checked_and_token_signed_with_the_generated_secret(self, client, config):
-        """An install that never configured auth.jwt_secret used to skip the
-        password check entirely. With the generated secret pinned the
-        password is verified and the token is signed with that secret."""
+        """Without a configured auth.jwt_secret, the password is still checked
+        and the token is signed with the generated secret."""
         config.auth.password_hash = _HASH
         pin_jwt_secret(_GENERATED)
         assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
@@ -172,9 +167,8 @@ class TestLoginRoute:
         assert res.status_code == 200
         token = res.json()["token"]
         assert _claims(token, _GENERATED)["sub"] == "user"
-        # ...and specifically not with the literal the old code used. Decoding
-        # with a ten-byte key trips PyJWT's key-length warning; that is the
-        # point of the check, not noise worth surfacing in the run.
+        # Not signed with "dev-secret". That ten-byte key triggers PyJWT's
+        # key-length warning, so the warning is suppressed.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with pytest.raises(jwt.InvalidSignatureError):

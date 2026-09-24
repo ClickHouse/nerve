@@ -1,11 +1,8 @@
-"""Every CLI command that opens the state database opens it the production way.
+"""CLI commands open the state database through ``open_production_db``.
 
-``nerve.migrate.open_production_db`` is ``Database.connect`` (state-file
-policy and migrations) followed by the first-account/secret bootstrap. So a
-maintenance command that happens to be the first thing run after an upgrade
-leaves the same state ``nerve start`` would: one account and a signing secret. And
-because the policy lives in ``connect()``, the same commands refuse insecure
-state the same way, with the operator remedy instead of a traceback.
+That is ``Database.connect`` followed by the identity bootstrap. The first
+command after an upgrade therefore leaves one account and a signing secret,
+as ``nerve start`` does, and refuses insecure state with the operator message.
 """
 
 from __future__ import annotations
@@ -40,8 +37,8 @@ def _config_dir(tmp_path: Path) -> Path:
 
 
 def _migrated_but_unbootstrapped_db() -> Path:
-    """What an upgrade leaves before anything bootstraps: the schema at its
-    head, with its system actor but no account or signing secret."""
+    """A database at the schema head with its system actor, but no account
+    and no signing secret."""
 
     async def _make() -> None:
         db = Database(paths.db_path())
@@ -90,14 +87,14 @@ class TestTheFirstCommandAfterAnUpgradeBootstraps:
         assert result.exit_code == 0, result.output
         assert _identity_state() == (1, 1, 1)
 
-        # Running again — or `nerve start` next — finds the rows and adds none.
+        # A second run finds the rows and adds none.
         result = CliRunner().invoke(main, ["-c", str(config_dir), *argv])
         assert result.exit_code == 0, result.output
         assert _identity_state() == (1, 1, 1)
 
     def test_a_configured_secret_is_honoured_by_the_opener_too(self, tmp_path, no_engine):
-        """The same bootstrap as the gateway's: with ``auth.jwt_secret``
-        configured, nothing secret is stored in the database."""
+        """With ``auth.jwt_secret`` configured, no secret is stored in the
+        database."""
         from nerve.cli import main
 
         config_dir = _config_dir(tmp_path)
@@ -112,8 +109,8 @@ class TestTheFirstCommandAfterAnUpgradeBootstraps:
 
 
 class TestTheCliRefusesInsecureState:
-    """The refusal is ``Database.connect``'s, so it needs no per-command code;
-    what the CLI adds is the message instead of a traceback."""
+    """``Database.connect`` refuses; the CLI prints the message, not a
+    traceback."""
 
     @_OPENERS
     def test_a_writable_database_is_refused_unrepaired_and_unbootstrapped(
@@ -130,7 +127,7 @@ class TestTheCliRefusesInsecureState:
         assert "Refusing to open" in result.output, result.output
         assert f"chmod 600 {db_path}" in result.output
         assert result.exception is None or isinstance(result.exception, SystemExit)
-        # Evidence untouched: no repair, no migration side effects, no rows.
+        # No repair, no migration, no rows.
         assert stat.S_IMODE(os.stat(db_path).st_mode) == 0o666
         assert _identity_state() == (0, 1, 0)
 
@@ -150,9 +147,8 @@ class TestTheCliRefusesInsecureState:
 
 
 def test_the_gateway_and_the_cli_share_one_opener():
-    """No opener in production code bypasses connect()+bootstrap: the CLI
-    maintenance commands import the opener, and nothing but the opener, the
-    gateway lifespan and the migrate bootstrap constructs a Database."""
+    """Only ``db/__init__.py``, ``db/base.py`` and ``migrate.py`` construct a
+    Database, so no CLI command can skip connect() and the bootstrap."""
     import re
 
     root = Path(__file__).resolve().parents[1] / "nerve"

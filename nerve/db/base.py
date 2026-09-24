@@ -1,8 +1,8 @@
 """Core Database class — connection management, write lock, migrations, and FTS health check.
 
 The Database class composes internal domain-specific stores via multiple
-inheritance. Production behavior should enter through a service or workflow,
-not treat individual storage methods as a public compatibility surface.
+inheritance. Production code calls services and workflows; the storage methods
+are not a public API.
 """
 
 from __future__ import annotations
@@ -92,48 +92,35 @@ _DEFAULT_PRAGMAS: dict[str, object] = {
 }
 
 
-# Owner-only modes for the state directory and the database files. nerve.db
-# holds the JWT signing secret generated for installs without auth.jwt_secret
-# (``instance_secrets``) — a credential that used to live only in a 0600 config
-# file — so the files that carry it must be no weaker, and neither may the
-# directory that lists them. Re-asserted on every connect rather than only at
-# creation, which is what covers installs created under a permissive umask
-# before this existed and databases put in place by a restore.
+# nerve.db can hold the generated JWT signing secret (``instance_secrets``), so
+# the state directory and database files are owner-only. connect() applies
+# these modes every time, which also covers old installs and restored files.
 _STATE_DIR_MODE = 0o700
 _DB_FILE_MODE = 0o600
-# The main file plus every sidecar SQLite may leave beside it.
+# The main file and every sidecar SQLite can create.
 _DB_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 
 
-# Group/world permission bits, split by the hazard each poses to the state DB.
-#   write (020/002) — another user can replace nerve.db or rewrite accounts,
-#                     actors and history. An integrity hazard, on the files AND
-#                     the directory (a writable dir lets a 0600 file be swapped).
-#   read  (040/004) — another user can read a signing secret out of the file.
-#                     A confidentiality hazard, and only on the files: read on
-#                     the directory is ordinary traversal (0755) and harmless.
+# Group/world write on the files or the directory lets another user replace or
+# change the database (integrity). Group/world read on the files lets another
+# user copy the signing secret (confidentiality). Read on the directory is
+# ordinary traversal and is permitted.
 _GROUP_WORLD_WRITE = 0o022
 _GROUP_WORLD_READ = 0o044
 
-# _mode_of sentinel: the path does not exist (which is fine — an absent sidecar,
-# a fresh install). Distinct from ``None``, which means the path exists but its
-# mode could not be read, and must fail closed (an attacker cannot make a file
-# uninspectable to hide a wide mode, but we must not assume secure either).
+# _mode_of result for a path that does not exist. ``None`` means the path
+# exists but its mode cannot be read, which is treated as unsafe.
 _ABSENT = object()
 
 
 class InsecureStateStorage(RuntimeError):
-    """The state directory or database files are not owner-only in a way this
-    layer will not repair on its own.
+    """The state directory or database files are not safe to use.
 
-    Raised by :meth:`Database.connect` *before* the database is opened or
-    migrated when a database file, a sidecar or the state directory is
-    group/world-writable, or when its mode cannot be read. Write access by
-    another user means the contents — accounts, actors, history — may have
-    been altered; chmod'ing that away would erase the evidence and then trust
-    the result. The operator acknowledges by fixing the modes by hand. Also
-    raised by the bootstrap when a database-held signing secret would have to
-    live in a file other users can read (confidentiality).
+    :meth:`Database.connect` raises it before it opens the database when a
+    database file, sidecar or the state directory is group/world-writable, or
+    its mode cannot be read. Another user may have changed the contents, so the
+    operator must check them and fix the modes by hand. The bootstrap also
+    raises it when a generated signing secret would go into a readable file.
     """
 
 
@@ -142,8 +129,8 @@ class IdentityInvariantError(RuntimeError):
 
 
 def _mode_of(path: Path):
-    """Permission bits of ``path``; ``_ABSENT`` if it does not exist; ``None``
-    if it exists but cannot be inspected (logged, and treated as unsafe)."""
+    """Permission bits of ``path``, ``_ABSENT`` if it does not exist, or
+    ``None`` if its mode cannot be read."""
     try:
         return stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
@@ -157,15 +144,12 @@ def _mode_of(path: Path):
 class StatePermissions:
     """The modes of the state directory and database files, classified.
 
-    ``writable`` (files or the directory) and ``uninspectable`` are *integrity*
-    hazards — another user could replace or rewrite the database — and are fatal
-    whatever the signing-secret arrangement is; :meth:`Database.connect` refuses
-    to open on them and repairs nothing. ``readable`` (files only) is a
-    *confidentiality* hazard: repaired automatically, and fatal at bootstrap
-    only when a database-held secret would be used and the repair failed.
-    ``exposed_before_repair`` records that a database file carried group/world
-    read bits when first observed, before any chmod: the trigger to rotate a
-    stored signing key, since it may already have been copied.
+    ``writable`` and ``uninspectable`` are integrity hazards: connect() refuses
+    to open and repairs nothing. ``readable`` (files only) is a confidentiality
+    hazard: connect() repairs it, and the bootstrap refuses only if the repair
+    failed and the secret would be stored in the database.
+    ``exposed_before_repair`` is set when a database file was readable before
+    any repair; a stored signing secret may have been copied and is rotated.
     """
 
     writable: list[tuple[Path, int]] = field(default_factory=list)
@@ -189,8 +173,8 @@ class StatePermissions:
 
 
 def _state_targets(db_path: Path) -> list[tuple[Path, int, bool]]:
-    """(path, desired mode, is a database file) for the directory and every
-    database file SQLite may leave beside the main one."""
+    """(path, desired mode, is a database file) for the directory and each
+    database file."""
     targets = [(db_path.parent, _STATE_DIR_MODE, False)]
     targets.extend(
         (Path(f"{db_path}{suffix}"), _DB_FILE_MODE, True) for suffix in _DB_FILE_SUFFIXES
@@ -201,10 +185,7 @@ def _state_targets(db_path: Path) -> list[tuple[Path, int, bool]]:
 def _inspect_state_permissions(db_path: Path) -> StatePermissions:
     """Classify the current modes without changing anything.
 
-    The pre-open snapshot. Anything ``writable`` or ``uninspectable`` here is
-    evidence the contents may have been altered, and is what
-    :meth:`Database.connect` refuses on; ``readable``/``exposed_before_repair``
-    is what it repairs and rotates for.
+    connect() calls this before it opens the database.
     """
     perms = StatePermissions()
     for path, _desired, is_db_file in _state_targets(db_path):
@@ -223,17 +204,11 @@ def _inspect_state_permissions(db_path: Path) -> StatePermissions:
 
 
 def _repair_state_permissions(db_path: Path) -> StatePermissions:
-    """Make the state directory 0700 and the database files 0600, verify, and
-    classify whatever could not be secured.
+    """Set the directory to 0700 and the database files to 0600, then classify
+    what is still not secure.
 
-    Only ever reached after :func:`_inspect_state_permissions` found no
-    integrity hazard, so what it repairs is read exposure and the directory
-    mode. Idempotent: a mode already right is left alone and an absent path
-    skipped. Every change is *verified* by re-reading the mode, never trusting
-    chmod's return, because on a filesystem without modes a chmod can succeed
-    and change nothing. Read exposure on a database file *before* repair is
-    remembered so a possibly-copied signing key can be rotated even after the
-    mode is fixed.
+    Each change is verified by reading the mode again: on a filesystem without
+    Unix modes, chmod can succeed and change nothing.
     """
     perms = StatePermissions()
     for path, desired, is_db_file in _state_targets(db_path):
@@ -320,10 +295,9 @@ class Database(
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
         self._system_actor_id: str | None = None
-        # What connect() found when it tried to make the state files owner-only.
-        # Secured on every ordinary filesystem. The identity bootstrap consults
-        # it before it trusts — or stores a signing secret in — the database
-        # (see nerve.migrate._refuse_insecure_secret_storage).
+        # The state-file modes connect() found after its repair. The identity
+        # bootstrap reads this before it stores a signing secret in the
+        # database (nerve.migrate._refuse_insecure_secret_storage).
         self.state_permissions: StatePermissions = StatePermissions()
 
     @property
@@ -343,54 +317,40 @@ class Database(
     async def connect(self) -> None:
         """Open the database connection, tune it, and apply migrations.
 
-        The state-file policy is enforced here, so every opener — the gateway,
-        each CLI command, the installer, tests — gets the same treatment:
+        Every opener goes through this state-file policy:
 
-        1. Inspect before touching anything. A group/world-**writable** database
-           file, sidecar or state directory, or one whose mode cannot be read,
-           means another user may have altered the contents. That is evidence,
-           not something to chmod away: refuse to open (no migration, no
-           repair) with the manual remedy, so the operator acknowledges it.
-        2. Repair what is repairable: read exposure on the files and the
-           directory mode, verified after the chmod.
-        3. Migrate, then — if a database file was readable before the repair —
-           retire the stored signing secret, which may have been copied, and
-           drop a matching process pin so nothing accepts it meanwhile.
+        1. If a database file, sidecar or the state directory is
+           group/world-writable, or its mode cannot be read, refuse to open.
+           Another user may have changed the contents, so nothing is repaired.
+        2. Remove group/world read bits and verify the result.
+        3. Migrate. If a database file was readable before step 2, delete the
+           stored signing secret, which may have been copied.
         """
-        # A directory this call creates is created owner-only; one that already
-        # exists is judged as found. mkdir's mode is subject to the umask, which
-        # can only remove bits, so this never widens anything.
+        # A new directory is created owner-only. An existing one is checked
+        # below as it is.
         self.db_path.parent.mkdir(mode=_STATE_DIR_MODE, parents=True, exist_ok=True)
         pre = _inspect_state_permissions(self.db_path)
         if pre.writable or pre.uninspectable:
             raise InsecureStateStorage(_refusal_message(self.db_path, pre))
         if not self.db_path.exists():
-            # Create the file owner-only *before* SQLite does. SQLite creates a
-            # new database at 0644-under-umask and gives the -wal/-shm sidecars
-            # the main file's mode, so fixing the mode first covers all three
-            # with no window in which the file is wider than intended.
+            # Create the file owner-only before SQLite creates it with the
+            # umask mode. SQLite gives the -wal/-shm sidecars the main file's
+            # mode, so this covers them too.
             self.db_path.touch(mode=_DB_FILE_MODE)
         self._db = await aiosqlite.connect(str(self.db_path))
-        # The connection now exists, and aiosqlite keeps a live non-daemon
-        # thread behind it, so *every* failure below has to close it: a
-        # migration that raised used to leave both in place — the caller sees
-        # the exception, the thread goes on holding the process open, and a
-        # retry opens a second one. BaseException, so a cancellation partway
-        # through cleans up too.
+        # aiosqlite runs a non-daemon thread for the connection, and that thread
+        # keeps the process alive. Close the connection on any failure below,
+        # including cancellation.
         try:
             self._db.row_factory = aiosqlite.Row
             # Apply pragmas BEFORE migrations so the migration writes also run
             # under the tuned busy_timeout/synchronous settings and contend
             # politely.
             await self._apply_pragmas()
-            # journal_mode=WAL has now opened the sidecars; a -wal/-shm pair that
-            # already existed from an earlier, wider run keeps its old mode until
-            # this pass tightens it. Its verdict is what the bootstrap reads.
+            # After journal_mode=WAL, so existing -wal/-shm files are included.
             self.state_permissions = _repair_state_permissions(self.db_path)
             if self.state_permissions.writable or self.state_permissions.uninspectable:
-                # Not reachable for anything the pre-open inspection saw; a
-                # sidecar SQLite just created inherits the main file's 0600.
-                # Kept as the backstop for whatever else a filesystem might do.
+                # A backstop: the check before open covers the known cases.
                 raise InsecureStateStorage(
                     _refusal_message(self.db_path, self.state_permissions)
                 )
@@ -407,8 +367,8 @@ class Database(
                 )
             await run_migrations(self._db)
             await self._cache_system_actor_id()
-            # After migrations (the table exists) and after repair: a key that was
-            # readable by other users is compromised and must not be reused.
+            # After migrations, so the table exists. A key that other users
+            # could read is compromised.
             if exposed:
                 await self._rotate_exposed_signing_secret()
             await self._check_fts_integrity()
@@ -449,17 +409,12 @@ class Database(
         return self._system_actor_id
 
     async def _rotate_exposed_signing_secret(self) -> None:
-        """Retire a database-held signing secret that was readable by other
-        users before connect() repaired the mode — on disk *and* in memory.
+        """Delete a stored signing secret that other users could read, and
+        unpin it if this process uses it.
 
-        The key may already have been copied, so re-securing the file is not
-        enough: the row is deleted, and if this process had that very key
-        pinned, the pin is dropped so requests fail closed until the bootstrap
-        pins the replacement (:func:`nerve.migrate.ensure_jwt_secret` generates
-        a fresh one). Runs in the connect path so it covers every opener
-        (gateway, ``nerve migrate``, the installer), not just the gateway
-        process. Only an actually-stored key is rotated: a fresh 0644 database
-        from old code that never held one is not an exposure.
+        The key may have been copied, so fixing the file mode is not enough.
+        Requests fail closed until the bootstrap generates and pins a new key.
+        A database with no stored key has nothing to rotate.
         """
         from nerve.db.accounts import JWT_SECRET_NAME
 
@@ -480,9 +435,8 @@ class Database(
             "it: it may still hold the retired key pinned until then.",
             self.db_path,
         )
-        # Memory must agree with disk: a verifier still holding the retired key
-        # would keep accepting tokens minted with the copy. Imported lazily —
-        # the gateway module is heavier than this layer needs at import time.
+        # A pinned copy of the deleted key would still verify tokens signed with
+        # it. Imported here to keep the gateway module out of this import path.
         from nerve.gateway.auth import pinned_jwt_secret, unpin_jwt_secret
 
         if pinned_jwt_secret() == stored:
