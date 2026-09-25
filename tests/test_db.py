@@ -277,6 +277,39 @@ class TestChannelSessions:
         row = await db.get_channel_session("tg:1")
         assert row["session_id"] == "ch-b"
 
+    async def test_conversation_scope_is_delimiter_bounded_before_limit(
+        self, db: Database,
+    ):
+        for session_id, key in (
+            ("root", "chat:C1"),
+            ("thread", "chat:C1:1700.1"),
+        ):
+            await db.create_session(session_id)
+            await db.set_channel_session(key, session_id)
+
+        # These sort later and outnumber the limit. A raw prefix query would
+        # select them first and crowd the real conversation out.
+        for index in range(25):
+            session_id = f"sibling-{index}"
+            await db.create_session(session_id)
+            await db.set_channel_session(f"chat:C12:{index}", session_id)
+
+        rows = await db.list_channel_sessions_for_conversation(
+            "chat:C1", limit=2,
+        )
+        assert {row["channel_key"] for row in rows} == {
+            "chat:C1", "chat:C1:1700.1",
+        }
+
+    async def test_conversation_scope_escapes_like_wildcards(self, db: Database):
+        await db.create_session("literal")
+        await db.create_session("wildcard")
+        await db.set_channel_session("chat:C_1:thread", "literal")
+        await db.set_channel_session("chat:CX1:thread", "wildcard")
+
+        rows = await db.list_channel_sessions_for_conversation("chat:C_1")
+        assert [row["session_id"] for row in rows] == ["literal"]
+
 
 @pytest.mark.asyncio
 class TestMessages:

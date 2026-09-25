@@ -411,16 +411,71 @@ class NotificationService:
         return {"notification_id": notification_id, "status": "sent"}
 
     # ------------------------------------------------------------------ #
-    #  Answer routing (called by REST API / Telegram callback)             #
+    #  Answer routing                                                       #
     # ------------------------------------------------------------------ #
+
+    async def answer_delivered_notification(
+        self,
+        notification_id: str,
+        answer: str,
+        *,
+        channel: str,
+        target: str,
+        actor: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Answer an explicit notification within its delivery scope.
+
+        The post-answer row lets an adapter render the result without reaching
+        through the service to its database.
+        """
+        delivery = await self.db.get_notification_delivery(
+            notification_id, channel, target,
+        )
+        if not delivery:
+            return None
+        accepted = await self.handle_answer(
+            notification_id,
+            answer,
+            answered_by=channel,
+            actor=actor,
+        )
+        if not accepted:
+            return None
+        return await self.db.get_notification(notification_id)
+
+    async def answer_latest_question(
+        self,
+        answer: str,
+        *,
+        channel: str,
+        target: str,
+        actor: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Answer the newest pending question delivered to one exact target."""
+        pending = await self.db.find_pending_question_for_delivery(channel, target)
+        if not pending:
+            return None
+        accepted = await self.handle_answer(
+            pending["id"],
+            answer,
+            answered_by=channel,
+            actor=actor,
+        )
+        if not accepted:
+            return None
+        return await self.db.get_notification(pending["id"])
 
     async def handle_answer(
         self,
         notification_id: str,
         answer: str,
         answered_by: str,
+        actor: str | None = None,
     ) -> bool:
         """Process a user's answer to a question or approval.
+
+        ``answered_by`` identifies the transport; ``actor`` identifies the
+        person within that transport and is retained for audit.
 
         - For ``type=approval`` rows: look up the dispatcher in the
           handler registry, run it, audit-log the outcome, then flip
@@ -438,16 +493,17 @@ class NotificationService:
 
         if notif.get("type") == "approval":
             return await self._handle_approval_answer(
-                notif, answer, answered_by,
+                notif, answer, answered_by, actor,
             )
 
         success = await self.db.answer_notification(
-            notification_id, answer, answered_by,
+            notification_id, answer, answered_by, actor=actor,
         )
         if not success:
             return False
 
         session_id = notif["session_id"]
+        attribution = {"answered_by_actor": actor} if actor else {}
 
         from nerve.agent.streaming import broadcaster
 
@@ -468,6 +524,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                **attribution,
             })
             return True
 
@@ -483,6 +540,7 @@ class NotificationService:
             "answer": answer,
             "answered_by": answered_by,
             "content": injected_message,
+            **attribution,
         })
 
         # Dispatch unconditionally — ``engine.run`` serializes per
@@ -510,6 +568,7 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            **attribution,
         })
 
         return True
@@ -519,6 +578,7 @@ class NotificationService:
         notif: dict[str, Any],
         answer: str,
         answered_by: str,
+        actor: str | None = None,
     ) -> bool:
         """Route an approval answer through the dispatcher registry."""
         notification_id = notif["id"]
@@ -580,7 +640,10 @@ class NotificationService:
                     },
                 )
 
-        await self._append_approval_audit(result.audit_event)
+        attribution: dict[str, Any] = {"answered_by": answered_by}
+        if actor:
+            attribution["answered_by_actor"] = actor
+        await self._append_approval_audit({**result.audit_event, **attribution})
 
         # Snooze keeps the row pending and stamps ``redeliver_at`` so
         # the periodic maintenance tick (:meth:`redeliver_due`) fans it
@@ -614,7 +677,7 @@ class NotificationService:
             )
         else:
             await self.db.answer_notification(
-                notification_id, answer, answered_by,
+                notification_id, answer, answered_by, actor=actor,
             )
 
         from nerve.agent.streaming import broadcaster
@@ -623,9 +686,9 @@ class NotificationService:
             "notification_id": notification_id,
             "session_id": session_id,
             "answer": answer,
-            "answered_by": answered_by,
             "approval_status": "snoozed" if snoozed else "answered",
             "dispatch_ok": result.ok,
+            **attribution,
         }
         if snoozed:
             payload["snooze_until"] = snooze_until
@@ -771,6 +834,9 @@ class NotificationService:
                         option_labels=option_labels,
                         extra=extra_web,
                     )
+                    await self.db.record_notification_delivery(
+                        notification_id, "web",
+                    )
                     return "web"
                 elif channel_name == "telegram":
                     msg_id = await self._deliver_telegram(
@@ -783,7 +849,7 @@ class NotificationService:
                             notification_id,
                             telegram_message_id=str(msg_id),
                         )
-                    return "telegram"
+                    return "telegram" if msg_id else None
             except Exception as e:
                 logger.error(
                     "Failed to deliver %s to %s: %s",
@@ -862,6 +928,7 @@ class NotificationService:
         await self.db.update_notification(
             notification_id, channels_delivered=json.dumps(["web"]),
         )
+        await self.db.record_notification_delivery(notification_id, "web")
 
         message: dict[str, Any] = {
             "type": "notification",
@@ -974,6 +1041,12 @@ class NotificationService:
             channel = self._get_telegram_channel()
             if channel:
                 channel._cache_message(int(msg_id), chat_id, text)
+            await self.db.record_notification_delivery(
+                notification_id,
+                "telegram",
+                target=str(chat_id),
+                message_id=str(msg_id),
+            )
 
         return msg_id
 
@@ -1286,13 +1359,22 @@ class NotificationService:
         now-dead inline keyboard. Telegram refuses edits on old
         messages (>48h) — all failures are swallowed by design.
         """
-        message_id = notif.get("telegram_message_id")
+        target = str(notif.get("telegram_chat_id") or "")
+        delivery = None
+        if target:
+            delivery = await self.db.get_notification_delivery(
+                notif["id"], "telegram", target,
+            )
+        message_id = (
+            (delivery or {}).get("message_id")
+            or notif.get("telegram_message_id")
+        )
         if not message_id:
             return
         bot = self._get_telegram_bot()
         if not bot:
             return
-        chat_id = notif.get("telegram_chat_id") or self._resolve_telegram_chat_id()
+        chat_id = target or self._resolve_telegram_chat_id()
         if not chat_id:
             return
 
