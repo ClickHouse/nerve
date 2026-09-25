@@ -1,7 +1,8 @@
-import type { MessageBlock } from '../../types/chat';
+import { useChatStore } from '../../stores/chatStore';
 import { BlockRenderer } from './BlockRenderer';
 
-export function StreamingMessage({ blocks }: { blocks: MessageBlock[] }) {
+export function StreamingMessage() {
+  const blocks = useChatStore(s => s.streamingBlocks);
   if (blocks.length === 0) {
     return (
       <div className="py-4 px-5 msg-assistant">

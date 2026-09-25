@@ -33,7 +33,8 @@ import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
   const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
-  const { handleWSMessage, loadSessions } = useChatStore();
+  const handleWSMessage = useChatStore(s => s.handleWSMessage);
+  const loadSessions = useChatStore(s => s.loadSessions);
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
 

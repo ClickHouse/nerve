@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useShallow } from 'zustand/react/shallow';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -42,16 +43,50 @@ function formatModelLabel(model: string): string {
 export function ChatPage() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
+  // Nothing here selects streamingBlocks or the panels array: both change for
+  // each streamed token. StreamingMessage subscribes to the blocks itself.
   const {
     sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
-    streamingBlocks, isStreaming, loading,
+    isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
-    sidebarCollapsed, mobileSidebarOpen, panels, panelVisible,
+    sidebarCollapsed, mobileSidebarOpen, panelVisible,
     modifiedFiles, modifiedFilesCount,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
-  } = useChatStore();
+  } = useChatStore(useShallow(s => ({
+    sessions: s.sessions,
+    archivedSessions: s.archivedSessions,
+    systemSessions: s.systemSessions,
+    activeSession: s.activeSession,
+    virtualSession: s.virtualSession,
+    messages: s.messages,
+    isStreaming: s.isStreaming,
+    loading: s.loading,
+    agentStatus: s.agentStatus,
+    contextUsage: s.contextUsage,
+    backendStatus: s.backendStatus,
+    currentTodos: s.currentTodos,
+    currentCCTasks: s.currentCCTasks,
+    sidebarCollapsed: s.sidebarCollapsed,
+    mobileSidebarOpen: s.mobileSidebarOpen,
+    panelVisible: s.panelVisible,
+    modifiedFiles: s.modifiedFiles,
+    modifiedFilesCount: s.modifiedFilesCount,
+    backendDefault: s.backendDefault,
+    newChatBackend: s.newChatBackend,
+    loadSessions: s.loadSessions,
+    switchSession: s.switchSession,
+    createSession: s.createSession,
+    deleteSession: s.deleteSession,
+    sendMessage: s.sendMessage,
+    stopSession: s.stopSession,
+    toggleSessionList: s.toggleSessionList,
+    setMobileSidebarOpen: s.setMobileSidebarOpen,
+    openFilesPanel: s.openFilesPanel,
+  })));
+  const hasPanels = useChatStore(s => s.panels.length > 0);
+  const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
 
   // The active session row may live in the feed or a lazy archived/system group.
   const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
@@ -255,10 +290,9 @@ export function ChatPage() {
     : STATUS_LABELS[agentStatus.state] || null;
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
-  const filesPanelActive = panels.some(p => p.id === 'files-panel');
   // SidePanel renders nothing without a tab, so it only covers the column when
   // there is one.
-  const panelCoversColumn = isMobile && panelVisible && panels.length > 0;
+  const panelCoversColumn = isMobile && panelVisible && hasPanels;
 
   return (
     // `relative` anchors the mobile side panel, which covers this column but
@@ -469,7 +503,6 @@ export function ChatPage() {
             ) : (
               <MessageList
                 messages={messages}
-                streamingBlocks={streamingBlocks}
                 isStreaming={isStreaming}
                 onForkMessage={canForkSession ? handleForkMessage : undefined}
                 messageForks={messageForks}
@@ -496,7 +529,7 @@ export function ChatPage() {
         </div>
 
         {/* Side panel — sub-agents, plans, files, etc. (always render when tabs exist for animation) */}
-        {panels.length > 0 && <SidePanel />}
+        {hasPanels && <SidePanel />}
       </div>
     </div>
   );
