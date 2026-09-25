@@ -169,3 +169,131 @@ class TestDeclinePlan:
         engine, _ = await _setup(db, tmp_path)
         with pytest.raises(PlanNotFound):
             await decline_plan(db=db, engine=engine, plan_id="plan-missing")
+
+
+def _hold_callers_in_get_task(db, monkeypatch, callers: int = 2) -> None:
+    """Make every caller wait inside ``get_task`` until ``callers`` of them
+    have passed the pending check, forcing the check-then-act interleaving."""
+    real_get_task = db.get_task
+    arrived = 0
+    all_arrived = asyncio.Event()
+
+    async def held_get_task(task_id):
+        nonlocal arrived
+        arrived += 1
+        if arrived >= callers:
+            all_arrived.set()
+        await asyncio.wait_for(all_arrived.wait(), timeout=5.0)
+        return await real_get_task(task_id)
+
+    monkeypatch.setattr(db, "get_task", held_get_task)
+
+
+@pytest.mark.asyncio
+class TestConcurrentReview:
+    async def test_double_approve_spawns_one_session(self, db, tmp_path, monkeypatch):
+        engine, _ = await _setup(db, tmp_path)
+        _hold_callers_in_get_task(db, monkeypatch)
+
+        results = await asyncio.gather(
+            approve_plan(db=db, engine=engine, plan_id="plan-act"),
+            approve_plan(db=db, engine=engine, plan_id="plan-act"),
+            return_exceptions=True,
+        )
+        wins = [r for r in results if isinstance(r, dict)]
+        assert len(wins) == 1
+        assert sum(isinstance(r, PlanNotPending) for r in results) == 1
+
+        await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
+        assert len(engine.sessions.calls) == 1
+        assert len(engine.runs) == 1
+        plan = await db.get_plan("plan-act")
+        assert plan["impl_session_id"] == wins[0]["impl_session_id"]
+
+    async def test_approve_racing_decline_has_one_winner(self, db, tmp_path, monkeypatch):
+        engine, task_id = await _setup(db, tmp_path)
+        _hold_callers_in_get_task(db, monkeypatch)
+
+        approved, declined = await asyncio.gather(
+            approve_plan(db=db, engine=engine, plan_id="plan-act"),
+            decline_plan(db=db, engine=engine, plan_id="plan-act"),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(r, PlanNotPending) for r in (approved, declined)) == 1
+
+        plan = await db.get_plan("plan-act")
+        task = await db.get_task(task_id)
+        if isinstance(approved, dict):
+            assert (plan["status"], task["status"]) == ("implementing", "in_progress")
+        else:
+            assert (plan["status"], task["status"]) == ("declined", "done")
+            assert engine.sessions.calls == []
+
+
+@pytest.mark.asyncio
+class TestFailureRecovery:
+    async def test_failed_session_create_puts_plan_back_to_pending(self, db, tmp_path):
+        engine, _ = await _setup(db, tmp_path)
+
+        async def broken_get_or_create(*args, **kwargs):
+            raise RuntimeError("session store unavailable")
+
+        engine.sessions.get_or_create = broken_get_or_create
+        with pytest.raises(RuntimeError):
+            await approve_plan(db=db, engine=engine, plan_id="plan-act")
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert plan["impl_session_id"] is None
+        assert engine.runs == []
+
+        # Once the failure clears, the same plan can be approved.
+        engine.sessions = FakeSessionManager()
+        result = await approve_plan(db=db, engine=engine, plan_id="plan-act")
+        plan = await db.get_plan("plan-act")
+        assert plan["impl_session_id"] == result["impl_session_id"]
+
+    async def test_failed_task_close_puts_plan_back_to_pending(
+        self, db, tmp_path, monkeypatch,
+    ):
+        from nerve.agent.tools.handlers import tasks as task_handlers
+
+        engine, task_id = await _setup(db, tmp_path)
+
+        async def broken_task_done(ctx, args):
+            raise RuntimeError("task store unavailable")
+
+        monkeypatch.setattr(task_handlers, "task_done_handler", broken_task_done)
+        with pytest.raises(RuntimeError):
+            await decline_plan(db=db, engine=engine, plan_id="plan-act", feedback="no")
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert plan["feedback"] is None
+        assert (await db.get_task(task_id))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+class TestActor:
+    async def test_approve_records_the_actor(self, db, tmp_path):
+        engine, task_id = await _setup(db, tmp_path)
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor="sess-agent")
+        events = await db.list_task_events(task_id)
+        assert [e["actor"] for e in events if e["to_status"] == "in_progress"] == ["sess-agent"]
+
+    async def test_decline_defaults_to_system(self, db, tmp_path):
+        engine, task_id = await _setup(db, tmp_path)
+        await decline_plan(db=db, engine=engine, plan_id="plan-act")
+        events = await db.list_task_events(task_id)
+        assert [e["actor"] for e in events if e["to_status"] == "done"] == ["system"]
+
+    async def test_mcp_tool_records_the_calling_session(self, db, tmp_path):
+        from dataclasses import replace
+
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, task_id = await _setup(db, tmp_path)
+        ctx = replace(tools_mod._legacy_ctx("sess-mcp"), db=db, engine=engine)
+        await plan_approve_handler(ctx, {"plan_id": "plan-act"})
+        events = await db.list_task_events(task_id)
+        assert [e["actor"] for e in events if e["to_status"] == "in_progress"] == ["sess-mcp"]

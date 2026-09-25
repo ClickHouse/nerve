@@ -23,7 +23,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -221,10 +221,32 @@ async def request_plan_revision(
     }
 
 
+async def _raise_not_pending(db: "Database", plan_id: str, verb: str) -> NoReturn:
+    """Raise for a plan that left ``pending`` before this caller could act on it."""
+    plan = await db.get_plan(plan_id)
+    if not plan:
+        raise PlanNotFound(f"Plan not found: {plan_id}")
+    raise PlanNotPending(
+        f"Plan is '{plan['status']}' — only pending plans can be {verb}."
+    )
+
+
+async def _revert_plan(
+    db: "Database", plan_id: str, from_status: str, **fields,
+) -> None:
+    """Best-effort undo of a claimed transition after a later step failed."""
+    try:
+        await db.transition_plan(plan_id, from_status, **fields)
+    except Exception:
+        logger.exception("Failed to restore plan %s after an error", plan_id)
+
+
 async def approve_plan(
     db: "Database",
     engine: "AgentEngine",
     plan_id: str,
+    *,
+    actor: str = "system",
 ) -> dict:
     """Approve a pending plan and spawn its implementation session.
 
@@ -232,20 +254,25 @@ async def approve_plan(
         db: Database instance (plan/task lookups + updates).
         engine: AgentEngine (session creation + run dispatch).
         plan_id: The pending plan to approve.
+        actor: Who approved, recorded in the task's status history: the
+            calling agent's session id, or ``"system"`` for the WebUI and chat.
 
     Returns:
         ``{"plan_id", "task_id", "impl_session_id"}`` on success.
 
     Raises:
         PlanNotFound: No plan with that ID.
-        PlanNotPending: The plan is not ``pending`` (guards double-approve).
+        PlanNotPending: The plan is not ``pending``, including when a
+            concurrent approve or decline got to it first.
         TaskNotFound: The plan's task no longer exists.
 
     Behavior contract:
-        - Flips the plan to ``implementing`` up front so a concurrent
-          approve can't spawn a second session.
-        - Creates ``impl-<uuid>`` and stores it on the plan.
+        - Claims the plan with one atomic ``pending`` → ``implementing``
+          transition that also stores the new ``impl-<uuid>`` session id, so
+          concurrent approvals spawn exactly one implementation session.
         - Moves the task to ``in_progress`` with an audit note.
+        - If creating the session or updating the task fails, the plan goes
+          back to ``pending`` so it can be approved again.
         - Dispatches ``engine.run()`` in the background with the build
           prompt; registers the task with the engine (when supported) so
           ``/stop`` can cancel a stuck implementation.
@@ -269,40 +296,50 @@ async def approve_plan(
 
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
-
-    # Mark implementing immediately (prevents a double-approve race).
-    await db.update_plan(plan_id, status="implementing", reviewed_at=now)
-
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
-    await engine.sessions.get_or_create(
-        impl_session_id, title=f"Implement: {task['title']}", source="web",
+
+    claimed = await db.transition_plan(
+        plan_id, "pending",
+        status="implementing", reviewed_at=now, impl_session_id=impl_session_id,
     )
-    await db.update_plan(plan_id, impl_session_id=impl_session_id)
+    if not claimed:
+        await _raise_not_pending(db, plan_id, "approved")
 
-    # Move the task to in_progress with an audit note. Uses the legacy
-    # ToolContext (db/engine overridden with the handed-in instances) — the
-    # same pattern request_plan_revision relies on, so tests with a
-    # config-less FakeEngine keep working.
-    task_ctx = replace(_legacy_ctx("system"), db=db, engine=engine)
-    await task_update_handler(task_ctx, {
-        "task_id": plan["task_id"],
-        "status": "in_progress",
-        "note": f"Plan approved — implementation started (session: {impl_session_id})",
-    })
+    # The legacy ToolContext (db/engine overridden with the handed-in
+    # instances) is the same pattern request_plan_revision relies on, so
+    # tests with a config-less FakeEngine keep working.
+    task_ctx = replace(_legacy_ctx(actor), db=db, engine=engine)
+    try:
+        await engine.sessions.get_or_create(
+            impl_session_id, title=f"Implement: {task['title']}", source="web",
+        )
+        await task_update_handler(task_ctx, {
+            "task_id": plan["task_id"],
+            "status": "in_progress",
+            "note": f"Plan approved — implementation started (session: {impl_session_id})",
+        })
 
-    # Read the task file for the implementation prompt. Resolve against the
-    # legacy ToolContext workspace (init_tools sets it to config.workspace),
-    # the same field request_plan_revision relies on — best-effort.
-    task_content = ""
-    workspace = getattr(task_ctx, "workspace", None)
-    if task.get("file_path") and workspace:
-        task_file = workspace / task["file_path"]
-        if task_file.exists():
-            task_content = await asyncio.to_thread(
-                task_file.read_text, encoding="utf-8",
-            )
+        # Read the task file for the implementation prompt. Resolve against
+        # the legacy ToolContext workspace (init_tools sets it to
+        # config.workspace), the same field request_plan_revision relies on.
+        task_content = ""
+        workspace = getattr(task_ctx, "workspace", None)
+        if task.get("file_path") and workspace:
+            task_file = workspace / task["file_path"]
+            if task_file.exists():
+                task_content = await asyncio.to_thread(
+                    task_file.read_text, encoding="utf-8",
+                )
 
-    prompt = _build_impl_prompt(task, task_content, plan_type, plan["content"])
+        prompt = _build_impl_prompt(task, task_content, plan_type, plan["content"])
+    except Exception:
+        # Nothing has been dispatched yet, so hand the plan back to review.
+        await _revert_plan(
+            db, plan_id, "implementing",
+            status="pending", reviewed_at=plan.get("reviewed_at"),
+            impl_session_id=plan.get("impl_session_id"),
+        )
+        raise
 
     async def _run_impl():
         try:
@@ -340,21 +377,30 @@ async def decline_plan(
     engine: "AgentEngine",
     plan_id: str,
     feedback: str = "",
+    *,
+    actor: str = "system",
 ) -> dict:
     """Decline a pending plan and close its task as done.
+
+    The ``pending`` → ``declined`` transition is atomic, so it cannot
+    interleave with a concurrent approve or decline. If closing the task
+    fails, the plan goes back to ``pending`` so the decline can be retried.
 
     Args:
         db: Database instance.
         engine: AgentEngine (only used to build the task-handler context).
         plan_id: The pending plan to decline.
         feedback: Optional free-text reason, recorded on plan + task note.
+        actor: Who declined, recorded in the task's status history: the
+            calling agent's session id, or ``"system"`` for the WebUI and chat.
 
     Returns:
         ``{"plan_id", "task_id", "status": "declined", "feedback"}``.
 
     Raises:
         PlanNotFound: No plan with that ID.
-        PlanNotPending: The plan is not ``pending``.
+        PlanNotPending: The plan is not ``pending``, including when a
+            concurrent approve or decline got to it first.
         TaskNotFound: The plan's task no longer exists.
     """
     from dataclasses import replace
@@ -380,17 +426,27 @@ async def decline_plan(
     fields: dict = {"status": "declined", "reviewed_at": now}
     if feedback:
         fields["feedback"] = feedback
-    await db.update_plan(plan_id, **fields)
+    if not await db.transition_plan(plan_id, "pending", **fields):
+        await _raise_not_pending(db, plan_id, "declined")
 
     if feedback:
         note = f"Plan {plan_id} declined — {feedback}"
     else:
         note = f"Related plan {plan_id} was closed without a specified reason"
-    task_ctx = replace(_legacy_ctx("system"), db=db, engine=engine)
-    await task_done_handler(task_ctx, {
-        "task_id": plan["task_id"],
-        "note": note,
-    })
+    task_ctx = replace(_legacy_ctx(actor), db=db, engine=engine)
+    try:
+        await task_done_handler(task_ctx, {
+            "task_id": plan["task_id"],
+            "note": note,
+        })
+    except Exception:
+        # The task is still open, so put the plan back up for review.
+        await _revert_plan(
+            db, plan_id, "declined",
+            status="pending", reviewed_at=plan.get("reviewed_at"),
+            feedback=plan.get("feedback"),
+        )
+        raise
 
     logger.info(
         "Plan declined: plan=%s task=%s", plan_id, plan["task_id"],
