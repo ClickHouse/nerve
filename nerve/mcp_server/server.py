@@ -57,6 +57,7 @@ def build_mcp_server(
     ctx_resolver: CtxResolver,
     audit_writer: AuditWriter | None = None,
     include_hoa: bool = False,
+    excluded: "Callable[[], set[str]] | None" = None,
     name: str = "nerve",
     version: str = "1.0.0",
 ) -> Server:
@@ -75,6 +76,13 @@ def build_mcp_server(
         include_hoa: If ``True``, expose HoA tools (``hoa_*``) to the
             external endpoint. Off by default since these tools spawn
             subprocess agents and warrant a separate trust decision.
+        excluded: Called per request for the names the configuration
+            leaves nothing to serve (see
+            :func:`~nerve.agent.backends.base.config_excluded_tools`). A
+            callable rather than a set, because this endpoint is built
+            once at startup and a config reload has to reach it. The
+            Claude backend passes the same names to its in-process MCP
+            server, so both tool surfaces answer one config.
         name: Server name advertised to clients.
         version: Server version advertised to clients.
 
@@ -92,10 +100,14 @@ def build_mcp_server(
             isError=True,
         )
 
+    def _excluded_now() -> set[str]:
+        return excluded() if excluded is not None else set()
+
     async def _list_tools(
         rctx: ServerRequestContext,
         params: PaginatedRequestParams | None = None,
     ) -> ListToolsResult:
+        hidden = _excluded_now()
         return ListToolsResult(
             tools=[
                 Tool(
@@ -104,6 +116,7 @@ def build_mcp_server(
                     inputSchema=spec.input_schema,
                 )
                 for spec in registry.list(include_hoa=include_hoa)
+                if spec.name not in hidden
             ]
         )
 
@@ -122,6 +135,12 @@ def build_mcp_server(
         # malicious caller could still invoke a HoA tool by name. Enforce
         # the same allowlist here.
         if not include_hoa and name.startswith("hoa_"):
+            return _error(f"Tool not available: {name!r}")
+
+        # Same reason, for a name the config leaves nothing to serve: a
+        # caller that kept an older tool list would otherwise spend the
+        # call on a refusal from deeper in.
+        if name in _excluded_now():
             return _error(f"Tool not available: {name!r}")
 
         # Validate arguments against the tool's declared inputSchema before

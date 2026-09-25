@@ -98,7 +98,25 @@ class TestExcludedTools:
     def test_claude_excludes_schedule_wakeup(self, tmp_path, db):
         engine = _engine(tmp_path, db)
         assert "schedule_wakeup" in engine._backends["claude"].excluded_tools()
-        assert engine._backends["codex"].excluded_tools() == set()
+        assert "schedule_wakeup" not in engine._backends["codex"].excluded_tools()
+
+    def test_both_backends_drop_a_tool_the_config_cannot_serve(self, tmp_path, db):
+        # Outbound is off by default, so send_channel_message could only
+        # refuse. Backend-specific exclusions still apply alongside it.
+        engine = _engine(tmp_path, db)
+        for name in ("claude", "codex"):
+            excluded = engine._backends[name].excluded_tools()
+            assert "send_channel_message" in excluded, name
+
+    def test_the_tool_returns_once_a_channel_accepts_outbound(self, tmp_path, db):
+        engine = _engine(tmp_path, db)
+        engine.config.slack.enabled = True
+        engine.config.slack.allow_outbound = True
+        for name in ("claude", "codex"):
+            excluded = engine._backends[name].excluded_tools()
+            assert "send_channel_message" not in excluded, name
+        # Read per session off the live config, so a reload is enough.
+        assert "schedule_wakeup" in engine._backends["claude"].excluded_tools()
 
     def test_prompt_tool_list_respects_exclusions(self):
         from nerve.agent.prompts import _format_tool_list
