@@ -45,6 +45,15 @@ interface PendingDelta {
 let pendingDeltas: PendingDelta[] = [];
 let flushFrame: number | null = null;
 
+/** Discard deltas from the view being left before another session can reuse it. */
+export function discardStreamDeltas(): void {
+  if (flushFrame !== null) {
+    cancelAnimationFrame(flushFrame);
+    flushFrame = null;
+  }
+  pendingDeltas = [];
+}
+
 function queueDelta(delta: PendingDelta, get: Get, set: Set): void {
   const last = pendingDeltas[pendingDeltas.length - 1];
   if (last && last.type === delta.type && last.sessionId === delta.sessionId && last.parentId === delta.parentId) {

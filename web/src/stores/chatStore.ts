@@ -13,7 +13,7 @@ import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/dr
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 // Handlers
-import { flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
+import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -618,6 +618,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     }
     if (id === get().activeSession && get().messages.length > 0) return;
+    discardStreamDeltas();
     // Clear all auto-close timers
     clearAllAutoCloseTimers();
     set({
