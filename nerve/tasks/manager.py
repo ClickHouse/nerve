@@ -122,8 +122,11 @@ class TaskManager:
             )
         return task
 
-    async def mark_done(self, task_id: str) -> bool:
+    async def mark_done(self, task_id: str, expect_revision: int | None = None) -> bool:
         """Mark a task as done and move its file.
+
+        Returns ``False`` when the task is missing, or when ``expect_revision``
+        is given and the row has moved past it; nothing is written then.
 
         Raises :class:`~nerve.config.LockdownError` on a locked instance when the
         stored ``file_path`` lands inside the tracked config subtree.
@@ -143,20 +146,27 @@ class TaskManager:
             content = await asyncio.to_thread(src.read_text, encoding="utf-8")
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             content += f"\n- {today}: DONE"
-
-            await asyncio.to_thread(move_task_file, src, dst, content)
-
-            # Update DB
             rel_path = str(dst.relative_to(self.workspace))
-            await self.db.upsert_task(
-                task_id=task_id,
-                file_path=rel_path,
-                title=row["title"],
-                status="done",
-                content=content,
-            )
+            move = lambda: move_task_file(src, dst, content)
 
-        return True
+            # Without a token the order stays move-then-row, as before. With
+            # one the row is claimed first, so a refused caller moves nothing.
+            if expect_revision is None:
+                await asyncio.to_thread(move)
+                return await self.db.transition_task(
+                    task_id, "done", file_path=rel_path, content=content,
+                )
+            if not await self.db.transition_task(
+                task_id, "done", expect_revision=expect_revision,
+                file_path=rel_path, content=content,
+            ):
+                return False
+            await asyncio.to_thread(move)
+            return True
+
+        return await self.db.transition_task(
+            task_id, "done", expect_revision=expect_revision,
+        )
 
     async def get_overdue_tasks(self) -> list[Task]:
         """Get tasks that are past their deadline."""
