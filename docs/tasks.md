@@ -125,8 +125,9 @@ the row recording a task's creation, so an aging calculation can tell
 "created here" from "moved here".
 
 Recording happens inside the same transaction as the status write, from all
-three paths that can change one: `update_task_status`, `move_task`, and the
-full-row `upsert_task` (which is how `task_update` flips status when it also
+three paths that can change one: `transition_task` (which `update_task_status`
+wraps), `move_task`, and the full-row `upsert_task` (which is how
+`task_update` flips status when it also
 writes a note). A no-op transition records nothing — that single rule is
 what keeps `reindex()` from doubling the table on every run, since it
 rewrites every row with the status it already had. The one case where
@@ -143,6 +144,24 @@ This powers the aging indicator on board cards and the timeline in the task
 detail view. Tasks whose last transition predates v044 report no entry time
 rather than a guessed one, so the UI stays silent instead of showing an age
 that isn't true.
+
+### Revisions (`revision`)
+
+Every write to a task row advances `tasks.revision` by one, added in
+migration v045. The row routes return it, and `task_read` ends with a
+`<!-- nerve: revision=N ... -->` line that `task_write` strips again.
+
+Pass the value you read as `expect_revision` to `task_update` or `task_done`
+to make the write conditional: if the row has changed since, nothing is
+written and the tool reports a conflict, so re-read and retry. Without it,
+writes stay last-write-wins, except that a reopen is always conditional on
+the task still being done. In code, `upsert_task`, `update_task_tags` and
+`transition_task` take the same argument and return `False` instead of
+writing.
+
+The fence protects the row. Two writers that both pass it can still lose one
+another's edits to the markdown body, since each builds the new body from its
+own read of the file.
 
 ### Live Updates
 
