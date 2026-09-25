@@ -462,7 +462,10 @@ def build_session_tail_view(
 # decline / revise, all tap-driven so nothing needs a copy-pasted plan id.
 _PLANS_PAGE_SIZE = 8            # plans shown per /plans page; ⬅️/➡️ page the rest
 _PLAN_LABEL_MAX = 40           # Telegram wraps long button labels poorly
-_PLAN_BODY_MAX = 3400          # plan body clip (raw) — keeps the HTML card < 4096
+_PLAN_TITLE_MAX = 200          # task title clip on the detail card
+_PLAN_BODY_MAX = 3400          # plan body clip on the detail card, in displayed characters
+_PLAN_REVISE_TTL = 24 * 3600   # seconds an unanswered ✍️ Revise prompt stays valid
+_TG_TEXT_MAX = 4096            # Telegram's message limit, counted on the displayed text
 _PLAN_STATUS_EMOJI = {
     "pending": "🟠",           # awaiting your review — the actionable state
     "implementing": "⚙️",      # approved, an impl session is running
@@ -470,6 +473,33 @@ _PLAN_STATUS_EMOJI = {
     "superseded": "🗂",
     "failed": "⚠️",
 }
+
+
+def _tg_len(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _tg_visible_len(html_text: str) -> int:
+    """Telegram length of an HTML message as displayed (tags dropped, entities decoded)."""
+    return _tg_len(_html.unescape(re.sub(r"<[^>]*>", "", html_text)))
+
+
+def _clip_tg(text: str, cap: int) -> str:
+    """Like ``_clip``, but ``cap`` counts UTF-16 code units, as Telegram does."""
+    t = (text or "").strip()
+    if not t:
+        return "(no text)"
+    if _tg_len(t) > cap:
+        kept: list[str] = []
+        used = 0
+        for ch in t:
+            used += 2 if ord(ch) > 0xFFFF else 1
+            if used > cap - 1:         # leave room for the ellipsis
+                break
+            kept.append(ch)
+        t = "".join(kept).rstrip() + "…"
+    return _html.escape(t)
 
 
 def _plan_label(plan: dict) -> str:
@@ -548,8 +578,9 @@ def build_plan_detail_view(
     """Render one plan (HTML) with its review actions.
 
     The plan body is an *expandable blockquote* — long plans collapse to a
-    few lines and expand in place on tap, and the whole card is clipped to
-    stay under Telegram's 4096-char limit. A ``pending`` plan gets Approve /
+    few lines and expand in place on tap. The title and body are clipped
+    before escaping, so the markup stays intact and the displayed card fits
+    Telegram's 4096-character limit. A ``pending`` plan gets Approve /
     Decline / Revise buttons; any other status is read-only (with its impl
     session shown when present). Send/edit with ``ParseMode.HTML``. Returns
     ``(html_text, keyboard)``.
@@ -558,7 +589,9 @@ def build_plan_detail_view(
     pid = str(plan.get("id") or "?")
     status = plan.get("status") or "?"
     emoji = _PLAN_STATUS_EMOJI.get(status, "•")
-    task_title = _html.escape(str(plan.get("task_title") or plan.get("task_id") or "?"))
+    task_title = _clip(
+        str(plan.get("task_title") or plan.get("task_id") or "?"), _PLAN_TITLE_MAX,
+    )
     version = plan.get("version") or 1
     ptype = plan.get("plan_type") or "generic"
 
@@ -578,10 +611,12 @@ def build_plan_detail_view(
     if plan.get("feedback"):
         header += f"\n<b>Revision feedback:</b> {_clip(str(plan['feedback']), 300)}"
 
-    body = _clip(str(plan.get("content") or ""), _PLAN_BODY_MAX)
-    text = f"{header}\n\n<blockquote expandable>{body}</blockquote>"
-    if len(text) > 4096:                       # defensive final clamp
-        text = text[:4093] + "…"
+    head = f"{header}\n\n"
+    # Telegram applies its limit to the displayed text, so the body gets
+    # whatever room the displayed header leaves.
+    budget = min(_PLAN_BODY_MAX, _TG_TEXT_MAX - _tg_visible_len(head))
+    body = _clip_tg(str(plan.get("content") or ""), budget)
+    text = f"{head}<blockquote expandable>{body}</blockquote>"
 
     rows: list[list[InlineKeyboardButton]] = []
     if status == "pending":
@@ -658,10 +693,11 @@ class TelegramChannel(BaseChannel):
         self._message_cache_max = 200
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
-        # /plans revise flow: chat_id -> (plan_id, force_reply_prompt_message_id).
-        # A reply to that prompt is treated as revision feedback, not a message
-        # for the agent (see _handle_message).
-        self._pending_plan_revision: dict[int, tuple[str, int]] = {}
+        # /plans revise flow: (chat_id, prompt_message_id) ->
+        # (plan_id, user_id, monotonic ts). A reply to one of these ForceReply
+        # prompts from the user who tapped Revise is revision feedback, not a
+        # message for the agent (see _handle_message).
+        self._plan_revise_prompts: dict[tuple[int, int], tuple[str, int, float]] = {}
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
@@ -1354,16 +1390,19 @@ class TelegramChannel(BaseChannel):
 
         Plans are global (not chat-scoped), matching the WebUI: pending ones
         (the actionable state) are listed ahead of implementing ones, each
-        already newest-first from the store. We fetch both statuses and
-        paginate in memory — the queue is small — and fetch one extra past the
-        page to learn whether a further page exists.
+        newest-first from the store. Rows are fetched up to the end of the
+        requested page plus one more, which tells whether a further page
+        exists, so every page is reachable however long the queue grows.
         """
         offset = max(0, offset)
-        pending = await self.router.list_plans(status="pending", limit=200)
-        implementing = await self.router.list_plans(status="implementing", limit=200)
-        plans = pending + implementing
+        need = offset + _PLANS_PAGE_SIZE + 1
+        plans = await self.router.list_plans(status="pending", limit=need)
+        if len(plans) < need:
+            plans = plans + await self.router.list_plans(
+                status="implementing", limit=need - len(plans),
+            )
         page = plans[offset:offset + _PLANS_PAGE_SIZE]
-        has_next = offset + _PLANS_PAGE_SIZE < len(plans)
+        has_next = len(plans) > offset + _PLANS_PAGE_SIZE
         return build_plans_view(
             page, offset=offset, has_prev=offset > 0, has_next=has_next,
         )
@@ -1518,9 +1557,10 @@ class TelegramChannel(BaseChannel):
     async def _start_plan_revise(self, query: Any, plan_id: str) -> None:
         """Ask for revision feedback via a ForceReply prompt.
 
-        The next message that *replies to* this prompt is captured as feedback
-        in ``_handle_message`` and dispatched to the planner — Telegram's
-        native way to collect a text argument after a button press.
+        A message that *replies to* this prompt, from the user who tapped
+        Revise and within ``_PLAN_REVISE_TTL``, is captured as feedback in
+        ``_handle_message`` and dispatched to the planner — Telegram's native
+        way to collect a text argument after a button press.
         """
         plan = await self.router.get_plan(plan_id)
         if not plan or plan.get("status") != "pending":
@@ -1536,8 +1576,9 @@ class TelegramChannel(BaseChannel):
             f"“{title}”.\nThe planner will produce a new version from your notes.",
             reply_markup=ForceReply(input_field_placeholder="What should change?"),
         )
-        self._pending_plan_revision[query.message.chat.id] = (
-            plan_id, prompt.message_id,
+        self._prune_plan_revise_prompts()
+        self._plan_revise_prompts[(query.message.chat.id, prompt.message_id)] = (
+            plan_id, query.from_user.id, time.monotonic(),
         )
 
     async def _submit_plan_revision(
@@ -1566,25 +1607,35 @@ class TelegramChannel(BaseChannel):
             f"planner ({result['session_id']}); a new version will appear in /plans."
         )
 
+    def _prune_plan_revise_prompts(self) -> None:
+        """Forget Revise prompts left unanswered for longer than the TTL."""
+        cutoff = time.monotonic() - _PLAN_REVISE_TTL
+        for key, (_plan_id, _user_id, started) in list(self._plan_revise_prompts.items()):
+            if started < cutoff:
+                del self._plan_revise_prompts[key]
+
     async def _maybe_consume_plan_revision(self, update: Update) -> bool:
         """Consume a reply to a /plans revise prompt as revision feedback.
 
         Returns True (message handled — do not route to the agent) only when
-        this chat has a pending revise prompt AND this message replies to that
-        exact prompt. Any other message falls through to normal routing.
+        the message replies to an open Revise prompt in this chat and comes
+        from the user who tapped Revise. Several prompts can be open at once;
+        each reply goes to the plan of the prompt it answers. Any other
+        message falls through to normal routing.
         """
         chat = update.effective_chat
         msg = update.message
-        if not chat or not msg:
+        user = update.effective_user
+        reply_to = getattr(msg, "reply_to_message", None) if msg else None
+        if not chat or not user or not reply_to:
             return False
-        pending = self._pending_plan_revision.get(chat.id)
-        if not pending:
+        self._prune_plan_revise_prompts()
+        key = (chat.id, reply_to.message_id)
+        pending = self._plan_revise_prompts.get(key)
+        if not pending or pending[1] != user.id:
             return False
-        reply_to = getattr(msg, "reply_to_message", None)
-        if not reply_to or reply_to.message_id != pending[1]:
-            return False
-        plan_id, _prompt_id = pending
-        self._pending_plan_revision.pop(chat.id, None)
+        del self._plan_revise_prompts[key]
+        plan_id = pending[0]
         feedback = (msg.text or "").strip()
         if not feedback:
             await msg.reply_text("No feedback given — revision cancelled.")
@@ -2258,13 +2309,18 @@ class TelegramChannel(BaseChannel):
     async def _safe_edit(
         self, query: Any, text: str, markup: Any, parse_mode: Any = None,
     ) -> None:
-        """edit_message_text, swallowing the benign 'not modified'/transient errors."""
+        """edit_message_text that never raises.
+
+        "Message is not modified" (re-showing the same view) is expected and
+        ignored; any other failure is logged, since the card then stays stale.
+        """
         try:
             await query.edit_message_text(
                 text=text, reply_markup=markup, parse_mode=parse_mode,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning("Telegram message edit failed: %s", exc)
 
     async def _edit_session_tail(
         self, query: Any, session_id: str, window: int,

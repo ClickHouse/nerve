@@ -1,9 +1,15 @@
 """Tests for the /plans inline-keyboard builders (nerve.channels.telegram)."""
 
+import re
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from nerve.channels.telegram import (
+    _PLAN_REVISE_TTL,
     _PLANS_PAGE_SIZE,
+    _tg_visible_len,
     build_plan_confirm_view,
     build_plan_detail_view,
     build_plans_view,
@@ -185,10 +191,10 @@ class _FakeRouter:
     async def list_plans(self, status=None, limit=100):
         self.calls.append((status, limit))
         if status == "pending":
-            return list(self._pending)
+            return list(self._pending)[:limit]
         if status == "implementing":
-            return list(self._impl)
-        return list(self._pending) + list(self._impl)
+            return list(self._impl)[:limit]
+        return (list(self._pending) + list(self._impl))[:limit]
 
 
 def _make_channel(router):
@@ -240,3 +246,144 @@ async def test_plans_view_empty():
     text, markup = await ch._plans_view_for()
     assert _cbs(markup) == ["plan:list:0"]
     assert "No plans awaiting review" in text
+
+
+@pytest.mark.asyncio
+async def test_plans_view_reaches_the_end_of_a_long_queue():
+    pending = [
+        {"id": f"plan-p{n:03d}", "task_title": f"P{n}", "status": "pending", "version": 1}
+        for n in range(205)
+    ]
+    implementing = [
+        {"id": f"plan-i{n:03d}", "task_title": f"I{n}", "status": "implementing", "version": 1}
+        for n in range(5)
+    ]
+    router = _FakeRouter(pending=pending, implementing=implementing)
+    ch = _make_channel(router)
+
+    last = (len(pending) + len(implementing) - 1) // _PLANS_PAGE_SIZE * _PLANS_PAGE_SIZE
+    _t, markup = await ch._plans_view_for(last)
+    cbs = _cbs(markup)
+    assert [c for c in cbs if c.startswith("plan:view:")][-1] == "plan:view:plan-i004"
+    assert f"plan:list:{last + _PLANS_PAGE_SIZE}" not in cbs
+    # Only rows up to the end of the requested page (+1) are fetched.
+    assert all(limit <= last + _PLANS_PAGE_SIZE + 1 for _status, limit in router.calls)
+
+
+# --- detail card markup under entity-heavy input ---------------------------- #
+
+@pytest.mark.parametrize("content", [
+    "&" * 8000,              # each '&' escapes to five characters
+    "<b>" * 3000,
+    "😀" * 5000,             # two UTF-16 code units each
+    "a<&>\n" * 2000,
+])
+def test_detail_markup_stays_valid_and_fits(content):
+    plan = {
+        **_PENDING, "content": content,
+        "task_title": "T&<>" * 300, "feedback": "&<" * 500,
+    }
+    text, _m = build_plan_detail_view(plan, tzname="UTC")
+
+    assert text.count("<blockquote expandable>") == 1
+    assert text.endswith("…</blockquote>")
+    assert "</b>" in text.split("\n", 1)[0]   # the clipped title keeps its tag
+    body = text.split("<blockquote expandable>", 1)[1][: -len("</blockquote>")]
+    assert "<" not in body and ">" not in body
+    assert "&" not in re.sub(r"&(amp|lt|gt|quot|#x27);", "", body)   # whole entities only
+    assert _tg_visible_len(text) <= 4096
+
+
+# --- revise ForceReply correlation ------------------------------------------ #
+
+class _PlanRouter:
+    def __init__(self, *plans):
+        self._plans = {p["id"]: p for p in plans}
+
+    async def get_plan(self, plan_id):
+        return self._plans.get(plan_id)
+
+
+def _revise_channel(router):
+    ch = _make_channel(router)
+    ch._plan_revise_prompts = {}
+    submitted = []
+
+    async def record_submission(update, plan_id, feedback):
+        submitted.append((plan_id, feedback))
+
+    ch._submit_plan_revision = record_submission
+    return ch, submitted
+
+
+def _revise_tap(chat_id, user_id, prompt_id):
+    """A callback query for ✍️ Revise whose ForceReply prompt gets ``prompt_id``."""
+    async def answer(*args, **kwargs):
+        return None
+
+    async def reply_text(text, **kwargs):
+        return SimpleNamespace(message_id=prompt_id)
+
+    return SimpleNamespace(
+        answer=answer,
+        from_user=SimpleNamespace(id=user_id),
+        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), reply_text=reply_text),
+    )
+
+
+def _reply(chat_id, user_id, reply_to_id, text):
+    async def reply_text(text, **kwargs):
+        return None
+
+    msg = SimpleNamespace(
+        text=text,
+        reply_to_message=SimpleNamespace(message_id=reply_to_id) if reply_to_id else None,
+        reply_text=reply_text,
+    )
+    return SimpleNamespace(
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+        message=msg,
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_revise_prompts_in_one_chat_each_reach_their_plan():
+    router = _PlanRouter({**_PENDING, "id": "plan-a"}, {**_PENDING, "id": "plan-b"})
+    ch, submitted = _revise_channel(router)
+    await ch._start_plan_revise(_revise_tap(1, 7, prompt_id=10), "plan-a")
+    await ch._start_plan_revise(_revise_tap(1, 7, prompt_id=11), "plan-b")
+
+    assert await ch._maybe_consume_plan_revision(_reply(1, 7, 10, "fix A")) is True
+    assert await ch._maybe_consume_plan_revision(_reply(1, 7, 11, "fix B")) is True
+    assert submitted == [("plan-a", "fix A"), ("plan-b", "fix B")]
+    assert ch._plan_revise_prompts == {}
+
+
+@pytest.mark.asyncio
+async def test_revise_reply_from_another_user_is_not_consumed():
+    ch, submitted = _revise_channel(_PlanRouter({**_PENDING, "id": "plan-a"}))
+    await ch._start_plan_revise(_revise_tap(1, 7, prompt_id=10), "plan-a")
+
+    assert await ch._maybe_consume_plan_revision(_reply(1, 8, 10, "not mine")) is False
+    assert submitted == []
+    assert (1, 10) in ch._plan_revise_prompts   # still open for the user who tapped
+
+
+@pytest.mark.asyncio
+async def test_expired_revise_prompt_is_not_consumed():
+    ch, submitted = _revise_channel(_PlanRouter())
+    ch._plan_revise_prompts = {
+        (1, 10): ("plan-a", 7, time.monotonic() - _PLAN_REVISE_TTL - 1),
+    }
+    assert await ch._maybe_consume_plan_revision(_reply(1, 7, 10, "late")) is False
+    assert submitted == []
+    assert ch._plan_revise_prompts == {}
+
+
+@pytest.mark.asyncio
+async def test_message_that_is_not_a_reply_falls_through():
+    ch, submitted = _revise_channel(_PlanRouter())
+    ch._plan_revise_prompts = {(1, 10): ("plan-a", 7, time.monotonic())}
+    assert await ch._maybe_consume_plan_revision(_reply(1, 7, None, "hello")) is False
+    assert submitted == []
