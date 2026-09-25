@@ -1,8 +1,9 @@
 import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChatMessage, MessageBlock } from '../../types/chat';
+import type { ChatMessage } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
+import { useChatStore } from '../../stores/chatStore';
 import { providerConfigured, useSetupStore } from '../../stores/setupStore';
 import { CHAT_EMPTY_NO_PROVIDER } from '../Setup/copy';
 import { UserMessage } from './UserMessage';
@@ -12,9 +13,8 @@ import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
 import { GitBranch } from '../ui/icons';
 
-function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage, messageForks }: {
+function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
   messages: ChatMessage[];
-  streamingBlocks: MessageBlock[];
   isStreaming: boolean;
   /** Fork the chat from a specific message (undefined = feature unavailable
       for this session, e.g. a virtual chat). */
@@ -27,6 +27,9 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   const containerRef = useRef<HTMLDivElement>(null);
   const isNearBottom = useRef(true);
   const prevMessageCount = useRef(0);
+  // The count only: the blocks change for each streamed token, and
+  // StreamingMessage subscribes to them itself.
+  const streamingBlockCount = useChatStore(s => s.streamingBlocks.length);
 
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
@@ -55,7 +58,7 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
     const wasEmpty = prevMessageCount.current === 0 && messages.length > 0;
     prevMessageCount.current = messages.length;
     endRef.current?.scrollIntoView({ behavior: wasEmpty ? 'instant' : 'smooth' });
-  }, [messages.length, streamingBlocks.length, isStreaming]);
+  }, [messages.length, streamingBlockCount, isStreaming]);
 
   return (
     <div className="flex-1 overflow-y-auto relative" ref={containerRef} onScroll={handleScroll}>
@@ -122,7 +125,7 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
         );
       })}
 
-      {isStreaming && <StreamingMessage blocks={streamingBlocks} />}
+      {isStreaming && <StreamingMessage />}
 
       <div ref={endRef} />
     </div>
@@ -131,6 +134,6 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
 
 // Memoized so unrelated store updates (notably the per-keystroke draft write
 // from the composer) don't re-render the whole message list. Every prop is a
-// stable store slice, so the list re-renders only when messages,
-// streamingBlocks, or isStreaming actually change.
+// stable store slice, so the list re-renders only when messages, isStreaming,
+// or the streaming block count actually change.
 export const MessageList = memo(MessageListImpl);

@@ -16,7 +16,7 @@ import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/read
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
+import { flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
@@ -1250,6 +1250,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   handleWSMessage: (msg: WSMessage) => {
     const sid = (msg as { session_id?: string }).session_id;
     if (sid && sid !== get().activeSession && VIEW_SCOPED_EVENTS.has(msg.type)) return;
+    if (msg.type !== 'thinking' && msg.type !== 'token') flushStreamDeltas(get, set);
     switch (msg.type) {
       // Streaming
       case 'thinking':     return handleThinking(msg, get, set);

@@ -95,7 +95,7 @@ function said(text: string, actor_id: string | null, id = 1): ChatMessage {
 }
 
 function renderTranscript(messages: ChatMessage[]) {
-  return render(<MessageList messages={messages} streamingBlocks={[]} isStreaming={false} />);
+  return render(<MessageList messages={messages} isStreaming={false} />);
 }
 
 function labels(): string[] {
