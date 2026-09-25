@@ -14,6 +14,8 @@ exercise the genuine handler path rather than a mock of it.
 
 from __future__ import annotations
 
+import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -489,6 +491,69 @@ class TestTaskBoardRoutes:
     async def test_patch_on_a_missing_task_is_404(self, setup):
         resp = setup.client.patch("/api/tasks/nope", json={"status": "pending"})
         assert resp.status_code == 404
+
+    async def test_patch_with_unencodable_content_keeps_the_file(self, setup):
+        """The route rewrites a task file like the tool handlers do.
+
+        A failed rewrite used to truncate the live file first and encode
+        afterwards, so it left 0 bytes; see tests/test_task_file_writes.py.
+
+        The lone surrogate goes on the wire by hand: httpx serialises ``json=``
+        with ``ensure_ascii=False`` and would fail to encode it client-side, so
+        the route would never see it. ``json.dumps`` escapes it to ASCII, which
+        is what a real client puts in the body, and the server's ``json.loads``
+        hands the route back a str it cannot encode.
+        """
+        task_id = await self._create(setup, "Patch unencodable")
+        path = setup.workspace / "memory" / "tasks" / "active" / f"{task_id}.md"
+        before = path.read_bytes()
+        assert before, "harness: the seeded task file is empty"
+
+        body = json.dumps({"content": "# Patch unencodable\n\nnew body\ud800"})
+
+        with pytest.raises(UnicodeEncodeError):
+            setup.client.patch(
+                f"/api/tasks/{task_id}",
+                content=body,
+                headers={"content-type": "application/json"},
+            )
+
+        assert path.read_bytes() == before
+
+    async def test_patch_keeps_the_file_when_the_write_fails_late(
+        self, setup, monkeypatch,
+    ):
+        """The same guarantee for the route when the content is fine.
+
+        The unencodable case above fails in the encoder, so on its own it is
+        also satisfied by a writer that encodes the content and only then
+        truncates the live file. This one sends ordinary content and fails the
+        write at its ``os.fsync``, after the bytes have been handed to the
+        filesystem, which is where a write error and a mid-write death land.
+        """
+        task_id = await self._create(setup, "Patch late failure")
+        path = setup.workspace / "memory" / "tasks" / "active" / f"{task_id}.md"
+        before = path.read_bytes()
+        assert before, "harness: the seeded task file is empty"
+        reached = []
+
+        def enospc(fd):
+            reached.append(fd)
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(os, "fsync", enospc)
+
+        with pytest.raises(OSError):
+            setup.client.patch(
+                f"/api/tasks/{task_id}",
+                json={"content": "# Patch late failure\n\nnew body\n"},
+            )
+
+        # The rewrite is the only thing on this path that syncs, so a run that
+        # never got there would satisfy the assertion below for the wrong
+        # reason.
+        assert reached, "the write never reached os.fsync"
+        assert path.read_bytes() == before
 
     # ── Column order ─────────────────────────────────────────────────────
 

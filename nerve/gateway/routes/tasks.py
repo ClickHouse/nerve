@@ -16,6 +16,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
+from nerve.tasks.files import write_task_file
 
 router = APIRouter()
 
@@ -336,9 +337,7 @@ async def update_task(task_id: str, req: TaskUpdateRequest, user: dict = Depends
         # caller-influenced write.
         ensure_path_not_tracked_config(file_path, "write")
         if file_path.exists():
-            await asyncio.to_thread(
-                file_path.write_text, req.content, encoding="utf-8",
-            )
+            await asyncio.to_thread(write_task_file, file_path, req.content)
             # Re-sync title from markdown to SQLite
             from nerve.tasks.models import (
                 parse_task_frontmatter,
