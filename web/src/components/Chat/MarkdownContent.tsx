@@ -1,9 +1,12 @@
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from './CodeBlock';
 
-export function MarkdownContent({ content }: { content: string }) {
+// Memoized: react-markdown parses and highlights the full string on each
+// render, and the chat renders again for each streamed token batch.
+export const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="markdown-content">
       <ReactMarkdown
@@ -27,4 +30,4 @@ export function MarkdownContent({ content }: { content: string }) {
       >{content}</ReactMarkdown>
     </div>
   );
-}
+});

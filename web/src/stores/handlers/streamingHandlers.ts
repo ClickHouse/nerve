@@ -28,6 +28,82 @@ function isSubagentTool(name: string | undefined): boolean {
 }
 
 // ------------------------------------------------------------------ //
+//  Delta batching: thinking and token                                 //
+// ------------------------------------------------------------------ //
+
+/** A thinking or token delta that is not yet in the store. */
+interface PendingDelta {
+  type: 'thinking' | 'text';
+  /** Active session when the delta arrived. */
+  sessionId: string;
+  parentId?: string;
+  content: string;
+}
+
+// Deltas are applied to the store once per animation frame, not once per
+// WS message, so that the chat renders at most once per frame.
+let pendingDeltas: PendingDelta[] = [];
+let flushFrame: number | null = null;
+
+function queueDelta(delta: PendingDelta, get: Get, set: Set): void {
+  const last = pendingDeltas[pendingDeltas.length - 1];
+  if (last && last.type === delta.type && last.sessionId === delta.sessionId && last.parentId === delta.parentId) {
+    last.content += delta.content;
+  } else {
+    pendingDeltas.push(delta);
+  }
+  if (flushFrame === null) {
+    flushFrame = requestAnimationFrame(() => flushStreamDeltas(get, set));
+  }
+}
+
+/** Apply all queued deltas to the store. The WS dispatcher calls this before
+ *  it handles any other event, so blocks stay in the order of the events. */
+export function flushStreamDeltas(get: Get, set: Set): void {
+  if (flushFrame !== null) {
+    cancelAnimationFrame(flushFrame);
+    flushFrame = null;
+  }
+  if (pendingDeltas.length === 0) return;
+  const deltas = pendingDeltas;
+  pendingDeltas = [];
+  for (const delta of deltas) {
+    // Drop deltas of a session that is no longer on screen.
+    if (delta.sessionId !== get().activeSession) continue;
+    applyDelta(delta, get, set);
+  }
+}
+
+function applyDelta(delta: PendingDelta, get: Get, set: Set): void {
+  const state = get();
+  const parentId = delta.parentId;
+  if (parentId) {
+    // Sub-agent output — belongs to its side-panel, never the main chat (mirrors
+    // the replay invariant in applyStreamEvent). Route to the panel by id
+    // regardless of its status: a background sub-agent's panel may already be
+    // marked complete by the time its output streams in.
+    if (state.panels.some(p => p.id === parentId)) {
+      set(s => ({
+        panels: appendBlockToPanel(s.panels, parentId, { type: delta.type, content: delta.content }),
+      }));
+    }
+    return;
+  }
+  const blocks = [...state.streamingBlocks];
+  const last = blocks[blocks.length - 1];
+  if ((last?.type === 'thinking' || last?.type === 'text') && last.type === delta.type) {
+    blocks[blocks.length - 1] = { ...last, content: last.content + delta.content };
+  } else {
+    blocks.push({ type: delta.type, content: delta.content });
+  }
+  // Keep the same agentStatus object when the state does not change, so that
+  // components which select agentStatus do not render again.
+  const agentState = delta.type === 'thinking' ? 'thinking' as const : 'writing' as const;
+  const agentStatus = state.agentStatus.state === agentState ? state.agentStatus : { state: agentState };
+  set({ streamingBlocks: blocks, agentStatus });
+}
+
+// ------------------------------------------------------------------ //
 //  Streaming handlers: thinking, token, tool_use, tool_result         //
 // ------------------------------------------------------------------ //
 
@@ -36,28 +112,12 @@ export function handleThinking(
   get: Get,
   set: Set,
 ): void {
-  const state = get();
-  const parentId = msg.parent_tool_use_id;
-  if (parentId) {
-    // Sub-agent output — belongs to its side-panel, never the main chat (mirrors
-    // the replay invariant in applyStreamEvent). Route to the panel by id
-    // regardless of its status: a background sub-agent's panel may already be
-    // marked complete by the time its thoughts stream in.
-    if (state.panels.some(p => p.id === parentId)) {
-      set(s => ({
-        panels: appendBlockToPanel(s.panels, parentId, { type: 'thinking', content: msg.content }),
-      }));
-    }
-    return;
-  }
-  const blocks = [...state.streamingBlocks];
-  const last = blocks[blocks.length - 1];
-  if (last?.type === 'thinking') {
-    blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
-  } else {
-    blocks.push({ type: 'thinking', content: msg.content });
-  }
-  set({ streamingBlocks: blocks, agentStatus: { state: 'thinking' } });
+  queueDelta({
+    type: 'thinking',
+    sessionId: get().activeSession,
+    parentId: msg.parent_tool_use_id,
+    content: msg.content,
+  }, get, set);
 }
 
 export function handleToken(
@@ -65,26 +125,12 @@ export function handleToken(
   get: Get,
   set: Set,
 ): void {
-  const state = get();
-  const parentId = msg.parent_tool_use_id;
-  if (parentId) {
-    // Sub-agent output — route to its side-panel by id (any status), never the
-    // main chat. See handleThinking for the rationale.
-    if (state.panels.some(p => p.id === parentId)) {
-      set(s => ({
-        panels: appendBlockToPanel(s.panels, parentId, { type: 'text', content: msg.content }),
-      }));
-    }
-    return;
-  }
-  const blocks = [...state.streamingBlocks];
-  const last = blocks[blocks.length - 1];
-  if (last?.type === 'text') {
-    blocks[blocks.length - 1] = { ...last, content: last.content + msg.content };
-  } else {
-    blocks.push({ type: 'text', content: msg.content });
-  }
-  set({ streamingBlocks: blocks, agentStatus: { state: 'writing' } });
+  queueDelta({
+    type: 'text',
+    sessionId: get().activeSession,
+    parentId: msg.parent_tool_use_id,
+    content: msg.content,
+  }, get, set);
 }
 
 export function handleWakeup(

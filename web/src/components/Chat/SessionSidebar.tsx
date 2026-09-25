@@ -4,6 +4,7 @@ import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
+import { useShallow } from 'zustand/react/shallow';
 import { useChatStore } from '../../stores/chatStore';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
@@ -101,7 +102,36 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore(useShallow(s => ({
+    searchResults: s.searchResults,
+    searchLoading: s.searchLoading,
+    searchSessions: s.searchSessions,
+    clearSearch: s.clearSearch,
+    renameSession: s.renameSession,
+    toggleStar: s.toggleStar,
+    archiveSession: s.archiveSession,
+    setSessionParent: s.setSessionParent,
+    virtualSession: s.virtualSession,
+    discardVirtualSession: s.discardVirtualSession,
+    sidebarWidth: s.sidebarWidth,
+    setSidebarWidth: s.setSidebarWidth,
+    sessionsHasMore: s.sessionsHasMore,
+    loadMoreSessions: s.loadMoreSessions,
+    archivedSessions: s.archivedSessions,
+    archivedCount: s.archivedCount,
+    archivedLoading: s.archivedLoading,
+    archivedHasMore: s.archivedHasMore,
+    loadArchivedSessions: s.loadArchivedSessions,
+    clearArchivedSessions: s.clearArchivedSessions,
+    unarchiveSession: s.unarchiveSession,
+    starArchivedSession: s.starArchivedSession,
+    systemSessions: s.systemSessions,
+    systemCount: s.systemCount,
+    systemLoading: s.systemLoading,
+    systemHasMore: s.systemHasMore,
+    loadSystemSessions: s.loadSystemSessions,
+    clearSystemSessions: s.clearSystemSessions,
+  })));
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   // In drawer mode the list is a modal overlay: it needs focus, Tab
