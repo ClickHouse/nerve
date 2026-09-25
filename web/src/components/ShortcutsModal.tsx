@@ -41,6 +41,7 @@ const SECTIONS: Section[] = [
       { combo: { mod: true, shift: true, key: 's' }, description: 'Toggle session sidebar' },
       { combo: { mod: true, shift: true, key: ';' }, description: 'Focus message input' },
       { combo: { mod: true, shift: true, key: 'c' }, description: 'Copy last response' },
+      { combo: { mod: true, shift: true, key: 'f' }, description: 'Fork this chat' },
       { combo: { mod: true, shift: true, key: 'Backspace' }, description: 'Delete current conversation' },
       { combo: { mod: true, key: '\\' }, description: 'Toggle side panel' },
     ],
@@ -76,7 +77,7 @@ export function ShortcutsModal() {
       <div className="p-5 space-y-5">
         {SECTIONS.map((section) => (
           <div key={section.title}>
-            <h3 className="text-[11px] uppercase tracking-wider text-text-faint font-medium mb-2">
+            <h3 className="text-xs uppercase tracking-wider text-text-faint font-medium mb-2">
               {section.title}
             </h3>
             <div className="space-y-1.5">
@@ -85,7 +86,7 @@ export function ShortcutsModal() {
                   key={idx}
                   className="flex items-center justify-between gap-4 py-1"
                 >
-                  <span className="text-[13px] text-text-secondary">{item.description}</span>
+                  <span className="text-sm text-text-secondary">{item.description}</span>
                   <Kbd combo={item.combo} label={item.label} />
                 </div>
               ))}
@@ -99,7 +100,7 @@ export function ShortcutsModal() {
 
 function Kbd({ combo, label }: { combo: ShortcutCombo; label?: string }) {
   return (
-    <kbd className="px-2 py-1 text-[11px] font-mono text-text-secondary bg-surface border border-border-subtle rounded shrink-0 tabular-nums">
+    <kbd className="px-2 py-1 text-xs leading-none font-mono text-text-secondary bg-surface border border-border-subtle rounded shrink-0 tabular-nums">
       {label ?? formatCombo(combo)}
     </kbd>
   );

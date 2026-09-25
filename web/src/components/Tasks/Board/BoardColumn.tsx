@@ -1,10 +1,11 @@
 import { useDroppable } from '@dnd-kit/core';
 import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ChevronLeft, ChevronRight, GripVertical, Plus } from 'lucide-react';
 import { columnDragId } from './dropIntent';
 import type { Task, TaskStatusDef } from '../../../api/client';
 import type { Lane } from '../../../stores/taskStore';
+import { IconButton } from '../../ui';
+import { ChevronLeft, ChevronRight, GripVertical, Plus } from '../../ui/icons';
 import { BoardCard } from './BoardCard';
 
 export interface BoardColumnProps {
@@ -72,24 +73,23 @@ export function BoardColumn({
           ${isColumnDragging ? 'opacity-40' : ''}`}
       >
         {dragHandle}
-        <button
+        <IconButton
+          label={`Expand ${label} column`}
+          size="xs"
           onClick={() => onToggleCollapse(lane.status)}
-          className="text-text-faint hover:text-text-muted cursor-pointer"
-          aria-label={`Expand ${label} column`}
-          title={`Expand ${label}`}
         >
           <ChevronRight size={15} />
-        </button>
+        </IconButton>
         <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: color }} />
         {/* Vertical rail: the label reads bottom-to-top so long status
             names stay legible instead of being truncated to a glyph. */}
         <span
-          className="text-[12px] font-medium text-text-secondary whitespace-nowrap"
+          className="text-xs font-medium text-text-secondary whitespace-nowrap"
           style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
         >
           {label}
         </span>
-        <span className="text-[11px] text-text-faint tabular-nums">{lane.total}</span>
+        <span className="text-xs text-text-faint tabular-nums">{lane.total}</span>
       </div>
     );
   }
@@ -105,29 +105,30 @@ export function BoardColumn({
         <div className="flex items-center gap-2">
           {dragHandle}
           <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
-          <h2 className="text-[13px] font-semibold text-text-secondary truncate">{label}</h2>
-          <span className="text-[11px] text-text-faint tabular-nums">{lane.total}</span>
+          {/* The named type steps carry a line-height, so the header pins its
+              own — a lane header is chrome and must not grow at the cards'
+              expense. */}
+          <h2 className="text-sm leading-tight font-semibold text-text-secondary truncate">{label}</h2>
+          <span className="text-xs leading-tight text-text-faint tabular-nums">{lane.total}</span>
           <div className="ml-auto flex items-center gap-0.5">
-            <button
+            <IconButton
+              label={`New task in ${label}`}
+              size="xs"
               onClick={() => onCreate(lane.status)}
-              className="p-1 text-text-faint hover:text-text-muted cursor-pointer rounded"
-              aria-label={`New task in ${label}`}
-              title={`New task in ${label}`}
             >
               <Plus size={14} />
-            </button>
-            <button
+            </IconButton>
+            <IconButton
+              label={`Collapse ${label} column`}
+              size="xs"
               onClick={() => onToggleCollapse(lane.status)}
-              className="p-1 text-text-faint hover:text-text-muted cursor-pointer rounded"
-              aria-label={`Collapse ${label} column`}
-              title="Collapse"
             >
               <ChevronLeft size={14} />
-            </button>
+            </IconButton>
           </div>
         </div>
         {status?.description && (
-          <p className="mt-1 text-[11px] text-text-faint line-clamp-1" title={status.description}>
+          <p className="mt-1 text-xs leading-tight text-text-faint line-clamp-1" title={status.description}>
             {status.description}
           </p>
         )}
@@ -154,7 +155,7 @@ export function BoardColumn({
 
         {lane.tasks.length === 0 && (
           <div
-            className={`h-20 flex items-center justify-center text-[12px] rounded-lg border border-dashed
+            className={`h-20 flex items-center justify-center text-xs rounded-lg border border-dashed
               ${isOver
                 ? 'border-accent/40 text-accent'
                 : 'border-border-subtle text-text-faint'}`}
@@ -166,7 +167,7 @@ export function BoardColumn({
         {hidden > 0 && (
           // The lane is paginated server-side; say so rather than silently
           // showing a partial column whose count doesn't match its cards.
-          <p className="pt-1 pb-2 text-center text-[11px] text-text-faint">
+          <p className="pt-1 pb-2 text-center text-xs leading-tight text-text-faint">
             +{hidden} more — narrow the filters or use List view
           </p>
         )}

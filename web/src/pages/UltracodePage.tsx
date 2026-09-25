@@ -13,7 +13,8 @@ import {
   Timer,
   Workflow,
   XCircle,
-} from 'lucide-react';
+} from '../components/ui/icons';
+import { Badge, Button, IconButton, type BadgeTone } from '../components/ui';
 import {
   api,
   type UltracodeRun,
@@ -39,33 +40,29 @@ function isFailureStatus(status?: string): boolean {
   return TERMINAL_FAILURES.has(normalizedStatus(status));
 }
 
-function statusClasses(status?: string): string {
+/** The `Badge` tone for a run/step status — succeeded / failed / running. */
+function statusTone(status?: string): BadgeTone {
   const value = normalizedStatus(status);
-  if (value === 'completed' || value === 'done' || value === 'success') {
-    return 'border-emerald-400/25 bg-emerald-400/10 text-hue-emerald';
-  }
-  if (isFailureStatus(value)) {
-    return 'border-red-400/25 bg-red-400/10 text-hue-red';
-  }
-  if (isActiveStatus(value)) {
-    return 'border-blue-400/25 bg-blue-400/10 text-hue-blue';
-  }
-  return 'border-border bg-surface-raised text-text-muted';
+  if (value === 'completed' || value === 'done' || value === 'success') return 'success';
+  if (isFailureStatus(value)) return 'danger';
+  if (isActiveStatus(value)) return 'info';
+  return 'neutral';
 }
 
 function StatusIcon({ status, size = 14 }: { status?: string; size?: number }) {
   const value = normalizedStatus(status);
   if (value === 'completed' || value === 'done' || value === 'success') {
-    return <CheckCircle2 size={size} className="text-hue-emerald shrink-0" />;
+    return <CheckCircle2 size={size} className="text-success shrink-0" />;
   }
   if (value === 'cancelled' || value === 'canceled' || value === 'refuted') {
-    return <Ban size={size} className="text-hue-red shrink-0" />;
+    return <Ban size={size} className="text-error shrink-0" />;
   }
   if (isFailureStatus(value)) {
-    return <XCircle size={size} className="text-hue-red shrink-0" />;
+    return <XCircle size={size} className="text-error shrink-0" />;
   }
   if (isActiveStatus(value)) {
-    return <Loader2 size={size} className="text-hue-blue animate-spin shrink-0" />;
+    // Click UI's `loading` is a static glyph, so the spin stays on the call site.
+    return <Loader2 size={size} className="text-info animate-spin shrink-0" />;
   }
   return <CircleDashed size={size} className="text-text-faint shrink-0" />;
 }
@@ -172,12 +169,12 @@ function StatCard({ icon, label, value, detail }: {
 }) {
   return (
     <div className="rounded-xl border border-border-subtle bg-surface px-3.5 py-3 min-w-0">
-      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.13em] text-text-faint">
+      <div className="flex items-center gap-1.5 text-2xs uppercase tracking-[0.13em] text-text-faint">
         {icon}
         {label}
       </div>
       <div className="mt-1.5 text-lg font-semibold tabular-nums text-text truncate">{value}</div>
-      {detail && <div className="mt-0.5 text-[11px] text-text-dim truncate">{detail}</div>}
+      {detail && <div className="mt-0.5 text-xs text-text-dim truncate">{detail}</div>}
     </div>
   );
 }
@@ -188,6 +185,9 @@ function RunListItem({ run, selected, onSelect }: {
   onSelect: () => void;
 }) {
   const usage = run.aggregate_usage;
+  // A bare <button> rather than `Button`: this is a multi-line card, and
+  // `Button`'s base `inline-flex items-center justify-center` would lay its
+  // rows side by side.
   return (
     <button
       type="button"
@@ -202,18 +202,18 @@ function RunListItem({ run, selected, onSelect }: {
         <div className="pt-0.5"><StatusIcon status={run.status} size={15} /></div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-2">
-            <span className="text-[13px] font-medium text-text-secondary truncate">{runTitle(run)}</span>
-            <span className="text-[10px] text-text-faint shrink-0">
+            <span className="text-sm font-medium text-text-secondary truncate">{runTitle(run)}</span>
+            <span className="text-2xs text-text-faint shrink-0">
               {relativeTime(run.updated_at || run.completed_at || run.started_at)}
             </span>
           </div>
           {run.task && run.task !== runTitle(run) && (
-            <div className="mt-0.5 text-[11px] text-text-dim truncate">{run.task}</div>
+            <div className="mt-0.5 text-xs text-text-dim truncate">{run.task}</div>
           )}
-          <div className="mt-2 flex items-center gap-2.5 text-[10px] text-text-faint tabular-nums">
-            <span className={`px-1.5 py-0.5 rounded border capitalize ${statusClasses(run.status)}`}>
+          <div className="mt-2 flex items-center gap-2.5 text-2xs text-text-faint tabular-nums">
+            <Badge tone={statusTone(run.status)} outline className="capitalize">
               {normalizedStatus(run.status).replace(/_/g, ' ')}
-            </span>
+            </Badge>
             <span>{workerCount(run)} agents</span>
             <span>{formatDuration(runDuration(run))}</span>
             {usage && <span>{formatCount(usageTotal(usage))} tok</span>}
@@ -238,14 +238,14 @@ function StepCard({ step, index }: { step: UltracodeRunStep; index: number }) {
           <StatusIcon status={step.status} size={16} />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="text-[13px] font-medium text-text-secondary truncate">{title}</span>
+              <span className="text-sm font-medium text-text-secondary truncate">{title}</span>
               {step.kind && (
-                <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-raised text-text-faint border border-border-subtle">
+                <span className="text-2xs uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-raised text-text-faint border border-border-subtle">
                   {step.kind}
                 </span>
               )}
             </div>
-            <div className="mt-1 flex items-center gap-3 text-[10px] text-text-dim min-w-0">
+            <div className="mt-1 flex items-center gap-3 text-2xs text-text-dim min-w-0">
               {step.model && <span className="truncate">{step.model}</span>}
               {step.reasoning_effort && <span>{step.reasoning_effort}</span>}
               {dependencies.length > 0 && (
@@ -256,8 +256,8 @@ function StepCard({ step, index }: { step: UltracodeRunStep; index: number }) {
             </div>
           </div>
           <div className="text-right shrink-0">
-            <div className="text-[11px] text-text-muted tabular-nums">{formatDuration(step.duration_ms)}</div>
-            {step.usage && <div className="text-[10px] text-text-faint tabular-nums">{formatCount(usageTotal(step.usage))} tok</div>}
+            <div className="text-xs text-text-muted tabular-nums">{formatDuration(step.duration_ms)}</div>
+            {step.usage && <div className="text-2xs text-text-faint tabular-nums">{formatCount(usageTotal(step.usage))} tok</div>}
           </div>
           <span className="text-text-faint group-open:rotate-90 transition-transform">›</span>
         </div>
@@ -265,15 +265,15 @@ function StepCard({ step, index }: { step: UltracodeRunStep; index: number }) {
       <div className="border-t border-border-subtle bg-bg-sunken px-4 py-3">
         {output.text ? (
           <>
-            <pre className={`text-[11px] leading-5 whitespace-pre-wrap break-words max-h-96 overflow-auto ${step.error ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`text-xs leading-5 whitespace-pre-wrap break-words max-h-96 overflow-auto ${step.error ? 'text-error' : 'text-text-muted'}`}>
               {output.text}
             </pre>
             {output.truncated && (
-              <div className="mt-2 text-[10px] text-hue-amber">Output truncated in the dashboard.</div>
+              <div className="mt-2 text-2xs text-warning">Output truncated in the dashboard.</div>
             )}
           </>
         ) : (
-          <div className="text-[11px] text-text-faint">No output recorded yet.</div>
+          <div className="text-xs text-text-faint">No output recorded yet.</div>
         )}
       </div>
     </details>
@@ -288,22 +288,22 @@ function EventRow({ event }: { event: UltracodeRunEvent }) {
     <div className="relative pl-7 pb-4 last:pb-0">
       <div className="absolute left-[6px] top-4 bottom-0 w-px bg-border-subtle last:hidden" />
       <div className={`absolute left-0 top-1.5 w-[13px] h-[13px] rounded-full border-2 border-bg ${
-        hasFailure ? 'bg-red-400' : active ? 'bg-blue-400' : 'bg-emerald-400'
+        hasFailure ? 'bg-error' : active ? 'bg-info' : 'bg-success'
       }`} />
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="text-[12px] text-text-secondary">
-            <span className="font-mono text-[11px]">{event.type || 'event'}</span>
+          <div className="text-xs text-text-secondary">
+            <span className="font-mono text-xs">{event.type || 'event'}</span>
             {event.label && <span className="text-text-muted"> · {event.label}</span>}
           </div>
-          {event.message && <div className="mt-1 text-[11px] text-text-muted whitespace-pre-wrap">{event.message}</div>}
+          {event.message && <div className="mt-1 text-xs text-text-muted whitespace-pre-wrap">{event.message}</div>}
           {eventData.text && (
-            <pre className="mt-1.5 text-[10px] leading-4 text-text-dim whitespace-pre-wrap break-words max-h-32 overflow-auto">
+            <pre className="mt-1.5 text-2xs leading-4 text-text-dim whitespace-pre-wrap break-words max-h-32 overflow-auto">
               {eventData.text}
             </pre>
           )}
         </div>
-        <time className="text-[10px] text-text-faint tabular-nums shrink-0" title={formatTimestamp(event.at)}>
+        <time className="text-2xs text-text-faint tabular-nums shrink-0" title={formatTimestamp(event.at)}>
           {event.at ? new Date(event.at).toLocaleTimeString() : '—'}
         </time>
       </div>
@@ -319,14 +319,10 @@ function EmptyDashboard({ message, onRefresh }: { message: string; onRefresh: ()
           <Workflow size={26} className="text-text-faint" />
         </div>
         <h2 className="mt-4 text-base font-medium text-text-secondary">No Ultracode runs to show</h2>
-        <p className="mt-1.5 text-[13px] leading-5 text-text-dim">{message}</p>
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="mt-4 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border bg-surface text-[12px] text-text-muted hover:bg-surface-hover hover:text-text-secondary cursor-pointer"
-        >
+        <p className="mt-1.5 text-sm leading-5 text-text-dim">{message}</p>
+        <Button variant="secondary" className="mt-4" onClick={onRefresh}>
           <RefreshCw size={12} /> Refresh
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -440,41 +436,39 @@ export function UltracodePage() {
     <div className="h-full flex flex-col overflow-hidden bg-bg">
       <header className="h-[58px] shrink-0 border-b border-border-subtle px-5 flex items-center justify-between bg-bg">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-violet-400/10 border border-violet-400/20 flex items-center justify-center shrink-0">
+          <div className="w-8 h-8 rounded-lg bg-hue-violet/10 border border-hue-violet/20 flex items-center justify-center shrink-0">
             <Workflow size={17} className="text-hue-violet" />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="text-[15px] font-semibold text-text">Ultracode</h1>
-              <span className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border bg-surface-raised text-text-faint">
+              <h1 className="text-base font-semibold text-text">Ultracode</h1>
+              <span className="text-2xs uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border bg-surface-raised text-text-faint">
                 read only
               </span>
               {active && (
-                <span className="flex items-center gap-1 text-[10px] text-hue-blue">
+                <span className="flex items-center gap-1 text-2xs text-info">
                   <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60 animate-ping" />
-                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-400" />
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-info opacity-60 animate-ping" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-info" />
                   </span>
                   live
                 </span>
               )}
             </div>
-            <p className="text-[11px] text-text-dim">Parallel worker runs and execution journals</p>
+            <p className="text-xs text-text-dim">Parallel worker runs and execution journals</p>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={() => { void refreshAll(); }}
+        <IconButton
+          label="Refresh runs"
           disabled={refreshing}
-          className="p-2 rounded-lg text-text-dim hover:text-text-secondary hover:bg-surface-raised disabled:opacity-50 cursor-pointer"
-          title="Refresh runs"
+          onClick={() => { void refreshAll(); }}
         >
           <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
-        </button>
+        </IconButton>
       </header>
 
       {error && (
-        <div className="shrink-0 px-4 py-2 border-b border-red-400/20 bg-red-400/5 flex items-center gap-2 text-[11px] text-hue-red">
+        <div className="shrink-0 px-4 py-2 border-b border-error-border bg-error-bg flex items-center gap-2 text-xs text-error">
           <AlertCircle size={13} />
           <span className="truncate">{error}</span>
         </div>
@@ -483,8 +477,8 @@ export function UltracodePage() {
       <div className="flex-1 min-h-0 flex">
         <aside className="w-[330px] shrink-0 border-r border-border-subtle bg-bg-sunken flex flex-col min-h-0">
           <div className="h-10 px-3.5 border-b border-border-subtle flex items-center justify-between shrink-0">
-            <span className="text-[10px] uppercase tracking-[0.13em] text-text-faint">Runs</span>
-            <span className="text-[10px] tabular-nums text-text-faint">{runs.length}</span>
+            <span className="text-2xs uppercase tracking-[0.13em] text-text-faint">Runs</span>
+            <span className="text-2xs tabular-nums text-text-faint">{runs.length}</span>
           </div>
           <div className="flex-1 overflow-y-auto">
             {loading ? (
@@ -502,7 +496,7 @@ export function UltracodePage() {
                 />
               ))
             ) : (
-              <div className="px-5 py-10 text-center text-[12px] text-text-faint">No run journals found.</div>
+              <div className="px-5 py-10 text-center text-xs text-text-faint">No run journals found.</div>
             )}
           </div>
         </aside>
@@ -524,14 +518,14 @@ export function UltracodePage() {
                       <div className="flex items-center gap-2.5">
                         <StatusIcon status={selectedRun.status} size={19} />
                         <h2 className="text-xl font-semibold text-text truncate">{runTitle(selectedRun)}</h2>
-                        <span className={`text-[10px] capitalize px-2 py-0.5 rounded-full border shrink-0 ${statusClasses(selectedRun.status)}`}>
+                        <Badge tone={statusTone(selectedRun.status)} outline pill className="capitalize">
                           {normalizedStatus(selectedRun.status).replace(/_/g, ' ')}
-                        </span>
+                        </Badge>
                       </div>
                       {selectedRun.task && selectedRun.task !== runTitle(selectedRun) && (
-                        <p className="mt-2 text-[13px] leading-5 text-text-muted max-w-3xl">{selectedRun.task}</p>
+                        <p className="mt-2 text-sm leading-5 text-text-muted max-w-3xl">{selectedRun.task}</p>
                       )}
-                      <div className="mt-2 flex items-center gap-3 text-[10px] text-text-dim min-w-0">
+                      <div className="mt-2 flex items-center gap-3 text-2xs text-text-dim min-w-0">
                         <span className="font-mono truncate" title={selectedRun.cwd || undefined}>{selectedRun.cwd || 'workspace'}</span>
                         <span className="shrink-0" title={formatTimestamp(selectedRun.started_at)}>
                           started {relativeTime(selectedRun.started_at)}
@@ -573,8 +567,8 @@ export function UltracodePage() {
                   <section className="rounded-xl border border-border-subtle bg-surface px-4 py-3">
                     <div className="flex items-center justify-between gap-4">
                       <div>
-                        <div className="text-[10px] uppercase tracking-[0.13em] text-text-faint">Usage</div>
-                        <div className="mt-0.5 text-[11px] text-text-dim">Aggregate across every worker in this run</div>
+                        <div className="text-2xs uppercase tracking-[0.13em] text-text-faint">Usage</div>
+                        <div className="mt-0.5 text-xs text-text-dim">Aggregate across every worker in this run</div>
                       </div>
                       <div className="flex items-center gap-5 text-right tabular-nums">
                         {[
@@ -584,8 +578,8 @@ export function UltracodePage() {
                           ['Reasoning', usage.reasoning_output_tokens],
                         ].map(([label, value]) => (
                           <div key={String(label)}>
-                            <div className="text-[10px] text-text-faint">{label}</div>
-                            <div className="mt-0.5 text-[12px] text-text-secondary">{formatCount(value as number | undefined)}</div>
+                            <div className="text-2xs text-text-faint">{label}</div>
+                            <div className="mt-0.5 text-xs text-text-secondary">{formatCount(value as number | undefined)}</div>
                           </div>
                         ))}
                       </div>
@@ -600,18 +594,15 @@ export function UltracodePage() {
                       ['events', `Events ${selectedRun.events?.length || 0}`],
                       ['result', 'Run detail'],
                     ] as Array<[DetailTab, string]>).map(([id, label]) => (
-                      <button
+                      <Button
                         key={id}
-                        type="button"
+                        variant="tab"
+                        active={tab === id}
                         onClick={() => setTab(id)}
-                        className={`px-3 py-2 text-[12px] border-b-2 -mb-px transition-colors cursor-pointer ${
-                          tab === id
-                            ? 'border-accent text-text-secondary'
-                            : 'border-transparent text-text-dim hover:text-text-muted'
-                        }`}
+                        className="px-3 py-2 -mb-px"
                       >
                         {label}
-                      </button>
+                      </Button>
                     ))}
                   </div>
 
@@ -620,7 +611,7 @@ export function UltracodePage() {
                       {steps.length > 0 ? steps.map((step, index) => (
                         <StepCard key={step.step_id || step.id || `${index}`} step={step} index={index} />
                       )) : (
-                        <div className="rounded-xl border border-dashed border-border p-8 text-center text-[12px] text-text-faint">
+                        <div className="rounded-xl border border-dashed border-border p-8 text-center text-xs text-text-faint">
                           No worker records in this journal.
                         </div>
                       )}
@@ -632,10 +623,10 @@ export function UltracodePage() {
                       {events.length > 0 ? events.map((event, index) => (
                         <EventRow key={`${event.at || 'event'}-${event.type || ''}-${index}`} event={event} />
                       )) : (
-                        <div className="py-6 text-center text-[12px] text-text-faint">No journal events recorded.</div>
+                        <div className="py-6 text-center text-xs text-text-faint">No journal events recorded.</div>
                       )}
                       {(selectedRun.events?.length || 0) > events.length && (
-                        <div className="pt-3 border-t border-border-subtle text-center text-[10px] text-text-faint">
+                        <div className="pt-3 border-t border-border-subtle text-center text-2xs text-text-faint">
                           Showing the latest {events.length} events.
                         </div>
                       )}
@@ -645,27 +636,27 @@ export function UltracodePage() {
                   {tab === 'result' && (
                     <div className="space-y-3">
                       <div className="rounded-xl border border-border-subtle bg-surface overflow-hidden">
-                        <div className="px-4 py-2.5 border-b border-border-subtle text-[10px] uppercase tracking-[0.13em] text-text-faint">
+                        <div className="px-4 py-2.5 border-b border-border-subtle text-2xs uppercase tracking-[0.13em] text-text-faint">
                           Final result
                         </div>
                         <div className="bg-bg-sunken px-4 py-3">
                           {topResult.text ? (
                             <>
-                              <pre className={`text-[11px] leading-5 whitespace-pre-wrap break-words max-h-[32rem] overflow-auto ${selectedRun.error ? 'text-hue-red' : 'text-text-muted'}`}>
+                              <pre className={`text-xs leading-5 whitespace-pre-wrap break-words max-h-[32rem] overflow-auto ${selectedRun.error ? 'text-error' : 'text-text-muted'}`}>
                                 {topResult.text}
                               </pre>
-                              {topResult.truncated && <div className="mt-2 text-[10px] text-hue-amber">Result truncated in the dashboard.</div>}
+                              {topResult.truncated && <div className="mt-2 text-2xs text-warning">Result truncated in the dashboard.</div>}
                             </>
                           ) : (
-                            <div className="text-[11px] text-text-faint">No top-level result recorded.</div>
+                            <div className="text-xs text-text-faint">No top-level result recorded.</div>
                           )}
                         </div>
                       </div>
                       <div className="rounded-xl border border-border-subtle bg-surface overflow-hidden">
-                        <div className="px-4 py-2.5 border-b border-border-subtle text-[10px] uppercase tracking-[0.13em] text-text-faint">
+                        <div className="px-4 py-2.5 border-b border-border-subtle text-2xs uppercase tracking-[0.13em] text-text-faint">
                           Run options
                         </div>
-                        <pre className="bg-bg-sunken px-4 py-3 text-[11px] leading-5 text-text-muted whitespace-pre-wrap break-words overflow-auto">
+                        <pre className="bg-bg-sunken px-4 py-3 text-xs leading-5 text-text-muted whitespace-pre-wrap break-words overflow-auto">
                           {formatValue(selectedRun.options || {}).text}
                         </pre>
                       </div>

@@ -1,5 +1,5 @@
 import type { WSMessage } from '../../api/websocket';
-import type { PanelTab } from '../../types/chat';
+import type { PanelTab, Session } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import { hydrateMessage } from '../../utils/hydrateMessage';
 import type { Get, Set } from './types';
@@ -222,19 +222,24 @@ export function handleSessionRunning(
   get: Get,
   set: Set,
 ): void {
-  // Global broadcast: a session started or stopped running
+  // Global broadcast: a session started or stopped running. The event also
+  // carries the session's pending work (scheduled wake-up / live background
+  // task), so a session that only *looks* idle keeps its parked indicator
+  // without waiting for the next list fetch.
+  const runState = (sess: Session): Session => ({
+    ...sess,
+    is_running: msg.is_running,
+    pending_wakeup_at: msg.pending_wakeup_at ?? null,
+    has_background_tasks: !!msg.has_background_tasks,
+  });
   set(s => {
     const updates: Record<string, unknown> = {
       sessions: s.sessions.map(sess =>
-        sess.id === msg.session_id
-          ? { ...sess, is_running: msg.is_running }
-          : sess,
+        sess.id === msg.session_id ? runState(sess) : sess,
       ),
       // Also update search results if present
       searchResults: s.searchResults?.map(sess =>
-        sess.id === msg.session_id
-          ? { ...sess, is_running: msg.is_running }
-          : sess,
+        sess.id === msg.session_id ? runState(sess) : sess,
       ) ?? null,
     };
     // Active session started running from a background trigger (e.g.,

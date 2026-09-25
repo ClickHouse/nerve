@@ -37,6 +37,7 @@ from nerve.sources.imap import (
     _parse_cursor,
 )
 from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import SourceRunner
 
 # 1x1 transparent PNG (valid, tiny) for the image tests.
 _PNG_BYTES = base64.b64decode(
@@ -179,6 +180,39 @@ class _FakeIMAP:
         return "OK", [(b"1 (RFC822 {n}", self._raw)]
 
 
+class _FakeMailbox:
+    """Minimal mailbox for exercising the blocking cursor flow."""
+
+    def __init__(self, uids: list[int], *, search_status: str = "OK"):
+        self.uids = uids
+        self.search_status = search_status
+        self.search_args: list[tuple] = []
+
+    def login(self, username, password):
+        return "OK", [b"logged in"]
+
+    def select(self, mailbox, readonly=True):
+        return "OK", [b"selected"]
+
+    def status(self, mailbox, query):
+        return "OK", [b"INBOX (UIDVALIDITY 9 UIDNEXT 200)"]
+
+    def uid(self, command, *args):
+        assert command == "search"
+        self.search_args.append(args)
+        if self.search_status != "OK":
+            return self.search_status, [b"search failed"]
+        if len(args) > 1 and isinstance(args[1], str) and args[1].endswith(":*"):
+            lower_bound = int(args[1][:-2])
+            uids = [uid for uid in self.uids if uid >= lower_bound]
+        else:
+            uids = self.uids
+        return "OK", [" ".join(str(uid) for uid in uids).encode()]
+
+    def logout(self):
+        return "BYE", [b"logged out"]
+
+
 def _parse(src: ImapSource, message: EmailMessage) -> dict:
     return src._fetch_one(_FakeIMAP(message), 7, 99)
 
@@ -262,6 +296,127 @@ def _src(**kw) -> ImapSource:
     return ImapSource(
         host="h", username="u@x", password="p", label="scans", **kw,
     )
+
+
+def _stub_parsed_message(uid: int, uidvalidity: int) -> dict:
+    return {
+        "id": f"{uidvalidity}-{uid}",
+        "subject": f"Message {uid}",
+        "from": "sender@example.com",
+        "date": "",
+        "timestamp": "2026-06-20T00:00:00+00:00",
+        "body": "body",
+        "matched": False,
+        "image": None,
+        "media_type": None,
+    }
+
+
+def test_blocking_fetch_processes_oldest_batch(monkeypatch):
+    """A backlog is drained from the oldest UID instead of skipping ahead."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102, 103, 104, 105])
+    fetched: list[int] = []
+
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    def _fetch_one(_mailbox, uid, uidvalidity):
+        fetched.append(uid)
+        return _stub_parsed_message(uid, uidvalidity)
+
+    monkeypatch.setattr(src, "_fetch_one", _fetch_one)
+
+    cursor = "9:100"
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-101", "9-102"]
+    assert fetched == [101, 102]
+    assert cursor == "9:102"
+    assert mailbox.search_args == [(None, "101:*")]
+
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-103", "9-104"]
+    assert cursor == "9:104"
+    assert mailbox.search_args == [(None, "101:*"), (None, "103:*")]
+
+    parsed, cursor = src._imap_fetch_blocking(cursor, limit=2)
+    assert [message["id"] for message in parsed] == ["9-105"]
+    assert cursor == "9:105"
+    assert mailbox.search_args == [
+        (None, "101:*"), (None, "103:*"), (None, "105:*")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_propagates_uid_failure(monkeypatch):
+    """A failed UID must be visible to SourceRunner instead of being hidden."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102, 103])
+    fetched: list[int] = []
+
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    def _fetch_one(_mailbox, uid, uidvalidity):
+        fetched.append(uid)
+        if uid == 102:
+            raise RuntimeError("temporary parse failure")
+        return _stub_parsed_message(uid, uidvalidity)
+
+    monkeypatch.setattr(src, "_fetch_one", _fetch_one)
+
+    with pytest.raises(RuntimeError, match="temporary parse failure"):
+        await src.fetch(cursor="9:100", limit=2)
+    assert fetched == [101, 102]
+
+
+@pytest.mark.asyncio
+async def test_fetch_propagates_search_failure(monkeypatch):
+    """A failed search must not be treated as an empty mailbox."""
+    src = _src()
+    mailbox = _FakeMailbox([101, 102], search_status="NO")
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL",
+        lambda host, port: mailbox,
+    )
+
+    with pytest.raises(RuntimeError, match="IMAP SEARCH failed"):
+        await src.fetch(cursor="9:100", limit=2)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_blocking_fetch_rejects_non_positive_limit_before_connect(monkeypatch, limit):
+    src = _src()
+
+    def _unexpected_connect(*args):
+        raise AssertionError("non-positive limit should not connect to IMAP")
+
+    monkeypatch.setattr(
+        "nerve.sources.imap.imaplib.IMAP4_SSL", _unexpected_connect,
+    )
+
+    assert src._imap_fetch_blocking(None, limit) == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_imap_fetch_failure(db, monkeypatch):
+    src = _src()
+
+    def _boom(cursor, limit):
+        raise RuntimeError("temporary parse failure")
+
+    monkeypatch.setattr(src, "_imap_fetch_blocking", _boom)
+    runner = SourceRunner(source=src, db=db, batch_size=2)
+
+    result = await runner.run()
+
+    assert result.records_ingested == 0
+    assert result.error == "temporary parse failure"
+    assert await db.get_sync_cursor(src.source_name) is None
 
 
 def _matched_msg(**over) -> dict:
@@ -385,16 +540,15 @@ async def test_only_matched_drops_the_rest(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fetch_swallows_blocking_errors(monkeypatch):
+async def test_fetch_propagates_blocking_errors(monkeypatch):
     src = _src(vision_client_factory=lambda: _FakeVisionClient(text="x"))
 
     def _boom(cursor, limit):
         raise RuntimeError("imap down")
 
     monkeypatch.setattr(src, "_imap_fetch_blocking", _boom)
-    result = await src.fetch(cursor="5:5", limit=10)
-    assert result.records == []
-    assert result.next_cursor == "5:5"  # cursor preserved on error
+    with pytest.raises(RuntimeError, match="imap down"):
+        await src.fetch(cursor="5:5", limit=10)
 
 
 # ---------------------------------------------------------------------------

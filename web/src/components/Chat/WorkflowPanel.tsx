@@ -1,4 +1,4 @@
-import { Loader2, Check, X, Circle } from 'lucide-react';
+import { Loader2, Check, X, Circle } from '../ui/icons';
 import { MarkdownContent } from './MarkdownContent';
 import type { PanelTab, WorkflowAgent, WorkflowSnapshot } from '../../types/chat';
 
@@ -24,16 +24,16 @@ function AgentState({ state }: { state?: string }) {
 
 function AgentRow({ agent }: { agent: WorkflowAgent }) {
   return (
-    <div className="flex items-center gap-2 px-2 py-1 rounded hover:bg-surface-hover/50">
+    <div className="flex items-center gap-2 px-2 py-1 rounded leading-tight hover:bg-surface-hover/50">
       <AgentState state={agent.state} />
-      <span className="text-[12px] text-text-secondary truncate max-w-[140px]">{agent.label || 'agent'}</span>
+      <span className="text-xs text-text-secondary truncate max-w-[140px]">{agent.label || 'agent'}</span>
       {agent.lastToolName && (
-        <span className="text-[11px] text-text-faint font-mono shrink-0">{agent.lastToolName}</span>
+        <span className="text-xs text-text-faint font-mono shrink-0">{agent.lastToolName}</span>
       )}
       {agent.lastToolSummary && (
-        <span className="text-[11px] text-text-dim truncate flex-1">{agent.lastToolSummary}</span>
+        <span className="text-xs text-text-dim truncate flex-1">{agent.lastToolSummary}</span>
       )}
-      <div className="ml-auto shrink-0 flex items-center gap-2 text-[10px] text-text-faint font-mono">
+      <div className="ml-auto shrink-0 flex items-center gap-2 text-2xs text-text-faint font-mono">
         {agent.tokens ? <span>{fmtTokens(agent.tokens)}</span> : null}
         {agent.durationMs ? <span>{fmtDuration(agent.durationMs)}</span> : null}
       </div>
@@ -70,7 +70,7 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
   if (!wf || (wf.phases.length === 0 && wf.agents.length === 0)) {
     return (
       <div className="flex-1 overflow-y-auto px-4 py-4">
-        <div className="flex items-center gap-2 text-[13px] text-text-dim">
+        <div className="flex items-center gap-2 text-sm text-text-dim">
           <Loader2 size={14} className="animate-spin" /> Starting workflow…
         </div>
       </div>
@@ -85,7 +85,7 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
   return (
     <div className="flex-1 overflow-y-auto px-4 py-3">
       {/* Totals bar */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-text-faint font-mono mb-3 pb-2 border-b border-border-subtle">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-faint font-mono mb-3 pb-2 border-b border-border-subtle">
         <span><span className="text-text-secondary">{done}</span>/{total} agents done</span>
         {running > 0 && <span><span className="text-hue-amber">{running}</span> running</span>}
         <span>{groups.length} phases</span>
@@ -100,12 +100,12 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
           return (
             <div key={group.index}>
               <div className="flex items-center gap-2 mb-1">
-                <span className="text-[10px] uppercase tracking-wider text-text-faint">
+                <span className="text-2xs uppercase tracking-wider text-text-faint">
                   Phase {group.index}
                 </span>
-                <span className="text-[12px] font-medium text-text-secondary">{group.title}</span>
+                <span className="text-xs font-medium text-text-secondary">{group.title}</span>
                 {group.agents.length > 0 && (
-                  <span className="text-[10px] text-text-faint font-mono ml-auto">
+                  <span className="text-2xs text-text-faint font-mono ml-auto">
                     {gDone}/{group.agents.length}
                   </span>
                 )}
@@ -115,7 +115,7 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
                   {group.agents.map((a, i) => <AgentRow key={i} agent={a} />)}
                 </div>
               ) : (
-                <div className="px-2 py-1 text-[11px] text-text-faint italic">pending…</div>
+                <div className="px-2 py-1 text-xs text-text-faint italic">pending…</div>
               )}
             </div>
           );
@@ -124,8 +124,8 @@ export function WorkflowPanel({ tab }: { tab: PanelTab }) {
 
       {/* Final summary / result */}
       {tab.content && (
-        <div className="mt-4 pt-3 border-t border-border-subtle text-[13px]">
-          <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">Result</div>
+        <div className="mt-4 pt-3 border-t border-border-subtle text-sm">
+          <div className="text-2xs uppercase tracking-wider text-text-faint mb-1">Result</div>
           <MarkdownContent content={tab.content} />
         </div>
       )}

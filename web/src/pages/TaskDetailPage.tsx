@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft } from '../components/ui/icons';
+import { Button, IconButton } from '../components/ui';
 import { useTaskStore } from '../stores/taskStore';
 import { useTaskStatusStore } from '../stores/taskStatusStore';
 import { TaskDetailBody } from '../components/Tasks/TaskDetailBody';
@@ -38,12 +39,9 @@ export function TaskDetailPage() {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3 text-text-faint">
         <span>Task not found</span>
-        <button
-          onClick={() => navigate('/tasks')}
-          className="text-[13px] text-accent hover:underline cursor-pointer"
-        >
+        <Button variant="link" size="md" onClick={() => navigate('/tasks')}>
           Back to tasks
-        </button>
+        </Button>
       </div>
     );
   }
@@ -53,13 +51,9 @@ export function TaskDetailPage() {
     // overflowing it.
     <div className="h-full flex flex-col min-h-0">
       <div className="border-b border-border-subtle px-6 py-3 bg-bg shrink-0 flex items-center gap-3 min-w-0">
-        <button
-          onClick={() => navigate('/tasks')}
-          aria-label="Back to tasks"
-          className="p-1.5 text-text-dim hover:text-text-muted hover:bg-surface-raised rounded cursor-pointer shrink-0"
-        >
+        <IconButton label="Back to tasks" onClick={() => navigate('/tasks')}>
           <ArrowLeft size={18} />
-        </button>
+        </IconButton>
         <h1 className="text-lg font-semibold text-text truncate">{selectedTask.title}</h1>
       </div>
 

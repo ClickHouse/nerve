@@ -1,14 +1,16 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, CheckSquare, ListTodo, Plus, CheckCircle, Pencil, FileText, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, CheckSquare, ListTodo, Plus, CheckCircle, Pencil, FileText, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { Badge, type BadgeTone } from '../../ui';
 
-const STATUS_COLORS: Record<string, string> = {
-  pending: 'bg-yellow-500/15 text-hue-yellow',
-  'in-progress': 'bg-blue-500/15 text-hue-blue',
-  'in_progress': 'bg-blue-500/15 text-hue-blue',
-  done: 'bg-green-500/15 text-hue-green',
-  completed: 'bg-green-500/15 text-hue-green',
-  deferred: 'bg-border-subtle text-text-muted',
+/** Task lifecycle state — an outcome, so it takes the status-shaped tones. */
+const STATUS_TONES: Record<string, BadgeTone> = {
+  pending: 'warning',
+  'in-progress': 'info',
+  'in_progress': 'info',
+  done: 'success',
+  completed: 'success',
+  deferred: 'neutral',
 };
 
 /** Extract readable text from MCP content blocks. */
@@ -93,17 +95,15 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : isDone ? 'text-hue-green' : isCreate ? 'text-hue-blue' : 'text-text-muted'}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : isDone ? 'text-hue-green' : isCreate ? 'text-hue-blue' : 'text-text-muted'}`} />
         }
-        <span className="text-[13px] font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
-        {title && <span className="text-[12px] text-text-muted truncate">{title}</span>}
+        <span className="text-sm leading-tight font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
+        {title && <span className="text-xs text-text-muted truncate">{title}</span>}
         {status && (
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${STATUS_COLORS[status] || 'bg-border-subtle text-text-muted'}`}>
-            {status}
-          </span>
+          <Badge tone={STATUS_TONES[status] || 'neutral'}>{status}</Badge>
         )}
         {isList && taskList.length > 0 && (
-          <span className="text-[10px] text-text-faint shrink-0">{taskList.length} tasks</span>
+          <span className="text-2xs text-text-faint shrink-0">{taskList.length} tasks</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -115,22 +115,22 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Create: show what was created */}
           {isCreate && title && (
             <div className="px-3 py-2">
-              <div className="text-[12px] text-text-secondary flex items-center gap-2">
+              <div className="text-xs text-text-secondary flex items-center gap-2">
                 <Plus size={11} className="text-hue-blue" />
                 <span className="font-medium">{title}</span>
               </div>
               {block.input.content ? (
-                <p className="text-[12px] text-text-muted mt-1 pl-5">{String(block.input.content).slice(0, 200)}</p>
+                <p className="text-xs text-text-muted mt-1 pl-5">{String(block.input.content).slice(0, 200)}</p>
               ) : null}
               {block.input.deadline ? (
-                <p className="text-[10px] text-text-dim mt-1 pl-5">Deadline: {String(block.input.deadline)}</p>
+                <p className="text-2xs text-text-dim mt-1 pl-5">Deadline: {String(block.input.deadline)}</p>
               ) : null}
             </div>
           )}
 
           {/* Done/Update: show status change */}
           {(isDone || isUpdate) && (
-            <div className="px-3 py-2 text-[12px]">
+            <div className="px-3 py-2 text-xs">
               <span className="text-text-muted">{block.input.task_id ? String(block.input.task_id) : title}</span>
               {block.input.note ? <p className="text-text-muted mt-1">{String(block.input.note)}</p> : null}
             </div>
@@ -140,36 +140,34 @@ export function TaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {taskList.length > 0 ? (
             <div className="px-3 py-2 space-y-1 max-h-60 overflow-y-auto">
               {taskList.map((t, i) => (
-                <div key={i} className="flex items-center gap-2 text-[12px]">
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${STATUS_COLORS[t.status] || 'bg-border-subtle text-text-muted'}`}>
-                    {t.status}
-                  </span>
+                <div key={i} className="flex items-center gap-2 text-xs">
+                  <Badge tone={STATUS_TONES[t.status] || 'neutral'} className="shrink-0">{t.status}</Badge>
                   <span className="text-text-secondary truncate">{t.title}</span>
-                  {t.deadline && <span className="text-[10px] text-text-faint shrink-0">{t.deadline}</span>}
+                  {t.deadline && <span className="text-2xs text-text-faint shrink-0">{t.deadline}</span>}
                 </div>
               ))}
             </div>
           ) : resultText && !isCreate && !isDone && !isUpdate ? (
-            <pre className={`px-3 py-2 text-[12px] whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`px-3 py-2 text-xs whitespace-pre-wrap max-h-60 overflow-y-auto ${block.isError ? 'text-error' : 'text-text-muted'}`}>
               {resultText}
             </pre>
           ) : null}
 
           {/* Success message */}
           {(isCreate || isDone) && resultText && !block.isError && !taskList.length && (
-            <div className="px-3 py-1.5 text-[11px] text-hue-green/70 border-t border-border-subtle">
+            <div className="px-3 py-1.5 text-xs text-success border-t border-border-subtle">
               {isDone ? 'Task completed' : 'Task created'}
             </div>
           )}
 
           {block.isError && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-hue-red whitespace-pre-wrap border-t border-border-subtle">
+            <pre className="px-3 py-2 text-xs text-error whitespace-pre-wrap border-t border-border-subtle">
               {resultText}
             </pre>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> Working...
             </div>
           )}

@@ -287,7 +287,18 @@ class SourceRunner:
             records = kept
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
-        await self._persist_to_inbox(records)
+        try:
+            await self._persist_to_inbox(records)
+        except Exception as e:
+            logger.error(
+                "Source %s persistence failed: %s",
+                self.source.source_name, e, exc_info=True,
+            )
+            return IngestResult(
+                records_ingested=0,
+                records_dropped=dropped_count,
+                error=str(e),
+            )
 
         # 3. LLM-based condensation for still-long records (configurable per source)
         if self.condense:
@@ -317,14 +328,9 @@ class SourceRunner:
 
     async def _persist_to_inbox(self, records: list[SourceRecord]) -> None:
         """Save records to the source_messages table for inbox display."""
-        try:
-            await self.db.insert_source_messages(
-                records, source=self.source.source_name, ttl_days=self.ttl_days,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to persist %d records to inbox: %s", len(records), e,
-            )
+        await self.db.insert_source_messages(
+            records, source=self.source.source_name, ttl_days=self.ttl_days,
+        )
 
     async def _update_processed_content(self, processed_map: dict[str, str]) -> None:
         """Update processed_content on inbox messages after condensation."""

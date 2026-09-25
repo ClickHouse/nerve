@@ -37,12 +37,12 @@ export function TaskTimeline({ taskId, currentStatus }: {
   }, [taskId]);
 
   if (events === null) {
-    return <p className="text-[12px] text-text-faint">Loading history...</p>;
+    return <p className="text-xs text-text-faint">Loading history...</p>;
   }
   if (events.length === 0) {
     // Tasks that last changed status before v044 have no history, and
     // inventing one would be worse than saying so.
-    return <p className="text-[12px] text-text-faint">No status history recorded.</p>;
+    return <p className="text-xs text-text-faint">No status history recorded.</p>;
   }
 
   const nowIso = new Date().toISOString();
@@ -54,7 +54,7 @@ export function TaskTimeline({ taskId, currentStatus }: {
         const dwell = span(event.created_at, next?.created_at ?? nowIso);
         const isCurrent = !next && event.to_status === currentStatus;
         return (
-          <li key={event.id} className="flex items-start gap-2.5 text-[12px]">
+          <li key={event.id} className="flex items-start gap-2.5 text-xs">
             <span
               className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0
                 ${isCurrent ? 'bg-accent' : 'bg-border'}`}

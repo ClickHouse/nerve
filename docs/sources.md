@@ -78,7 +78,8 @@ A persistent cron job (`inbox-processor`) runs every 15 minutes:
 - **Instances:** One source per configured account (`imap:<label>`), each with an independent cursor
 - **Cursor:** `<UIDVALIDITY>:<max_uid>` — UIDs are only stable within a UIDVALIDITY, so a server-side reset is detected and re-baselined instead of trusted
 - **First run:** `SINCE` window of `initial_lookback_days` (default 1)
-- **Subsequent runs:** `UID SEARCH <last+1>:*`, filtered client-side (the `N:*` range always returns at least the highest UID)
+- **Subsequent runs:** `UID SEARCH <last+1>:*`, filtered client-side (the `N:*` range always returns at least the highest UID); oldest UIDs are processed first when a batch is full
+- **Failure policy:** A search or message fetch/parse failure fails the batch and leaves the cursor unchanged. `SourceRunner` reports the error and applies its health/backoff policy. Fix or remove a permanently malformed message, then the next run retries it; manually advancing the cursor is an operator recovery action when skipping that UID is confirmed safe
 - **Blocking I/O:** the whole IMAP conversation runs in a worker thread via `asyncio.to_thread`
 - **Credentials:** passwords live in `sync.imap.passwords` keyed by username (put them in `config.local.yaml`); an account with no password is skipped with a warning instead of failing the sync
 - **Optional image pass:** see below

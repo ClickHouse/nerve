@@ -1,4 +1,5 @@
 import { useTaskStatusStore } from '../../stores/taskStatusStore';
+import { Button } from '../ui';
 
 export function TaskFilters({ active, onChange }: {
   active: string;
@@ -13,17 +14,16 @@ export function TaskFilters({ active, onChange }: {
   return (
     <div className="flex gap-1">
       {filters.map(f => (
-        <button
+        <Button
           key={f.value || 'active'}
+          variant="pill"
+          size="sm"
+          active={active === f.value}
+          aria-pressed={active === f.value}
           onClick={() => onChange(f.value)}
-          className={`px-3 py-1.5 text-[13px] rounded-md cursor-pointer transition-colors
-            ${active === f.value
-              ? 'bg-accent/15 text-accent font-medium'
-              : 'text-text-dim hover:text-text-muted hover:bg-surface-raised'
-            }`}
         >
           {f.label}
-        </button>
+        </Button>
       ))}
     </div>
   );

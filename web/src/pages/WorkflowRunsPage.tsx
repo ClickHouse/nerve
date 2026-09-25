@@ -13,7 +13,8 @@ import {
   RefreshCw,
   Rocket,
   XCircle,
-} from 'lucide-react';
+} from '../components/ui/icons';
+import { Badge, type BadgeTone, Button, IconButton } from '../components/ui';
 import {
   api,
   type WorkflowRun,
@@ -30,18 +31,18 @@ function statusLabel(status: WorkflowRunStatus): string {
   return status.replace(/_/g, ' ');
 }
 
-function statusBadgeClasses(status: WorkflowRunStatus): string {
+function statusTone(status: WorkflowRunStatus): BadgeTone {
   switch (status) {
     case 'running':
-      return 'border-blue-400/25 bg-blue-400/10 text-hue-blue';
+      return 'info';
     case 'done':
-      return 'border-emerald-400/25 bg-emerald-400/10 text-hue-emerald';
+      return 'success';
     case 'failed':
-      return 'border-red-400/25 bg-red-400/10 text-hue-red';
+      return 'danger';
     case 'budget_exhausted':
-      return 'border-amber-400/25 bg-amber-400/10 text-hue-amber';
+      return 'warning';
     default: // pending, killed
-      return 'border-border bg-surface-raised text-text-muted';
+      return 'neutral';
   }
 }
 
@@ -118,27 +119,25 @@ function eventExtras(event: WorkflowRunJournalEvent): string {
 function BudgetBar({ run }: { run: WorkflowRun }) {
   if (run.budget_usd === null || run.budget_usd <= 0) {
     return (
-      <span className="text-[11px] text-text-dim tabular-nums whitespace-nowrap">
+      <span className="text-xs text-text-dim tabular-nums whitespace-nowrap">
         {fmtUsd(run.spent_usd)} spent
       </span>
     );
   }
   const pct = (run.spent_usd / run.budget_usd) * 100;
-  let color = '#10b981'; // emerald-500
-  if (pct >= 100) color = '#ef4444'; // red-500
-  else if (pct >= 80) color = '#f59e0b'; // amber-500
+  const fill = pct >= 100 ? 'bg-error' : pct >= 80 ? 'bg-warning' : 'bg-success';
   return (
     <div
       className="flex items-center gap-2 whitespace-nowrap"
       title={run.warned_at ? `Budget warning issued ${relativeTime(run.warned_at)}` : `${Math.round(pct)}% of budget`}
     >
-      <span className="text-[11px] text-text-dim tabular-nums">
+      <span className="text-xs text-text-dim tabular-nums">
         {fmtUsd(run.spent_usd)} / {fmtUsd(run.budget_usd)}
       </span>
       <div className="w-24 h-1.5 bg-border-subtle rounded-full overflow-hidden">
         <div
-          className="h-full rounded-full transition-all duration-300"
-          style={{ width: `${Math.min(pct, 100)}%`, backgroundColor: color }}
+          className={`h-full rounded-full transition-all duration-300 ${fill}`}
+          style={{ width: `${Math.min(pct, 100)}%` }}
         />
       </div>
     </div>
@@ -148,8 +147,8 @@ function BudgetBar({ run }: { run: WorkflowRun }) {
 function Meta({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="min-w-0">
-      <div className="text-[9px] uppercase tracking-wider text-text-faint">{label}</div>
-      <div className={`mt-0.5 text-[11px] text-text-secondary truncate ${mono ? 'font-mono' : ''}`} title={value}>
+      <div className="text-2xs uppercase tracking-wider text-text-faint">{label}</div>
+      <div className={`mt-0.5 text-xs text-text-secondary truncate ${mono ? 'font-mono' : ''}`} title={value}>
         {value}
       </div>
     </div>
@@ -159,7 +158,7 @@ function Meta({ label, value, mono }: { label: string; value: string; mono?: boo
 function DetailBlock({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1.5">{label}</div>
+      <div className="text-2xs uppercase tracking-wider text-text-faint mb-1.5">{label}</div>
       {children}
     </div>
   );
@@ -168,7 +167,7 @@ function DetailBlock({ label, children }: { label: string; children: ReactNode }
 function JournalEventRow({ event }: { event: WorkflowRunJournalEvent }) {
   const extras = eventExtras(event);
   return (
-    <div className="flex items-start gap-2.5 text-[11px] leading-5 min-w-0">
+    <div className="flex items-start gap-2.5 text-xs leading-5 min-w-0">
       <time className="text-text-faint tabular-nums shrink-0" title={formatTimestamp(event.ts)}>
         {event.ts ? new Date(event.ts).toLocaleTimeString() : '—'}
       </time>
@@ -233,21 +232,21 @@ function RunCard({ run }: { run: WorkflowRun }) {
           <StatusIcon status={run.status} />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="text-[13px] font-medium text-text-secondary truncate">{runTitle(run)}</span>
-              <span className="shrink-0 text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-raised text-text-faint border border-border-subtle font-mono">
+              <span className="text-sm font-medium text-text-secondary truncate">{runTitle(run)}</span>
+              <span className="shrink-0 text-2xs uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-raised text-text-faint border border-border-subtle font-mono">
                 {run.engine}
               </span>
             </div>
-            <div className="mt-1.5 flex items-center gap-2.5 text-[10px] text-text-faint min-w-0">
-              <span className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-full border capitalize shrink-0 ${statusBadgeClasses(run.status)}`}>
+            <div className="mt-1.5 flex items-center gap-2.5 text-2xs text-text-faint min-w-0">
+              <Badge pill outline tone={statusTone(run.status)} className="capitalize gap-1.5 shrink-0">
                 {run.status === 'running' && (
                   <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60 animate-ping" />
-                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-400" />
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-info opacity-60 animate-ping" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-info" />
                   </span>
                 )}
                 {statusLabel(run.status)}
-              </span>
+              </Badge>
               <span className="font-mono shrink-0">{run.id}</span>
               <span className="shrink-0" title={formatTimestamp(run.created_at)}>
                 created {relativeTime(run.created_at)}
@@ -256,14 +255,13 @@ function RunCard({ run }: { run: WorkflowRun }) {
           </div>
           <BudgetBar run={run} />
           {run.session_id && (
-            <button
-              type="button"
+            <Button
+              variant="secondary"
               onClick={e => { e.stopPropagation(); navigate(`/chat/${run.session_id}`); }}
-              className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-border bg-surface text-[11px] text-text-muted hover:bg-surface-hover hover:text-text-secondary cursor-pointer"
               title="Open the run's session chat"
             >
               <MessageSquare size={12} /> Chat
-            </button>
+            </Button>
           )}
           <ChevronRight
             size={15}
@@ -286,14 +284,14 @@ function RunCard({ run }: { run: WorkflowRun }) {
           </div>
 
           <DetailBlock label="Prompt">
-            <pre className="text-[11px] leading-5 whitespace-pre-wrap break-words max-h-64 overflow-auto text-text-muted">
+            <pre className="text-xs leading-5 whitespace-pre-wrap break-words max-h-64 overflow-auto text-text-muted">
               {run.spec?.prompt || '—'}
             </pre>
           </DetailBlock>
 
           {run.error && (
             <DetailBlock label="Error">
-              <pre className="text-[11px] leading-5 whitespace-pre-wrap break-words max-h-48 overflow-auto text-hue-red">
+              <pre className="text-xs leading-5 whitespace-pre-wrap break-words max-h-48 overflow-auto text-hue-red">
                 {run.error}
               </pre>
             </DetailBlock>
@@ -301,7 +299,7 @@ function RunCard({ run }: { run: WorkflowRun }) {
 
           {resultText && (
             <DetailBlock label="Result">
-              <pre className="text-[11px] leading-5 whitespace-pre-wrap break-words max-h-96 overflow-auto text-text-muted">
+              <pre className="text-xs leading-5 whitespace-pre-wrap break-words max-h-96 overflow-auto text-text-muted">
                 {resultText}
               </pre>
             </DetailBlock>
@@ -309,11 +307,11 @@ function RunCard({ run }: { run: WorkflowRun }) {
 
           <DetailBlock label={journal && events.length > 0 ? `Journal events (last ${events.length})` : 'Journal events'}>
             {journalLoading && !journal ? (
-              <div className="py-1 flex items-center gap-2 text-[11px] text-text-faint">
+              <div className="py-1 flex items-center gap-2 text-xs text-text-faint">
                 <Loader2 size={12} className="animate-spin" /> Loading journal…
               </div>
             ) : journalError ? (
-              <div className="text-[11px] text-hue-red">{journalError}</div>
+              <div className="text-xs text-hue-red">{journalError}</div>
             ) : events.length > 0 ? (
               <div className="space-y-1 max-h-64 overflow-auto">
                 {events.map((event, index) => (
@@ -321,21 +319,16 @@ function RunCard({ run }: { run: WorkflowRun }) {
                 ))}
               </div>
             ) : (
-              <div className="text-[11px] text-text-faint">No journal events recorded yet.</div>
+              <div className="text-xs text-text-faint">No journal events recorded yet.</div>
             )}
           </DetailBlock>
 
           {killable && (
             <div className="flex justify-end pt-0.5">
-              <button
-                type="button"
-                onClick={() => { void onKill(); }}
-                disabled={killing}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-red-400/25 bg-red-400/10 text-hue-red text-[12px] hover:bg-red-400/20 disabled:opacity-50 cursor-pointer"
-              >
+              <Button variant="danger" onClick={() => { void onKill(); }} disabled={killing}>
                 {killing ? <Loader2 size={12} className="animate-spin" /> : <OctagonX size={12} />}
                 Kill run
-              </button>
+              </Button>
             </div>
           )}
         </div>
@@ -352,16 +345,16 @@ function EmptyState() {
           <Rocket size={26} className="text-text-faint" />
         </div>
         <h2 className="mt-4 text-base font-medium text-text-secondary">No workflow runs yet</h2>
-        <p className="mt-1.5 text-[13px] leading-5 text-text-dim">
+        <p className="mt-1.5 text-sm leading-5 text-text-dim">
           Workflow runs are long-lived autonomous agent runs with a hard spend budget.
           Each run executes in its own session, its cost is tracked while it works, and
           it is stopped automatically when the budget is exhausted.
         </p>
-        <p className="mt-2 text-[13px] leading-5 text-text-dim">
+        <p className="mt-2 text-sm leading-5 text-text-dim">
           Start one by asking the agent to use the{' '}
-          <code className="bg-surface-raised px-1.5 py-0.5 rounded text-[12px]">workflow_run_start</code>{' '}
+          <code className="bg-surface-raised px-1.5 py-0.5 rounded text-xs">workflow_run_start</code>{' '}
           tool, or via{' '}
-          <code className="bg-surface-raised px-1.5 py-0.5 rounded text-[12px]">POST /api/workflow-runs</code>.
+          <code className="bg-surface-raised px-1.5 py-0.5 rounded text-xs">POST /api/workflow-runs</code>.
         </p>
       </div>
     </div>
@@ -404,38 +397,33 @@ export function WorkflowRunsPage() {
     <div className="h-full flex flex-col overflow-hidden bg-bg">
       <header className="h-[58px] shrink-0 border-b border-border-subtle px-5 flex items-center justify-between bg-bg">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-amber-400/10 border border-amber-400/20 flex items-center justify-center shrink-0">
+          {/* The page's own icon tile — identity, not status, hence `hue-amber`. */}
+          <div className="w-8 h-8 rounded-lg bg-hue-amber/10 border border-hue-amber/20 flex items-center justify-center shrink-0">
             <Rocket size={17} className="text-hue-amber" />
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="text-[15px] font-semibold text-text">Workflow Runs</h1>
+              <h1 className="text-base font-semibold text-text">Workflow Runs</h1>
               {hasActive && (
-                <span className="flex items-center gap-1 text-[10px] text-hue-blue">
+                <span className="flex items-center gap-1 text-2xs text-hue-blue">
                   <span className="relative flex h-1.5 w-1.5">
-                    <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60 animate-ping" />
-                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-blue-400" />
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-info opacity-60 animate-ping" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-info" />
                   </span>
                   {activeCount} active
                 </span>
               )}
             </div>
-            <p className="text-[11px] text-text-dim">Budgeted autonomous agent runs</p>
+            <p className="text-xs text-text-dim">Budgeted autonomous agent runs</p>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={() => { void onRefresh(); }}
-          disabled={refreshing}
-          className="p-2 rounded-lg text-text-dim hover:text-text-secondary hover:bg-surface-raised disabled:opacity-50 cursor-pointer"
-          title="Refresh runs"
-        >
+        <IconButton label="Refresh runs" onClick={() => { void onRefresh(); }} disabled={refreshing}>
           <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
-        </button>
+        </IconButton>
       </header>
 
       {error && (
-        <div className="shrink-0 px-4 py-2 border-b border-red-400/20 bg-red-400/5 flex items-center gap-2 text-[11px] text-hue-red">
+        <div className="shrink-0 px-4 py-2 border-b border-error-border bg-error-bg flex items-center gap-2 text-xs text-error">
           <AlertCircle size={13} />
           <span className="truncate">{error}</span>
         </div>
@@ -456,7 +444,7 @@ export function WorkflowRunsPage() {
               ))}
             </div>
             {total > runs.length && (
-              <div className="mt-4 text-center text-[10px] text-text-faint">
+              <div className="mt-4 text-center text-2xs text-text-faint">
                 Showing the latest {runs.length} of {total} runs.
               </div>
             )}

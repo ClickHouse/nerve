@@ -1674,6 +1674,12 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
             click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
+            hidden = status.get("hidden_models") or []
+            if hidden:
+                click.echo(
+                    "[--] Hidden catalog entries (opt in via codex.models): "
+                    + ", ".join(hidden)
+                )
             if status.get("auth_mismatch"):
                 click.echo(
                     "[ERR] Codex auth mismatch: configured "

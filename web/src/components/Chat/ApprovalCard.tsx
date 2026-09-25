@@ -1,4 +1,5 @@
-import { ShieldQuestion, Terminal, FileDiff, Check, Ban } from 'lucide-react';
+import { ShieldQuestion, Terminal, FileDiff, Check, Ban } from '../ui/icons';
+import { Button } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 
 /**
@@ -60,21 +61,21 @@ export function ApprovalCard() {
     <div className="mx-4 mb-2 border border-hue-orange/40 rounded-lg bg-surface shadow-lg overflow-hidden">
       <div className="px-3 py-2 flex items-center gap-2 bg-hue-orange/10">
         <Icon size={15} className="text-hue-orange" />
-        <span className="text-[13px] font-medium text-text-primary">{title}</span>
-        <span className="ml-auto text-[11px] text-text-muted">approval required</span>
+        <span className="text-sm font-medium text-text">{title}</span>
+        <span className="ml-auto text-xs text-text-muted">approval required</span>
       </div>
 
       <div className="px-3 py-2 space-y-1.5">
         {command && (
-          <pre className="text-[12px] font-mono bg-surface-deep rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap break-all">
+          <pre className="text-xs font-mono bg-bg-sunken rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap break-all">
             {command}
           </pre>
         )}
         {cwd && (
-          <div className="text-[11px] text-text-muted font-mono">in {cwd}</div>
+          <div className="text-xs text-text-muted font-mono">in {cwd}</div>
         )}
         {changes.length > 0 && (
-          <ul className="text-[12px] font-mono space-y-0.5">
+          <ul className="text-xs font-mono space-y-0.5">
             {changes.map((c, i) => (
               <li key={i} className="text-text-secondary">
                 <span className="text-hue-orange mr-1.5">{kindLabel(c.kind)}</span>
@@ -84,23 +85,17 @@ export function ApprovalCard() {
           </ul>
         )}
         {reason && (
-          <div className="text-[12px] text-text-secondary">{reason}</div>
+          <div className="text-xs text-text-secondary">{reason}</div>
         )}
       </div>
 
       <div className="px-3 py-2 flex gap-2 border-t border-border">
-        <button
-          onClick={() => answerInteraction(null)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-hue-green/15 text-hue-green text-[12px] font-medium hover:bg-hue-green/25 transition-colors"
-        >
+        <Button variant="success" size="sm" onClick={() => answerInteraction(null)}>
           <Check size={13} /> Approve
-        </button>
-        <button
-          onClick={() => denyInteraction('Declined by user.')}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-hue-red/15 text-hue-red text-[12px] font-medium hover:bg-hue-red/25 transition-colors"
-        >
+        </Button>
+        <Button variant="danger" size="sm" onClick={() => denyInteraction('Declined by user.')}>
           <Ban size={13} /> Decline
-        </button>
+        </Button>
       </div>
     </div>
   );

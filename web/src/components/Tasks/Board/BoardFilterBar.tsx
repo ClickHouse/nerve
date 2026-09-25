@@ -1,5 +1,6 @@
-import { Tag, X } from 'lucide-react';
 import { useTaskStore } from '../../../stores/taskStore';
+import { Button } from '../../ui';
+import { Tag, X } from '../../ui/icons';
 
 /** How many tag facets to offer before it stops being a filter bar. */
 const MAX_FACETS = 12;
@@ -29,27 +30,23 @@ export function BoardFilterBar() {
       {facets.map((tag) => {
         const active = tag.name === tagFilter;
         return (
-          <button
+          <Button
             key={tag.name}
-            onClick={() => setTagFilter(active ? '' : tag.name)}
+            variant="pill"
+            size="xs"
+            active={active}
             aria-pressed={active}
-            className={`shrink-0 px-2 py-0.5 text-[11px] rounded-full border cursor-pointer transition-colors
-              ${active
-                ? 'bg-accent/15 border-accent/40 text-accent'
-                : 'bg-surface-raised border-border-subtle text-text-dim hover:text-text-secondary hover:border-border'}`}
+            onClick={() => setTagFilter(active ? '' : tag.name)}
           >
             {tag.name}
-            <span className="ml-1 tabular-nums opacity-60">{tag.count}</span>
-          </button>
+            <span className="tabular-nums opacity-60">{tag.count}</span>
+          </Button>
         );
       })}
       {tagFilter && (
-        <button
-          onClick={() => setTagFilter('')}
-          className="shrink-0 flex items-center gap-1 px-2 py-0.5 text-[11px] text-text-faint hover:text-text-muted cursor-pointer"
-        >
+        <Button variant="ghost" size="xs" onClick={() => setTagFilter('')}>
           <X size={11} /> Clear
-        </button>
+        </Button>
       )}
     </div>
   );

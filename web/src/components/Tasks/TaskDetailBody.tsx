@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Calendar, Edit3, ExternalLink, Eye, History, Save } from 'lucide-react';
 import type { Task } from '../../api/client';
 import { useTaskStore } from '../../stores/taskStore';
+import { Button, IconButton } from '../ui';
+import { Calendar, Edit3, ExternalLink, Eye, History, Save } from '../ui/icons';
 import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 import { TaskTimeline } from './TaskTimeline';
@@ -58,12 +59,11 @@ export function TaskDetailBody({ task }: { task: Task }) {
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center gap-3 px-5 py-2.5 text-[12px] border-b border-border-subtle shrink-0 flex-wrap">
+      <div className="flex items-center gap-3 px-5 py-2.5 text-xs border-b border-border-subtle shrink-0 flex-wrap">
         <StatusBadge status={task.status} />
         <StatusSelect
           value={task.status}
           onChange={(status) => updateStatus(task.id, status)}
-          className="text-[12px] px-2 py-1 bg-surface-raised border border-border rounded text-text-muted outline-none cursor-pointer"
         />
         {task.deadline && (
           <span className="flex items-center gap-1 text-text-dim">
@@ -83,51 +83,48 @@ export function TaskDetailBody({ task }: { task: Task }) {
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          <button
-            onClick={() => setShowHistory((v) => !v)}
+          <IconButton
+            label="Status history"
+            size="xs"
+            active={showHistory}
             aria-pressed={showHistory}
-            title="Status history"
-            aria-label="Status history"
-            className={`flex items-center gap-1 px-2 py-1 rounded-md cursor-pointer transition-colors
-              ${showHistory ? 'text-accent' : 'text-text-dim hover:text-text-muted'}`}
+            onClick={() => setShowHistory((v) => !v)}
           >
             <History size={13} />
-          </button>
+          </IconButton>
           {dirty && (
             <>
               {saveError && (
-                <span role="alert" className="text-[12px] text-hue-red">
+                <span role="alert" className="text-xs text-error">
                   Save failed — not saved yet.
                 </span>
               )}
-              <button
-                onClick={handleSave}
-                disabled={saving}
-                className="flex items-center gap-1.5 px-3 py-1 text-[12px] bg-accent hover:bg-accent-hover text-white rounded-md cursor-pointer disabled:opacity-50"
-              >
+              <Button variant="primary" size="xs" onClick={handleSave} disabled={saving}>
                 <Save size={12} /> {saving ? 'Saving...' : 'Save'}
-              </button>
+              </Button>
             </>
           )}
-          <div className="flex bg-surface-raised rounded-md border border-border">
-            <button
-              onClick={() => setMode('edit')}
+          {/* `overflow-hidden` so the segments' own radii are clipped by the
+              group rather than fought with a per-corner override. */}
+          <div className="flex bg-surface-raised rounded-md border border-border overflow-hidden">
+            <IconButton
+              label="Edit"
+              size="xs"
+              active={mode === 'edit'}
               aria-pressed={mode === 'edit'}
-              title="Edit"
-              className={`px-2.5 py-1 rounded-l-md cursor-pointer transition-colors
-                ${mode === 'edit' ? 'text-text' : 'text-text-dim hover:text-text-muted'}`}
+              onClick={() => setMode('edit')}
             >
               <Edit3 size={13} />
-            </button>
-            <button
-              onClick={() => setMode('preview')}
+            </IconButton>
+            <IconButton
+              label="Preview"
+              size="xs"
+              active={mode === 'preview'}
               aria-pressed={mode === 'preview'}
-              title="Preview"
-              className={`px-2.5 py-1 rounded-r-md cursor-pointer transition-colors
-                ${mode === 'preview' ? 'text-text' : 'text-text-dim hover:text-text-muted'}`}
+              onClick={() => setMode('preview')}
             >
               <Eye size={13} />
-            </button>
+            </IconButton>
           </div>
         </div>
       </div>
@@ -139,11 +136,19 @@ export function TaskDetailBody({ task }: { task: Task }) {
       )}
 
       {mode === 'edit' ? (
+        // Deliberately *not* the house `TextArea`. That primitive is a form
+        // field — `bg-surface-raised`, a border, a radius and `px-3 py-2` — and
+        // this is a full-bleed document pane that fills the panel and sits on
+        // the sunken surface. Its chrome cannot be undone from here either:
+        // Tailwind emits same-property utilities alphabetically, so
+        // `bg-bg-sunken` on the call site loses to the primitive's
+        // `bg-surface-raised` at equal specificity. The type scale below is the
+        // design system's; the box is this pane's own.
         <textarea
           value={localContent}
           onChange={(e) => { setLocalContent(e.target.value); setDirty(true); setSaveError(false); }}
           onKeyDown={handleKeyDown}
-          className="flex-1 min-h-0 p-5 bg-bg-sunken text-[13px] text-text font-mono leading-relaxed outline-none resize-none"
+          className="flex-1 min-h-0 p-5 bg-bg-sunken text-sm text-text font-mono leading-relaxed outline-none resize-none"
           spellCheck={false}
           placeholder="Task content..."
         />

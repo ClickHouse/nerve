@@ -16,12 +16,31 @@
          there, 404 otherwise. Not a bundled asset: it is per-instance config. -->
     <link rel="icon" href="/favicon.ico" />
     <title>Nerve</title>
+    <!-- Pre-paint theme stamp. Must mirror themeStore's getInitialPreference()
+         and resolve() exactly, or the first frame disagrees with the app.
+
+         Both attributes are needed and they are not interchangeable:
+           data-theme      Nerve's own preference. Absent means "follow the OS",
+                           which a media query in index.css handles.
+           data-cui-theme  Click UI's tokens. It has no "system" value and it
+                           defaults to LIGHT when the attribute is missing —
+                           while Nerve defaults to dark. Leaving it unset is a
+                           white flash on every cold load. -->
     <script>
-      (function() {
+      (function () {
         var p = localStorage.getItem('nerve-theme');
-        if (p === 'light' || p === 'dark') {
+        if (p !== 'light' && p !== 'dark' && p !== 'system') p = 'dark';
+        if (p !== 'system') {
           document.documentElement.setAttribute('data-theme', p);
         }
+        var resolved =
+          p === 'system'
+            ? (window.matchMedia &&
+               window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark')
+            : p;
+        document.documentElement.setAttribute('data-cui-theme', resolved);
       })();
     </script>
   </head>

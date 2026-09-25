@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, FileText, FilePlus, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, FileText, FilePlus, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 
 export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
@@ -20,12 +20,12 @@ export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : 'text-hue-blue'}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-blue'}`} />
         }
-        <span className="text-[13px] font-mono font-medium text-text-secondary">{block.tool}</span>
-        <span className="text-[12px] text-text-dim truncate font-mono">{filePath}</span>
+        <span className="text-sm leading-tight font-mono font-medium text-text-secondary">{block.tool}</span>
+        <span className="text-xs text-text-dim truncate font-mono">{filePath}</span>
         {lineCount && !isWrite && (
-          <span className="text-[10px] text-text-faint shrink-0">{lineCount} lines</span>
+          <span className="text-2xs text-text-faint shrink-0">{lineCount} lines</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -35,13 +35,13 @@ export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
       {expanded && (
         <div className="border-t border-border">
           {block.result !== undefined && (
-            <pre className={`px-3 py-2 text-[12px] font-mono whitespace-pre-wrap max-h-80 overflow-y-auto bg-bg ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+            <pre className={`px-3 py-2 text-xs font-mono whitespace-pre-wrap max-h-80 overflow-y-auto bg-bg ${block.isError ? 'text-error' : 'text-text-muted'}`}>
               {block.result}
             </pre>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> {isWrite ? 'Writing...' : 'Reading...'}
             </div>
           )}

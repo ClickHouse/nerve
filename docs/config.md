@@ -247,7 +247,7 @@ A reload is always explicit. Two things cause one:
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
-| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
+| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
 All of that is reloaded together, and the response says what happened to each
 piece: `POST /api/config/reload` returns `ok`, a per-subsystem `detail`, and an
@@ -907,6 +907,7 @@ from any working directory:
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |
 | `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
 | `agent.cache_ttl_excluded_models` | list | `[]` | Model-name substrings that never request the 1h TTL |
+| `agent.cli_max_message_bytes` | int | `67108864` (64 MiB) | Upper bound on one stream-json message read from the Claude CLI subprocess (the Agent SDK's `max_buffer_size`). The SDK's own default is 1 MiB, and a line over the bound aborts the whole turn — image tool results routinely exceed it: the Read tool ships the base64 image twice per line and re-encodes anything over 2000 px, so a 300 KB screenshot can become a 1.3 MB line. The Read image validator also refuses images whose encoded line cannot fit under this bound, so a too-big image fails as a tool error instead of killing the turn |
 | `agent.agent_teams` | bool | `true` | Set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` for the CLI subprocess, which registers the `SendMessage` tool. The Agent tool advertises `SendMessage` for resuming a sub-agent whether or not the flag is set, so with it off the model reaches for a tool that does not exist. Nerve loads no settings files (`setting_sources=[]`), so the env dict is the flag's only route in. Teammates stay opt-in per turn and cost a full context window each; the CLI cannot restore in-process teammates when a session's client is recycled (idle timeout, restart, crash retry) |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
 | `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
@@ -931,12 +932,13 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.144.1 and < 0.145.0
-  min_version: 0.144.1
-  max_version: 0.145.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.154.0
+  min_version: 0.153.1
+  max_version: 0.154.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
+  models: [gpt-6-astra]    # hidden catalog entries to offer when the account serves them
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
   sandbox: danger-full-access   # read-only | workspace-write | danger-full-access
@@ -946,6 +948,7 @@ codex:                     # active when a codex backend is selected
   turn_idle_timeout_seconds: null  # null → agent.cli_idle_timeout_seconds
   pricing:                      # $/1M tokens — cost is None for unlisted models
     gpt-5.6-sol: {input: 5.0, cached_input: 0.5, output: 30.0}
+    gpt-6-astra: {input: 10.0, cached_input: 1.0, output: 50.0}  # >272K-token requests bill more; not modelled
   extra_config: {}              # arbitrary codex -c key=value passthrough
   ultracode:                    # optional managed third-party orchestrator
     enabled: false

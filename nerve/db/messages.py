@@ -20,12 +20,20 @@ class MessageStore:
         external_id: str | None = None,
         native_turn_id: str | None = None,
         created_at: str | None = None,
+        bump_updated_at: bool = True,
     ) -> int:
         """Insert a message row. ``external_id`` enables idempotent ingest
         from external sources (Codex thread sync, MCP server).
 
         ``created_at`` lets external ingesters preserve original Codex
         timestamps. Defaults to ``CURRENT_TIMESTAMP`` for native callers.
+
+        ``bump_updated_at=False`` records the row without moving the
+        session's ``updated_at``: the sidebar sorts on that column, and a
+        turn nobody asked for (a fired wakeup, a background task settling)
+        must not shuffle the list under the user. ``message_count`` still
+        advances — the message is real, only the "last activity" clock is
+        left alone.
         """
         async with self._atomic():
             if created_at is not None:
@@ -51,11 +59,17 @@ class MessageStore:
                 ) as cursor:
                     msg_id = cursor.lastrowid
             # Update session timestamp and message counter
-            now = datetime.now(timezone.utc).isoformat()
-            await self.db.execute(
-                "UPDATE sessions SET updated_at = ?, message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
-                (now, session_id),
-            )
+            if bump_updated_at:
+                now = datetime.now(timezone.utc).isoformat()
+                await self.db.execute(
+                    "UPDATE sessions SET updated_at = ?, message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
+                    (now, session_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE sessions SET message_count = COALESCE(message_count, 0) + 1 WHERE id = ?",
+                    (session_id,),
+                )
         return msg_id
 
     async def get_native_turn_at_message(
@@ -92,6 +106,67 @@ class MessageStore:
         ) as cursor:
             row = await cursor.fetchone()
         return str(row[0]) if row else None
+
+    async def copy_messages_to_session(
+        self,
+        source_session_id: str,
+        dest_session_id: str,
+        up_to_native_turn_id: str | None = None,
+    ) -> int:
+        """Copy message rows into a freshly forked session.
+
+        The fork's *native* context is carried by the backend (Claude
+        ``--fork-session`` / Codex ``thread/fork``); these copies exist so
+        the forked chat *displays* the conversation it remembers. Copies
+        keep ``created_at`` (history reads chronologically), ``native_turn_id``
+        (so a fork can itself be forked at a copied message — both backends
+        preserve entry/turn ids across a fork), and get a synthetic
+        ``external_id`` (``forkcopy:<source row id>``) for provenance.
+
+        ``up_to_native_turn_id`` bounds the copy at the assistant row that
+        completed that native turn — the same boundary the backend truncates
+        the native context at, so display and context never disagree.
+        Returns the number of rows copied.
+        """
+        boundary_id: int | None = None
+        if up_to_native_turn_id is not None:
+            async with self.db.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND native_turn_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (source_session_id, up_to_native_turn_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                raise ValueError(
+                    f"native turn {up_to_native_turn_id!r} not found in "
+                    f"session {source_session_id}"
+                )
+            boundary_id = int(row[0])
+
+        where = "session_id = ?"
+        params: list = [dest_session_id, source_session_id]
+        if boundary_id is not None:
+            where += " AND id <= ?"
+            params.append(boundary_id)
+
+        async with self._atomic():
+            async with self.db.execute(
+                f"""INSERT INTO messages
+                      (session_id, role, content, thinking, blocks, channel,
+                       external_id, native_turn_id, created_at)
+                    SELECT ?, role, content, thinking, blocks, channel,
+                           'forkcopy:' || id, native_turn_id, created_at
+                    FROM messages WHERE {where} ORDER BY id ASC""",
+                params,
+            ) as cursor:
+                copied = cursor.rowcount or 0
+            if copied:
+                await self.db.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (copied, dest_session_id),
+                )
+        return copied
 
     async def add_message_idempotent(
         self,

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Plus, Trash2, Sparkles, HelpCircle, StickyNote } from 'lucide-react';
+import { Plus, Trash2, Sparkles, HelpCircle, StickyNote } from '../ui/icons';
+import { Button } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import type { QuoteAction } from '../../stores/chatStore';
 
@@ -138,15 +139,17 @@ export function SelectionToolbar({ containerRef }: { containerRef: React.RefObje
     >
       <div className="flex items-center bg-surface-raised border border-border rounded-lg shadow-xl shadow-black/50 overflow-hidden">
         {ACTIONS.map(({ action, icon: Icon, label }) => (
-          <button
+          <Button
             key={action}
+            variant="ghost"
+            size="sm"
             onClick={() => handleAction(action)}
             title={label}
-            className="flex items-center gap-1.5 px-3 py-2 text-[12px] text-text-muted hover:text-white hover:bg-surface-hover transition-colors cursor-pointer border-r border-border last:border-r-0"
+            className="py-2 rounded-none border-r border-border last:border-r-0 hover:bg-surface-hover"
           >
             <Icon size={13} />
             <span>{label}</span>
-          </button>
+          </Button>
         ))}
       </div>
     </div>

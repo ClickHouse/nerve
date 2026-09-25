@@ -1,0 +1,259 @@
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react';
+import { overridable } from './styles';
+
+/**
+ * The app's button.
+ *
+ * Deliberately **not** Click UI's `Button`: that one renders its content from a
+ * `label` string plus an `iconLeft`/`iconRight` icon name, and takes no
+ * children. Most buttons in this app hold real markup — an icon element, a
+ * truncating span, a count badge — which it cannot take. Click UI's `Button` is
+ * the right thing for a plain labelled button; import it directly.
+ *
+ * Everything the design system does contribute reaches this through the
+ * semantic tokens (`bg-accent`, `text-text-muted`, `border-border-subtle`),
+ * which is where Click UI's palette is bound.
+ */
+
+export type ButtonVariant =
+  | 'primary'
+  | 'secondary'
+  | 'ghost'
+  | 'subtle'
+  | 'danger'
+  | 'dangerGhost'
+  | 'dangerSolid'
+  | 'success'
+  | 'warning'
+  | 'info'
+  | 'accent'
+  | 'accentSoft'
+  | 'link'
+  | 'pill'
+  | 'tab';
+
+export type ButtonSize = 'xs' | 'sm' | 'md';
+
+const VARIANTS: Record<ButtonVariant, string> = {
+  /**
+   * The page's one committing action.
+   *
+   * `text-on-accent`, never `text-white`: the accent is ClickHouse yellow in
+   * dark mode, where white is unreadable on it. `overridable` lets a call site
+   * correct a wrong default, but 1.1:1 text is not something a reviewer will
+   * spot at the call site, so it has to be right here.
+   */
+  primary: 'text-on-accent bg-accent hover:bg-accent-hover rounded-lg font-medium',
+  /** Sits beside a primary without competing with it. */
+  secondary:
+    'text-text-secondary bg-surface-raised hover:bg-surface-hover border border-border rounded-lg',
+  /**
+   * Bare label; only the text colour moves. For "Cancel", "Show more".
+   * Resting colour lives in INACTIVE — see the note there.
+   */
+  ghost: 'rounded',
+  /**
+   * The menu/list-row shape: no chrome at rest, a surface on hover.
+   * Resting colour lives in INACTIVE — see the note there.
+   */
+  subtle: 'rounded',
+  /**
+   * Destructive, tinted. Uses `hue-red` rather than a stock `red-*` so it
+   * follows the light theme; a stock red is one fixed value in both themes.
+   */
+  danger:
+    'text-hue-red bg-hue-red/15 hover:bg-hue-red/25 rounded-md font-medium',
+  /**
+   * Affirmative, but *not* the page's primary action — "Accept as-is",
+   * "Adopt & continue", "Start review loop". Green rather than accent, because
+   * the accent is ClickHouse yellow and reads as neither.
+   *
+   * Tinted, not solid, and that is forced rather than chosen: `--theme-success`
+   * is Click UI's feedback *foreground*, which in dark mode is a pale mint
+   * (#ccffd0). `bg-success text-white` measures 1.12:1. Text-on-tint is the
+   * only pairing legible in both themes (10.5:1 dark, 7.3:1 light).
+   */
+  success:
+    'text-success bg-success-bg border border-success-border hover:border-success rounded-md font-medium',
+  /** Same shape as `success`, for a cautionary action. 5.7:1 dark, 5.3:1 light. */
+  warning:
+    'text-warning bg-warning-bg border border-warning-border hover:border-warning rounded-md font-medium',
+  /** Same shape as `success`, for an informational action. 7.2:1 dark, 6.2:1 light. */
+  info: 'text-info bg-info-bg border border-info-border hover:border-info rounded-md font-medium',
+  /**
+   * The accent member of the tinted family, for a committing action that must
+   * not shout — a list of answer options where every one is equally valid, or a
+   * button standing beside `success`/`danger` siblings that has to read as the
+   * same kind of control. `primary` would be too loud on all of them, and
+   * `accent` has no fill so it reads as a link.
+   *
+   * Like the other tinted variants it is never paired with `active`, so it sets
+   * its colour directly rather than going through INACTIVE.
+   */
+  accentSoft:
+    'text-accent bg-accent/15 border border-accent/30 hover:bg-accent/25 rounded-md font-medium',
+  /**
+   * An accent-coloured text button that is *not* a selection — "Clear filter",
+   * "View processing session". Distinct from `link` (which drops the padding to
+   * sit inside a sentence) and from `ghost active` (which would claim the
+   * control is currently selected).
+   */
+  accent: 'text-accent hover:bg-surface-raised rounded',
+  /**
+   * Destructive, but quiet until pointed at — the row-level delete/remove/purge
+   * treatment. Distinct from `danger`, which is already red at rest and shouts
+   * from inside a list.
+   */
+  dangerGhost: 'text-text-dim hover:text-hue-red hover:bg-hue-red/10 rounded',
+  /**
+   * Destructive and unmissable — for the confirm step, not the trigger.
+   *
+   * `bg-error-solid`, not `bg-hue-red`. `hue-red` is an *identity* hue meant
+   * for text on the page background, so it flips to a light #ff7575 in dark
+   * mode, where white on it measures 2.61:1. `error-solid` is a
+   * theme-independent palette entry (#c10000 both ways), giving 6.43:1 in
+   * either theme.
+   */
+  dangerSolid:
+    'text-white bg-error-solid hover:bg-error-solid/90 rounded-md font-medium',
+  /** An inline affordance that reads as a link but acts as a button. */
+  link: 'text-accent hover:underline rounded',
+  /** Filter chip. Pair with `active`. */
+  pill: 'rounded-full border whitespace-nowrap',
+  /** Underlined tab. Pair with `active`. */
+  tab: 'font-medium border-b-2 rounded-none',
+};
+
+/**
+ * The selected treatment, per variant: an active control is accent on an accent
+ * tint.
+ *
+ * **Any variant with an entry here must set no colour in VARIANTS.** Its
+ * resting colour goes in INACTIVE instead, so that exactly one of the two sets
+ * is ever on the element.
+ *
+ * That is not tidiness, it is the only thing that works. Tailwind v4 emits
+ * same-property utilities in alphabetical order of class name, so between two
+ * colour classes on one element the later-*sorting* name wins — not the one
+ * written last, and not the one from the "more specific" map. `.text-accent`
+ * sorts before every other colour token in this app; measured in the built
+ * stylesheet it lands at offset 49085, against `.text-hue-red` 51903,
+ * `.text-on-accent` 52978, `.text-text-dim` 53924, `.text-text-faint` 53967,
+ * `.text-text-muted` 54167, `.text-text-secondary` 54214 and `.text-white`
+ * 54310. An accent `ACTIVE` appended after a coloured base therefore loses,
+ * silently, and a `border-transparent` in the base outsorts, and so beats,
+ * `ACTIVE.tab`'s `border-accent`.
+ *
+ * `overridable` does not rescue this. It resolves the *caller's* `className`
+ * against these tables and deliberately leaves collisions between the tables
+ * themselves in place, so that they still reach the DOM where the test can see
+ * them. `Button.test.tsx` pins the invariant.
+ */
+const ACTIVE: Partial<Record<ButtonVariant, string>> = {
+  pill: 'bg-accent/15 text-accent border-accent/30',
+  tab: 'text-accent border-accent',
+  subtle: 'bg-accent/15 text-accent',
+  ghost: 'text-accent',
+};
+
+const INACTIVE: Partial<Record<ButtonVariant, string>> = {
+  pill: 'text-text-dim border-border hover:text-text-muted',
+  tab: 'text-text-dim border-transparent hover:text-text-muted',
+  ghost: 'text-text-muted hover:text-text-secondary',
+  /**
+   * `hover:text-text` is the load-bearing half of this. Do not drop it.
+   *
+   * `subtle` is the menu/list-row variant, and rows frequently sit *inside* a
+   * raised group — a segmented control puts `bg-surface-raised` on the
+   * container and the segments sit directly on it (`TasksPage`'s Board/List
+   * switch is exactly that shape). A `hover:bg-surface-raised` segment would
+   * then be hovering to the colour it is already on, and the control would go
+   * dead.
+   *
+   * `surface-hover` rather than `surface-raised` is better, but it does not
+   * rescue that case on its own, so it is no reason to drop the text move. Both
+   * are `color-mix` of the same two near-neutral greys: `surface-raised` is
+   * 50/50, `surface-hover` is 25/75. In dark those inputs are #282828 and
+   * #323232, so the two land roughly 2 units apart out of 255; in light
+   * (#f6f7fa, #e6e7e9) roughly 4. On a raised parent that step is essentially
+   * invisible, and the text is the only thing the eye actually gets. A
+   * genuinely distinct surface step would need a token the palette does not
+   * have.
+   *
+   * The text moves *up* from the resting colour rather than the resting colour
+   * moving down: dimming ~71 list rows at rest to buy a hover state on one
+   * segmented control would be a bad trade. Both hovers are `hover:`-prefixed,
+   * so they carry a pseudo-class and sit outside the ordering hazard on ACTIVE
+   * — this pair is decided by specificity, not by class name.
+   */
+  subtle: 'text-text-secondary hover:text-text hover:bg-surface-hover',
+};
+
+const SIZES: Record<ButtonSize, string> = {
+  xs: 'px-2 py-1 text-xs gap-1',
+  sm: 'px-3 py-1.5 text-xs gap-1.5',
+  md: 'px-3 py-2 text-sm gap-2',
+};
+
+/**
+ * `link` takes the type scale but not the padding — a link sitting in a
+ * sentence cannot carry a button's box.
+ *
+ * A separate table rather than a `px-0` at each of the ~30 call sites: the
+ * padding is wrong for *every* link, not for some of them, and `overridable`
+ * exists for the exceptions rather than for the rule.
+ */
+const LINK_SIZES: Record<ButtonSize, string> = {
+  xs: 'text-xs gap-1',
+  sm: 'text-xs gap-1.5',
+  md: 'text-sm gap-2',
+};
+
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  /** Selected/current. Only `pill`, `tab`, `subtle` and `ghost` render it. */
+  active?: boolean;
+  /** Stretch to the container. Off by default; a bare `w-full` in the base
+   *  classes would fight every caller that wants an intrinsic width. */
+  fullWidth?: boolean;
+  children?: ReactNode;
+}
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button(
+  {
+    variant = 'secondary',
+    size = 'sm',
+    active = false,
+    fullWidth = false,
+    className,
+    type,
+    children,
+    ...rest
+  },
+  ref,
+) {
+  const state = active ? ACTIVE[variant] : INACTIVE[variant];
+  return (
+    <button
+      ref={ref}
+      // Buttons inside a form default to `submit` and will submit it. Almost
+      // none of these are submit buttons, and the ones that are say so.
+      type={type ?? 'button'}
+      className={overridable(
+        [
+          'inline-flex items-center justify-center shrink-0 cursor-pointer',
+          'transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+          variant === 'link' ? LINK_SIZES[size] : SIZES[size],
+          VARIANTS[variant],
+          state,
+          fullWidth && 'w-full',
+        ],
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+});

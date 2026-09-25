@@ -113,6 +113,51 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# Reasoning-effort vocabulary shared by nerve's effort_map values and the
+# app-server catalog, weakest first. Used only to clamp a requested effort
+# down to what the serving model advertises.
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _catalog_entries(result: dict) -> list[dict]:
+    """The model entries of a ``model/list`` result (defensive)."""
+    models = result.get("data") or result.get("models") or []
+    return [item for item in models if isinstance(item, dict)]
+
+
+def _model_id(item: dict) -> str:
+    return str(item.get("id") or item.get("model") or item.get("slug") or "")
+
+
+def _supported_efforts(item: dict) -> list[str]:
+    """``supportedReasoningEfforts`` as plain strings (empty = unknown)."""
+    out: list[str] = []
+    for entry in item.get("supportedReasoningEfforts") or []:
+        value = entry.get("reasoningEffort") if isinstance(entry, dict) else entry
+        if isinstance(value, str) and value and value not in out:
+            out.append(value)
+    return out
+
+
+def clamp_effort(effort: str | None, supported: list[str]) -> str | None:
+    """Clamp *effort* to the strongest advertised level at or below it.
+
+    The catalog is advisory: an unknown model, an empty list or an effort
+    outside the shared vocabulary passes through untouched and the
+    app-server decides. An entry that advertises only up to ``high`` gets
+    ``high`` for a ``max``/``ultra`` request instead of a failed turn.
+    """
+    if not effort or not supported or effort in supported:
+        return effort
+    if effort not in _EFFORT_ORDER:
+        return effort
+    rank = {name: i for i, name in enumerate(_EFFORT_ORDER)}
+    lower = [s for s in supported if s in rank and rank[s] <= rank[effort]]
+    if not lower:
+        return effort
+    return max(lower, key=lambda s: rank[s])
+
+
 class CodexBackend:
     """OpenAI Codex app-server backend."""
 
@@ -132,6 +177,37 @@ class CodexBackend:
         self._preflight_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
+
+    def catalog(self, entries: list[dict]) -> dict[str, Any]:
+        """Digest a ``model/list`` (``includeHidden``) result.
+
+        ``offered`` feeds the picker: every visible entry plus the configured
+        ``codex.models`` the live catalog actually serves (hidden entries are
+        hidden upstream for a reason — internal previews, reviewers — so they
+        are opt-in by name). ``allowed`` is what a session may run on: the
+        whole catalog, hidden included, plus the configured models
+        unconditionally. ``efforts`` maps model id → advertised reasoning
+        efforts, for clamping turn requests.
+        """
+        visible: list[str] = []
+        all_ids: list[str] = []
+        efforts: dict[str, list[str]] = {}
+        for item in entries:
+            model_id = _model_id(item)
+            if not model_id:
+                continue
+            all_ids.append(model_id)
+            if not item.get("hidden"):
+                visible.append(model_id)
+            efforts[model_id] = _supported_efforts(item)
+        configured = [m for m in (self.codex.models or []) if m]
+        return {
+            "listed": sorted(set(all_ids)),
+            "offered": sorted({*visible, *(m for m in configured if m in all_ids)}),
+            "allowed": sorted({*all_ids, *configured}),
+            "hidden": sorted(set(all_ids) - set(visible)),
+            "efforts": efforts,
+        }
 
     @property
     def config(self):
@@ -171,6 +247,7 @@ class CodexBackend:
         allowed = {
             self.codex.model,
             self.codex.cron_model or self.codex.model,
+            *(self.codex.models or []),
             *(self.codex.pricing or {}).keys(),
             *self._live_models,
         }
@@ -275,7 +352,12 @@ class CodexBackend:
                         raise BackendError(
                             "Codex is not authenticated. To fix: " + self.auth_hint()
                         )
-                    model_result = await transport.request("model/list", {}, timeout=10)
+                    # includeHidden: the catalog omits API-only entries such
+                    # as GPT-6 Astra from the default picker list; nerve
+                    # decides what to offer (see ``catalog``).
+                    model_result = await transport.request(
+                        "model/list", {"includeHidden": True}, timeout=10,
+                    )
                     try:
                         rate_result = await transport.request(
                             "account/rateLimits/read", {}, timeout=10,
@@ -284,17 +366,15 @@ class CodexBackend:
                         rate_result = {}
                 finally:
                     await transport.close()
-                models = model_result.get("data") or model_result.get("models") or []
-                model_ids = sorted({
-                    str(item.get("id") or item.get("model") or item.get("slug"))
-                    for item in models if isinstance(item, dict)
-                    and (item.get("id") or item.get("model") or item.get("slug"))
-                })
-                if model_ids and self.codex.model not in model_ids:
+                catalog = self.catalog(_catalog_entries(model_result))
+                model_ids = catalog["offered"]
+                # An empty catalog (older/odd app-server) skips the check,
+                # as before; a populated one must allow the default model.
+                if catalog["listed"] and self.codex.model not in catalog["allowed"]:
                     raise BackendError(
                         f"Configured Codex model {self.codex.model!r} is unavailable"
                     )
-                self._live_models = set(model_ids)
+                self._live_models = set(catalog["allowed"])
                 rate_limits = rate_result.get("rateLimits")
                 if isinstance(rate_limits, dict):
                     self._rate_limits = rate_limits
@@ -318,6 +398,7 @@ class CodexBackend:
                     ),
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
+                    "hidden_models": catalog["hidden"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,
                     "ultracode": plugin,
@@ -634,6 +715,9 @@ class CodexClient(AgentClient):
         self._ultracode_priced_worker_count = 0
         self._ultracode_runs: set[str] = set()
         self._effective_auth = "unknown"
+        # model id -> advertised reasoning efforts (from model/list at
+        # connect); empty until then, which leaves efforts unclamped.
+        self._model_efforts: dict[str, list[str]] = {}
 
     # -- protocol --------------------------------------------------------- #
 
@@ -722,25 +806,40 @@ class CodexClient(AgentClient):
         self._thread_id = str(thread_id)
 
     async def _validate_live_model(self) -> None:
-        """Confirm the selected model against the authenticated app-server."""
+        """Confirm the selected model against the authenticated app-server.
+
+        Hidden catalog entries count (GPT-6 Astra is hidden upstream), as
+        do the configured ``codex.models``; the model's advertised
+        reasoning efforts are kept for :meth:`start_turn` to clamp against.
+        """
         try:
-            response = await self._transport.request("model/list", {})
+            response = await self._transport.request(
+                "model/list", {"includeHidden": True},
+            )
         except CodexRpcError as e:
             raise BackendError(
                 f"Codex model discovery failed; the app-server protocol is "
                 f"not compatible: {e}"
             ) from e
-        models = response.get("data") or response.get("models") or []
-        ids = {
-            str(item.get("id") or item.get("model") or item.get("slug"))
-            for item in models if isinstance(item, dict)
-        }
-        ids.discard("")
-        if ids and self.model not in ids:
+        catalog = self._backend.catalog(_catalog_entries(response))
+        self._model_efforts = catalog["efforts"]
+        allowed = catalog["allowed"]
+        if catalog["listed"] and self.model not in allowed:
             raise BackendError(
                 f"Codex model {self.model!r} is unavailable for the current "
-                f"account (available: {sorted(ids)})"
+                f"account (available: {catalog['offered'] or allowed})"
             )
+
+    def turn_effort(self) -> str | None:
+        """The reasoning effort for the next turn, clamped to the model."""
+        effort = self._backend.map_effort(self._spec.effort)
+        clamped = clamp_effort(effort, self._model_efforts.get(self.model) or [])
+        if clamped != effort:
+            logger.info(
+                "Codex model %s does not advertise effort %r; sending %r",
+                self.model, effort, clamped,
+            )
+        return clamped
 
     async def _ensure_auth(self) -> None:
         """Best-effort auth check with a clear operator hint.
@@ -809,7 +908,7 @@ class CodexClient(AgentClient):
             "threadId": self._thread_id,
             "input": self._build_input_items(turn),
         }
-        effort = self._backend.map_effort(self._spec.effort)
+        effort = self.turn_effort()
         if effort:
             params["effort"] = effort
 

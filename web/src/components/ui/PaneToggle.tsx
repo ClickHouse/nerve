@@ -1,11 +1,13 @@
-import { PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { PanelLeftClose, PanelLeftOpen } from './icons';
+import { IconButton } from './IconButton';
 
 /**
  * Opens/closes a page's side pane once it has collapsed into a drawer.
  *
  * Same icon pair and position as the chat header's sidebar toggle, so the
  * control for "show me the list" is in the same corner on every page that
- * has a list.
+ * has a list. Both glyphs keep the bar on the same edge, so only the arrow
+ * turns over as the toggle flips.
  */
 export function PaneToggle({ open, onToggle, label }: {
   open: boolean;
@@ -15,14 +17,15 @@ export function PaneToggle({ open, onToggle, label }: {
 }) {
   const action = `${open ? 'Hide' : 'Show'} ${label}`;
   return (
-    <button
+    <IconButton
+      label={action}
       onClick={onToggle}
-      title={action}
-      aria-label={action}
       aria-expanded={open}
-      className="w-8 h-8 -ml-1 shrink-0 flex items-center justify-center rounded text-text-faint hover:text-text-muted hover:bg-surface-raised cursor-pointer transition-colors"
+      // Pulls the button's own box back out of the header's leading gap, so the
+      // glyph lines up with the title beside it rather than the button's edge.
+      className="-ml-1"
     >
       {open ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
-    </button>
+    </IconButton>
   );
 }

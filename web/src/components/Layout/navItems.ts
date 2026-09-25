@@ -1,11 +1,13 @@
 import {
   MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, Clock,
-  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket,
-} from 'lucide-react';
+  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, type Icon,
+} from '../ui/icons';
 
 export type NavItem = {
   path: string;
-  icon: typeof MessageSquare;
+  /** The destination's glyph. `Icon` is the shape every icon in `ui/icons`
+   *  has, so NavRail and BottomNav can both render it as `<Icon size={n}/>`. */
+  icon: Icon;
   label: string;
   /** Hidden unless the named feature is enabled. */
   feature?: 'ultracode';

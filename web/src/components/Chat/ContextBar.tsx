@@ -42,10 +42,12 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
     ? (usage.cache_read_input_tokens / totalInput * 100)
     : 0;
 
-  // Color based on usage level
-  let barColor = '#3b82f6'; // blue
-  if (pct > 80) barColor = '#ef4444'; // red
-  else if (pct > 60) barColor = '#f59e0b'; // amber
+  // Colour by usage level. These land in an inline `backgroundColor`, so they
+  // reference the theme variables directly rather than Tailwind classes —
+  // same tokens, resolved at paint time, so they follow the theme.
+  let barColor = 'var(--theme-info)';
+  if (pct > 80) barColor = 'var(--theme-error)';
+  else if (pct > 60) barColor = 'var(--theme-warning)';
 
   return (
     <div
@@ -53,7 +55,7 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
       onMouseEnter={() => setHovering(true)}
       onMouseLeave={() => setHovering(false)}
     >
-      <span className="text-[11px] text-text-dim whitespace-nowrap">
+      <span className="text-xs text-text-dim whitespace-nowrap">
         ~{formatTokens(estimatedContext)} / {formatTokens(max)}
       </span>
       <div className="w-20 h-1.5 bg-border-subtle rounded-full overflow-hidden">
@@ -65,30 +67,30 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
 
       {hovering && (
         <div className="absolute right-0 top-full mt-2 z-50 bg-surface-raised border border-border-subtle rounded-lg p-3 shadow-xl min-w-[220px]">
-          <div className="text-[11px] text-text-muted uppercase tracking-wider mb-2">Context Window</div>
-          <div className="space-y-1.5 text-[12px]">
+          <div className="text-xs text-text-muted uppercase tracking-wider mb-2">Context Window</div>
+          <div className="space-y-1.5 text-xs leading-tight">
             <Row label="Est. context" value={estimatedContext} bold />
             <Row label="Max context" value={max} />
-            <Row label="Remaining" value={Math.max(0, max - estimatedContext)} color={pct > 80 ? '#ef4444' : '#22c55e'} />
+            <Row label="Remaining" value={Math.max(0, max - estimatedContext)} color={pct > 80 ? 'var(--theme-error)' : 'var(--theme-success)'} />
 
             {/* Per-turn token breakdown */}
             <div className="border-t border-border-subtle my-1.5" />
-            <div className="text-[11px] text-text-muted uppercase tracking-wider mb-1">
+            <div className="text-xs text-text-muted uppercase tracking-wider mb-1">
               Turn Tokens (cumulative)
             </div>
             <Row label="Fresh input" value={usage.input_tokens} />
             <Row label="Output" value={usage.output_tokens} />
             {usage.cache_read_input_tokens > 0 && (
-              <Row label="Cache read" value={usage.cache_read_input_tokens} color="#22c55e" />
+              <Row label="Cache read" value={usage.cache_read_input_tokens} color="var(--theme-success)" />
             )}
             {usage.cache_creation_input_tokens > 0 && (
-              <Row label="Cache created" value={usage.cache_creation_input_tokens} color="#a855f7" />
+              <Row label="Cache created" value={usage.cache_creation_input_tokens} color="var(--theme-hue-purple)" />
             )}
             {(usage.cache_creation_5m_input_tokens ?? 0) > 0 && (
-              <Row label="  ↳ 5m TTL" value={usage.cache_creation_5m_input_tokens!} color="#c084fc" />
+              <Row label="  ↳ 5m TTL" value={usage.cache_creation_5m_input_tokens!} color="var(--theme-hue-violet)" />
             )}
             {(usage.cache_creation_1h_input_tokens ?? 0) > 0 && (
-              <Row label="  ↳ 1h TTL" value={usage.cache_creation_1h_input_tokens!} color="#e879f9" />
+              <Row label="  ↳ 1h TTL" value={usage.cache_creation_1h_input_tokens!} color="var(--theme-hue-violet)" />
             )}
             {numCalls > 1 && (
               <div className="flex justify-between items-center">
@@ -99,14 +101,14 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
 
             {/* Cost section */}
             <div className="border-t border-border-subtle my-1.5" />
-            <div className="text-[11px] text-text-muted uppercase tracking-wider mb-1">Cost</div>
+            <div className="text-xs text-text-muted uppercase tracking-wider mb-1">Cost</div>
             {(sessionCostUsd ?? 0) > 0 && (
               <CostRow label="Session total" value={sessionCostUsd!} bold />
             )}
             {cacheRate > 0 && (
               <div className="flex justify-between items-center">
                 <span className="text-text-muted">Cache hit rate</span>
-                <span className="text-text-muted" style={{ color: cacheRate > 50 ? '#22c55e' : undefined }}>
+                <span className={cacheRate > 50 ? 'text-success' : 'text-text-muted'}>
                   {cacheRate.toFixed(1)}%
                 </span>
               </div>

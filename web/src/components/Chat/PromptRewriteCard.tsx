@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Sparkles, X, RotateCcw, CornerDownLeft, ChevronRight, Loader2 } from 'lucide-react';
+import { Sparkles, X, RotateCcw, CornerDownLeft, ChevronRight, Loader2 } from '../ui/icons';
+import { Button, IconButton, TextArea } from '../ui';
 
 export type RewriteCardState =
   | { status: 'loading' }
@@ -70,38 +71,34 @@ export function PromptRewriteCard({ state, original, onApprove, onSendOriginal, 
   const canApprove = state.status === 'ready' && edited.trim().length > 0;
 
   return (
-    <div className="rewrite-card relative rounded-xl border border-hue-purple/25 bg-surface overflow-hidden shadow-[0_8px_40px_-12px_rgba(168,85,247,0.25)]">
+    <div className="rewrite-card relative rounded-xl border border-hue-purple/25 bg-surface overflow-hidden shadow-[0_8px_40px_-12px] shadow-hue-purple/25">
       {/* Gradient hairline */}
-      <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-purple-400/60 to-transparent" />
+      <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-hue-purple/60 to-transparent" />
 
       {/* Header */}
       <div className="flex items-center gap-2 px-4 pt-3 pb-2">
         <Sparkles size={14} className="text-hue-purple shrink-0" />
-        <span className="text-[11px] font-medium uppercase tracking-wider text-hue-purple">
+        <span className="text-xs font-medium uppercase tracking-wider text-hue-purple">
           {STATE_LABELS[state.status]}
         </span>
         {state.status === 'ready' && (
-          <span className="text-[10px] text-text-muted bg-surface-raised px-1.5 py-0.5 rounded">
+          <span className="text-2xs text-text-muted bg-surface-raised px-1.5 py-0.5 rounded">
             {formatModel(state.model)}
           </span>
         )}
         {state.status === 'ready' && edited !== state.rewritten && (
-          <span className="text-[10px] text-text-faint italic">edited</span>
+          <span className="text-2xs text-text-faint italic">edited</span>
         )}
         <div className="flex-1" />
-        <button
-          onClick={onDiscard}
-          className="text-text-faint hover:text-text-muted transition-colors cursor-pointer"
-          title="Dismiss (Esc)"
-        >
+        <IconButton label="Dismiss (Esc)" size="xs" onClick={onDiscard}>
           <X size={15} />
-        </button>
+        </IconButton>
       </div>
 
       {/* Body */}
       {state.status === 'loading' && (
         <div className="px-4 pb-3">
-          <div className="flex items-center gap-2 text-[13px] text-text-muted mb-3">
+          <div className="flex items-center gap-2 text-sm text-text-muted mb-3">
             <Loader2 size={13} className="animate-spin text-hue-purple" />
             <span>Refining your prompt…</span>
           </div>
@@ -111,19 +108,17 @@ export function PromptRewriteCard({ state, original, onApprove, onSendOriginal, 
             <div className="rewrite-shimmer h-3 rounded w-[55%]" />
           </div>
           <div className="flex justify-end mt-3">
-            <button
-              onClick={onDiscard}
-              className="px-3 py-1.5 text-[12px] text-text-muted hover:text-text-secondary rounded-lg cursor-pointer transition-colors"
-            >
+            <Button variant="ghost" size="sm" onClick={onDiscard} className="rounded-lg">
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {state.status === 'ready' && (
         <div className="px-4 pb-3">
-          <textarea
+          <TextArea
+            bare
             ref={editRef}
             value={edited}
             onChange={(e) => setEdited(e.target.value)}
@@ -134,70 +129,66 @@ export function PromptRewriteCard({ state, original, onApprove, onSendOriginal, 
               }
             }}
             rows={2}
-            className="w-full bg-transparent text-[14px] leading-relaxed text-text outline-none resize-none placeholder:text-text-faint"
+            className="text-sm leading-relaxed"
             placeholder="Rewritten prompt…"
           />
 
           {/* Original message — collapsible */}
-          <button
+          <Button
+            variant="ghost"
+            size="xs"
             onClick={() => setShowOriginal(v => !v)}
-            className="mt-1 flex items-center gap-1 text-[11px] text-text-muted hover:text-text-secondary cursor-pointer transition-colors"
+            aria-expanded={showOriginal}
+            className="mt-1 px-0 py-0 gap-1"
           >
             <ChevronRight
               size={12}
               className={`transition-transform ${showOriginal ? 'rotate-90' : ''}`}
             />
             <span>Original message</span>
-          </button>
+          </Button>
           {showOriginal && (
-            <div className="mt-1.5 ml-1 pl-3 border-l-2 border-border text-[12px] text-text-muted whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto">
+            <div className="mt-1.5 ml-1 pl-3 border-l-2 border-border text-xs text-text-muted whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto">
               {original}
             </div>
           )}
 
           {/* Actions */}
           <div className="flex items-center gap-2 mt-3">
-            <span className="text-[11px] text-text-faint hidden sm:block">
+            <span className="text-xs text-text-faint hidden sm:block">
               Enter to send · Esc to dismiss
             </span>
             <div className="flex-1" />
-            <button
-              onClick={onSendOriginal}
-              className="px-3 py-1.5 text-[12px] text-text-secondary bg-surface-raised hover:bg-surface-hover border border-border rounded-lg cursor-pointer transition-colors"
-            >
+            <Button size="sm" onClick={onSendOriginal}>
               Send original
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
               onClick={() => canApprove && onApprove(edited.trim())}
               disabled={!canApprove}
-              className="px-3.5 py-1.5 text-[12px] font-medium text-white bg-accent hover:bg-accent-hover rounded-lg flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-30"
+              className="px-3.5 gap-1.5"
             >
               <CornerDownLeft size={12} />
               <span>Send</span>
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {state.status === 'error' && (
         <div className="px-4 pb-3">
-          <div className="text-[13px] text-error/90 mb-3 break-words">
+          <div className="text-sm text-error/90 mb-3 break-words">
             {state.message}
           </div>
           <div className="flex items-center gap-2 justify-end">
-            <button
-              onClick={onRetry}
-              className="px-3 py-1.5 text-[12px] text-text-muted hover:text-text-secondary rounded-lg flex items-center gap-1.5 cursor-pointer transition-colors"
-            >
+            <Button variant="ghost" size="sm" onClick={onRetry} className="rounded-lg gap-1.5">
               <RotateCcw size={12} />
               <span>Retry</span>
-            </button>
-            <button
-              onClick={onSendOriginal}
-              className="px-3.5 py-1.5 text-[12px] font-medium text-white bg-accent hover:bg-accent-hover rounded-lg cursor-pointer transition-colors"
-            >
+            </Button>
+            <Button variant="primary" size="sm" onClick={onSendOriginal} className="px-3.5">
               Send original
-            </button>
+            </Button>
           </div>
         </div>
       )}

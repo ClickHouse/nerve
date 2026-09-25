@@ -13,6 +13,8 @@
  */
 
 import { useEffect, useState, useCallback } from 'react';
+import { api } from '../../api/client';
+import { Badge, Button } from '../ui';
 import {
   Activity,
   AlertCircle,
@@ -25,8 +27,7 @@ import {
   RefreshCw,
   Trash2,
   XCircle,
-} from 'lucide-react';
-import { api } from '../../api/client';
+} from '../ui/icons';
 
 type AgentFile = {
   path: string;
@@ -139,7 +140,7 @@ export function ExternalAgentsSection() {
   if (loading) {
     return (
       <section>
-        <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+        <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
           <ExternalLink size={14} /> External Agents
         </h2>
         <div className="text-text-faint text-sm">Loading...</div>
@@ -150,10 +151,10 @@ export function ExternalAgentsSection() {
   if (!state) {
     return (
       <section>
-        <h2 className="text-[14px] font-medium text-text-muted mb-3 flex items-center gap-2">
+        <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
           <ExternalLink size={14} /> External Agents
         </h2>
-        <div className="text-hue-red text-sm">Failed to load</div>
+        <div className="text-error text-sm">Failed to load</div>
       </section>
     );
   }
@@ -165,21 +166,17 @@ export function ExternalAgentsSection() {
   return (
     <section>
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-[14px] font-medium text-text-muted flex items-center gap-2">
+        <h2 className="text-sm font-medium text-text-muted flex items-center gap-2">
           <ExternalLink size={14} /> External Agents
-          <span className="text-text-faint text-[11px]">
+          <span className="text-text-faint text-xs">
             (sync every {state.sync_interval_minutes}m, policy: {state.conflict_policy})
           </span>
         </h2>
         {configured.length > 0 && (
-          <button
+          <Button
+            size="md"
             onClick={onSyncAll}
             disabled={syncing}
-            className={`flex items-center gap-1.5 px-3 py-2 text-[12px] bg-surface border border-border-subtle rounded-lg cursor-pointer transition-colors shrink-0 ${
-              syncing
-                ? 'text-text-faint cursor-not-allowed'
-                : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-            }`}
             title="Re-render every configured agent's memory bundle"
           >
             {syncing ? (
@@ -191,7 +188,7 @@ export function ExternalAgentsSection() {
                 <RefreshCw size={12} /> Sync now
               </>
             )}
-          </button>
+          </Button>
         )}
       </div>
 
@@ -215,14 +212,14 @@ export function ExternalAgentsSection() {
       </div>
 
       {unconfigured.length > 0 && (
-        <div className="mt-4 text-[12px] text-text-faint">
+        <div className="mt-4 text-xs text-text-faint">
           <div className="mb-1">Available but not configured:</div>
           <ul className="list-disc pl-5 space-y-0.5">
             {unconfigured.map((a) => (
               <li key={a.name}>
                 {a.display_name}
                 {a.cli_installed && (
-                  <span className="text-hue-emerald"> (CLI installed)</span>
+                  <span className="text-success"> (CLI installed)</span>
                 )}
               </li>
             ))}
@@ -255,19 +252,15 @@ function AgentCard({
     <div className="border border-border-subtle rounded-lg p-4 bg-surface">
       <div className="flex items-start justify-between mb-3">
         <div>
-          <div className="flex items-center gap-2 text-[14px] font-medium text-text-secondary">
+          <div className="flex items-center gap-2 text-sm font-medium text-text-secondary">
             {agent.display_name ?? agent.name}
-            {!enabled && (
-              <span className="text-[11px] text-text-faint border border-border-subtle px-1.5 py-0.5 rounded">
-                paused
-              </span>
-            )}
+            {!enabled && <Badge size="sm">paused</Badge>}
           </div>
-          <div className="text-[11px] text-text-dim mt-1 flex items-center gap-2 flex-wrap">
+          <div className="text-xs text-text-dim mt-1 flex items-center gap-2 flex-wrap">
             <span className="flex items-center gap-1">
               {installed ? (
                 <>
-                  <CheckCircle2 size={11} className="text-hue-emerald" />
+                  <CheckCircle2 size={11} className="text-success" />
                   CLI installed
                   {agent.cli_version && (
                     <span className="text-text-faint">({agent.cli_version})</span>
@@ -288,14 +281,10 @@ function AgentCard({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          <button
+          <Button
+            size="xs"
             onClick={() => onToggle(agent.name, !enabled)}
             disabled={busy}
-            className={`flex items-center gap-1 px-2 py-1 text-[11px] border border-border-subtle rounded transition-colors ${
-              busy
-                ? 'text-text-faint cursor-not-allowed'
-                : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised cursor-pointer'
-            }`}
             title={enabled ? 'Pause sync for this agent' : 'Resume sync'}
           >
             {enabled ? (
@@ -307,24 +296,24 @@ function AgentCard({
                 <Play size={11} /> Resume
               </>
             )}
-          </button>
-          <button
+          </Button>
+          {/* `dangerGhost`, not `danger`: this sits on a card that is repeated
+              once per agent, and a red-at-rest button on every one of them
+              reads as an alarm rather than an action. */}
+          <Button
+            variant="dangerGhost"
+            size="xs"
             onClick={() => onRemove(agent.name)}
             disabled={busy}
-            className={`flex items-center gap-1 px-2 py-1 text-[11px] border border-border-subtle rounded transition-colors ${
-              busy
-                ? 'text-text-faint cursor-not-allowed'
-                : 'text-hue-red/80 hover:text-hue-red hover:bg-surface-raised cursor-pointer'
-            }`}
             title="Remove from sync (files on disk are left intact)"
           >
             <Trash2 size={11} /> Remove
-          </button>
+          </Button>
         </div>
       </div>
 
       {agent.last_error && (
-        <div className="text-[11px] text-hue-red flex items-start gap-1.5 mb-3">
+        <div className="text-xs text-error flex items-start gap-1.5 mb-3">
           <AlertCircle size={11} className="mt-0.5 shrink-0" />
           <span className="break-all">{agent.last_error}</span>
         </div>
@@ -335,7 +324,7 @@ function AgentCard({
           {files.map((f) => (
             <div
               key={f.path}
-              className="flex items-center justify-between gap-3 text-[11px]"
+              className="flex items-center justify-between gap-3 text-xs"
             >
               <div className="flex items-center gap-1.5 min-w-0 flex-1">
                 <FileText size={11} className="text-text-faint shrink-0" />
@@ -348,11 +337,11 @@ function AgentCard({
                 {f.skipped ? (
                   <span className="text-text-faint">unchanged</span>
                 ) : f.error ? (
-                  <span className="text-hue-red flex items-center gap-1">
+                  <span className="text-error flex items-center gap-1">
                     <XCircle size={11} /> error
                   </span>
                 ) : f.written_at ? (
-                  <span className="text-hue-emerald flex items-center gap-1">
+                  <span className="text-success flex items-center gap-1">
                     <CheckCircle2 size={11} /> {relativeTime(f.written_at)}
                   </span>
                 ) : null}

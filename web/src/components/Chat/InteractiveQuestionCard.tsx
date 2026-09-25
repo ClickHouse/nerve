@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ExternalLink, MessageCircleQuestion, Send, X } from 'lucide-react';
+import { ExternalLink, MessageCircleQuestion, Send, X } from '../ui/icons';
+import { Button, TextField } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 
 interface QuestionOption {
@@ -78,10 +79,10 @@ export function InteractiveQuestionCard() {
     <div className="mx-4 mb-2 border border-accent/30 rounded-lg bg-surface shadow-lg overflow-hidden">
       <div className="px-3 py-2 flex items-center gap-2 bg-accent/10">
         <MessageCircleQuestion size={15} className="text-accent" />
-        <span className="text-[13px] font-medium text-text-primary">
+        <span className="text-sm font-medium text-text">
           {message || 'Codex needs your input'}
         </span>
-        <span className="ml-auto text-[11px] text-text-muted">waiting</span>
+        <span className="ml-auto text-xs text-text-muted">waiting</span>
       </div>
       <div className="px-3 py-3 space-y-3">
         {url && (
@@ -89,7 +90,7 @@ export function InteractiveQuestionCard() {
             href={url}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-1.5 text-[12px] text-accent hover:underline break-all"
+            className="flex items-center gap-1.5 text-xs text-accent hover:underline break-all"
           >
             <ExternalLink size={12} />
             {url}
@@ -102,8 +103,8 @@ export function InteractiveQuestionCard() {
           return (
             <div key={key} className="space-y-2">
               <div>
-                {q.header && <div className="text-[10px] uppercase tracking-wide text-accent/70">{q.header}</div>}
-                <div className="text-[13px] text-text-secondary">{q.question}</div>
+                {q.header && <div className="text-2xs uppercase tracking-wide text-accent/70">{q.header}</div>}
+                <div className="text-sm text-text-secondary">{q.question}</div>
               </div>
               {options.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
@@ -111,29 +112,37 @@ export function InteractiveQuestionCard() {
                     const value = option.value ?? option.label;
                     const active = (selected[key] ?? []).includes(value);
                     return (
-                      <button
+                      <Button
                         key={value}
+                        variant="pill"
+                        size="sm"
+                        active={active}
+                        // A toggle button: a plain button that stays lit.
+                        // `role="radio"` / `role="checkbox"` with `aria-checked`
+                        // would announce a keyboard model the group does not
+                        // implement — there is no `radiogroup`, no roving tab
+                        // stop and no arrow-key movement, so every option is
+                        // separately tabbable and the arrow keys do nothing.
+                        aria-pressed={active}
                         onClick={() => choose(q, value)}
                         title={option.description}
-                        className={`px-2.5 py-1.5 rounded border text-[12px] cursor-pointer ${active
-                          ? 'border-accent/50 bg-accent/10 text-accent-text'
-                          : 'border-border-subtle text-text-muted hover:text-text-secondary hover:border-border'}`}
+                        className="rounded px-2.5 py-1.5"
                       >
                         {option.label}
-                      </button>
+                      </Button>
                     );
                   })}
                 </div>
               )}
               {showText && (
-                <input
+                <TextField
                   type={q.isSecret ? 'password' : 'text'}
                   value={text[key] ?? ''}
                   onChange={(event) => setText(current => ({ ...current, [key]: event.target.value }))}
                   onKeyDown={(event) => { if (event.key === 'Enter' && complete) submit(); }}
                   placeholder={q.allowOther && options.length ? 'Other…' : 'Type your answer…'}
                   autoComplete="off"
-                  className="w-full px-2.5 py-2 rounded border border-border bg-bg-sunken text-[13px] text-text-primary outline-none focus:border-accent/50"
+                  className="px-2.5 rounded"
                 />
               )}
             </div>
@@ -141,19 +150,12 @@ export function InteractiveQuestionCard() {
         })}
       </div>
       <div className="px-3 py-2 border-t border-border-subtle flex justify-end gap-2">
-        <button
-          onClick={() => deny('Declined by user.')}
-          className="px-2.5 py-1.5 rounded text-[12px] text-text-muted hover:bg-surface-raised flex items-center gap-1 cursor-pointer"
-        >
+        <Button variant="subtle" size="sm" onClick={() => deny('Declined by user.')}>
           <X size={12} /> Decline
-        </button>
-        <button
-          onClick={submit}
-          disabled={!complete}
-          className="px-3 py-1.5 rounded text-[12px] bg-accent text-white disabled:opacity-40 flex items-center gap-1 cursor-pointer disabled:cursor-not-allowed"
-        >
+        </Button>
+        <Button variant="primary" size="sm" onClick={submit} disabled={!complete} className="rounded">
           <Send size={12} /> Continue
-        </button>
+        </Button>
       </div>
     </div>
   );

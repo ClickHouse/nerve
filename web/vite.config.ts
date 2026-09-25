@@ -23,5 +23,15 @@ export default defineConfig({
     // Components are asserted on behaviour and ARIA, never on Tailwind
     // classes, so there is nothing to gain from processing the stylesheet.
     css: false,
+    server: {
+      deps: {
+        // Click UI's components import their own CSS alongside themselves.
+        // Left external, those imports reach Node directly and it refuses the
+        // `.css` extension; run through Vite they resolve to the stub that
+        // `css: false` installs. Any spec that renders a Click UI component
+        // needs this.
+        inline: ['@clickhouse/click-ui'],
+      },
+    },
   },
 })

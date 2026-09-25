@@ -1,5 +1,5 @@
 import { useState, lazy, Suspense } from 'react';
-import { ChevronRight, ChevronDown, FileEdit, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, FileEdit, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 
 // The diff renderer pulls in @pierre/diffs + Shiki — only loaded when an Edit
@@ -21,10 +21,10 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <FileEdit size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : 'text-hue-amber'}`} />
+          : <FileEdit size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-amber'}`} />
         }
-        <span className="text-[13px] font-mono font-medium text-text-secondary">Edit</span>
-        <span className="text-[12px] text-text-dim truncate font-mono">{filePath}</span>
+        <span className="text-sm leading-tight font-mono font-medium text-text-secondary">Edit</span>
+        <span className="text-xs text-text-dim truncate font-mono">{filePath}</span>
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
@@ -36,7 +36,7 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
           <div className="max-h-80 overflow-y-auto">
             <Suspense
               fallback={
-                <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+                <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
                   <Loader2 size={12} className="animate-spin" /> Loading diff…
                 </div>
               }
@@ -48,12 +48,12 @@ export function EditToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Error */}
           {block.isError && block.result && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <pre className="text-[12px] font-mono text-hue-red whitespace-pre-wrap">{block.result}</pre>
+              <pre className="text-xs font-mono text-error whitespace-pre-wrap">{block.result}</pre>
             </div>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Applying edit...
             </div>
           )}

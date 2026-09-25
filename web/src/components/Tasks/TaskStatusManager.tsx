@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
-import { X, Plus, Trash2, Pencil, Check, Lock } from 'lucide-react';
 import {
   useTaskStatusStore,
   statusBadgeStyle,
   type TaskStatusDef,
 } from '../../stores/taskStatusStore';
-import { Modal } from '../ui/Modal';
+import { Badge, Button, IconButton, Modal, TextArea, TextField } from '../ui';
+import { X, Plus, Trash2, Pencil, Check, Lock } from '../ui/icons';
 
 const PALETTE = [
   '#ef4444', '#f97316', '#f59e0b', '#eab308', '#84cc16', '#22c55e',
@@ -112,6 +112,9 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
           style={{ backgroundColor: color }}
           title="Pick a color"
         >
+          {/* A bare `<input>`, not `TextField`: it is invisible, stretched over
+              the swatch, and the swatch itself is the control. `TextField`'s
+              field chrome would be painted onto something with `opacity-0`. */}
           <input
             type="color"
             value={color}
@@ -119,50 +122,51 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
             className="absolute inset-0 opacity-0 cursor-pointer"
           />
         </label>
-        <input
+        <TextField
           value={name}
           onChange={e => setName(e.target.value)}
           placeholder="name (e.g. in_review)"
           autoFocus
-          className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
+          fullWidth={false}
+          className="flex-1"
         />
-        <input
+        <TextField
           value={label}
           onChange={e => setLabel(e.target.value)}
           placeholder="Label (optional)"
-          className="flex-1 px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50"
+          fullWidth={false}
+          className="flex-1"
         />
       </div>
-      <textarea
+      <TextArea
         value={description}
         onChange={e => setDescription(e.target.value)}
         rows={2}
         placeholder="Description (optional)"
-        className="w-full px-3 py-2 bg-surface border border-border-subtle rounded-lg text-[13px] text-text outline-none focus:border-accent/50 resize-none"
       />
       <div className="flex justify-end gap-2">
-        <button
-          onClick={resetAdd}
-          className="px-3 py-1.5 text-[13px] text-text-muted hover:text-text cursor-pointer"
-        >
+        <Button variant="ghost" onClick={resetAdd}>
           Cancel
-        </button>
-        <button
+        </Button>
+        <Button
+          variant="primary"
           onClick={handleCreate}
           disabled={busy || !name.trim()}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] bg-accent hover:bg-accent-hover text-white rounded-lg cursor-pointer disabled:opacity-50"
         >
           <Plus size={14} /> Add status
-        </button>
+        </Button>
       </div>
     </div>
   ) : (
-    <button
+    // `accent` rather than a ghost carrying an accent class: a call site cannot
+    // recolour a variant (Tailwind orders colour utilities alphabetically), and
+    // this control is an accent-text affordance, not a selected one.
+    <Button
+      variant="accent"
       onClick={() => { setColor(randomColor()); setShowAdd(true); }}
-      className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] text-accent hover:bg-accent/10 rounded-lg cursor-pointer"
     >
       <Plus size={14} /> New status
-    </button>
+    </Button>
   );
 
   return (
@@ -176,7 +180,7 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
     >
       <div className="p-5 space-y-2">
         {error && (
-          <div className="px-3 py-2 mb-1 text-[12px] text-hue-red bg-red-400/10 border border-red-400/20 rounded-lg">
+          <div className="px-3 py-2 mb-1 text-xs text-error bg-error-bg border border-error-border rounded-lg">
             {error}
           </div>
         )}
@@ -184,7 +188,8 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
           {statuses.map(s => (
             <div key={s.name} className="border border-border-subtle rounded-lg p-3">
               <div className="flex items-center gap-3">
-                {/* Color swatch — click to recolor */}
+                {/* Color swatch — click to recolor. Bare `<input>` for the
+                    same reason as the one in the add form above. */}
                 <label
                   className="relative w-6 h-6 rounded-full border border-border shrink-0 cursor-pointer"
                   style={{ backgroundColor: s.color }}
@@ -200,78 +205,87 @@ export function TaskStatusManager({ onClose }: { onClose: () => void }) {
 
                 <div className="min-w-0 flex-1">
                   {editing === s.name ? (
-                    <input
+                    <TextField
+                      fieldSize="sm"
                       value={editLabel}
                       onChange={e => setEditLabel(e.target.value)}
-                      className="w-full px-2 py-1 text-[13px] bg-surface border border-border-subtle rounded text-text outline-none focus:border-accent/50"
                       placeholder="Label"
                     />
                   ) : (
                     <div className="flex items-center gap-2">
-                      <span style={statusBadgeStyle(s.color)} className="px-2 py-0.5 rounded-full border text-[12px]">
+                      {/* User-configured hex, not a theme token — inline, as
+                          `Badge` leaves `style` open for. */}
+                      <Badge size="sm" pill outline style={statusBadgeStyle(s.color)}>
                         {s.label}
-                      </span>
-                      <code className="text-[11px] text-text-faint">{s.name}</code>
+                      </Badge>
+                      <code className="text-xs text-text-faint">{s.name}</code>
                       {!!s.is_system && (
-                        <span className="flex items-center gap-1 text-[10px] text-text-faint" title="Protected — cannot be deleted">
-                          <Lock size={10} /> protected
-                        </span>
+                        <Badge size="xs" title="Protected — cannot be deleted">
+                          <Lock size={10} />
+                          protected
+                        </Badge>
                       )}
                     </div>
                   )}
                   {editing !== s.name && s.description && (
-                    <div className="text-[12px] text-text-dim mt-1">{s.description}</div>
+                    <div className="text-xs text-text-dim mt-1">{s.description}</div>
                   )}
                 </div>
 
                 <div className="flex items-center gap-1 shrink-0">
                   {editing === s.name ? (
                     <>
-                      <button
+                      {/* `IconButton` has no success tone and a green class on
+                          the button would lose to the variant's own colour, so
+                          the hue goes on the icon — the house convention for a
+                          tinted control. */}
+                      <IconButton
+                        label="Save"
+                        size="xs"
                         onClick={() => saveEdit(s)}
                         disabled={busy}
-                        className="p-1.5 text-hue-green hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
-                        title="Save"
                       >
-                        <Check size={14} />
-                      </button>
-                      <button
+                        <Check size={14} className="text-hue-green" />
+                      </IconButton>
+                      <IconButton
+                        label="Cancel"
+                        size="xs"
                         onClick={() => setEditing(null)}
-                        className="p-1.5 text-text-faint hover:bg-surface-hover rounded cursor-pointer"
-                        title="Cancel"
                       >
                         <X size={14} />
-                      </button>
+                      </IconButton>
                     </>
                   ) : (
                     <>
-                      <button
+                      <IconButton
+                        label="Edit label & description"
+                        size="xs"
                         onClick={() => beginEdit(s)}
-                        className="p-1.5 text-text-faint hover:text-text-muted hover:bg-surface-hover rounded cursor-pointer"
-                        title="Edit label & description"
                       >
                         <Pencil size={14} />
-                      </button>
-                      <button
+                      </IconButton>
+                      <IconButton
+                        label={s.is_system ? 'Protected status' : 'Delete'}
+                        size="xs"
+                        variant="dangerGhost"
                         onClick={() => handleDelete(s)}
                         disabled={!!s.is_system}
-                        className="p-1.5 text-text-faint hover:text-hue-red hover:bg-surface-hover rounded cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                        title={s.is_system ? 'Protected status' : 'Delete'}
                       >
                         <Trash2 size={14} />
-                      </button>
+                      </IconButton>
                     </>
                   )}
                 </div>
               </div>
 
               {editing === s.name && (
-                <textarea
+                <TextArea
+                  fieldSize="sm"
                   value={editDesc}
                   onChange={e => setEditDesc(e.target.value)}
                   rows={2}
                   placeholder="Description (optional)"
-                  className="mt-2 w-full px-2 py-1 text-[12px] bg-surface border border-border-subtle rounded text-text outline-none focus:border-accent/50 resize-none"
+                  className="mt-2"
                 />
               )}
             </div>

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, RefreshCw, Zap, CheckCircle, XCircle, Clock } from 'lucide-react';
+import { Plus, RefreshCw, Zap, CheckCircle, XCircle, Clock } from '../components/ui/icons';
 import { useSkillsStore, type Skill } from '../stores/skillsStore';
-import { Modal } from '../components/ui/Modal';
+import { Badge, Button, Modal, TextArea, TextField } from '../components/ui';
 
 function SkillCard({ skill }: { skill: Skill }) {
   const navigate = useNavigate();
@@ -20,24 +20,30 @@ function SkillCard({ skill }: { skill: Skill }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="text-sm font-medium text-text truncate">{skill.name}</h3>
-            <span className="text-[10px] text-text-dim bg-surface-raised px-1.5 py-0.5 rounded">
-              v{skill.version}
-            </span>
+            <Badge>v{skill.version}</Badge>
           </div>
           <p className="text-xs text-text-muted mt-1 line-clamp-2">{skill.description}</p>
         </div>
+        {/* A switch, not an icon button: the track *is* the control, so there
+            is no glyph for `IconButton` to take as children.
+
+            `bg-success-solid`, not `bg-success`: the white knob has to stay
+            legible on the track, and the bare token is a feedback *foreground*
+            — pale mint in dark mode, where the knob would vanish. */}
         <button
+          type="button"
           onClick={(e) => { e.stopPropagation(); toggleSkill(skill.id, !skill.enabled); }}
           className={`ml-3 w-8 h-4 rounded-full transition-colors flex items-center shrink-0 cursor-pointer ${
-            skill.enabled ? 'bg-emerald-600 justify-end' : 'bg-border-subtle justify-start'
+            skill.enabled ? 'bg-success-solid justify-end' : 'bg-border-subtle justify-start'
           }`}
           title={skill.enabled ? 'Enabled' : 'Disabled'}
+          aria-pressed={skill.enabled}
         >
           <div className="w-3 h-3 rounded-full bg-white mx-0.5" />
         </button>
       </div>
 
-      <div className="flex items-center gap-4 mt-3 text-[10px] text-text-dim">
+      <div className="flex items-center gap-4 mt-3 text-2xs text-text-dim">
         <div className="flex items-center gap-1">
           <Zap size={10} />
           <span>{skill.total_invocations} uses</span>
@@ -87,42 +93,43 @@ function CreateSkillDialog() {
       closeOnBackdrop={false}
       footer={
         <>
-          <button onClick={() => setShowCreateDialog(false)} className="px-3 py-1.5 text-xs text-text-muted hover:text-text-secondary cursor-pointer">
+          <Button variant="ghost" onClick={() => setShowCreateDialog(false)}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="primary"
             onClick={handleCreate}
             disabled={!name.trim() || !description.trim() || actionLoading}
-            className="px-3 py-1.5 text-xs bg-accent text-white rounded hover:bg-accent-hover disabled:opacity-50 cursor-pointer disabled:cursor-default"
           >
             {actionLoading ? 'Creating...' : 'Create Skill'}
-          </button>
+          </Button>
         </>
       }
     >
       <div className="p-4 space-y-3">
         <div>
           <label className="text-xs text-text-muted block mb-1">Name</label>
-          <input
+          <TextField
             value={name} onChange={e => setName(e.target.value)}
-            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent"
             placeholder="e.g. code-review"
             autoFocus
           />
         </div>
         <div>
           <label className="text-xs text-text-muted block mb-1">Description</label>
-          <textarea
+          <TextArea
             value={description} onChange={e => setDescription(e.target.value)}
-            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[60px] resize-y"
+            resizable
+            className="min-h-[60px]"
             placeholder='This skill should be used when the user asks to "review code"...'
           />
         </div>
         <div>
           <label className="text-xs text-text-muted block mb-1">Instructions (optional)</label>
-          <textarea
+          <TextArea
             value={content} onChange={e => setContent(e.target.value)}
-            className="w-full bg-bg border border-border rounded px-3 py-1.5 text-sm text-text outline-none focus:border-accent min-h-[120px] resize-y font-mono text-xs"
+            resizable
+            className="min-h-[120px] font-mono text-xs"
             placeholder="Markdown instructions for the agent..."
           />
         </div>
@@ -142,27 +149,23 @@ export function SkillsPage() {
       <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
         <div className="flex items-center gap-2">
           <h1 className="text-sm font-medium text-text">Skills</h1>
-          <span className="text-[10px] text-text-dim bg-surface-raised px-1.5 py-0.5 rounded">
-            {skills.length}
-          </span>
+          <Badge>{skills.length}</Badge>
         </div>
         <div className="flex items-center gap-2">
-          <button
+          <Button
+            variant="subtle"
+            size="xs"
             onClick={syncSkills}
             disabled={actionLoading}
-            className="flex items-center gap-1 px-2 py-1 text-xs text-text-muted hover:text-text-secondary hover:bg-surface-hover rounded cursor-pointer disabled:opacity-50"
             title="Re-scan filesystem for new skills"
           >
             <RefreshCw size={12} className={actionLoading ? 'animate-spin' : ''} />
             Sync
-          </button>
-          <button
-            onClick={() => setShowCreateDialog(true)}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-accent text-white rounded hover:bg-accent-hover cursor-pointer"
-          >
+          </Button>
+          <Button variant="primary" size="xs" onClick={() => setShowCreateDialog(true)}>
             <Plus size={12} />
             New Skill
-          </button>
+          </Button>
         </div>
       </div>
 

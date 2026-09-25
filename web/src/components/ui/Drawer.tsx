@@ -19,6 +19,25 @@ import { safeAreaInsets } from '../../utils/safeArea';
  * `side` distinguishes the two jobs navigation does on a phone: `left` for
  * "which item within this section" (the chat session list), `right` for
  * "which section of the app" (the nav overflow behind More).
+ *
+ * **Why this is not Click UI's `Flyout`.** Four reasons, and each is one of the
+ * behaviours above:
+ *
+ * 1. `Flyout` defaults to `modal={false}` — a non-modal Radix dialog, so no
+ *    focus trap, no `aria-modal`, and nothing stopping Tab from walking onto
+ *    the transcript behind it. On a phone this surface *is* covering the page.
+ * 2. It unmounts its content when closed. The slide has to animate in both
+ *    directions, which is why this one stays mounted and parked off-screen.
+ * 3. Radix dismisses on Escape with `preventDefault()` and nothing more, so the
+ *    global Escape shortcut ("stop the agent") would still fire behind it.
+ *    `useModalSurface` claims the key with `stopPropagation()`.
+ * 4. Its sizes are the desktop side-panel set (`narrow`/`wide`/`widest`) over a
+ *    relative or absolute positioning strategy — not a 85vw-capped-at-320px
+ *    sheet pinned to the viewport, and nothing in it pays the safe-area inset
+ *    that a viewport-pinned surface owes.
+ *
+ * `Flyout` is the right component for a desktop detail panel. This is a phone
+ * sheet. Click UI reaches it through the surface and border tokens below.
  */
 export function Drawer({ open, onClose, side = 'left', label, children }: {
   open: boolean;

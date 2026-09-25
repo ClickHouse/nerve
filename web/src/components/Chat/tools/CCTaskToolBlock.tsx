@@ -1,4 +1,4 @@
-import { ChevronRight, ChevronDown, Plus, Pencil, ListTodo, FileText, OctagonX, Radio, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Plus, Pencil, ListTodo, FileText, OctagonX, Radio, Loader2 } from '../../ui/icons';
 import { useState } from 'react';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { extractResultText } from '../../../utils/extractResultText';
@@ -20,6 +20,9 @@ export function CCTaskToolBlock({ block }: { block: ToolCallBlockData }) {
   let Icon = ListTodo;
   let label = block.tool;
   let summary = '';
+  // Identity, not status: the hue says *which* task tool ran (create / update /
+  // stop), so it stays on `hue-*`. Only `block.isError` — the call's actual
+  // outcome — swaps in a status token, at the render site below.
   let iconColor = 'text-text-muted';
 
   switch (block.tool) {
@@ -90,10 +93,10 @@ export function CCTaskToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : iconColor}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : iconColor}`} />
         }
-        <span className="text-[13px] font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
-        {summary && <span className="text-[12px] text-text-muted truncate">{summary}</span>}
+        <span className="text-sm leading-tight font-medium text-text-secondary shrink-0 whitespace-nowrap">{label}</span>
+        {summary && <span className="text-xs text-text-muted truncate">{summary}</span>}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
@@ -103,8 +106,8 @@ export function CCTaskToolBlock({ block }: { block: ToolCallBlockData }) {
         <div className="border-t border-border">
           {/* Input */}
           <div className="px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">Input</div>
-            <pre className="text-[12px] text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-40 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
+            <div className="text-2xs uppercase tracking-wider text-text-faint mb-1">Input</div>
+            <pre className="text-xs text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-40 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
               {JSON.stringify(input, null, 2)}
             </pre>
           </div>
@@ -112,17 +115,17 @@ export function CCTaskToolBlock({ block }: { block: ToolCallBlockData }) {
           {/* Result */}
           {resultText && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">
+              <div className="text-2xs uppercase tracking-wider text-text-faint mb-1">
                 {block.isError ? 'Error' : 'Result'}
               </div>
-              <pre className={`text-[12px] whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle ${block.isError ? 'text-hue-red' : 'text-text-muted'}`}>
+              <pre className={`text-xs whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle ${block.isError ? 'text-error' : 'text-text-muted'}`}>
                 {resultText}
               </pre>
             </div>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Running...
             </div>
           )}

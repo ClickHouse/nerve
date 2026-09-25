@@ -1,14 +1,20 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, HelpCircle, ShieldCheck, X } from 'lucide-react';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
+import { Button, IconButton, type ButtonVariant } from '../ui';
+import { Bell, HelpCircle, ShieldCheck, X } from '../ui/icons';
 
 const TOAST_DURATION = 5000;
 
-const APPROVAL_QUICK_BUTTON_STYLES: Record<string, string> = {
-  approve: 'bg-emerald-400/15 text-hue-emerald border-emerald-400/30 hover:bg-emerald-400/25',
-  decline: 'bg-red-400/15 text-hue-red border-red-400/30 hover:bg-red-400/25',
-  snooze_24h: 'bg-border-subtle/40 text-text-muted border-border-subtle hover:bg-border-subtle/60',
+/**
+ * The three canonical approval answers, as button variants. `success` and
+ * `danger` are both *tinted*: `--theme-success` is a feedback foreground (pale
+ * mint in dark mode) and would be unreadable as a solid fill.
+ */
+const APPROVAL_QUICK_VARIANTS: Record<string, ButtonVariant> = {
+  approve: 'success',
+  decline: 'danger',
+  snooze_24h: 'secondary',
 };
 
 const APPROVAL_QUICK_LABELS: Record<string, string> = {
@@ -72,12 +78,13 @@ export function NotificationToast() {
                   >
                     {notif.title}
                   </p>
-                  <button
+                  <IconButton
+                    label="Dismiss"
+                    size="xs"
                     onClick={() => dismissToast(notif.id)}
-                    className="text-text-faint hover:text-text-muted shrink-0 cursor-pointer"
                   >
                     <X size={14} />
-                  </button>
+                  </IconButton>
                 </div>
                 {notif.body && (
                   <p className="text-xs text-text-muted mt-0.5 line-clamp-2">{notif.body}</p>
@@ -85,38 +92,40 @@ export function NotificationToast() {
                 {/* Quick answer buttons for questions */}
                 {isQuestion && options && notif.status === 'pending' && (
                   <div className="flex flex-wrap gap-1.5 mt-2">
+                    {/* The pill chip, in its selected treatment: an answer
+                        option is a choice among a set. */}
                     {options.slice(0, 3).map((opt: string) => (
-                      <button
+                      <Button
                         key={opt}
+                        variant="pill"
+                        size="xs"
+                        active
                         onClick={() => {
                           answerNotification(notif.id, opt);
                           dismissToast(notif.id);
                         }}
-                        className="px-2 py-0.5 bg-accent/15 text-accent rounded text-xs border border-accent/30 hover:bg-accent/25 cursor-pointer"
                       >
                         {opt}
-                      </button>
+                      </Button>
                     ))}
                   </div>
                 )}
                 {/* Quick action buttons for approvals */}
                 {isApproval && options && notif.status === 'pending' && (
                   <div className="flex flex-wrap gap-1.5 mt-2">
-                    {options.slice(0, 3).map((value: string) => {
-                      const style = APPROVAL_QUICK_BUTTON_STYLES[value] || 'bg-accent/15 text-accent border-accent/30 hover:bg-accent/25';
-                      return (
-                        <button
-                          key={value}
-                          onClick={() => {
-                            answerNotification(notif.id, value);
-                            dismissToast(notif.id);
-                          }}
-                          className={`px-2 py-0.5 rounded text-xs border cursor-pointer ${style}`}
-                        >
-                          {quickLabel(value, notif)}
-                        </button>
-                      );
-                    })}
+                    {options.slice(0, 3).map((value: string) => (
+                      <Button
+                        key={value}
+                        variant={APPROVAL_QUICK_VARIANTS[value] ?? 'secondary'}
+                        size="xs"
+                        onClick={() => {
+                          answerNotification(notif.id, value);
+                          dismissToast(notif.id);
+                        }}
+                      >
+                        {quickLabel(value, notif)}
+                      </Button>
+                    ))}
                   </div>
                 )}
               </div>

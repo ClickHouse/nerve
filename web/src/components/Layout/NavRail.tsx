@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { LogOut } from 'lucide-react';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
+import { IconButton } from '../ui';
+import { LogOut } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS } from './navItems';
 
@@ -38,6 +39,15 @@ export function NavRail() {
           const active = location.pathname.startsWith(path);
           const isNotifs = path === '/notifications';
           return (
+            // A native button, not `Button`/`IconButton`: this is a 40×40 cell
+            // holding an icon *above* a label, and every `Button` size carries
+            // at least `px-2`. Tailwind emits the values of one utility in
+            // ascending order, so a call site's `px-0` loses to the variant's
+            // `px-2` at equal specificity — the padding cannot be removed, and
+            // 40px minus 16px does not fit the word "Notifs".
+            //
+            // The active treatment below is `Button variant="subtle" active`'s,
+            // spelled out, so the two agree on what "current" looks like.
             <button
               key={path}
               onClick={() => navigate(path)}
@@ -49,9 +59,15 @@ export function NavRail() {
               title={label}
             >
               <Icon size={18} />
-              <span className="text-[9px]">{label}</span>
+              {/* 10px/14px: the label has to clear the 18px glyph inside 40px. */}
+              <span className="text-2xs leading-none">{label}</span>
+              {/* bg-error-solid, not bg-error. The bare status token is Click
+                  UI's feedback *foreground* — pale #ffbaba in dark — so white
+                  on it is 1.62:1. `-solid` is a theme-independent ramp entry
+                  (#c10000, 6.43:1 both ways). The plain token is still right
+                  for the connection dot, which carries no text. */}
               {isNotifs && pendingCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-red-500 rounded-full text-[9px] text-white flex items-center justify-center font-medium">
+                <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-error-solid rounded-full text-2xs leading-none text-white flex items-center justify-center font-medium">
                   {pendingCount > 9 ? '9+' : pendingCount}
                 </span>
               )}
@@ -61,16 +77,12 @@ export function NavRail() {
       </div>
 
       <div className="flex flex-col items-center gap-2">
-        <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-emerald-400' : 'bg-red-400'}`}
+        <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
         <ThemeToggle />
-        <button
-          onClick={logout}
-          className="w-10 h-10 rounded-lg flex items-center justify-center text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
-          title="Logout"
-        >
+        <IconButton label="Logout" size="md" onClick={logout}>
           <LogOut size={16} />
-        </button>
+        </IconButton>
       </div>
     </div>
   );

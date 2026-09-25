@@ -46,6 +46,12 @@ def _rss_mb(pid: int) -> float:
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=None)
+    parser.add_argument("--effort", default="low", help="nerve effort (default low)")
+    parser.add_argument(
+        "--bin", default="codex",
+        help="codex binary to drive (default: PATH `codex`); handy for "
+             "verifying a freshly downloaded CLI before installing it",
+    )
     parser.add_argument("--home", default=os.path.expanduser("~/.nerve/codex"))
     parser.add_argument("--auth", choices=["chatgpt", "api_key"], default="chatgpt")
     parser.add_argument(
@@ -74,6 +80,7 @@ async def main() -> int:
     cfg = NerveConfig.from_dict({
         "workspace": str(workspace),
         "codex": {
+            "bin_path": args.bin,
             "home_dir": args.home,
             "auth": args.auth,
             **({"api_key": api_key} if api_key else {}),
@@ -95,21 +102,22 @@ async def main() -> int:
         snapshots.append((path, content))
 
     spec = SessionSpec(
-        session_id="smoke", source="web", model=args.model, effort="low",
+        session_id="smoke", source="web", model=args.model, effort=args.effort,
         system_prompt="You are a smoke test. Be terse.",
         cwd=str(workspace), interactive=None, snapshot=snapshot,
         idle_timeout=120.0,
     )
 
-    print(f"→ spawning codex app-server (home={args.home}, auth={args.auth})")
+    print(f"→ spawning codex app-server (bin={args.bin}, home={args.home}, auth={args.auth})")
     client = await backend.create_client(spec)
     proc = client._transport._proc
     print(f"✓ thread started: {client.native_session_id}")
     print(f"  app-server RSS after connect: {_rss_mb(proc.pid):.1f} MB")
+    print(f"  model: {client.model}, effort sent: {client.turn_effort()!r}")
 
-    # Model catalog — diagnostics for picking codex.model.
+    # Model catalog — diagnostics for picking codex.model (hidden included).
     try:
-        models = await client._transport.request("model/list", {})
+        models = await client._transport.request("model/list", {"includeHidden": True})
         ids = [
             m.get("id") or m.get("model") or str(m)
             for m in (models.get("models") or models.get("data") or [])

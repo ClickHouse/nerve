@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Bot, Search, Lightbulb, Wrench, Loader2, ArrowRight } from 'lucide-react';
+import { ChevronRight, ChevronDown, Bot, Search, Lightbulb, Wrench, Loader2, ArrowRight } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { MarkdownContent } from '../MarkdownContent';
 import { useChatStore } from '../../../stores/chatStore';
 import { extractResultText } from '../../../utils/extractResultText';
+import { Button, IconButton } from '../../ui';
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
   Explore: Search,
@@ -11,6 +12,7 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
   'general-purpose': Wrench,
 };
 
+/** Agent identity, not status — which sub-agent ran, at a glance. */
 const AGENT_COLORS: Record<string, string> = {
   Explore: 'text-hue-cyan',
   Plan: 'text-hue-amber',
@@ -74,36 +76,38 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
       <div className="flex items-center gap-2 px-3 py-2">
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : color}`} />
+          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : color}`} />
         }
-        <span className={`text-[13px] font-medium ${color}`}>{subagentType}</span>
-        {description && <span className="text-[12px] text-text-muted truncate flex-1">{description}</span>}
-        {model && <span className="text-[10px] text-text-faint shrink-0">{model}</span>}
+        <span className={`text-sm leading-tight font-medium ${color}`}>{subagentType}</span>
+        {description && <span className="text-xs text-text-muted truncate flex-1">{description}</span>}
+        {model && <span className="text-2xs text-text-faint shrink-0">{model}</span>}
 
         <div className="ml-auto shrink-0 flex items-center gap-1.5">
           {/* View in panel button */}
           {(isRunning || resultText) && (
-            <button
+            <Button
+              variant="subtle"
+              size="xs"
               onClick={handleViewInPanel}
-              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-text-dim hover:text-text-secondary cursor-pointer transition-colors rounded hover:bg-surface-raised"
               title="View in side panel"
             >
               View <ArrowRight size={10} />
-            </button>
+            </Button>
           )}
           {/* Expand toggle (inline fallback) */}
-          <button
+          <IconButton
+            size="xs"
+            label={expanded ? 'Collapse result' : 'Expand result'}
             onClick={() => setExpanded(!expanded)}
-            className="p-1 text-text-faint hover:text-text-muted cursor-pointer transition-colors"
           >
             {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          </button>
+          </IconButton>
         </div>
       </div>
 
       {/* Summary line when complete and collapsed */}
       {!expanded && !isRunning && summaryLine && (
-        <div className="px-3 pb-2 text-[11px] text-text-faint truncate">
+        <div className="px-3 pb-2 text-xs text-text-faint truncate">
           {summaryLine}{summaryLine.length >= 120 ? '...' : ''}
         </div>
       )}
@@ -116,13 +120,13 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
             <div className="border-b border-border-subtle">
               <button
                 onClick={() => setShowPrompt(!showPrompt)}
-                className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left text-[10px] uppercase tracking-wider text-text-faint hover:text-text-muted cursor-pointer"
+                className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left text-2xs uppercase tracking-wider text-text-faint hover:text-text-muted cursor-pointer"
               >
                 {showPrompt ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
                 Prompt
               </button>
               {showPrompt && (
-                <pre className="px-3 pb-2 text-[12px] text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
+                <pre className="px-3 pb-2 text-xs text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
                   {prompt}
                 </pre>
               )}
@@ -131,19 +135,19 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
 
           {/* Result rendered as markdown */}
           {displayText && (
-            <div className="px-3 py-2 max-h-96 overflow-y-auto text-[13px]">
+            <div className="px-3 py-2 max-h-96 overflow-y-auto text-sm">
               <MarkdownContent content={displayText} />
             </div>
           )}
 
           {block.isError && resultText && (
-            <pre className="px-3 py-2 text-[12px] text-hue-red whitespace-pre-wrap">
+            <pre className="px-3 py-2 text-xs text-error whitespace-pre-wrap">
               {resultText}
             </pre>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2">
               <Loader2 size={12} className="animate-spin" /> Agent working...
             </div>
           )}

@@ -314,10 +314,15 @@ def test_prune_bg_tasks_drops_settled():
 
 
 def _patch_finalize(engine: AgentEngine):
-    """Replace _finalize_turn with a recorder (avoids DB plumbing)."""
+    """Replace _finalize_turn with a recorder (avoids DB plumbing).
+
+    The recorded ``bump_updated_at`` is stashed on the turn state so callers
+    can assert it without every existing call site growing a second binding.
+    """
     finalized: list[_TurnState] = []
 
-    async def _record(session_id, st, channel):
+    async def _record(session_id, st, channel, bump_updated_at=True):
+        st.recorded_bump_updated_at = bump_updated_at  # type: ignore[attr-defined]
         finalized.append(st)
 
     engine._finalize_turn = _record  # type: ignore[method-assign]
@@ -382,10 +387,18 @@ async def test_drain_processes_full_autonomous_turn():
     types = [e.get("type") for e in events]
     assert "background_tasks_update" in types
     assert "auto_turn" in types
-    assert {"type": "session_running", "session_id": "s1",
-            "is_running": True} in events
-    assert {"type": "session_running", "session_id": "s1",
-            "is_running": False} in events
+    framing = [e for e in events if e.get("type") == "session_running"]
+    assert [e["is_running"] for e in framing] == [True, False]
+    # Every transition carries the session's pending work so the sidebar can
+    # keep a parked session in its Running group without a list refetch.
+    assert all(
+        e["session_id"] == "s1"
+        and e["pending_wakeup_at"] is None
+        and e["has_background_tasks"] is False
+        for e in framing
+    )
+    # An autonomous turn is a continuation — it must not re-sort the sidebar.
+    assert st.recorded_bump_updated_at is False
     # Buffer fully consumed — nothing left to desync the next turn
     assert client.buffer_used() == 0
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -12,12 +12,14 @@ import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
-import { Loader2, PanelLeftOpen, PanelLeftClose, Files, ExternalLink } from 'lucide-react';
+import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
+import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
+import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
@@ -54,6 +56,24 @@ export function ChatPage() {
   // The active session row may live in the feed or a lazy archived/system group.
   const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
 
+  // Forks of THIS chat keyed by their anchor message — MessageList marks the
+  // divergence points with a pill. Memoized so the memo'd list doesn't
+  // re-render on unrelated store churn.
+  const messageForks = useMemo(() => {
+    const map = new Map<string, { id: string; title: string }[]>();
+    for (const s of sessions) {
+      if (s.parent_session_id !== activeSession) continue;
+      if (!s.forked_from_message || !s.id.startsWith('fork-')) continue;
+      const arr = map.get(s.forked_from_message) ?? [];
+      arr.push({ id: s.id, title: s.title || s.id });
+      map.set(s.forked_from_message, arr);
+    }
+    return map.size > 0 ? map : undefined;
+  }, [sessions, activeSession]);
+
+  // Forkable = a real session with a native conversation to branch from.
+  const canForkSession = !!activeSessionRow?.sdk_session_id;
+
   // Below `md` the session list becomes an off-canvas drawer. Its open state is
   // deliberately NOT `sidebarCollapsed`: that one is a persisted desktop
   // preference (default: expanded), and reusing it would both pop the drawer
@@ -82,6 +102,20 @@ export function ChatPage() {
     previousSession.current = activeSession;
     if (switched) setMobileSidebarOpen(false);
   }, [activeSession, setMobileSidebarOpen]);
+
+  // Fork the active chat — optionally from a specific message. The fork is
+  // a real server session immediately; jump into it (push, not replace, so
+  // Back returns to the source chat).
+  const handleFork = useCallback(async (atMessageId?: number) => {
+    const { activeSession: source, virtualSession: virt } = useChatStore.getState();
+    if (!source || virt?.id === source) return; // nothing to fork in a new chat
+    const forkId = await forkChat(source, atMessageId);
+    if (forkId) navigate(`/chat/${forkId}`);
+  }, [navigate]);
+
+  const handleForkMessage = useCallback((messageId: number) => {
+    void handleFork(messageId);
+  }, [handleFork]);
 
   // Chat-scoped keyboard shortcuts. Global ones (new chat, search, modal,
   // Esc cascade) live in <GlobalShortcuts /> in App.tsx.
@@ -124,6 +158,13 @@ export function ChatPage() {
       },
     },
     {
+      id: 'chat-fork',
+      combo: { mod: true, shift: true, key: 'f' },
+      description: 'Fork this chat',
+      section: 'chat',
+      action: () => { void handleFork(); },
+    },
+    {
       id: 'chat-delete-current',
       combo: { mod: true, shift: true, key: 'Backspace' },
       description: 'Delete current conversation',
@@ -136,7 +177,7 @@ export function ChatPage() {
         }
       },
     },
-  ], []);
+  ], [handleFork]);
 
   useKeyboardShortcuts(chatShortcuts);
 
@@ -249,15 +290,8 @@ export function ChatPage() {
           {/* Header */}
           <div className="border-b border-border-subtle px-3 md:px-5 py-2.5 flex items-center justify-between gap-2 bg-bg shrink-0">
             <div className="flex items-center gap-2 min-w-0">
-              <button
-                onClick={toggleSessionList}
-                className="w-6 h-6 shrink-0 flex items-center justify-center text-text-faint hover:text-text-muted cursor-pointer transition-colors rounded"
-                title={sessionListOpen ? 'Hide sidebar' : 'Show sidebar'}
-                aria-expanded={sessionListOpen}
-              >
-                {sessionListOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}
-              </button>
-              <span className="font-medium text-[15px] truncate">
+              <PaneToggle open={sessionListOpen} onToggle={toggleSessionList} label="sidebar" />
+              <span className="font-medium text-base truncate">
                 {virtualSession?.id === activeSession
                   ? 'New chat'
                   : (activeSessionRow?.title || activeSession)}
@@ -269,10 +303,12 @@ export function ChatPage() {
                 return (
                   <span
                     title={`Agent backend: ${backend}`}
-                    className={`hidden md:inline shrink-0 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
+                    // Which backend is running is identity, not status, so
+                    // this stays on the `hue-*` scale.
+                    className={`hidden md:inline shrink-0 text-2xs uppercase tracking-wide px-1.5 py-0.5 rounded border ${
                       backend === 'codex'
-                        ? 'text-hue-teal border-teal-400/25 bg-teal-400/10'
-                        : 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                        ? 'text-hue-teal border-hue-teal/25 bg-hue-teal/10'
+                        : 'text-hue-orange border-hue-orange/25 bg-hue-orange/10'
                     }`}
                   >
                     {backend}
@@ -282,7 +318,7 @@ export function ChatPage() {
               {(() => {
                 const model = activeSessionRow?.model;
                 return model ? (
-                  <span className="hidden md:inline shrink-0 text-[11px] text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
+                  <span className="hidden md:inline shrink-0 text-xs text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
                     {formatModelLabel(model)}
                   </span>
                 ) : null;
@@ -299,17 +335,20 @@ export function ChatPage() {
                   : rl.status === 'failed' ? `failed${rl.failure_reason ? ` (${rl.failure_reason})` : ''}`
                   : rl.status === 'killed' ? 'killed'
                   : rl.status;
+                // A review loop's state is status, so these are the feedback
+                // tokens. The default branch is the live loop, which takes the
+                // same green as `passed`.
                 const tone = rl.status === 'passed'
-                  ? 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10'
+                  ? 'text-success border-success-border bg-success-bg'
                   : rl.status === 'awaiting_user'
-                  ? 'text-hue-orange border-orange-400/25 bg-orange-400/10'
+                  ? 'text-warning border-warning-border bg-warning-bg'
                   : rl.status === 'failed' || rl.status === 'killed'
-                  ? 'text-error border-red-400/25 bg-red-400/10'
-                  : 'text-emerald-400 border-emerald-400/25 bg-emerald-400/10';
+                  ? 'text-error border-error-border bg-error-bg'
+                  : 'text-success border-success-border bg-success-bg';
                 return (
                   <span
                     title={`Review loop ${rl.id}: ${rl.status}${rl.failure_reason ? ` — ${rl.failure_reason}` : ''}`}
-                    className={`text-[11px] px-1.5 py-0.5 rounded border flex items-center gap-1.5 ${tone}`}
+                    className={`text-xs px-1.5 py-0.5 rounded border flex items-center gap-1.5 ${tone}`}
                   >
                     {live && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
                     🔁 {rl.iteration}/{rl.max_iterations} — {label}
@@ -317,7 +356,7 @@ export function ChatPage() {
                 );
               })()}
               {statusLabel && (
-                <div className="flex items-center gap-1.5 min-w-0 text-[12px] text-text-muted">
+                <div className="flex items-center gap-1.5 min-w-0 text-xs text-text-muted">
                   <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
                   <span className="truncate">{statusLabel}</span>
                 </div>
@@ -329,7 +368,7 @@ export function ChatPage() {
                 const used = rateLimits?.primary?.usedPercent;
                 return (
                   <span
-                    className="text-[11px] text-text-faint"
+                    className="text-xs text-text-faint"
                     title={JSON.stringify(backendStatus.data)}
                   >
                     Codex limit{typeof used === 'number' ? ` ${used}% used` : ' updated'}
@@ -343,19 +382,25 @@ export function ChatPage() {
                 activeSession={activeSession}
                 onSelect={switchSession}
               />
-              {fileCount > 0 && (
-                <button
-                  onClick={openFilesPanel}
-                  className={`flex items-center gap-1.5 px-2 py-1 rounded text-[12px] transition-colors cursor-pointer ${
-                    filesPanelActive
-                      ? 'text-hue-teal bg-teal-400/10'
-                      : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'
-                  }`}
-                  title="Modified files"
+              {canForkSession && (
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={() => void handleFork()}
+                  title="Fork this chat — branch a new chat that shares this conversation (⌘⇧F)"
                 >
-                  <Files size={14} />
+                  <GitBranch size={14} />
+                  <span className="hidden lg:inline">Fork</span>
+                </Button>
+              )}
+              {/* House convention for a tinted action: the identity hue rides
+                  the icon and the label stays neutral, so nothing competes
+                  with `subtle`'s own text colour. */}
+              {fileCount > 0 && (
+                <Button variant="subtle" size="xs" onClick={openFilesPanel} title="Modified files">
+                  <Files size={14} className={filesPanelActive ? 'text-hue-teal' : undefined} />
                   <span className="tabular-nums">{fileCount}</span>
-                </button>
+                </Button>
               )}
               {contextUsage && (
                 <div className="hidden md:flex">
@@ -367,7 +412,7 @@ export function ChatPage() {
                   href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-[12px] text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
+                  className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-xs text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
                   title="View this session's trace in Langfuse"
                 >
                   <ExternalLink size={12} />
@@ -376,6 +421,36 @@ export function ChatPage() {
               )}
             </div>
           </div>
+
+          {/* Fork provenance strip — orients a freshly opened fork: where it
+              branched from, one click back to the source. */}
+          {activeSessionRow?.id.startsWith('fork-') && (() => {
+            const parentId = activeSessionRow.parent_session_id;
+            const parentRow = parentId
+              ? findSessionById(parentId, sessions, archivedSessions, systemSessions)
+              : undefined;
+            return (
+              <div className="border-b border-border-subtle bg-hue-violet/[0.06] px-3 md:px-5 py-1.5 flex items-center gap-1.5 text-xs text-text-muted shrink-0">
+                <GitBranch size={12} className="text-hue-violet shrink-0" />
+                {parentRow ? (
+                  <>
+                    <span className="shrink-0">Forked from</span>
+                    <Link
+                      to={`/chat/${parentRow.id}`}
+                      className="truncate text-text-secondary hover:text-text underline-offset-2 hover:underline"
+                    >
+                      {parentRow.title || parentRow.id}
+                    </Link>
+                  </>
+                ) : (
+                  <span>Forked from another chat</span>
+                )}
+                {activeSessionRow.forked_from_message && (
+                  <span className="shrink-0 text-text-faint">· branched mid-conversation</span>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Review-loop dashboard — sticky above the transcript for
               observer sessions: live criteria, attempt timeline with
@@ -396,6 +471,8 @@ export function ChatPage() {
                 messages={messages}
                 streamingBlocks={streamingBlocks}
                 isStreaming={isStreaming}
+                onForkMessage={canForkSession ? handleForkMessage : undefined}
+                messageForks={messageForks}
               />
             )}
             <ChatWidthHandle />

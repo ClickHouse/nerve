@@ -5,7 +5,7 @@ import type { FileDiff } from '../../types/chat';
 
 function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div className="px-4 py-6 text-center text-[13px] text-text-faint">
+    <div className="px-4 py-6 text-center text-sm text-text-faint">
       {children}
     </div>
   );
@@ -30,7 +30,7 @@ export function DiffView({ diff, wrap }: { diff: FileDiff; wrap?: boolean }) {
     <div className="diff-view">
       <PatchDiff patch={diff.patch} options={options} />
       {diff.truncated && (
-        <div className="text-center py-3 text-[11px] text-text-faint bg-bg border-t border-border-subtle">
+        <div className="text-center py-3 text-xs text-text-faint bg-bg border-t border-border-subtle">
           Diff truncated at {MAX_DIFF_LINES} lines
         </div>
       )}

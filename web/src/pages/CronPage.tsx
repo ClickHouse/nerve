@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw, Loader2 } from 'lucide-react';
+import { RefreshCw, Loader2 } from '../components/ui/icons';
+import { IconButton } from '../components/ui';
 import { useCronStore } from '../stores/cronStore';
 import { CronSidebar } from '../components/Cron/CronSidebar';
 import { JobInfoCard } from '../components/Cron/JobInfoCard';
@@ -57,11 +58,9 @@ export function CronPage() {
           : undefined}
         title="Cron Jobs"
         actions={
-          <button onClick={handleRefresh} disabled={refreshing}
-            className="text-text-dim hover:text-text-muted cursor-pointer p-1.5 hover:bg-surface-raised rounded"
-            title="Refresh" aria-label="Refresh">
+          <IconButton label="Refresh" onClick={handleRefresh} disabled={refreshing}>
             {refreshing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
-          </button>
+          </IconButton>
         }
       />
 

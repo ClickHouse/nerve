@@ -160,13 +160,34 @@ def _page_size() -> int | None:
     return size if size and size > 0 else None
 
 
+async def _pending_wakeup_map(deps) -> dict[str, str]:
+    """``session_id -> fire_at`` for every pending wakeup, in one query.
+
+    ``ScheduleWakeup`` keeps at most one pending row per session, so a plain
+    map is enough. Enrichment: a failure dims the indicator, it must never
+    fail the listing.
+    """
+    try:
+        rows = await deps.db.list_pending_wakeups()
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        return {}
+    return {r["session_id"]: r["fire_at"] for r in rows if r.get("session_id")}
+
+
 async def _decorate(deps, sessions: list[dict]) -> list[dict]:
     """Attach the live per-row bits every sidebar list needs."""
     running_ids = deps.engine.sessions.get_running_ids()
     awaiting_ids = get_awaiting_ids()
+    # Pending work: no turn is in flight, yet the session isn't idle either —
+    # a wakeup is scheduled, or a background task is still running inside its
+    # CLI. The sidebar keeps those parked sessions in the "Running" group
+    # (with their own dot colour) instead of dropping them to idle.
+    wakeup_at = await _pending_wakeup_map(deps)
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
+        s["pending_wakeup_at"] = wakeup_at.get(s["id"])
+        s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
     await _attach_review_loops(deps, sessions)
     return sessions
 
@@ -201,12 +222,7 @@ async def search_sessions(q: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
     deps = get_deps()
     sessions = await deps.db.search_sessions(q.strip())
-    running_ids = deps.engine.sessions.get_running_ids()
-    awaiting_ids = get_awaiting_ids()
-    for s in sessions:
-        s["is_running"] = s["id"] in running_ids
-        s["awaiting_input"] = s["id"] in awaiting_ids
-    await _attach_review_loops(deps, sessions)
+    await _decorate(deps, sessions)
     return {"sessions": sessions}
 
 
@@ -448,6 +464,18 @@ async def update_session(session_id: str, req: dict, user: dict = Depends(requir
                 )
             if await _would_create_cycle(deps.db, session_id, new_parent):
                 raise HTTPException(status_code=400, detail="That drop would create a cycle")
+        elif (
+            session.get("status") == "created"
+            and session.get("parent_session_id")
+        ):
+            # Symmetric fork-window guard: clearing the parent of a
+            # not-yet-started fork would silently discard the fork context
+            # its first turn is about to branch from.
+            raise HTTPException(
+                status_code=409,
+                detail="This fork hasn't started yet — send its first "
+                       "message before un-nesting it",
+            )
         fields["parent_session_id"] = new_parent
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -557,7 +585,13 @@ async def session_status(session_id: str, user: dict = Depends(require_auth)):
 
 @router.post("/api/sessions/fork")
 async def fork_session(req: ForkRequest, user: dict = Depends(require_auth)):
-    """Fork a session, optionally from a specific message."""
+    """Fork a session, optionally from a specific message.
+
+    The fork branches the source's native conversation on its first turn
+    and starts pre-populated with the source's messages up to the fork
+    point. 404 = unknown source; 409 = source not forkable (no native
+    conversation yet, or the anchor message has no native turn mapping).
+    """
     deps = get_deps()
     try:
         fork = await deps.engine.fork_session(
@@ -565,7 +599,8 @@ async def fork_session(req: ForkRequest, user: dict = Depends(require_auth)):
         )
         return fork
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        status = 404 if "not found" in str(e).lower() else 409
+        raise HTTPException(status_code=status, detail=str(e))
 
 
 # "Run later" — defer a prompt without spending tokens now. The three timed

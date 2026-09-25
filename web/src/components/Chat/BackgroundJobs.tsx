@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Loader2, Terminal, Bot, Check, AlertTriangle } from 'lucide-react';
+import { Loader2, Terminal, Bot, Check, AlertTriangle } from '../ui/icons';
+import { Badge, Button } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import type { Session } from '../../types/chat';
 
@@ -55,15 +56,17 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
       onMouseLeave={() => setHovering(false)}
     >
       {/* Badge */}
-      <div className={`flex items-center gap-1.5 px-2 py-1 rounded text-[12px] cursor-default ${
-        runningTasks.length > 0
-          ? 'text-hue-emerald bg-emerald-400/10'
-          : 'text-text-faint bg-surface-raised'
-      }`}>
+      <Badge
+        size="sm"
+        tone={runningTasks.length > 0 ? 'success' : 'neutral'}
+        className="gap-1.5 px-2 py-1 cursor-default"
+      >
         {runningTasks.length > 0 ? (
+          /* `bg-current` so the pulse always matches whichever tone the badge
+             is wearing, rather than pinning a second green beside it. */
           <span className="relative flex h-2 w-2 shrink-0">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-current opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-current" />
           </span>
         ) : (
           <Check size={11} className="shrink-0" />
@@ -79,7 +82,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
             + {runningSessions.length} session{runningSessions.length > 1 ? 's' : ''}
           </span>
         )}
-      </div>
+      </Badge>
 
       {/* Dropdown */}
       {hovering && (
@@ -87,7 +90,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
           {/* Background tasks (current session) */}
           {backgroundTasks.length > 0 && (
             <>
-              <div className="px-3 py-1.5 text-[10px] text-text-faint uppercase tracking-wider">
+              <div className="px-3 py-1.5 text-2xs text-text-faint uppercase tracking-wider">
                 Background Tasks
               </div>
               {backgroundTasks.map(task => {
@@ -96,7 +99,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
                 return (
                   <div
                     key={task.task_id}
-                    className="flex items-center gap-2 px-3 py-1.5 text-[12px]"
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs leading-tight"
                   >
                     {task.status === 'running' ? (
                       <Loader2 size={12} className="shrink-0 text-hue-emerald animate-spin" />
@@ -108,7 +111,7 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
                     <span className={`flex-1 min-w-0 truncate ${statusColor}`}>
                       {task.label}
                     </span>
-                    <span className="shrink-0 text-[10px] text-text-faint flex items-center gap-1">
+                    <span className="shrink-0 text-2xs text-text-faint flex items-center gap-1">
                       <Icon size={10} />
                       {task.status === 'running' ? formatElapsed(task.startedAt) : task.status}
                     </span>
@@ -122,21 +125,24 @@ export function BackgroundJobs({ sessions, activeSession, onSelect }: {
           {runningSessions.length > 0 && (
             <>
               {backgroundTasks.length > 0 && <div className="border-t border-border my-1" />}
-              <div className="px-3 py-1.5 text-[10px] text-text-faint uppercase tracking-wider">
+              <div className="px-3 py-1.5 text-2xs text-text-faint uppercase tracking-wider">
                 Other Running Sessions
               </div>
               {runningSessions.map(s => (
-                <button
+                <Button
                   key={s.id}
+                  variant="subtle"
+                  size="sm"
+                  fullWidth
                   onClick={() => { setHovering(false); onSelect(s.id); }}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-text-muted hover:bg-border-subtle hover:text-text transition-colors cursor-pointer"
+                  className="justify-start gap-2 px-3 py-1.5 rounded-none text-left leading-tight"
                 >
                   <Loader2 size={12} className="shrink-0 text-hue-emerald animate-spin" />
                   <span className="flex-1 min-w-0 truncate">{s.title || s.id}</span>
-                  <span className="shrink-0 text-[10px] text-text-faint">
+                  <span className="shrink-0 text-2xs text-text-faint">
                     {s.source || 'web'}
                   </span>
-                </button>
+                </Button>
               ))}
             </>
           )}

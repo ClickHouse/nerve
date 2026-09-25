@@ -59,12 +59,31 @@ When you want a new session that starts with the parent's full context:
 options = ClaudeAgentOptions(
     resume=parent.sdk_session_id,   # Branch FROM this point
     fork_session=True,              # Create independent branch
+    resume_session_at=turn_uuid,    # Optional: truncate at a mid-point turn
 )
 ```
 
 The fork inherits all parent context but diverges from that point. New messages don't affect the parent.
 
-**Nerve's implementation:** `engine.run()` detects `parent_session_id` on first message (status=CREATED) and sets `fork_from`. See `engine.py:556-567`.
+**Mid-point forks.** Both backends can branch at an earlier turn, not just
+the end: Claude via `resume_session_at` (a transcript-entry UUID), Codex via
+`thread/fork` + `lastTurnId`. To make that possible, each backend records a
+per-turn anchor as `messages.native_turn_id` on the completed assistant row —
+Codex reports the turn id natively; the Claude client tracks the last
+main-chain transcript-entry uuid streamed during the turn
+(`ClaudeClient._translate_and_capture`). `db.get_native_turn_at_message()`
+maps a UI message id to that anchor. Message forks on rows with no anchor
+(history predating this recording) are refused rather than silently forking
+the full context.
+
+**Display parity.** `SessionManager.fork_session()` copies the source's
+message rows up to the fork boundary into the fork
+(`db.copy_messages_to_session`), so the forked chat shows the history the
+agent actually remembers. Copies keep `native_turn_id` (forks are
+re-forkable) and get `external_id = "forkcopy:<source row id>"` for
+provenance.
+
+**Nerve's implementation:** `engine.run()` detects `parent_session_id` on first message (status=CREATED) and sets `fork_from` (+ `fork_last_turn_id` for message-anchored forks). See `_get_or_create_client` / `_run_inner` in `engine.py`.
 
 ## Session ID Lifecycle
 

@@ -1,5 +1,6 @@
-import { Sun, Moon, Monitor } from 'lucide-react';
 import { useThemeStore } from '../../stores/themeStore';
+import { IconButton } from '../ui';
+import { Sun, Moon, Monitor } from '../ui/icons';
 
 const THEME_ICONS = {
   system: Monitor,
@@ -18,13 +19,13 @@ export function ThemeToggle() {
   const cycleTheme = useThemeStore((s) => s.cycleTheme);
   const Icon = THEME_ICONS[preference];
 
+  // The label names the *current* preference, which is what the cycle
+  // dark → light → system needs to expose: the glyph alone cannot say which of
+  // the three states you are in. IconButton spends it as both `title` and
+  // `aria-label`, so the control has an accessible name.
   return (
-    <button
-      onClick={cycleTheme}
-      className="w-10 h-10 rounded-lg flex items-center justify-center text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer transition-colors"
-      title={THEME_LABELS[preference]}
-    >
+    <IconButton label={THEME_LABELS[preference]} size="md" onClick={cycleTheme}>
       <Icon size={16} />
-    </button>
+    </IconButton>
   );
 }

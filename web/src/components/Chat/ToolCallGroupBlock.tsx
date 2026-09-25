@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from '../ui/icons';
+import { Button } from '../ui';
 import type { ToolCallGroup } from '../../types/renderBlocks';
 import { ToolCallBlock } from './ToolCallBlock';
 
@@ -36,11 +37,13 @@ export function ToolCallGroupBlock({ group }: { group: ToolCallGroup }) {
     <div className="my-0.5">
       {/* Collapse bar — only shown for groups of 4+ */}
       {needsCollapsing && (
-        <button
+        <Button
+          variant="subtle"
+          size="sm"
+          fullWidth
           onClick={() => setExpanded(!expanded)}
-          className="flex items-center gap-2 w-full px-3 py-1.5 text-left cursor-pointer
-                     text-[12px] text-text-faint hover:text-text-muted hover:bg-surface-raised
-                     rounded-md transition-colors"
+          aria-expanded={expanded}
+          className="justify-start gap-2 rounded-md text-left leading-tight"
         >
           {hasRunning
             ? <Loader2 size={12} className="text-accent animate-spin shrink-0" />
@@ -57,7 +60,7 @@ export function ToolCallGroupBlock({ group }: { group: ToolCallGroup }) {
               : <ChevronRight size={12} className="text-text-faint" />
             }
           </div>
-        </button>
+        </Button>
       )}
 
       {/* Expanded hidden items */}

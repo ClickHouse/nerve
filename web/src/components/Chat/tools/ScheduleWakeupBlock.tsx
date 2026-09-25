@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Clock, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronDown, Clock, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { extractResultText } from '../../../utils/extractResultText';
 
@@ -86,20 +86,20 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Clock size={14} className={`shrink-0 ${block.isError ? 'text-hue-red' : 'text-hue-cyan'}`} />
+          : <Clock size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-cyan'}`} />
         }
-        <span className="text-[13px] font-medium text-text-secondary shrink-0 whitespace-nowrap">
+        <span className="text-sm leading-tight font-medium text-text-secondary shrink-0 whitespace-nowrap">
           Schedule wakeup
         </span>
         {delayLabel && (
-          <span className="text-[12px] text-text-muted shrink-0">
+          <span className="text-xs text-text-muted shrink-0">
             in {delayLabel}
             {timeLabel ? ` · ${timeLabel}` : ''}
             {wasClamped ? ' (clamped)' : ''}
           </span>
         )}
         {reason && (
-          <span className="text-[12px] text-text-faint truncate">— {reason}</span>
+          <span className="text-xs text-text-faint truncate">— {reason}</span>
         )}
         <div className="ml-auto shrink-0">
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
@@ -116,7 +116,7 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
               client is reaped, the wakeup is lost (unless `durable: true`,
               which the model rarely sets). Net: it's a deferred prompt
               that piggybacks on the next user turn. */}
-          <div className="px-3 py-2 text-[11px] text-text-faint italic">
+          <div className="px-3 py-2 text-xs text-text-faint italic">
             Queued by the Claude Code CLI. Nerve has no <code>/loop</code>
             timer, so the wakeup will only surface on the next user
             message — and will arrive before that message in the
@@ -125,8 +125,8 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
 
           {prompt && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1">Prompt</div>
-              <pre className="text-[12px] text-text-muted whitespace-pre-wrap overflow-x-auto max-h-40 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
+              <div className="text-2xs uppercase tracking-wider text-text-faint mb-1">Prompt</div>
+              <pre className="text-xs text-text-muted whitespace-pre-wrap overflow-x-auto max-h-40 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
                 {prompt}
               </pre>
             </div>
@@ -134,14 +134,14 @@ export function ScheduleWakeupBlock({ block }: { block: ToolCallBlockData }) {
 
           {block.isError && block.result !== undefined && (
             <div className="px-3 py-2 border-t border-border-subtle">
-              <pre className="text-[12px] text-hue-red whitespace-pre-wrap">
+              <pre className="text-xs text-error whitespace-pre-wrap">
                 {extractResultText(block.result)}
               </pre>
             </div>
           )}
 
           {isRunning && block.result === undefined && (
-            <div className="px-3 py-3 text-[12px] text-text-dim flex items-center gap-2 border-t border-border-subtle">
+            <div className="px-3 py-3 text-xs text-text-dim flex items-center gap-2 border-t border-border-subtle">
               <Loader2 size={12} className="animate-spin" /> Scheduling...
             </div>
           )}

@@ -1,21 +1,23 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Lightbulb } from 'lucide-react';
+import { Lightbulb } from '../components/ui/icons';
 import { usePlanStore, type Plan } from '../stores/planStore';
-import { PageHeader } from '../components/ui/PageHeader';
+import { Badge, type BadgeTone, Button, PageHeader } from '../components/ui';
 
-const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-400/10 text-hue-yellow border-yellow-400/20',
-  approved: 'bg-emerald-400/10 text-hue-emerald border-emerald-400/20',
-  implementing: 'bg-blue-400/10 text-hue-blue border-blue-400/20',
-  declined: 'bg-red-400/10 text-hue-red border-red-400/20',
-  superseded: 'bg-border-subtle/50 text-text-muted border-border-subtle',
-  failed: 'bg-red-400/10 text-hue-red border-red-400/20',
+/** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
+const STATUS_TONES: Record<string, BadgeTone> = {
+  pending: 'warning',
+  approved: 'success',
+  implementing: 'info',
+  declined: 'danger',
+  superseded: 'neutral',
+  failed: 'danger',
 };
 
-const TYPE_STYLES: Record<string, { label: string; className: string }> = {
-  'skill-create': { label: 'Skill', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
-  'skill-update': { label: 'Skill Update', className: 'bg-purple-400/10 text-hue-purple border-purple-400/20' },
+/** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
+const TYPE_LABELS: Record<string, string> = {
+  'skill-create': 'Skill',
+  'skill-update': 'Skill Update',
 };
 
 const FILTERS = [
@@ -36,17 +38,17 @@ function PlanCard({ plan }: { plan: Plan }) {
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <h3 className="font-medium text-[15px] text-text mb-1">
+          <h3 className="font-medium text-base text-text mb-1">
             {plan.task_title || plan.task_id}
           </h3>
-          <div className="flex items-center gap-3 text-[12px]">
-            <span className={`px-2 py-0.5 rounded-full border ${STATUS_STYLES[plan.status] || STATUS_STYLES.superseded}`}>
+          <div className="flex items-center gap-3 text-xs">
+            <Badge size="sm" pill outline tone={STATUS_TONES[plan.status] ?? 'neutral'}>
               {plan.status}
-            </span>
-            {plan.plan_type && plan.plan_type !== 'generic' && TYPE_STYLES[plan.plan_type] && (
-              <span className={`px-2 py-0.5 rounded-full border text-[11px] ${TYPE_STYLES[plan.plan_type].className}`}>
-                {TYPE_STYLES[plan.plan_type].label}
-              </span>
+            </Badge>
+            {plan.plan_type && plan.plan_type !== 'generic' && TYPE_LABELS[plan.plan_type] && (
+              <Badge size="sm" pill outline tone="purple">
+                {TYPE_LABELS[plan.plan_type]}
+              </Badge>
             )}
             <span className="text-text-faint">v{plan.version}</span>
             <span className="text-text-faint">{plan.created_at?.slice(0, 10)}</span>
@@ -69,17 +71,14 @@ export function PlansPage() {
         icon={<Lightbulb size={18} className="text-accent shrink-0" />}
         title="Plans"
         filters={FILTERS.map(f => (
-          <button
+          <Button
             key={f.value}
+            variant="pill"
+            active={filter === f.value}
             onClick={() => setFilter(f.value)}
-            className={`px-3 py-1 text-[12px] rounded-full border cursor-pointer transition-colors whitespace-nowrap
-              ${filter === f.value
-                ? 'bg-accent/15 text-accent border-accent/30'
-                : 'text-text-dim border-border hover:border-border hover:text-text-muted'
-              }`}
           >
             {f.label}
-          </button>
+          </Button>
         ))}
       />
 

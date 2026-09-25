@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, UserMessage
 
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec, TransportDiedError
@@ -30,6 +30,9 @@ from nerve.config import AgentConfig, NerveConfig
         ("xhigh",  "claude-opus-5",             "xhigh"),
         ("xhigh",  "claude-opus-5-20260720",    "xhigh"),
         ("max",    "us.anthropic.claude-opus-5", "max"),
+        # Opus 5.5 supports the full ladder
+        ("max",    "claude-opus-5-5",           "max"),
+        ("low",    "claude-opus-5-5",           "low"),
         # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
         ("max",    "claude-sonnet-5",           "max"),
         ("xhigh",  "claude-sonnet-5",           "xhigh"),
@@ -72,6 +75,21 @@ def test_effective_effort(value, model, expected):
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
     assert ClaudeBackend._effective_effort("max") == "max"
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # Opus 5.5 rejects thinking.type="disabled"; send adaptive.
+        ("claude-opus-5-5",              {"type": "adaptive"}),
+        ("us.anthropic.claude-opus-5-5", {"type": "adaptive"}),
+        ("claude-opus-5",                {"type": "disabled"}),
+        ("claude-opus-4-8",              {"type": "disabled"}),
+        (None,                           {"type": "disabled"}),
+    ],
+)
+def test_parse_thinking_config_disabled(model, expected):
+    assert ClaudeBackend._parse_thinking_config("disabled", model) == expected
 
 
 @pytest.mark.parametrize(
@@ -202,13 +220,15 @@ def _translated(messages: list) -> list:
     return [event for m in messages for event in translate_message(m)]
 
 
-def _result_msg(session_id: str = "sdk-1") -> ResultMessage:
+def _result_msg(session_id: str = "sdk-1", **overrides) -> ResultMessage:
     """A terminal ResultMessage: translates to one TurnCompleted."""
-    return ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1,
-        is_error=False, num_turns=1, session_id=session_id,
-        total_cost_usd=0.5, usage={"input_tokens": 1},
-    )
+    values = {
+        "subtype": "success", "duration_ms": 1, "duration_api_ms": 1,
+        "is_error": False, "num_turns": 1, "session_id": session_id,
+        "total_cost_usd": 0.5, "usage": {"input_tokens": 1},
+    }
+    values.update(overrides)
+    return ResultMessage(**values)
 
 
 @pytest.mark.asyncio
@@ -245,6 +265,98 @@ async def test_receive_turn_raises_on_idle_timeout():
     assert seen == _translated(messages)
     # The underlying iterator was closed before the exception propagated.
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_captures_fork_anchor_uuid():
+    """The turn's TurnCompleted carries the last MAIN-CHAIN transcript-entry
+    uuid as native_turn_id — the ``resume_session_at`` fork anchor. Sidechain
+    (subagent) entries and uuid-less messages must not win."""
+    messages = [
+        AssistantMessage(content=[TextBlock(text="a")], model="m", uuid="uuid-1"),
+        # Sidechain entry arrives later but is not a valid truncation point.
+        AssistantMessage(
+            content=[TextBlock(text="sub")], model="m",
+            uuid="uuid-side", parent_tool_use_id="tool-1",
+        ),
+        AssistantMessage(content=[TextBlock(text="b")], model="m", uuid="uuid-2"),
+        # End-turn tool shape: the kept turn can close on a user entry.
+        UserMessage(content=[], uuid="uuid-3"),
+        _result_msg(),
+    ]
+    sdk = _StubClient(messages)
+    client = _turn_client(sdk, "sess-fork", idle_timeout=5.0)
+    completed = [
+        e async for e in client.receive_turn()
+        if isinstance(e, ev.TurnCompleted)
+    ]
+    assert len(completed) == 1
+    assert completed[0].native_turn_id == "uuid-3"
+
+
+@pytest.mark.asyncio
+async def test_start_turn_resets_fork_anchor():
+    """A new turn must not inherit the previous turn's anchor uuid."""
+
+    class _QueryStub:
+        async def query(self, *_a, **_k):
+            return None
+
+    client = _turn_client(_StubClient([]), "sess-reset", idle_timeout=5.0)
+    client._last_entry_uuid = "stale-uuid"
+    client._sdk = _QueryStub()
+    from nerve.agent.backends.base import TurnInput
+    await client.start_turn(TurnInput(text="hi"))
+    assert client._last_entry_uuid is None
+
+
+def test_claude_options_pass_resume_session_at_only_for_forks(tmp_path):
+    """fork_last_turn_id maps to resume_session_at, gated on spec.fork —
+    without fork_session the flag would truncate the ORIGINAL session."""
+    cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    backend = ClaudeBackend(SimpleNamespace(
+        config=lambda: cfg,
+        claude_plugins=lambda: [],
+    ))
+    base = dict(
+        session_id="fork-opts", source="web", model=cfg.agent.model,
+        effort="high", system_prompt="p", cwd=str(tmp_path),
+        resume_native_id="native-1", fork_last_turn_id="uuid-9",
+    )
+    with patch.object(backend, "_build_mcp_servers", return_value={}), \
+         patch.object(backend, "_build_hooks", return_value={}):
+        forked = backend._build_options(SessionSpec(**base, fork=True))
+        plain = backend._build_options(SessionSpec(**base, fork=False))
+    assert forked.fork_session is True
+    assert forked.resume_session_at == "uuid-9"
+    assert plain.resume_session_at is None
+
+
+def test_claude_options_set_stdout_buffer_from_config(tmp_path):
+    """The SDK's 1 MiB per-line default aborts the turn on any large image
+    tool result; the configured cap must reach ClaudeAgentOptions."""
+    def _opts(cfg):
+        backend = ClaudeBackend(SimpleNamespace(
+            config=lambda: cfg,
+            claude_plugins=lambda: [],
+        ))
+        spec = SessionSpec(
+            session_id="buf-opts", source="web", model=cfg.agent.model,
+            effort="high", system_prompt="p", cwd=str(tmp_path),
+        )
+        with patch.object(backend, "_build_mcp_servers", return_value={}), \
+             patch.object(backend, "_build_hooks", return_value={}):
+            return backend._build_options(spec)
+
+    default = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    assert default.agent.cli_max_message_bytes == 64 * 1024 * 1024
+    assert _opts(default).max_buffer_size == 64 * 1024 * 1024
+
+    custom = NerveConfig.from_dict({
+        "workspace": str(tmp_path),
+        "agent": {"cli_max_message_bytes": 8 * 1024 * 1024},
+    })
+    assert _opts(custom).max_buffer_size == 8 * 1024 * 1024
 
 
 @pytest.mark.asyncio
@@ -318,6 +430,36 @@ async def test_receive_turn_completes_on_result_without_raising():
     assert len(terminal) == 1
     assert terminal[0].status == "completed"
     assert sdk.aclose_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "status", "error"),
+    [
+        (
+            _result_msg(
+                subtype="error_max_turns", is_error=True,
+                terminal_reason="max_turns", num_turns=50,
+            ),
+            "failed",
+            "max turns (50) exhausted",
+        ),
+        (
+            _result_msg(is_error=True, api_error_status=529),
+            "failed",
+            "API error (HTTP 529)",
+        ),
+        (
+            _result_msg(is_error=True, terminal_reason="aborted_streaming"),
+            "interrupted",
+            "aborted streaming",
+        ),
+    ],
+)
+def test_result_message_preserves_abnormal_terminal_state(message, status, error):
+    event = translate_message(message)[0]
+
+    assert isinstance(event, ev.TurnCompleted)
+    assert (event.status, event.error) == (status, error)
 
 
 @pytest.mark.asyncio
@@ -734,11 +876,15 @@ class TestValidateResumeTarget:
 # ClaudeBackend._build_hooks — background-agent permission parity
 # ---------------------------------------------------------------------------
 
-def _make_hook_backend(background_agent_permissions: bool) -> ClaudeBackend:
+def _make_hook_backend(
+    background_agent_permissions: bool,
+    cli_max_message_bytes: int = 64 * 1024 * 1024,
+) -> ClaudeBackend:
     """Minimal backend stub for exercising _build_hooks's PreToolUse wiring."""
     config = SimpleNamespace(
         agent=SimpleNamespace(
             background_agent_permissions=background_agent_permissions,
+            cli_max_message_bytes=cli_max_message_bytes,
         ),
     )
     return ClaudeBackend(SimpleNamespace(config=lambda: config))
@@ -757,6 +903,48 @@ def _catch_all_grant_hook(hooks: dict):
         if matcher.matcher is None:
             return matcher.hooks[0]
     return None
+
+
+def _read_validator_hook(backend: ClaudeBackend):
+    for matcher in backend._build_hooks(_hook_spec("sess-img"))["PreToolUse"]:
+        if matcher.matcher == "Read":
+            return matcher.hooks[0]
+    raise AssertionError("Read image validator hook not registered")
+
+
+def _fake_png(tmp_path: Path, size: int) -> str:
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * size)
+    return str(png)
+
+
+class TestReadHookTransportBound:
+    """A valid image can still be too big for the SDK transport: its result
+    is one stream-json line, and a line over max_buffer_size aborts the
+    whole turn. The Read validator refuses it up front instead."""
+
+    @pytest.mark.asyncio
+    async def test_denies_image_that_cannot_fit_the_configured_cap(self, tmp_path):
+        # 600 KB → ~820 KB of base64, shipped twice per line → > 1 MiB.
+        path = _fake_png(tmp_path, 600 * 1024)
+        hook = _read_validator_hook(
+            _make_hook_backend(True, cli_max_message_bytes=1024 * 1024),
+        )
+        out = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": path}}, "tid", None,
+        )
+        spec = out["hookSpecificOutput"]
+        assert spec.get("permissionDecision") == "deny"
+        assert "cli_max_message_bytes" in spec["permissionDecisionReason"]
+
+    @pytest.mark.asyncio
+    async def test_allows_the_same_image_under_the_default_cap(self, tmp_path):
+        path = _fake_png(tmp_path, 600 * 1024)
+        hook = _read_validator_hook(_make_hook_backend(True))
+        out = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": path}}, "tid", None,
+        )
+        assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 class TestBuildHooksBackgroundPermissions:

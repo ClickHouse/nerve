@@ -1,5 +1,6 @@
+import type { ReactNode } from 'react';
 import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/chat';
-import { Download, FileText } from 'lucide-react';
+import { Download, FileText } from '../ui/icons';
 import { getToken } from '../../api/client';
 import { formatMessageTime } from '../../utils/messageTime';
 
@@ -9,20 +10,25 @@ function authUrl(url: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
 }
 
-export function UserMessage({ message }: { message: ChatMessage }) {
+export function UserMessage({ message, actions }: {
+  message: ChatMessage;
+  /** Hover toolbar (MessageActions) — anchored to the reading column. */
+  actions?: ReactNode;
+}) {
   const text = message.blocks.find(b => b.type === 'text')?.content || '';
   const images = message.blocks.filter(b => b.type === 'image') as ImageBlockData[];
   const files = message.blocks.filter(b => b.type === 'file') as FileBlockData[];
 
   return (
-    <div className="py-4 px-5 msg-user" data-role="user">
-      <div className="max-w-[var(--chat-width)] mx-auto">
+    <div className="py-4 px-5 msg-user group/msg" data-role="user">
+      <div className="max-w-[var(--chat-width)] mx-auto relative">
+        {actions}
         <div className="flex gap-3">
           <div className="w-7 h-7 rounded-full bg-surface-raised flex items-center justify-center text-xs font-medium text-text-muted shrink-0 mt-0.5">
             U
           </div>
           <div className="min-w-0 flex-1">
-            {text && <div className="whitespace-pre-wrap text-[15px] leading-relaxed pt-0.5">{text}</div>}
+            {text && <div className="whitespace-pre-wrap text-base leading-relaxed pt-0.5">{text}</div>}
 
             {/* Attached images */}
             {images.length > 0 && (
@@ -66,7 +72,7 @@ export function UserMessage({ message }: { message: ChatMessage }) {
         </div>
         {message.created_at && (
           <div
-            className="mt-1 text-right text-[10px] text-text-faint/60 tabular-nums"
+            className="mt-1 text-right text-2xs text-text-faint tabular-nums"
             title={new Date(message.created_at).toLocaleString()}
           >
             {formatMessageTime(message.created_at)}

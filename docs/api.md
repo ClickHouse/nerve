@@ -97,11 +97,21 @@ Response: {
 ```
 
 #### `POST /api/sessions/fork`
-Fork a session, optionally from a specific message point.
+Fork a session, optionally from a specific message point (`at_message_id` is
+a numeric message row id as a string). The fork branches the source's
+*native* conversation on its first turn (Claude `--fork-session` +
+`--resume-session-at`; Codex `thread/fork` + `lastTurnId`) and is created
+pre-populated with the source's messages up to the fork point, so the new
+chat displays exactly the history the agent remembers.
+
+Errors: `404` unknown source; `409` not forkable — the source has no native
+conversation yet (no completed turn), or the anchor message has no native
+turn mapping (sessions predating per-turn recording can only be forked
+whole).
 
 ```json
-Request:  { "source_session_id": "main", "at_message_id": "msg-42", "title": "My Fork" }
-Response: { "id": "fork-a1b2c3d4", "title": "My Fork", "source": "web", "status": "created", "parent_session_id": "main" }
+Request:  { "source_session_id": "main", "at_message_id": "42", "title": "My Fork" }
+Response: { "id": "fork-a1b2c3d4", "title": "My Fork", "source": "web", "status": "created", "parent_session_id": "main", "message_count": 12 }
 ```
 
 #### `POST /api/sessions/{id}/resume`

@@ -98,6 +98,9 @@ export interface ChatMessage {
   blocks: MessageBlock[];
   channel?: string;
   created_at?: string;
+  /** Backend-native turn id recorded on completed assistant rows — the
+      anchor that makes "fork from here" possible at this point. */
+  native_turn_id?: string | null;
 }
 
 export interface Session {
@@ -109,6 +112,9 @@ export interface Session {
   status?: string;
   sdk_session_id?: string;
   parent_session_id?: string;
+  /** Set on message-anchored forks: the source-session message id the
+      fork branched at (whole-chat forks leave it null). */
+  forked_from_message?: string | null;
   connected_at?: string;
   message_count?: number;
   total_cost_usd?: number;
@@ -120,6 +126,13 @@ export interface Session {
   // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).
   // Drives the sidebar "waiting" indicator. Set by backend + WS updates.
   awaiting_input?: boolean;
+  // Pending work with no turn in flight — the session is parked, not idle,
+  // and keeps its place in the sidebar's "Running" group with a violet dot.
+  // `pending_wakeup_at` is the ISO fire time of the scheduled wake-up (at
+  // most one per session); `has_background_tasks` covers run_in_background
+  // Bash/Agent work still live inside the session's CLI.
+  pending_wakeup_at?: string | null;
+  has_background_tasks?: boolean;
   starred?: boolean;
   // Live review-loop state for this observer session (rehydrated from
   // GET /api/sessions, kept fresh by the global review_loop_update event;
