@@ -3,13 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  RefreshCw, Play, Loader2, Mail, Github, MessageCircle, Inbox,
+  RefreshCw, Play, Loader2, Mail, Github, MessageCircle, Slack, Inbox,
   ExternalLink, Trash2, ChevronDown, ChevronRight,
   CheckCircle2, XCircle, HardDrive, Database, Filter, AlertTriangle,
 } from '../components/ui/icons';
 import { Badge, Button, Checkbox, IconButton, type BadgeTone } from '../components/ui';
 import { useSourcesStore, type SourceOverviewEntry } from '../stores/sourcesStore';
 import { MessageContent } from '../components/Sources/MessageContent';
+import { sourceLabel } from '../utils/sourceLabel';
 
 // --- Helpers ---
 
@@ -37,6 +38,7 @@ function sourceIcon(source: string) {
     case 'github': return <Github size={14} className="text-hue-purple" />;
     case 'github_repos': return <Github size={14} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={14} className="text-hue-blue" />;
+    case 'slack': return <Slack size={14} className="text-hue-emerald" />;
     default: return <Inbox size={14} className="text-text-dim" />;
   }
 }
@@ -52,18 +54,11 @@ function sourceBadgeTone(source: string): BadgeTone {
     case 'github': return 'purple';
     case 'github_repos': return 'purple';
     case 'telegram': return 'info';
+    // `accent` rather than `success`: the tone has to say "Slack", and a
+    // status token would say the row went well.
+    case 'slack': return 'accent';
     default: return 'neutral';
   }
-}
-
-function sourceLabel(source: string): string {
-  const type = source.split(':')[0];
-  // For gmail:<account>, show just the account
-  if (source.includes(':')) {
-    const rest = source.slice(source.indexOf(':') + 1);
-    return rest.length > 20 ? rest.slice(0, 18) + '..' : rest;
-  }
-  return type;
 }
 
 // --- Sync Button ---

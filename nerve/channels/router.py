@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
 
 from nerve.agent.interactive import get_handler
@@ -22,9 +23,11 @@ from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
 from nerve.channels.stream_adapter import StreamAdapter
+from nerve.db.observations import DEFAULT_MAX_ROWS
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -365,6 +368,44 @@ class ChannelRouter:
         ctx = self._message_context.get(session_id)
         target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
         return await chan_obj.send_file(target, file_path)
+
+    # ------------------------------------------------------------------ #
+    #  Observation buffer                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def observe(
+        self,
+        msg: ObservedMessage,
+        ttl_days: int = 7,
+        max_stored_messages: int = DEFAULT_MAX_ROWS,
+    ) -> bool:
+        """Buffer a message a channel collected for the source inbox.
+
+        Channels reach the database through the router, never through the
+        engine directly, so this is the seam. Returns True if the record was
+        buffered.
+
+        A failure is swallowed and logged. This sits on a channel's dispatch
+        path, ahead of any live handling, so a database hiccup must not take
+        down message handling for the sake of a buffered copy.
+        """
+        db = getattr(self.engine, "db", None)
+        if db is None:
+            return False
+        try:
+            await db.insert_channel_observation(
+                channel=msg.channel_name,
+                channel_key=msg.channel_key,
+                payload=asdict(msg),
+                ttl_days=ttl_days,
+                max_rows=max_stored_messages,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to buffer an observation from %s: %s", msg.channel_name, e,
+            )
+            return False
 
     # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
