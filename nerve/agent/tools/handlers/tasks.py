@@ -74,6 +74,40 @@ async def _validate_status(ctx: ToolContext, status: str) -> str | None:
     )
 
 
+def _expect_revision(args: dict) -> int | None:
+    """The optional ``expect_revision`` fence, or ``None`` when it is absent.
+
+    Raises ``ValueError`` for a value that is not an integer: dropping it
+    would turn the caller's conditional write into an unconditional one.
+    """
+    raw = args.get("expect_revision")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"expect_revision must be an integer, got {raw!r}.") from None
+
+
+def _revision_conflict(task_id: str, expected: int, *, reopened: bool = False) -> ToolResult:
+    if reopened:
+        return ToolResult.text(
+            f"Task {task_id} was reopened, but it changed again before the other edits were "
+            "written, so they were not applied. Re-read it and retry them.",
+            is_error=True,
+        )
+    return ToolResult.text(
+        f"Task {task_id} changed since you read it (expected revision {expected}); "
+        "nothing was written. Re-read it and retry.",
+        is_error=True,
+    )
+
+
+# task_read appends this line so an agent can see the revision; task_write
+# strips it so a read-edit-write round trip cannot persist it.
+_REVISION_TRAILER_RE = re.compile(r"^<!-- nerve: revision=\d+[^\n]*-->[ \t]*(?:\n|\Z)", re.MULTILINE)
+
+
 # Process-wide read-before-write guard. Tracks task IDs that have been
 # read (via task_read) or created (via task_create) in this process
 # lifetime. task_write refuses to overwrite unless the task is in this
@@ -396,6 +430,10 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     has_field_edits = (
         deadline is not None or raw_tags is not None or bool(new_title)
     )
+    try:
+        expect_revision = _expect_revision(args)
+    except ValueError as e:
+        return ToolResult.text(str(e), is_error=True)
 
     # Reject unknown statuses with the list of valid options.
     if status:
@@ -405,17 +443,22 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     # Route done transitions through task_done to ensure file move + FTS sync
     if status == TERMINAL_STATUS:
-        return await task_done_handler(ctx, {"task_id": task_id, "note": note})
+        return await task_done_handler(
+            ctx, {"task_id": task_id, "note": note, "expect_revision": expect_revision},
+        )
 
     # ...and the mirror. A task leaving the terminal status has to have its
     # markdown moved back out of done/ *before* anything else edits it —
     # otherwise the row points into done/ with a non-done status, which
     # TaskManager.reindex() treats as an orphan and force-resets to done.
+    reopened: ToolResult | None = None
     if ctx.db and status:
         current = await ctx.db.get_task(task_id)
         if current and current.get("status") == TERMINAL_STATUS:
             reopened = await task_reopen_handler(
-                ctx, {"task_id": task_id, "status": status, "note": note},
+                ctx,
+                {"task_id": task_id, "status": status, "note": note,
+                 "expect_revision": expect_revision},
             )
             if reopened.is_error or not has_field_edits:
                 return reopened
@@ -428,6 +471,9 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         task = await ctx.db.get_task(task_id)
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
+        if reopened and expect_revision is not None:
+            # The reopen's single guarded write advanced the row by exactly one revision.
+            expect_revision += 1
 
         new_tags_str = ""
         if raw_tags is not None:
@@ -481,9 +527,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 elif raw_tags is not None:
                     # Every tag removed (an empty set, or "-last_tag").
                     content = re.sub(r"\*\*Tags:\*\* .*\n?", "", content, count=1)
-                await asyncio.to_thread(
-                    file_path.write_text, content, encoding="utf-8",
-                )
 
                 final_title = new_title or task["title"]
                 final_status = status or task["status"]
@@ -495,23 +538,50 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     edits["deadline"] = deadline or None
                 if raw_tags is not None:
                     edits["tags"] = new_tags_str
-                await ctx.db.upsert_task(
-                    task_id=task_id,
-                    file_path=task["file_path"],
-                    title=final_title,
-                    status=final_status,
-                    content=content,
-                    actor=ctx.session_id,
-                    **edits,
+                write = lambda: file_path.write_text(content, encoding="utf-8")
+                kw = dict(
+                    task_id=task_id, file_path=task["file_path"], title=final_title,
+                    status=final_status, content=content, actor=ctx.session_id, **edits,
                 )
+                # Without a token the order stays file-then-row, as before. With
+                # one the row is written first, so a refused caller writes no file.
+                if expect_revision is None:
+                    await asyncio.to_thread(write)
+                    await ctx.db.upsert_task(**kw)
+                else:
+                    if not await ctx.db.upsert_task(**kw, expect_revision=expect_revision):
+                        return _revision_conflict(
+                            task_id, expect_revision, reopened=reopened is not None,
+                        )
+                    await asyncio.to_thread(write)
                 await _emit_task_event(ctx, task_id, "updated")
                 return ToolResult.text(f"Task {task_id} updated.")
 
         # Fall back to metadata updates when no task file was changed.
+        if expect_revision is not None and (note or deadline is not None or new_title):
+            if reopened is not None:
+                return ToolResult.text(
+                    f"Task {task_id} was reopened, but it has no task file to write, so its "
+                    "other edits were not applied.",
+                    is_error=True,
+                )
+            return ToolResult.text(
+                f"Task {task_id} has no task file to write, so its note, title or deadline "
+                "cannot be applied; nothing was written.",
+                is_error=True,
+            )
+        applied = True
         if status:
-            await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
-        if raw_tags is not None:
-            await ctx.db.update_task_tags(task_id, new_tags_str)
+            applied = await ctx.db.transition_task(
+                task_id, status, expect_revision=expect_revision, actor=ctx.session_id,
+                **({"tags": new_tags_str} if raw_tags is not None else {}),
+            )
+        elif raw_tags is not None:
+            applied = await ctx.db.update_task_tags(
+                task_id, new_tags_str, expect_revision=expect_revision,
+            )
+        if not applied and expect_revision is not None:
+            return _revision_conflict(task_id, expect_revision, reopened=reopened is not None)
         await _emit_task_event(ctx, task_id, "updated")
 
     return ToolResult.text(f"Task {task_id} updated.")
@@ -537,14 +607,20 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     file_path.read_text, encoding="utf-8",
                 )
                 _tasks_read.add(task_id)
-                return ToolResult.text(content)
+                # The adapters drop ``structured``, so the text carries it too.
+                sep = "" if content.endswith("\n") else "\n"
+                return ToolResult.text(
+                    f"{content}{sep}<!-- nerve: revision={task['revision']} "
+                    "(index metadata, not file content) -->",
+                    structured={"revision": task["revision"]},
+                )
 
     return ToolResult.text(f"Task file not found for: {task_id}")
 
 
 async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
-    new_content = args.get("content", "")
+    new_content = _REVISION_TRAILER_RE.sub("", args.get("content", ""))
 
     if task_id not in _tasks_read:
         return ToolResult.text(
@@ -602,6 +678,10 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
 async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     note = args.get("note", "")
+    try:
+        expect_revision = _expect_revision(args)
+    except ValueError as e:
+        return ToolResult.text(str(e), is_error=True)
 
     if ctx.db:
         task = await ctx.db.get_task(task_id)
@@ -615,37 +695,44 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if ctx.workspace:
             ensure_path_not_tracked_config(ctx.workspace / task["file_path"], "move")
 
-        await ctx.db.update_task_status(task_id, "done", actor=ctx.session_id)
+        src = ctx.workspace / task["file_path"] if ctx.workspace else None
+        if src is not None and src.exists():
+            content = await asyncio.to_thread(src.read_text, encoding="utf-8")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if note:
+                content += f"\n- {today}: DONE — {note}"
+            else:
+                content += f"\n- {today}: DONE"
+
+            dst = _done_dir(ctx) / src.name
+            rel_path = str(dst.relative_to(ctx.workspace))
+            # Without a token the file moves before the row is written. With one
+            # the row is claimed first, so a refused caller moves nothing.
+            if expect_revision is None:
+                await asyncio.to_thread(move_task_file, src, dst, content)
+                await ctx.db.transition_task(
+                    task_id, "done", actor=ctx.session_id,
+                    file_path=rel_path, content=content,
+                )
+            else:
+                if not await ctx.db.transition_task(
+                    task_id, "done", expect_revision=expect_revision,
+                    actor=ctx.session_id, file_path=rel_path, content=content,
+                ):
+                    return _revision_conflict(task_id, expect_revision)
+                await asyncio.to_thread(move_task_file, src, dst, content)
+        else:
+            done = await ctx.db.transition_task(
+                task_id, "done", expect_revision=expect_revision, actor=ctx.session_id,
+            )
+            if not done and expect_revision is not None:
+                return _revision_conflict(task_id, expect_revision)
 
         # Mark any implementing plans for this task as done
         implementing_plans = await ctx.db.get_plans_for_task(task_id)
         for p in implementing_plans:
             if p.get("status") == "implementing":
                 await ctx.db.update_plan(p["id"], status="done")
-
-        # Move file to done/
-        if ctx.workspace:
-            src = ctx.workspace / task["file_path"]
-            if src.exists():
-                content = await asyncio.to_thread(src.read_text, encoding="utf-8")
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                if note:
-                    content += f"\n- {today}: DONE — {note}"
-                else:
-                    content += f"\n- {today}: DONE"
-
-                dst = _done_dir(ctx) / src.name
-
-                await asyncio.to_thread(move_task_file, src, dst, content)
-
-                rel_path = str(dst.relative_to(ctx.workspace))
-                await ctx.db.upsert_task(
-                    task_id=task_id,
-                    file_path=rel_path,
-                    title=task["title"],
-                    status="done",
-                    content=content,
-                )
 
         await _emit_task_event(ctx, task_id, "done")
 
@@ -670,6 +757,10 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     status = (args.get("status", "") or "").strip().lower() or DEFAULT_STATUS
     note = args.get("note", "")
+    try:
+        expect_revision = _expect_revision(args)
+    except ValueError as e:
+        return ToolResult.text(str(e), is_error=True)
 
     if status == TERMINAL_STATUS:
         return ToolResult.text(
@@ -710,27 +801,28 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 is_error=True,
             )
 
-    await ctx.db.update_task_status(task_id, status, actor=ctx.session_id)
-
+    kw: dict = dict(
+        expect=(TERMINAL_STATUS,), expect_revision=expect_revision, actor=ctx.session_id,
+    )
     if src is not None:
-        # Re-checked because the guard above is not atomic with the move.
-        if src.exists():
-            content = await asyncio.to_thread(src.read_text, encoding="utf-8")
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            suffix = f" — {note}" if note else ""
-            content += f"\n- {today}: REOPENED ({status}){suffix}"
-
-            dst = _task_dir(ctx) / src.name
-
-            await asyncio.to_thread(move_task_file, src, dst, content)
-
-            await ctx.db.upsert_task(
-                task_id=task_id,
-                file_path=str(dst.relative_to(ctx.workspace)),
-                title=task["title"],
-                status=status,
-                content=content,
-            )
+        content = await asyncio.to_thread(src.read_text, encoding="utf-8")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        suffix = f" — {note}" if note else ""
+        content += f"\n- {today}: REOPENED ({status}){suffix}"
+        dst = _task_dir(ctx) / src.name
+        kw.update(file_path=str(dst.relative_to(ctx.workspace)), content=content)
+    # ``expect`` makes the "is it still done?" check above atomic with the flip, and the
+    # row is claimed before any file work, so a refused reopen moves nothing.
+    if not await ctx.db.transition_task(task_id, status, **kw):
+        if expect_revision is not None:
+            return _revision_conflict(task_id, expect_revision)
+        return ToolResult.text(
+            f"Task {task_id} changed before it could be reopened (it is no longer done); "
+            "nothing was written.",
+            is_error=True,
+        )
+    if src is not None:
+        await asyncio.to_thread(move_task_file, src, dst, content)
 
     await _emit_task_event(ctx, task_id, "updated")
     return ToolResult.text(f"Task {task_id} reopened (status: {status}).")
@@ -804,7 +896,11 @@ TASK_LIST_SPEC = ToolSpec(
 
 TASK_UPDATE_SPEC = ToolSpec(
     name="task_update",
-    description="Update a task's status, deadline, tags, title, or add an update note.",
+    description=(
+        "Update a task's status, deadline, tags, title, or add an update note. "
+        "Pass expect_revision (from task_read) to refuse the update, writing "
+        "nothing, if the task has changed since."
+    ),
     input_schema=TASK_UPDATE_SCHEMA,
     handler=task_update_handler,
 )
@@ -828,7 +924,11 @@ TASK_WRITE_SPEC = ToolSpec(
 
 TASK_DONE_SPEC = ToolSpec(
     name="task_done",
-    description="Mark a task as done and move its file to the done/ directory.",
+    description=(
+        "Mark a task as done and move its file to the done/ directory. "
+        "Pass expect_revision (from task_read) to refuse the completion, "
+        "writing nothing, if the task has changed since."
+    ),
     input_schema=TASK_DONE_SCHEMA,
     handler=task_done_handler,
 )
