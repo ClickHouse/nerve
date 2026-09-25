@@ -181,16 +181,21 @@ def _install(tmp_path: Path, *, local_yaml: str = "{}\n") -> tuple[Path, Path]:
     return config_dir, workspace
 
 
-def test_migrate_dry_run_inspects_existing_identity_without_writing(tmp_path):
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "real"])
+def test_migrate_reports_existing_identity_without_writing(tmp_path, dry_run):
+    """Only the gateway and ``nerve init`` write identity state. ``migrate``
+    reports what the gateway will do, in both modes."""
+    from nerve.migrate import bootstrap_identity_sync
+
     config_dir, workspace = _install(tmp_path)
-    migrate(config_dir, workspace=workspace)
+    bootstrap_identity_sync(_config())
     before = paths.db_path().read_bytes()
 
     report = migrate(
         config_dir,
         workspace=workspace,
         config=_config(password=True),
-        dry_run=True,
+        dry_run=dry_run,
     )
 
     assert not report.bootstrapped_account
@@ -199,18 +204,19 @@ def test_migrate_dry_run_inspects_existing_identity_without_writing(tmp_path):
     assert paths.db_path().read_bytes() == before
 
 
-def test_cli_migrate_dry_run_reports_bootstrap_without_creating_database(tmp_path):
+@pytest.mark.parametrize("argv", [["migrate", "--dry-run"], ["migrate"]], ids=["dry-run", "real"])
+def test_cli_migrate_reports_bootstrap_without_creating_database(tmp_path, argv):
     from nerve.cli import main
 
     config_dir, _workspace = _install(
         tmp_path,
         local_yaml=f"auth:\n  password_hash: '{_HASH}'\n",
     )
-    result = CliRunner().invoke(main, ["-c", str(config_dir), "migrate", "--dry-run"])
+    result = CliRunner().invoke(main, ["-c", str(config_dir), *argv])
 
     assert result.exit_code == 0, result.output
-    assert "would create the local owner account" in result.output
+    assert "At its next start, the gateway will:" in result.output
+    assert "- create the local owner account" in result.output
     assert "credential_source=config" in result.output
-    assert "would generate a JWT signing secret" in result.output
-    assert "Dry run — no changes written." in result.output
+    assert "- generate a JWT signing secret" in result.output
     assert not paths.db_path().exists()

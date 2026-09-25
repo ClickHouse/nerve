@@ -1,8 +1,9 @@
 """CLI commands open the state database through ``open_production_db``.
 
-That is ``Database.connect`` followed by the identity bootstrap. The first
-command after an upgrade therefore leaves one account and a signing secret,
-as ``nerve start`` does, and refuses insecure state with the operator message.
+That is ``Database.connect`` followed by loading the signing secret. Only the
+gateway and ``nerve init`` create accounts, so the first command after an
+upgrade leaves a signing secret and no account. Insecure state is refused with
+the operator message.
 """
 
 from __future__ import annotations
@@ -74,9 +75,11 @@ def no_engine(monkeypatch):
     monkeypatch.setattr(engine_mod, "AgentEngine", MagicMock(return_value=AsyncMock()))
 
 
-class TestTheFirstCommandAfterAnUpgradeBootstraps:
+class TestTheFirstCommandAfterAnUpgradeLoadsOnlyTheSecret:
     @_OPENERS
-    def test_it_leaves_one_account_and_one_system_principal(self, tmp_path, no_engine, argv):
+    def test_it_stores_a_signing_secret_and_creates_no_account(
+        self, tmp_path, no_engine, argv,
+    ):
         from nerve.cli import main
 
         config_dir = _config_dir(tmp_path)
@@ -85,12 +88,12 @@ class TestTheFirstCommandAfterAnUpgradeBootstraps:
 
         result = CliRunner().invoke(main, ["-c", str(config_dir), *argv])
         assert result.exit_code == 0, result.output
-        assert _identity_state() == (1, 1, 1)
+        assert _identity_state() == (0, 1, 1)
 
-        # A second run finds the rows and adds none.
+        # A second run finds the secret and adds nothing.
         result = CliRunner().invoke(main, ["-c", str(config_dir), *argv])
         assert result.exit_code == 0, result.output
-        assert _identity_state() == (1, 1, 1)
+        assert _identity_state() == (0, 1, 1)
 
     def test_a_configured_secret_is_honoured_by_the_opener_too(self, tmp_path, no_engine):
         """With ``auth.jwt_secret`` configured, no secret is stored in the
@@ -105,7 +108,7 @@ class TestTheFirstCommandAfterAnUpgradeBootstraps:
         _migrated_but_unbootstrapped_db()
         result = CliRunner().invoke(main, ["-c", str(config_dir), "cron"])
         assert result.exit_code == 0, result.output
-        assert _identity_state() == (1, 1, 0)
+        assert _identity_state() == (0, 1, 0)
 
 
 class TestTheCliRefusesInsecureState:
@@ -148,7 +151,7 @@ class TestTheCliRefusesInsecureState:
 
 def test_the_gateway_and_the_cli_share_one_opener():
     """Only ``db/__init__.py``, ``db/base.py`` and ``migrate.py`` construct a
-    Database, so no CLI command can skip connect() and the bootstrap."""
+    Database, so no CLI command can skip connect()."""
     import re
 
     root = Path(__file__).resolve().parents[1] / "nerve"

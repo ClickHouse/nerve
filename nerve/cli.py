@@ -316,8 +316,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
-    # maybe_migrate also runs the identity bootstrap (not on a fresh install;
-    # the gateway runs it again at startup).
+    # The gateway runs the identity bootstrap when it starts.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
@@ -842,8 +841,8 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
         if rc != 0:
             raise click.ClickException("npm run build failed")
 
-    # Migrate a legacy config layout to workspace/config (idempotent), and
-    # bootstrap the local owner account / signing secret in nerve.db.
+    # Migrate a legacy config layout to workspace/config (idempotent), and show
+    # what the gateway will do to nerve.db at its next start.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
@@ -852,7 +851,7 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
             config=config,
         )
         if report and report.identity_actions:
-            click.echo("\nIdentity bootstrap:")
+            click.echo("\nAt its next start, the gateway will:")
             for action in report.identity_actions:
                 click.echo(f"  - {action}")
         if report and report.did_anything:
@@ -1467,9 +1466,9 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
     Non-destructive (originals kept as *.migrated) and idempotent.
 
-    Also creates the local owner account and, if auth.jwt_secret is not set,
-    a JWT signing secret in nerve.db. The gateway does the same check at
-    every start.
+    Also shows what the gateway will do to nerve.db at its next start: create
+    the local owner account and, if auth.jwt_secret is not set, a JWT signing
+    secret. This command does not write them.
     """
     from nerve.migrate import migrate as run_migrate
 
@@ -1485,7 +1484,7 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
 
     if not report.did_anything and not report.did_bootstrap:
         click.secho(
-            "Nothing to migrate — already on the workspace layout, and the local "
+            "Nothing to migrate: already on the workspace layout, and the local "
             "account is in place.",
             fg="green",
         )
@@ -1495,8 +1494,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     prefix = "[dry-run] would " if dry_run else ""
     for action in report.actions:
         click.echo(f"  {prefix}{action}")
-    for action in report.identity_actions:
-        click.echo(f"  {prefix}{action}")
+    if report.identity_actions:
+        click.echo("\n  At its next start, the gateway will:")
+        for action in report.identity_actions:
+            click.echo(f"  - {action}")
     for warning in report.warnings:
         click.secho(f"\n  Note: {warning}", fg="yellow")
     if report.secrets_moved:
@@ -1517,7 +1518,7 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     elif report.did_anything:
         click.secho("\nMigration complete. Review workspace/config/settings.yaml before committing.", fg="green")
     else:
-        click.secho("\nMigration complete.", fg="green")
+        click.secho("\nThe config layout needs no migration.", fg="green")
 
 
 @main.group(name="config")
