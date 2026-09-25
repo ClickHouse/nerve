@@ -20,7 +20,9 @@ function installStorage(): void {
 installStorage();
 
 vi.mock('../../api/client', () => ({
-  api: {},
+  api: {
+    getMessages: vi.fn().mockResolvedValue({ messages: [] }),
+  },
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
   getToken: vi.fn(),
   setUnauthorizedHandler: vi.fn(),
@@ -93,6 +95,20 @@ describe('stream delta batching', () => {
     runFrame();
 
     expect(useChatStore.getState().streamingBlocks).toEqual([]);
+  });
+
+  it('does not revive old deltas after switching away and back to an idle session', async () => {
+    send(token('stale'));
+    const toOther = useChatStore.getState().switchSession('s2');
+    const back = useChatStore.getState().switchSession('s1');
+    await Promise.all([toOther, back]);
+
+    runFrame();
+    send({ type: 'session_status', session_id: 's1', is_running: false });
+
+    expect(useChatStore.getState().streamingBlocks).toEqual([]);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().agentStatus).toEqual({ state: 'idle' });
   });
 
   it('keeps the same agentStatus object while the agent state does not change', () => {
