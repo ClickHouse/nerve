@@ -2,7 +2,7 @@
 
 Coordinates between MCP tools (agent-side), channels (delivery), and the
 answer routing mechanism (user-side). Supports fire-and-forget notifications,
-async questions with multi-channel delivery (web UI + Telegram), and
+async questions with multi-channel delivery (web UI + Telegram + Slack), and
 ``approval``-kind notifications that route to a server-side dispatcher when
 the user picks an inline option (see ``nerve.notifications.handlers``).
 """
@@ -477,11 +477,12 @@ class NotificationService:
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
 
-        - For ``type=approval`` rows: look up the dispatcher in the
-          handler registry, run it, audit-log the outcome, then flip
-          the row's status. Snooze answers keep the row pending and
-          stamp ``redeliver_at`` so the periodic maintenance tick
-          (:meth:`redeliver_due`) fans it out again with a fresh card.
+        - For ``type=approval`` rows: claim the row, look up the
+          dispatcher in the handler registry, run it, audit-log the
+          outcome, then flip the row's status. Snooze answers keep the
+          row pending and stamp ``redeliver_at`` so the periodic
+          maintenance tick (:meth:`redeliver_due`) fans it out again
+          with a fresh card.
         - For ``type=question`` rows (legacy): persist the answer,
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
@@ -580,11 +581,26 @@ class NotificationService:
         answered_by: str,
         actor: str | None = None,
     ) -> bool:
-        """Route an approval answer through the dispatcher registry."""
+        """Route an approval answer through the dispatcher registry.
+
+        Claims the row before the dispatcher runs. The status read in
+        :meth:`handle_answer` cannot decide who acts, because the dispatch
+        it precedes takes long enough for a second press to pass the same
+        read, and the action behind an approval card is not repeatable. A
+        card in a shared channel has as many pressers as the channel has
+        members, so the claim is what keeps one decision to one action.
+        """
         notification_id = notif["id"]
         session_id = notif["session_id"]
         target_kind = notif.get("target_kind") or ""
         target_id = notif.get("target_id") or ""
+
+        if not await self.db.claim_pending_approval(notification_id):
+            logger.info(
+                "approval %s is already claimed; the %r press from %s is "
+                "ignored", notification_id, answer, actor or answered_by,
+            )
+            return False
 
         dispatcher = _handlers.get(target_kind) if target_kind else None
         if dispatcher is None:
@@ -675,9 +691,15 @@ class NotificationService:
             await self.db.snooze_notification(
                 notification_id, snooze_until, new_expires_at,
             )
-        else:
-            await self.db.answer_notification(
-                notification_id, answer, answered_by, actor=actor,
+        elif not await self.db.answer_notification(
+            notification_id, answer, answered_by, actor=actor,
+        ):
+            # The expiry sweep can take a claimed row while its dispatcher
+            # runs, which leaves the action done and the row expired.
+            logger.warning(
+                "approval %s stopped being pending during its dispatch; the "
+                "%r decision ran but the row does not record it",
+                notification_id, answer,
             )
 
         from nerve.agent.streaming import broadcaster
@@ -850,6 +872,21 @@ class NotificationService:
                             telegram_message_id=str(msg_id),
                         )
                     return "telegram" if msg_id else None
+                elif channel_name == "slack":
+                    msg_id = await self._deliver_slack(
+                        notification_id, session_id, notif_type,
+                        title, body, priority, options,
+                        option_labels=option_labels,
+                    )
+                    if not msg_id:
+                        return None
+                    return "slack"
+                else:
+                    logger.warning(
+                        "notifications.channels names %r, which nothing "
+                        "delivers to; notification %s skips it",
+                        channel_name, notification_id,
+                    )
             except Exception as e:
                 logger.error(
                     "Failed to deliver %s to %s: %s",
@@ -972,14 +1009,15 @@ class NotificationService:
             return None
         return channel._app.bot
 
-    def _build_telegram_text(
+    def _build_notification_text(
         self, session_id: str, title: str, body: str, priority: str,
     ) -> str:
-        """Compose the Telegram message text for a notification.
+        """Compose the chat message text for a notification.
 
-        Shared by the initial delivery, the re-delivery tick, and the
-        expiry edit (which rebuilds the original text to append a
-        status line).
+        Shared by Telegram and Slack, and within each by the initial
+        delivery, the re-delivery tick, and the expiry edit (which rebuilds
+        the original text to append a status line). Markdown is converted
+        per channel at send time.
         """
         priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
         if title:
@@ -1014,7 +1052,7 @@ class NotificationService:
         if not chat_id:
             return None
 
-        text = self._build_telegram_text(session_id, title, body, priority)
+        text = self._build_notification_text(session_id, title, body, priority)
 
         if notif_type in ("question", "approval") and options:
             button_labels: list[tuple[str, str]] = []
@@ -1124,6 +1162,107 @@ class NotificationService:
         )
 
         return str(msg.message_id)
+
+    # ------------------------------------------------------------------ #
+    #  Slack delivery                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _get_slack_channel(self):
+        """Get the connected SlackChannel, or None if unavailable."""
+        channel = self.engine.router.get_channel("slack")
+        if not channel or not getattr(channel, "is_available", False):
+            return None
+        return channel
+
+    async def _deliver_slack(
+        self,
+        notification_id: str,
+        session_id: str,
+        notif_type: str,
+        title: str,
+        body: str,
+        priority: str,
+        options: list[str] | None,
+        option_labels: dict[str, str] | None = None,
+    ) -> str | None:
+        """Send a notification to Slack, with Block Kit buttons for answers."""
+        channel = self._get_slack_channel()
+        if not channel:
+            # Slack is in the default channel list, so most installations
+            # reach here with it switched off. An absent channel is that
+            # case and stays quiet; a registered one that cannot take
+            # traffic is worth a line.
+            if self.engine.router.get_channel("slack") is None:
+                logger.debug(
+                    "Slack is not running; notification %s skips it",
+                    notification_id,
+                )
+            else:
+                logger.warning(
+                    "Slack channel not available for notification %s",
+                    notification_id,
+                )
+            return None
+
+        text = self._build_notification_text(session_id, title, body, priority)
+
+        button_options: list[tuple[str, str]] = []
+        if notif_type in ("question", "approval") and options:
+            for value in options:
+                if notif_type == "approval":
+                    label = (
+                        (option_labels or {}).get(value)
+                        or value.replace("_", " ").title()
+                    )
+                    emoji = _APPROVAL_EMOJIS.get(value, "")
+                    rendered = f"{emoji} {label}".strip() if emoji else label
+                else:
+                    rendered = value
+                button_options.append((rendered, value))
+
+        delivery = await channel.post_notification(
+            notification_id,
+            text,
+            button_options or None,
+        )
+        if not delivery:
+            return None
+        target, message_id = delivery
+        await self.db.record_notification_delivery(
+            notification_id,
+            "slack",
+            target=target,
+            message_id=message_id,
+        )
+        return message_id
+
+    async def _edit_slack_expired(self, notif: dict[str, Any]) -> None:
+        """Best-effort edit of the Slack card to show it expired.
+
+        Rebuilds the original text from the row and appends the status line,
+        dropping the now-dead buttons. All failures are swallowed by design.
+        """
+        channel = self._get_slack_channel()
+        if not channel:
+            return
+        delivery = await self.db.get_latest_notification_delivery(
+            notif["id"], "slack",
+        )
+        if not delivery or not delivery.get("message_id"):
+            return
+
+        text = self._build_notification_text(
+            notif["session_id"],
+            notif.get("title") or "",
+            notif.get("body") or "",
+            notif.get("priority") or "normal",
+        )
+        text += "\n\n⏰ Expired unanswered"
+        await channel.expire_notification(
+            delivery["target"],
+            str(delivery["message_id"]),
+            text,
+        )
 
     # ------------------------------------------------------------------ #
     #  Maintenance (called by the periodic background tick)                #
@@ -1270,8 +1409,9 @@ class NotificationService:
                     "expiry broadcast failed for %s: %s", notif["id"], exc,
                 )
 
-            # Telegram: mark the card expired, drop dead buttons.
+            # Chat channels: mark the card expired, drop dead buttons.
             await self._edit_telegram_expired(notif)
+            await self._edit_slack_expired(notif)
 
             # Approvals: the proposer is the mechanical pipeline, not a
             # conversation — record the expiry in its audit log.
@@ -1359,12 +1499,14 @@ class NotificationService:
         now-dead inline keyboard. Telegram refuses edits on old
         messages (>48h) — all failures are swallowed by design.
         """
-        target = str(notif.get("telegram_chat_id") or "")
-        delivery = None
-        if target:
-            delivery = await self.db.get_notification_delivery(
-                notif["id"], "telegram", target,
-            )
+        delivery = await self.db.get_latest_notification_delivery(
+            notif["id"], "telegram",
+        )
+        target = str(
+            (delivery or {}).get("target")
+            or notif.get("telegram_chat_id")
+            or ""
+        )
         message_id = (
             (delivery or {}).get("message_id")
             or notif.get("telegram_message_id")
@@ -1378,7 +1520,7 @@ class NotificationService:
         if not chat_id:
             return
 
-        text = self._build_telegram_text(
+        text = self._build_notification_text(
             notif["session_id"],
             notif.get("title") or "",
             notif.get("body") or "",
