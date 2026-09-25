@@ -101,11 +101,12 @@ _DB_FILE_MODE = 0o600
 _DB_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 
 
-# Group/world write on the files or the directory lets another user replace or
-# change the database (integrity). Group/world read on the files lets another
-# user copy the signing secret (confidentiality). Read on the directory is
-# ordinary traversal and is permitted.
-_GROUP_WORLD_WRITE = 0o022
+# Write access for another user on the files or the directory lets that user
+# replace or change the database (integrity). Group/world read on the files lets
+# another user copy the signing secret (confidentiality). Read on the directory
+# is ordinary traversal and is permitted.
+_GROUP_WRITE = 0o020
+_WORLD_WRITE = 0o002
 _GROUP_WORLD_READ = 0o044
 
 # _mode_of result for a path that does not exist. ``None`` means the path
@@ -116,11 +117,12 @@ _ABSENT = object()
 class InsecureStateStorage(RuntimeError):
     """The state directory or database files are not safe to use.
 
-    :meth:`Database.connect` raises it before it opens the database when a
-    database file, sidecar or the state directory is group/world-writable, or
-    its mode cannot be read. Another user may have changed the contents, so the
-    operator must check them and fix the modes by hand. The bootstrap also
-    raises it when a generated signing secret would go into a readable file.
+    :meth:`Database.connect` raises it before it opens the database when
+    another user can write to a database file, a sidecar or the state
+    directory, or when a mode cannot be read. Another user may have changed the
+    contents, so the operator must check them and fix the modes by hand. The
+    bootstrap also raises it when a generated signing secret would go into a
+    readable file.
     """
 
 
@@ -140,14 +142,52 @@ def _mode_of(path: Path):
         return None
 
 
+def _group_is_owner_only(path: Path) -> bool:
+    """Whether the group of ``path`` contains only its owner.
+
+    True for a per-user group: the current user owns ``path``, and its group is
+    that user's primary group, has the same name and has no other members. A
+    ``002`` umask with per-user groups gives group write, which then gives no
+    other user access. Any lookup failure returns ``False``.
+    """
+    try:
+        import grp
+        import pwd
+
+        st = os.stat(path)
+        owner = pwd.getpwuid(st.st_uid)
+        group = grp.getgrgid(st.st_gid)
+        if st.st_uid != os.geteuid() or st.st_gid != owner.pw_gid:
+            return False
+        if group.gr_name != owner.pw_name or set(group.gr_mem) - {owner.pw_name}:
+            return False
+        return not any(
+            user.pw_gid == st.st_gid and user.pw_name != owner.pw_name
+            for user in pwd.getpwall()
+        )
+    except (ImportError, KeyError, OSError):
+        return False
+
+
+def _writable_by_others(path: Path, mode: int) -> bool:
+    """Whether a user other than the owner can write to ``path``.
+
+    World write always counts. Group write counts unless the group contains
+    only the owner (:func:`_group_is_owner_only`).
+    """
+    if mode & _WORLD_WRITE:
+        return True
+    return bool(mode & _GROUP_WRITE) and not _group_is_owner_only(path)
+
+
 @dataclass
 class StatePermissions:
     """The modes of the state directory and database files, classified.
 
-    ``writable`` and ``uninspectable`` are integrity hazards: connect() refuses
-    to open and repairs nothing. ``readable`` (files only) is a confidentiality
-    hazard: connect() repairs it, and the bootstrap refuses only if the repair
-    failed and the secret would be stored in the database.
+    ``writable`` (by another user) and ``uninspectable`` are integrity hazards:
+    connect() refuses to open and repairs nothing. ``readable`` (files only) is a
+    confidentiality hazard: connect() repairs it, and the bootstrap refuses only
+    if the repair failed and the secret would be stored in the database.
     ``exposed_before_repair`` is set when a database file was readable before
     any repair; a stored signing secret may have been copied and is rotated.
     """
@@ -159,7 +199,7 @@ class StatePermissions:
 
     @property
     def integrity_hazards(self) -> list[str]:
-        return [f"{p} is {m:04o} (group/world-writable)" for p, m in self.writable] + [
+        return [f"{p} is {m:04o} (writable by other users)" for p, m in self.writable] + [
             f"{p} has a mode that cannot be read" for p in self.uninspectable
         ]
 
@@ -195,7 +235,7 @@ def _inspect_state_permissions(db_path: Path) -> StatePermissions:
         if mode is None:
             perms.uninspectable.append(path)
             continue
-        if mode & _GROUP_WORLD_WRITE:
+        if _writable_by_others(path, mode):
             perms.writable.append((path, mode))
         if is_db_file and (mode & _GROUP_WORLD_READ):
             perms.readable.append((path, mode))
@@ -235,7 +275,11 @@ def _repair_state_permissions(db_path: Path) -> StatePermissions:
             if final is None:
                 perms.uninspectable.append(path)
                 continue
-        if final & _GROUP_WORLD_WRITE:
+            if final != pre:
+                logger.info(
+                    "Restricted permissions on %s from %04o to %04o", path, pre, final,
+                )
+        if _writable_by_others(path, final):
             perms.writable.append((path, final))
         elif is_db_file and (final & _GROUP_WORLD_READ):
             perms.readable.append((path, final))
@@ -250,9 +294,8 @@ def _refusal_message(db_path: Path, perms: StatePermissions) -> str:
     return (
         f"Refusing to open {db_path}: {'; '.join(perms.integrity_hazards)}. Another "
         f"user could have altered the state (accounts, actors, history), so it is "
-        f"not repaired automatically. If you trust the contents, acknowledge by "
-        f"fixing the modes yourself — chmod 700 {db_path.parent}; chmod 600 {files} "
-        f"— then start again."
+        f"not repaired automatically. If you trust the contents, fix the modes "
+        f"yourself (chmod 700 {db_path.parent}; chmod 600 {files}), then start again."
     )
 
 
@@ -319,10 +362,12 @@ class Database(
 
         Every opener goes through this state-file policy:
 
-        1. If a database file, sidecar or the state directory is
-           group/world-writable, or its mode cannot be read, refuse to open.
-           Another user may have changed the contents, so nothing is repaired.
-        2. Remove group/world read bits and verify the result.
+        1. If another user can write to a database file, a sidecar or the state
+           directory, or a mode cannot be read, refuse to open. Another user may
+           have changed the contents, so nothing is repaired.
+        2. Set the directory to 0700 and the files to 0600, and verify the
+           result. This also removes group write when the group contains only
+           the owner, as a ``002`` umask with per-user groups gives.
         3. Migrate. If a database file was readable before step 2, delete the
            stored signing secret, which may have been copied.
         """

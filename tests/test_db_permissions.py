@@ -2,10 +2,11 @@
 
 On every open, ``Database.connect``:
 
-* refuses to open, with no migration and no repair, when the state directory,
-  a database file or a sidecar is group/world-writable or its mode cannot be
-  read;
-* makes the directory 0700 and the files 0600, and verifies the result;
+* refuses to open, with no migration and no repair, when another user can
+  write to the state directory, a database file or a sidecar, or a mode cannot
+  be read;
+* makes the directory 0700 and the files 0600, and verifies the result. This
+  includes group write when the group contains only the owner;
 * deletes a stored signing secret that was readable before the repair, and
   drops it from the process pin.
 
@@ -61,6 +62,19 @@ def permissive_umask(request):
     old = os.umask(request.param)
     yield request.param
     os.umask(old)
+
+
+@pytest.fixture
+def shared_group(monkeypatch):
+    """Group write counts as another user's access, whatever this machine's
+    group setup is."""
+    monkeypatch.setattr(base, "_group_is_owner_only", lambda path: False)
+
+
+@pytest.fixture
+def owner_only_group(monkeypatch):
+    """The group of every state path contains only its owner."""
+    monkeypatch.setattr(base, "_group_is_owner_only", lambda path: True)
 
 
 async def _make_db(path: Path) -> None:
@@ -151,7 +165,7 @@ async def test_a_0755_directory_is_not_a_hazard(tmp_path):
     Only write access is a hazard."""
     state = tmp_path / "state"
     state.mkdir()
-    os.chmod(state, 0o755)  # explicit: a umask of 002 would make it 0775, which *is* a hazard
+    os.chmod(state, 0o755)  # explicit: a 002 umask gives 0775 (TestOwnerOnlyGroupWrite)
     db_path = state / "nerve.db"
     await _make_db(db_path)
     os.chmod(state, 0o755)
@@ -181,9 +195,11 @@ async def test_hardening_is_idempotent_across_reconnects(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("shared_group")
 class TestRefusesToOpenWritableState:
-    """Writable state is not opened, migrated or repaired, whatever the
-    configuration says. The message gives the chmod commands."""
+    """State that another user can write to is not opened, migrated or
+    repaired, whatever the configuration says. The message gives the chmod
+    commands."""
 
     @pytest.mark.parametrize("mode", [0o666, 0o660, 0o606], ids=["0666", "group-w", "world-w"])
     async def test_a_writable_database_file_is_refused_before_anything_happens(
@@ -225,8 +241,8 @@ class TestRefusesToOpenWritableState:
         "mode", [0o777, 0o770, 0o707, 0o775], ids=["0777", "group-w", "world-w", "0775-umask-002"],
     )
     async def test_a_writable_directory_is_refused(self, tmp_path, mode):
-        """Group-writable counts as writable. That includes 0775, which a plain
-        mkdir gives under a 002 umask."""
+        """Group write counts when the group has other members. That includes
+        0775, which a plain mkdir gives under a 002 umask."""
         db_path = tmp_path / "state" / "nerve.db"
         await _make_db(db_path)
         os.chmod(db_path.parent, mode)
@@ -292,6 +308,109 @@ class TestRefusesToOpenWritableState:
         os.chmod(db_path, 0o666)
         with pytest.raises(InsecureStateStorage):
             await init_db(db_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("owner_only_group")
+class TestOwnerOnlyGroupWrite:
+    """Group write is repaired when the group contains only the owner, as a
+    002 umask with per-user groups gives. World write is still refused."""
+
+    async def test_a_umask_002_install_is_repaired(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path.parent, 0o775)
+        os.chmod(db_path, 0o664)
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert _mode(db_path.parent) == 0o700
+            assert _mode(db_path) == 0o600
+            assert db.state_secured
+        finally:
+            await db.close()
+
+    @pytest.mark.parametrize(
+        "target,mode", [("dir", 0o777), ("file", 0o666)], ids=["dir-0777", "file-0666"],
+    )
+    async def test_world_write_is_refused(self, tmp_path, target, mode):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        path = db_path.parent if target == "dir" else db_path
+        os.chmod(path, mode)
+
+        with pytest.raises(InsecureStateStorage):
+            await Database(db_path).connect()
+        assert _mode(path) == mode
+
+
+class TestGroupIsOwnerOnly:
+    """``_group_is_owner_only`` accepts only a per-user group."""
+
+    @pytest.fixture
+    def entries(self, tmp_path, monkeypatch):
+        import grp
+        import pwd
+
+        path = tmp_path / "f"
+        path.touch()
+        st = os.stat(path)
+        entries = SimpleNamespace(
+            path=path,
+            uid=st.st_uid,
+            gid=st.st_gid,
+            owner=pwd.struct_passwd(("me", "x", st.st_uid, st.st_gid, "", "/", "/bin/sh")),
+            group=grp.struct_group(("me", "x", st.st_gid, [])),
+            others=[],
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: st.st_uid)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: entries.owner)
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: entries.group)
+        monkeypatch.setattr(pwd, "getpwall", lambda: [entries.owner, *entries.others])
+        return entries
+
+    def test_a_per_user_group_is_owner_only(self, entries):
+        assert base._group_is_owner_only(entries.path)
+
+    def test_a_group_with_another_name_is_not(self, entries):
+        import grp
+
+        entries.group = grp.struct_group(("staff", "x", entries.gid, []))
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_with_another_member_is_not(self, entries):
+        import grp
+
+        entries.group = grp.struct_group(("me", "x", entries.gid, ["me", "bob"]))
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_that_is_another_users_primary_group_is_not(self, entries):
+        import pwd
+
+        entries.others = [pwd.struct_passwd(("bob", "x", 4242, entries.gid, "", "/", "/bin/sh"))]
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_that_is_not_the_owners_primary_group_is_not(self, entries):
+        import pwd
+
+        entries.owner = pwd.struct_passwd(
+            ("me", "x", entries.uid, entries.gid + 1, "", "/", "/bin/sh"),
+        )
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_file_owned_by_another_user_is_not(self, entries, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: entries.uid + 1)
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_failed_lookup_is_not(self, entries, monkeypatch):
+        import grp
+
+        def missing(gid):
+            raise KeyError(gid)
+
+        monkeypatch.setattr(grp, "getgrgid", missing)
+        assert not base._group_is_owner_only(entries.path)
 
 
 @pytest.mark.asyncio
