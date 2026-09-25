@@ -15,9 +15,11 @@ membership management belong outside Nerve.
 
 ## Bootstrap
 
-The database contains one system actor for autonomous work. It also creates the
-first human account when no account exists. Interactive setup uses the supplied
-display name; headless setup leaves it empty.
+A migration creates one system actor for autonomous work. When no account
+exists, the gateway creates the first human account at startup. `nerve init`
+creates it during setup, with the display name that you enter; a
+non-interactive setup leaves the name empty. Other CLI commands do not create
+accounts.
 
 An account's `credential_source` is `config` for `auth.password_hash`, `local`
 for a hash stored on the account, or `none` for passwordless access. Bootstrap
@@ -27,19 +29,21 @@ a local credential.
 ## Session-signing secret
 
 Nerve uses `auth.jwt_secret` when configured. Otherwise it generates a secret
-in `instance_secrets` on first start. Authentication fails closed until startup
+and stores it in `instance_secrets`. Authentication fails closed until startup
 has selected a secret.
 
 The selected secret does not change on configuration reload. Adding or changing
 `auth.jwt_secret` takes effect after restart and retires the stored secret.
-Removing it later generates a new secret instead of restoring the retired one.
+If you remove it later, Nerve generates a new secret; the retired one does not
+come back.
 
-The database and its directory must satisfy the state-file permissions described
-in [Configuration](config.md). Nerve refuses unsafe state that it cannot repair.
+The database and its directory must be private to the owner. Nerve repairs the
+modes when it can and refuses to open the database when another user could
+have changed it. See [State-file permissions](config.md#state-file-permissions).
 
 ## Backup and restore
 
 A normal backup includes `nerve.db`, so it preserves account and actor IDs and
 the generated signing secret. `--no-secrets` removes stored secrets and causes a
-new signing key to be generated after restore. Backup and restore files retain
-the owner-only protections described in [Setup](setup.md).
+new signing key to be generated after restore. Backup and restore keep these
+files owner-only; see [State-file permissions](config.md#state-file-permissions).

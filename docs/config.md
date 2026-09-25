@@ -303,22 +303,20 @@ as a warning: nothing failed, but the new value is not live yet.
 With no daemon running there is nothing to reload and the command says so. Config
 is read fresh at startup, so `nerve start` already picks the edit up.
 
-It authenticates with the same signing secret the daemon pinned at startup (see
+It signs its request with the signing secret that the daemon uses (see
 [Accounts and identity](accounts.md)):
 
-- **`auth.jwt_secret` set** → it signs a token with it. If that is not the secret
-  the running daemon started with — the key was changed in config without a
-  restart — the gateway rejects the request and only a restart resolves it.
-- **Unset** → it signs with the secret the daemon generated into `nerve.db` on its
-  first start; this shell is on the same box, so it reads it from there. With no
-  secret anywhere the daemon has never started, and the command refuses before
-  sending anything: the gateway takes no unauthenticated request, locked or not.
-  If the secret is meant to come from `${ENV_VAR}`, export it in that shell too.
+- **`auth.jwt_secret` set** → it signs with that value. If the daemon started
+  with a different value, because the setting changed after the start, the
+  gateway rejects the request. Restart the daemon.
+- **Unset** → it reads the secret that the daemon generated into `nerve.db`. If
+  there is no secret, the daemon has never started, and the command stops
+  before it sends anything. If `auth.jwt_secret` comes from `${ENV_VAR}`, export
+  the variable in this shell too.
 
-`auth.password_hash` is not an alternative here. It gates the browser login,
-which is what mints a token from it; request authentication uses the effective
-startup-pinned signing secret, so a password neither replaces the token nor
-gives the CLI one to sign.
+`auth.password_hash` does not replace the signing secret. The password is for
+the browser login. The gateway authenticates each request with the signing
+secret.
 
 `POST /api/config/sync` runs the same reload but scores it differently, because it
 answers a different question. Its `ok` is about the *merge*: true once the merged
@@ -611,12 +609,10 @@ referenced from `settings.yaml` before you lock the box. The usual ones:
 `auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
 `anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
 
-`auth.jwt_secret` is worth getting right even though it is no longer required. A
-locked instance that ends up without it neither runs open nor refuses every
-request: it generates a signing secret on its first start and keeps it in
-`nerve.db` — machine-local state, not configuration (see
-[Accounts and identity](accounts.md)). Supplying it from the fleet lets you rotate
-it centrally; leaving it out gives each box its own. Note also that a `${VAR}` left unresolved
+`auth.jwt_secret` is optional. A locked instance without it generates a signing
+secret on its first start and keeps it in `nerve.db`, which is machine-local
+state (see [Accounts and identity](accounts.md)). Supply it from the fleet to
+rotate it centrally, or leave it out to give each box its own. Note also that a `${VAR}` left unresolved
 survives as its literal text, which is a perfectly usable signing key and one
 published in the config repo, so check that the variable is actually set on the box.
 
@@ -886,6 +882,42 @@ from any working directory:
 5. The current directory (fresh-install fallback)
 
 `nerve doctor` reports which directory was used and how it was found.
+
+## State-file permissions
+
+The state directory (`~/.nerve`, or `NERVE_HOME`) holds `nerve.db`. The
+database holds accounts, history and, when `auth.jwt_secret` is not set, the
+session-signing secret. Nerve keeps the directory at `0700` and the database
+files (`nerve.db` and its `-wal`, `-shm` and `-journal` files) at `0600`. It
+examines them each time it opens the database:
+
+| Mode found | Result |
+|---|---|
+| Read permission for the group or other users | Nerve removes it. If a database file was readable, Nerve also deletes the stored signing secret and generates a new one, so users must sign in again. |
+| Group write, and the group contains only the owner | Nerve removes it. This repairs an installation created under a `002` umask, where each user has a personal group. |
+| Group write, and the group has other members | Nerve does not open the database. Another user could have changed it. Examine the contents, then run the `chmod` commands from the error message. |
+| World write | Nerve does not open the database, as for a shared group. |
+| A mode that Nerve cannot read | Nerve does not open the database. |
+
+A group contains only the owner when it is the owner's primary group, has the
+owner's user name, and has no other members.
+
+On a filesystem that does not keep Unix modes, the repair has no effect. Nerve
+then does not open the database if other users can write to it. If other users
+can only read it, Nerve does not store a signing secret in it, so set
+`auth.jwt_secret`.
+
+Backups follow the same rule:
+
+- `nerve backup` creates the bundle at `0600`. If the filesystem does not keep
+  that mode, a backup with secrets stops before it writes anything. A
+  `--no-secrets` backup continues with a warning.
+- The snapshot is prepared in the state directory. If Nerve cannot use it,
+  Nerve uses the system temp directory, but only if no other user can rename
+  entries on that path: each directory must belong to you or to root, and a
+  directory that others can write to must be sticky, as `/tmp` is.
+- `nerve restore` installs `nerve.db` at `0600`. If other users can still read
+  the installed file, restore removes the signing secret from it and fails.
 
 ## Core
 

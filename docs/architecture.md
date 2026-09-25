@@ -241,9 +241,9 @@ SQLite with WAL mode (schema version 16):
 - `notifications` — Async notifications and questions (id, session_id, type, title, body, priority, status, options, answer, delivery tracking, expiry)
 - `mcp_servers` — MCP server registry (config is source of truth, DB tracks metadata)
 - `mcp_tool_usage` — MCP tool invocation tracking
-- `actor_refs` — Attribution identity: stable id, `kind` (`human`/`system`), display name (see [Accounts and identity](accounts.md))
-- `accounts` — Local login state, one per human actor: username, `credential_source` (`config`/`local`/`none`), credential, enabled
-- `instance_secrets` — Machine-local secrets that are state rather than configuration (the generated JWT signing secret)
+- `actor_refs`: attribution identity: stable id, `kind` (`human`/`system`), display name (see [Accounts and identity](accounts.md))
+- `accounts`: local login state, one per human actor: username, `credential_source` (`config`/`local`/`none`), credential, enabled
+- `instance_secrets`: machine-local secrets that are state, not configuration (the generated JWT signing secret)
 
 memU SQLite (`~/.nerve/memu.sqlite`):
 - `memu_resources` — Indexed source files/conversations
@@ -265,8 +265,8 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 
 ## Security
 
-- JWT authentication for all API/WebSocket access; the signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db` — there is no unauthenticated mode
+- JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode
 - bcrypt password hashing
 - Path traversal prevention on file operations
 - Self-signed HTTPS (mkcert)
-- Local accounts with a stable actor identity per account (one bootstrapped owner today; see [Accounts and identity](accounts.md)) — no multi-tenancy
+- Local accounts with a stable actor identity per account (one owner account, created at first start; see [Accounts and identity](accounts.md)). No multi-tenancy
