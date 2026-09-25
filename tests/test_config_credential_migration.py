@@ -234,9 +234,9 @@ class TestTheScrub:
 
 @pytest.mark.asyncio
 class TestAConcurrentPasswordChange:
-    """The bootstrap runs from every CLI command that opens the database, which
-    can be alongside a live daemon. Its writes are conditioned on the source it
-    read, so a password set in that window is never written over."""
+    """``nerve init`` can run the bootstrap beside a live daemon. Its writes are
+    conditioned on the source it read, so a password set in that window is
+    never written over."""
 
     async def test_the_copy_does_not_overwrite_a_password_set_meanwhile(
         self, db: Database, tmp_path, monkeypatch,

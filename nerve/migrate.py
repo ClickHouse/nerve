@@ -1158,9 +1158,8 @@ async def _migrate_config_credentials(
         else:
             moved = 0
             for account in stragglers:
-                # Conditioned on the row still being on `config`. This runs from
-                # every CLI command that opens the database, which can be
-                # alongside a live daemon — so an account whose owner set a
+                # Conditioned on the row still being on `config`. `nerve init`
+                # can run beside a live daemon, so an account whose owner set a
                 # password between the read above and this write must keep it,
                 # not have the configured hash put back over it.
                 if await db.set_account_credential_if_source(

@@ -90,8 +90,8 @@ life of the process, so changing `auth.jwt_secret` requires a restart. Rotating
 the secret signs users out.
 
 Nerve refuses authentication until a signing secret and identity store are
-available. State-file permission requirements are documented in
-[Configuration](config.md).
+available. The database files must be private to the owner; see
+[State-file permissions](config.md#state-file-permissions).
 
 ## Upgrade compatibility
 
