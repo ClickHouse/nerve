@@ -5,7 +5,7 @@ vi.mock('../api/client', () => ({
   api: {
     login: vi.fn(),
     authStatus: vi.fn(),
-    getOwnAccount: vi.fn(),
+    getViewer: vi.fn(),
   },
   setToken: vi.fn(),
   clearToken: vi.fn(),
@@ -17,19 +17,22 @@ vi.mock('./helpers/draftStorage', () => ({ clearAllDrafts: vi.fn() }));
 vi.mock('./helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 
 const client = await import('../api/client');
-const { useAuthStore } = await import('./authStore');
+const { useAuthStore, selfActorId } = await import('./authStore');
 
 const api = client.api as unknown as {
   login: ReturnType<typeof vi.fn>;
   authStatus: ReturnType<typeof vi.fn>;
-  getOwnAccount: ReturnType<typeof vi.fn>;
+  getViewer: ReturnType<typeof vi.fn>;
 };
 
-/** The signed-in account, as `/api/accounts/me` returns it. */
+/** This session's actor and account, as `/api/auth/me` returns them. */
 function me(overrides: Record<string, unknown> = {}) {
   return {
-    id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't', ...overrides,
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: {
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
+      enabled: true, has_password: true, created_at: 't', ...overrides,
+    },
   };
 }
 const getToken = client.getToken as unknown as ReturnType<typeof vi.fn>;
@@ -55,9 +58,10 @@ beforeEach(() => {
     error: null,
     sessionExpired: false,
     loginMode: null,
+    viewer: null,
     account: null,
   });
-  api.getOwnAccount.mockResolvedValue(me());
+  api.getViewer.mockResolvedValue(me());
 });
 
 describe('checkAuth: where a cold start lands', () => {
@@ -106,7 +110,7 @@ describe('checkAuth: a tab that already holds a token', () => {
   it('still reads the descriptor, so the expiry overlay asks for the right fields',
     async () => {
       getToken.mockReturnValue('an-existing-token');
-      api.getOwnAccount.mockResolvedValue(me());
+      api.getViewer.mockResolvedValue(me());
       api.authStatus.mockResolvedValue(
         status({ login: 'username_password' }),
       );
@@ -124,7 +128,7 @@ describe('checkAuth: a tab that already holds a token', () => {
     // used to stop at "clear the token", landing a passwordless install on a
     // login form it does not need and cannot use.
     getToken.mockReturnValue('a-dead-token');
-    api.getOwnAccount.mockRejectedValue(new Error('401'));
+    api.getViewer.mockRejectedValue(new Error('401'));
     api.authStatus.mockResolvedValue(
       status({ login: 'none', auth_required: false }),
     );
@@ -139,7 +143,7 @@ describe('checkAuth: a tab that already holds a token', () => {
 
   it('still shows the login page when a dead token meets a password', async () => {
     getToken.mockReturnValue('a-dead-token');
-    api.getOwnAccount.mockRejectedValue(new Error('401'));
+    api.getViewer.mockRejectedValue(new Error('401'));
     api.authStatus.mockResolvedValue(status({ login: 'password' }));
 
     await useAuthStore.getState().checkAuth();
@@ -203,19 +207,42 @@ describe('who the session belongs to', () => {
   it('is read at startup and after signing in', async () => {
     getToken.mockReturnValue('a-token');
     api.authStatus.mockResolvedValue(status());
-    api.getOwnAccount.mockResolvedValue(me({ id: 'acc-7', username: 'bob' }));
+    api.getViewer.mockResolvedValue(me({ id: 'acc-7', username: 'bob' }));
 
     await useAuthStore.getState().checkAuth();
 
     expect(useAuthStore.getState().account).toEqual({ id: 'acc-7', username: 'bob' });
+    expect(useAuthStore.getState().viewer)
+      .toEqual({ id: 'actor-1', kind: 'human', display_name: 'Alice' });
+    expect(selfActorId()).toBe('actor-1');
+  });
+
+  it('keeps the viewer when the session has no account', async () => {
+    getToken.mockReturnValue('a-token');
+    api.authStatus.mockResolvedValue(status());
+    api.getViewer.mockResolvedValue({
+      actor: { id: 'actor-9', kind: 'human', display_name: 'Dana' },
+      account: null,
+    });
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useAuthStore.getState().authenticated).toBe(true);
+    expect(useAuthStore.getState().account).toBeNull();
+    expect(useAuthStore.getState().viewer?.id).toBe('actor-9');
+    expect(selfActorId()).toBe('actor-9');
   });
 
   it('is cleared on logout, along with everything account-scoped', async () => {
-    useAuthStore.setState({ account: { id: 'acc-1', username: 'alice' } });
+    useAuthStore.setState({
+      viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+      account: { id: 'acc-1', username: 'alice' },
+    });
     api.authStatus.mockResolvedValue(status());
 
     useAuthStore.getState().logout();
 
+    expect(useAuthStore.getState().viewer).toBeNull();
     expect(useAuthStore.getState().account).toBeNull();
     expect(clearAllDrafts).toHaveBeenCalled();
     expect(clearAllReads).toHaveBeenCalled();
@@ -232,11 +259,12 @@ describe('who the session belongs to', () => {
         authenticated: false,
       });
       api.login.mockResolvedValue({ token: 'bobs-token' });
-      api.getOwnAccount.mockResolvedValue(me({ id: 'acc-2', username: 'bob' }));
+      api.getViewer.mockResolvedValue(me({ id: 'acc-2', username: 'bob' }));
 
       await useAuthStore.getState().login('a-passphrase', 'bob');
 
       expect(useAuthStore.getState().authenticated).toBe(false);
+      expect(useAuthStore.getState().viewer).toBeNull();
       expect(useAuthStore.getState().account).toBeNull();
       expect(useAuthStore.getState().error).toMatch(/different account/);
       expect(clearAllDrafts).toHaveBeenCalled();
@@ -254,7 +282,7 @@ describe('who the session belongs to', () => {
       authenticated: false,
     });
     api.login.mockResolvedValue({ token: 'a-fresh-token' });
-    api.getOwnAccount.mockRejectedValue(new Error('network'));
+    api.getViewer.mockRejectedValue(new Error('network'));
 
     await useAuthStore.getState().login('a-passphrase', 'alice');
 
@@ -274,7 +302,7 @@ describe('who the session belongs to', () => {
       authenticated: false,
     });
     api.login.mockResolvedValue({ token: 'a-fresh-token' });
-    api.getOwnAccount.mockResolvedValue(me({ id: 'acc-1', username: 'alice' }));
+    api.getViewer.mockResolvedValue(me({ id: 'acc-1', username: 'alice' }));
 
     await useAuthStore.getState().login('a-passphrase', 'alice');
 
@@ -285,7 +313,7 @@ describe('who the session belongs to', () => {
 
   it('does not purge on an ordinary cold sign-in', async () => {
     api.login.mockResolvedValue({ token: 'a-fresh-token' });
-    api.getOwnAccount.mockResolvedValue(me({ id: 'acc-2', username: 'bob' }));
+    api.getViewer.mockResolvedValue(me({ id: 'acc-2', username: 'bob' }));
 
     await useAuthStore.getState().login('a-passphrase', 'bob');
 

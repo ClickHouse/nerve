@@ -20,6 +20,9 @@ export function hydrateMessage(raw: any): ChatMessage {
       channel: raw.channel,
       created_at: raw.created_at,
       native_turn_id: raw.native_turn_id,
+      // Resolve the stable id at render time so renamed actors need no message
+      // rewrite. Null rows remain unlabeled.
+      actor_id: raw.actor_id ?? null,
     };
   }
 
@@ -71,6 +74,8 @@ export function hydrateMessage(raw: any): ChatMessage {
     blocks.push({ type: 'text', content: raw.content });
   }
 
+  // Assistant authorship is represented by role, not actor_id. Omitting the
+  // field prevents backend payloads from attaching a principal accidentally.
   return {
     id: raw.id,
     role: 'assistant',

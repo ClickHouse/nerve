@@ -1,8 +1,9 @@
 import { create } from 'zustand';
 import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
-  type Account, type LoginKind,
+  type Account, type ActorRef, type LoginKind, type Viewer,
 } from '../api/client';
+import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 
@@ -10,6 +11,12 @@ import { clearAllReads } from './helpers/readStorage';
 export interface SignedInAccount {
   id: string;
   username: string | null;
+}
+
+/** What `/api/auth/me` says about this session. */
+export interface Identity {
+  viewer: ActorRef;
+  account: SignedInAccount | null;
 }
 
 /**
@@ -20,6 +27,8 @@ export interface SignedInAccount {
 function purgeAccountScopedState(): void {
   clearAllDrafts();
   clearAllReads();
+  // Do not let a name snapshot outlive the session that read it.
+  useActorStore.getState().reset();
 }
 
 /**
@@ -65,10 +74,18 @@ interface AuthState {
    */
   loginMode: LoginKind | null;
   /**
-   * The account this session belongs to, once it is known.
+   * The actor this session acts as, once it is known.
    *
-   * Read at startup and after every sign-in, from `/api/accounts/me`. It is
-   * what binds re-authentication to the person whose app is on screen: the
+   * Read at startup and after every sign-in, from `/api/auth/me`. Attribution
+   * compares message and session authors with this id. It does not depend on
+   * the session having a local account. `null` means unknown.
+   */
+  viewer: ActorRef | null;
+  /**
+   * The local account this session belongs to, once it is known.
+   *
+   * Read with `viewer`, from `/api/auth/me`. It is what binds
+   * re-authentication to the person whose app is on screen: the
    * session-expired overlay sits on top of a *mounted* application holding that
    * person's drafts and loaded state, so it may only be unlocked by them.
    * `null` means unknown — the overlay then offers nothing but a sign-out.
@@ -107,14 +124,45 @@ let sessionEstablished = false;
  */
 let statusGeneration = 0;
 
-function identityOf(account: Account): SignedInAccount {
+/** Drops login/startup decisions superseded by logout or another auth session. */
+let authGeneration = 0;
+
+function beginAuthSession(): number {
+  return ++authGeneration;
+}
+
+function isCurrentAuthSession(generation: number): boolean {
+  return generation === authGeneration;
+}
+
+/** Bind delayed work to the login/logout generation that started it. */
+export function bindAuthSession(): { stillCurrent: () => boolean } {
+  const generation = authGeneration;
+  return { stillCurrent: () => isCurrentAuthSession(generation) };
+}
+
+/** Bind delayed optimistic work to the actor and auth session that requested it. */
+export function bindSender(): { actorId: string | null; stillCurrent: () => boolean } {
+  const authSession = bindAuthSession();
+  const actorId = useAuthStore.getState().viewer?.id ?? null;
+  return { actorId, stillCurrent: authSession.stillCurrent };
+}
+
+function accountOf(account: Account): SignedInAccount {
   return { id: account.id, username: account.username };
 }
 
-/** The signed-in account, or `null` if it cannot be read right now. */
-async function loadIdentity(): Promise<SignedInAccount | null> {
+export function identityOf(viewer: Viewer): Identity {
+  return {
+    viewer: viewer.actor,
+    account: viewer.account ? accountOf(viewer.account) : null,
+  };
+}
+
+/** This session's identity, or `null` if it cannot be read right now. */
+async function loadIdentity(): Promise<Identity | null> {
   try {
-    return identityOf(await api.getOwnAccount());
+    return identityOf(await api.getViewer());
   } catch {
     return null;
   }
@@ -127,9 +175,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   error: null,
   sessionExpired: false,
   loginMode: null,
+  viewer: null,
   account: null,
 
   login: async (password: string, username?: string) => {
+    const generation = beginAuthSession();
     const previous = get().account;
     const wasExpired = get().sessionExpired;
     set({ loading: true, error: null });
@@ -137,14 +187,25 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     try {
       ({ token } = await api.login(password, username));
     } catch (e: any) {
+      if (!isCurrentAuthSession(generation)) return;
       set({ error: e.message || 'Login failed', loading: false });
       // A refused sign-in is a good moment to find out the form was asking for
       // the wrong thing, which is what a stale descriptor looks like from here.
       void get().refreshStatus();
       return;
     }
-    setToken(token);
+    // Never install a credential for a session logout already ended.
+    if (!isCurrentAuthSession(generation)) return;
+
+    const tokenRevision = setToken(token);
     const identity = await loadIdentity();
+    // Take back only this attempt's token revision. JWTs minted for the same
+    // account in one second can be byte-identical, so string equality cannot
+    // distinguish this stale attempt from a newer login.
+    if (!isCurrentAuthSession(generation)) {
+      clearToken(tokenRevision);
+      return;
+    }
 
     if (wasExpired) {
       // Unlocking a *mounted* application — one still holding the previous
@@ -162,7 +223,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         });
         return;
       }
-      if (!previous || identity.id !== previous.id) {
+      if (!previous || identity.account?.id !== previous.id) {
         // A different person, in front of somebody else's mounted application.
         // Nothing of the previous account may survive, so this is a sign-out
         // rather than a sign-in.
@@ -171,7 +232,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         sessionEstablished = false;
         set({
           authenticated: false, loading: false, sessionExpired: false,
-          account: null,
+          viewer: null, account: null,
           error: 'That is a different account. Sign in again to use it.',
         });
         return;
@@ -181,18 +242,23 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     sessionEstablished = true;
     set({
       authenticated: true, loading: false, sessionExpired: false,
-      account: identity,
+      viewer: identity?.viewer ?? null,
+      account: identity?.account ?? null,
     });
   },
 
   logout: () => {
+    beginAuthSession();
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
     // browser. Only on a *deliberate* logout — an expired session must never
     // take your unsent work with it.
     purgeAccountScopedState();
     sessionEstablished = false;  // back to a cold start: next 401 is not an "expiry"
-    set({ authenticated: false, sessionExpired: false, error: null, account: null });
+    set({
+      authenticated: false, loading: false, sessionExpired: false,
+      error: null, viewer: null, account: null,
+    });
     void get().refreshStatus();
   },
 
@@ -206,26 +272,29 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   checkAuth: async () => {
+    const authSession = beginAuthSession();
     const token = getToken();
     const generation = ++statusGeneration;
     // Both at once. Nothing renders until both have answered — that is what
     // `ready` means — so asking in sequence would double the blank screen.
-    // `/api/accounts/me` *is* the session check: it needs a valid token and it
-    // says which account the token belongs to, which is one request rather than
-    // two for strictly more than `/api/auth/check` answered.
+    // `/api/auth/me` *is* the session check: it needs a valid token and it
+    // says which actor and account the token belongs to, which is one request
+    // rather than two for strictly more than `/api/auth/check` answered.
     const [statusOutcome, identityOutcome] = await Promise.allSettled([
       api.authStatus(),
-      token ? api.getOwnAccount() : Promise.resolve(null),
+      token ? api.getViewer() : Promise.resolve(null),
     ]);
 
     const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
     applyStatus(generation, status);
 
+    if (!isCurrentAuthSession(authSession)) return;
+
     if (token && identityOutcome.status === 'fulfilled' && identityOutcome.value) {
       sessionEstablished = true;
       set({
         authenticated: true, ready: true,
-        account: identityOf(identityOutcome.value),
+        ...identityOf(identityOutcome.value),
       });
       return;
     }
@@ -237,7 +306,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     // login form it did not need and could not use.
     const hadToken = !!token;
     if (hadToken) clearToken();
-    set({ account: null });
+    set({ viewer: null, account: null });
 
     // Auto-login only when the server reports a passwordless install. That
     // state requires exactly one account; a multi-account install requires an
@@ -245,11 +314,18 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (status?.login === 'none') {
       try {
         const { token: fresh } = await api.login('');
-        setToken(fresh);
+        if (!isCurrentAuthSession(authSession)) return;
+        const tokenRevision = setToken(fresh);
+        const identity = await loadIdentity();
+        if (!isCurrentAuthSession(authSession)) {
+          clearToken(tokenRevision);
+          return;
+        }
         sessionEstablished = true;
         set({
           authenticated: true, ready: true, sessionExpired: false,
-          account: await loadIdentity(),
+          viewer: identity?.viewer ?? null,
+          account: identity?.account ?? null,
         });
         return;
       } catch {
@@ -305,3 +381,8 @@ setUnauthorizedHandler(() => {
   // takes — a second account, most of all. Ask before drawing the form.
   void useAuthStore.getState().refreshStatus();
 });
+
+/** Stable actor for optimistic rows; null until the viewer is known. */
+export function selfActorId(): string | null {
+  return useAuthStore.getState().viewer?.id ?? null;
+}

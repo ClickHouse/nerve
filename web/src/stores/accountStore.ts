@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { api, getToken, type Account } from '../api/client';
-import { useAuthStore } from './authStore';
+import { api, type Account } from '../api/client';
+import { useActorStore } from './actorStore';
+import { bindAuthSession, identityOf, useAuthStore } from './authStore';
 
 /**
  * The server's message, out of the error the API layer throws.
@@ -54,12 +55,11 @@ function upsert(accounts: Account[], account: Account): Account[] {
 }
 
 /**
- * Re-read the list and `/api/auth/status`. Returns the failure, or `null`.
+ * Re-read the list, signed-in identity, `/api/auth/status`, and the actor map.
+ * Returns the failure, or `null`.
  *
- * The status half is not laziness: both of the things this screen does —
- * setting the first password, adding the second account — change how the *login
- * form* behaves, and a stale descriptor would leave a tab auto-logging-in or
- * asking for the wrong fields.
+ * Auth status updates the login form after the first password or second account
+ * is added. The actor map updates renamed labels; messages store ids, not names.
  *
  * A refresh failure is not a mutation failure. Once the write has committed,
  * reporting a redraw problem as a failed write can make the caller retry a
@@ -69,19 +69,17 @@ function upsert(accounts: Account[], account: Account): Account[] {
 async function resync(
   set: (partial: Partial<AccountState>) => void,
 ): Promise<unknown | null> {
-  // Both, independently. They answer different questions of different servers'
-  // worth of state, and the list failing used to skip the status refresh
-  // entirely — so an install that had just set its first password or added its
-  // second account could be left with `loginMode` describing
-  // the instance it was five seconds ago, purely because a list request
-  // happened to fail.
-  const sessionToken = getToken();
+  // Run each refresh independently so a list failure cannot block login mode,
+  // identity, or actor-label updates. Bind a delayed identity response to this
+  // auth session so it cannot overwrite a later login.
+  const authSession = bindAuthSession();
   const identity = useAuthStore.getState().account;
   const [listOutcome, identityOutcome] = await Promise.allSettled([
     api.listAccounts(),
-    identity ? Promise.resolve(identity) : api.getOwnAccount(),
-    // refreshStatus swallows its own failures and keeps the last known answer.
+    identity ? Promise.resolve(null) : api.getViewer(),
+    // These retain their last known values on failure.
     useAuthStore.getState().refreshStatus(),
+    useActorStore.getState().refresh(),
   ]);
   const auth = useAuthStore.getState();
   if (
@@ -90,14 +88,9 @@ async function resync(
     && identityOutcome.value
     && auth.authenticated
     && !auth.account
-    && getToken() === sessionToken
+    && authSession.stillCurrent()
   ) {
-    useAuthStore.setState({
-      account: {
-        id: identityOutcome.value.id,
-        username: identityOutcome.value.username,
-      },
-    });
+    useAuthStore.setState(identityOf(identityOutcome.value));
   }
   if (listOutcome.status === 'rejected') {
     set({ loading: false });

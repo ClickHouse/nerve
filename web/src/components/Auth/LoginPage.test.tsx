@@ -8,7 +8,7 @@ vi.mock('../../api/client', async () => {
   );
   return {
     ...actual,
-    api: { authStatus: vi.fn(), login: vi.fn(), getOwnAccount: vi.fn() },
+    api: { authStatus: vi.fn(), login: vi.fn(), getViewer: vi.fn() },
     setToken: vi.fn(),
     clearToken: vi.fn(),
     getToken: vi.fn(() => null),
@@ -55,9 +55,12 @@ beforeEach(() => {
     login,
     refreshStatus,
   });
-  (api.getOwnAccount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
-    enabled: true, has_password: true, created_at: 't',
+  (api.getViewer as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    account: {
+      id: 'acc-1', actor_id: 'actor-1', username: 'alice', display_name: 'Alice',
+      enabled: true, has_password: true, created_at: 't',
+    },
   });
 });
 

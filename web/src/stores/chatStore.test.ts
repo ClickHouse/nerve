@@ -27,7 +27,11 @@ vi.mock('../api/client', () => ({
     listSessions: vi.fn(),
     listArchivedSessions: vi.fn(),
     listSystemSessions: vi.fn(),
+    getViewer: vi.fn(async () => { throw new Error("401"); }),
   },
+  // chatStore reads these authStore dependencies when it stamps optimistic rows.
+  getToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../api/websocket', () => ({
   ws: { switchSession: vi.fn(), send: vi.fn(), connect: vi.fn() },

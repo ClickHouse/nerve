@@ -25,7 +25,14 @@ from nerve.gateway.auth import (
     verify_password,
 )
 from nerve.db.accounts import login_state_from
-from nerve.gateway.routes.accounts import account_credential, instance_is_passwordless
+from nerve.gateway.routes._deps import get_deps
+from nerve.gateway.routes.accounts import (
+    AccountOut,
+    _render,
+    account_credential,
+    instance_is_passwordless,
+)
+from nerve.gateway.routes.actors import actor_out
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
 
 logger = logging.getLogger(__name__)
@@ -266,3 +273,35 @@ async def auth_status():
 @router.get("/api/auth/check", dependencies=[Depends(require_auth)])
 async def check_auth():
     return {"authenticated": True}
+
+
+class ViewerActor(BaseModel):
+    """One actor, in the shape ``GET /api/actors`` returns."""
+
+    id: str
+    kind: str
+    display_name: str | None
+
+
+class ViewerResponse(BaseModel):
+    actor: ViewerActor
+    account: AccountOut | None
+
+
+@router.get("/api/auth/me", response_model=ViewerResponse)
+async def who_am_i(actor: Actor = Depends(require_auth)):
+    """The actor this request acts as, and its local account if it has one.
+
+    The web UI compares message and session authors with ``actor``.
+    ``account`` is ``None`` for a credential without an account, such as the
+    system principal's.
+    """
+    db = get_deps().db
+    ref = await db.get_actor_ref(actor.actor_id)
+    if ref is None:  # pragma: no cover - require_auth resolved it a moment ago
+        raise HTTPException(status_code=401, detail="This credential names no actor")
+    account = await db.get_account(actor.account_id) if actor.account_id else None
+    return ViewerResponse(
+        actor=ViewerActor(**actor_out(ref)),
+        account=await _render(db, account) if account else None,
+    )

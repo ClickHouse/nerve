@@ -44,6 +44,13 @@ export interface ActorRef {
   display_name: string | null;
 }
 
+/** `GET /api/auth/me`: the actor this session acts as, and its local account.
+ *  `account` is `null` for a credential without an account. */
+export interface Viewer {
+  actor: ActorRef;
+  account: Account | null;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -278,15 +285,25 @@ export interface WorkflowRunJournal {
 }
 
 let authToken: string | null = localStorage.getItem('nerve_token');
+let tokenRevision = 0;
 
-export function setToken(token: string) {
+/** Install a token and return the revision that owns it. */
+export function setToken(token: string): number {
   authToken = token;
+  tokenRevision += 1;
   localStorage.setItem('nerve_token', token);
+  return tokenRevision;
 }
 
-export function clearToken() {
+/** Clear the current token, optionally only if a caller still owns it. */
+export function clearToken(expectedRevision?: number): boolean {
+  if (expectedRevision !== undefined && expectedRevision !== tokenRevision) {
+    return false;
+  }
   authToken = null;
+  tokenRevision += 1;
   localStorage.removeItem('nerve_token');
+  return true;
 }
 
 export function getToken(): string | null {
@@ -302,9 +319,11 @@ const SESSION_TOKEN_HEADER = 'X-Nerve-Token';
  * talking to the server never expires — no daily re-login, no logout
  * mid-sentence.
  */
-function absorbRefreshedToken(res: Response): void {
+function absorbRefreshedToken(res: Response, requestRevision: number): void {
   const fresh = res.headers.get(SESSION_TOKEN_HEADER);
-  if (fresh && fresh !== authToken) setToken(fresh);
+  if (requestRevision === tokenRevision && fresh && fresh !== authToken) {
+    setToken(fresh);
+  }
 }
 
 /**
@@ -324,28 +343,32 @@ export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorized = handler;
 }
 
-function handleUnauthorized(): Error {
-  clearToken();
-  onUnauthorized?.();
+function handleUnauthorized(requestRevision: number): Error {
+  // A response belongs to the token revision that sent it. A logout, login,
+  // or accepted slide makes older 401s informational rather than authority to
+  // clear the new session or put its UI into the expiry state.
+  if (clearToken(requestRevision)) onUnauthorized?.();
   return new Error('Unauthorized');
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const requestToken = authToken;
+  const requestRevision = tokenRevision;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
   };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+  if (requestToken) {
+    headers['Authorization'] = `Bearer ${requestToken}`;
   }
 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
 
-  absorbRefreshedToken(res);
-
   if (res.status === 401) {
-    throw handleUnauthorized();
+    throw handleUnauthorized(requestRevision);
   }
+
+  absorbRefreshedToken(res, requestRevision);
 
   if (!res.ok) {
     const body = await res.text();
@@ -374,17 +397,16 @@ export const api = {
 
   authStatus: () => request<AuthStatus>('/auth/status'),
 
+  /**
+   * Who this session acts as. Doubles as the authentication check at startup:
+   * it needs a valid session *and* answers which actor and account the session
+   * belongs to. Attribution compares authors with the actor; re-authentication
+   * is bound to the account.
+   */
+  getViewer: () => request<Viewer>('/auth/me'),
+
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
-
-  /**
-   * The signed-in account. Doubles as the authentication check at startup: it
-   * needs a valid session *and* answers which account the session belongs to,
-   * which is what binds a re-authentication to the person whose app is on
-   * screen. `403` for the instance's own system credential, which has no
-   * account — a browser never holds one.
-   */
-  getOwnAccount: () => request<Account>('/accounts/me'),
 
   createAccount: (body: { username: string; password: string; display_name?: string }) =>
     request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
@@ -852,8 +874,10 @@ export const api = {
     formData.append('session_id', sessionId);
     files.forEach(f => formData.append('files', f));
 
+    const requestToken = authToken;
+    const requestRevision = tokenRevision;
     const headers: Record<string, string> = {};
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    if (requestToken) headers['Authorization'] = `Bearer ${requestToken}`;
 
     const res = await fetch(`${API_BASE}/files/upload`, {
       method: 'POST',
@@ -861,11 +885,12 @@ export const api = {
       body: formData,
     });
 
-    absorbRefreshedToken(res);
-
     if (res.status === 401) {
-      throw handleUnauthorized();
+      throw handleUnauthorized(requestRevision);
     }
+
+    absorbRefreshedToken(res, requestRevision);
+
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`${res.status}: ${body}`);

@@ -33,7 +33,7 @@ export {
   RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server,
   ShieldCheck, ShieldQuestion, SlidersHorizontal, Sparkle, Sparkles,
   Square, SquareTerminal, Star, StickyNote, Sun, Tag, Terminal, Timer,
-  Users,
+  User, Users,
   Trash2, TrendingDown, TrendingUp, Unlink, Workflow, WrapText, Wrench, X,
   XCircle, Zap
 } from 'lucide-react';

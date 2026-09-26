@@ -265,6 +265,53 @@ class TestEveryAccountMayManageAccounts:
 
 
 # --------------------------------------------------------------------------- #
+#  The viewer                                                                  #
+# --------------------------------------------------------------------------- #
+
+_ACTOR_FIELDS = {"id", "kind", "display_name"}
+
+
+@pytest.mark.asyncio
+class TestViewer:
+    async def test_a_session_returns_its_actor_and_its_account(self, install: _Install):
+        await install.db.update_actor_profile(
+            install.identity.owner_actor_id, display_name="Alice",
+        )
+        async with _client(install.app) as client:
+            response = await client.get("/api/auth/me", headers=install.headers())
+        assert response.status_code == 200
+        body = response.json()
+        _assert_no_credential(body)
+        assert set(body) == {"actor", "account"}
+        assert set(body["actor"]) == _ACTOR_FIELDS
+        assert set(body["account"]) == _ACCOUNT_FIELDS
+        assert body["actor"] == {
+            "id": install.identity.owner_actor_id,
+            "kind": "human",
+            "display_name": "Alice",
+        }
+        assert body["account"]["id"] == install.owner_id
+        assert body["account"]["actor_id"] == body["actor"]["id"]
+
+    async def test_the_system_principal_has_an_actor_and_no_account(
+        self, install: _Install,
+    ):
+        async with _client(install.app) as client:
+            response = await client.get(
+                "/api/auth/me", headers=_bearer(create_system_token(_SECRET)),
+            )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["account"] is None
+        assert body["actor"]["id"] == install.db.system_actor_id
+        assert body["actor"]["kind"] == "system"
+
+    async def test_no_token_no_viewer(self, install: _Install):
+        async with _client(install.app) as client:
+            assert (await client.get("/api/auth/me")).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
 #  The guards                                                                  #
 # --------------------------------------------------------------------------- #
 
