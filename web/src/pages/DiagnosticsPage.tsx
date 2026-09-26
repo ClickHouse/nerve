@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from '../components/ui/icons';
 import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
+import { StatusBadge } from '../components/Cron/controls';
 
 function formatUptime(isoDate: string): string {
   const diff = Date.now() - new Date(isoDate).getTime();
@@ -419,10 +420,7 @@ export function DiagnosticsPage() {
                     <tr key={log.id} className="border-t border-border-subtle hover:bg-surface">
                       <td className="px-4 py-2 font-mono text-text-secondary">{log.job_id}</td>
                       <td className="px-4 py-2">
-                        {log.status === 'success'
-                          ? <span className="flex items-center gap-1 text-hue-emerald"><CheckCircle2 size={12} /> ok</span>
-                          : <span className="flex items-center gap-1 text-hue-red"><XCircle size={12} /> error</span>
-                        }
+                        <StatusBadge status={log.status} />
                       </td>
                       <td className="px-4 py-2 text-text-dim">{log.started_at}</td>
                       <td className="px-4 py-2 text-hue-red text-xs truncate max-w-xs">{log.error || ''}</td>

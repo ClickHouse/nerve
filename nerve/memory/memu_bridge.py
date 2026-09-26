@@ -2102,14 +2102,35 @@ class MemUBridge:
         pass
 
     @staticmethod
-    def _release_memory() -> None:
-        """Force Python GC and return freed pages to the OS."""
-        gc.collect()
+    def _malloc_trim() -> None:
+        """Hand freed glibc arenas back to the OS. Cheap; never raises."""
         if MemUBridge._libc is not None:
             try:
                 MemUBridge._libc.malloc_trim(0)
             except Exception:
                 pass
+
+    @staticmethod
+    def _release_memory() -> None:
+        """Force a full Python GC and return freed pages to the OS.
+
+        The full collection walks the whole heap and stops every Python thread
+        for the duration, so callers must be rare or tolerate a pause. Use
+        :meth:`_trim_memory` on hot paths.
+        """
+        gc.collect()
+        MemUBridge._malloc_trim()
+
+    @staticmethod
+    def _trim_memory() -> None:
+        """Return freed pages to the OS without pausing other threads.
+
+        The generational pass reclaims the embedding cycles a just-finished
+        memorize leaves behind, and ``malloc_trim`` returns the pages. Neither
+        cost grows with heap size, so this is safe to call per indexed file.
+        """
+        gc.collect(1)
+        MemUBridge._malloc_trim()
 
     _MEMORIZE_TIMEOUT = 300
     # Number of retry attempts after a timeout.
@@ -2478,9 +2499,9 @@ class MemUBridge:
                             name=f"filter-knowledge-{Path(file_path).name}",
                         )
 
-                # gc.collect + malloc_trim can take 100ms+ on a large heap
-                # — run off the event loop.
-                await asyncio.to_thread(self._release_memory)
+                # Per-file, so the cost must not grow with the heap: a full
+                # collection here stalls the event loop for seconds.
+                self._trim_memory()
                 return True
 
             except asyncio.TimeoutError:

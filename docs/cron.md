@@ -481,6 +481,17 @@ Set `catchup: false` on jobs where a late run doesn't make sense:
 
 Interval alignment still applies even with `catchup: false` — only the startup catch-up fire is skipped.
 
+### Late runs
+
+A run that cannot start exactly on time still runs if it starts within 30 seconds
+of its scheduled time (`_MISFIRE_GRACE_SECONDS` in `nerve/cron/service.py`; read
+when the scheduler is built, so changing it needs a restart).
+
+A run delayed beyond that is dropped rather than run very late, and recorded in
+`cron_logs` with status `missed` so the gap is visible next to the runs around it.
+A `missed` row never counts as a successful run, so it does not affect interval
+alignment or startup catch-up.
+
 ## Source Runners
 
 In addition to YAML-defined cron jobs, the cron service auto-registers **source runners** from the `sync:` config. Each enabled source becomes an APScheduler job with ID `source:<name>` (e.g., `source:gmail`, `source:github`).
@@ -498,7 +509,7 @@ See [sources.md](sources.md) for full documentation.
 Every cron and source run is logged in the `cron_logs` SQLite table:
 - `job_id` — Which job ran (e.g., `morning-briefing` or `source:gmail`)
 - `started_at` / `finished_at` — Timestamps
-- `status` — `success` or `error`
+- `status` — `success`, `error`, or `missed` (see [Late runs](#late-runs))
 - `output` — First 2000 chars of response / summary
 - `error` — Error message if failed
 
