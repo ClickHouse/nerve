@@ -8,11 +8,14 @@ from pydantic import BaseModel
 
 from nerve.config import get_config
 from nerve.gateway.auth import (
-    create_token,
+    NO_IDENTITY_DETAIL,
+    create_session_token,
     effective_jwt_secret,
+    identity_store,
     require_auth,
     verify_password,
 )
+from nerve.identity import Actor, ActorResolutionError, actor_for_sole_account
 
 router = APIRouter()
 
@@ -37,12 +40,21 @@ async def login(req: LoginRequest):
             "gateway so one is generated, or set auth.jwt_secret.",
         )
 
+    store = identity_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
+
     if config.auth.password_hash:
         if not verify_password(req.password, config.auth.password_hash):
             raise HTTPException(status_code=401, detail="Invalid password")
-    # A sole passwordless account accepts any password.
+    # Password-only login resolves to the sole account; passwordless accepts
+    # any password.
+    try:
+        actor: Actor = await actor_for_sole_account(store)
+    except ActorResolutionError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
 
-    return LoginResponse(token=create_token(secret))
+    return LoginResponse(token=create_session_token(secret, actor.account_id))
 
 
 @router.get("/api/auth/status")
@@ -54,6 +66,6 @@ async def auth_status():
     }
 
 
-@router.get("/api/auth/check")
-async def check_auth(user: dict = Depends(require_auth)):
+@router.get("/api/auth/check", dependencies=[Depends(require_auth)])
+async def check_auth():
     return {"authenticated": True}

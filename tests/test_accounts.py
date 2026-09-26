@@ -150,6 +150,21 @@ async def test_connect_fails_on_corrupt_system_identity(tmp_path, shape):
 
 
 @pytest.mark.asyncio
+async def test_connect_caches_the_system_actor(tmp_path):
+    db = Database(tmp_path / "nerve.db")
+    await db.connect()
+    try:
+        actor = db.system_actor
+        assert actor is db.system_actor
+        assert actor.actor_id == db.system_actor_id
+        assert actor.is_system and actor.account_id is None
+    finally:
+        await db.close()
+    with pytest.raises(RuntimeError, match="not connected"):
+        db.system_actor
+
+
+@pytest.mark.asyncio
 async def test_account_schema_guards_identity_and_login_state(db: Database):
     human = await _insert_human(db)
     with pytest.raises(sqlite3.IntegrityError):

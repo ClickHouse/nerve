@@ -19,6 +19,24 @@ When `auth.password_hash` is unset, any password is accepted for the sole local
 account. Treat the returned token as opaque. A `503` response means startup has
 not selected a signing secret yet.
 
+The token identifies the sole local account. Disabled accounts cannot log in
+(`401`).
+
+#### Authenticated requests
+
+Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
+or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+
+Every request resolves its token to an account actor or the system principal.
+Unknown and disabled accounts fail with `401`; unavailable startup identity
+state fails with `503`. See [Accounts and identity](accounts.md) for token
+types and legacy-session compatibility.
+
+When a session is more than halfway to expiry, the response includes a refreshed
+token in `X-Nerve-Token`. Replace the current token with it. The header also
+upgrades sessions created before account-based tokens and is exposed through
+CORS.
+
 #### `GET /api/auth/status`
 Return whether login requires a password. Authentication is not required.
 
@@ -570,7 +588,15 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 ## WebSocket Protocol
 
-Connect to `ws[s]://host:port/ws?token=<jwt>`.
+Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
+too). The token is resolved to an actor at admission. A credential that names
+nobody is refused with close code `4001`. Once admitted, both identity and
+authority remain fixed until the socket reconnects; account changes are checked
+at the next connection.
+
+Unlike REST, a WebSocket never hands back a refreshed token — it has no
+response headers. The browser's ordinary REST traffic keeps the stored token
+fresh.
 
 ### Client → Server
 

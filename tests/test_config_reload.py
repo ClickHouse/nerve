@@ -21,7 +21,6 @@ from nerve.config_reload import (
 )
 from nerve.cron.service import CronService
 
-
 def _fake_runner(job_id, source_name):
     return SimpleNamespace(
         job_id=job_id,
@@ -781,7 +780,7 @@ class TestReloadRoute:
             "nerve.config_reload.reload_all",
             AsyncMock(return_value={"config": "reloaded"}),
         )
-        result = await route_mod.reload_config_route(user={})
+        result = await route_mod.reload_config_route()
         assert result["ok"] is True
         assert result["detail"] == {"config": "reloaded"}
         assert result["errors"] == {}
@@ -805,7 +804,7 @@ class TestReloadRoute:
                 "config": "error: bad yaml", "cron": {"enabled": 3},
             }),
         )
-        result = await route_mod.reload_config_route(user={})
+        result = await route_mod.reload_config_route()
         assert result["ok"] is False
         assert result["errors"] == {"config": "bad yaml"}
         # The rest still ran — best-effort is the point, and the detail shows it.
