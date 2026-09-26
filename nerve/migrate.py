@@ -1596,7 +1596,10 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
 
 
 def bootstrap_identity_sync(
-    config: NerveConfig, *, display_name: str | None = None,
+    config: NerveConfig,
+    *,
+    display_name: str | None = None,
+    passwordless: bool = False,
 ) -> MigrationReport:
     """Run the identity bootstrap on a new connection, for the installer.
 
@@ -1604,6 +1607,10 @@ def bootstrap_identity_sync(
     owner here; the gateway would create it unnamed. This does not skip a
     fresh install, because the installer has just written the configuration.
     Raises on failure.
+
+    ``passwordless`` records the operator's choice of a passwordless
+    installation, which completes setup. It has no effect on an account that
+    has a password.
     """
     try:
         asyncio.get_running_loop()
@@ -1616,7 +1623,9 @@ def bootstrap_identity_sync(
         )
     report = MigrationReport()
     asyncio.run(
-        _bootstrap_with_own_connection(config, paths.db_path(), report, display_name)
+        _bootstrap_with_own_connection(
+            config, paths.db_path(), report, display_name, passwordless,
+        )
     )
     return report
 
@@ -1626,6 +1635,7 @@ async def _bootstrap_with_own_connection(
     db_path: Path,
     report: MigrationReport,
     display_name: str | None = None,
+    passwordless: bool = False,
 ) -> None:
     from nerve.db import Database
 
@@ -1633,8 +1643,28 @@ async def _bootstrap_with_own_connection(
     await db.connect()
     try:
         await bootstrap_identity(db, config, report=report, display_name=display_name)
+        if passwordless:
+            await _confirm_passwordless(db, config, report)
     finally:
         await db.close()
+
+
+async def _confirm_passwordless(
+    db: "Database", config: NerveConfig, report: MigrationReport,
+) -> None:
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    if not config.auth.password_hash and await db.complete_passwordless_setup(
+        invalidate_secret_name=SETUP_TOKEN_NAME,
+    ):
+        report.identity_actions.append(
+            "recorded a passwordless installation: anyone who can reach the "
+            "gateway is admitted as the owner account"
+        )
+    else:
+        report.identity_actions.append(
+            "kept the existing password: a password cannot be removed"
+        )
 
 
 async def open_production_db(

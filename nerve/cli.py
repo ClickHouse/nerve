@@ -276,7 +276,9 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
 
     display_name = (choices.user_name or "").strip() or None
     try:
-        report = bootstrap_identity_sync(config, display_name=display_name)
+        report = bootstrap_identity_sync(
+            config, display_name=display_name, passwordless=choices.passwordless,
+        )
     except Exception as e:  # noqa: BLE001 - any failure means there is no account
         # The wizard deleted its checkpoint when it applied the configuration.
         # Save the answers again so a re-run keeps the name, then fail. The
@@ -304,6 +306,16 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    from nerve.db.accounts import read_setup_required
+
+    if read_setup_required(
+        paths.db_path(), configured_password=bool(config.auth.password_hash),
+    ):
+        click.echo(
+            "  Setup is not complete: no password was set and a passwordless "
+            "installation was not chosen. After the gateway starts, run "
+            "'nerve status' to read the setup token, then complete setup at /setup."
+        )
 
 
 @main.command()
@@ -593,6 +605,28 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         click.echo("Starting Nerve... new instance will start shortly.")
 
 
+def _echo_setup_token(config) -> None:
+    """Print the unclaimed instance's token only to this local terminal."""
+    from nerve.db.accounts import read_instance_secret
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    if not token:
+        return
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    click.echo()
+    click.secho(
+        "  Setup of this instance is not complete, and sign-in is refused "
+        "until it is. Complete it on the setup page with the token below.",
+        fg="yellow",
+    )
+    click.echo(f"  Setup page: http://{host}:{port}/setup")
+    click.echo(f"  Setup token: {token}")
+
+
 @main.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output (like tail -f)")
 @click.pass_context
@@ -604,6 +638,7 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
+        _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
@@ -649,6 +684,8 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
+
+    _echo_setup_token(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -1183,7 +1220,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
-    from nerve.db.accounts import inspect_bootstrap_state
+    from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
     from nerve.gateway.auth import source_authenticates
 
     configured = bool(config.auth.password_hash)
@@ -1197,10 +1234,18 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
+    elif not usable and read_setup_required(
+        paths.db_path(), configured_password=configured,
+    ):
+        warnings.append(
+            "[WARN] Setup is not complete — sign-in is refused until it is. "
+            "Complete it at /setup with the setup token shown by `nerve status` "
+            "on the host"
+        )
     elif not usable:
         warnings.append(
-            "[WARN] No password set — passwordless: anyone who can reach "
-            "the gateway acts as the owner"
+            "[WARN] No password set — passwordless by choice: anyone who can "
+            "reach the gateway acts as the owner"
         )
     else:
         lines.append(

@@ -140,8 +140,8 @@ async def example():
 ```
 
 Use `actor: Actor = Depends(require_auth)` on handlers that consume identity for
-attribution, account authority, or session-epoch checks; otherwise gate the
-module through the router dependency.
+attribution or account authority; otherwise gate the module through the router
+dependency.
 
 ## Development Workflow
 

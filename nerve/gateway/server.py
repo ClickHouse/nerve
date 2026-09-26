@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -28,8 +30,12 @@ from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
-from nerve.gateway.auth import SESSION_TOKEN_HEADER, authenticate_websocket
-from nerve.identity import Actor
+from nerve.gateway.auth import (
+    SESSION_TOKEN_HEADER,
+    authenticate_websocket,
+    identity_store,
+)
+from nerve.identity import Actor, ActorResolutionError, actor_for_account
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
@@ -123,6 +129,41 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
         await websocket.close(code=4001, reason="Unauthorized")
         return None
     return WebSocketConnection(client_id=str(uuid.uuid4())[:8], actor=actor)
+
+
+# Open sockets by client id, so that disabling an account can close its sockets.
+_live_sockets: dict[str, tuple[WebSocketConnection, WebSocket]] = {}
+
+WS_ACCOUNT_DISABLED_CODE = 1008
+WS_ACCOUNT_DISABLED_REASON = "Account disabled"
+
+
+async def _account_enabled(actor: Actor) -> bool:
+    """Whether the actor may still use a socket. The system principal may."""
+    if actor.is_system:
+        return True
+    store = identity_store()
+    if store is None or not actor.account_id:
+        return False
+    try:
+        await actor_for_account(store, actor.account_id)
+    except ActorResolutionError:
+        return False
+    return True
+
+
+async def close_account_sockets(account_id: str) -> None:
+    """Close every open WebSocket of one account."""
+    for client_id, (connection, websocket) in list(_live_sockets.items()):
+        if connection.actor.account_id != account_id:
+            continue
+        _live_sockets.pop(client_id, None)
+        try:
+            await websocket.close(
+                code=WS_ACCOUNT_DISABLED_CODE, reason=WS_ACCOUNT_DISABLED_REASON,
+            )
+        except Exception as e:  # noqa: BLE001 - it may be closed already
+            logger.debug("WebSocket %s could not be closed: %s", client_id, e)
 
 
 async def _send_session_status(
@@ -308,6 +349,15 @@ async def lifespan(app: FastAPI):
         identity_report = await bootstrap_identity(db, config)
         for action in identity_report.identity_actions:
             logger.info("Identity bootstrap: %s", action)
+
+        # Create the setup token before serving. Never log it: `nerve status`
+        # reads it from the database.
+        from nerve import setup_token
+
+        await setup_token.ensure_setup_token(
+            db,
+            unclaimed=await setup_token.instance_is_unclaimed(db, config),
+        )
 
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
         proxy_service = None
@@ -866,6 +916,21 @@ def create_app() -> FastAPI:
     async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    # FastAPI validation errors echo the rejected input, which can include the
+    # setup token. Return them without the input.
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(  # noqa: ANN001
+        request, exc: RequestValidationError,
+    ):
+        errors = [
+            {key: value for key, value in error.items() if key != "input"}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(errors)},
+        )
+
     # Sliding session tokens. `require_auth` re-mints a session token once it
     # is past half its lifetime and stashes it on request.state; hand it back
     # on the response so the browser can swap it in. Net effect: a tab in
@@ -919,49 +984,62 @@ def create_app() -> FastAPI:
             return
 
         client_id = connection.client_id
-        router = _engine.router
-        # Reuse the last session for this channel (no sticky period).
-        # Only create a brand-new session if none exist at all.
-        active_session = await router.get_last_session("web:default")
-        if not active_session:
-            # Not through the router: this ingress knows *who* connected, so
-            # the session it mints belongs to that person rather than to the
-            # web channel in general.
-            active_session = await _engine.sessions.get_active_session(
-                "web:default", source="web", actor=connection.actor,
-            )
-        logger.info("WebSocket connected: %s (session: %s)", client_id, active_session)
-
-        # Register as broadcast listener for the active session
-        async def ws_broadcast(session_id: str, message: dict):
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                pass
-
-        await broadcaster.register(active_session, client_id, ws_broadcast)
-        # Also register on __global__ channel for cross-session notifications
-        await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
-
-        # Inform the client which session they're connected to
-        await websocket.send_json({
-            "type": "session_switched",
-            "session_id": active_session,
-        })
-
-        # If a turn is mid-flight (page reload, transient WS drop, sticky
-        # reconnect after a network blip), replay the broadcaster buffer so
-        # the freshly-bound listener can rebuild the in-flight stream
-        # without waiting for new events. Idle sessions get nothing here;
-        # they hydrate via REST + the existing ``session_switched`` event.
-        if broadcaster.is_buffering(active_session):
-            is_running = _engine.is_session_running(active_session)
-            session_record = await _engine.db.get_session(active_session)
-            await _send_session_status(
-                websocket, active_session, is_running, session_record,
-            )
-
+        # Register, then check the account. A disable that commits before the
+        # registration is caught by the check; one after it closes this socket.
+        _live_sockets[client_id] = (connection, websocket)
+        active_session: str | None = None
         try:
+            if not await _account_enabled(connection.actor):
+                await websocket.close(
+                    code=WS_ACCOUNT_DISABLED_CODE,
+                    reason=WS_ACCOUNT_DISABLED_REASON,
+                )
+                return
+
+            router = _engine.router
+            # Reuse the last session for this channel (no sticky period).
+            # Only create a brand-new session if none exist at all.
+            active_session = await router.get_last_session("web:default")
+            if not active_session:
+                # Not through the router: this ingress knows *who* connected,
+                # so the session it mints belongs to that person rather than
+                # to the web channel in general.
+                active_session = await _engine.sessions.get_active_session(
+                    "web:default", source="web", actor=connection.actor,
+                )
+            logger.info(
+                "WebSocket connected: %s (session: %s)", client_id, active_session,
+            )
+
+            # Register as broadcast listener for the active session
+            async def ws_broadcast(session_id: str, message: dict):
+                try:
+                    await websocket.send_json(message)
+                except Exception:
+                    pass
+
+            await broadcaster.register(active_session, client_id, ws_broadcast)
+            # Also register on __global__ channel for cross-session notifications
+            await broadcaster.register("__global__", f"global:{client_id}", ws_broadcast)
+
+            # Inform the client which session they're connected to
+            await websocket.send_json({
+                "type": "session_switched",
+                "session_id": active_session,
+            })
+
+            # If a turn is mid-flight (page reload, transient WS drop, sticky
+            # reconnect after a network blip), replay the broadcaster buffer so
+            # the freshly-bound listener can rebuild the in-flight stream
+            # without waiting for new events. Idle sessions get nothing here;
+            # they hydrate via REST + the existing ``session_switched`` event.
+            if broadcaster.is_buffering(active_session):
+                is_running = _engine.is_session_running(active_session)
+                session_record = await _engine.db.get_session(active_session)
+                await _send_session_status(
+                    websocket, active_session, is_running, session_record,
+                )
+
             while True:
                 data = await websocket.receive_json()
                 msg_type = data.get("type", "")
@@ -1112,7 +1190,9 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.warning("WebSocket error for %s: %s", client_id, e)
         finally:
-            await broadcaster.unregister(active_session, client_id)
+            _live_sockets.pop(client_id, None)
+            if active_session is not None:
+                await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")
 
     # Health check (no auth required) — must be before static mount

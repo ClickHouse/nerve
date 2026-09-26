@@ -446,13 +446,26 @@ class TestDoctorAgreesWithTheLoginRoute:
         assert "is in use by 1 account(s)" in report
         assert "passwordless" not in report
 
-    async def test_the_same_install_without_the_key_is_passwordless(self, tmp_path):
+    async def test_the_same_install_without_the_key_requires_setup(self, tmp_path):
         from nerve.cli import doctor_report
 
         config = await self._install_with(tmp_path, "none")
         report = doctor_report(config)
+        assert "Setup is not complete" in report
+
+    async def test_a_passwordless_install_by_choice_is_called_out(self, tmp_path):
+        from nerve.cli import doctor_report
+
+        config = await self._install_with(tmp_path, "none")
+        database = Database(paths.db_path())
+        await database.connect()
+        try:
+            assert await database.complete_passwordless_setup()
+        finally:
+            await database.close()
+        report = doctor_report(config)
         assert "No password set" in report
-        assert "passwordless" in report
+        assert "passwordless by choice" in report
 
     async def test_a_stale_key_no_row_reads_is_still_called_out(self, tmp_path):
         from nerve.cli import doctor_report

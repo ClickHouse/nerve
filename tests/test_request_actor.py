@@ -560,6 +560,7 @@ class TestLoginAdmission:
         return app
 
     async def test_a_disabled_sole_account_cannot_log_in(self, install):
+        assert await install.db.complete_passwordless_setup()
         await install.set_enabled(False)
         async with _client(self._login_app()) as client:
             res = await client.post("/api/auth/login", json={"password": ""})

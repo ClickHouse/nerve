@@ -25,6 +25,7 @@ Treat the returned token as opaque.
 |---|---|
 | Invalid credentials or missing required username | `401` `Invalid username or password` |
 | Valid credentials for a disabled account | `401` |
+| Setup is not complete (`login` is `setup`) | `409` |
 | Authentication is not ready | `503` |
 
 #### Authenticated requests
@@ -53,33 +54,15 @@ Response: {
 
 | Field | Meaning |
 |---|---|
-| `login` | `none`, `password`, or `username_password` |
+| `login` | `setup`, `none`, `password`, or `username_password` |
 | `auth_required` | Compatibility field; equivalent to `login != "none"` |
+
+`setup` means setup is not complete: login is refused and only
+`POST /api/setup/claim` is permitted. `none` means the operator chose a
+passwordless installation.
 
 The response does not expose usernames or the account count. Before
 authentication is ready, it returns the fail-closed `username_password` state.
-
-### Actors
-
-An actor is *who* something is attributed to: a person, or the agent's system
-principal. Sessions and messages store an actor id, never a name, so this is
-where a name is looked up at render time — a rename changes every label and
-moves no stored row.
-
-```json
-{ "id": "…", "kind": "human", "display_name": "Alice" }
-```
-
-| Endpoint | Does |
-|---|---|
-| `GET /api/actors` | `{ "actors": [...] }`, oldest first. One row per person plus the system principal, so a single call labels a whole list |
-
-`kind` is `human` or `system`.
-
-This is an identity, not an account: nothing from `accounts` appears here (no
-username, no `enabled`, no `has_password`), and an actor need not have an
-account at all — the system principal does not. A disabled person's actor is
-still readable, because their history stays in the UI after their access ends.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -128,7 +111,7 @@ not change when the username changes.
 | Endpoint | Does |
 |---|---|
 | `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
-| `GET /api/accounts/me` | the signed-in account |
+| `GET /api/accounts/me` | Return the signed-in account |
 | `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
 | `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
 | `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
@@ -144,8 +127,75 @@ Failures:
 | `404` | Account not found |
 | `409` | Username or account-state conflict; the response explains the conflict |
 
-Disabling an account affects its next request. An existing WebSocket keeps its
-accepted identity until it reconnects.
+Disabling an account affects its next request and closes its open WebSockets.
+
+### Setup claim
+
+#### `POST /api/setup/claim`
+
+Complete setup of the one account on an install whose `login` status is
+`setup`. This is the only unauthenticated account write; every request must
+include the persisted setup token.
+
+```json
+Request: {
+  "username": "alice",
+  "password": "…",
+  "setup_token": "…",
+  "display_name": "Alice"
+}
+Response: { "token": "eyJ…" }
+```
+
+To keep the installation passwordless, send `"passwordless": true` and no
+`password`. `username` is then optional:
+
+```json
+Request: { "passwordless": true, "setup_token": "…" }
+```
+
+Send exactly one of `password` and `"passwordless": true`. `display_name` is
+optional. The response token is the client session minted after the claim;
+the actor and account are read through `GET /api/auth/me`, and names through
+the actor directory.
+
+The setup token is read locally with `nerve status`, sent only in the JSON
+body, and invalidated after success. It never appears in a URL, response,
+server log, or browser storage. Use HTTPS or a protected tunnel when claiming
+remotely.
+
+The claim and the setup completion record are one database transaction. Of
+concurrent claimants exactly one can win.
+
+| Response | When |
+|---|---|
+| `400` | both or neither of `password` and `"passwordless": true`; a password claim without a username; the username is malformed/reserved; or the password exceeds bcrypt's 72-byte limit |
+| `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
+| `409` | setup is already complete, including a request that passed token validation before a concurrent winner, or a configured password |
+| `422` | the setup token is missing/empty, the password is empty, or a field has the wrong type |
+| `503` | no signing secret, or identity startup is incomplete |
+
+### Actors
+
+An actor is *who* something is attributed to: a person, or the agent's system
+principal. Sessions and messages store an actor id, never a name, so this is
+where a name is looked up at render time — a rename changes every label and
+moves no stored row.
+
+```json
+{ "id": "…", "kind": "human", "display_name": "Alice" }
+```
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/actors` | `{ "actors": [...] }`, oldest first. One row per person plus the system principal, so a single call labels a whole list |
+
+`kind` is `human` or `system`.
+
+This is an identity, not an account: nothing from `accounts` appears here (no
+username, no `enabled`, no `has_password`), and an actor need not have an
+account at all — the system principal does not. A disabled person's actor is
+still readable, because their history stays in the UI after their access ends.
 
 ### Sessions
 
@@ -697,9 +747,8 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
 too). The token is resolved to an actor at admission. A credential that names
-nobody is refused with close code `4001`. Once admitted, both identity and
-authority remain fixed until the socket reconnects; account changes are checked
-at the next connection.
+nobody is refused with close code `4001`. The actor stays fixed until the socket
+reconnects. Disabling the account closes the socket with code `1008`.
 
 Unlike REST, a WebSocket never hands back a refreshed token — it has no
 response headers. The browser's ordinary REST traffic keeps the stored token

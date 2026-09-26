@@ -380,9 +380,10 @@ def _scrub_account_credentials(snapshot: Path) -> None:
     ``config.local.yaml``; leaving them on ``config`` would restore an account
     that cannot authenticate but is not considered passwordless.
 
-    A restored single-account database is passwordless. With multiple accounts,
-    nobody can log in until credentials are restored from a secrets-bearing
-    backup.
+    It also removes the ``instance_setup`` row. A restored single-account
+    database is then passwordless with setup not complete, so only the
+    setup-token claim is permitted. With multiple accounts, nobody can log in
+    until credentials are restored from a secrets-bearing backup.
 
     Edits the snapshot after it is taken and before it is checksummed; the live
     database is never touched. ``secure_delete`` makes SQLite overwrite the
@@ -400,6 +401,10 @@ def _scrub_account_credentials(snapshot: Path) -> None:
         conn.execute(
             "UPDATE accounts SET credential = NULL, credential_source = 'none'"
         )
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instance_setup'"
+        ).fetchone():
+            conn.execute("DELETE FROM instance_setup")
         conn.commit()
         left = conn.execute(
             "SELECT COUNT(*) FROM accounts "

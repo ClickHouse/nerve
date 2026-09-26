@@ -75,6 +75,7 @@ def client(config, tmp_path, open_identity_db, wire_identity_store):
         wire_identity_store(database)
         c.account_id = identity.owner_account_id
         c.actor_id = identity.owner_actor_id
+        c.db = database
         try:
             yield c
         finally:
@@ -207,6 +208,7 @@ class TestLoginRoute:
         """A passwordless install admits each caller as its single account
         using a normally signed token."""
         pin_jwt_secret(_GENERATED)
+        assert client.portal.call(client.db.complete_passwordless_setup)
         assert client.get("/api/auth/status").json() == {
             "auth_required": False, "login": "none",
         }
@@ -221,6 +223,7 @@ class TestLoginRoute:
     def test_passwordless_with_a_configured_secret_is_unchanged(self, client, config):
         config.auth.jwt_secret = _CONFIGURED
         pin_jwt_secret(_CONFIGURED)
+        assert client.portal.call(client.db.complete_passwordless_setup)
         res = client.post("/api/auth/login", json={"password": ""})
         assert res.status_code == 200
         assert _claims(res.json()["token"], _CONFIGURED)["sub"] == client.account_id

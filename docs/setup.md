@@ -123,7 +123,7 @@ Dependency installation adapts to the environment: as root (a plain `ubuntu:24.0
 
 The daemon is not started: unattended installs are normally followed by a service manager that owns the process (see [systemd Service](#systemd-service-optional)). Set `NERVE_START=1` to start it from the installer instead.
 
-Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards.
+Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards. `NERVE_PASSWORDLESS` is also read once here: the choice is recorded in `nerve.db`, and changing the variable later has no effect.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -132,7 +132,8 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
-| `NERVE_PASSWORD` | unset | Web UI password. When unset, the installation is passwordless: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)) |
+| `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
+| `NERVE_PASSWORDLESS` | unset | `1` completes setup without a password: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)). Not allowed with `NERVE_PASSWORD`. With neither, setup stays incomplete until the [browser claim](#claiming-an-instance-from-a-browser) |
 | `NERVE_TASK` | unset | Worker mode task description |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
@@ -192,9 +193,9 @@ EOF
 `auth.password_hash` here is a **starting** password, not where the password
 lives. The first start copies it onto the local account and removes the key from
 this file; after that, passwords are managed on the accounts screen in the web
-UI and this key does nothing. Leaving it out is fine too — the install is then
-passwordless until you set a password there, which is what a headless install
-lands as. See [Accounts and identity](accounts.md).
+UI and this key does nothing. If you leave it out, setup is not complete until
+you [claim the instance from a browser](#claiming-an-instance-from-a-browser).
+See [Accounts and identity](accounts.md).
 
 `jwt_expiry_hours` is an **idle** timeout, not a cap on a working session: the
 gateway re-mints the token whenever a request arrives past half its lifetime,
@@ -219,6 +220,24 @@ nerve doctor             # Verify everything is set up
 nerve start              # Start the server
 # Open http://localhost:8900
 ```
+
+## Claiming an instance from a browser
+
+If `nerve init` did not get a password or a passwordless choice (for example,
+`--non-interactive` with neither `NERVE_PASSWORD` nor `NERVE_PASSWORDLESS=1`),
+setup is not complete and sign-in is refused. To complete it:
+
+1. On the host, run `nerve status`. It shows the setup page and the setup token.
+2. Open `/setup` and enter the token.
+3. Set a username and password, or select "Keep this installation
+   passwordless". Without a password, anyone who can reach the gateway is the
+   owner.
+
+The claim signs you in and deletes the token. To add a password after a
+passwordless setup, use the Accounts page. A password cannot be removed.
+
+The setup token is a bearer credential. For remote setup, use HTTPS or an
+encrypted tunnel.
 
 ## HTTPS Setup
 

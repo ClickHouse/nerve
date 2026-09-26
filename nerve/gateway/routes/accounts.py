@@ -232,8 +232,18 @@ async def update_account(
 
     This is also how the account an upgrade created — which has no username —
     gets one, which it must before a second account can exist.
+
+    Refused while setup is required: only the claim may change that account.
     """
     db = get_deps().db
+    config = get_config()
+    if setup_required(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="Setup of this instance is not complete. Complete it "
+                   "through POST /api/setup/claim with the mandatory setup "
+                   "token.",
+        )
     account = await db.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -261,9 +271,10 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
 
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
-    what stops it — at every door. An open WebSocket keeps the identity it was
-    accepted with until it reconnects.
+    what stops it — at every door. Its open WebSockets are closed.
     """
+    from nerve.gateway.server import close_account_sockets
+
     db = get_deps().db
     try:
         account = await db.disable_account(account_id)
@@ -271,6 +282,7 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
         raise HTTPException(status_code=409, detail=str(e)) from e
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    await close_account_sockets(account_id)
     logger.info("Account %s disabled by account %s", account_id, actor.account_id)
     return await _render(db, account)
 
@@ -294,10 +306,8 @@ async def change_own_password(
 
     ``current_password`` is required whenever the account already has one —
     from its own row or from ``auth.password_hash`` — so a stolen session token
-    is not on its own enough to take the account over. The account that has
-    none (a passwordless install, before anyone has set one) is the one case
-    that may set a first password without proving anything beyond being signed
-    in, which is also what it has to do before a second account can exist.
+    is not on its own enough to take the account over. An account with no
+    password may set its first one without it.
 
     An **omitted** current password and an **empty** one are different things.
     The first is "I am not claiming to know it"; the second is a claim that the
@@ -307,13 +317,24 @@ async def change_own_password(
 
     Setting a password moves the account to its own credential, after which
     ``auth.password_hash`` no longer applies to it.
+
+    Refused while setup is required: only the claim may set that first password.
     """
     db = get_deps().db
+    config = get_config()
     account = await db.get_account(actor.account_id)
     if account is None:  # pragma: no cover - resolved a moment ago
         raise HTTPException(status_code=404, detail="Account not found")
 
-    existing = account_credential(account, get_config())
+    if setup_required(await db.login_state(), config):
+        raise HTTPException(
+            status_code=409,
+            detail="Setup of this instance is not complete. Set the first "
+                   "password through POST /api/setup/claim with the mandatory "
+                   "setup token.",
+        )
+
+    existing = account_credential(account, config)
     if existing:
         supplied = req.current_password
         if supplied is None or not verify_password(supplied, existing):
@@ -361,12 +382,20 @@ def account_credential(account: dict, config) -> str:
 
 
 def instance_is_passwordless(state, config) -> bool:
-    """Whether anyone reaching the gateway is admitted as the one account.
+    """Whether the instance has one account and no credential anywhere.
 
-    A passwordless instance has exactly one account and no credential anywhere
-    — neither on its row nor in configuration. Both halves are read here so
-    the login route and ``/api/auth/status`` cannot disagree about which state
-    the instance is in (a status that says "passwordless" while login wants a
-    password is a browser that logs itself out in a loop).
+    Both the row and configuration are read here so the login route and
+    ``/api/auth/status`` cannot disagree about which state the instance is in
+    (a status that says "passwordless" while login wants a password is a
+    browser that logs itself out in a loop).
     """
     return state.passwordless and not config.auth.password_hash
+
+
+def setup_required(state, config) -> bool:
+    """Whether only the setup-token claim is permitted.
+
+    True when there is no credential anywhere and setup is not recorded as
+    complete. A credential always completes setup.
+    """
+    return instance_is_passwordless(state, config) and not state.setup_complete
