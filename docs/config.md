@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | ✅ read per request. Only the gateway's own auth: the MCP endpoint checks `/mcp/v1` against the `auth.jwt_secret` it was mounted with, so rotating that secret is half-hot (see the restart table). `auth.jwt_expiry_hours` governs tokens minted *after* the reload; already-issued tokens keep the window they were signed with until they next slide |
+| Web gateway auth (`auth.*`) | partly. `auth.password_hash` follows the next login, and `auth.jwt_expiry_hours` follows the next token issue or refresh. `auth.jwt_secret` requires a restart (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `auth.jwt_secret` | half-hot: the web gateway reads it per request, so its own auth follows a reload, but the MCP endpoint captured it when the app was mounted and keeps checking `/mcp/v1` against the old secret. Rotating it moves one and not the other until a restart |
+| `auth.jwt_secret` | pinned at startup. A restart applies a changed value or generates a stored secret when the setting is removed |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
@@ -303,20 +303,20 @@ as a warning: nothing failed, but the new value is not live yet.
 With no daemon running there is nothing to reload and the command says so. Config
 is read fresh at startup, so `nerve start` already picks the edit up.
 
-It authenticates the way the gateway asks to be authenticated, which depends on
-`auth.jwt_secret` in the config it just read:
+It signs its request with the signing secret that the daemon uses (see
+[Accounts and identity](accounts.md)):
 
-- **Set** → it signs a token with it. If that is not the secret the running daemon
-  started with, the gateway rejects the request and only a restart resolves it.
-- **Empty, unlocked** → the gateway is in dev mode and does not ask for a token
-  (`require_auth` runs open), so the call goes unauthenticated.
-- **Empty, locked** → refused before anything is sent. A locked gateway never takes
-  the open path, so no request from that shell can be authenticated. If the secret
-  comes from `${ENV_VAR}`, export it in that shell too.
+- **`auth.jwt_secret` set** → it signs with that value. If the daemon started
+  with a different value, because the setting changed after the start, the
+  gateway rejects the request. Restart the daemon.
+- **Unset** → it reads the secret that the daemon generated into `nerve.db`. If
+  there is no secret, the daemon has never started, and the command stops
+  before it sends anything. If `auth.jwt_secret` comes from `${ENV_VAR}`, export
+  the variable in this shell too.
 
-`auth.password_hash` is not an alternative here. It gates the browser login, which
-is what mints a token from it; `require_auth` reads `auth.jwt_secret` alone, so a
-password neither makes the endpoint ask for a token nor gives the CLI one to sign.
+`auth.password_hash` does not replace the signing secret. The password is for
+the browser login. The gateway authenticates each request with the signing
+secret.
 
 `POST /api/config/sync` runs the same reload but scores it differently, because it
 answers a different question. Its `ok` is about the *merge*: true once the merged
@@ -609,10 +609,10 @@ referenced from `settings.yaml` before you lock the box. The usual ones:
 `auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
 `anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
 
-`auth.jwt_secret` is the one to get right. A locked instance that ends up without
-it does not fall back to the unauthenticated dev mode an unlocked box would — the
-gateway refuses every request with a 503 and websockets are declined — so the box
-comes up unusable rather than open. Note also that a `${VAR}` left unresolved
+`auth.jwt_secret` is optional. A locked instance without it generates a signing
+secret on its first start and keeps it in `nerve.db`, which is machine-local
+state (see [Accounts and identity](accounts.md)). Supply it from the fleet to
+rotate it centrally, or leave it out to give each box its own. Note also that a `${VAR}` left unresolved
 survives as its literal text, which is a perfectly usable signing key and one
 published in the config repo, so check that the variable is actually set on the box.
 
@@ -882,6 +882,42 @@ from any working directory:
 5. The current directory (fresh-install fallback)
 
 `nerve doctor` reports which directory was used and how it was found.
+
+## State-file permissions
+
+The state directory (`~/.nerve`, or `NERVE_HOME`) holds `nerve.db`. The
+database holds accounts, history and, when `auth.jwt_secret` is not set, the
+session-signing secret. Nerve keeps the directory at `0700` and the database
+files (`nerve.db` and its `-wal`, `-shm` and `-journal` files) at `0600`. It
+examines them each time it opens the database:
+
+| Mode found | Result |
+|---|---|
+| Read permission for the group or other users | Nerve removes it. If a database file was readable, Nerve also deletes the stored signing secret and generates a new one, so users must sign in again. |
+| Group write, and the group contains only the owner | Nerve removes it. This repairs an installation created under a `002` umask, where each user has a personal group. |
+| Group write, and the group has other members | Nerve does not open the database. Another user could have changed it. Examine the contents, then run the `chmod` commands from the error message. |
+| World write | Nerve does not open the database, as for a shared group. |
+| A mode that Nerve cannot read | Nerve does not open the database. |
+
+A group contains only the owner when it is the owner's primary group, has the
+owner's user name, and has no other members.
+
+On a filesystem that does not keep Unix modes, the repair has no effect. Nerve
+then does not open the database if other users can write to it. If other users
+can only read it, Nerve does not store a signing secret in it, so set
+`auth.jwt_secret`.
+
+Backups follow the same rule:
+
+- `nerve backup` creates the bundle at `0600`. If the filesystem does not keep
+  that mode, a backup with secrets stops before it writes anything. A
+  `--no-secrets` backup continues with a warning.
+- The snapshot is prepared in the state directory. If Nerve cannot use it,
+  Nerve uses the system temp directory, but only if no other user can rename
+  entries on that path: each directory must belong to you or to root, and a
+  directory that others can write to must be sticky, as `/tmp` is.
+- `nerve restore` installs `nerve.db` at `0600`. If other users can still read
+  the installed file, restore removes the signing secret from it and fails.
 
 ## Core
 
@@ -1231,8 +1267,8 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.password_hash` | string | - | bcrypt hash for login |
-| `auth.jwt_secret` | string | - | JWT signing secret |
+| `auth.password_hash` | string | - | bcrypt hash for login. When unset, anyone who can reach the gateway can act as the sole owner. Use passwordless mode only on a restricted gateway |
+| `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)
 

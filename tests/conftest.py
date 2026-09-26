@@ -1,6 +1,7 @@
 """Shared test fixtures for Nerve tests."""
 
 import asyncio
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -76,6 +77,55 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _unpin_jwt_secret():
+    """Clear the process signing secret before and after each test.
+
+    Startup pins the secret once per process. A test that pins one must not
+    leave it in force for the next test.
+    """
+    from nerve.gateway.auth import unpin_jwt_secret
+
+    unpin_jwt_secret()
+    yield
+    unpin_jwt_secret()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _deterministic_umask():
+    """Run the suite under umask 022, whatever the developer's shell has.
+
+    ``Database.connect`` refuses a group-writable state directory, and under
+    umask 002 every plain ``mkdir()`` in a fixture makes one. Tests about the
+    umask set their own.
+    """
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
+
+
+@pytest.fixture
+def bypass_auth():
+    """Replace ``require_auth`` on a test app.
+
+    Without a signing secret every auth check fails closed, so route tests
+    that are not about auth use this. Yields a function that takes the app
+    and returns it. Auth tests use the real dependency.
+    """
+    from nerve.gateway.auth import require_auth
+
+    apps = []
+
+    def _bypass(app):
+        app.dependency_overrides[require_auth] = lambda: {"sub": "user"}
+        apps.append(app)
+        return app
+
+    yield _bypass
+    for app in apps:
+        app.dependency_overrides.pop(require_auth, None)
 
 
 @pytest.fixture

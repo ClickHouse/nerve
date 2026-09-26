@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -67,7 +69,7 @@ def _make_memu_db(path: Path, *, items: int = 5) -> None:
 def nerve_dir(tmp_path: Path) -> Path:
     """A populated ~/.nerve replica, with secrets, state, and junk."""
     nd = tmp_path / "dot_nerve"
-    nd.mkdir()
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
     _make_nerve_db(nd / "nerve.db")
     _make_memu_db(nd / "memu.sqlite")
 
@@ -373,6 +375,690 @@ def test_no_secrets_omits_and_flags(nerve_dir, workspace, config_dir, tmp_path):
     assert report.manifest["flags"]["include_secrets"] is False
     # Non-secret state still present.
     assert any(m.endswith("state/cron/jobs.yaml") for m in members)
+
+
+def _plant_instance_secret(db_path: Path) -> None:
+    """The table v047 adds, holding the generated JWT signing secret."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('jwt_secret', 'planted-signing-secret')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stored_secrets(db_path: Path) -> list[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [r[0] for r in conn.execute("SELECT value FROM instance_secrets").fetchall()]
+    finally:
+        conn.close()
+
+
+def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, config_dir, tmp_path):
+    """The generated signing secret is a row in nerve.db. A --no-secrets
+    snapshot deletes it; the live database keeps it."""
+    _plant_instance_secret(nerve_dir / "nerve.db")
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out1", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x1"
+    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
+    assert report.ok, report.errors  # checksums were taken after the scrub
+    assert _stored_secrets(staging / "state" / "nerve.db") == []
+    assert "planted-signing-secret" not in (staging / "state" / "nerve.db").read_bytes().decode(
+        "latin-1"
+    )
+    assert _stored_secrets(nerve_dir / "nerve.db") == ["planted-signing-secret"]
+
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir, include_secrets=True,
+    )
+    staging = tmp_path / "x2"
+    backup_mod.verify_bundle(kept.path, extract_to=staging)
+    assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
+
+
+def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
+    """A restore keeps the account, actor and system actor ids that stored
+    rows reference, and the signing secret that live sessions verify with."""
+    import asyncio
+
+    from nerve.db import Database
+    from nerve.db.accounts import JWT_SECRET_NAME
+
+    nd = tmp_path / "real_nerve"
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
+
+    async def _bootstrap():
+        db = Database(nd / "nerve.db")
+        await db.connect()
+        try:
+            account = await db._bootstrap_first_account(credential_source="none")
+            secret = await db._ensure_instance_secret(
+                JWT_SECRET_NAME, "stable-signing-secret"
+            )
+            return db.system_actor_id, account, secret, await db._account_rows()
+        finally:
+            await db.close()
+
+    async def _read_back(path: Path):
+        db = Database(path)
+        await db.connect()  # already at the schema head: no migration runs
+        try:
+            return (
+                db.system_actor_id,
+                await db._get_instance_secret(JWT_SECRET_NAME),
+                await db._account_rows(),
+            )
+        finally:
+            await db.close()
+
+    system_id, identity, secret, accounts = asyncio.run(_bootstrap())
+    _make_memu_db(nd / "memu.sqlite")
+
+    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
+    nd2 = tmp_path / "restored_nerve"
+    rep = backup_mod.restore_bundle(
+        result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+    )
+    assert rep.ok, rep.errors
+
+    found_system_id, found_secret, found_accounts = asyncio.run(
+        _read_back(nd2 / "nerve.db")
+    )
+    assert found_system_id == system_id
+    assert found_accounts == accounts
+    assert found_accounts[0]["id"] == identity.account_id
+    assert found_accounts[0]["actor_id"] == identity.actor_id
+    assert found_secret == secret == "stable-signing-secret"
+
+
+def _member_mode(bundle: Path, name: str) -> int | None:
+    comp = backup_mod._compression_for(bundle)
+    with backup_mod._tar_reader(bundle, comp) as tar:
+        for m in tar:
+            if m.name == name:
+                return stat.S_IMODE(m.mode)
+    return None
+
+
+def _stored_secret(db_file: Path) -> str | None:
+    conn = sqlite3.connect(str(db_file))
+    try:
+        row = conn.execute(
+            "SELECT value FROM instance_secrets WHERE name='jwt_secret'"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def test_backup_archives_the_database_owner_only(nerve_dir, workspace, config_dir, tmp_path):
+    """The archived nerve.db member is 0600, so extraction never makes a
+    readable copy of the signing secret."""
+    result = backup_mod.create_backup(nerve_dir, workspace, tmp_path / "out", config_dir=config_dir)
+    assert _member_mode(result.path, "state/nerve.db") == 0o600
+
+
+def _nerve_dir_with_stored_key(tmp_path) -> Path:
+    """A real nerve.db holding a jwt_secret row, ready to back up."""
+    import asyncio
+
+    from nerve.db import Database
+    from nerve.db.accounts import JWT_SECRET_NAME
+    from nerve.gateway.auth import unpin_jwt_secret
+
+    nd = tmp_path / "src_nerve"
+    nd.mkdir(mode=0o700)  # as Nerve creates it; a 002 umask would otherwise give 0775
+
+    async def _seed():
+        db = Database(nd / "nerve.db")
+        await db.connect()
+        try:
+            await db._bootstrap_first_account(credential_source="none")
+            await db._ensure_instance_secret(
+                JWT_SECRET_NAME, "backed-up-secret-32-bytes-padded!!"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_seed())
+    unpin_jwt_secret()
+    _make_memu_db(nd / "memu.sqlite")
+    return nd
+
+
+def test_restore_installs_the_database_owner_only(workspace, config_dir, tmp_path):
+    nd = _nerve_dir_with_stored_key(tmp_path)
+    result = backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir)
+
+    nd2 = tmp_path / "restored_nerve"
+    rep = backup_mod.restore_bundle(
+        result.path, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+    )
+    assert rep.ok, rep.errors
+    assert (os.stat(nd2 / "nerve.db").st_mode & 0o777) == 0o600
+    assert (os.stat(nd2).st_mode & 0o700) == 0o700
+    assert (nd2 / "nerve.db").with_name("nerve.db.restore-tmp").exists() is False
+    # A securable restore keeps the key (live sessions keep verifying).
+    assert _stored_secret(nd2 / "nerve.db") == "backed-up-secret-32-bytes-padded!!"
+
+
+class TestRestoreNeverLeavesAReadableKey:
+    """Restore verifies each step before the next: the directory is 0700, the
+    temporary is created 0600 and checked before any copy, the rename is
+    atomic, and a failed last-resort key scrub raises."""
+
+    @staticmethod
+    def _bundle(tmp_path, workspace, config_dir) -> Path:
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        return backup_mod.create_backup(nd, workspace, tmp_path / "out", config_dir=config_dir).path
+
+    @staticmethod
+    def _restore(bundle: Path, nd2: Path, tmp_path: Path):
+        return backup_mod.restore_bundle(
+            bundle, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+        )
+
+    def test_an_unsecurable_destination_directory_aborts_before_anything_is_written(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        nd2.mkdir(mode=0o755)  # exists, empty, reachable by others
+        real_chmod = os.chmod
+        monkeypatch.setattr(  # the directory's mode cannot be changed
+            backup_mod.os, "chmod",
+            lambda p, m, *a, **k: None if Path(p) == nd2 else real_chmod(p, m, *a, **k),
+        )
+        with pytest.raises(BackupError, match="could not be made 0700"):
+            self._restore(bundle, nd2, tmp_path)
+        assert list(nd2.iterdir()) == []  # nothing landed in it
+
+    def test_a_temporary_that_cannot_be_created_owner_only_aborts_before_the_copy(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """Abort before copying when the temporary file's 0600 mode does not
+        take effect."""
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        copies: list[int] = []
+        real_copy = backup_mod.shutil.copyfileobj
+        monkeypatch.setattr(
+            backup_mod.shutil, "copyfileobj",
+            lambda *a, **k: (copies.append(1), real_copy(*a, **k))[1],
+        )
+        # Directories verify; every regular file reads back wide.
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: stat.S_ISDIR(st_mode))
+
+        with pytest.raises(BackupError, match="nothing was copied"):
+            self._restore(bundle, nd2, tmp_path)
+        assert copies == []
+        assert not (nd2 / "nerve.db").exists()
+        assert not (nd2 / "nerve.db.restore-tmp").exists()  # partial temporary removed
+
+    @staticmethod
+    def _installed_file_reads_back_wide(monkeypatch) -> None:
+        """Make both checks on the temporary pass and the installed file read
+        back wide. That is the only case that reaches the scrub."""
+        seen = {"files": 0}
+
+        def fake(st_mode: int) -> bool:
+            if stat.S_ISDIR(st_mode):
+                return True
+            seen["files"] += 1
+            # 1: the temp's fstat at create; 2: the fstat before publishing it;
+            # 3: the final stat of the installed file.
+            return seen["files"] <= 2
+
+        monkeypatch.setattr(backup_mod, "_mode_is_private", fake)
+
+    def test_the_last_resort_scrub_removes_the_key_and_the_restore_still_fails(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The scrub removes the key, and the restore still reports failure."""
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        self._installed_file_reads_back_wide(monkeypatch)
+        with pytest.raises(BackupError, match="scrubbed") as ei:
+            self._restore(bundle, nd2, tmp_path)
+        assert "not complete" in str(ei.value)
+        assert _stored_secret(nd2 / "nerve.db") is None  # scrubbed, verified
+
+    def test_a_failing_scrub_propagates_instead_of_claiming_success(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        bundle = self._bundle(tmp_path, workspace, config_dir)
+        nd2 = tmp_path / "restored_nerve"
+        self._installed_file_reads_back_wide(monkeypatch)
+
+        def failing_scrub(db_file: Path) -> None:
+            raise BackupError(f"could not scrub the signing secret from {db_file}: database is locked")
+
+        monkeypatch.setattr(backup_mod, "_scrub_db_secret", failing_scrub)
+        with pytest.raises(BackupError, match="could not scrub"):
+            self._restore(bundle, nd2, tmp_path)
+
+
+class TestScrubIsVerified:
+    """``_scrub_db_secret`` checks for the table explicitly, and raises when the
+    delete fails or cannot be verified."""
+
+    def test_a_database_without_the_table_has_nothing_to_scrub(self, tmp_path):
+        old = tmp_path / "old.db"
+        _make_nerve_db(old)  # pre-v047 shape: no instance_secrets table
+        backup_mod._scrub_db_secret(old)  # no error, nothing to do
+
+    def test_a_scrub_that_cannot_write_raises_and_leaves_the_row(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file modes")
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        db_file = nd / "nerve.db"
+        os.chmod(db_file, 0o444)
+        try:
+            with pytest.raises(BackupError, match="could not (scrub|open)"):
+                backup_mod._scrub_db_secret(db_file)
+        finally:
+            os.chmod(db_file, 0o600)
+        assert _stored_secret(db_file) == "backed-up-secret-32-bytes-padded!!"
+
+
+class TestStagingIsOutOfReach:
+    """The staged snapshot holds every account and the signing secret until
+    ``--no-secrets`` scrubs it. Staging is not in the output directory, where
+    another user could swap the staging directory, and the staging directory
+    is re-checked before the snapshot is written and before it is archived."""
+
+    def test_staging_does_not_happen_in_the_output_directory(
+        self, nerve_dir, workspace, config_dir, tmp_path,
+    ):
+        out = tmp_path / "out"
+        out.mkdir()
+        seen: list[list[str]] = []
+        real_snapshot = backup_mod._snapshot_db
+
+        def watch(src, dst):
+            seen.append([p.name for p in out.iterdir()])
+            return real_snapshot(src, dst)
+
+        backup_mod._snapshot_db = watch
+        try:
+            result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+        finally:
+            backup_mod._snapshot_db = real_snapshot
+        # During the copy, the output directory held only the bundle
+        # temporary, never the staged secrets.
+        assert seen and all(
+            all(name.endswith(".tmp") for name in names) for names in seen
+        ), seen
+        assert result.path.exists()
+
+    def test_the_staging_parent_is_never_the_output_directory(self, tmp_path):
+        """The parent is the state dir when it is owner-only, else the resolved
+        system temp dir. It is never the output directory."""
+        import tempfile
+
+        system_temp = Path(tempfile.gettempdir()).resolve()
+        nd = tmp_path / "state"
+        nd.mkdir(mode=0o700)
+        assert backup_mod._stage_parent(nd) == nd
+
+        os.chmod(nd, 0o777)  # a state dir anyone can write in is not usable
+        try:
+            assert backup_mod._stage_parent(nd) == system_temp
+        finally:
+            os.chmod(nd, 0o700)
+        assert backup_mod._stage_parent(tmp_path / "missing") == system_temp
+
+    def test_a_temp_directory_owned_by_someone_else_is_refused(
+        self, tmp_path, monkeypatch,
+    ):
+        """A sticky bit is not enough: a directory's owner can rename any entry
+        in it. A ``1777`` TMPDIR owned by another user is refused, and with an
+        unusable state dir the backup fails."""
+        import tempfile
+
+        foreign = tmp_path / "foreign-tmp"
+        foreign.mkdir()
+        os.chmod(foreign, 0o1777)  # chmod, not mkdir: the umask would mask it
+        real_stat = os.stat
+
+        def someone_elses(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            if Path(path) == foreign:
+                return os.stat_result(
+                    tuple(st)[:4] + (st.st_uid + 12345, st.st_gid) + tuple(st)[6:]
+                )
+            return st
+
+        monkeypatch.setattr(backup_mod.os, "stat", someone_elses)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(foreign))
+        nd = tmp_path / "state"
+        nd.mkdir()
+        os.chmod(nd, 0o777)  # unusable, so the temp dir is the only candidate
+
+        with pytest.raises(BackupError, match="owned by uid"):
+            backup_mod._stage_parent(nd)
+
+    def test_verify_and_restore_stage_in_the_vetted_temp_directory_too(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """Extracting a bundle puts nerve.db on disk, so verify and restore
+        use the same vetted temp directory as staging."""
+        import tempfile
+
+        bundle = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        ).path
+        seen: list = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def watch(*a, **k):
+            seen.append(k.get("dir"))
+            return real_mkdtemp(*a, **k)
+
+        monkeypatch.setattr(backup_mod.tempfile, "mkdtemp", watch)
+        vetted = backup_mod._vetted_temp_dir()
+
+        backup_mod.verify_bundle(bundle)
+        backup_mod.restore_bundle(
+            bundle, tmp_path / "restored", tmp_path / "restored_ws",
+            config_dir=tmp_path / "restored_cfg",
+        )
+        assert seen and all(d == vetted for d in seen), seen
+
+    def test_an_unsafe_ancestor_is_refused(self, tmp_path, monkeypatch):
+        """Every ancestor is checked: a writable directory above the parent
+        lets another user swap the path below it."""
+        loose = tmp_path / "loose"
+        (loose / "tmp").mkdir(parents=True)
+        os.chmod(loose, 0o777)  # world-writable and not sticky
+        try:
+            reason = backup_mod._unsafe_stage_reason(loose / "tmp")
+        finally:
+            os.chmod(loose, 0o755)
+        assert reason and "writable by other users and not sticky" in reason
+
+    @pytest.mark.parametrize("include_secrets", [True, False], ids=["secrets", "no-secrets"])
+    def test_a_swapped_staging_directory_is_refused(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
+    ):
+        """Replacing the staging directory after it is created is refused.
+        ``--no-secrets`` too: the snapshot holds the key until the scrub."""
+        attacker = tmp_path / "attacker-stage"
+        swapped: list[Path] = []
+        real_writable = backup_mod._is_group_world_writable
+
+        def swap_then_check(path):
+            """Run between opening the staging directory and its first use."""
+            if not swapped:
+                for stage in nerve_dir.glob(".nerve-backup-stage-*"):
+                    stage.rename(attacker)
+                    stage.mkdir(mode=0o777)  # a readable one in its place
+                    swapped.append(stage)
+            return real_writable(path)
+
+        monkeypatch.setattr(backup_mod, "_is_group_world_writable", swap_then_check)
+        out = tmp_path / "out"
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, out,
+                config_dir=config_dir, include_secrets=include_secrets,
+            )
+
+        assert swapped, "the test did not manage to swap the staging directory"
+        assert not (swapped[0] / "state").exists()  # no database was copied into it
+        assert not out.exists() or list(out.iterdir()) == []  # nothing published
+
+    @pytest.mark.parametrize("include_secrets", [True, False], ids=["secrets", "no-secrets"])
+    def test_a_swap_after_the_first_verification_is_caught_too(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, include_secrets,
+    ):
+        """Swap the directory during the snapshot, after its first check. The
+        snapshot is written through its own descriptor, so the planted
+        directory gets nothing, and the check before archiving refuses."""
+        attacker = tmp_path / "attacker-stage"
+        swapped: list[Path] = []
+        real_snapshot = backup_mod._snapshot_db
+
+        def swap_during_the_snapshot(src, dst):
+            result = real_snapshot(src, dst)
+            if not swapped:
+                for stage in nerve_dir.glob(".nerve-backup-stage-*"):
+                    stage.rename(attacker)
+                    stage.mkdir(mode=0o777)
+                    swapped.append(stage)
+            return result
+
+        monkeypatch.setattr(backup_mod, "_snapshot_db", swap_during_the_snapshot)
+        out = tmp_path / "out"
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, out,
+                config_dir=config_dir, include_secrets=include_secrets,
+            )
+
+        assert swapped, "the test did not manage to swap the staging directory"
+        assert list(swapped[0].iterdir()) == []  # nothing at all landed in theirs
+        assert not out.exists() or list(out.iterdir()) == []
+        # The snapshot went to the verified directory (the one renamed away),
+        # not to the planted name. It is not cleaned up by name, and it stays
+        # owner-only.
+        assert (attacker / "state" / "nerve.db").exists()
+        assert stat.S_IMODE(os.stat(attacker).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(attacker / "state" / "nerve.db").st_mode) == 0o600
+
+
+class TestTheBundleItselfIsOwnerOnly:
+    """The bundle holds nerve.db (with the signing secret unless
+    ``--no-secrets``) and config.local.yaml, so it is created 0600 before any
+    byte is written."""
+
+    def test_the_bundle_is_created_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        assert (os.stat(result.path).st_mode & 0o777) == 0o600
+        assert not (tmp_path / "out" / (result.path.name + ".tmp")).exists()
+
+    @staticmethod
+    def _output_filesystem_ignores_modes(monkeypatch, out: Path) -> None:
+        """Make only the output directory's filesystem ignore the mode.
+
+        The staging checks run first, so this is the only way to reach the
+        bundle's own check. The file is still created exclusively."""
+        real_create = backup_mod._exclusive_create
+
+        def fake(path, what):
+            fd, private = real_create(path, what)
+            return (fd, False) if path.parent == out else (fd, private)
+
+        monkeypatch.setattr(backup_mod, "_exclusive_create", fake)
+
+    def test_a_bundle_that_cannot_be_created_owner_only_is_refused(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The check runs while the file is empty, so no bundle is left."""
+        out = tmp_path / "out"
+        out.mkdir()
+        self._output_filesystem_ignores_modes(monkeypatch, out)
+        with pytest.raises(BackupError, match="nothing was written"):
+            backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+        assert list(out.iterdir()) == []
+
+    def test_a_no_secrets_bundle_is_still_written_with_a_warning(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch, caplog,
+    ):
+        """A ``--no-secrets`` bundle holds no credential, so a wide mode only
+        logs a warning."""
+        import logging
+
+        out = tmp_path / "out"
+        out.mkdir()
+        self._output_filesystem_ignores_modes(monkeypatch, out)
+        with caplog.at_level(logging.WARNING, logger="nerve.backup"):
+            result = backup_mod.create_backup(
+                nerve_dir, workspace, out, config_dir=config_dir, include_secrets=False,
+            )
+        assert result.path.exists()
+        assert any("readable by other users" in r.getMessage() for r in caplog.records)
+
+    def test_the_no_secrets_fallback_still_writes_through_its_own_descriptor(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """A wide mode is accepted, a swapped name is not. The bytes go to the
+        exclusively created descriptor, so a symlink planted at the name does
+        not get its target overwritten, and the name is checked before
+        publication."""
+        out = tmp_path / "out"
+        out.mkdir()
+        target = tmp_path / "precious.db"
+        target.write_text("do not truncate me", encoding="utf-8")
+        os.chmod(target, 0o644)
+        real_create = backup_mod._exclusive_create
+        swapped: list[Path] = []
+
+        def wide_then_swapped(path, what):
+            fd, private = real_create(path, what)
+            if path.parent == out:
+                path.unlink()
+                path.symlink_to(target)  # the name now points at their file
+                swapped.append(path)
+                return fd, False  # ...and the mode did not stick either
+            return fd, private
+
+        monkeypatch.setattr(backup_mod, "_exclusive_create", wide_then_swapped)
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, out, config_dir=config_dir, include_secrets=False,
+            )
+
+        assert swapped, "the test did not manage to swap the bundle temporary"
+        assert target.read_text(encoding="utf-8") == "do not truncate me"
+        assert not any(p.is_file() and not p.is_symlink() for p in out.iterdir())
+
+    def test_a_state_filesystem_that_ignores_modes_refuses_before_the_snapshot(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """When the staging filesystem ignores the mode, the backup refuses
+        before the database is copied."""
+        monkeypatch.setattr(backup_mod, "_mode_is_private", lambda st_mode: False)
+        with pytest.raises(BackupError, match="owner-only"):
+            backup_mod.create_backup(
+                nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+            )
+        assert list((tmp_path / "out").iterdir()) == []
+        assert not list(nerve_dir.glob(".nerve-backup-stage-*"))  # cleaned up
+
+    def test_the_bundle_is_written_through_the_descriptor_it_verified(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """The tar is written to the checked descriptor, not to the path. A
+        user who replaces the temporary with a symlink gets nothing."""
+        out = tmp_path / "out"
+        out.mkdir()
+        target = tmp_path / "attacker.tar"
+        target.write_text("", encoding="utf-8")
+        os.chmod(target, 0o644)
+        real_create = backup_mod._exclusive_create
+        swapped: list[Path] = []
+
+        def swap_right_after_creating_it(path, what):
+            """Swap the bundle temporary for a symlink right after it is
+            created and verified. The staged snapshot is not touched."""
+            fd, private = real_create(path, what)
+            if path.parent == out:
+                path.unlink()
+                path.symlink_to(target)
+                swapped.append(path)
+            return fd, private
+
+        monkeypatch.setattr(backup_mod, "_exclusive_create", swap_right_after_creating_it)
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+        assert swapped, "the test did not manage to swap the temporary"
+        assert target.read_bytes() == b""  # nothing was written through the symlink
+        assert list(out.iterdir()) == []  # and no bundle was published
+
+    def test_a_swapped_restore_temporary_is_not_published_either(
+        self, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        """Restore installs the file whose mode it verified, not whatever the
+        name points at when it renames."""
+        nd = _nerve_dir_with_stored_key(tmp_path)
+        bundle = backup_mod.create_backup(
+            nd, workspace, tmp_path / "out", config_dir=config_dir,
+        ).path
+        nd2 = tmp_path / "restored_nerve"
+        target = tmp_path / "attacker.db"
+        target.write_text("attacker", encoding="utf-8")
+        real_copy = backup_mod.shutil.copyfileobj
+
+        def swap_after_copy(inp, out, *a, **k):
+            result = real_copy(inp, out, *a, **k)
+            tmp = nd2 / "nerve.db.restore-tmp"
+            if tmp.is_file():
+                tmp.unlink()
+                tmp.symlink_to(target)
+            return result
+
+        monkeypatch.setattr(backup_mod.shutil, "copyfileobj", swap_after_copy)
+        with pytest.raises(BackupError, match="replaced while it was being written"):
+            backup_mod.restore_bundle(
+                bundle, nd2, tmp_path / "restored_ws", config_dir=tmp_path / "restored_cfg",
+            )
+        assert not (nd2 / "nerve.db").exists()
+        assert target.read_text(encoding="utf-8") == "attacker"
+
+
+class TestRestoredConfigLocalIsOwnerOnly:
+    """config.local.yaml holds the password hash and machine-local secrets. It
+    goes through the same verified 0600 temporary as nerve.db, and a failure
+    aborts the restore: without the file the instance would be passwordless."""
+
+    def test_it_is_installed_owner_only(self, nerve_dir, workspace, config_dir, tmp_path):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        cfg2 = tmp_path / "restored_cfg"
+        cfg2.mkdir(mode=0o755)  # an ordinary config dir, reachable by others
+        rep = backup_mod.restore_bundle(
+            result.path, tmp_path / "restored_nerve", tmp_path / "restored_ws",
+            config_dir=cfg2,
+        )
+        assert rep.ok, rep.errors
+        assert (os.stat(cfg2 / "config.local.yaml").st_mode & 0o777) == 0o600
+        assert not (cfg2 / "config.local.yaml.restore-tmp").exists()
+
+    def test_a_failure_aborts_the_restore_instead_of_dropping_the_file(
+        self, nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+    ):
+        result = backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        )
+        real_create = backup_mod._secure_create
+
+        def refuse_config_temp(path, what, **kwargs):
+            if path.name.startswith("config.local.yaml"):
+                raise BackupError(f"{what}: could not create {path} owner-only")
+            return real_create(path, what, **kwargs)
+
+        monkeypatch.setattr(backup_mod, "_secure_create", refuse_config_temp)
+        cfg2 = tmp_path / "restored_cfg"
+        with pytest.raises(BackupError, match="config.local.yaml"):
+            backup_mod.restore_bundle(
+                result.path, tmp_path / "restored_nerve", tmp_path / "restored_ws",
+                config_dir=cfg2,
+            )
+        assert not (cfg2 / "config.local.yaml").exists()
 
 
 def test_state_only_skips_workspace(nerve_dir, workspace, config_dir, tmp_path):
