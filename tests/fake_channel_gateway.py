@@ -5,6 +5,9 @@ the public JWK Set to a key file for Nerve. It opens WebSocket streams
 to a Nerve endpoint, negotiates, advertises capabilities, and serves inbox
 pages from an in-memory inbox while it records every read and
 acknowledgement. Switches on the gateway simulate lost frames and outages.
+It records every operation and answers it with the next scripted reply for
+its kind, or with success. It serves ``file_read`` from ``files``, and it
+answers a ``file_send`` after the final chunk and keeps it in ``uploads``.
 
 ``NerveServer`` runs an ASGI app on a loopback port with uvicorn, so the
 tests exercise real HTTP upgrades and real status codes.
@@ -16,6 +19,7 @@ contract samples.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import secrets
@@ -102,9 +106,15 @@ def gateway_negotiation(**limits: int) -> dict[str, Any]:
     }
 
 
-def capabilities(self_id: str = AGENT_AUTHOR) -> dict[str, Any]:
+def capabilities(
+    self_id: str = AGENT_AUTHOR, *, operations: list[str] | None = None, **limits: int,
+) -> dict[str, Any]:
+    """The sample capabilities, with other operations or limits if given."""
     body = copy.deepcopy(CAPABILITIES)
     body["self"]["id"] = self_id
+    if operations is not None:
+        body["operations"] = operations
+    body["limits"].update(limits)
     return body
 
 
@@ -186,6 +196,20 @@ class FakeChannelGateway:
         self.drop_ack_results = 0     # the ack is stored, its result is lost
         self.read_changed = asyncio.Event()
         self.ack_changed = asyncio.Event()
+        # Every operation: {"stream", "request_id", "connection_id", "kind",
+        # "operation", "at"}, where "at" is the event loop time of arrival.
+        self.operations: list[dict[str, Any]] = []
+        # kind -> replies used in order: a result body without "kind",
+        # "hold" (no result), or "close" (close the stream, no result).
+        self.operation_replies: dict[str, list[Any]] = {}
+        self.operation_changed = asyncio.Event()
+        self._next_message = 0
+        # attachment ID -> its bytes, served by file_read.
+        self.files: dict[str, bytes] = {}
+        # Completed uploads: {"request_id", "file", "data"}.
+        self.uploads: list[dict[str, Any]] = []
+        # Largest chunk that file_read sends.
+        self.chunk_bytes = 64 * 1024
 
     # ------------------------------------------------------------------ #
     #  Tokens and keys                                                     #
@@ -271,15 +295,105 @@ class FakeChannelGateway:
                 pass
 
     async def _any_change(self) -> None:
-        read = asyncio.ensure_future(self.read_changed.wait())
-        ack = asyncio.ensure_future(self.ack_changed.wait())
+        events = (self.read_changed, self.ack_changed, self.operation_changed)
+        waits = {asyncio.ensure_future(event.wait()) for event in events}
         try:
-            await asyncio.wait({read, ack}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            read.cancel()
-            ack.cancel()
-        self.read_changed.clear()
-        self.ack_changed.clear()
+            for wait in waits:
+                wait.cancel()
+        for event in events:
+            event.clear()
+
+    # ------------------------------------------------------------------ #
+    #  Operations                                                          #
+    # ------------------------------------------------------------------ #
+
+    def script(self, kind: str, *replies: Any) -> None:
+        """Queue replies for the next operations of *kind*."""
+        self.operation_replies.setdefault(kind, []).extend(replies)
+
+    def sent_operations(self, kind: str) -> list[dict[str, Any]]:
+        """The payloads of the operations of *kind*, in arrival order."""
+        return [record["operation"][kind] for record in self.operations if record["kind"] == kind]
+
+    def new_target(self, destination: dict[str, Any]) -> dict[str, Any]:
+        """A new message in *destination*, as a send result names it."""
+        self._next_message += 1
+        target = copy.deepcopy(destination)
+        target["message"] = {"id": f"1700009000.{self._next_message:06d}"}
+        return target
+
+    async def serve_operation(self, stream: FakeStream, frame: dict[str, Any]) -> None:
+        """Record one operation and answer it with its next scripted reply."""
+        operation = frame["payload"]["operation"]
+        kind = operation["kind"]
+        self.operations.append({
+            "stream": stream,
+            "request_id": frame["request_id"],
+            "connection_id": frame["connection_id"],
+            "kind": kind,
+            "operation": operation,
+            "at": asyncio.get_running_loop().time(),
+        })
+        self.operation_changed.set()
+        replies = self.operation_replies.get(kind)
+        reply = replies.pop(0) if replies else {"outcome": "succeeded"}
+        if reply == "hold":
+            stream.held.append(frame)
+            return
+        if reply == "close":
+            await stream.websocket.close()
+            return
+        if kind == "file_send" and reply.get("outcome") == "succeeded":
+            # Answered after the final chunk, as the gateway does.
+            stream.uploads[frame["request_id"]] = {"frame": frame, "reply": reply, "data": bytearray()}
+            return
+        reply = dict(reply)
+        data = reply.pop("data", None)
+        body = {"kind": kind, **reply}
+        if body["outcome"] == "succeeded" and kind == "send" and "target" not in body:
+            body["target"] = self.new_target(operation["send"]["destination"])
+        if body["outcome"] == "succeeded" and kind == "file_read":
+            read = operation["file_read"]
+            if data is None:
+                content = self.files[read["target"]["attachment"]["id"]]
+                data = content[read["offset_bytes"]:read["offset_bytes"] + read["length_bytes"]]
+            body.setdefault("transfer", {
+                "transfer_id": f"t-{frame['request_id']}",
+                "kind": "file_bytes",
+                "serialization": "raw",
+                "total_bytes": len(data),
+            })
+        await stream.respond(
+            frame["request_id"], "operation_result", body, connection_id=frame["connection_id"],
+        )
+        if data is not None and body["outcome"] == "succeeded":
+            await stream.send_chunks(
+                frame["request_id"], frame["connection_id"], body["transfer"]["transfer_id"], data,
+            )
+
+    async def receive_chunk(self, stream: FakeStream, frame: dict[str, Any]) -> None:
+        """Collect one upload chunk, and answer the upload after the final one."""
+        upload = stream.uploads.get(frame["correlation_id"])
+        if upload is None:
+            return
+        chunk = frame["payload"]["transfer"]
+        upload["data"] += base64.b64decode(chunk["data"])
+        if not chunk["final"]:
+            return
+        del stream.uploads[frame["correlation_id"]]
+        request = upload["frame"]
+        self.uploads.append({
+            "request_id": request["request_id"],
+            "file": request["payload"]["operation"]["file_send"]["file"],
+            "data": bytes(upload["data"]),
+        })
+        self.operation_changed.set()
+        await stream.respond(
+            request["request_id"], "operation_result", {"kind": "file_send", **upload["reply"]},
+            connection_id=request["connection_id"],
+        )
 
     async def serve(self, stream: FakeStream, frame: dict[str, Any]) -> None:
         """Answer one inbox request the way the gateway would."""
@@ -370,6 +484,8 @@ class FakeStream:
         self.frames: list[dict[str, Any]] = []
         self.requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.held: list[dict[str, Any]] = []
+        # request ID -> an upload whose final chunk has not arrived.
+        self.uploads: dict[str, dict[str, Any]] = {}
         self.nerve_negotiation = asyncio.Event()
         self.closed = asyncio.Event()
         self.close_code: int | None = None
@@ -396,6 +512,12 @@ class FakeStream:
                         await self.gateway.serve(self, frame)
                     else:
                         await self.requests.put(frame)
+                elif frame["kind"] == "operation":
+                    # Served also without auto_serve; a "hold" reply keeps
+                    # an operation for the test to answer.
+                    await self.gateway.serve_operation(self, frame)
+                elif frame["kind"] == "transfer":
+                    await self.gateway.receive_chunk(self, frame)
         except ConnectionClosed:
             pass
         finally:
@@ -415,19 +537,49 @@ class FakeStream:
     async def send_raw(self, text: str) -> None:
         await self.websocket.send(text)
 
-    async def respond(self, correlation_id: str, kind: str, body: dict[str, Any]) -> None:
-        frame = {"version": "1", "kind": kind, "correlation_id": correlation_id, "payload": {kind: body}}
+    async def respond(
+        self, correlation_id: str, kind: str, body: dict[str, Any], *, connection_id: str | None = None,
+    ) -> None:
+        frame: dict[str, Any] = {"version": "1", "kind": kind, "correlation_id": correlation_id}
+        if connection_id is not None:
+            frame["connection_id"] = connection_id
+        frame["payload"] = {kind: body}
         try:
             await self.websocket.send(json.dumps(frame))
         except ConnectionClosed:
             pass
 
+    async def send_chunks(
+        self, correlation_id: str, connection_id: str, transfer_id: str, data: bytes,
+    ) -> None:
+        """Send *data* as the chunks of a read transfer."""
+        size = self.gateway.chunk_bytes
+        for offset in range(0, len(data), size):
+            piece = data[offset:offset + size]
+            await self.respond(correlation_id, "transfer", {
+                "transfer_id": transfer_id,
+                "offset": offset,
+                "total_bytes": len(data),
+                "data": base64.b64encode(piece).decode("ascii"),
+                "final": offset + len(piece) == len(data),
+            }, connection_id=connection_id)
+
     async def negotiate(self, **limits: int) -> None:
         await self.send("negotiation", gateway_negotiation(**limits))
         await asyncio.wait_for(self.nerve_negotiation.wait(), EVENT_TIMEOUT)
 
-    async def advertise(self, *, connection_id: str = CONNECTION_ID, self_id: str = AGENT_AUTHOR) -> None:
-        await self.send("capabilities", capabilities(self_id), connection_id=connection_id)
+    async def advertise(
+        self,
+        *,
+        connection_id: str = CONNECTION_ID,
+        self_id: str = AGENT_AUTHOR,
+        operations: list[str] | None = None,
+        **limits: int,
+    ) -> None:
+        await self.send(
+            "capabilities", capabilities(self_id, operations=operations, **limits),
+            connection_id=connection_id,
+        )
 
     async def nudge(self, purpose: str | None = None) -> None:
         await self.send("nudge", {"purpose": purpose} if purpose else {})

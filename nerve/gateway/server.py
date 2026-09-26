@@ -505,7 +505,10 @@ async def lifespan(app: FastAPI):
 
         if hosted_providers(config):
             try:
-                runtime = HostedChannelRuntime(config, _engine.router, get_config)
+                runtime = HostedChannelRuntime(
+                    config, _engine.router, get_config,
+                    notification_service=notification_service,
+                )
                 await runtime.start()
                 startup_cleanups.append(("hosted channels", runtime.stop))
                 _hosted_channels = runtime

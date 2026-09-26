@@ -25,11 +25,14 @@ from nerve.channels.hosted.contract.model import (
     InboxReadResult,
     Negotiation,
     Nudge,
+    Operation,
+    OperationResult,
     Payload,
     StreamLimits,
     decode_envelope,
     encode_envelope,
     validate_inbox_read_result,
+    validate_operation_result,
 )
 from nerve.channels.hosted.contract.wire import Rejected, RejectionReason
 
@@ -53,6 +56,8 @@ __all__ = [
     "InboxReadResult",
     "Negotiation",
     "Nudge",
+    "Operation",
+    "OperationResult",
     "Payload",
     "Rejected",
     "RejectionReason",
@@ -60,4 +65,5 @@ __all__ = [
     "decode_envelope",
     "encode_envelope",
     "validate_inbox_read_result",
+    "validate_operation_result",
 ]

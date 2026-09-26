@@ -1251,7 +1251,7 @@ reload, switch the gateway to the new key, then remove the old public key and
 reload again.
 
 The gateway admits each event, so `allow_users`, `allow_channels`, and
-`allow_direct_messages` do not apply. Nerve still checks that a channel message
+`allow_direct_messages` do not apply to incoming messages. Nerve still checks that a channel message
 mentions the agent or continues a thread that has a session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
@@ -1264,10 +1264,44 @@ latest accepted event.
 The stream endpoint still accepts streams, and events stay in the gateway's
 inbox until a reload sets `enabled` to `true`.
 
-Replies, notifications, reactions, and file transfers do not reach Slack in
-hosted mode yet. `slack.mode` and `channels.hosted.*` need a restart; a
-reload of running hosted channels reads the key file again. Changing
-`mode` from `socket` to `hosted` stops the Socket Mode connection at once.
+Replies, reactions, and `send_channel_message` go to Slack as operations on
+a gateway stream that advertises them for the connection. A reply goes on the
+connection of the conversation's latest accepted event; a conversation
+without one uses the only connection that can send. Nerve splits a message at
+the connection's advisory character limit and paces streaming edits by its
+edit interval. The typing indicator is an `eyes` reaction on the message that
+started the turn. `slack.allow_outbound` still decides whether the agent may
+use `send_channel_message`. When `allow_channels` or `deny_channels` is set,
+the conversation ID must also pass them. Hosted events carry no trusted
+conversation names, so rules match conversation IDs only: a name rule in
+`allow_channels` allows nothing, and a name or glob rule in `deny_channels`
+refuses every conversation. Without these rules, Nerve does not limit the
+destination, including direct messages; the gateway decides. The gateway
+decides in every case, and the agent gets a refusal without the gateway's
+reason. A message whose result is lost is not sent again, because it may
+already be in Slack.
+
+`send_file` uploads a file of up to the connection's advertised file limit
+in chunks after its operation. The attachments of a message that starts a
+turn are read through the gateway before the turn, with the Socket Mode
+rules: text files go into the prompt, images and PDFs are attached, and ZIP
+files are unpacked one level. One file is read up to 16 MiB less one byte.
+The files of one message are read up to 32 MiB together, and the content
+unpacked from ZIP files counts against the same limit.
+
+Notifications go to the same conversation as in Socket Mode
+(`notifications.slack_channel_id`, else the first literal conversation ID in
+`slack.allow_channels`), with one button for each answer. A button press
+answers the notification only in the conversation where it was delivered,
+and the card then shows the answer without buttons. A press that answers
+nothing, for example a second press, gets a short notice and the card stays.
+An expired card is edited without buttons. `/nerve` commands, including the host commands
+`doctor` and `restart`, are not available in hosted mode; `nerve doctor`
+reports this and the local settings that still apply.
+
+`slack.mode` and `channels.hosted.*` need a restart; a reload of running
+hosted channels reads the key file again. Changing `mode` from `socket` to
+`hosted` stops the Socket Mode connection at once.
 
 ### Setting up the Slack app
 
@@ -1514,6 +1548,8 @@ from a cron run with no conversation attached.
 
 It is **off by default**: `slack.allow_outbound: true` enables the capability,
 and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
+In hosted mode the channel gateway also decides where it may go, and a name
+rule in `allow_channels` cannot grant (see [Hosted mode](#hosted-mode)).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
