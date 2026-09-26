@@ -142,18 +142,27 @@ class AccountStore:
 
     # -- actor_refs ----------------------------------------------------------
 
+    # An actor row plus the login name of the account behind it, so a label can
+    # fall back to the username when no display name is set. ``accounts.actor_id``
+    # is UNIQUE, so the join never multiplies rows; the system actor and an
+    # account without a username read ``NULL``.
+    _ACTOR_REF_SELECT = (
+        "SELECT r.*, a.username FROM actor_refs r "
+        "LEFT JOIN accounts a ON a.actor_id = r.id"
+    )
+
     async def get_actor_ref(self, actor_id: str) -> dict | None:
         async with self.db.execute(
-            "SELECT * FROM actor_refs WHERE id = ?", (actor_id,)
+            f"{self._ACTOR_REF_SELECT} WHERE r.id = ?", (actor_id,)
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
     async def list_actor_refs(self, *, kind: str | None = None) -> list[dict]:
         if kind is None:
-            sql, params = "SELECT * FROM actor_refs ORDER BY created_at, id", ()
+            sql, params = f"{self._ACTOR_REF_SELECT} ORDER BY r.created_at, r.id", ()
         else:
-            sql = "SELECT * FROM actor_refs WHERE kind = ? ORDER BY created_at, id"
+            sql = f"{self._ACTOR_REF_SELECT} WHERE r.kind = ? ORDER BY r.created_at, r.id"
             params = (kind,)
         async with self.db.execute(sql, params) as cursor:
             return [dict(row) async for row in cursor]

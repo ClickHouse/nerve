@@ -293,6 +293,7 @@ class ViewerActor(BaseModel):
     id: str
     kind: str
     display_name: str | None
+    username: str | None = None
 
 
 class ViewerResponse(BaseModel):

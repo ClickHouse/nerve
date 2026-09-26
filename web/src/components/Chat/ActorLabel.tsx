@@ -28,7 +28,7 @@ function useAttribution(actorId: string | null | undefined): Attribution {
   return {
     name: discriminator ? `${base} (${discriminator})` : base,
     system,
-    anonymous: !actor?.display_name?.trim() && !system,
+    anonymous: !system && !actor?.display_name?.trim() && !actor?.username?.trim(),
     ambiguous: !!discriminator,
   };
 }
