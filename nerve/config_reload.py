@@ -43,6 +43,7 @@ _ERROR_PREFIX = "error: "
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
     "auth.jwt_secret",
+    "channels.hosted",
     "codex.home_dir",
     "external_agents.enabled",
     "gateway.host",
@@ -59,6 +60,7 @@ _RESTART_ONLY_PATHS = (
     "mcp_endpoint.path",
     "memory",
     "proxy",
+    "slack.mode",
     "sync.codex",
     "telegram.allowed_users",
     "telegram.bot_token",

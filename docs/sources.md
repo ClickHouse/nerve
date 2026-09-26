@@ -242,6 +242,14 @@ of that table you land in:
   the access policy. A matching source can still collect a message that fails
   the live access policy.
 - **Telegram** has no "addressed to me" test: authorization alone decides.
+- **Hosted Slack** (`slack.mode: hosted`): the gateway sends a separate
+  observation for each message it admits for observation, and a message that
+  also starts a turn arrives twice. The live route accepts the turn copy, and
+  the table above decides the observation copy. The gateway gives no trusted
+  names, so only a channel ID or member ID can grant; a name matches only the
+  display name in the event, which can deny but never grant. Nerve
+  acknowledges an observation to the gateway only after the buffer row is
+  written.
 
 **Never collected, whatever the config says:** direct and group DMs, the
 agent's own messages, other bots and apps, join/leave and similar service

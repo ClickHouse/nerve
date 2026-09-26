@@ -1196,7 +1196,20 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Telegram disabled")
 
     # Check Slack
-    if config.slack.enabled:
+    if config.slack.enabled and config.slack.mode == "hosted":
+        # A gateway holds the tokens, so there are none to check here.
+        hosted = config.channels.hosted
+        problems = hosted.problems()
+        if problems:
+            errors.extend(
+                f"[ERR] Slack is hosted but {problem}" for problem in problems
+            )
+        else:
+            lines.append(
+                f"[OK] Slack hosted by the channel gateway: agent "
+                f"{hosted.agent_id}, stream tokens from {hosted.issuer}"
+            )
+    elif config.slack.enabled:
         missing = [
             name for name, value in (
                 ("bot_token", config.slack.bot_token),
