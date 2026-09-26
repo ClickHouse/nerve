@@ -11,16 +11,21 @@ Unless noted otherwise, endpoints require a JWT in the `Authorization: Bearer
 Log in and receive a session token. Authentication is not required.
 
 ```json
-Request:  { "password": "..." }
+Request:  { "password": "...", "username": "alice" }
 Response: { "token": "eyJ..." }
 ```
 
-When `auth.password_hash` is unset, any password is accepted for the sole local
-account. Treat the returned token as opaque. A `503` response means startup has
-not selected a signing secret yet.
+`username` is optional when one account exists and required when there are two
+or more. Use `GET /api/auth/status` to determine which fields to show. On a
+passwordless installation, any password is accepted for the sole account.
 
-The token identifies the sole local account. Disabled accounts cannot log in
-(`401`).
+Treat the returned token as opaque.
+
+| Outcome | Response |
+|---|---|
+| Invalid credentials or missing required username | `401` `Invalid username or password` |
+| Valid credentials for a disabled account | `401` |
+| Authentication is not ready | `503` |
 
 #### Authenticated requests
 
@@ -34,15 +39,25 @@ types and legacy-session compatibility.
 
 When a session is more than halfway to expiry, the response includes a refreshed
 token in `X-Nerve-Token`. Replace the current token with it. The header also
-upgrades sessions created before account-based tokens and is exposed through
-CORS.
+upgrades sessions created before per-account login and is exposed through CORS.
 
 #### `GET /api/auth/status`
-Return whether login requires a password. Authentication is not required.
+Return the required login fields. Authentication is not required.
 
 ```json
-Response: { "auth_required": true }
+Response: {
+  "auth_required": true,
+  "login": "password"
+}
 ```
+
+| Field | Meaning |
+|---|---|
+| `login` | `none`, `password`, or `username_password` |
+| `auth_required` | Compatibility field; equivalent to `login != "none"` |
+
+The response does not expose usernames or the account count. Before
+authentication is ready, it returns the fail-closed `username_password` state.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -50,6 +65,50 @@ Verify current authentication.
 ```json
 Response: { "authenticated": true }
 ```
+
+### Accounts
+
+Every signed-in account can manage accounts. System credentials cannot. Account
+responses never include password hashes or their storage location.
+
+An account is:
+
+```json
+{
+  "id": "…",
+  "actor_id": "…",
+  "username": "alice",
+  "display_name": "Alice",
+  "enabled": true,
+  "has_password": true,
+  "created_at": "…"
+}
+```
+
+`id` identifies the account. `actor_id` is the stable attribution ID and does
+not change when the username changes.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
+| `GET /api/accounts/me` | the signed-in account |
+| `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
+| `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
+| `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
+| `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
+| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
+
+Failures:
+
+| Response | When |
+|---|---|
+| `400` | Invalid username or password longer than 72 UTF-8 bytes |
+| `403` | System credential, or current password not supplied or incorrect |
+| `404` | Account not found |
+| `409` | Username or account-state conflict; the response explains the conflict |
+
+Disabling an account affects its next request. An existing WebSocket keeps its
+accepted identity until it reconnects.
 
 ### Sessions
 

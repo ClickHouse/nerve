@@ -28,11 +28,12 @@ import { UltracodePage } from './pages/UltracodePage';
 import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
+import { AccountsPage } from './pages/AccountsPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
+  const { authenticated, ready, checkAuth, sessionExpired } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
@@ -47,7 +48,10 @@ function App() {
     return () => { unsub(); ws.disconnect(); };
   }, [authenticated]);
 
-  if (checking) return null;
+  // Nothing renders until startup has decided where this tab belongs. A stored
+  // token is not that decision: the instance may still be unset-up, and
+  // rendering on the token alone landed on /chat before the answer arrived.
+  if (!ready) return null;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -67,7 +71,7 @@ function App() {
       <GlobalShortcuts />
       <Routes location={background ?? location}>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/" element={<Home />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
           <Route path="/tasks" element={<TasksPage />} />
@@ -84,6 +88,7 @@ function App() {
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
+          <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -98,6 +103,17 @@ function App() {
       <ShortcutsModal />
     </>
   );
+}
+
+/**
+ * Where the app opens.
+ *
+ * Passwordless standalone installs open Accounts so the owner can name and
+ * secure the account. The setup claim page arrives in the later claim PR.
+ */
+function Home() {
+  const loginMode = useAuthStore((s) => s.loginMode);
+  return <Navigate to={loginMode === 'none' ? '/accounts' : '/chat'} replace />;
 }
 
 /**

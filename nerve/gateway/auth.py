@@ -60,9 +60,82 @@ SYSTEM_SUBJECT = "agent-system"
 LEGACY_SUBJECT = "user"
 
 
+# bcrypt accepts at most 72 bytes. Validate before calling it.
+PASSWORD_MAX_BYTES = 72
+
+# Work factor for new hashes. Existing hashes are accepted and upgraded after a
+# successful login.
+BCRYPT_COST = 12
+
+
+class PasswordTooLongError(ValueError):
+    """The password exceeds bcrypt's byte limit."""
+
+
+def password_length_problem(plain: str) -> str | None:
+    """Return a validation error for a password, or ``None``."""
+    if not plain:
+        return "A password is required"
+    size = len(plain.encode("utf-8"))
+    if size > PASSWORD_MAX_BYTES:
+        return (
+            f"That password is {size} bytes long; the maximum is "
+            f"{PASSWORD_MAX_BYTES} bytes. Note that this is bytes rather than "
+            "characters — accented letters and emoji cost two to four each."
+        )
+    return None
+
+
+def hash_password(plain: str) -> str:
+    """Hash a valid password for storage.
+
+    Raises :class:`PasswordTooLongError` instead of truncating overlong input.
+    """
+    problem = password_length_problem(plain)
+    if problem:
+        raise PasswordTooLongError(problem)
+    return bcrypt.hashpw(
+        plain.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_COST),
+    ).decode("utf-8")
+
+
+def bcrypt_cost(hashed: str) -> int | None:
+    """Return a bcrypt hash's work factor, or ``None`` if invalid."""
+    parts = (hashed or "").split("$")
+    if len(parts) < 4 or not parts[1].startswith("2"):
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None
+
+
+def needs_rehash(hashed: str) -> bool:
+    """Return whether a valid hash uses a different work factor."""
+    cost = bcrypt_cost(hashed)
+    return cost is not None and cost != BCRYPT_COST
+
+
+def source_authenticates(credential_source: str, *, configured_password: bool) -> bool:
+    """Return whether the account has a local or configured credential."""
+    return credential_source == "local" or configured_password
+
+
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash."""
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    """Verify a password, returning ``False`` for malformed hashes.
+
+    Candidates are truncated to 72 bytes to preserve hashes created by bcrypt
+    versions that silently truncated overlong passwords. New hashes reject such
+    passwords in :func:`hash_password`.
+    """
+    if not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(
+            (plain or "").encode("utf-8")[:PASSWORD_MAX_BYTES], hashed.encode("utf-8"),
+        )
+    except (ValueError, TypeError):
+        return False
 
 
 def session_expiry_hours() -> int:

@@ -425,6 +425,85 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
     assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
 
 
+# Obviously synthetic, and long enough to be found in the raw file bytes.
+_PLANTED_HASH = "$2b$12$planted-account-password-hash-not-a-real-one"
+
+
+def _plant_accounts(db_path: Path) -> None:
+    """The v047 accounts table, with a password hash on the row — the shape
+    every install has after the startup migration off the configured
+    credential."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "CREATE TABLE accounts ("
+            "  id TEXT PRIMARY KEY, actor_id TEXT NOT NULL UNIQUE, username TEXT,"
+            "  credential_source TEXT NOT NULL"
+            "    CHECK (credential_source IN ('config', 'local', 'none')),"
+            "  credential TEXT, enabled INTEGER NOT NULL DEFAULT 1,"
+            "  created_at TEXT NOT NULL,"
+            "  CHECK ((credential_source = 'local' AND credential IS NOT NULL)"
+            "         OR (credential_source IN ('config', 'none') AND credential IS NULL)))"
+        )
+        conn.execute(
+            "INSERT INTO accounts VALUES "
+            "('acc-1', 'actor-1', 'alice', 'local', ?, 1, 't')",
+            (_PLANTED_HASH,),
+        )
+        conn.execute(
+            "INSERT INTO accounts VALUES "
+            "('acc-2', 'actor-2', 'bob', 'none', NULL, 1, 't')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _account_credentials(db_path: Path) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT username, credential_source, credential FROM accounts ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_a_database_without_the_accounts_table_is_left_alone(tmp_path):
+    """A bundle from before the accounts table existed has nothing to scrub,
+    and that is checked explicitly rather than inferred from an error."""
+    old = tmp_path / "old.db"
+    _make_nerve_db(old)
+    backup_mod._scrub_account_credentials(old)  # no error, nothing to do
+    backup_mod._scrub_snapshot_secrets(old)
+
+
+def test_an_exposed_restored_database_loses_every_credential(tmp_path, monkeypatch):
+    """The restore last resort: a file that reads back wide has the signing
+    secret *and* the password hashes taken out of it before the restore fails."""
+    src, dst = tmp_path / "src.db", tmp_path / "dst.db"
+    _make_nerve_db(src)
+    _plant_instance_secret(src)
+    _plant_accounts(src)
+
+    # The temporary verifies twice (so the copy proceeds and is published) and
+    # the installed file then reads back wide — the one case the scrub is for.
+    seen = {"files": 0}
+
+    def fake(st_mode: int) -> bool:
+        if stat.S_ISDIR(st_mode):
+            return True
+        seen["files"] += 1
+        return seen["files"] <= 2
+
+    monkeypatch.setattr(backup_mod, "_mode_is_private", fake)
+    with pytest.raises(BackupError) as excinfo:
+        backup_mod._secure_install_db(src, dst)
+    assert "password hashes" in str(excinfo.value)
+    assert _stored_secrets(dst) == []
+    assert _account_credentials(dst) == [("alice", "none", None), ("bob", "none", None)]
+
+
 def test_restore_preserves_the_bootstrapped_identity_ids(workspace, config_dir, tmp_path):
     """A restore keeps the account, actor and system actor ids that stored
     rows reference, and the signing secret that live sessions verify with."""
@@ -1247,3 +1326,302 @@ def test_gzip_fallback_roundtrip(nerve_dir, workspace, config_dir, tmp_path):
     assert result.compression == "gzip"
     report = backup_mod.verify_bundle(result.path)
     assert report.ok, report.errors
+
+
+# --------------------------------------------------------------------------- #
+#  --no-secrets and the tracked configuration                                  #
+# --------------------------------------------------------------------------- #
+
+# Synthetic bcrypt verifier with a production-compatible shape. Startup does
+# not rewrite tracked or fleet-managed configuration, so this hash may still be
+# present when a backup is taken.
+_TRACKED_HASH = "$2b$12$tracked-password-hash-left-by-the-migration"
+
+
+def _with_tracked_config(ws: Path) -> Path:
+    cfg = ws / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text(
+        "timezone: UTC\n"
+        "auth:\n"
+        f"  password_hash: '{_TRACKED_HASH}'\n"
+        "  jwt_secret: an-obviously-synthetic-signing-secret\n"
+        "agent:\n  max_turns: 40\n",
+        encoding="utf-8",
+    )
+    (cfg / "cron").mkdir(exist_ok=True)
+    (cfg / "cron" / "jobs.yaml").write_text(
+        "jobs:\n  - id: nightly\n    env:\n      SOME_API_KEY: a-fake-value\n",
+        encoding="utf-8",
+    )
+    return cfg / "settings.yaml"
+
+
+def _member(bundle: Path, name: str, staging: Path) -> str:
+    """Extract the bundle (zstd or gzip, via the module's own reader) and read
+    one file out of it."""
+    report = backup_mod.verify_bundle(bundle, extract_to=staging)
+    assert report.ok, report.errors
+    path = staging / name
+    assert path.is_file(), f"{name} not in the bundle"
+    return path.read_text(encoding="utf-8")
+
+
+def test_a_config_file_with_nothing_secret_in_it_is_copied_unchanged(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Most tracked config has only references in it. Rewriting those would
+    churn the bundle for nothing and lose the file's comments."""
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    body = "# a comment worth keeping\ntimezone: UTC\nagent:\n  max_turns: 40\n"
+    (cfg / "settings.yaml").write_text(body, encoding="utf-8")
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    assert _member(
+        bundle.path, "workspace/config/settings.yaml", tmp_path / "x",
+    ) == body
+
+
+def test_a_no_secrets_backup_refuses_a_config_file_it_cannot_inspect(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Refuse a no-secrets backup when a configuration file cannot be inspected
+    for credentials."""
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    marker = "$2b$12$MARKER-inside-a-file-that-will-not-parse"
+    (cfg / "settings.yaml").write_text(
+        f"this: [is not: valid\nauth: password_hash: '{marker}'\n", encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+
+    with pytest.raises(BackupError) as excinfo:
+        backup_mod.create_backup(
+            nerve_dir, workspace, out, config_dir=config_dir, include_secrets=False,
+        )
+    assert "settings.yaml" in str(excinfo.value)
+    assert "--no-secrets" in str(excinfo.value)
+    # Nothing was published, so the marker is nowhere in the output directory.
+    for path in out.rglob("*"):
+        if path.is_file():
+            assert marker not in path.read_bytes().decode("latin-1"), path
+
+    # ...and the same instance backs up fine *with* secrets: this is a promise
+    # that cannot be kept, not a broken backup.
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
+        include_secrets=True,
+    )
+    assert kept.path.is_file()
+
+
+def test_a_config_file_that_is_not_a_mapping_is_refused_too(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    cfg = workspace / "config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text("- just\n- a list\n", encoding="utf-8")
+
+    with pytest.raises(BackupError, match="settings.yaml"):
+        backup_mod.create_backup(
+            nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+            include_secrets=False,
+        )
+
+
+def test_the_rewritten_file_is_staged_owner_only(
+    nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+):
+    """The reason it is being rewritten is that the original had a credential in
+    it, so the copy must not exist at a wider mode even briefly."""
+    _with_tracked_config(workspace)
+    seen: list[int] = []
+    real = backup_mod._secure_create
+
+    def recording(path, what, **kw):
+        fd = real(path, what, **kw)
+        if path.name == "settings.yaml":
+            seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd
+
+    monkeypatch.setattr(backup_mod, "_secure_create", recording)
+    backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    assert seen == [0o600]
+
+
+def test_no_secrets_leaves_no_credential_anywhere_in_the_archive(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Search the finished archive for markers planted in every credential
+    location: the two
+    inside nerve.db, the machine-local overlay, the tracked workspace config, a
+    cron job's environment, and the state files that are omitted by name — and
+    then the finished bundle is searched for every one of them, in the extracted
+    members and in the compressed bytes. Anything added to the backup later that
+    carries a credential fails here without updating a mechanism-specific test.
+    """
+    markers = {
+        "jwt secret in nerve.db": "MARKER-jwt-secret-in-the-database",
+        "account hash on the row": "$2b$12$MARKER-account-password-hash",
+        "hash in config.local.yaml": "$2b$12$MARKER-local-config-hash",
+        "api key in config.local.yaml": "MARKER-anthropic-key",
+        "hash in tracked settings.yaml": "$2b$12$MARKER-tracked-hash",
+        "jwt secret in tracked settings.yaml": "MARKER-tracked-jwt",
+        "token in a cron env block": "MARKER-cron-token",
+        "mcp-token file": "MARKER-mcp-token",
+        "telegram session": "MARKER-telegram",
+    }
+
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "CREATE TABLE instance_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,"
+            " created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('jwt_secret', ?, 't')",
+            (markers["jwt secret in nerve.db"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _plant_accounts(nerve_dir / "nerve.db")
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "UPDATE accounts SET credential = ? WHERE credential IS NOT NULL",
+            (markers["account hash on the row"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    (config_dir / "config.local.yaml").write_text(
+        f"auth:\n  password_hash: '{markers['hash in config.local.yaml']}'\n"
+        f"anthropic_api_key: {markers['api key in config.local.yaml']}\n",
+        encoding="utf-8",
+    )
+    cfg = workspace / "config"
+    (cfg / "cron").mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.yaml").write_text(
+        "timezone: UTC\nauth:\n"
+        f"  password_hash: '{markers['hash in tracked settings.yaml']}'\n"
+        f"  jwt_secret: {markers['jwt secret in tracked settings.yaml']}\n",
+        encoding="utf-8",
+    )
+    (cfg / "cron" / "jobs.yaml").write_text(
+        "jobs:\n  - id: nightly\n    env:\n"
+        f"      GH_TOKEN: {markers['token in a cron env block']}\n",
+        encoding="utf-8",
+    )
+    (nerve_dir / "mcp-token").write_text(markers["mcp-token file"], encoding="utf-8")
+    (nerve_dir / "telegram_sync.session").write_text(
+        markers["telegram session"], encoding="utf-8",
+    )
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
+
+    blob = bundle.path.read_bytes().decode("latin-1")
+    extracted = {
+        str(p.relative_to(staging)): p.read_bytes().decode("latin-1")
+        for p in staging.rglob("*") if p.is_file()
+    }
+    leaks = {
+        label: [name for name, body in extracted.items() if value in body]
+        for label, value in markers.items()
+        if value in blob or any(value in body for body in extracted.values())
+    }
+    assert leaks == {}, leaks
+    assert _account_credentials(staging / "state" / "nerve.db") == [
+        ("alice", "none", None), ("bob", "none", None),
+    ]
+    assert _account_credentials(nerve_dir / "nerve.db")[0] == (
+        "alice", "local", markers["account hash on the row"],
+    )
+    settings = extracted["workspace/config/settings.yaml"]
+    jobs = extracted["workspace/config/cron/jobs.yaml"]
+    assert "timezone: UTC" in settings and "${" in settings
+    assert "nightly" in jobs and "${" in jobs
+
+    # ...and the same bundle taken *with* secrets does carry them, or the test
+    # above would pass against a backup that archived nothing at all.
+    kept = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out2", config_dir=config_dir,
+        include_secrets=True,
+    )
+    kept_staging = tmp_path / "x2"
+    assert backup_mod.verify_bundle(kept.path, extract_to=kept_staging).ok
+    kept_bodies = "".join(
+        p.read_bytes().decode("latin-1")
+        for p in kept_staging.rglob("*") if p.is_file()
+    )
+    for label in (
+        "hash in tracked settings.yaml", "hash in config.local.yaml",
+        "account hash on the row", "jwt secret in nerve.db",
+    ):
+        assert markers[label] in kept_bodies, label
+
+
+def test_a_transitional_config_account_restores_as_passwordless(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """Restore a transitional account before startup migrates its credential.
+    Its credential lives in config.local.yaml, which this bundle
+    omits — so a row left on `config` comes back able to authenticate against
+    nothing, and not recognised as passwordless either. That is the one state
+    with no way out of it."""
+    import asyncio
+
+    from nerve.db import Database
+
+    async def bootstrap(path: Path) -> None:
+        database = Database(path)
+        await database.connect()
+        try:
+            await database._bootstrap_first_account(credential_source="config")
+        finally:
+            await database.close()
+
+    async def state_of(path: Path):
+        database = Database(path)
+        await database.connect()
+        try:
+            return await database.login_state(), await database.list_accounts()
+        finally:
+            await database.close()
+
+    db_path = nerve_dir / "nerve.db"
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(db_path) + suffix).unlink(missing_ok=True)
+    asyncio.run(bootstrap(db_path))
+    before, _ = asyncio.run(state_of(db_path))
+    assert before.passwordless is False          # it reads auth.password_hash
+
+    bundle = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+        include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    assert backup_mod.verify_bundle(bundle.path, extract_to=staging).ok
+
+    after, accounts = asyncio.run(state_of(staging / "state" / "nerve.db"))
+    assert [a["credential_source"] for a in accounts] == ["none"]
+    assert [a["credential"] for a in accounts] == [None]
+    # ...which is what makes the restored instance usable: passwordless, so its
+    # owner can sign in and set a password, rather than locked out of an account
+    # whose credential was in a file this bundle does not carry.
+    assert after.passwordless is True
+    assert after.single_account is True

@@ -60,8 +60,10 @@ someone else's tree — have to pass ``legacy_cron_dir=`` as well (or set
 
 **Identity bootstrap.** :func:`bootstrap_identity` is the part of the accounts
 migration that reads configuration. The v047 schema migration creates the
-tables; this step creates the first account and, if ``auth.jwt_secret`` is
-unset, a signing secret. Only the gateway, at every start, and ``nerve init``
+tables; this step creates the first account, moves ``auth.password_hash`` onto
+the account row and out of the configuration files
+(:func:`_migrate_config_credentials`), and, if ``auth.jwt_secret`` is unset,
+creates a signing secret. Only the gateway, at every start, and ``nerve init``
 run it. :func:`migrate` reports what the gateway will do and writes nothing to
 ``nerve.db``. Other CLI commands open the database with
 :func:`open_production_db`, which loads the signing secret and creates no
@@ -292,6 +294,13 @@ class MigrationReport:
     # The stored signing secret was (or would be) deleted because
     # auth.jwt_secret is configured.
     retired_stored_secret: bool = False
+    # An account's credential moved off `config` onto the row itself — the
+    # configured hash copied across, not re-hashed (see
+    # :func:`_migrate_config_credentials`).
+    migrated_config_credential: bool = False
+    # `auth.password_hash` was (or would be) removed from the machine-local
+    # configuration afterwards, because nothing reads it any more.
+    scrubbed_config_password: bool = False
 
     @property
     def did_anything(self) -> bool:
@@ -306,6 +315,8 @@ class MigrationReport:
             or self.updated_credential_source
             or self.generated_jwt_secret
             or self.retired_stored_secret
+            or self.migrated_config_credential
+            or self.scrubbed_config_password
         )
 
 
@@ -1002,6 +1013,304 @@ def _mirror_action(current: str, expected: str, dry_run: bool) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+#  Move credentials out of configuration                                      #
+# --------------------------------------------------------------------------- #
+#
+# ``credential_source = 'config'`` is transitional. Startup copies the
+# configured hash to the account row, where the accounts API can manage it,
+# then removes the obsolete machine-local configuration value.
+#
+# The hash is already bcrypt, so this is a *copy* and not a re-hash: nobody's
+# password changes, and every open session stays valid. Copy first, scrub
+# second — the other order locks everybody out if the copy fails.
+
+# Only the machine-local layers are ever rewritten. The tracked settings file is
+# shared configuration (possibly under version control and possibly delivered by
+# a fleet), so a value there is reported, never edited.
+_MACHINE_CONFIG_FILES = ("config.yaml", "config.local.yaml")
+
+
+def _declared_password_hash(path: Path) -> bool:
+    """Whether this file's own ``auth`` section sets a non-empty password hash.
+
+    Read per file rather than from the merged config: the merged view cannot say
+    *where* the value came from, and the answer decides whether this is a file
+    to rewrite, a file to warn about, or neither.
+    """
+    if not path.is_file():
+        return False
+    try:
+        raw = _read_yaml_mapping(path)
+    except Exception:  # noqa: BLE001 — a broken file fails startup elsewhere, loudly
+        return False
+    auth = raw.get("auth")
+    return isinstance(auth, dict) and bool(auth.get("password_hash"))
+
+
+def _leading_comment(text: str) -> str:
+    """The file's opening comment block, so a rewrite keeps its header."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            break
+        kept.append(line)
+    return "\n".join(kept).rstrip() + "\n\n" if kept else ""
+
+
+def _strip_password_hash(path: Path) -> None:
+    """Remove ``auth.password_hash`` from a machine-local config file.
+
+    Written through :func:`nerve.paths.write_private_text`: created
+    ``O_CREAT|O_EXCL`` at 0600, the mode confirmed on the descriptor before the
+    first byte, written through that descriptor and proved to still be the same
+    file before it is renamed into place. The file keeps the signing secret and
+    every API key the wizard collected, so it must not exist at a wider mode for
+    even the moment a write-then-chmod would leave.
+
+    Raises :class:`nerve.paths.InsecureFileError` with nothing written if that
+    cannot be guaranteed; the caller reports it and leaves the value alone.
+    """
+    original = path.read_text(encoding="utf-8")
+    raw = _read_yaml_mapping(path)
+    auth = raw.get("auth")
+    if not isinstance(auth, dict):  # pragma: no cover - guarded by the caller
+        return
+    auth.pop("password_hash", None)
+    if not auth:
+        # An empty mapping would be an empty overlay rather than an eraser, so
+        # either shape is safe here; dropping the key keeps the file tidy.
+        raw.pop("auth", None)
+    paths.write_private_text(
+        path,
+        _leading_comment(original)
+        + yaml.safe_dump(raw, default_flow_style=False, sort_keys=False),
+    )
+
+
+def _copy_action(count: int, dry_run: bool) -> str:
+    verb = "copy" if dry_run else "copied"
+    which = "the account" if count == 1 else f"{count} accounts"
+    return (
+        f"{verb} auth.password_hash onto {which} in nerve.db and set "
+        "credential_source=local (the hash is copied, not re-hashed — no "
+        "password changes)"
+    )
+
+
+def _scrub_password_action(scrubbed: list[Path], dry_run: bool) -> str:
+    verb = "remove" if dry_run else "removed"
+    where = ", ".join(str(p) for p in scrubbed)
+    return f"{verb} auth.password_hash from {where} — nothing reads it any more"
+
+
+def _orphan_password_warning() -> str:
+    """Explain a configured hash that no account uses and cannot be removed."""
+    return (
+        "auth.password_hash is set but no account uses it: every account has its "
+        "own password (credential_source=local) or none at all. Editing the "
+        "configured value has no effect; change passwords on the accounts screen."
+    )
+
+
+def _dead_password_warning(remaining: list[Path], *, locked: bool) -> str:
+    where = ", ".join(str(p) for p in remaining)
+    lead = (
+        "this instance is in lockdown, so its configuration is fleet-managed and "
+        "was not rewritten"
+        if locked
+        else "this value is in shared configuration, which is not rewritten here"
+    )
+    return (
+        f"auth.password_hash is still set in {where}, but {lead}. "
+        "It no longer authenticates anybody: every account now carries its own "
+        "password hash in nerve.db, and changing the configured value has no "
+        "effect. Remove the key, and change passwords through the accounts "
+        "screen instead."
+    )
+
+
+async def _migrate_config_credentials(
+    db: "Database", config: NerveConfig, report: MigrationReport, *,
+    dry_run: bool, pending_config_rows: int = 0,
+) -> None:
+    """Move every account off ``credential_source = 'config'``.
+
+    ``pending_config_rows`` counts accounts a *dry run* says would be created on
+    ``config`` — they are not in the table yet, and a dry run that showed the
+    account being created and then said nothing about its credential would
+    describe a state the real run never passes through.
+    """
+    if not config.auth.password_hash:
+        # Nothing to copy. A row still on `config` with no configured hash is
+        # brought back to `none` by the mirror, which has already run.
+        return
+    stragglers = [
+        account for account in await db.list_accounts()
+        if account["credential_source"] == "config"
+    ]
+    if stragglers or pending_config_rows:
+        if dry_run:
+            report.migrated_config_credential = True
+            report.identity_actions.append(
+                _copy_action(len(stragglers) + pending_config_rows, dry_run=True)
+            )
+        else:
+            moved = 0
+            for account in stragglers:
+                # Conditioned on the row still being on `config`. `nerve init`
+                # can run beside a live daemon, so an account whose owner set a
+                # password between the read above and this write must keep it,
+                # not have the configured hash put back over it.
+                if await db.set_account_credential_if_source(
+                    account["id"],
+                    expected_source="config",
+                    credential_source="local",
+                    credential=config.auth.password_hash,
+                ):
+                    moved += 1
+            # Reported from what the writes actually did, not from what they
+            # were going to do: a concurrent password change is entitled to win,
+            # and telling the operator the configured hash was copied onto that
+            # account when it was not is worse than saying nothing.
+            skipped = len(stragglers) - moved
+            if moved:
+                report.migrated_config_credential = True
+                report.identity_actions.append(_copy_action(moved, dry_run=False))
+                logger.info(
+                    "Identity: %d account(s) moved off the configured password "
+                    "onto their own credential in nerve.db. The hash was copied, "
+                    "so nobody's password changed.", moved,
+                )
+            if skipped:
+                note = (
+                    f"{skipped} account(s) were left as they are: their credential "
+                    "changed while this migration was running, so the newer one "
+                    "stands. Nothing was lost, and nothing is left to do."
+                )
+                report.identity_actions.append(note)
+                logger.info("Identity: %s", note)
+
+    # The retirement is judged on its own, every start, and not only by the run
+    # that did the copy. The copy commits to the database before the file is
+    # rewritten — it has to, or a failed copy would leave nobody able to log in
+    # — so a rewrite that failed, or a process that stopped in between, leaves a
+    # credential on disk that nothing reads and that no later start would look
+    # at again if this were a one-shot. Recomputed from the rows rather than
+    # remembered in a "pending" flag, because a flag is another thing that can
+    # be wrong.
+    sources = [account["credential_source"] for account in await db.list_accounts()]
+    if dry_run:
+        # Nothing was written, so model what the real run would have left.
+        sources = ["local" if source == "config" else source for source in sources]
+        sources += ["local"] * pending_config_rows
+    if not sources or any(source in ("config", "none") for source in sources):
+        # Some account still authenticates against the configured value — a
+        # `none` row reads it too (see routes.accounts.account_credential) — or
+        # there are no accounts at all, which means the bootstrap has not run.
+        # Either way it is live, not dead, and is not this step's to remove.
+        return
+    _retire_config_password(config, report, dry_run=dry_run)
+
+
+def _retire_config_password(
+    config: NerveConfig, report: MigrationReport, *, dry_run: bool,
+) -> list[Path]:
+    """Take the now-dead ``auth.password_hash`` out of configuration, or say why not.
+
+    Behavior depends on who manages the configuration:
+
+    * **ordinary install** — the key is removed from this box's own
+      ``config.yaml`` / ``config.local.yaml``. Both are machine-local and
+      gitignored; leaving it in either would keep a credential on disk that
+      nothing reads and that an operator would later edit expecting an effect.
+    * **lockdown** — nothing is written. Configuration is fleet-managed and the
+      value may be an ``${ENV_VAR}`` reference the next push reasserts. A
+      warning names the file and the key and says plainly that the fleet-managed
+      value no longer authenticates anybody, because a fleet that rotates the
+      password through configuration after this point would otherwise believe it
+      had changed a credential when it had not.
+
+    A value in the *tracked* settings file is reported the same way on any
+    install: it is shared configuration, not this box's to rewrite.
+
+    Returns the files that still declare the key afterwards — empty when the
+    value is gone for good.
+    """
+    tracked = workspace_settings_file(config.workspace)
+    remaining = [tracked] if _declared_password_hash(tracked) else []
+    machine = [
+        config.config_dir / name
+        for name in _MACHINE_CONFIG_FILES
+        if _declared_password_hash(config.config_dir / name)
+    ]
+
+    if config.lockdown:
+        # Under lockdown the machine layers are not even read, so whatever is in
+        # them is already inert; report every file that still carries the key.
+        remaining = remaining + machine
+        machine = []
+
+    scrubbed: list[Path] = []
+    for path in machine:
+        if dry_run:
+            scrubbed.append(path)
+            continue
+        try:
+            _strip_password_hash(path)
+        except (paths.InsecureFileError, OSError) as e:
+            # Nothing was written. The credential is already on the account row,
+            # so the configured value is inert either way — report it rather than
+            # stopping a start over a tidy-up.
+            report.warnings.append(
+                f"auth.password_hash could not be removed from {path} ({e}); it no "
+                "longer authenticates anybody, so remove it by hand"
+            )
+            logger.warning(
+                "Identity: auth.password_hash could not be removed from %s (%s). "
+                "It no longer authenticates anybody.", path, e,
+            )
+            remaining.append(path)
+            continue
+        scrubbed.append(path)
+
+    if scrubbed:
+        report.scrubbed_config_password = True
+        report.identity_actions.append(_scrub_password_action(scrubbed, dry_run))
+        # Said at the moment it becomes true, because it is the one consequence
+        # an operator cannot see from the outside: older code knows nothing
+        # about account rows, so it reads a config with no password_hash as a
+        # passwordless install and admits every caller.
+        report.warnings.append(
+            f"auth.password_hash {'is about to be' if dry_run else 'has been'} "
+            "removed from configuration now that the account carries its own. A "
+            "downgrade to a previous release would find no configured password and "
+            "treat this instance as passwordless, which admits every caller — "
+            "restore a backup taken before the upgrade instead of downgrading in "
+            "place."
+        )
+        if not dry_run and not remaining:
+            # Keep this process's view of the world in step with the file it just
+            # rewrote: a config object that still shows a password hash would
+            # make /api/auth/status and the login route read a credential that
+            # exists nowhere, until the next restart reloaded it away.
+            config.auth.password_hash = ""
+
+    warning = None
+    if remaining:
+        warning = _dead_password_warning(remaining, locked=config.lockdown)
+    elif not scrubbed:
+        # Configured, read by nobody, and in none of the files this box owns: a
+        # value set programmatically, or arriving by some route this cannot
+        # name. There is nothing to rewrite, so explain that it has no effect.
+        warning = _orphan_password_warning()
+    if warning:
+        report.warnings.append(warning)
+        if not dry_run:
+            logger.warning("Identity: %s", warning)
+    return remaining
+
+
 def _secret_action(dry_run: bool) -> str:
     verb = "generate" if dry_run else "generated"
     return (
@@ -1100,11 +1409,15 @@ async def bootstrap_identity(
     """
     report = MigrationReport(dry_run=dry_run) if report is None else report
     source = _credential_source_for(config)
+    # Include accounts a dry run would create with the transitional source so
+    # credential migration can report what it would do with them.
+    pending_config_rows = 0
 
     if dry_run:
         if await db._count_accounts() == 0:
             report.bootstrapped_account = True
             report.identity_actions.append(_account_action(source, dry_run=True))
+            pending_config_rows = 1 if source == "config" else 0
     else:
         # Check before any write, so an unsafe database gets no account either.
         _refuse_insecure_secret_storage(db, config, log=False)
@@ -1132,7 +1445,24 @@ async def bootstrap_identity(
         report.updated_credential_source = True
         report.identity_actions.append(_mirror_action(current, source, dry_run))
         if not dry_run:
-            await db._set_bootstrap_credential_source(account["id"], source)
+            # Same condition, same reason: a row that has moved to `local` since
+            # it was read has a password of its own now, and the mirror clearing
+            # it would lock that person out.
+            await db.set_account_credential_if_source(
+                account["id"], expected_source=current, credential_source=source,
+            )
+
+    # Then move rows off `config`. The order matters in one direction: the
+    # mirror may have *just* put a row on `config` (a passwordless
+    # install that gained auth.password_hash), and this is what finishes the job
+    # in the same start rather than leaving a transitional state behind.
+    #
+    # It also settles the passwordless guard before anything evaluates it: an
+    # install whose password lives in configuration is `local` by the time the
+    # gateway serves, so passwordless state is derived from the migrated row.
+    await _migrate_config_credentials(
+        db, config, report, dry_run=dry_run, pending_config_rows=pending_config_rows,
+    )
 
     await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
     return report
@@ -1231,12 +1561,31 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
     if not sources:  # no database / pre-v047 schema, or zero accounts
         report.bootstrapped_account = True
         report.identity_actions.append(_account_action(source, dry_run=True))
+        settled = [source]
     else:
+        settled = []
         for current in sources:
             if current == "local" or current == source:
+                settled.append(current)
                 continue
             report.updated_credential_source = True
             report.identity_actions.append(_mirror_action(current, source, dry_run=True))
+            settled.append(source)
+
+    # Model the copy and then the retirement. Retirement is evaluated on every
+    # start, so a dry run reports it even when this run would copy nothing.
+    if config.auth.password_hash:
+        on_config = [current for current in settled if current == "config"]
+        if on_config:
+            report.migrated_config_credential = True
+            report.identity_actions.append(_copy_action(len(on_config), dry_run=True))
+            settled = [
+                "local" if current == "config" else current for current in settled
+            ]
+        if settled and not any(
+            current in ("config", "none") for current in settled
+        ):
+            _retire_config_password(config, report, dry_run=True)
     if config.auth.jwt_secret:
         if stored:
             report.retired_stored_secret = True
