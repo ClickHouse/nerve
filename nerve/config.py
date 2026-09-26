@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from nerve import paths
 from nerve.coerce import FALSY, TRUTHY
@@ -1285,6 +1287,9 @@ SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
 # in a channel as well, for the unrelated reason that a slash payload carries
 # no thread to bind a session to — see ``_THREADED_CHANNEL_REFUSAL``.
 SLACK_HOST_COMMANDS: tuple[str, ...] = ("doctor", "restart")
+# How Slack traffic reaches this process: its own Socket Mode connection, or
+# streams from a shared channel gateway.
+SLACK_MODES: tuple[str, ...] = ("socket", "hosted")
 
 
 def _slack_commands(raw: object) -> list[str] | None:
@@ -1321,10 +1326,12 @@ def _slack_commands(raw: object) -> list[str] | None:
 
 @dataclass
 class SlackConfig:
-    """Slack Socket Mode and access settings.
+    """Slack transport and access settings.
 
     Direct messages require explicit opt-in. Sender and channel patterns match
     Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
+    In hosted mode the tokens and access lists are unused; the source grant
+    still decides what reaches the inbox.
     """
 
     # Off until the workspace is set up. Slack reaches an installation that
@@ -1354,6 +1361,11 @@ class SlackConfig:
     # Channels whose traffic feeds the inbox. Its own grant, not derived
     # from allow_channels — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # "socket": this process holds the tokens and a Socket Mode connection.
+    # "hosted": a shared channel gateway holds them and streams events here
+    # (see HostedChannelsConfig). The access lists above apply to socket
+    # mode only; in hosted mode the gateway admits each event.
+    mode: str = "socket"
 
     @classmethod
     @_coerced
@@ -1366,17 +1378,27 @@ class SlackConfig:
                 stream_mode,
             )
             stream_mode = "partial"
+        mode = str(d.get("mode") or "socket").strip().lower()
+        if mode not in SLACK_MODES:
+            logger.warning(
+                "slack.mode %r is not one of %s; falling back to 'socket'",
+                mode, SLACK_MODES,
+            )
+            mode = "socket"
         bot_token = d.get("bot_token", "")
         app_token = d.get("app_token", "")
-        # Explicit `enabled` wins. Otherwise both tokens enable Slack, except
-        # under lockdown where the machine-local opt-in is unavailable. Invalid
-        # boolean values fail closed.
+        # Explicit `enabled` wins. Otherwise hosted mode enables Slack, since
+        # naming the mode is an explicit opt-in that needs no token. In socket
+        # mode both tokens enable it, except under lockdown where the
+        # machine-local opt-in is unavailable. Invalid boolean values fail
+        # closed.
         enabled = (
             _as_bool(d["enabled"], False, label="SlackConfig.enabled")
             if "enabled" in d
-            else bool(bot_token and app_token) and not locked
+            else mode == "hosted" or (bool(bot_token and app_token) and not locked)
         )
         return cls(
+            mode=mode,
             enabled=enabled,
             bot_token=bot_token,
             app_token=app_token,
@@ -2367,14 +2389,97 @@ class NotificationsConfig:
         )
 
 
+HOSTED_CHANNEL_AUDIENCE = "nerve-channel"
+_HOSTED_MAX_STREAMS = 64
+
+
+def _is_local_host(host: str) -> bool:
+    """Whether *host* is ``localhost``, a ``.localhost`` name, or a loopback address."""
+    import ipaddress
+
+    host = host.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@dataclass
+class HostedChannelsConfig:
+    """Streams from a shared channel gateway, for providers in hosted mode.
+
+    In hosted mode (``slack.mode: hosted``) Nerve holds no provider tokens.
+    Gateway replicas open streams to ``/_internal/channel/v1/stream`` on the
+    gateway port, and Nerve accepts a stream only with a control plane
+    workload identity token: signed by a key from ``jwks_url``, issued by
+    ``issuer`` for ``audience``, and naming exactly ``tenant_id`` and
+    ``agent_id``. ``max_streams`` bounds the streams open at one time; a
+    gateway normally holds one per replica. ``issuer`` and ``jwks_url`` must
+    use https, except for localhost and loopback addresses.
+    """
+
+    issuer: str = ""
+    jwks_url: str = ""
+    audience: str = HOSTED_CHANNEL_AUDIENCE
+    tenant_id: str = ""
+    agent_id: str = ""
+    max_streams: int = 8
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> HostedChannelsConfig:
+        return cls(
+            issuer=str(d.get("issuer") or "").strip(),
+            jwks_url=str(d.get("jwks_url") or "").strip(),
+            audience=str(d.get("audience") or HOSTED_CHANNEL_AUDIENCE).strip(),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            max_streams=d.get("max_streams", 8),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot authenticate a stream. Empty when they can."""
+        found: list[str] = []
+        for key in ("issuer", "jwks_url"):
+            parts = urlsplit(getattr(self, key))
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                found.append(f"channels.hosted.{key} must be an http or https URL")
+            elif parts.scheme == "http" and not _is_local_host(parts.hostname or ""):
+                # A key set or issuer read over plain HTTP lets anyone on the
+                # path forge the gateway, so HTTP is for local development.
+                found.append(
+                    f"channels.hosted.{key} must use https unless it names "
+                    "localhost or a loopback address",
+                )
+        if not self.audience:
+            found.append("channels.hosted.audience must not be empty")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"channels.hosted.{key} must be a lowercase UUID")
+        if not 1 <= self.max_streams <= _HOSTED_MAX_STREAMS:
+            found.append(
+                f"channels.hosted.max_streams must be from 1 to {_HOSTED_MAX_STREAMS}",
+            )
+        return found
+
+
 @dataclass
 class ChannelsConfig:
     """Global channel settings."""
 
+    hosted: HostedChannelsConfig = field(default_factory=HostedChannelsConfig)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> ChannelsConfig:
-        return cls()
+        return cls(hosted=HostedChannelsConfig.from_dict(d.get("hosted") or {}))
 
 
 @dataclass

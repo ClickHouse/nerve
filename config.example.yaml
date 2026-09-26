@@ -136,6 +136,11 @@ slack:
   # install that does not use Slack never has to say so. Set it to true to be
   # told about a missing token instead of having the channel stay down.
   enabled: false
+  # "socket" (default): this process holds the tokens below. "hosted": a
+  # shared channel gateway holds them and streams events to this process;
+  # no token is needed, and channels.hosted below must name the control plane
+  # issuer and this agent. See docs/config.md#hosted-mode.
+  # mode: socket
   # Socket Mode needs both tokens in config.local.yaml; no public URL is needed:
   #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
   #   app_token: xapp-…   (Basic Information → App-Level Tokens, connections:write)
@@ -201,6 +206,18 @@ slack:
   #   deny_senders: ["*-bot"]
   #   include_handled_messages: false   # true also collects live-routed messages
   #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
+
+# Streams from a shared channel gateway, for a provider in hosted mode
+# (slack.mode: hosted). A stream opens only with a control plane workload
+# identity token for this exact tenant and agent.
+# channels:
+#   hosted:
+#     issuer: https://cp.example.com/workload-identity
+#     jwks_url: https://cp.example.com/workload-identity/jwks.json
+#     audience: nerve-channel
+#     tenant_id: 00000000-0000-0000-0000-000000000000
+#     agent_id: 00000000-0000-0000-0000-000000000000
+#     max_streams: 8
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. A

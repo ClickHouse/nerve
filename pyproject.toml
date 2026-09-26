@@ -46,7 +46,10 @@ dependencies = [
     # dependency is declared rather than borrowed from claude-agent-sdk.
     "jsonschema>=4.20",
     "apscheduler>=3.11.0",
-    "pyjwt>=2.10.0",
+    # The crypto extra brings `cryptography`, which ES256 needs: hosted
+    # channel streams are authenticated with control plane workload identity
+    # tokens signed with P-256 keys.
+    "pyjwt[crypto]>=2.10.1",
     "bcrypt>=4.2.0",
     "httpx>=0.28.0",
     "websockets>=14.0",
