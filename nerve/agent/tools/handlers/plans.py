@@ -226,12 +226,17 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
 
+    # The agent approved this plan through its own tool, so both the session
+    # and the run it dispatches are the instance's own work.
+    impl_actor = ctx.db.system_actor
+
     # Mark as implementing (prevents double-approve)
     await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
 
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
     await ctx.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
+        actor=impl_actor,
     )
     await ctx.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
@@ -296,6 +301,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
+                actor=impl_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

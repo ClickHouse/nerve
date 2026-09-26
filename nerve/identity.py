@@ -1,10 +1,22 @@
 """Request and autonomous-work identity.
 
-This top-level module imports neither the database nor gateway at runtime, so
-both may use :class:`Actor`. Actors are resolved per request and passed down;
-there is no process-global current actor. The system actor cannot change, so
-the database caches it at connect (``Database.system_actor``). ``actor_id`` is
-permanent identity, while ``display_name`` is only a presentation snapshot.
+An :class:`Actor` is the identity carried through an operation: the person who
+made the request, or the agent's system principal when the work is autonomous
+(cron, hooks, background agents). Human actors are resolved per request and
+passed down the call chain. The system actor cannot change, so the database
+caches it at connect (``Database.system_actor``); there is no process-global
+"current actor".
+
+This module sits at the top level, outside both :mod:`nerve.db` and
+:mod:`nerve.gateway`, because both ends need it: the gateway resolves an actor
+on the request, and the data-access layer stores its id. It therefore imports
+neither at runtime — the database handle arrives as an argument and is typed
+only for the checker — so ``nerve.db`` can import this module without a cycle.
+
+``actor_id`` is permanent identity. ``display_name`` is a presentation snapshot
+taken when the actor was resolved. Renaming an account changes what later
+requests carry and rewrites nothing stored before. Names are never identity or
+authorization keys.
 """
 
 from __future__ import annotations

@@ -14,6 +14,7 @@ import pytest
 from nerve import cli, paths
 from nerve.agent.engine import AgentEngine, _RESUME_AFTER_RESTART_PROMPT
 from nerve.agent.sessions import SessionStatus
+from tests.actor_rows import FAKE_SYSTEM_ACTOR
 
 
 # --------------------------------------------------------------------------- #
@@ -27,7 +28,12 @@ def _engine_with(sessions_by_id: dict) -> AgentEngine:
     async def _get_session(sid):
         return sessions_by_id.get(sid)
 
-    engine.db = SimpleNamespace(get_session=AsyncMock(side_effect=_get_session))
+    engine.db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=_get_session),
+        # The resume trigger is the instance's own, so the drainer passes the
+        # system actor to run().
+        system_actor=FAKE_SYSTEM_ACTOR,
+    )
     engine.run = AsyncMock(return_value="ok")
     return engine
 

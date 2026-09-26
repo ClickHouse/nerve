@@ -153,6 +153,8 @@ async def approve_plan(
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
     await deps.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
+        # The session exists because this person approved the plan.
+        actor=actor,
     )
     await deps.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
@@ -226,6 +228,11 @@ async def approve_plan(
         try:
             await deps.engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
+                # Nerve assembles the prompt from the task file and the
+                # approved plan, so the turn is the instance's own work even
+                # though a person's approval started it. The session above
+                # carries who approved.
+                actor=deps.db.system_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

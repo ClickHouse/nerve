@@ -497,6 +497,7 @@ class WorkflowRunService:
                 f"[{parent_title}] {label}" if parent_title
                 else f"Workflow: {label}"
             )
+            leg_actor = self.db.system_actor
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=leg_title,
@@ -505,6 +506,7 @@ class WorkflowRunService:
                 backend=backend,
                 model=model,
                 cwd=spec.get("cwd") or None,
+                actor=leg_actor,
             )
             if origin:
                 await self.db.update_session_fields(
@@ -524,6 +526,7 @@ class WorkflowRunService:
                 source="workflow",
                 model=model,
                 effort_override=str(spec.get("effort") or "") or None,
+                actor=leg_actor,
             )
 
             # engine.run returns normally even for interrupted, cancelled,
