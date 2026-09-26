@@ -1,7 +1,8 @@
 """Bulk lookup for the actor ids stored on sessions and messages.
 
-The response is built field by field from ``actor_refs`` so account and
-credential state cannot leak into attribution display.
+The response is built field by field from ``actor_refs`` plus the login name of
+the account behind a human actor, so credential and access state cannot leak
+into attribution display.
 """
 
 from __future__ import annotations
@@ -16,11 +17,17 @@ router = APIRouter()
 
 
 def actor_out(row: dict) -> dict:
-    """The public shape of an actor: an id, what kind it is, and a name."""
+    """The public shape of an actor: an id, what kind it is, and its names.
+
+    ``username`` is the login name of the account behind a human actor, so a
+    label can fall back to it when no display name is set. It is ``None`` for
+    the system principal and for an account that has not been given one.
+    """
     return {
         "id": row["id"],
         "kind": row["kind"],
         "display_name": row["display_name"],
+        "username": row.get("username"),
     }
 
 

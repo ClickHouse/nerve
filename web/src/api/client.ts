@@ -41,15 +41,18 @@ export interface Account {
   created_at: string;
 }
 
-/** One actor, as `/api/actors` returns it: an identity plus the name to show
+/** One actor, as `/api/actors` returns it: an identity plus the names to show
  *  for it *right now*. Sessions and messages store the id, never the name, so
- *  a rename changes every label without touching a stored row. Carries
- *  nothing from the account behind it — an actor may have no account (the
- *  agent's system principal). */
+ *  a rename changes every label without touching a stored row. `username` is
+ *  the login name of the account behind a human actor — a label falls back to
+ *  it when no display name is set — and `null` for an actor without one (the
+ *  agent's system principal has no account). Nothing else about the account
+ *  travels with it. */
 export interface ActorRef {
   id: string;
   kind: 'human' | 'system';
   display_name: string | null;
+  username: string | null;
 }
 
 /** `GET /api/auth/me`: the actor this session acts as, and its local account.

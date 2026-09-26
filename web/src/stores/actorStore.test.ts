@@ -26,7 +26,7 @@ const BOB = 'actor-bob';
 const SYSTEM = 'actor-system';
 
 function actor(id: string, overrides: Partial<ActorRef> = {}): ActorRef {
-  return { id, kind: 'human', display_name: null, ...overrides } as ActorRef;
+  return { id, kind: 'human', display_name: null, username: null, ...overrides } as ActorRef;
 }
 
 const alice = (name: string | null = 'Alice') => actor(ALICE, { display_name: name });
@@ -138,9 +138,13 @@ describe('actor directory reads', () => {
 });
 
 describe('actor presentation helpers', () => {
-  it('uses current names, neutral human fallback, and the Nerve fallback', () => {
+  it('uses current names, then the login name, then the neutral and Nerve fallbacks', () => {
     expect(actorName(alice())).toBe('Alice');
     expect(actorName(alice('  '))).toBe(UNNAMED_ACTOR);
+    expect(actorName(actor(ALICE, { display_name: null, username: 'alice' }))).toBe('alice');
+    expect(actorName(actor(ALICE, { display_name: '  ', username: 'alice' }))).toBe('alice');
+    expect(actorName(actor(ALICE, { display_name: 'Alice', username: 'alice' }))).toBe('Alice');
+    expect(actorName(actor(ALICE, { display_name: null, username: '  ' }))).toBe(UNNAMED_ACTOR);
     expect(actorName(undefined)).toBe(UNNAMED_ACTOR);
     expect(actorName(system())).toBe(SYSTEM_ACTOR_NAME);
   });

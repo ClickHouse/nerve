@@ -55,7 +55,7 @@ const BOB = 'actor-bob';
 const SYSTEM = 'actor-system';
 
 function actorRef(id: string, overrides: Partial<ActorRef> = {}): ActorRef {
-  return { id, kind: 'human', display_name: null, ...overrides } as ActorRef;
+  return { id, kind: 'human', display_name: null, username: null, ...overrides } as ActorRef;
 }
 const alice = (name: string | null = 'Alice') => actorRef(ALICE, { display_name: name });
 const bob = (name: string | null = 'Bob') => actorRef(BOB, { display_name: name });
@@ -120,6 +120,16 @@ describe('viewer-relative session rows', () => {
     await waitFor(() => expect(markers()).toEqual(['Started by Alice', 'Started by Alice']));
     expect(screen.getByText('bob')).toBeInTheDocument();
     expect(screen.getByText('legacy')).toBeInTheDocument();
+  });
+
+  it('labels a person without a display name by their login name', async () => {
+    listActors.mockResolvedValue({
+      actors: [actorRef(ALICE, { username: 'alice' }), bob(), system()],
+    });
+    renderSidebar([chat('alice-1', ALICE), chat('bob', BOB)]);
+
+    await waitFor(() => expect(markers()).toEqual(['Started by alice']));
+    expect(screen.queryByText('Unnamed account')).toBeNull();
   });
 
   it('always marks Nerve with an accessible bot glyph', async () => {

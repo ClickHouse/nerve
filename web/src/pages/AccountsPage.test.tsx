@@ -49,7 +49,7 @@ function account(overrides: Partial<Account> = {}): Account {
 
 function viewer(overrides: Partial<Account> = {}): Viewer {
   return {
-    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    actor: { id: 'actor-1', kind: 'human', display_name: 'Alice', username: 'alice' },
     account: account(overrides),
   };
 }
@@ -73,7 +73,7 @@ beforeEach(() => {
   useAuthStore.setState({
     authenticated: true,
     loginMode: null,
-    viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+    viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice', username: 'alice' },
     account: { id: 'acc-1', username: 'alice' },
   });
 });

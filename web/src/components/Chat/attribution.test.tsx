@@ -83,7 +83,7 @@ const BOB = 'actor-bob';
 const SYSTEM = 'actor-system';
 
 function actorRef(id: string, overrides: Partial<ActorRef> = {}): ActorRef {
-  return { id, kind: 'human', display_name: null, ...overrides } as ActorRef;
+  return { id, kind: 'human', display_name: null, username: null, ...overrides } as ActorRef;
 }
 
 const alice = (name: string | null = 'Alice') => actorRef(ALICE, { display_name: name });
@@ -183,6 +183,17 @@ describe('viewer-relative transcript labels', () => {
     expect(screen.queryByText(ALICE)).toBeNull();
     expect(screen.getByTitle(`Sent by actor ${ALICE}`)).toBeInTheDocument();
     expect(screen.getByText('still readable')).toBeInTheDocument();
+  });
+
+  it('falls back to the login name when a person has no display name', async () => {
+    listActors.mockResolvedValue({ actors: [actorRef(ALICE, { username: 'alice' }), bob()] });
+    signInAs(BOB);
+    renderTranscript([said('still readable', ALICE)]);
+
+    expect(await screen.findByText('alice')).toBeInTheDocument();
+    expect(screen.getByTitle('Sent by alice')).toBeInTheDocument();
+    expect(screen.queryByText('Unnamed account')).toBeNull();
+    expect(screen.queryByText(ALICE)).toBeNull();
   });
 
   it('uses visible collision-safe suffixes when Bob and Alice have equal names', async () => {
