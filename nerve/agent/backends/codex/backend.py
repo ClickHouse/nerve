@@ -708,6 +708,13 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
+        # Thread-cumulative token counters at this turn's start; the turn's
+        # usage is (turn-end total - this baseline). None until the turn's
+        # first tokenUsage notification sets it.
+        self._turn_total_base: dict[str, int] | None = None
+        # Set when a native collaboration child (collabAgentToolCall) ran this
+        # turn, whose separate-thread tokens are not in this thread's total.
+        self._turn_has_native_child: bool = False
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -888,7 +895,7 @@ class CodexClient(AgentClient):
     async def start_turn(self, turn: TurnInput) -> None:
         if not self._thread_id:
             raise BackendError("codex client has no thread")
-        self._turn_usage = None
+        self._reset_turn_usage_accounting()
         self._last_error = None
         self._items.clear()
         self._ultracode_usage = None
@@ -1061,6 +1068,7 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
+                self._capture_turn_total_base(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
                     self._context_window = window
@@ -1194,6 +1202,9 @@ class CodexClient(AgentClient):
                 input={"query": item.get("query", "")},
             ))
         elif item_type == "collabAgentToolCall":
+            # Native collaboration child runs in a separate thread; mark the
+            # turn so its usage is reported as a lower bound.
+            self._turn_has_native_child = True
             out.append(ev.SubagentStarted(
                 tool_use_id=item_id or "codex-subagent",
                 subagent_type=str(item.get("tool") or "Agent"),
@@ -1345,11 +1356,11 @@ class CodexClient(AgentClient):
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
-        usage = self._normalize_usage(self._turn_usage)
-        if usage is None and self._ultracode_usage:
+        usage = self._normalize_usage(self._turn_usage, self._turn_total_base)
+        if usage is None and (self._ultracode_usage or self._turn_has_native_child):
             # A turn can complete before app-server emits a parent tokenUsage
-            # notification. Child usage is still authoritative and must not
-            # disappear merely because the parent count is absent.
+            # notification. Emit a zero record so the Ultracode child totals
+            # and/or the native-child lower-bound marker are still recorded.
             usage = ev.NormalizedUsage()
         if usage is not None and self._ultracode_usage:
             child = self._ultracode_usage
@@ -1363,6 +1374,11 @@ class CodexClient(AgentClient):
             # separate field is diagnostic detail, not additional billing).
             usage.output_tokens += child.get("output_tokens", 0)
             usage.raw["ultracode"] = dict(child)
+        if usage is not None and self._turn_has_native_child:
+            # Native-child tokens are not part of this turn's usage; mark the
+            # figure a lower bound.
+            usage.raw["cost_is_lower_bound"] = True
+            usage.raw["native_children_unattributed"] = True
         estimate = compute_cost(self.model, usage, self._backend.codex.pricing)
         if (
             estimate is not None
@@ -1372,7 +1388,9 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(self._turn_usage)
+            parent_usage = self._normalize_usage(
+                self._turn_usage, self._turn_total_base,
+            )
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1412,9 +1430,44 @@ class CodexClient(AgentClient):
             error=error,
         )
 
+    def _reset_turn_usage_accounting(self) -> None:
+        """Clear per-turn token-accounting state (latest tokenUsage payload,
+        turn-start cumulative baseline, native-child marker) at turn start."""
+        self._turn_usage = None
+        self._turn_total_base = None
+        self._turn_has_native_child = False
+
+    def _capture_turn_total_base(self, usage: dict) -> None:
+        """Record the thread-cumulative counters at this turn's start, from the
+        turn's first tokenUsage notification.
+
+        ``tokenUsage.total`` is the per-thread cumulative counter and
+        ``tokenUsage.last`` the most recent single response, so ``total - last``
+        on that first notification is the cumulative total just before the
+        turn's first response — the baseline for the turn's delta.
+        """
+        if self._turn_total_base is not None:
+            return
+        total = usage.get("total")
+        if not isinstance(total, dict):
+            return
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+        self._turn_total_base = {
+            key: max(0, int(total.get(key) or 0) - int((last or {}).get(key) or 0))
+            for key in ("inputTokens", "cachedInputTokens", "outputTokens")
+        }
+
     @staticmethod
-    def _normalize_usage(usage: dict | None) -> ev.NormalizedUsage | None:
+    def _normalize_usage(
+        usage: dict | None,
+        turn_total_base: dict | None = None,
+    ) -> ev.NormalizedUsage | None:
         """``thread/tokenUsage/updated`` → NormalizedUsage.
+
+        The turn's usage is the cumulative-``total`` delta over the turn:
+        ``total`` minus ``turn_total_base`` (the turn-start cumulative
+        counters). When no cumulative ``total`` is present, ``last`` — the most
+        recent single response — is used instead.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
@@ -1423,17 +1476,34 @@ class CodexClient(AgentClient):
         """
         if not usage:
             return None
-        last = usage.get("last") or {}
-        if not isinstance(last, dict):
+        total = usage.get("total") if isinstance(usage.get("total"), dict) else None
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else None
+        if total is not None:
+            # Per-turn delta of the cumulative thread total (clamped at zero).
+            base = turn_total_base or {}
+            raw_input = max(0, int(total.get("inputTokens") or 0)
+                            - int(base.get("inputTokens") or 0))
+            raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
+                             - int(base.get("cachedInputTokens") or 0))
+            raw_output = max(0, int(total.get("outputTokens") or 0)
+                             - int(base.get("outputTokens") or 0))
+        elif last is not None:
+            # No cumulative total available: use the single last response.
+            raw_input = int(last.get("inputTokens") or 0)
+            raw_cached = int(last.get("cachedInputTokens") or 0)
+            raw_output = int(last.get("outputTokens") or 0)
+        else:
             return None
-        input_tokens = int(last.get("inputTokens") or 0)
-        cached = int(last.get("cachedInputTokens") or 0)
         return ev.NormalizedUsage(
-            input_tokens=max(0, input_tokens - cached),
-            output_tokens=int(last.get("outputTokens") or 0),
-            cache_read_tokens=cached,
+            input_tokens=max(0, raw_input - raw_cached),
+            output_tokens=raw_output,
+            cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
-            raw={"last": last, "total": usage.get("total")},
+            raw={
+                "last": usage.get("last"),
+                "total": usage.get("total"),
+                "turn_total_base": turn_total_base,
+            },
         )
 
     @staticmethod
