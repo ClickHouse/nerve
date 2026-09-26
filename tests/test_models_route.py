@@ -235,3 +235,71 @@ class TestListModels:
         )
         assert codex_opt["available"] is False
         assert codex_opt["reason"] == "codex binary not found"
+
+    def test_excluded_discovered_models_are_pruned_from_the_picker(
+        self, make_client, stub_discovery,
+    ):
+        """A stale ID discovery advertises but serving 404s is kept out."""
+        from nerve.config import AgentConfig, NerveConfig
+
+        stub_discovery([
+            "claude-opus-5", "claude-3-5-haiku-20241022", "claude-sonnet-4-6",
+        ])
+        cfg = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-opus-5",
+            "model_discovery_excluded_models": ["claude-3-5-haiku"],
+        }))
+        data = make_client(cfg=cfg).get("/api/models").json()
+
+        claude_ids = [
+            m["id"] for m in data["models"] if m["backend"] == "claude"
+        ]
+        assert claude_ids == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_reloaded_exclusion_refilters_warm_cache_without_refetch(
+        self, make_client, monkeypatch,
+    ):
+        """A hot-reloaded exclusion re-filters the cached raw catalog in place:
+        no second discovery fetch, and the shared cache is left intact."""
+        import nerve.config as cfg_mod
+        from nerve import models_catalog
+        from nerve.config import AgentConfig, NerveConfig
+
+        calls = {"n": 0}
+
+        def _fetch(config, timeout=models_catalog._DISCOVERY_TIMEOUT):
+            calls["n"] += 1
+            return [
+                "claude-opus-5",
+                "claude-3-5-haiku-20241022",
+                "claude-sonnet-4-6",
+            ]
+
+        monkeypatch.setattr(models_catalog, "fetch_models", _fetch)
+
+        # First render, no exclusions → the retired ID is visible; one fetch.
+        client = make_client(cfg=NerveConfig(
+            agent=AgentConfig.from_dict({"model": "claude-opus-5"}),
+        ))
+        ids = [
+            m["id"] for m in client.get("/api/models").json()["models"]
+            if m["backend"] == "claude"
+        ]
+        assert "claude-3-5-haiku-20241022" in ids
+        assert calls["n"] == 1
+
+        # Hot reload swaps in a config that excludes the retired ID. Same
+        # credentials fingerprint → the discovery cache stays warm.
+        cfg_mod._config = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-opus-5",
+            "model_discovery_excluded_models": ["claude-3-5-haiku"],
+        }))
+        ids2 = [
+            m["id"] for m in client.get("/api/models").json()["models"]
+            if m["backend"] == "claude"
+        ]
+        assert ids2 == ["claude-opus-5", "claude-sonnet-4-6"]
+        # No refetch, and the raw catalog is untouched — only the picker view
+        # is filtered, so flipping the exclusion back would restore the entry.
+        assert calls["n"] == 1
+        assert "claude-3-5-haiku-20241022" in models_catalog._cache["models"]

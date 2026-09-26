@@ -823,11 +823,27 @@ class AgentConfig:
     # resolve there).
     models: list[str] = field(default_factory=list)
     # Ask the Anthropic Models API (GET /v1/models) which models the
-    # configured credentials can reach, and offer those in the picker, so a
-    # newly released model needs no code change or config edit. Best-effort:
+    # configured credentials' catalog endpoint advertises, and offer those in
+    # the picker, so a newly released model needs no code change or config
+    # edit. Catalog membership is not a serving guarantee — an advertised ID
+    # can still fail on send, and discovery runs no serving probe (see
+    # `model_discovery_excluded_models` to prune such entries). Best-effort:
     # ignored when `models` above is set explicitly, on Bedrock, without an
     # API key, or when the API is unreachable — the built-in list applies.
     model_discovery: bool = True
+    # Substrings of model IDs to drop from DISCOVERY results before they reach
+    # the picker (case-insensitive substring match; empty/whitespace patterns
+    # are ignored). A proxy/provider catalog is not a serving guarantee — e.g.
+    # CLIProxyAPI's GET /v1/models advertises retired IDs that 404 on send — so
+    # this prunes such entries from the dynamically discovered list without a
+    # code change, and hot-reloads (it is read at pick time, not baked into the
+    # discovery cache). Scope: applied ONLY to entries taken from discovery. The
+    # configured default (`model`) always leads and an explicit `models` list is
+    # authoritative — neither is ever filtered, so naming a model in config
+    # intentionally overrides an exclusion. Not a validator and not a denylist:
+    # excluding everything discovery returns just leaves the configured default,
+    # never a fallback that would re-introduce an excluded ID.
+    model_discovery_excluded_models: list[str] = field(default_factory=list)
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
@@ -928,6 +944,9 @@ class AgentConfig:
             },
             models=_str_list(d.get("models"), clean=True),
             model_discovery=d.get("model_discovery", True),
+            model_discovery_excluded_models=_str_list(
+                d.get("model_discovery_excluded_models")
+            ),
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
@@ -961,6 +980,32 @@ class AgentConfig:
         return not any(
             tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
         )
+
+    def is_model_discovery_excluded(self, model: str | None) -> bool:
+        """Whether *model* is pruned from DISCOVERY results.
+
+        Case-insensitive substring match against any non-empty entry in
+        ``model_discovery_excluded_models``; empty/whitespace patterns are
+        ignored (an empty pattern must never match everything). Only entries
+        taken from discovery are checked — see
+        :meth:`NerveConfig.selectable_claude_models`."""
+        resolved = (model or "").lower()
+        if not resolved:
+            return False
+        patterns = self.model_discovery_excluded_models
+        # Guard a malformed non-list value (e.g. a YAML mapping such as
+        # ``{haiku: false}``, which the coercion layer leaves untouched and
+        # warns about): iterating a dict would turn its keys into active
+        # patterns. Only a genuine list carries exclusions — anything else is
+        # invalid for this field and matches nothing. (A ``${VAR}`` reference
+        # is already coerced to a one-element list before this runs.)
+        if not isinstance(patterns, list):
+            return False
+        for tok in patterns:
+            pattern = str(tok or "").strip().lower()
+            if pattern and pattern in resolved:
+                return True
+        return False
 
 
 @dataclass
@@ -2723,17 +2768,31 @@ class NerveConfig:
         from the first source that has anything to say:
 
         1. ``agent.models`` — an explicit list always wins,
-        2. *discovered* — what the Anthropic Models API reports the
-           credentials can reach (see :mod:`nerve.models_catalog`),
+        2. *discovered* — what the Anthropic Models API catalog advertises for
+           the configured credentials (see :mod:`nerve.models_catalog`; catalog
+           membership does not validate servability), minus any entry matching
+           ``agent.model_discovery_excluded_models``,
         3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
 
         Bedrock model IDs are region-prefixed, so neither discovery nor the
         bare built-ins apply there — Bedrock offers only configured models.
+
+        Exclusions are applied here, at pick time, to the *discovered* branch
+        only — so a hot-reloaded pattern takes effect against the cached raw
+        catalog without a refetch, and the configured default / an explicit
+        ``agent.models`` list are never filtered. When every discovered entry
+        is excluded the result is just the configured default: discovery is
+        still considered to have produced a catalog (it is not a failure), so
+        control does not fall through to the built-in list and re-introduce an
+        excluded ID.
         """
         if self.agent.models:
             extras = list(self.agent.models)
         elif discovered:
-            extras = list(discovered)
+            extras = [
+                m for m in discovered
+                if not self.agent.is_model_discovery_excluded(m)
+            ]
         elif self.provider.is_bedrock:
             extras = []
         else:
