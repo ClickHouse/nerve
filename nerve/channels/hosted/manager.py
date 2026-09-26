@@ -4,7 +4,8 @@ Every gateway replica opens its own stream, so Nerve holds several equal
 streams to one agent. Nerve prefers the oldest ready stream that is not
 draining and has room for another request. When the preferred stream closes
 or drains, the next one takes its place. A draining stream is used only when
-no other stream is open.
+no other stream is open. An operation goes only to a stream that advertised
+the operation for its connection, with the same preference.
 
 The upgrade is refused before the WebSocket opens: ``401`` without detail for
 any authentication failure, ``503`` above the stream limit, and ``404`` when
@@ -182,6 +183,42 @@ class StreamManager:
             changed = self._changed
             await changed.wait()
 
+    def operation_stream(
+        self, connection_id: uuid.UUID, operation: str, read_bytes: int = 0, upload_bytes: int = 0,
+    ) -> ChannelStream | None:
+        """The stream for the next *operation* on *connection_id*, or ``None``.
+
+        ``None`` also when streams advertise the operation but none has room
+        for it now, including room for a read of up to *read_bytes* or an
+        upload of *upload_bytes*.
+        """
+        able = [
+            stream for stream in self.streams
+            if stream.ready and stream.supports(connection_id, operation)
+        ]
+        steady = [stream for stream in able if not stream.draining]
+        for stream in steady or able:
+            if stream.has_operation_capacity(connection_id, read_bytes, upload_bytes):
+                return stream
+        return None
+
+    def connections(self, operation: str) -> set[uuid.UUID]:
+        """The connections that some ready stream advertised *operation* for."""
+        return {
+            connection_id
+            for stream in self.streams if stream.ready
+            for connection_id in stream.capabilities
+            if stream.supports(connection_id, operation)
+        }
+
+    async def wait_for_change(self, timeout: float) -> None:
+        """Wait up to *timeout* seconds for a stream, request, or capability change."""
+        changed = self._changed
+        try:
+            await asyncio.wait_for(changed.wait(), timeout)
+        except TimeoutError:
+            pass
+
     def capabilities_for(self, connection_id: uuid.UUID) -> Capabilities | None:
         """The capabilities of *connection_id* on the preferred stream that has them."""
         for stream in self.streams:
@@ -210,6 +247,7 @@ class StreamManager:
     def stream_capabilities(
         self, stream: ChannelStream, connection_id: uuid.UUID, capabilities: Capabilities,
     ) -> None:
+        self._notify()
         self._on_capabilities(stream, connection_id, capabilities)
 
     def stream_changed(self, stream: ChannelStream) -> None:

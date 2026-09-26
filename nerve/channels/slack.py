@@ -149,6 +149,32 @@ def is_slack_id(pattern: str) -> bool:
     return bool(_SLACK_ID_RE.match(pattern))
 
 
+def notification_target(config: NerveConfig) -> str | None:
+    """The conversation for notification cards, or ``None``.
+
+    That is ``notifications.slack_channel_id``, else the first literal
+    conversation ID in ``slack.allow_channels``. The hosted channel uses the
+    same choice.
+    """
+    configured = config.notifications.slack_channel_id.strip()
+    if configured:
+        if is_slack_id(configured) and configured[0] in "CGD":
+            return configured
+        logger.warning(
+            "notifications.slack_channel_id is not a Slack conversation id",
+        )
+        return None
+
+    for entry in config.slack.allow_channels:
+        if is_slack_id(entry) and entry[0] in "CG":
+            return entry
+    logger.warning(
+        "No notifications.slack_channel_id is set and slack.allow_channels "
+        "has no literal conversation id",
+    )
+    return None
+
+
 def format_target(channel_id: str, thread_ts: str | None = None) -> str:
     """Pack a conversation address into one opaque target string."""
     return f"{channel_id}:{thread_ts}" if thread_ts else channel_id
@@ -1547,23 +1573,7 @@ class SlackChannel(BaseChannel):
 
     def _notification_target(self) -> str | None:
         """Resolve a concrete conversation from the active config generation."""
-        configured = self.config.notifications.slack_channel_id.strip()
-        if configured:
-            if is_slack_id(configured) and configured[0] in "CGD":
-                return configured
-            logger.warning(
-                "notifications.slack_channel_id is not a Slack conversation id",
-            )
-            return None
-
-        for entry in self.config.slack.allow_channels:
-            if is_slack_id(entry) and entry[0] in "CG":
-                return entry
-        logger.warning(
-            "No notifications.slack_channel_id is set and slack.allow_channels "
-            "has no literal conversation id",
-        )
-        return None
+        return notification_target(self.config)
 
     async def post_notification(
         self,

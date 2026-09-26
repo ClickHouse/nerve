@@ -93,6 +93,19 @@ class ObservedMessage:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class OutboundRefused(Exception):
+    """The transport refused a message by policy after the channel allowed it.
+
+    A channel whose policy is decided outside Nerve, for example by a channel
+    gateway, raises it from :meth:`BaseChannel.send`. The router reports it
+    as a refusal, not as a transport failure. ``reason`` is fit for the agent.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class BaseChannel(abc.ABC):
     """Abstract base for all communication channels.
 

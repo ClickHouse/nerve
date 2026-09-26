@@ -25,6 +25,7 @@ from nerve.channels.base import (
     InboundMessage,
     ObservedMessage,
     OutboundMessage,
+    OutboundRefused,
 )
 from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
@@ -570,7 +571,9 @@ class ChannelRouter:
         say why nothing was sent instead of only that nothing was.
 
         A transport failure propagates rather than becoming a refusal: "the
-        policy said no" and "Slack was down" are different answers.
+        policy said no" and "Slack was down" are different answers. A channel
+        whose policy is checked at delivery raises
+        :class:`~nerve.channels.base.OutboundRefused`, which becomes a refusal.
         """
         channel = self._channels.get(channel_name)
         if not channel:
@@ -585,11 +588,17 @@ class ChannelRouter:
             return verdict
 
         formatted = channel.format_response(message)
-        await channel.send(OutboundMessage(
-            target=target,
-            text=formatted,
-            session_id=session_id or "",
-        ))
+        try:
+            await channel.send(OutboundMessage(
+                target=target,
+                text=formatted,
+                session_id=session_id or "",
+            ))
+        except OutboundRefused as refusal:
+            logger.info(
+                "Refused addressed delivery to %s at delivery: %s", channel_name, refusal.reason,
+            )
+            return Decision(False, refusal.reason)
         return verdict
 
     # ------------------------------------------------------------------ #

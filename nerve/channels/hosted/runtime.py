@@ -1,17 +1,17 @@
 """Build and run hosted channels from the process config.
 
-The runtime owns the token verifier, the stream manager, the inbox reader,
-and one :class:`HostedChannel` for each provider in hosted mode. The hosted
-settings and the provider modes are read once at startup; a change needs a
-restart. A reload reads the gateway key file again. The source grant of each
-provider is read per event, so it follows a reload.
+The runtime owns the token verifier, the stream manager, the operation
+runner, the inbox reader, and one :class:`HostedChannel` for each provider in
+hosted mode. The hosted settings and the provider modes are read once at
+startup; a change needs a restart. A reload reads the gateway key file again.
+The source grant of each provider is read per event, so it follows a reload.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.channels.hosted.auth import GatewayTokenVerifier
 from nerve.channels.hosted.channel import HostedChannel
@@ -23,6 +23,7 @@ from nerve.channels.hosted.contract import (
 )
 from nerve.channels.hosted.intake import InboxReader, ReaderSettings
 from nerve.channels.hosted.manager import StreamManager
+from nerve.channels.hosted.operations import OperationRunner, OperationTiming
 from nerve.channels.hosted.stream import ChannelStream, StreamTiming
 
 if TYPE_CHECKING:
@@ -65,6 +66,8 @@ class HostedChannelRuntime:
         *,
         stream_timing: StreamTiming = StreamTiming(),
         reader_settings: ReaderSettings = ReaderSettings(),
+        operation_timing: OperationTiming = OperationTiming(),
+        notification_service: Any | None = None,
     ) -> None:
         settings = config.channels.hosted
         problems = settings.problems()
@@ -83,12 +86,6 @@ class HostedChannelRuntime:
             tenant_id=tenant_id,
             agent_id=agent_id,
         )
-        self.channels: dict[str, HostedChannel] = {
-            provider: HostedChannel(
-                provider, router, config_getter, is_id=_identifier_test(provider),
-            )
-            for provider in providers
-        }
         self.streams = StreamManager(
             verifier=self.verifier,
             receive_limits=RECEIVE_LIMITS,
@@ -98,6 +95,18 @@ class HostedChannelRuntime:
             on_nudge=self._stream_nudged,
             on_capabilities=self._stream_capabilities,
         )
+        self.operations = OperationRunner(self.streams, operation_timing)
+        self.channels: dict[str, HostedChannel] = {
+            provider: HostedChannel(
+                provider, router, config_getter,
+                is_id=_identifier_test(provider),
+                operations=self.operations,
+                reaction_names=_reaction_names(provider),
+                notifications=notification_service,
+                **_notification_rules(provider),
+            )
+            for provider in providers
+        }
         self.reader = InboxReader(self.streams, dict(self.channels), settings=reader_settings)
         self._registered: list[HostedChannel] = []
 
@@ -160,6 +169,25 @@ def _identifier_test(provider: str) -> Callable[[str], bool] | None:
 
         return is_slack_id
     return None
+
+
+def _notification_rules(provider: str) -> dict[str, Any]:
+    """How a provider chooses its notification conversation and button styles."""
+    if provider == "slack":
+        from nerve.channels.slack import notification_target
+        from nerve.channels.slack_presentation import approval_style
+
+        return {"notification_target": notification_target, "button_style": approval_style}
+    return {}
+
+
+def _reaction_names(provider: str) -> dict[str, str]:
+    """A provider's short reaction names and their emoji."""
+    if provider == "slack":
+        from nerve.channels.slack_presentation import slack_emoji_by_name
+
+        return slack_emoji_by_name()
+    return {}
 
 
 __all__ = ["RECEIVE_LIMITS", "HostedChannelRuntime", "hosted_providers"]

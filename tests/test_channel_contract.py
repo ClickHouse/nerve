@@ -23,11 +23,40 @@ from nerve.channels.hosted.contract import (
     InboxAckItem,
     InboxRead,
     Negotiation,
+    Operation,
+    OperationResult,
     Payload,
     Rejected,
     decode_envelope,
     encode_envelope,
     validate_inbox_read_result,
+    validate_operation_result,
+)
+from nerve.channels.hosted.contract.model import (
+    ActionElement,
+    ActionsContent,
+    AttachmentReference,
+    AttachmentTarget,
+    ContentPart,
+    ContentReference,
+    ConversationReference,
+    DeleteOperation,
+    EditOperation,
+    FileReadOperation,
+    FileSendOperation,
+    FileUpload,
+    InteractionOperation,
+    InteractionTarget,
+    MessageContainer,
+    MessageReference,
+    MessageTarget,
+    Reaction,
+    ReactionOperation,
+    SendOperation,
+    TextContent,
+    ThreadReference,
+    TransferChunk,
+    TypingOperation,
 )
 from nerve.channels.hosted.runtime import RECEIVE_LIMITS
 from tests.fake_channel_gateway import CONNECTION_ID, capabilities, gateway_negotiation, message_event
@@ -164,7 +193,68 @@ class TestInboxPages:
         validate_inbox_read_result(InboxRead(maximum_events=1, maximum_bytes=16384), result, 20000)
 
 
+class TestOperationResults:
+    SEND = Operation(kind="send", deadline_millis=30000, send=SendOperation())
+    READ = Operation(kind="file_read", deadline_millis=30000, file_read=FileReadOperation(length_bytes=10))
+
+    def result(self, **members: Any) -> OperationResult:
+        value = frame("operation_result", members, connection_id=CONNECTION_ID)
+        del value["request_id"]
+        value["correlation_id"] = "n-1"
+        return decode(value).body
+
+    def refused(self, operation: Operation, **members: Any) -> str:
+        with pytest.raises(Rejected) as error:
+            validate_operation_result(operation, self.result(**members))
+        return error.value.reason
+
+    def test_a_result_needs_a_known_outcome(self):
+        value = frame("operation_result", {"kind": "send", "outcome": "done"}, connection_id=CONNECTION_ID)
+
+        assert reason(value) == "kind_unsupported"
+
+    def test_a_result_answers_its_own_operation_kind(self):
+        assert self.refused(self.SEND, kind="edit", outcome="succeeded") == "scope_mismatch"
+
+    def test_a_successful_send_and_read_carry_the_output_that_nerve_reads(self):
+        assert self.refused(self.SEND, kind="send", outcome="succeeded") == "malformed_frame"
+        assert self.refused(self.READ, kind="file_read", outcome="succeeded") == "malformed_frame"
+        validate_operation_result(self.SEND, self.result(kind="send", outcome="forbidden"))
+
+    def test_results_and_transfers_name_their_connection(self):
+        assert reason(frame("operation_result", {"kind": "send", "outcome": "forbidden"})) == "scope_mismatch"
+        assert reason(frame("transfer", {"transfer_id": "t", "total_bytes": 1, "data": "AA=="})) == "scope_mismatch"
+
+    def test_only_a_successful_read_carries_a_transfer(self):
+        transfer = {"transfer_id": "t", "total_bytes": 4}
+        target = {"conversation": {"id": "C1"}, "message": {"id": "1.2"}}
+
+        assert self.refused(self.READ, kind="file_read", outcome="unavailable", transfer=transfer) == "malformed_frame"
+        assert self.refused(
+            self.SEND, kind="send", outcome="succeeded", target=target, transfer=transfer,
+        ) == "malformed_frame"
+
+    def test_a_chunk_stays_inside_its_transfer_and_ends_with_it(self):
+        def chunk(**members: Any) -> dict[str, Any]:
+            body = {"transfer_id": "t", "offset": 0, "total_bytes": 3, "data": "AAA=", "final": False, **members}
+            return frame("transfer", body, connection_id=CONNECTION_ID)
+
+        assert reason(chunk(offset=2, final=True)) == "limit_exceeded"
+        assert reason(chunk(final=True)) == "malformed_frame"
+        assert reason(chunk(offset=1)) == "malformed_frame"
+
+    def test_capabilities_need_usable_limits(self):
+        assert reason(frame("capabilities", capabilities(text_characters=0), connection_id=CONNECTION_ID)) == (
+            "limit_exceeded"
+        )
+        value = frame("capabilities", capabilities(), connection_id=CONNECTION_ID)
+        del value["payload"]["capabilities"]["limits"]
+        assert reason(value) == "limit_exceeded"
+
+
 TIME = datetime(2026, 9, 16, 10, 0, 0, 250000, tzinfo=timezone.utc)
+MESSAGE = MessageTarget(conversation=ConversationReference(id="C1"), message=MessageReference(id="1.2"))
+MESSAGE_JSON = {"conversation": {"id": "C1"}, "message": {"id": "1.2"}}
 
 # The payloads that Nerve sends, member for member. The gateway refuses a
 # frame with an unknown member or without a required one.
@@ -182,6 +272,65 @@ SENT: list[tuple[str, Any, dict[str, Any]]] = [
         "reason": "shutdown", "initiated_at": "2026-09-16T10:00:00.25Z", "deadline": "2026-09-16T10:00:10.25Z",
     }),
     ("inbox_read", InboxRead(maximum_events=25, maximum_bytes=131072), {"maximum_events": 25, "maximum_bytes": 131072}),
+    ("operation", Operation(kind="send", deadline_millis=30000, send=SendOperation(
+        destination=MessageContainer(conversation=ConversationReference(id="C1"), thread=ThreadReference(id="1.1")),
+        content=(
+            ContentPart(kind="text", text=TextContent(format="markdown", body="Deploy now?")),
+            ContentPart(kind="actions", actions=ActionsContent(elements=(
+                ActionElement(kind="button", action_id="notif:n1:yes", label="Yes", value="yes", style="primary"),
+            ))),
+        ),
+    )), {"kind": "send", "deadline_millis": 30000, "send": {
+        "destination": {"conversation": {"id": "C1"}, "thread": {"id": "1.1"}},
+        "content": [
+            {"kind": "text", "text": {"format": "markdown", "body": "Deploy now?"}},
+            {"kind": "actions", "actions": {"elements": [{
+                "kind": "button", "action_id": "notif:n1:yes", "label": "Yes", "value": "yes", "style": "primary",
+            }]}},
+        ],
+    }}),
+    ("operation", Operation(kind="edit", deadline_millis=30000, edit=EditOperation(
+        target=MESSAGE, content=(ContentPart(kind="text", text=TextContent(format="markdown", body="Done")),),
+    )), {"kind": "edit", "deadline_millis": 30000, "edit": {
+        "target": MESSAGE_JSON, "content": [{"kind": "text", "text": {"format": "markdown", "body": "Done"}}],
+    }}),
+    ("operation", Operation(kind="delete", deadline_millis=30000, delete=DeleteOperation(target=MESSAGE)), {
+        "kind": "delete", "deadline_millis": 30000, "delete": {"target": MESSAGE_JSON},
+    }),
+    ("operation", Operation(kind="reaction", deadline_millis=30000, reaction=ReactionOperation(
+        target=MESSAGE, reaction=Reaction(action="add", name="custom:partyparrot"),
+    )), {"kind": "reaction", "deadline_millis": 30000, "reaction": {
+        "target": MESSAGE_JSON, "reaction": {"action": "add", "name": "custom:partyparrot"},
+    }}),
+    ("operation", Operation(kind="interaction", deadline_millis=30000, interaction=InteractionOperation(
+        target=InteractionTarget(origin=MESSAGE, interaction_id="press-1"), response="update",
+        content=(ContentPart(kind="reference", reference=ContentReference(
+            kind="mention", mention_kind="user", id="U1",
+        )),),
+    )), {"kind": "interaction", "deadline_millis": 30000, "interaction": {
+        "target": {"origin": MESSAGE_JSON, "interaction_id": "press-1"}, "response": "update",
+        "content": [{"kind": "reference", "reference": {"kind": "mention", "mention_kind": "user", "id": "U1"}}],
+    }}),
+    ("operation", Operation(kind="file_read", deadline_millis=30000, file_read=FileReadOperation(
+        target=AttachmentTarget(origin=MESSAGE, attachment=AttachmentReference(id="F1", name="a.txt")),
+        offset_bytes=0, length_bytes=4096,
+    )), {"kind": "file_read", "deadline_millis": 30000, "file_read": {
+        "target": {"origin": MESSAGE_JSON, "attachment": {"id": "F1", "name": "a.txt"}},
+        "offset_bytes": 0, "length_bytes": 4096,
+    }}),
+    ("operation", Operation(kind="file_send", deadline_millis=30000, file_send=FileSendOperation(
+        destination=MessageContainer(conversation=ConversationReference(id="C1")),
+        file=FileUpload(transfer_id="upload-1", name="a.txt", media_type="text/plain", total_bytes=3),
+    )), {"kind": "file_send", "deadline_millis": 30000, "file_send": {
+        "destination": {"conversation": {"id": "C1"}},
+        "file": {"transfer_id": "upload-1", "name": "a.txt", "media_type": "text/plain", "total_bytes": 3},
+    }}),
+    ("operation", Operation(kind="typing", deadline_millis=30000, typing=TypingOperation(
+        target=MessageContainer(conversation=ConversationReference(id="C1")),
+    )), {"kind": "typing", "deadline_millis": 30000, "typing": {"target": {"conversation": {"id": "C1"}}}}),
+    ("transfer", TransferChunk(transfer_id="upload-1", offset=0, total_bytes=3, data=b"abc", final=True), {
+        "transfer_id": "upload-1", "offset": 0, "total_bytes": 3, "data": "YWJj", "final": True,
+    }),
     ("inbox_ack", InboxAck(items=(
         InboxAckItem(inbox_id="1007", outcome="accepted"),
         InboxAckItem(inbox_id="1008", outcome="rejected", reason_code="admission_rejected"),
@@ -193,7 +342,10 @@ SENT: list[tuple[str, Any, dict[str, Any]]] = [
 
 
 class TestEncoding:
-    @pytest.mark.parametrize(("kind", "body", "expected"), SENT, ids=[kind for kind, _, _ in SENT])
+    @pytest.mark.parametrize(
+        ("kind", "body", "expected"), SENT,
+        ids=[getattr(body, "kind", kind) for kind, body, _ in SENT],
+    )
     def test_nerve_sends_exactly_the_contract_members(self, kind, body, expected):
         envelope = Envelope(version="1", kind=kind, request_id="n-1", payload=Payload(**{kind: body}))
 

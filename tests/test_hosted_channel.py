@@ -29,6 +29,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 import nerve.config as config_module
 from nerve.agent.sessions import SessionManager
 from nerve.channels.hosted.intake import ReaderSettings
+from nerve.channels.hosted.operations import OperationTiming
 from nerve.channels.hosted.runtime import HostedChannelRuntime
 from nerve.channels.hosted.stream import StreamTiming
 from nerve.channels.router import ChannelRouter
@@ -39,6 +40,7 @@ from nerve.config import (
     SlackConfig,
 )
 from nerve.gateway import server as gateway_server
+from nerve.notifications.service import NotificationService
 from nerve.sources.registry import build_source_runners
 
 from tests.fake_channel_gateway import (
@@ -67,6 +69,7 @@ FAST_READER = ReaderSettings(
     stop_grace=0.5,
 )
 FAST_STREAM = StreamTiming(heartbeat_interval=1.0, negotiation_timeout=2.0)
+FAST_OPERATIONS = OperationTiming(result_grace=0.5, stream_wait=1.0, retry_delay=0.05)
 
 
 class Turns:
@@ -101,6 +104,7 @@ class Hosted:
     gateway: FakeChannelGateway
     runtime: HostedChannelRuntime
     server: NerveServer
+    notifications: NotificationService | None = None
 
     async def stream(self, **kwargs: Any) -> FakeStream:
         return await self.gateway.open_stream(self.server.stream_url, **kwargs)
@@ -136,7 +140,15 @@ def hosted_config(tmp_path, **source: Any) -> NerveConfig:
     return config
 
 
-async def start_hosted(tmp_path, db, monkeypatch, reader: ReaderSettings = FAST_READER, **source: Any):
+async def start_hosted(
+    tmp_path,
+    db,
+    monkeypatch,
+    reader: ReaderSettings = FAST_READER,
+    operations: OperationTiming = FAST_OPERATIONS,
+    notifications: bool = False,
+    **source: Any,
+):
     config = hosted_config(tmp_path, **source)
     monkeypatch.setattr(config_module, "_config", config)
     turns = Turns()
@@ -146,15 +158,18 @@ async def start_hosted(tmp_path, db, monkeypatch, reader: ReaderSettings = FAST_
     engine.run = turns.run
     router = ChannelRouter(engine)
     router.BATCH_DEBOUNCE = 0.0
+    engine.router = router
+    service = NotificationService(config, db, engine) if notifications else None
     gateway = FakeChannelGateway(jwks_file=config.channels.hosted.gateway_jwks_file)
     runtime = HostedChannelRuntime(
         config, router, lambda: config, stream_timing=FAST_STREAM, reader_settings=reader,
+        operation_timing=operations, notification_service=service,
     )
     await runtime.start()
     monkeypatch.setattr(gateway_server, "_hosted_channels", runtime)
     server = NerveServer(gateway_server.create_app())
     await server.__aenter__()
-    return Hosted(config, db, router, turns, gateway, runtime, server)
+    return Hosted(config, db, router, turns, gateway, runtime, server, service)
 
 
 async def stop_hosted(hosted: Hosted) -> None:

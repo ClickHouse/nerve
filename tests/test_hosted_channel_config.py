@@ -142,6 +142,27 @@ class TestDoctor:
         assert "private key members" in report
         assert private["d"] not in report
 
+    def test_hosted_mode_reports_the_local_settings_that_still_apply(self):
+        config = hosted_config()
+        config.slack.allow_outbound = True
+        config.slack.allow_channels = ["C0123ABCD"]
+        config.slack.commands = ["reply", "restart"]
+        config.slack.deny_channels = ["#random"]
+
+        report = doctor_report(config)
+
+        assert "[OK] Slack send tool on, limited to 1 allow and 1 deny rule(s)" in report
+        assert "[OK] Slack notifications go to C0123ABCD" in report
+        assert "[--] Slack /nerve commands are not available in hosted mode" in report
+        assert "[WARN] slack.commands enables restart, but host commands are not available" in report
+        assert "[WARN] slack.deny_channels has a rule that is not a conversation id" in report
+
+    def test_hosted_mode_warns_without_a_notification_conversation(self):
+        report = doctor_report(hosted_config())
+
+        assert "[--] Slack send tool off" in report
+        assert "[WARN] Slack notifications have no conversation" in report
+
     def test_unusable_hosted_settings_are_errors(self):
         report = doctor_report(hosted_config(agent_id=""))
 
