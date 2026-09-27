@@ -1263,8 +1263,9 @@ reload, switch the gateway to the new key, then remove the old public key and
 reload again.
 
 The gateway admits each event, so `allow_users`, `allow_channels`, and
-`allow_direct_messages` do not apply to incoming messages. Nerve still checks that a channel message
-mentions the agent or continues a thread that has a session. `slack.source`
+`allow_direct_messages` do not apply to incoming messages, and Nerve does not
+check them again: a channel message that the gateway admits for a turn needs no
+mention check and, as a thread reply, no local session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
 

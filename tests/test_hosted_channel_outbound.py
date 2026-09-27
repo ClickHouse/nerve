@@ -444,7 +444,7 @@ class TestSendTool:
 
     async def test_several_connections_without_history_are_refused(self, hosted):
         stream = await hosted.stream()
-        await stream.advertise(connection_id=str(uuid.uuid4()), self_id="U_OTHER_AGENT")
+        await stream.advertise(connection_id=str(uuid.uuid4()))
         channel = hosted.runtime.channels["slack"]
         await hosted.gateway.wait_for(
             lambda: len(hosted.runtime.streams.connections("send")) == 2,

@@ -62,6 +62,10 @@ from nerve.channels.hosted.runtime import RECEIVE_LIMITS
 from tests.fake_channel_gateway import CONNECTION_ID, capabilities, gateway_negotiation, message_event
 
 
+def direct_message(**changes: Any) -> dict[str, Any]:
+    return message_event(conversation="D0DIRECT", conversation_kind="direct", **changes)
+
+
 def frame(kind: str, body: dict[str, Any], **envelope: Any) -> dict[str, Any]:
     return {"version": "1", "kind": kind, "request_id": "g-1", **envelope, "payload": {kind: body}}
 
@@ -89,7 +93,7 @@ def reason(value: dict[str, Any] | str, limit: int = 262144) -> str:
 
 class TestDecoding:
     def test_a_page_decodes_into_the_members_that_nerve_reads(self):
-        event = decode(page(message_event(thread="1.0"))).body.events[0]
+        event = decode(page(direct_message(thread="1.0"))).body.events[0]
 
         assert event.delivery.inbox_id == "1000"
         assert event.admission.purpose == "invoke"
@@ -99,14 +103,20 @@ class TestDecoding:
         assert event.occurred_at == datetime(2026, 9, 16, 10, 0, 0, 100000, tzinfo=timezone.utc)
 
     def test_unknown_members_are_ignored(self):
-        value = page(message_event())
+        value = page(direct_message())
         value["trace"] = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
         value["payload"]["inbox_read_result"]["events"][0]["new_member"] = {"any": ["shape"]}
 
         assert decode(value).body.events[0].kind == "message"
 
+    def test_a_mention_of_the_agent_carries_the_self_flag(self):
+        [mention, text] = decode(page(message_event(mention_agent=True))).body.events[0].content
+
+        assert (mention.reference.id, mention.reference.self) == ("U_FIXTURE_AGENT", True)
+        assert text.reference is None
+
     def test_a_member_of_another_type_is_malformed(self):
-        value = page(message_event())
+        value = page(direct_message())
         value["payload"]["inbox_read_result"]["events"][0]["connection_id"] = 7
 
         assert reason(value) == "malformed_frame"
@@ -141,7 +151,7 @@ class TestFrameChecks:
     def test_capabilities_name_their_connection(self):
         assert reason(frame("capabilities", capabilities())) == "scope_mismatch"
         body = decode(frame("capabilities", capabilities(), connection_id=CONNECTION_ID)).body
-        assert body.self.id == "U_FIXTURE_AGENT"
+        assert "send" in body.operations and body.limits.text_characters == 4000
 
     @pytest.mark.parametrize("change", [{"supported_versions": ["2"]}, {"delivery_modes": ["push"]}])
     def test_a_negotiation_needs_version_1_and_pull(self, change):
@@ -155,19 +165,19 @@ class TestFrameChecks:
 class TestInboxPages:
     @pytest.mark.parametrize("member", ["event_id", "delivery", "admission", "message", "author"])
     def test_an_event_needs_the_members_that_nerve_reads(self, member):
-        value = page(message_event())
+        value = page(direct_message())
         del value["payload"]["inbox_read_result"]["events"][0][member]
 
         assert reason(value) == "malformed_frame"
 
     def test_an_invoke_needs_its_invoke_member(self):
-        value = page(message_event())
+        value = page(direct_message())
         del value["payload"]["inbox_read_result"]["events"][0]["admission"]["invoke"]
 
         assert reason(value) == "malformed_frame"
 
     def test_an_unknown_admission_purpose_is_refused(self):
-        value = page(message_event())
+        value = page(direct_message())
         value["payload"]["inbox_read_result"]["events"][0]["admission"]["purpose"] = "inspect"
 
         assert reason(value) == "kind_unsupported"
@@ -179,7 +189,7 @@ class TestInboxPages:
         assert reason(value) == "kind_unsupported"
 
     def test_a_page_larger_than_the_read_is_refused(self):
-        result = decode(page(message_event(message_id="1"), message_event(message_id="2"))).body
+        result = decode(page(direct_message(message_id="1"), direct_message(message_id="2"))).body
 
         with pytest.raises(Rejected) as error:
             validate_inbox_read_result(InboxRead(maximum_events=1, maximum_bytes=16384), result, 1000)
@@ -188,7 +198,7 @@ class TestInboxPages:
             validate_inbox_read_result(InboxRead(maximum_events=2, maximum_bytes=16384), result, 16385)
 
     def test_one_event_may_exceed_the_read_byte_limit(self):
-        result = decode(page(message_event())).body
+        result = decode(page(direct_message())).body
 
         validate_inbox_read_result(InboxRead(maximum_events=1, maximum_bytes=16384), result, 20000)
 

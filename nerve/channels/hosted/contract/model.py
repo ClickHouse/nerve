@@ -149,13 +149,18 @@ class TextContent:
 
 @_record
 class ContentReference:
-    """A mention, a link that a person wrote, or unsupported provider content."""
+    """A mention, a link that a person wrote, or unsupported provider content.
+
+    ``self`` marks a user mention of the agent that receives the event. It is
+    omitted when false, and only received content carries it.
+    """
 
     kind: str = ""
     mention_kind: str = omit_empty()
     id: str = omit_empty()
     url: str = omit_empty()
     label: str = omit_empty()
+    self: bool = omit_empty(False)
 
 
 @_record
@@ -367,9 +372,8 @@ class ConnectionLimits:
 
 @_record
 class Capabilities:
-    """A connection's own identity, operations, and limits."""
+    """A connection's operations and limits."""
 
-    self: AuthorReference = struct(AuthorReference)
     operations: tuple[str, ...] = omit_empty(())
     limits: ConnectionLimits = struct(ConnectionLimits)
 

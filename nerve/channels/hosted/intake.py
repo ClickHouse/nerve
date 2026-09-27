@@ -52,14 +52,12 @@ class Disposition:
 
     ``accepted``, ``duplicate``, and ``rejected`` are acknowledgement
     outcomes. ``deferred`` is local only: the row is not acknowledged and
-    comes back on a later read. ``until_capabilities`` defers until a stream
-    advertises capabilities.
+    comes back on a later read.
     """
 
     outcome: str
     reason_code: str = ""
     detail: str = ""
-    until_capabilities: bool = False
 
     @classmethod
     def accepted(cls) -> Disposition:
@@ -70,8 +68,8 @@ class Disposition:
         return cls("rejected", reason_code, detail)
 
     @classmethod
-    def deferred(cls, detail: str, *, until_capabilities: bool = False) -> Disposition:
-        return cls("deferred", detail=detail, until_capabilities=until_capabilities)
+    def deferred(cls, detail: str) -> Disposition:
+        return cls("deferred", detail=detail)
 
 
 class EventConsumer(Protocol):
@@ -97,7 +95,6 @@ class ReaderSettings:
     request_timeout: float = 15.0
     poll_interval: float = 30.0
     observe_interval: float = 5.0
-    deferred_retry: float = 5.0
     backoff_initial: float = 0.5
     backoff_maximum: float = 30.0
     capacity_poll: float = 0.1
@@ -180,7 +177,6 @@ class InboxReader:
         self._observe_due: float | None = None
         self._next_poll: float | None = None
         self._retry_at: float | None = None
-        self._awaiting_capabilities = False
         self._last_read_start = float("-inf")
         self._deferral_backoff = Backoff(settings.backoff_initial, settings.backoff_maximum, rng)
         self.outcomes: collections.Counter[str] = collections.Counter()
@@ -215,13 +211,6 @@ class InboxReader:
         if self._observe_due is None or due < self._observe_due:
             self._observe_due = due
         self._wake.set()
-
-    def capabilities_changed(self) -> None:
-        """Resume a page that waits for a connection's capabilities."""
-        if self._awaiting_capabilities:
-            self._awaiting_capabilities = False
-            self._deferred = False
-            self.read_now()
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                           #
@@ -338,11 +327,7 @@ class InboxReader:
         self._deferred = True
         self._again = False
         self._observe_due = None
-        if deferral.until_capabilities:
-            self._awaiting_capabilities = True
-            self._retry_at = self._clock() + self._settings.deferred_retry
-        else:
-            self._retry_at = self._clock() + self._deferral_backoff.next()
+        self._retry_at = self._clock() + self._deferral_backoff.next()
 
     async def _read(self) -> list[Event]:
         read = InboxRead(
