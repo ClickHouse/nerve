@@ -1198,8 +1198,15 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # Check Slack
     if config.slack.enabled and config.slack.mode == "hosted":
         # A gateway holds the tokens, so there are none to check here.
+        from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
         hosted = config.channels.hosted
         problems = hosted.problems()
+        if not problems:
+            try:
+                keys = read_key_file(hosted.gateway_jwks_file)
+            except KeyFileError as error:
+                problems = [f"channels.hosted.gateway_jwks_file: {error}"]
         if problems:
             errors.extend(
                 f"[ERR] Slack is hosted but {problem}" for problem in problems
@@ -1207,7 +1214,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             lines.append(
                 f"[OK] Slack hosted by the channel gateway: agent "
-                f"{hosted.agent_id}, stream tokens from {hosted.issuer}"
+                f"{hosted.agent_id}, {len(keys)} gateway key(s) from "
+                f"{hosted.gateway_jwks_file}"
             )
     elif config.slack.enabled:
         missing = [

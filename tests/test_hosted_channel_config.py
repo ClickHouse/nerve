@@ -7,11 +7,16 @@ and the Socket Mode lifecycle owner.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from jwt.algorithms import ECAlgorithm
 
+from nerve.channels.hosted.auth import KeyFileError
 from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_providers
 from nerve.channels.slack_runtime import SlackRuntime
 from nerve.cli import doctor_report
@@ -21,14 +26,23 @@ from nerve.config import (
     SlackConfig,
     validate_config_keys,
 )
-from nerve.config_reload import restart_required
+from nerve.config_reload import _reload_hosted_keys, restart_required
+
+from tests.fake_channel_gateway import FakeChannelGateway
 
 HOSTED = {
-    "issuer": "http://cp.localhost:8080/workload-identity",
-    "jwks_url": "http://cp.localhost:8080/workload-identity/jwks.json",
+    "gateway_jwks_file": "/run/nerve/gateway-jwks.json",
     "tenant_id": "6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04",
     "agent_id": "b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17",
 }
+
+
+@pytest.fixture(autouse=True)
+def gateway(tmp_path, monkeypatch) -> FakeChannelGateway:
+    """A gateway whose public key file the hosted settings name."""
+    gateway = FakeChannelGateway(jwks_file=tmp_path / "gateway-jwks.json")
+    monkeypatch.setitem(HOSTED, "gateway_jwks_file", str(gateway.jwks_file))
+    return gateway
 
 
 def hosted_config(**hosted: Any) -> NerveConfig:
@@ -74,12 +88,16 @@ class TestParsing:
     def test_the_hosted_settings_are_read(self):
         config = hosted_config(max_streams="4", audience="nerve-channel")
 
-        assert config.channels.hosted == HostedChannelsConfig(**HOSTED, max_streams=4)
+        assert config.channels.hosted == HostedChannelsConfig(
+            **{**HOSTED, "gateway_jwks_file": Path(HOSTED["gateway_jwks_file"])}, max_streams=4,
+        )
+        assert config.channels.hosted.issuer == "nerve-gateway"
         assert config.channels.hosted.problems() == []
 
     @pytest.mark.parametrize(("key", "value", "problem"), [
-        ("issuer", "", "issuer"),
-        ("jwks_url", "ftp://cp.example/jwks.json", "jwks_url"),
+        ("gateway_jwks_file", "", "gateway_jwks_file"),
+        ("gateway_jwks_file", "gateway-jwks.json", "absolute path"),
+        ("issuer", "  ", "issuer"),
         ("tenant_id", "6F1D3A2C-0B4E-4F7A-9C1D-2E5B8A3F7C04", "tenant_id"),
         ("agent_id", "agent-1", "agent_id"),
         ("max_streams", 0, "max_streams"),
@@ -89,26 +107,17 @@ class TestParsing:
 
         assert len(problems) == 1 and problem in problems[0]
 
-    @pytest.mark.parametrize(("issuer", "allowed"), [
-        ("https://cp.example.com/workload-identity", True),
-        ("http://cp.localhost:8080/workload-identity", True),
-        ("http://localhost:8080/workload-identity", True),
-        ("http://127.0.0.1:8080/workload-identity", True),
-        ("http://[::1]:8080/workload-identity", True),
-        ("http://cp.example.com/workload-identity", False),
-        ("http://10.0.0.5/workload-identity", False),
-    ])
-    def test_plain_http_is_for_local_hosts_only(self, issuer, allowed):
-        problems = hosted_config(issuer=issuer, jwks_url=issuer + "/jwks.json").channels.hosted.problems()
-
-        assert (problems == []) is allowed
-        if not allowed:
-            assert all("must use https" in problem for problem in problems)
-
     def test_the_new_keys_are_known(self):
         merged = {"slack": {"mode": "hosted"}, "channels": {"hosted": {**HOSTED, "max_streams": 2}}}
 
         assert validate_config_keys(merged) == []
+
+    def test_a_key_set_url_is_not_a_setting(self):
+        merged = {"channels": {"hosted": {**HOSTED, "jwks_url": "https://cp.example/jwks.json"}}}
+
+        assert validate_config_keys(merged) == [
+            "unknown key 'channels.hosted.jwks_url' — it is ignored (typo or removed option?)",
+        ]
 
 
 class TestDoctor:
@@ -116,7 +125,22 @@ class TestDoctor:
         report = doctor_report(hosted_config())
 
         assert "[OK] Slack hosted by the channel gateway" in report
+        assert "1 gateway key(s)" in report
         assert "Slack enabled but" not in report
+
+    def test_a_missing_key_file_is_an_error(self, tmp_path):
+        report = doctor_report(hosted_config(gateway_jwks_file=str(tmp_path / "missing.json")))
+
+        assert "[ERR] Slack is hosted but channels.hosted.gateway_jwks_file: cannot read" in report
+
+    def test_a_key_file_with_a_private_key_is_an_error(self, gateway):
+        private = json.loads(ECAlgorithm.to_jwk(gateway.keys[gateway.kid]))
+        gateway.jwks_file.write_text(json.dumps({"keys": [{**private, "kid": "k"}]}), encoding="utf-8")
+
+        report = doctor_report(hosted_config())
+
+        assert "private key members" in report
+        assert private["d"] not in report
 
     def test_unusable_hosted_settings_are_errors(self):
         report = doctor_report(hosted_config(agent_id=""))
@@ -139,6 +163,30 @@ class TestReload:
 
         assert any(line.startswith("channels.hosted") for line in changed)
         assert any(line.startswith("slack.mode") for line in changed)
+
+
+@pytest.mark.asyncio
+class TestKeyReload:
+    async def test_a_reload_reads_the_key_file_again(self, gateway):
+        config = hosted_config()
+        runtime = HostedChannelRuntime(config, _Router(), lambda: config)
+        engine = SimpleNamespace(get_channel_runtime={"hosted": runtime}.get)
+        gateway.add_key("gateway-test-key-2")
+
+        assert _reload_hosted_keys(engine) == "2 gateway key(s)"
+        assert runtime.verifier.read_count == 2
+
+    async def test_an_unusable_file_is_a_reload_error_and_keeps_the_keys(self, gateway):
+        config = hosted_config()
+        runtime = HostedChannelRuntime(config, _Router(), lambda: config)
+        engine = SimpleNamespace(get_channel_runtime={"hosted": runtime}.get)
+        gateway.jwks_file.write_text('{"keys": []}', encoding="utf-8")
+
+        assert _reload_hosted_keys(engine).startswith("error: ")
+        await runtime.verifier.verify(gateway.token())
+
+    async def test_without_hosted_channels_there_is_nothing_to_report(self):
+        assert _reload_hosted_keys(SimpleNamespace(get_channel_runtime=lambda name: None)) is None
 
 
 class _Router:
@@ -239,9 +287,15 @@ class TestHostedRuntime:
         assert router.channels == {}
 
     async def test_unusable_settings_are_refused(self):
-        config = hosted_config(jwks_url="")
+        config = hosted_config(gateway_jwks_file="")
 
-        with pytest.raises(ValueError, match="jwks_url"):
+        with pytest.raises(ValueError, match="gateway_jwks_file"):
+            HostedChannelRuntime(config, _Router(), lambda: config)
+
+    async def test_an_unusable_key_file_is_refused(self, tmp_path):
+        config = hosted_config(gateway_jwks_file=str(tmp_path / "missing.json"))
+
+        with pytest.raises(KeyFileError, match="cannot read"):
             HostedChannelRuntime(config, _Router(), lambda: config)
 
     async def test_it_refuses_to_shadow_a_registered_channel(self):

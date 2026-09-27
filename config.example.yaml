@@ -138,8 +138,8 @@ slack:
   enabled: false
   # "socket" (default): this process holds the tokens below. "hosted": a
   # shared channel gateway holds them and streams events to this process;
-  # no token is needed, and channels.hosted below must name the control plane
-  # issuer and this agent. See docs/config.md#hosted-mode.
+  # no token is needed, and channels.hosted below must name the gateway's
+  # public key file and this agent. See docs/config.md#hosted-mode.
   # mode: socket
   # Socket Mode needs both tokens in config.local.yaml; no public URL is needed:
   #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
@@ -208,12 +208,13 @@ slack:
   #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
 
 # Streams from a shared channel gateway, for a provider in hosted mode
-# (slack.mode: hosted). A stream opens only with a control plane workload
-# identity token for this exact tenant and agent.
+# (slack.mode: hosted). A stream opens only with a token that the gateway
+# signs for this exact tenant and agent. gateway_jwks_file holds the
+# gateway's public keys only; Nerve fetches no keys over the network.
 # channels:
 #   hosted:
-#     issuer: https://cp.example.com/workload-identity
-#     jwks_url: https://cp.example.com/workload-identity/jwks.json
+#     gateway_jwks_file: /etc/nerve/gateway-jwks.json
+#     issuer: nerve-gateway
 #     audience: nerve-channel
 #     tenant_id: 00000000-0000-0000-0000-000000000000
 #     agent_id: 00000000-0000-0000-0000-000000000000
