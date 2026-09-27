@@ -1459,7 +1459,7 @@ class CodexClient(AgentClient):
             return
         last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
         self._turn_total_base = {
-            key: max(0, int(total.get(key) or 0) - int((last or {}).get(key) or 0))
+            key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
             for key in ("inputTokens", "cachedInputTokens", "outputTokens")
         }
 
