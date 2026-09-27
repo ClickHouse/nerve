@@ -254,8 +254,9 @@ def test_backend_notes_appended_to_developer_instructions(tmp_path):
 
 # --------------------------------------------------------------------------- #
 # Per-turn usage = cumulative-`total` delta over the turn.                      #
-# `total` is the per-thread cumulative counter, `last` a single response; the   #
-# turn-start baseline is `total - last` on the turn's first notification.       #
+# `total` is the per-thread cumulative counter, `last` a single response. The   #
+# baseline is the previous turn's carried `total`, or `total - last` on the     #
+# first notification for the first turn on a fresh client.                      #
 # --------------------------------------------------------------------------- #
 
 
@@ -428,3 +429,44 @@ async def test_context_occupancy_is_recoverable_from_usage_and_num_turns(tmp_pat
     assert done.num_turns == 3
     assert total_input // done.num_turns == 100_000   # single-call occupancy
     assert done.context_window == 272_000
+
+
+@pytest.mark.asyncio
+async def test_carried_baseline_survives_a_stale_first_notification(tmp_path):
+    # A rate-limit-then-retry can emit the turn's first tokenUsage carrying the
+    # PREVIOUS turn's total+last (no response happened yet). The carried
+    # previous-turn total must be the baseline, not (total - last) of that stale
+    # notification, or the previous turn's last response is counted twice.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(150_000, 140_000, 2_000),
+                      _tok(150_000, 140_000, 2_000))
+    _complete(client)                                    # turn 1 total = 150k/140k/2k
+    client._reset_turn_usage_accounting()
+    # Stale first notification for turn 2: previous turn's total AND last.
+    await _feed_usage(client, _tok(150_000, 140_000, 2_000),
+                      _tok(150_000, 140_000, 2_000))
+    # Turn 2's real (only) response lands.
+    await _feed_usage(client, _tok(310_000, 290_000, 3_000),
+                      _tok(160_000, 150_000, 1_000))
+    done = _complete(client)
+    assert done.usage.input_tokens == 10_000       # 160k - 150k cached, NOT 20k
+    assert done.usage.cache_read_tokens == 150_000  # NOT 290k
+    assert done.usage.output_tokens == 1_000        # NOT 3k
+
+
+@pytest.mark.asyncio
+async def test_failure_before_first_response_records_zero(tmp_path):
+    # Turn 2 fails before any real response, leaving only a stale notification
+    # carrying turn 1's total. Against the carried baseline the delta is zero —
+    # turn 1's last response is not re-counted.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100_000, 90_000, 5_000),
+                      _tok(100_000, 90_000, 5_000))
+    _complete(client)
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(100_000, 90_000, 5_000),
+                      _tok(100_000, 90_000, 5_000))   # stale only
+    done = _complete(client, status="failed", error="rate limit")
+    assert done.usage.input_tokens == 0
+    assert done.usage.cache_read_tokens == 0
+    assert done.usage.output_tokens == 0

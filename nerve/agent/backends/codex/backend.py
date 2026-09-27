@@ -708,9 +708,12 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
-        # Thread-cumulative token counters at this turn's start; the turn's
-        # usage is (turn-end total - this baseline). None until the turn's
-        # first tokenUsage notification sets it.
+        # Cumulative `total` at the end of the previous turn on this client,
+        # kept across turns; the baseline for the next turn's delta when known.
+        self._prev_total_usage: dict | None = None
+        # Fallback baseline for the first turn on a fresh client (no previous
+        # total yet): (total - last) from the turn's first tokenUsage
+        # notification. Reset per turn.
         self._turn_total_base: dict[str, int] | None = None
         # Count of model responses (tokenUsage notifications) in this turn,
         # reported as num_turns so the context bar can divide the turn-aggregate
@@ -1355,7 +1358,12 @@ class CodexClient(AgentClient):
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
-        usage = self._normalize_usage(self._turn_usage, self._turn_total_base)
+        baseline = (
+            self._prev_total_usage
+            if self._prev_total_usage is not None
+            else self._turn_total_base
+        )
+        usage = self._normalize_usage(self._turn_usage, baseline)
         if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
             # notification. Child usage is still authoritative and must not
@@ -1382,9 +1390,7 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(
-                self._turn_usage, self._turn_total_base,
-            )
+            parent_usage = self._normalize_usage(self._turn_usage, baseline)
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1408,6 +1414,11 @@ class CodexClient(AgentClient):
             cost = None
             cost_basis = "unknown"
             estimated_cost = estimate
+        # Carry this turn's ending cumulative total as the next turn's baseline.
+        if isinstance(self._turn_usage, dict) and isinstance(
+            self._turn_usage.get("total"), dict
+        ):
+            self._prev_total_usage = self._turn_usage["total"]
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
@@ -1432,13 +1443,14 @@ class CodexClient(AgentClient):
         self._turn_response_count = 0
 
     def _capture_turn_total_base(self, usage: dict) -> None:
-        """Record the thread-cumulative counters at this turn's start, from the
-        turn's first tokenUsage notification.
+        """Record the fallback turn-start baseline from the turn's first
+        tokenUsage notification, used only when no previous-turn total is
+        carried (the first turn on a fresh client).
 
         ``tokenUsage.total`` is the per-thread cumulative counter and
         ``tokenUsage.last`` the most recent single response, so ``total - last``
         on that first notification is the cumulative total just before the
-        turn's first response — the baseline for the turn's delta.
+        turn's first response.
         """
         if self._turn_total_base is not None:
             return
@@ -1454,14 +1466,14 @@ class CodexClient(AgentClient):
     @staticmethod
     def _normalize_usage(
         usage: dict | None,
-        turn_total_base: dict | None = None,
+        baseline: dict | None = None,
     ) -> ev.NormalizedUsage | None:
         """``thread/tokenUsage/updated`` → NormalizedUsage.
 
         The turn's usage is the cumulative-``total`` delta over the turn:
-        ``total`` minus ``turn_total_base`` (the turn-start cumulative
-        counters). When no cumulative ``total`` is present, ``last`` — the most
-        recent single response — is used instead.
+        ``total`` minus ``baseline`` (the cumulative counters as of turn start).
+        When no cumulative ``total`` is present, ``last`` — the most recent
+        single response — is used instead.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
@@ -1474,7 +1486,7 @@ class CodexClient(AgentClient):
         last = usage.get("last") if isinstance(usage.get("last"), dict) else None
         if total is not None:
             # Per-turn delta of the cumulative thread total (clamped at zero).
-            base = turn_total_base or {}
+            base = baseline or {}
             raw_input = max(0, int(total.get("inputTokens") or 0)
                             - int(base.get("inputTokens") or 0))
             raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
