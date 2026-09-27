@@ -486,3 +486,12 @@ async def test_context_window_exceeded_reset_is_clamped(tmp_path):
     assert done.usage.input_tokens == 0
     assert done.usage.cache_read_tokens == 0
     assert done.usage.output_tokens == 0
+    # The reset must not lower the carried baseline: a following turn whose
+    # total continues from the pre-error value baselines off that value, not 0.
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(210_000, 155_000, 10_500),
+                      _tok(10_000, 5_000, 500))
+    done2 = _complete(client)
+    assert done2.usage.input_tokens == 5_000        # (210k-200k) - (155k-150k)
+    assert done2.usage.cache_read_tokens == 5_000   # 155k - 150k
+    assert done2.usage.output_tokens == 500         # 10.5k - 10k

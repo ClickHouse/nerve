@@ -1415,10 +1415,17 @@ class CodexClient(AgentClient):
             cost_basis = "unknown"
             estimated_cost = estimate
         # Carry this turn's ending cumulative total as the next turn's baseline.
+        # `total` is cumulative but a ContextWindowExceeded error zeroes it, so
+        # keep the higher of the previous and current total — a reset must not
+        # lower the carried baseline.
         if isinstance(self._turn_usage, dict) and isinstance(
             self._turn_usage.get("total"), dict
         ):
-            self._prev_total_usage = self._turn_usage["total"]
+            new_total = self._turn_usage["total"]
+            if self._prev_total_usage is None or int(
+                new_total.get("inputTokens") or 0
+            ) >= int(self._prev_total_usage.get("inputTokens") or 0):
+                self._prev_total_usage = new_total
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
