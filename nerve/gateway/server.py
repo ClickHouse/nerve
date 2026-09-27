@@ -1234,7 +1234,7 @@ def create_app() -> FastAPI:
             await broadcaster.unregister("__global__", f"global:{client_id}")
 
     # Gateway channel streams. A separate endpoint from /ws with its own
-    # authentication: a workload identity token in the Authorization header,
+    # authentication: a gateway-signed token in the Authorization header,
     # never the web session token, a cookie, or a query parameter.
     from nerve.channels.hosted.manager import STREAM_PATH, refuse_upgrade
 

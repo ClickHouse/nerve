@@ -14,7 +14,6 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from nerve import paths
 from nerve.coerce import FALSY, TRUTHY
@@ -2454,21 +2453,9 @@ class NotificationsConfig:
         )
 
 
+HOSTED_CHANNEL_ISSUER = "nerve-gateway"
 HOSTED_CHANNEL_AUDIENCE = "nerve-channel"
 _HOSTED_MAX_STREAMS = 64
-
-
-def _is_local_host(host: str) -> bool:
-    """Whether *host* is ``localhost``, a ``.localhost`` name, or a loopback address."""
-    import ipaddress
-
-    host = host.lower().rstrip(".")
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 @dataclass
@@ -2477,16 +2464,15 @@ class HostedChannelsConfig:
 
     In hosted mode (``slack.mode: hosted``) Nerve holds no provider tokens.
     Gateway replicas open streams to ``/_internal/channel/v1/stream`` on the
-    gateway port, and Nerve accepts a stream only with a control plane
-    workload identity token: signed by a key from ``jwks_url``, issued by
-    ``issuer`` for ``audience``, and naming exactly ``tenant_id`` and
-    ``agent_id``. ``max_streams`` bounds the streams open at one time; a
-    gateway normally holds one per replica. ``issuer`` and ``jwks_url`` must
-    use https, except for localhost and loopback addresses.
+    gateway port, and Nerve accepts a stream only with a token that the
+    gateway signs: a key from the local JWK Set file ``gateway_jwks_file``,
+    ``issuer`` and ``audience``, and exactly ``tenant_id`` and ``agent_id``.
+    ``max_streams`` bounds the streams open at one time; a gateway normally
+    holds one per replica.
     """
 
-    issuer: str = ""
-    jwks_url: str = ""
+    gateway_jwks_file: Path | None = None
+    issuer: str = HOSTED_CHANNEL_ISSUER
     audience: str = HOSTED_CHANNEL_AUDIENCE
     tenant_id: str = ""
     agent_id: str = ""
@@ -2496,8 +2482,8 @@ class HostedChannelsConfig:
     @_coerced
     def from_dict(cls, d: dict) -> HostedChannelsConfig:
         return cls(
-            issuer=str(d.get("issuer") or "").strip(),
-            jwks_url=str(d.get("jwks_url") or "").strip(),
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            issuer=str(d.get("issuer") or HOSTED_CHANNEL_ISSUER).strip(),
             audience=str(d.get("audience") or HOSTED_CHANNEL_AUDIENCE).strip(),
             tenant_id=str(d.get("tenant_id") or "").strip(),
             agent_id=str(d.get("agent_id") or "").strip(),
@@ -2505,19 +2491,18 @@ class HostedChannelsConfig:
         )
 
     def problems(self) -> list[str]:
-        """Why these settings cannot authenticate a stream. Empty when they can."""
+        """Why these settings cannot authenticate a stream. Empty when they can.
+
+        The key file itself is read by the stream verifier and by ``nerve doctor``.
+        """
         found: list[str] = []
-        for key in ("issuer", "jwks_url"):
-            parts = urlsplit(getattr(self, key))
-            if parts.scheme not in ("http", "https") or not parts.netloc:
-                found.append(f"channels.hosted.{key} must be an http or https URL")
-            elif parts.scheme == "http" and not _is_local_host(parts.hostname or ""):
-                # A key set or issuer read over plain HTTP lets anyone on the
-                # path forge the gateway, so HTTP is for local development.
-                found.append(
-                    f"channels.hosted.{key} must use https unless it names "
-                    "localhost or a loopback address",
-                )
+        if self.gateway_jwks_file is None:
+            found.append("channels.hosted.gateway_jwks_file must name the gateway's public key file")
+        elif not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("channels.hosted.gateway_jwks_file must be an absolute path")
+        if not self.issuer:
+            found.append("channels.hosted.issuer must not be empty")
         if not self.audience:
             found.append("channels.hosted.audience must not be empty")
         for key in ("tenant_id", "agent_id"):

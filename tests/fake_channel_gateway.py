@@ -1,7 +1,7 @@
 """A channel gateway stand-in for hosted channel tests.
 
-``FakeChannelGateway`` signs workload identity tokens with a test ES256 key
-and serves the JWK Set through an httpx transport. It opens WebSocket streams
+``FakeChannelGateway`` signs stream tokens with a test ES256 key and writes
+the public JWK Set to a key file for Nerve. It opens WebSocket streams
 to a Nerve endpoint, negotiates, advertises capabilities, and serves inbox
 pages from an in-memory inbox while it records every read and
 acknowledgement. Switches on the gateway simulate lost frames and outages.
@@ -18,11 +18,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import secrets
 import time
-import uuid
+from pathlib import Path
 from typing import Any
 
-import httpx
 import jwt
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -34,8 +34,7 @@ TENANT_ID = "6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04"
 AGENT_ID = "b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17"
 CONNECTION_ID = "3d9a4f2e-1c7b-4a85-9e60-2f8b7c1d5a43"
 AGENT_AUTHOR = "U_FIXTURE_AGENT"
-ISSUER = "https://cp.test/workload-identity"
-JWKS_URL = "https://cp.test/workload-identity/jwks.json"
+ISSUER = "nerve-gateway"
 AUDIENCE = "nerve-channel"
 # An upper bound for waits. A loaded machine can be slow; a passing run is not.
 EVENT_TIMEOUT = 15.0
@@ -152,7 +151,10 @@ def message_event(
 
 
 class FakeChannelGateway:
-    """Tokens, a JWK Set, streams, and an inbox, for one tenant and agent."""
+    """Tokens, a key file, streams, and an inbox, for one tenant and agent.
+
+    With ``jwks_file``, every change to the published keys rewrites that file.
+    """
 
     def __init__(
         self,
@@ -160,15 +162,14 @@ class FakeChannelGateway:
         tenant_id: str = TENANT_ID,
         agent_id: str = AGENT_ID,
         issuer: str = ISSUER,
-        jwks_url: str = JWKS_URL,
+        jwks_file: Path | None = None,
     ) -> None:
         self.tenant_id = tenant_id
         self.agent_id = agent_id
         self.issuer = issuer
-        self.jwks_url = jwks_url
+        self.jwks_file = jwks_file
         self.keys: dict[str, ec.EllipticCurvePrivateKey] = {}
         self.published: list[str] = []
-        self.jwks_fetches = 0
         self.kid = self.add_key("gateway-test-key-1")
         # The inbox: event dicts in store order, each with its delivery.
         self.inbox: list[dict[str, Any]] = []
@@ -194,7 +195,17 @@ class FakeChannelGateway:
         self.keys[kid] = ec.generate_private_key(ec.SECP256R1())
         if publish:
             self.published.append(kid)
+            self.write_jwks()
         return kid
+
+    def unpublish(self, kid: str) -> None:
+        self.published.remove(kid)
+        self.write_jwks()
+
+    def write_jwks(self) -> None:
+        """Write the public keys to the key file, as the local stack does for Nerve."""
+        if self.jwks_file is not None:
+            self.jwks_file.write_text(json.dumps(self.jwks()), encoding="utf-8")
 
     def jwks(self) -> dict[str, Any]:
         keys = []
@@ -204,19 +215,8 @@ class FakeChannelGateway:
             keys.append(entry)
         return {"keys": keys}
 
-    def transport(self) -> httpx.MockTransport:
-        """An httpx transport that serves the JWK Set and counts fetches."""
-
-        def handle(request: httpx.Request) -> httpx.Response:
-            if str(request.url) != self.jwks_url:
-                return httpx.Response(404)
-            self.jwks_fetches += 1
-            return httpx.Response(200, json=self.jwks())
-
-        return httpx.MockTransport(handle)
-
     def token(self, *, kid: str | None = None, algorithm: str = "ES256", **claims: Any) -> str:
-        """A workload identity token. A claim set to ``None`` is left out."""
+        """A stream token. A claim set to ``None`` is left out."""
         now = int(time.time())
         payload: dict[str, Any] = {
             "iss": self.issuer,
@@ -225,7 +225,7 @@ class FakeChannelGateway:
             "iat": now,
             "nbf": now,
             "exp": now + 300,
-            "jti": uuid.uuid4().hex,
+            "jti": secrets.token_urlsafe(16),
             "tenant_id": self.tenant_id,
             "agent_id": self.agent_id,
         }

@@ -3,8 +3,8 @@
 The runtime owns the token verifier, the stream manager, the inbox reader,
 and one :class:`HostedChannel` for each provider in hosted mode. The hosted
 settings and the provider modes are read once at startup; a change needs a
-restart. The source grant of each provider is read per event, so it follows
-a reload.
+restart. A reload reads the gateway key file again. The source grant of each
+provider is read per event, so it follows a reload.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Callable
 
-from nerve.channels.hosted.auth import WorkloadTokenVerifier
+from nerve.channels.hosted.auth import GatewayTokenVerifier
 from nerve.channels.hosted.channel import HostedChannel
 from nerve.channels.hosted.contract import (
     MAX_FRAME_BYTES,
@@ -26,7 +26,6 @@ from nerve.channels.hosted.manager import StreamManager
 from nerve.channels.hosted.stream import ChannelStream, StreamTiming
 
 if TYPE_CHECKING:
-    import httpx
     from starlette.websockets import WebSocket
 
     from nerve.channels.router import ChannelRouter
@@ -59,7 +58,6 @@ class HostedChannelRuntime:
         router: ChannelRouter,
         config_getter: Callable[[], NerveConfig],
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
         stream_timing: StreamTiming = StreamTiming(),
         reader_settings: ReaderSettings = ReaderSettings(),
     ) -> None:
@@ -73,13 +71,12 @@ class HostedChannelRuntime:
         self.router = router
         tenant_id = uuid.UUID(settings.tenant_id)
         agent_id = uuid.UUID(settings.agent_id)
-        self.verifier = WorkloadTokenVerifier(
+        self.verifier = GatewayTokenVerifier(
+            key_file=settings.gateway_jwks_file,
             issuer=settings.issuer,
-            jwks_url=settings.jwks_url,
             audience=settings.audience,
             tenant_id=tenant_id,
             agent_id=agent_id,
-            transport=transport,
         )
         self.channels: dict[str, HostedChannel] = {
             provider: HostedChannel(
@@ -124,6 +121,14 @@ class HostedChannelRuntime:
             finally:
                 self.router.unregister(channel)
         self._registered.clear()
+
+    def reload_keys(self) -> str:
+        """Read the gateway key file again, for a config reload.
+
+        Raises :class:`~nerve.channels.hosted.auth.KeyFileError` and keeps the
+        current keys when the file cannot be used.
+        """
+        return f"{self.verifier.reload_keys()} gateway key(s)"
 
     async def serve(self, websocket: WebSocket) -> None:
         """Handle one upgrade at the stream endpoint."""

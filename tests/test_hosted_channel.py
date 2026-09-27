@@ -14,6 +14,7 @@ outstanding page, and the separation from the web UI's own authentication.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -45,7 +46,6 @@ from tests.fake_channel_gateway import (
     CONNECTION_ID,
     EVENT_TIMEOUT,
     ISSUER,
-    JWKS_URL,
     TENANT_ID,
     FakeChannelGateway,
     FakeStream,
@@ -130,7 +130,8 @@ def hosted_config(tmp_path, **source: Any) -> NerveConfig:
         enabled=True, mode="hosted", source=ChannelSourceConfig(**source_settings),
     )
     config.channels.hosted = HostedChannelsConfig(
-        issuer=ISSUER, jwks_url=JWKS_URL, tenant_id=TENANT_ID, agent_id=AGENT_ID, max_streams=2,
+        gateway_jwks_file=tmp_path / "gateway-jwks.json", issuer=ISSUER,
+        tenant_id=TENANT_ID, agent_id=AGENT_ID, max_streams=2,
     )
     return config
 
@@ -145,10 +146,9 @@ async def start_hosted(tmp_path, db, monkeypatch, reader: ReaderSettings = FAST_
     engine.run = turns.run
     router = ChannelRouter(engine)
     router.BATCH_DEBOUNCE = 0.0
-    gateway = FakeChannelGateway()
+    gateway = FakeChannelGateway(jwks_file=config.channels.hosted.gateway_jwks_file)
     runtime = HostedChannelRuntime(
-        config, router, lambda: config,
-        transport=gateway.transport(), stream_timing=FAST_STREAM, reader_settings=reader,
+        config, router, lambda: config, stream_timing=FAST_STREAM, reader_settings=reader,
     )
     await runtime.start()
     monkeypatch.setattr(gateway_server, "_hosted_channels", runtime)
@@ -192,11 +192,20 @@ class TestUpgradeAuthentication:
         {"sub": f"tenants/{TENANT_ID}/agents/{uuid.uuid4()}"},
         {"agent_id": str(uuid.uuid4())},
         {"tenant_id": str(uuid.uuid4())},
-        {"exp": 1_700_000_000, "iat": 1_699_999_000, "nbf": 1_699_999_000},
-        {"iss": "https://elsewhere.test/workload-identity"},
+        {"exp": 1_700_000_000, "iat": 1_699_999_800, "nbf": 1_699_999_800},
+        {"iss": "https://cp.test/workload-identity"},
     ], ids=["wrong_audience", "wrong_subject", "wrong_agent", "wrong_tenant", "expired", "wrong_issuer"])
     async def test_a_bad_token_is_refused_with_401_and_no_detail(self, hosted, claims):
         status, body = await hosted.refused_status(token=hosted.gateway.token(**claims))
+
+        assert status == 401
+        assert body == b""
+
+    async def test_a_lifetime_above_300_seconds_is_refused(self, hosted):
+        now = int(time.time())
+        token = hosted.gateway.token(iat=now, nbf=now, exp=now + 301)
+
+        status, body = await hosted.refused_status(token=token)
 
         assert status == 401
         assert body == b""

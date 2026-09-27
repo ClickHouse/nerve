@@ -22,7 +22,7 @@ from typing import Callable
 from starlette.responses import Response as HTTPResponse
 from starlette.websockets import WebSocket
 
-from nerve.channels.hosted.auth import TokenRejected, WorkloadTokenVerifier
+from nerve.channels.hosted.auth import GatewayTokenVerifier, TokenRejected
 from nerve.channels.hosted.contract import Capabilities, StreamLimits
 from nerve.channels.hosted.stream import (
     CLOSE_GOING_AWAY,
@@ -69,7 +69,7 @@ class StreamManager:
     def __init__(
         self,
         *,
-        verifier: WorkloadTokenVerifier,
+        verifier: GatewayTokenVerifier,
         receive_limits: StreamLimits,
         max_streams: int,
         timing: StreamTiming = StreamTiming(),
