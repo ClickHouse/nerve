@@ -361,18 +361,15 @@ async def test_fallback_to_last_when_total_absent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reset_turn_accounting_clears_state(tmp_path):
-    # start_turn()'s reset must clear the baseline and the native-child marker
-    # so nothing bleeds from the previous turn.
+    # start_turn()'s reset must clear the baseline and response count so nothing
+    # bleeds from the previous turn.
     client = _client(tmp_path)
-    await client._map_notification("item/started", {"item": {
-        "id": "c1", "type": "collabAgentToolCall", "tool": "Agent", "prompt": "go",
-    }})
     await _feed_usage(client, _tok(100, 0, 10), _tok(100, 0, 10))
-    assert client._turn_total_base is not None and client._turn_has_native_child
+    assert client._turn_total_base is not None and client._turn_response_count == 1
     client._reset_turn_usage_accounting()
     assert client._turn_usage is None
     assert client._turn_total_base is None
-    assert client._turn_has_native_child is False
+    assert client._turn_response_count == 0
 
 
 @pytest.mark.asyncio
@@ -383,37 +380,6 @@ async def test_error_turn_still_records_partial_usage(tmp_path):
     assert done.status == "failed" and done.error == "boom"
     assert done.usage.input_tokens == 200
     assert done.usage.output_tokens == 50
-
-
-@pytest.mark.asyncio
-async def test_native_child_flags_cost_lower_bound(tmp_path):
-    # A native collaboration child ran: its separate-thread tokens are not yet
-    # attributed here, so the turn's cost must be marked a lower bound.
-    client = _client(tmp_path)
-    await client._map_notification("item/started", {"item": {
-        "id": "c1", "type": "collabAgentToolCall", "tool": "Researcher",
-        "prompt": "investigate",
-    }})
-    await _feed_usage(client, _tok(500, 100, 60), _tok(500, 100, 60))
-    done = _complete(client)
-    assert done.usage.input_tokens == 400              # parent still counted
-    assert done.usage.raw.get("cost_is_lower_bound") is True
-    assert done.usage.raw.get("native_children_unattributed") is True
-
-
-@pytest.mark.asyncio
-async def test_native_child_only_turn_records_lower_bound(tmp_path):
-    # Turn completes with a native child but no parent tokenUsage notification:
-    # a zero-parent usage is still recorded, carrying the lower-bound marker so
-    # the child cost is not silently dropped.
-    client = _client(tmp_path)
-    await client._map_notification("item/started", {"item": {
-        "id": "c1", "type": "collabAgentToolCall", "tool": "Agent", "prompt": "x",
-    }})
-    done = _complete(client)
-    assert done.usage is not None
-    assert done.usage.input_tokens == 0
-    assert done.usage.raw.get("cost_is_lower_bound") is True
 
 
 @pytest.mark.asyncio

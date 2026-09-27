@@ -712,9 +712,6 @@ class CodexClient(AgentClient):
         # usage is (turn-end total - this baseline). None until the turn's
         # first tokenUsage notification sets it.
         self._turn_total_base: dict[str, int] | None = None
-        # Set when a native collaboration child (collabAgentToolCall) ran this
-        # turn, whose separate-thread tokens are not in this thread's total.
-        self._turn_has_native_child: bool = False
         # Count of model responses (tokenUsage notifications) in this turn,
         # reported as num_turns so the context bar can divide the turn-aggregate
         # usage back down to a single call's context occupancy.
@@ -1207,9 +1204,6 @@ class CodexClient(AgentClient):
                 input={"query": item.get("query", "")},
             ))
         elif item_type == "collabAgentToolCall":
-            # Native collaboration child runs in a separate thread; mark the
-            # turn so its usage is reported as a lower bound.
-            self._turn_has_native_child = True
             out.append(ev.SubagentStarted(
                 tool_use_id=item_id or "codex-subagent",
                 subagent_type=str(item.get("tool") or "Agent"),
@@ -1362,10 +1356,10 @@ class CodexClient(AgentClient):
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
         usage = self._normalize_usage(self._turn_usage, self._turn_total_base)
-        if usage is None and (self._ultracode_usage or self._turn_has_native_child):
+        if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
-            # notification. Emit a zero record so the Ultracode child totals
-            # and/or the native-child lower-bound marker are still recorded.
+            # notification. Child usage is still authoritative and must not
+            # disappear merely because the parent count is absent.
             usage = ev.NormalizedUsage()
         if usage is not None and self._ultracode_usage:
             child = self._ultracode_usage
@@ -1379,11 +1373,6 @@ class CodexClient(AgentClient):
             # separate field is diagnostic detail, not additional billing).
             usage.output_tokens += child.get("output_tokens", 0)
             usage.raw["ultracode"] = dict(child)
-        if usage is not None and self._turn_has_native_child:
-            # Native-child tokens are not part of this turn's usage; mark the
-            # figure a lower bound.
-            usage.raw["cost_is_lower_bound"] = True
-            usage.raw["native_children_unattributed"] = True
         estimate = compute_cost(self.model, usage, self._backend.codex.pricing)
         if (
             estimate is not None
@@ -1437,11 +1426,9 @@ class CodexClient(AgentClient):
 
     def _reset_turn_usage_accounting(self) -> None:
         """Clear per-turn token-accounting state (latest tokenUsage payload,
-        turn-start cumulative baseline, native-child marker, response count)
-        at turn start."""
+        turn-start cumulative baseline, response count) at turn start."""
         self._turn_usage = None
         self._turn_total_base = None
-        self._turn_has_native_child = False
         self._turn_response_count = 0
 
     def _capture_turn_total_base(self, usage: dict) -> None:
@@ -1506,11 +1493,7 @@ class CodexClient(AgentClient):
             output_tokens=raw_output,
             cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
-            raw={
-                "last": usage.get("last"),
-                "total": usage.get("total"),
-                "turn_total_base": turn_total_base,
-            },
+            raw={"last": last, "total": usage.get("total")},
         )
 
     @staticmethod
