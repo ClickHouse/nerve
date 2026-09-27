@@ -8,10 +8,11 @@ under Nerve's shared state dir. These tests pin that contract:
 * the files Nerve writes itself (config, log) are created — and repaired — at
   0600, and the auth directory it manages at 0700, regardless of how permissive
   the daemon's umask is;
-* the children Nerve launches (proxy, login) run under a native 0077 umask so
-  the files *they* create land owner-only too, without disturbing the daemon's
-  own umask; the proxy additionally gets its own process group while login
-  keeps the caller's;
+* the children Nerve launches (proxy, login) run under a 0077 umask (set by a
+  shell wrapper that then ``exec``s the binary, so the tracked pid is
+  unchanged) so the files *they* create land owner-only too; the proxy
+  additionally gets its own session/process group (``start_new_session``, which
+  uvloop accepts) while login keeps the caller's;
 * the directory tightening stays scoped — a shared parent is left alone, a
   symlinked auth directory's target is not chased, and a chmod that fails does
   not abort start-up. (The config/log writers do follow a symlinked path to its
@@ -221,48 +222,51 @@ class TestWriteProxyConfig:
 
 
 # ------------------------------------------------------------------ #
-#  Native launch arguments (umask / process_group), not preexec_fn    #
+#  Child launch policy — shell-umask wrapper + start_new_session      #
 # ------------------------------------------------------------------ #
 
 
-class TestNativeLaunchArgs:
-    """The proxy and login children are launched with native subprocess
-    ``umask``/``process_group`` arguments instead of a ``preexec_fn`` callback
-    (which the stdlib documents as unsafe in a threaded process). These fake
-    children confirm the arguments Nerve passes actually yield owner-only files
-    and the intended process group.
+class TestChildLaunchWrapper:
+    """The proxy and login children get their umask from a shell wrapper
+    (``sh -c 'umask 077 && exec "$0" "$@"'``), not a ``preexec_fn`` callback nor
+    the native ``umask=`` / ``process_group=`` kwargs (which uvloop rejects).
+    These fake children confirm the wrapper yields owner-only files, and that
+    ``start_new_session`` detaches the proxy while login keeps the caller's
+    process group.
     """
 
-    async def _spawn_fake_child(self, tmp_path: Path, *, own_group: bool):
-        script = 'touch "$1/childfile"; mkdir "$1/childdir"; sleep 1'
-        kwargs: dict = {"umask": 0o077}
-        if own_group:
-            kwargs["process_group"] = 0
+    async def _spawn_wrapped_child(self, tmp_path: Path, *, own_session: bool):
+        # Mirror how the service launches: the wrapper sets umask 077 then execs
+        # the "binary" — here a sub-shell that creates a file + a directory.
+        inner = f'touch "{tmp_path}/childfile"; mkdir "{tmp_path}/childdir"; sleep 1'
         return await asyncio.create_subprocess_exec(
-            "sh", "-c", script, "sh", str(tmp_path), **kwargs,
+            "/bin/sh", "-c", 'umask 077 && exec "$0" "$@"',
+            "/bin/sh", "-c", inner,
+            start_new_session=own_session,
         )
 
     @pytest.mark.asyncio
-    async def test_proxy_style_owner_only_and_own_group(self, tmp_path: Path) -> None:
+    async def test_proxy_style_owner_only_and_own_session(self, tmp_path: Path) -> None:
         with permissive_umask(0o022):
-            proc = await self._spawn_fake_child(tmp_path, own_group=True)
+            proc = await self._spawn_wrapped_child(tmp_path, own_session=True)
             try:
-                # process_group=0 puts the child in its own process group.
+                # start_new_session=True → own process group (and session).
                 assert _wait_own_group(proc.pid)
+                assert os.getsid(proc.pid) == proc.pid
                 # The child's umask did not touch the daemon's own umask.
                 assert _current_umask() == 0o022
             finally:
                 await proc.wait()
-        # umask(0o077) in the child made everything it created owner-only.
+        # umask 077 from the wrapper made everything the child created owner-only.
         assert _mode(tmp_path / "childfile") == 0o600
         assert _mode(tmp_path / "childdir") == 0o700
 
     @pytest.mark.asyncio
     async def test_login_style_owner_only_but_keeps_process_group(self, tmp_path: Path) -> None:
         with permissive_umask(0o022):
-            proc = await self._spawn_fake_child(tmp_path, own_group=False)
+            proc = await self._spawn_wrapped_child(tmp_path, own_session=False)
             try:
-                # No process_group: login stays in the caller's process group.
+                # No start_new_session: login stays in the caller's process group.
                 assert os.getpgid(proc.pid) == os.getpgrp()
             finally:
                 await proc.wait()
@@ -275,42 +279,69 @@ class TestNativeLaunchArgs:
 # ------------------------------------------------------------------ #
 
 
+def _fake_binary_service(tmp_path: Path) -> ProxyService:
+    # A fake binary that ignores its args and just lives, so start()/stop()
+    # exercise the real subprocess + shell-umask wrapper + log-open path.
+    binary = tmp_path / "cli-proxy-api"
+    binary.write_bytes(b"#!/bin/sh\nexec sleep 30\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+
+    cfg = NerveConfig.from_dict({
+        "proxy": {
+            "enabled": True,
+            "binary_path": str(binary),
+            "auth_dir": str(tmp_path / "auth"),
+            "log_file": str(tmp_path / "proxy.log"),
+            "api_key": "sk-test-secret",
+        },
+    })
+    svc = ProxyService(cfg)
+    svc._config_path = tmp_path / "proxy-config.yaml"
+    return svc
+
+
+def _assert_started_hardened(svc: ProxyService, tmp_path: Path) -> None:
+    assert svc._process is not None
+    # start_new_session gives the proxy its own session/process group.
+    assert _wait_own_group(svc._process.pid)
+    # Every secret is owner-only despite the wide-open umask.
+    assert _mode(tmp_path / "proxy.log") == 0o600
+    assert _mode(tmp_path / "proxy-config.yaml") == 0o600
+    assert _mode(tmp_path / "auth") == 0o700
+
+
 class TestStartLifecycleHardening:
     @pytest.mark.asyncio
     async def test_start_hardens_paths_and_preserves_process_group(self, tmp_path: Path) -> None:
-        # A fake binary that ignores its args and just lives, so start()/stop()
-        # exercise the real subprocess + native launch args + log-open path
-        # without a proxy.
-        binary = tmp_path / "cli-proxy-api"
-        binary.write_bytes(b"#!/bin/sh\nexec sleep 30\n")
-        binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
-
-        cfg = NerveConfig.from_dict({
-            "proxy": {
-                "enabled": True,
-                "binary_path": str(binary),
-                "auth_dir": str(tmp_path / "auth"),
-                "log_file": str(tmp_path / "proxy.log"),
-                "api_key": "sk-test-secret",
-            },
-        })
-        svc = ProxyService(cfg)
-        svc._config_path = tmp_path / "proxy-config.yaml"
-
+        svc = _fake_binary_service(tmp_path)
         with permissive_umask(0o000):
             with patch.object(svc, "_wait_for_healthy", new_callable=AsyncMock, return_value=True):
                 await svc.start()
-
         try:
-            assert svc._process is not None
-            # process_group=0 gives the proxy its own group (was preexec setpgrp).
-            assert _wait_own_group(svc._process.pid)
-            # Every secret is owner-only despite the wide-open umask.
-            assert _mode(tmp_path / "proxy.log") == 0o600
-            assert _mode(tmp_path / "proxy-config.yaml") == 0o600
-            assert _mode(tmp_path / "auth") == 0o700
+            _assert_started_hardened(svc, tmp_path)
         finally:
             await svc.stop()
-
         # Teardown reaped the child.
+        assert svc._process is None
+
+    def test_start_stop_under_uvloop(self, tmp_path: Path) -> None:
+        """Regression guard: the daemon runs uvicorn on uvloop, whose subprocess
+        support rejects the native ``umask=``/``process_group=`` kwargs
+        (``ValueError: unexpected kwargs``). pytest-asyncio uses the stdlib loop,
+        so the async test above would pass even with those kwargs. Drive the real
+        start()/stop() on an actual uvloop loop so a uvloop-incompatible launch
+        argument fails here, in CI — not only in production.
+        """
+        uvloop = pytest.importorskip("uvloop")
+        svc = _fake_binary_service(tmp_path)
+        loop = uvloop.new_event_loop()
+        try:
+            with permissive_umask(0o000):
+                with patch.object(svc, "_wait_for_healthy", new_callable=AsyncMock, return_value=True):
+                    loop.run_until_complete(svc.start())  # must not raise
+                _assert_started_hardened(svc, tmp_path)
+                assert os.getsid(svc._process.pid) == svc._process.pid
+        finally:
+            loop.run_until_complete(svc.stop())
+            loop.close()
         assert svc._process is None

@@ -64,11 +64,16 @@ def _detect_asset_suffix() -> str:
 # even though it lives under Nerve's state dir, which is shared with non-secret
 # files (databases, the PID file) and is not itself owner-only.
 #
-# The proxy and login children are launched with native, child-only ``umask``
-# and ``process_group`` subprocess arguments rather than a ``preexec_fn``
-# callback: running arbitrary Python between fork and exec is documented as
-# unsafe in a process that has threads (which the daemon does), so the callback
-# is avoided in favour of the equivalent kwargs the stdlib runs in C.
+# The proxy and login children get their child-only umask from a tiny shell
+# wrapper — ``sh -c 'umask 077 && exec "$0" "$@"'`` — rather than a
+# ``preexec_fn`` callback: running arbitrary Python between fork and exec is
+# documented as unsafe in a process that has threads (which the daemon does).
+# The shell sets the umask and then ``exec``s the proxy, so the pid Nerve tracks
+# and signals is unchanged. The native ``umask=`` / ``process_group=`` subprocess
+# kwargs are deliberately NOT used: the daemon runs its event loop on uvloop,
+# whose subprocess support rejects them (``ValueError: unexpected kwargs``).
+# ``start_new_session`` is accepted by both uvloop and the stdlib loop and gives
+# the proxy its own session/process group so signals aimed at Nerve miss it.
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -300,17 +305,19 @@ class ProxyService:
 
         try:
             self._process = await asyncio.create_subprocess_exec(
+                # Shell wrapper sets the child umask, then ``exec``s the proxy so
+                # its pid (the one stop() signals) is unchanged. Keeps the token
+                # JSON and per-request error logs the proxy creates owner-only
+                # (0600) without a preexec_fn callback or the native
+                # umask=/process_group= kwargs the daemon's uvloop loop rejects.
+                # start_new_session detaches it into its own session/process
+                # group so signals aimed at Nerve's group miss the proxy.
+                "/bin/sh", "-c", 'umask 077 && exec "$0" "$@"',
                 str(binary),
                 "--config", str(config_path),
                 stdout=log_fd,
                 stderr=log_fd,
-                # Native, child-only launch policy (no preexec_fn — unsafe in a
-                # threaded process): its own process group so signals aimed at
-                # Nerve's group miss the proxy, and a 0077 umask so the token
-                # JSON and error logs the proxy creates land owner-only. The
-                # daemon's own umask and process group are untouched.
-                umask=0o077,
-                process_group=0,
+                start_new_session=True,
             )
         finally:
             # The child has its own inherited dup of the log fd; the parent's
@@ -404,14 +411,16 @@ class ProxyService:
             cmd.append("--no-browser")
 
         proc = await asyncio.create_subprocess_exec(
+            # Shell wrapper sets the child umask, then ``exec``s the proxy (pid
+            # unchanged), so the OAuth token JSON is written owner-only without a
+            # preexec_fn callback or the native umask= kwarg the daemon's uvloop
+            # loop rejects. Process group is left as-is: login runs in the
+            # foreground and streams the OAuth URL to the operator.
+            "/bin/sh", "-c", 'umask 077 && exec "$0" "$@"',
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            # Native, child-only 0077 umask (no preexec_fn) so the OAuth token
-            # JSON is written owner-only. Process group is left as-is: login runs
-            # in the foreground and streams the OAuth URL to the operator.
-            umask=0o077,
         )
 
         # Stream output so the user can see the OAuth URL.
