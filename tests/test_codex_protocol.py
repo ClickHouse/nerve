@@ -470,3 +470,19 @@ async def test_failure_before_first_response_records_zero(tmp_path):
     assert done.usage.input_tokens == 0
     assert done.usage.cache_read_tokens == 0
     assert done.usage.output_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_context_window_exceeded_reset_is_clamped(tmp_path):
+    # codex-rs zeroes `total` on ContextWindowExceeded, so it can drop below the
+    # baseline. The clamped subtraction floors the turn's usage at zero.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(200_000, 150_000, 10_000),
+                      _tok(200_000, 150_000, 10_000))
+    _complete(client)                                    # baseline = 200k/150k/10k
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(0, 0, 0), _tok(0, 0, 0))   # counters zeroed
+    done = _complete(client, status="failed", error="context window exceeded")
+    assert done.usage.input_tokens == 0
+    assert done.usage.cache_read_tokens == 0
+    assert done.usage.output_tokens == 0
