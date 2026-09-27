@@ -715,6 +715,10 @@ class CodexClient(AgentClient):
         # Set when a native collaboration child (collabAgentToolCall) ran this
         # turn, whose separate-thread tokens are not in this thread's total.
         self._turn_has_native_child: bool = False
+        # Count of model responses (tokenUsage notifications) in this turn,
+        # reported as num_turns so the context bar can divide the turn-aggregate
+        # usage back down to a single call's context occupancy.
+        self._turn_response_count: int = 0
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -1068,6 +1072,7 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
+                self._turn_response_count += 1
                 self._capture_turn_total_base(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
@@ -1424,7 +1429,7 @@ class CodexClient(AgentClient):
             estimated_cost_usd=estimated_cost,
             duration_ms=turn.get("durationMs"),
             duration_api_ms=None,
-            num_turns=1,
+            num_turns=max(1, self._turn_response_count),
             context_window=self._context_window,
             status=status,  # type: ignore[arg-type]
             error=error,
@@ -1432,10 +1437,12 @@ class CodexClient(AgentClient):
 
     def _reset_turn_usage_accounting(self) -> None:
         """Clear per-turn token-accounting state (latest tokenUsage payload,
-        turn-start cumulative baseline, native-child marker) at turn start."""
+        turn-start cumulative baseline, native-child marker, response count)
+        at turn start."""
         self._turn_usage = None
         self._turn_total_base = None
         self._turn_has_native_child = False
+        self._turn_response_count = 0
 
     def _capture_turn_total_base(self, usage: dict) -> None:
         """Record the thread-cumulative counters at this turn's start, from the

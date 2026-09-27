@@ -428,3 +428,37 @@ async def test_dropped_mid_turn_notification_self_heals(tmp_path):
     done = _complete(client)
     assert done.usage.input_tokens == 600      # full cumulative, incl. the gap
     assert done.usage.output_tokens == 130
+
+
+@pytest.mark.asyncio
+async def test_num_turns_counts_model_responses(tmp_path):
+    # num_turns is the count of model responses in the turn (one per tokenUsage
+    # notification), so the context bar can divide the turn-aggregate usage back
+    # to a single call's context occupancy.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 0, 40), _tok(100, 0, 40))
+    await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))
+    assert _complete(client).num_turns == 2
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(450, 80, 150), _tok(150, 30, 50))
+    assert _complete(client).num_turns == 1
+    # No tokenUsage at all still reports at least one call.
+    client._reset_turn_usage_accounting()
+    assert _complete(client).num_turns == 1
+
+
+@pytest.mark.asyncio
+async def test_context_occupancy_is_recoverable_from_usage_and_num_turns(tmp_path):
+    # Three ~100k-token calls in a 272k window. The turn aggregates to ~300k
+    # input, but num_turns=3 lets the context bar recover a single call's ~100k
+    # occupancy (input + cache_read) / num_turns.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100_000, 0, 500), _tok(100_000, 0, 500), window=272_000)
+    await _feed_usage(client, _tok(200_000, 0, 1000), _tok(100_000, 0, 500))
+    await _feed_usage(client, _tok(300_000, 0, 1500), _tok(100_000, 0, 500))
+    done = _complete(client)
+    total_input = done.usage.input_tokens + done.usage.cache_read_tokens
+    assert total_input == 300_000        # turn aggregate (billing)
+    assert done.num_turns == 3
+    assert total_input // done.num_turns == 100_000   # single-call occupancy
+    assert done.context_window == 272_000
