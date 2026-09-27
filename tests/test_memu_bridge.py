@@ -1,6 +1,7 @@
 """Tests for nerve.memory.memu_bridge — event date resolution & knowledge filtering."""
 
 import asyncio
+import gc
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1135,6 +1136,32 @@ class TestMemorizeFileLockRetry:
             await bridge.memorize_file(str(target))
 
         assert bridge._service.memorize.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_memorize_file_skips_the_full_collection(tmp_path):
+    """A full collection holds the GIL while it walks the whole heap, so one per
+    indexed file stalls the event loop."""
+    bridge = _make_lock_test_bridge(tmp_path)
+    bridge._service.memorize = AsyncMock(return_value={"items": []})
+    target = tmp_path / "note.txt"
+    target.write_text("knowledge: a fact")
+
+    generations: list[int] = []
+
+    def record(phase, info):
+        if phase == "start":
+            generations.append(info["generation"])
+
+    gc.disable()  # record only the passes memorize_file runs itself
+    gc.callbacks.append(record)
+    try:
+        assert await bridge.memorize_file(str(target)) is True
+    finally:
+        gc.callbacks.remove(record)
+        gc.enable()
+
+    assert generations and 2 not in generations  # generation 2 = a full collection
 
 
 # ---------------------------------------------------------------------------

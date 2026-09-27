@@ -106,6 +106,8 @@ function LogRow({ log, showJobColumn }: { log: CronLog; showJobColumn: boolean }
             <span className="flex items-center gap-1 text-hue-amber">
               <Loader2 size={12} className="animate-spin" /> running
             </span>
+          ) : log.status === 'missed' ? (
+            '—'
           ) : (
             formatDuration(log.started_at, log.finished_at)
           )}

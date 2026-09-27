@@ -260,15 +260,9 @@ class CronService:
         self.engine = engine
         self.db = db
         self.timezone = ZoneInfo(config.timezone)
-        # coalesce collapses a backlog of ticks into one run; max_instances=1 is
-        # what makes a job's `lock: true` hold across schedules.
         self.scheduler = AsyncIOScheduler(
             timezone=self.timezone,
-            job_defaults={
-                "misfire_grace_time": _MISFIRE_GRACE_SECONDS,
-                "coalesce": True,
-                "max_instances": 1,
-            },
+            job_defaults={"misfire_grace_time": _MISFIRE_GRACE_SECONDS},
         )
         self._jobs: list[CronJob] = []
         # Ids from the last load that were refused for being reserved. Reported
@@ -381,19 +375,13 @@ class CronService:
         """Record a run APScheduler dropped for starting too late.
 
         Such a run never reaches _run_job_wrapper, so without this row nothing
-        distinguishes it from a run that was never scheduled.
-
-        Listeners are called synchronously on the event loop, so the write is
-        dispatched rather than awaited, and nothing may propagate out of here:
-        an exception would stop the remaining listeners.
+        distinguishes it from a run that was never scheduled. Listeners are
+        called synchronously on the event loop, so the write is dispatched
+        rather than awaited.
         """
-        try:
-            job_id = event.job_id
-            due = event.scheduled_run_time
-            logger.warning("Cron job %s missed its run at %s", job_id, due)
-            asyncio.create_task(self._record_missed_run(job_id, due))
-        except Exception as e:
-            logger.warning("Failed to handle missed-run event: %s", e)
+        asyncio.create_task(
+            self._record_missed_run(event.job_id, event.scheduled_run_time),
+        )
 
     async def _record_missed_run(self, job_id: str, due: datetime) -> None:
         """Persist one missed run. Logging a drop must not itself break cron."""

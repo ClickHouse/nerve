@@ -2123,11 +2123,10 @@ class MemUBridge:
 
     @staticmethod
     def _trim_memory() -> None:
-        """Return freed pages to the OS without pausing other threads.
+        """Collect the young generations and return freed pages to the OS.
 
-        The generational pass reclaims the embedding cycles a just-finished
-        memorize leaves behind, and ``malloc_trim`` returns the pages. Neither
-        cost grows with heap size, so this is safe to call per indexed file.
+        Reclaims the cycles a just-finished memorize leaves behind without
+        walking the long-lived heap, so it is cheap enough to run per file.
         """
         gc.collect(1)
         MemUBridge._malloc_trim()
@@ -2499,9 +2498,9 @@ class MemUBridge:
                             name=f"filter-knowledge-{Path(file_path).name}",
                         )
 
-                # Per-file, so the cost must not grow with the heap: a full
-                # collection here stalls the event loop for seconds.
-                self._trim_memory()
+                # A full collection holds the GIL, so it stalls the event loop
+                # even from a worker thread; only the young generations go here.
+                await asyncio.to_thread(self._trim_memory)
                 return True
 
             except asyncio.TimeoutError:

@@ -193,7 +193,7 @@ nerve logs                           # Tail the daemon log
 nerve status -f                      # Status + follow logs
 ```
 
-Cron run history is stored in the `cron_logs` SQLite table and visible in the web UI under Cron Logs. Each run records job ID, timestamps, status (success/error), and output.
+Cron run history is stored in the `cron_logs` SQLite table and visible in the web UI under Cron Logs. Each run records job ID, timestamps, status (success/error/missed), and output.
 
 ## Worker vs Personal — Key Differences
 
