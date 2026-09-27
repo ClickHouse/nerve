@@ -18,7 +18,6 @@ from nerve.channels.hosted.channel import HostedChannel
 from nerve.channels.hosted.contract import (
     MAX_FRAME_BYTES,
     MAX_TRANSFER_BYTES,
-    Capabilities,
     StreamLimits,
 )
 from nerve.channels.hosted.intake import InboxReader, ReaderSettings
@@ -93,7 +92,6 @@ class HostedChannelRuntime:
             timing=stream_timing,
             on_ready=self._stream_ready,
             on_nudge=self._stream_nudged,
-            on_capabilities=self._stream_capabilities,
         )
         self.operations = OperationRunner(self.streams, operation_timing)
         self.channels: dict[str, HostedChannel] = {
@@ -153,13 +151,6 @@ class HostedChannelRuntime:
 
     def _stream_nudged(self, stream: ChannelStream, purpose: str) -> None:
         self.reader.nudge(purpose)
-
-    def _stream_capabilities(
-        self, stream: ChannelStream, connection_id: uuid.UUID, capabilities: Capabilities,
-    ) -> None:
-        for channel in self.channels.values():
-            channel.note_capabilities(connection_id, capabilities)
-        self.reader.capabilities_changed()
 
 
 def _identifier_test(provider: str) -> Callable[[str], bool] | None:

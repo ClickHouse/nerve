@@ -80,6 +80,7 @@ MESSAGE_EVENT: dict[str, Any] = {
         "invoke": {
             "resolved_principal_id": "1c4a8f30-95d2-4b7e-a6f1-38c0e7b52a49",
             "access_projection_reference": 14,
+            "trigger": "mention",
         },
     },
     "occurred_at": "2026-09-16T10:00:00.100Z",
@@ -106,12 +107,9 @@ def gateway_negotiation(**limits: int) -> dict[str, Any]:
     }
 
 
-def capabilities(
-    self_id: str = AGENT_AUTHOR, *, operations: list[str] | None = None, **limits: int,
-) -> dict[str, Any]:
+def capabilities(*, operations: list[str] | None = None, **limits: int) -> dict[str, Any]:
     """The sample capabilities, with other operations or limits if given."""
     body = copy.deepcopy(CAPABILITIES)
-    body["self"]["id"] = self_id
     if operations is not None:
         body["operations"] = operations
     body["limits"].update(limits)
@@ -132,7 +130,11 @@ def message_event(
     connection_id: str = CONNECTION_ID,
     kind: str = "message",
 ) -> dict[str, Any]:
-    """A message event in the shape of the contract samples, without a delivery."""
+    """A message event in the shape of the contract samples, without a delivery.
+
+    An invoke event gets the trigger that the contract's precedence selects,
+    as the gateway sets it.
+    """
     event = copy.deepcopy(MESSAGE_EVENT)
     event["kind"] = kind
     event["event_id"] = event_id or f"ev-{purpose}-{conversation}-{message_id}-{kind}"
@@ -146,7 +148,7 @@ def message_event(
     content: list[dict[str, Any]] = []
     if mention_agent:
         content.append({"kind": "reference", "reference": {
-            "kind": "mention", "mention_kind": "user", "id": AGENT_AUTHOR, "label": "Nerve",
+            "kind": "mention", "mention_kind": "user", "id": AGENT_AUTHOR, "label": "Nerve", "self": True,
         }})
         text = " " + text
     content.append({"kind": "text", "text": {"format": "markdown", "body": text}})
@@ -157,7 +159,30 @@ def message_event(
             "issuer": event["issuer"],
             "installation_id": event["installation_id"],
         }}}
+    else:
+        event["admission"]["invoke"]["trigger"] = _selected_trigger(
+            kind, conversation_kind, mention_agent, thread, message_id,
+        )
     return event
+
+
+def _selected_trigger(
+    kind: str, conversation_kind: str, mention_agent: bool, thread: str | None, message_id: str,
+) -> str:
+    """The first trigger in the contract's precedence that describes the event."""
+    if kind == "interaction":
+        return "interaction"
+    if kind in ("reaction_added", "reaction_removed"):
+        return "reaction"
+    if kind == "command":
+        return "command"
+    if conversation_kind == "direct":
+        return "direct_message"
+    if mention_agent:
+        return "mention"
+    if thread is not None and thread != message_id:
+        return "thread_reply"
+    raise ValueError("an invoke message needs a direct conversation, a mention of the agent, or a thread reply")
 
 
 class FakeChannelGateway:
@@ -572,12 +597,11 @@ class FakeStream:
         self,
         *,
         connection_id: str = CONNECTION_ID,
-        self_id: str = AGENT_AUTHOR,
         operations: list[str] | None = None,
         **limits: int,
     ) -> None:
         await self.send(
-            "capabilities", capabilities(self_id, operations=operations, **limits),
+            "capabilities", capabilities(operations=operations, **limits),
             connection_id=connection_id,
         )
 
