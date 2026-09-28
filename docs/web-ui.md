@@ -153,8 +153,9 @@ verb visually.
 
 Null ids in legacy or unidentified-human history render no attribution element.
 Names are held only in memory. Equal rendered names get collision-safe id
-suffixes in visible text, and a missing display name uses `Unnamed account`.
-The system principal uses `Nerve` and a bot glyph.
+suffixes in visible text. A person without a display name is labelled by their
+username; `Unnamed account` appears only when they have neither. The system
+principal uses `Nerve` and a bot glyph.
 
 Optimistic and live messages carry actor ids so labels are correct before a
 reload. The actor directory coalesces concurrent reads and performs one

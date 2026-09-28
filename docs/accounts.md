@@ -120,7 +120,8 @@ system actor rather than a human account.
 
 Sessions store who created them in `created_by_actor_id`. User messages store
 who supplied the content in `actor_id`. Both columns contain stable actor IDs;
-clients resolve display names through `GET /api/actors`.
+clients resolve names through `GET /api/actors` — the display name, or the
+username when none is set.
 
 | Event | Stored actor |
 |---|---|

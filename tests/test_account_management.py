@@ -270,7 +270,7 @@ class TestEveryAccountMayManageAccounts:
 #  The viewer                                                                  #
 # --------------------------------------------------------------------------- #
 
-_ACTOR_FIELDS = {"id", "kind", "display_name"}
+_ACTOR_FIELDS = {"id", "kind", "display_name", "username"}
 
 
 @pytest.mark.asyncio
@@ -291,6 +291,7 @@ class TestViewer:
             "id": install.identity.owner_actor_id,
             "kind": "human",
             "display_name": "Alice",
+            "username": body["account"]["username"],
         }
         assert body["account"]["id"] == install.owner_id
         assert body["account"]["actor_id"] == body["actor"]["id"]

@@ -76,7 +76,7 @@ Return the actor this credential acts as, and its local account.
 
 ```json
 Response: {
-  "actor": { "id": "…", "kind": "human", "display_name": "Alice" },
+  "actor": { "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" },
   "account": { "id": "…", "actor_id": "…", "username": "alice", "…": "…" }
 }
 ```
@@ -183,7 +183,7 @@ where a name is looked up at render time — a rename changes every label and
 moves no stored row.
 
 ```json
-{ "id": "…", "kind": "human", "display_name": "Alice" }
+{ "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" }
 ```
 
 | Endpoint | Does |
@@ -192,10 +192,16 @@ moves no stored row.
 
 `kind` is `human` or `system`.
 
-This is an identity, not an account: nothing from `accounts` appears here (no
-username, no `enabled`, no `has_password`), and an actor need not have an
-account at all — the system principal does not. A disabled person's actor is
-still readable, because their history stays in the UI after their access ends.
+`username` is the login name of the account behind a human actor, or `null` for
+the system principal and for an account that has not been given one. It is here
+so a label can fall back to it when `display_name` is empty, and it is the same
+name every signed-in account already sees on `/accounts`.
+
+Otherwise this is an identity, not an account: nothing else from `accounts`
+appears here (no `enabled`, no `has_password`, no credential state), and an
+actor need not have an account at all — the system principal does not. A
+disabled person's actor is still readable, because their history stays in the
+UI after their access ends.
 
 ### Sessions
 

@@ -80,8 +80,9 @@ export const useActorStore = create<ActorState>((set, get) => {
   };
 });
 
+/** The display name, else the login name, else a neutral placeholder. */
 export function actorName(actor: ActorRef | undefined): string {
-  const name = actor?.display_name?.trim();
+  const name = actor?.display_name?.trim() || actor?.username?.trim();
   if (name) return name;
   return actor?.kind === 'system' ? SYSTEM_ACTOR_NAME : UNNAMED_ACTOR;
 }

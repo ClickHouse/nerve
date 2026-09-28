@@ -235,7 +235,7 @@ describe('who the session belongs to', () => {
 
   it('is cleared on logout, along with everything account-scoped', async () => {
     useAuthStore.setState({
-      viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice' },
+      viewer: { id: 'actor-1', kind: 'human', display_name: 'Alice', username: 'alice' },
       account: { id: 'acc-1', username: 'alice' },
     });
     api.authStatus.mockResolvedValue(status());

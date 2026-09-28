@@ -460,7 +460,9 @@ async def test_bulk_actor_directory_is_current_and_account_private(install):
             "id": install.alice_actor,
             "kind": "human",
             "display_name": "Alice",
+            "username": "alice",
         }
+        assert actors[install.system_actor_id]["username"] is None
 
         session_id = (
             await client.post("/api/sessions", headers=install.bob, json={})
@@ -476,9 +478,42 @@ async def test_bulk_actor_directory_is_current_and_account_private(install):
         }
 
     assert refreshed[install.bob_actor]["display_name"] == "Robert"
-    assert set(refreshed[install.bob_actor]) == {"id", "kind", "display_name"}
+    assert set(refreshed[install.bob_actor]) == {"id", "kind", "display_name", "username"}
     assert await install.creator_of(session_id) == install.bob_actor
     assert await install.said_in(session_id) == [("before rename", install.bob_actor)]
+
+
+@pytest.mark.asyncio
+async def test_actor_directory_carries_the_login_name_for_a_nameless_person(install):
+    """A person who never set a display name is still labelled, by username.
+
+    The directory exposes the login name next to the display name so the UI can
+    fall back to it instead of rendering an anonymous placeholder. Nothing else
+    about the account travels with it, and the system principal has none.
+    """
+    await install.db.update_actor_profile(install.bob_actor, display_name=None)
+    async with _client(install.app()) as client:
+        actors = {
+            row["id"]: row
+            for row in (
+                await client.get("/api/actors", headers=install.alice)
+            ).json()["actors"]
+        }
+
+    assert actors[install.bob_actor] == {
+        "id": install.bob_actor,
+        "kind": "human",
+        "display_name": None,
+        "username": "bob",
+    }
+    assert actors[install.system_actor_id] == {
+        "id": install.system_actor_id,
+        "kind": "system",
+        "display_name": None,
+        "username": None,
+    }
+    for row in actors.values():
+        assert not {"enabled", "has_password", "credential", "credential_source"} & set(row)
 
 
 @pytest.mark.asyncio
