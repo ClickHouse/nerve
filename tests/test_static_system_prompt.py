@@ -138,9 +138,9 @@ async def test_system_prompt_identical_across_sessions_with_different_recall(
     second = ["beta prior 2a"]
 
     engine._memory_bridge = _bridge(first)
-    await engine.run("s-one", "hello", source="web", channel="web")
+    await engine.run("s-one", "hello", source="web", channel="web", actor=None)
     engine._memory_bridge = _bridge(second)
-    await engine.run("s-two", "hello", source="web", channel="web")
+    await engine.run("s-two", "hello", source="web", channel="web", actor=None)
 
     prompt_one, prompt_two = (s.system_prompt for s in backend.specs)
     assert prompt_one == prompt_two
@@ -162,8 +162,8 @@ async def test_first_turn_carries_preamble_once_and_later_turns_do_not(
 ):
     engine, backend = _engine(tmp_path, db)
     sid = "s-first"
-    await engine.run(sid, "hello", source="web", channel="web")
-    await engine.run(sid, "and again", source="web", channel="web")
+    await engine.run(sid, "hello", source="web", channel="web", actor=None)
+    await engine.run(sid, "and again", source="web", channel="web", actor=None)
 
     (client,) = backend.clients
     first, second = client.turns
@@ -194,7 +194,7 @@ async def test_first_turn_carries_preamble_once_and_later_turns_do_not(
 
     # A client rebuild that RESUMES the transcript must not repeat it.
     engine.sessions.remove_client(sid)
-    await engine.run(sid, "third", source="web", channel="web")
+    await engine.run(sid, "third", source="web", channel="web", actor=None)
     assert len(backend.clients) == 2
     assert backend.specs[1].resume_native_id == "native-0"
     (third,) = backend.clients[1].turns
@@ -207,17 +207,17 @@ async def test_pre_existing_resumable_session_gets_preamble_once(tmp_path, db):
     id in the system prompt; it must receive the block once, then never."""
     engine, backend = _engine(tmp_path, db)
     sid = "s-legacy"
-    await db.create_session(sid, source="web", backend="claude")
+    await db.create_session(sid, source="web", backend="claude", actor=None)
     await db.update_session_fields(sid, {"sdk_session_id": "native-old"})
 
-    await engine.run(sid, "resume me", source="web", channel="web")
+    await engine.run(sid, "resume me", source="web", channel="web", actor=None)
     assert backend.specs[0].resume_native_id == "native-old"
     (first,) = backend.clients[0].turns
     assert first.startswith(OPEN)
     assert f"- **Session ID:** {sid}" in first
 
     engine.sessions.remove_client(sid)
-    await engine.run(sid, "once more", source="web", channel="web")
+    await engine.run(sid, "once more", source="web", channel="web", actor=None)
     (again,) = backend.clients[1].turns
     assert OPEN not in again and sid not in again
 
@@ -229,7 +229,7 @@ async def test_crash_retry_on_first_turn_sends_exactly_one_block(tmp_path, db):
     engine, backend = _engine(tmp_path, db)
     backend.die_on_first_start_turn = True
     sid = "s-retry"
-    out = await engine.run(sid, "hello", source="web", channel="web")
+    out = await engine.run(sid, "hello", source="web", channel="web", actor=None)
     assert out == "ok"
     assert len(backend.clients) == 2
     assert backend.clients[0].turns == []
@@ -247,7 +247,7 @@ async def test_flag_off_restores_inline_session_context(tmp_path, db):
     engine, backend = _engine(tmp_path, db, static_system_prompt=False)
     engine._memory_bridge = _bridge(["legacy prior 77"])
     sid = "s-inline"
-    await engine.run(sid, "hello", source="web", channel="web")
+    await engine.run(sid, "hello", source="web", channel="web", actor=None)
 
     prompt = backend.specs[0].system_prompt
     assert f"- **Session ID:** {sid}" in prompt
