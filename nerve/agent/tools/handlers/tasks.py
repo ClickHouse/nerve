@@ -38,7 +38,7 @@ from nerve.db.task_statuses import (
     normalize_color,
     random_status_color,
 )
-from nerve.tasks.files import move_task_file
+from nerve.tasks.files import move_task_file, write_task_file
 
 logger = logging.getLogger(__name__)
 
@@ -481,9 +481,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 elif raw_tags is not None:
                     # Every tag removed (an empty set, or "-last_tag").
                     content = re.sub(r"\*\*Tags:\*\* .*\n?", "", content, count=1)
-                await asyncio.to_thread(
-                    file_path.write_text, content, encoding="utf-8",
-                )
+                await asyncio.to_thread(write_task_file, file_path, content)
 
                 final_title = new_title or task["title"]
                 final_status = status or task["status"]
@@ -566,7 +564,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     file_path = ctx.workspace / task["file_path"]
     ensure_path_not_tracked_config(file_path, "write")
-    await asyncio.to_thread(file_path.write_text, new_content, encoding="utf-8")
+    await asyncio.to_thread(write_task_file, file_path, new_content)
 
     from nerve.tasks.models import (
         parse_task_frontmatter,
