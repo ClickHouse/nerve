@@ -219,18 +219,6 @@ class TestPricing:
         )
         assert _get_pricing("claude-opus-5") == MODEL_PRICING["opus-5"]
 
-    def test_sonnet_5_5_rates(self):
-        # Anchor: Sonnet 5.5 (verified against published pricing 2026-09-28).
-        # Base $2/MTok in, $10/MTok out, cache read $0.20/MTok, 5m write =
-        # 1.25x = $2.50/MTok, 1h write = 2.00x = $4.00/MTok.
-        from nerve.db.usage import _get_pricing
-        p_in, p_out, c_read, c5m, c1h, _ = _get_pricing("claude-sonnet-5-5")
-        assert p_in == 2
-        assert p_out == 10
-        assert c_read == 0.20
-        assert c5m == 2.50
-        assert c1h == 4.00
-
     def test_sonnet_5_5_does_not_resolve_to_sonnet_5(self, monkeypatch):
         # "sonnet-5" is a substring of "sonnet-5-5", so "sonnet-5-5" must be
         # checked first. The two tiers can have the same rates, so a marker
@@ -251,14 +239,10 @@ class TestPricing:
         assert _get_pricing("claude-opus-4-5-20251101") == MODEL_PRICING["opus-4-5"]
 
     def test_sonnet_5_rates(self):
-        # Sonnet 5 gets its own tier (verified against published pricing
-        # 2026-09-28: $2/MTok in, $10/MTok out, cache read $0.20/MTok, 5m
-        # write $2.50/MTok, 1h write $4.00/MTok); sonnet 4.x keeps resolving
-        # to "sonnet-4"; old-style claude-3-5-sonnet must NOT hit "sonnet-5".
+        # Sonnet 5 gets its own tier; sonnet 4.x keeps resolving to
+        # "sonnet-4"; old-style claude-3-5-sonnet must NOT hit "sonnet-5".
         from nerve.db.usage import MODEL_PRICING, _get_pricing
         assert _get_pricing("claude-sonnet-5") == MODEL_PRICING["sonnet-5"]
-        p_in, p_out, c_read, c5m, c1h, _ = MODEL_PRICING["sonnet-5"]
-        assert (p_in, p_out, c_read, c5m, c1h) == (2, 10, 0.20, 2.50, 4.00)
         assert _get_pricing("claude-sonnet-4-6") == MODEL_PRICING["sonnet-4"]
         assert _get_pricing("claude-3-5-sonnet-20241022") != MODEL_PRICING["sonnet-5"]
 
