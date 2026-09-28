@@ -321,8 +321,13 @@ class TestPreRecallFreeze:
         meta = json.loads(session.get("metadata") or "{}")
         assert meta.get("recalled_memories") == first, meta
         assert len(prompts) == 1
+        # Static-prompt mode (default): the frozen priors are rendered into
+        # the per-session preamble that ships with the first user message,
+        # never into the shared system prompt (its bytes are the cache key).
+        preamble_a = engine._pending_preambles["s-freeze"]
         for m in first:
-            assert f"- {m}" in prompts[0]
+            assert f"- {m}" in preamble_a
+            assert m not in prompts[0]
 
         # Phase B: evict the cached client so the rebuild re-enters the
         # freeze block (a live client returns before metadata is parsed),
@@ -334,13 +339,16 @@ class TestPreRecallFreeze:
 
         # Precondition: the rebuild really happened.
         assert len(prompts) == 2, prompts
-        # The frozen priors are what the second prompt carries.
+        # The frozen priors are what the rebuilt preamble carries.
+        preamble_b = engine._pending_preambles["s-freeze"]
         for m in first:
-            assert f"- {m}" in prompts[1]
+            assert f"- {m}" in preamble_b
         for m in second:
-            assert m not in prompts[1]
-        # Verbatim means byte-identical: order and multiplicity are prompt
-        # bytes (prompts.py:167), and byte-identity is the cache property.
+            assert m not in preamble_b
+        # Verbatim means byte-identical: order and multiplicity are bytes.
+        assert preamble_b == preamble_a
+        # And the system prompt itself is byte-identical across rebuilds —
+        # the prompt-cache property.
         assert prompts[1] == prompts[0]
         # Corroborating: nothing re-recalled, nothing overwrote the store.
         assert bridge.recall.await_count == 1
