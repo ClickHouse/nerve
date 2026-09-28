@@ -20,7 +20,7 @@ The wizard walks through:
 2. **Task description** — plain English description of what this worker should do
 3. **API configuration** — Anthropic API key or CLIProxyAPI proxy
 4. **Workspace setup** — creates workspace with worker-specific templates
-5. **Cron configuration** — enables `task-planner`, `skill-extractor`, `skill-reviser`, `memory-maintenance`
+5. **Cron configuration** — enables `task-planner`, `skill-extractor`, `skill-reviser`, `pr-feedback-harvester`, `memory-maintenance`
 
 ```bash
 nerve start -f    # Start in foreground (first boot triggers onboarding)
@@ -127,6 +127,9 @@ Workers create their own skills during onboarding and refine them over time.
 **Automated skill lifecycle:**
 - `skill-extractor` (every 12h) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
 - `skill-reviser` (weekly) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
+- `pr-feedback-harvester` (weekly) — reads review comments on the PRs the worker opened, clusters recurring feedback, and proposes the corresponding skill or `AGENTS.md` change
+
+The first two look inward — at memory and at the skill files. The harvester is the only one that looks outward, so it's how a reviewer's correction becomes a durable rule instead of being re-learned next month. It splits its findings into **general** feedback (→ a generic skill or an instruction file) and **repo-specific** feedback (→ that repository's own dev skill).
 
 When a skill-related plan is approved, the plan approval handler creates/updates the skill directly from the plan content (no implementation session needed — the plan IS the skill).
 
@@ -202,7 +205,7 @@ Cron run history is stored in the `cron_logs` SQLite table and visible in the we
 | **Purpose** | Full-featured assistant for one human | Task-focused autonomous agent |
 | **Workspace files** | SOUL.md, IDENTITY.md, USER.md, MEMORY.md, AGENTS.md, TOOLS.md | SOUL.md, TASK.md, MEMORY.md, AGENTS.md, TOOLS.md |
 | **Memory categories** | Life-oriented (relationships, finances, health, travel) | Operational (patterns, procedures, decisions, approvals) |
-| **Default crons** | inbox-processor, task-planner, memory-maintenance | task-planner, skill-extractor, skill-reviser, memory-maintenance |
+| **Default crons** | inbox-processor, task-planner, memory-maintenance | task-planner, skill-extractor, skill-reviser, pr-feedback-harvester, memory-maintenance |
 | **Sync sources** | Telegram, Gmail, GitHub | None by default (can add custom sources) |
 | **Channels** | Web UI + Telegram bot | Web UI (+ Telegram if configured) |
 | **Onboarding** | Interactive — user configures identity and preferences | Autonomous — agent researches task and self-configures |
