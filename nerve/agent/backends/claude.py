@@ -934,10 +934,18 @@ class ClaudeBackend:
         return "4-5" in m or "4-6" in m
 
     @staticmethod
+    def _model_rejects_disabled_thinking(model: str | None) -> bool:
+        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
+        # level. Effort is the only control.
+        return bool(model) and "opus-5-5" in model.lower()
+
+    @staticmethod
     def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
+            if ClaudeBackend._model_rejects_disabled_thinking(model):
+                return {"type": "adaptive"}
             return {"type": "disabled"}
         if v == "adaptive":
             return {"type": "adaptive"}
@@ -964,6 +972,7 @@ class ClaudeBackend:
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
+        "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
