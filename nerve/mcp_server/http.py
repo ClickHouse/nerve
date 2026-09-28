@@ -34,7 +34,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
 from nerve.agent.tools import ToolContext, ToolRegistry
-from nerve.gateway.auth import MCP_WORKER_CLAIM
+from nerve.gateway.auth import MCP_WORKER_CLAIM, effective_jwt_secret
 from nerve.mcp_server.audit import build_audit_writer
 from nerve.mcp_server.auth import (
     McpAuthError,
@@ -125,7 +125,8 @@ def _bound_identity_from_request(
     The signature was already verified at the ASGI mount; this re-decode
     only extracts the (signed) claim — cheap HS256, per tool call.
     """
-    if not config.auth.jwt_secret:
+    secret = effective_jwt_secret(config)
+    if not secret:
         return None, {}
     if rctx is None:
         return None, {}
@@ -144,7 +145,7 @@ def _bound_identity_from_request(
     if not token:
         return None, {}
     try:
-        payload = decode_mcp_token(token, config.auth.jwt_secret)
+        payload = decode_mcp_token(token, secret)
     except Exception:
         return None, {}
     runtime: dict[str, str] = {}

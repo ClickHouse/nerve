@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from nerve import paths
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
     AgentClient,
@@ -172,6 +173,7 @@ class CodexBackend:
 
     def __init__(self, deps: Any):
         self._deps = deps
+        paths.ensure_nerve_home()  # the default CODEX_HOME is under the state dir
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
         self._preflight_cache: tuple[float, dict[str, Any]] | None = None
         self._preflight_lock = asyncio.Lock()

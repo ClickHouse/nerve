@@ -1,0 +1,685 @@
+"""State-file security: the directory and database files are owner-only.
+
+On every open, ``Database.connect``:
+
+* refuses to open, with no migration and no repair, when another user can
+  write to the state directory, a database file or a sidecar, or a mode cannot
+  be read;
+* makes the directory 0700 and the files 0600, and verifies the result. This
+  includes group write when the group contains only the owner;
+* deletes a stored signing secret that was readable before the repair, and
+  drops it from the process pin.
+
+Every opener goes through ``connect()``. ``test_cli_openers.py`` covers the
+CLI.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import stat
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import nerve.db.base as base
+from nerve.config import AuthConfig, NerveConfig
+from nerve.db import Database, init_db
+from nerve.db.accounts import JWT_SECRET_NAME
+from nerve.gateway.auth import (
+    create_token,
+    decode_token,
+    effective_jwt_secret,
+    pin_jwt_secret,
+    pinned_jwt_secret,
+)
+from nerve.migrate import (
+    InsecureSecretStorage,
+    InsecureStateStorage,
+    bootstrap_identity,
+)
+
+_CONFIGURED = "configured-secret-padded-to-thirty-two-bytes!!"
+_S1 = "s1-generated-secret-padded-to-32-bytes!!"
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _tables(path: Path) -> set[str]:
+    conn = sqlite3.connect(str(path))
+    try:
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+@pytest.fixture(params=[0o022, 0o000], ids=["umask-022", "umask-000"])
+def permissive_umask(request):
+    old = os.umask(request.param)
+    yield request.param
+    os.umask(old)
+
+
+@pytest.fixture
+def shared_group(monkeypatch):
+    """Group write counts as another user's access, whatever this machine's
+    group setup is."""
+    monkeypatch.setattr(base, "_group_is_owner_only", lambda path: False)
+
+
+@pytest.fixture
+def owner_only_group(monkeypatch):
+    """The group of every state path contains only its owner."""
+    monkeypatch.setattr(base, "_group_is_owner_only", lambda path: True)
+
+
+async def _make_db(path: Path) -> None:
+    """Create a secured, migrated, empty database and close it. Nothing is
+    pinned, because only the bootstrap pins."""
+    db = Database(path)
+    await db.connect()
+    await db.close()
+
+
+async def _make_db_with_secret(path: Path, secret: str) -> None:
+    """A secured DB that holds ``secret`` as its jwt_secret, then closed."""
+    db = Database(path)
+    await db.connect()
+    try:
+        await db._ensure_instance_secret(JWT_SECRET_NAME, secret)
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------------------------------- #
+#  The good cases                                                              #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_fresh_database_is_owner_only(tmp_path, permissive_umask):
+    db_path = tmp_path / "state" / "nerve.db"
+    db = Database(db_path)
+    await db.connect()
+    try:
+        await db._write("CREATE TABLE IF NOT EXISTS t (x INTEGER)")  # force the WAL sidecars
+        assert _mode(db_path.parent) == 0o700
+        assert _mode(db_path) == 0o600
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{db_path}{suffix}")
+            if sidecar.exists():
+                assert _mode(sidecar) == 0o600, sidecar
+        assert db.state_secured
+        assert db.state_permissions.secured
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_directory_created_by_connect_is_owner_only_even_under_umask_000(
+    tmp_path, permissive_umask,
+):
+    """connect() creates a missing state directory 0700 under any umask, so
+    its own refusal does not fire on it."""
+    db_path = tmp_path / "state" / "nested" / "nerve.db"
+    await _make_db(db_path)
+    assert _mode(db_path.parent) == 0o700
+
+
+def test_nerve_creates_its_own_state_directory_owner_only(tmp_path, permissive_umask, monkeypatch):
+    """``ensure_nerve_home`` creates the state directory 0700 under any umask
+    and leaves an existing one unchanged; connect() judges that one."""
+    from nerve import paths
+
+    home = tmp_path / "home" / ".nerve"
+    monkeypatch.setenv("NERVE_HOME", str(home))
+    assert paths.ensure_nerve_home() == home
+    assert _mode(home) == 0o700
+    os.chmod(home, 0o755)
+    assert paths.ensure_nerve_home() == home  # idempotent
+    assert _mode(home) == 0o755  # not re-tightened here
+
+
+@pytest.mark.asyncio
+async def test_a_readable_file_is_repaired_to_owner_only(tmp_path):
+    db_path = tmp_path / "state" / "nerve.db"
+    await _make_db(db_path)
+    os.chmod(db_path, 0o644)  # exposed, no key stored → repaired, nothing to rotate
+
+    db = Database(db_path)
+    await db.connect()
+    try:
+        assert _mode(db_path) == 0o600
+        assert db.state_secured
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_0755_directory_is_not_a_hazard(tmp_path):
+    """Group/world read on the directory is accepted and tightened to 0700.
+    Only write access is a hazard."""
+    state = tmp_path / "state"
+    state.mkdir()
+    os.chmod(state, 0o755)  # explicit: a 002 umask gives 0775 (TestOwnerOnlyGroupWrite)
+    db_path = state / "nerve.db"
+    await _make_db(db_path)
+    os.chmod(state, 0o755)
+
+    db = Database(db_path)
+    await db.connect()
+    try:
+        assert db.state_secured
+        assert not db.state_permissions.writable
+        assert _mode(state) == 0o700
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_hardening_is_idempotent_across_reconnects(tmp_path):
+    db_path = tmp_path / "state" / "nerve.db"
+    for _ in range(2):
+        await _make_db(db_path)
+    assert _mode(db_path.parent) == 0o700
+    assert _mode(db_path) == 0o600
+
+
+# --------------------------------------------------------------------------- #
+#  Writable or uninspectable state is refused at open, unrepaired             #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("shared_group")
+class TestRefusesToOpenWritableState:
+    """State that another user can write to is not opened, migrated or
+    repaired, whatever the configuration says. The message gives the chmod
+    commands."""
+
+    @pytest.mark.parametrize("mode", [0o666, 0o660, 0o606], ids=["0666", "group-w", "world-w"])
+    async def test_a_writable_database_file_is_refused_before_anything_happens(
+        self, tmp_path, mode,
+    ):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, mode)
+
+        db = Database(db_path)
+        with pytest.raises(InsecureStateStorage) as ei:
+            await db.connect()
+        assert db._db is None  # never opened
+        assert _mode(db_path) == mode  # and not repaired: the evidence stands
+        msg = str(ei.value)
+        assert "Refusing to open" in msg and str(db_path) in msg
+        assert f"{mode:04o}" in msg and "altered" in msg
+        assert f"chmod 700 {db_path.parent}" in msg and f"chmod 600 {db_path}" in msg
+
+    async def test_no_migration_runs_on_a_refused_database(self, tmp_path):
+        """A writable database from older code is refused before migrations
+        can modify a file that another user may have altered."""
+        state = tmp_path / "state"
+        state.mkdir(mode=0o700)
+        old = state / "nerve.db"
+        conn = sqlite3.connect(str(old))
+        conn.execute("CREATE TABLE schema_version (version INTEGER)")
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.commit()
+        conn.close()
+        os.chmod(old, 0o666)
+
+        with pytest.raises(InsecureStateStorage):
+            await Database(old).connect()
+        assert _tables(old) == {"schema_version"}  # untouched
+        assert not Path(f"{old}-wal").exists()
+
+    @pytest.mark.parametrize(
+        "mode", [0o777, 0o770, 0o707, 0o775], ids=["0777", "group-w", "world-w", "0775-umask-002"],
+    )
+    async def test_a_writable_directory_is_refused(self, tmp_path, mode):
+        """Group write counts when the group has other members. That includes
+        0775, which a plain mkdir gives under a 002 umask."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path.parent, mode)
+
+        with pytest.raises(InsecureStateStorage) as ei:
+            await Database(db_path).connect()
+        assert _mode(db_path.parent) == mode  # not repaired
+        assert str(db_path.parent) in str(ei.value)
+
+    async def test_a_writable_sidecar_is_refused(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        wal = Path(f"{db_path}-wal")
+        wal.touch(mode=0o600)
+        os.chmod(wal, 0o666)
+
+        with pytest.raises(InsecureStateStorage) as ei:
+            await Database(db_path).connect()
+        assert str(wal) in str(ei.value)
+        assert _mode(wal) == 0o666
+
+    async def test_a_configured_secret_does_not_excuse_writable_state(self, tmp_path):
+        """Writable state is refused both when the database opens and at the
+        bootstrap backstop, even when a signing secret is configured."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o666)
+        with pytest.raises(InsecureStateStorage):
+            await Database(db_path).connect()
+        # The bootstrap backstop refuses the same finding.
+        from nerve.migrate import _refuse_insecure_secret_storage
+
+        stub = SimpleNamespace(
+            state_permissions=base.StatePermissions(writable=[(db_path, 0o666)]),
+            db_path=db_path,
+        )
+        with pytest.raises(InsecureStateStorage):
+            _refuse_insecure_secret_storage(
+                stub, NerveConfig(auth=AuthConfig(jwt_secret=_CONFIGURED)), log=False,
+            )
+
+    async def test_the_manual_remedy_then_opens_normally(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o666)
+        os.chmod(db_path.parent, 0o777)
+        with pytest.raises(InsecureStateStorage):
+            await Database(db_path).connect()
+
+        os.chmod(db_path.parent, 0o700)  # the operator acknowledges
+        os.chmod(db_path, 0o600)
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert db.state_secured
+        finally:
+            await db.close()
+
+    async def test_the_package_level_opener_is_covered_too(self, tmp_path):
+        """init_db() goes through Database.connect(), so it refuses too."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o666)
+        with pytest.raises(InsecureStateStorage):
+            await init_db(db_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("owner_only_group")
+class TestOwnerOnlyGroupWrite:
+    """Group write is repaired when the group contains only the owner, as a
+    002 umask with per-user groups gives. World write is still refused."""
+
+    async def test_a_umask_002_install_is_repaired(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path.parent, 0o775)
+        os.chmod(db_path, 0o664)
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert _mode(db_path.parent) == 0o700
+            assert _mode(db_path) == 0o600
+            assert db.state_secured
+        finally:
+            await db.close()
+
+    @pytest.mark.parametrize(
+        "target,mode", [("dir", 0o777), ("file", 0o666)], ids=["dir-0777", "file-0666"],
+    )
+    async def test_world_write_is_refused(self, tmp_path, target, mode):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        path = db_path.parent if target == "dir" else db_path
+        os.chmod(path, mode)
+
+        with pytest.raises(InsecureStateStorage):
+            await Database(db_path).connect()
+        assert _mode(path) == mode
+
+
+class TestGroupIsOwnerOnly:
+    """``_group_is_owner_only`` accepts only a per-user group."""
+
+    @pytest.fixture
+    def entries(self, tmp_path, monkeypatch):
+        import grp
+        import pwd
+
+        path = tmp_path / "f"
+        path.touch()
+        st = os.stat(path)
+        entries = SimpleNamespace(
+            path=path,
+            uid=st.st_uid,
+            gid=st.st_gid,
+            owner=pwd.struct_passwd(("me", "x", st.st_uid, st.st_gid, "", "/", "/bin/sh")),
+            group=grp.struct_group(("me", "x", st.st_gid, [])),
+            others=[],
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: st.st_uid)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: entries.owner)
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: entries.group)
+        monkeypatch.setattr(pwd, "getpwall", lambda: [entries.owner, *entries.others])
+        return entries
+
+    def test_a_per_user_group_is_owner_only(self, entries):
+        assert base._group_is_owner_only(entries.path)
+
+    def test_a_group_with_another_name_is_not(self, entries):
+        import grp
+
+        entries.group = grp.struct_group(("staff", "x", entries.gid, []))
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_with_another_member_is_not(self, entries):
+        import grp
+
+        entries.group = grp.struct_group(("me", "x", entries.gid, ["me", "bob"]))
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_that_is_another_users_primary_group_is_not(self, entries):
+        import pwd
+
+        entries.others = [pwd.struct_passwd(("bob", "x", 4242, entries.gid, "", "/", "/bin/sh"))]
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_group_that_is_not_the_owners_primary_group_is_not(self, entries):
+        import pwd
+
+        entries.owner = pwd.struct_passwd(
+            ("me", "x", entries.uid, entries.gid + 1, "", "/", "/bin/sh"),
+        )
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_file_owned_by_another_user_is_not(self, entries, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: entries.uid + 1)
+        assert not base._group_is_owner_only(entries.path)
+
+    def test_a_failed_lookup_is_not(self, entries, monkeypatch):
+        import grp
+
+        def missing(gid):
+            raise KeyError(gid)
+
+        monkeypatch.setattr(grp, "getgrgid", missing)
+        assert not base._group_is_owner_only(entries.path)
+
+
+@pytest.mark.asyncio
+class TestUninspectableIsRefused:
+    """A mode that cannot be read is treated as unsafe, even when the failure
+    is transient."""
+
+    async def test_a_one_shot_stat_failure_refuses_the_open(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+
+        real_mode_of = base._mode_of
+        calls = {"n": 0}
+
+        def flaky_mode_of(path):
+            if str(path) == str(db_path):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return None  # the first inspection of the db fails
+            return real_mode_of(path)
+
+        base_mode_of = base._mode_of
+        base._mode_of = flaky_mode_of
+        try:
+            with pytest.raises(InsecureStateStorage) as ei:
+                await Database(db_path).connect()
+            assert "cannot be read" in str(ei.value) and str(db_path) in str(ei.value)
+        finally:
+            base._mode_of = base_mode_of
+        assert base._mode_of is real_mode_of
+
+        # The failure was transient, so the next open works.
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert db.state_secured
+        finally:
+            await db.close()
+
+    async def test_an_uninspectable_directory_refuses_the_open(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        real_mode_of = base._mode_of
+        monkeypatch.setattr(
+            base, "_mode_of",
+            lambda p: None if str(p) == str(db_path.parent) else real_mode_of(p),
+        )
+        with pytest.raises(InsecureStateStorage) as ei:
+            await Database(db_path).connect()
+        assert str(db_path.parent) in str(ei.value)
+
+    async def test_a_verifying_read_that_fails_after_repair_refuses_too(
+        self, tmp_path, monkeypatch,
+    ):
+        """0644 passes the pre-open inspection, but the read that verifies the
+        chmod fails. The open is refused and the connection is closed."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o644)
+
+        real_mode_of = base._mode_of
+        calls = {"n": 0}
+
+        def flaky_mode_of(path):
+            if str(path) == str(db_path):
+                calls["n"] += 1
+                if calls["n"] >= 3:  # 1: inspect, 2: repair's pre-read, 3: verify
+                    return None
+            return real_mode_of(path)
+
+        monkeypatch.setattr(base, "_mode_of", flaky_mode_of)
+        db = Database(db_path)
+        with pytest.raises(InsecureStateStorage) as ei:
+            await db.connect()
+        assert db._db is None
+        assert "cannot be read" in str(ei.value) and str(db_path) in str(ei.value)
+
+
+# --------------------------------------------------------------------------- #
+#  A key exposed while the file was readable is rotated                       #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestExposedKeyIsRotated:
+    async def test_automatic_repair_rotates_the_exposed_key(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db_with_secret(db_path, _S1)
+        s1_token = create_token(_S1)
+
+        os.chmod(db_path, 0o644)  # exposed; copy S1
+        db = Database(db_path)
+        await db.connect()  # repairs to 0600 AND rotates S1
+        try:
+            assert _mode(db_path) == 0o600
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
+            # Bootstrap now generates a fresh S3, distinct from S1.
+            await bootstrap_identity(db, NerveConfig())
+            s3 = await db._get_instance_secret(JWT_SECRET_NAME)
+            assert s3 and s3 != _S1
+            assert effective_jwt_secret(NerveConfig()) == s3
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(NerveConfig()))
+        finally:
+            await db.close()
+
+    async def test_exposed_but_unrepairable_rotates_then_refuses(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db_with_secret(db_path, _S1)
+        os.chmod(db_path, 0o644)
+        monkeypatch.setattr(base.os, "chmod", lambda *a, **k: None)  # cannot repair
+
+        db = Database(db_path)
+        await db.connect()  # read exposure is not a refusal; it still rotates
+        try:
+            assert db.state_permissions.readable and not db.state_secured
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None  # rotated
+            # No configured secret + still-readable file → refuse to generate one.
+            with pytest.raises(InsecureStateStorage):
+                await bootstrap_identity(db, NerveConfig())
+        finally:
+            await db.close()
+
+    async def test_exposed_with_a_configured_secret_rotates_and_uses_config(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db_with_secret(db_path, _S1)
+        s1_token = create_token(_S1)
+
+        os.chmod(db_path, 0o644)
+        db = Database(db_path)
+        await db.connect()  # repairs + rotates S1
+        try:
+            config = NerveConfig(auth=AuthConfig(jwt_secret=_CONFIGURED))
+            await bootstrap_identity(db, config)
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
+            assert effective_jwt_secret(config) == _CONFIGURED
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(config))
+        finally:
+            await db.close()
+
+    async def test_a_readable_db_that_never_held_a_key_is_not_rotated(self, tmp_path):
+        """A 0644 database with no stored secret has nothing to rotate. After
+        the repair a secret is generated normally."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o644)
+
+        db = Database(db_path)
+        await db.connect()  # repaired; no key row → no rotation
+        try:
+            report = await bootstrap_identity(db, NerveConfig())
+            assert report.generated_jwt_secret
+            assert await db._get_instance_secret(JWT_SECRET_NAME)
+        finally:
+            await db.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Rotation reaches the process pin                                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestRotationReachesThePin:
+    """Retiring an exposed key also drops a matching process pin, so requests
+    fail closed until the bootstrap pins the replacement."""
+
+    async def test_the_pinned_compromised_key_is_unpinned_and_then_replaced(self, tmp_path):
+        db_path = tmp_path / "state" / "nerve.db"
+        config = NerveConfig()
+
+        db = Database(db_path)
+        await db.connect()
+        await bootstrap_identity(db, config)  # generates S1 and pins it
+        s1 = await db._get_instance_secret(JWT_SECRET_NAME)
+        await db.close()
+        assert s1 and pinned_jwt_secret() == s1
+        s1_token = create_token(s1)
+
+        os.chmod(db_path, 0o644)  # exposed; someone copies S1
+
+        db2 = Database(db_path)
+        await db2.connect()  # repairs, retires S1 on disk *and* unpins it
+        try:
+            assert await db2._get_instance_secret(JWT_SECRET_NAME) is None
+            assert pinned_jwt_secret() == ""
+            assert effective_jwt_secret(config) == ""  # fail closed: nothing verifies
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(config))
+
+            await bootstrap_identity(db2, config)  # pins the replacement S3
+            s3 = await db2._get_instance_secret(JWT_SECRET_NAME)
+            assert s3 and s3 != s1
+            assert effective_jwt_secret(config) == s3
+            with pytest.raises(Exception):
+                decode_token(s1_token, effective_jwt_secret(config))  # S1 rejected
+            assert decode_token(create_token(s3), effective_jwt_secret(config))  # S3 accepted
+        finally:
+            await db2.close()
+
+    async def test_a_pin_that_is_not_the_retired_key_is_left_alone(self, tmp_path):
+        """An exposed stored key is retired, but a pinned configured secret
+        that differs from it stays pinned."""
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db_with_secret(db_path, _S1)
+        pin_jwt_secret(_CONFIGURED)
+        os.chmod(db_path, 0o644)
+
+        db = Database(db_path)
+        await db.connect()
+        try:
+            assert await db._get_instance_secret(JWT_SECRET_NAME) is None
+            assert pinned_jwt_secret() == _CONFIGURED
+        finally:
+            await db.close()
+
+
+@pytest.mark.asyncio
+class TestAFailedConnectLeavesNothingOpen:
+    """``aiosqlite.connect`` starts a non-daemon thread, so any failure after
+    it closes the connection. Otherwise the thread keeps the process alive."""
+
+    async def test_a_failed_migration_closes_the_connection(self, tmp_path, monkeypatch):
+        import asyncio
+        import threading
+
+        db_path = tmp_path / "state" / "nerve.db"
+        before = threading.active_count()
+
+        async def boom(_conn):
+            raise sqlite3.OperationalError("migration exploded")
+
+        monkeypatch.setattr(base, "run_migrations", boom)
+        db = Database(db_path)
+        with pytest.raises(sqlite3.OperationalError, match="migration exploded"):
+            await db.connect()
+
+        assert db._db is None
+        for _ in range(50):  # the connection thread exits once it is closed
+            if threading.active_count() <= before:
+                break
+            await asyncio.sleep(0.02)
+        assert threading.active_count() <= before
+
+    async def test_the_global_is_not_published_by_a_failed_open(
+        self, tmp_path, monkeypatch,
+    ):
+        """A refused open leaves the global unset, so ``get_db()`` raises."""
+        import nerve.db as db_pkg
+
+        db_path = tmp_path / "state" / "nerve.db"
+        await _make_db(db_path)
+        os.chmod(db_path, 0o666)  # the state-file policy refuses this
+        monkeypatch.setattr(db_pkg, "_db", None)
+
+        with pytest.raises(InsecureStateStorage):
+            await init_db(db_path)
+        assert db_pkg._db is None
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await db_pkg.get_db()
+
+
+def test_the_round2_exception_name_still_resolves():
+    assert InsecureSecretStorage is InsecureStateStorage
+    assert InsecureStateStorage is base.InsecureStateStorage
+
+
+def test_restore_re_tightens_the_database_file():
+    from nerve import backup
+
+    assert "nerve.db" in backup._SECRET_RESTORE_PATHS

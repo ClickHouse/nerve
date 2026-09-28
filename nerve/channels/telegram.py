@@ -1089,6 +1089,8 @@ class TelegramChannel(BaseChannel):
             )
             return
         except Exception:
+            # Includes paths.InsecureFileError (nothing was saved). The user is
+            # paired only until restart, and the reply says so.
             logger.exception("Paired user %d but failed to persist to config", user_id)
             await update.message.reply_text(
                 "Paired for this run, but saving to config failed — check "

@@ -50,8 +50,9 @@ def stub_discovery(monkeypatch):
 
 
 @pytest.fixture
-def make_client():
-    """Factory: build a TestClient around a config + codex preflight stub."""
+def make_client(bypass_auth):
+    """Factory: build a TestClient around a config + codex preflight stub.
+    Auth is overridden on the app; these routes are not about it."""
     import nerve.config as cfg_mod
 
     created: list[Any] = []
@@ -65,9 +66,6 @@ def make_client():
         from nerve.gateway.routes.models import router as models_router
 
         cfg = cfg or NerveConfig()
-        # Auth dependency reads get_config().auth.jwt_secret — no secret
-        # makes require_auth a no-op.
-        cfg.auth.jwt_secret = ""
         cfg_mod._config = cfg
 
         backends: dict[str, Any] = {}
@@ -78,6 +76,7 @@ def make_client():
 
         app = FastAPI()
         app.include_router(models_router)
+        bypass_auth(app)
         client = TestClient(app)
         created.append(client)
         return client

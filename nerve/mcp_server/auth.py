@@ -1,16 +1,13 @@
 """Authenticate external MCP requests against the gateway JWT.
 
-The external MCP endpoint reuses Nerve's existing JWT secret
-(``config.auth.jwt_secret``) and the same token mechanism the web UI
-uses — no separate credential store, no per-client token table. A
-client (Codex, Claude Code, etc.) presents the JWT it received from
-``POST /api/auth/login`` either as an ``Authorization: Bearer <jwt>``
-header or as a ``?token=<jwt>`` query parameter.
+The external MCP endpoint uses the same JWT secret and tokens as the web UI
+(see :func:`nerve.gateway.auth.effective_jwt_secret`); there is no separate
+credential store. A client (Codex, Claude Code, etc.) sends the JWT from
+``POST /api/auth/login`` as an ``Authorization: Bearer <jwt>`` header or a
+``?token=<jwt>`` query parameter.
 
-When ``config.auth.jwt_secret`` is empty (Nerve's "dev mode") the
-gateway accepts all requests without auth; this module mirrors that
-behaviour so a fresh install can be smoke-tested locally without
-fiddling with credentials.
+There is no unauthenticated mode. Until startup pins a secret, every request
+is refused, as in the web gateway.
 """
 
 from __future__ import annotations
@@ -22,7 +19,13 @@ from fastapi import HTTPException
 from starlette.types import Scope
 
 from nerve.config import NerveConfig
-from nerve.gateway.auth import MCP_AUDIENCE, MCP_SESSION_CLAIM, decode_token
+from nerve.gateway.auth import (
+    MCP_AUDIENCE,
+    MCP_SESSION_CLAIM,
+    NO_SECRET_DETAIL,
+    decode_token,
+    effective_jwt_secret,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,23 +84,22 @@ def decode_mcp_token(token: str, jwt_secret: str) -> dict:
     return decode_token(token, jwt_secret, audience=MCP_AUDIENCE)
 
 
-def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
+def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict:
     """Validate the JWT on an incoming MCP request.
 
-    Returns the decoded JWT payload on success, ``None`` in dev mode
-    (no jwt_secret configured), and raises :class:`McpAuthError` on
-    auth failure.
+    Returns the decoded JWT payload. Raises :class:`McpAuthError` on a
+    missing or invalid token, or when no signing secret is pinned yet.
     """
-    if not config.auth.jwt_secret:
-        # Dev mode — matches gateway.auth.require_auth's bypass.
-        return None
+    secret = effective_jwt_secret(config)
+    if not secret:
+        raise McpAuthError(NO_SECRET_DETAIL)
 
     token = _extract_token_from_scope(scope)
     if not token:
         raise McpAuthError("Missing token")
 
     try:
-        return decode_mcp_token(token, config.auth.jwt_secret)
+        return decode_mcp_token(token, secret)
     except HTTPException as e:
         # decode_token raises FastAPI HTTPException; translate so the
         # caller doesn't need to import fastapi.
@@ -107,8 +109,8 @@ def authenticate_mcp(scope: Scope, config: NerveConfig) -> dict | None:
 def bound_session_id(payload: dict | None) -> str | None:
     """The engine session a decoded MCP token is bound to (or ``None``).
 
-    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and
-    dev mode's ``None`` payload) return ``None`` → satellite attribution.
+    Only ``aud=nerve-mcp`` tokens carry the claim; ordinary tokens (and a
+    ``None`` payload) return ``None`` → satellite attribution.
     """
     if not payload:
         return None

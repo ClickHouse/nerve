@@ -383,11 +383,14 @@ class AgentEngine:
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
-        from nerve.gateway.auth import create_mcp_session_token
+        from nerve.gateway.auth import create_mcp_session_token, effective_jwt_secret
 
-        if not self.config.auth.jwt_secret:
-            return ""  # dev mode — endpoint accepts unauthenticated calls
-        return create_mcp_session_token(self.config.auth.jwt_secret, session_id)
+        secret = effective_jwt_secret(self.config)
+        if not secret:
+            # No secret is pinned before startup completes. The endpoint
+            # refuses every request then, so an empty token is enough.
+            return ""
+        return create_mcp_session_token(secret, session_id)
 
     def _backend_for(self, session: dict | None, source: str) -> AgentBackend:
         """Resolve the backend for a session — STICKY on the stored column.

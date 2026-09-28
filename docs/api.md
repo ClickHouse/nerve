@@ -2,16 +2,28 @@
 
 ## REST API
 
-All endpoints require JWT authentication via `Authorization: Bearer <token>` header or `nerve_token` cookie.
+Unless noted otherwise, endpoints require a JWT in the `Authorization: Bearer
+<token>` header or `nerve_token` cookie.
 
 ### Auth
 
 #### `POST /api/auth/login`
-Login with password, receive JWT.
+Log in and receive a session token. Authentication is not required.
 
 ```json
 Request:  { "password": "..." }
 Response: { "token": "eyJ..." }
+```
+
+When `auth.password_hash` is unset, any password is accepted for the sole local
+account. Treat the returned token as opaque. A `503` response means startup has
+not selected a signing secret yet.
+
+#### `GET /api/auth/status`
+Return whether login requires a password. Authentication is not required.
+
+```json
+Response: { "auth_required": true }
 ```
 
 #### `GET /api/auth/check`

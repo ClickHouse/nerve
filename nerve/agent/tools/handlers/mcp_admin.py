@@ -52,7 +52,7 @@ async def nerve_api_handler(ctx: ToolContext, args: dict) -> ToolResult:
         app = _get_nerve_asgi_app()
 
         # Generate an internal auth token
-        from nerve.gateway.auth import create_token
+        from nerve.gateway.auth import create_token, effective_jwt_secret
         if ctx.config is not None:
             cfg = ctx.config
         else:
@@ -60,8 +60,9 @@ async def nerve_api_handler(ctx: ToolContext, args: dict) -> ToolResult:
             cfg = get_config()
 
         headers = {}
-        if cfg.auth.jwt_secret:
-            token = create_token(cfg.auth.jwt_secret)
+        secret = effective_jwt_secret(cfg)
+        if secret:
+            token = create_token(secret)
             headers["Authorization"] = f"Bearer {token}"
 
         method = (args.get("method") or "GET").upper()

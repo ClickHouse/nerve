@@ -222,6 +222,7 @@ class ProxyService:
     def _write_proxy_config(self) -> Path:
         """Write the proxy's own config.yaml and return its path."""
         auth_dir = self.config.proxy.auth_dir.expanduser()
+        paths.ensure_nerve_home()  # the defaults are in the state dir; create it owner-only
         # Create the auth directory owner-only *before* the proxy writes any
         # OAuth token JSON into it. The proxy's own files — token JSON, and the
         # error logs it writes (whose exact location varies by proxy version) —
@@ -301,7 +302,11 @@ class ProxyService:
 
         log_file = self.config.proxy.log_file.expanduser()
 
-        log_fd = await asyncio.to_thread(_open_private_append_log, log_file)
+        def _open_log():
+            paths.ensure_nerve_home()  # the log lives in the state dir; create it owner-only
+            return _open_private_append_log(log_file)
+
+        log_fd = await asyncio.to_thread(_open_log)
 
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -328,8 +333,14 @@ class ProxyService:
             self._process.pid, self.config.proxy.port,
         )
 
-        # Wait for the proxy to become healthy.
-        healthy = await self._wait_for_healthy(timeout=15)
+        # The subprocess is in its own process group, so any failure from here
+        # on, including a cancellation during the health wait, must stop it.
+        # Otherwise it keeps running and holds the port.
+        try:
+            healthy = await self._wait_for_healthy(timeout=15)
+        except BaseException:
+            await self.stop()
+            raise
         if not healthy:
             await self.stop()
             raise RuntimeError(
