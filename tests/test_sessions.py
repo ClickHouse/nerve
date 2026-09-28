@@ -22,19 +22,19 @@ class TestSessionCreation:
     """Test session creation."""
 
     async def test_get_or_create_new(self, sm: SessionManager):
-        session = await sm.get_or_create("new-1", title="New Session")
+        session = await sm.get_or_create("new-1", title="New Session", actor=None)
         assert session["id"] == "new-1"
         assert session["title"] == "New Session"
 
     async def test_get_or_create_existing(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("exist-1", title="First")
-        session = await sm.get_or_create("exist-1", title="Second")
+        await sm.get_or_create("exist-1", title="First", actor=None)
+        session = await sm.get_or_create("exist-1", title="Second", actor=None)
         # Should return existing, not overwrite
         real = await db.get_session("exist-1")
         assert real["title"] == "First"
 
     async def test_create_logs_event(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("evlog-1", source="web")
+        await sm.get_or_create("evlog-1", source="web", actor=None)
         events = await db.get_session_events("evlog-1")
         assert len(events) == 1
         assert events[0]["event_type"] == "created"
@@ -45,7 +45,7 @@ class TestLifecycleTransitions:
     """Test session status transitions."""
 
     async def test_mark_active(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-1")
+        await sm.get_or_create("trans-1", actor=None)
         await sm.mark_active("trans-1", sdk_session_id="sdk-1", connected_at="2024-01-01T00:00:00")
         session = await db.get_session("trans-1")
         assert session["status"] == "active"
@@ -59,7 +59,7 @@ class TestLifecycleTransitions:
         must still advance to now, since it drives channel stickiness. Regression:
         last_activity_at was pinned to connected_at, freezing it at session start."""
         from datetime import datetime, timezone
-        await sm.get_or_create("trans-la")
+        await sm.get_or_create("trans-la", actor=None)
         old = "2020-01-01T00:00:00+00:00"
         await sm.mark_active("trans-la", sdk_session_id="sdk-la", connected_at=old)
         session = await db.get_session("trans-la")
@@ -71,7 +71,7 @@ class TestLifecycleTransitions:
         assert (datetime.now(timezone.utc) - last).total_seconds() < 60
 
     async def test_mark_idle_preserves_sdk_id(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-2")
+        await sm.get_or_create("trans-2", actor=None)
         await sm.mark_active("trans-2", sdk_session_id="sdk-2")
         await sm.mark_idle("trans-2", preserve_sdk_id=True)
         session = await db.get_session("trans-2")
@@ -79,7 +79,7 @@ class TestLifecycleTransitions:
         assert session["sdk_session_id"] == "sdk-2"
 
     async def test_mark_idle_clears_sdk_id(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-3")
+        await sm.get_or_create("trans-3", actor=None)
         await sm.mark_active("trans-3", sdk_session_id="sdk-3")
         await sm.mark_idle("trans-3", preserve_sdk_id=False)
         session = await db.get_session("trans-3")
@@ -88,20 +88,20 @@ class TestLifecycleTransitions:
         assert session["connected_at"] is None
 
     async def test_mark_stopped(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-4")
+        await sm.get_or_create("trans-4", actor=None)
         await sm.mark_stopped("trans-4")
         session = await db.get_session("trans-4")
         assert session["status"] == "stopped"
 
     async def test_mark_error(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-5")
+        await sm.get_or_create("trans-5", actor=None)
         await sm.mark_error("trans-5", "something broke")
         session = await db.get_session("trans-5")
         assert session["status"] == "error"
         assert session["sdk_session_id"] is None
 
     async def test_transitions_log_events(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("trans-ev")
+        await sm.get_or_create("trans-ev", actor=None)
         await sm.mark_active("trans-ev", sdk_session_id="x")
         await sm.mark_idle("trans-ev")
         events = await db.get_session_events("trans-ev")
@@ -116,7 +116,7 @@ class TestChannelMapping:
 
     async def test_auto_session_created_on_first_message(self, sm: SessionManager, db: Database):
         """When a channel has no mapping, a new session is created automatically."""
-        sid = await sm.get_active_session("telegram:999", source="telegram")
+        sid = await sm.get_active_session("telegram:999", source="telegram", actor=None)
         assert len(sid) == 8  # Short UUID
         session = await db.get_session(sid)
         assert session is not None
@@ -124,17 +124,17 @@ class TestChannelMapping:
 
     async def test_auto_session_reused_within_sticky_period(self, sm: SessionManager, db: Database):
         """Same session returned if last activity is within sticky period."""
-        sid1 = await sm.get_active_session("telegram:111", source="telegram")
+        sid1 = await sm.get_active_session("telegram:111", source="telegram", actor=None)
         # Simulate recent activity
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         await db.update_session_fields(sid1, {"last_activity_at": now})
-        sid2 = await sm.get_active_session("telegram:111", source="telegram")
+        sid2 = await sm.get_active_session("telegram:111", source="telegram", actor=None)
         assert sid1 == sid2
 
     async def test_auto_session_rotated_after_sticky_period(self, sm: SessionManager, db: Database):
         """New session created if last activity exceeds sticky period."""
-        sid1 = await sm.get_active_session("telegram:222", source="telegram")
+        sid1 = await sm.get_active_session("telegram:222", source="telegram", actor=None)
         # Simulate old activity (3 hours ago, beyond 2h default)
         await db.update_session_fields(sid1, {
             "last_activity_at": "2020-01-01T00:00:00+00:00",
@@ -144,7 +144,7 @@ class TestChannelMapping:
             (sid1,),
         )
         await db.db.commit()
-        sid2 = await sm.get_active_session("telegram:222", source="telegram")
+        sid2 = await sm.get_active_session("telegram:222", source="telegram", actor=None)
         assert sid1 != sid2
 
     async def test_auto_session_reused_when_active_despite_old_timestamp(
@@ -158,7 +158,7 @@ class TestChannelMapping:
         sticky_period_minutes would orphan the session and route the
         user's follow-up message into a fresh, empty one.
         """
-        sid1 = await sm.get_active_session("telegram:333", source="telegram")
+        sid1 = await sm.get_active_session("telegram:333", source="telegram", actor=None)
         # Mark active and back-date timestamps to look like a hung turn that
         # started long before the sticky-period cutoff.
         await sm.mark_active(sid1, sdk_session_id="sdk-stuck")
@@ -170,7 +170,7 @@ class TestChannelMapping:
             (sid1,),
         )
         await db.db.commit()
-        sid2 = await sm.get_active_session("telegram:333", source="telegram")
+        sid2 = await sm.get_active_session("telegram:333", source="telegram", actor=None)
         assert sid1 == sid2
 
     async def test_auto_session_rotated_when_idle_after_sticky_period(
@@ -182,7 +182,7 @@ class TestChannelMapping:
         the engine's exception path), the time-based cutoff applies again
         and a new follow-up message mints a fresh session.
         """
-        sid1 = await sm.get_active_session("telegram:444", source="telegram")
+        sid1 = await sm.get_active_session("telegram:444", source="telegram", actor=None)
         await sm.mark_active(sid1, sdk_session_id="sdk-x")
         await sm.mark_idle(sid1)
         await db.update_session_fields(sid1, {
@@ -193,7 +193,7 @@ class TestChannelMapping:
             (sid1,),
         )
         await db.db.commit()
-        sid2 = await sm.get_active_session("telegram:444", source="telegram")
+        sid2 = await sm.get_active_session("telegram:444", source="telegram", actor=None)
         assert sid1 != sid2
 
     async def test_resumed_long_lived_session_stays_sticky_after_turn(
@@ -207,23 +207,23 @@ class TestChannelMapping:
         forked a fresh session even though a turn had just completed. last_activity_at
         must track the turn, so the same session is reused.
         """
-        sid1 = await sm.get_active_session("telegram:555", source="telegram")
+        sid1 = await sm.get_active_session("telegram:555", source="telegram", actor=None)
         # A turn resumes hours after the session first connected (original
         # connected_at is far in the past), then the turn finishes and goes idle.
         old_connect = "2020-01-01T00:00:00+00:00"
         await sm.mark_active(sid1, sdk_session_id="sdk-r", connected_at=old_connect)
         await sm.mark_idle(sid1)
-        sid2 = await sm.get_active_session("telegram:555", source="telegram")
+        sid2 = await sm.get_active_session("telegram:555", source="telegram", actor=None)
         assert sid1 == sid2
 
     async def test_set_and_get_active_session(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("ch-1")
+        await sm.get_or_create("ch-1", actor=None)
         await sm.set_active_session("telegram:123", "ch-1")
         # Simulate recent activity so sticky period passes
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         await db.update_session_fields("ch-1", {"last_activity_at": now})
-        sid = await sm.get_active_session("telegram:123")
+        sid = await sm.get_active_session("telegram:123", actor=None)
         assert sid == "ch-1"
 
     async def test_set_active_session_not_found(self, sm: SessionManager):
@@ -242,7 +242,7 @@ class TestChannelMapping:
         user's switch. set_active_session marks the chosen session freshly active
         so the choice is honoured.
         """
-        await sm.get_or_create("old-sess", source="telegram")
+        await sm.get_or_create("old-sess", source="telegram", actor=None)
         await db.update_session_fields(
             "old-sess", {"last_activity_at": "2020-01-01T00:00:00+00:00"},
         )
@@ -252,7 +252,7 @@ class TestChannelMapping:
         )
         await db.db.commit()
         await sm.set_active_session("telegram:777", "old-sess")   # explicit switch
-        sid = await sm.get_active_session("telegram:777", source="telegram")
+        sid = await sm.get_active_session("telegram:777", source="telegram", actor=None)
         assert sid == "old-sess"    # honoured, not rotated to a fresh session
 
 
@@ -347,27 +347,27 @@ class TestFork:
         native_turn_id (like a real completed turn). Returns row info."""
         rows = []
         for n in range(1, turns + 1):
-            uid = await db.add_message(session_id, "user", f"prompt {n}")
+            uid = await db.add_message(session_id, "user", f"prompt {n}", actor=None)
             aid = await db.add_message(
                 session_id, "assistant", f"answer {n}",
-                native_turn_id=f"turn-{n}",
+                native_turn_id=f"turn-{n}", actor=None,
             )
             rows.append({"user_id": uid, "assistant_id": aid, "turn": f"turn-{n}"})
         return rows
 
     async def test_fork_session(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("source-1", title="Source")
+        await sm.get_or_create("source-1", title="Source", actor=None)
         await sm.mark_active("source-1", sdk_session_id="sdk-src-1")
-        fork = await sm.fork_session("source-1", title="My Fork")
+        fork = await sm.fork_session("source-1", title="My Fork", actor=None)
         assert fork["id"].startswith("fork-")
         assert fork["parent_session_id"] == "source-1"
         assert fork["title"] == "My Fork"
 
     async def test_fork_copies_all_messages(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("source-2")
+        await sm.get_or_create("source-2", actor=None)
         await sm.mark_active("source-2", sdk_session_id="sdk-src-2")
         await self._seed_turns(db, "source-2", turns=2)
-        fork = await sm.fork_session("source-2")
+        fork = await sm.fork_session("source-2", actor=None)
         assert fork["message_count"] == 4
         msgs = await db.get_messages(fork["id"])
         assert [m["content"] for m in msgs] == [
@@ -379,12 +379,12 @@ class TestFork:
         assert msgs[3]["native_turn_id"] == "turn-2"
 
     async def test_fork_at_message_truncates_copy(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("source-3")
+        await sm.get_or_create("source-3", actor=None)
         await sm.mark_active("source-3", sdk_session_id="sdk-src-3")
         rows = await self._seed_turns(db, "source-3", turns=3)
         # Anchor at turn 2's assistant row: keep turns 1-2, drop turn 3.
         anchor = rows[1]["assistant_id"]
-        fork = await sm.fork_session("source-3", at_message_id=str(anchor))
+        fork = await sm.fork_session("source-3", at_message_id=str(anchor), actor=None)
         session = await db.get_session(fork["id"])
         assert session["forked_from_message"] == str(anchor)
         msgs = await db.get_messages(fork["id"])
@@ -395,37 +395,37 @@ class TestFork:
     async def test_fork_at_user_message_keeps_its_turn(self, sm: SessionManager, db: Database):
         """Anchoring at a user prompt keeps that prompt's full turn (the
         native fork points are turn boundaries)."""
-        await sm.get_or_create("source-4")
+        await sm.get_or_create("source-4", actor=None)
         await sm.mark_active("source-4", sdk_session_id="sdk-src-4")
         rows = await self._seed_turns(db, "source-4", turns=2)
         fork = await sm.fork_session(
-            "source-4", at_message_id=str(rows[0]["user_id"]),
+            "source-4", at_message_id=str(rows[0]["user_id"]), actor=None,
         )
         msgs = await db.get_messages(fork["id"])
         assert [m["content"] for m in msgs] == ["prompt 1", "answer 1"]
 
     async def test_fork_at_unmapped_message_raises(self, sm: SessionManager, db: Database):
         """A source with no native turn mappings can't be message-forked."""
-        await sm.get_or_create("source-5")
+        await sm.get_or_create("source-5", actor=None)
         await sm.mark_active("source-5", sdk_session_id="sdk-src-5")
-        mid = await db.add_message("source-5", "user", "hello")
-        await db.add_message("source-5", "assistant", "hi")  # no native_turn_id
+        mid = await db.add_message("source-5", "user", "hello", actor=None)
+        await db.add_message("source-5", "assistant", "hi", actor=None)  # no native_turn_id
         with pytest.raises(ValueError, match="native turn mapping"):
-            await sm.fork_session("source-5", at_message_id=str(mid))
+            await sm.fork_session("source-5", at_message_id=str(mid), actor=None)
 
     async def test_fork_without_native_conversation_raises(self, sm: SessionManager):
-        await sm.get_or_create("source-6", title="Fresh")
+        await sm.get_or_create("source-6", title="Fresh", actor=None)
         with pytest.raises(ValueError, match="[Nn]othing to fork"):
-            await sm.fork_session("source-6")
+            await sm.fork_session("source-6", actor=None)
 
     async def test_fork_nonexistent_raises(self, sm: SessionManager):
         with pytest.raises(ValueError, match="not found"):
-            await sm.fork_session("nonexistent")
+            await sm.fork_session("nonexistent", actor=None)
 
     async def test_fork_auto_title(self, sm: SessionManager):
-        await sm.get_or_create("source-7", title="Original")
+        await sm.get_or_create("source-7", title="Original", actor=None)
         await sm.mark_active("source-7", sdk_session_id="sdk-src-7")
-        fork = await sm.fork_session("source-7")
+        fork = await sm.fork_session("source-7", actor=None)
         assert "Fork of Original" in fork["title"]
 
 
@@ -434,7 +434,7 @@ class TestResumeInfo:
     """Test resume info retrieval."""
 
     async def test_get_resume_info(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("resume-1")
+        await sm.get_or_create("resume-1", actor=None)
         await sm.mark_active("resume-1", sdk_session_id="sdk-resume")
         info = await sm.get_resume_info("resume-1")
         assert info["sdk_session_id"] == "sdk-resume"
@@ -450,15 +450,15 @@ class TestCronHookSessions:
     """Test cron and hook session creation."""
 
     async def test_cron_session_with_run_id(self, sm: SessionManager):
-        session = await sm.create_cron_session("daily-check", run_id="20240101-120000")
+        session = await sm.create_cron_session("daily-check", run_id="20240101-120000", actor=None)
         assert session["id"] == "cron:daily-check:20240101-120000"
 
     async def test_cron_session_without_run_id(self, sm: SessionManager):
-        session = await sm.create_cron_session("daily-check")
+        session = await sm.create_cron_session("daily-check", actor=None)
         assert session["id"] == "cron:daily-check"
 
     async def test_hook_session(self, sm: SessionManager):
-        session = await sm.create_hook_session("github", "pr-123")
+        session = await sm.create_hook_session("github", "pr-123", actor=None)
         assert session["id"] == "hook:github:pr-123"
 
 
@@ -467,9 +467,9 @@ class TestMessages:
     """Test message delegation."""
 
     async def test_add_and_get_messages(self, sm: SessionManager):
-        await sm.get_or_create("msg-test")
-        await sm.add_message("msg-test", "user", "hello")
-        await sm.add_message("msg-test", "assistant", "hi there")
+        await sm.get_or_create("msg-test", actor=None)
+        await sm.add_message("msg-test", "user", "hello", actor=None)
+        await sm.add_message("msg-test", "assistant", "hi there", actor=None)
         history = await sm.get_conversation_history("msg-test")
         assert len(history) == 2
         assert history[0]["role"] == "user"
@@ -479,13 +479,13 @@ class TestMessages:
         self, sm: SessionManager,
     ):
         """Completed backend turns survive the SessionManager boundary."""
-        await sm.get_or_create("msg-native-turn")
+        await sm.get_or_create("msg-native-turn", actor=None)
         await sm.add_message(
             "msg-native-turn",
             "assistant",
             "persisted output",
             blocks=[{"type": "text", "content": "persisted output"}],
-            native_turn_id="turn-1",
+            native_turn_id="turn-1", actor=None,
         )
 
         history = await sm.get_conversation_history("msg-native-turn")
@@ -502,14 +502,14 @@ class TestArchiveAndCleanup:
     """Test session archival and cleanup."""
 
     async def test_archive_session(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("arch-1")
+        await sm.get_or_create("arch-1", actor=None)
         await sm.archive_session("arch-1")
         session = await db.get_session("arch-1")
         assert session["status"] == "archived"
         assert session["archived_at"] is not None
 
     async def test_unarchive_session(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("unarch-1")
+        await sm.get_or_create("unarch-1", actor=None)
         await sm.archive_session("unarch-1")
         await sm.unarchive_session("unarch-1")
         session = await db.get_session("unarch-1")
@@ -517,14 +517,14 @@ class TestArchiveAndCleanup:
         assert session["archived_at"] is None
 
     async def test_unarchive_logs_event(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("unarch-ev")
+        await sm.get_or_create("unarch-ev", actor=None)
         await sm.archive_session("unarch-ev")
         await sm.unarchive_session("unarch-ev")
         events = await db.get_session_events("unarch-ev")
         assert any(e["event_type"] == "unarchived" for e in events)
 
     async def test_unarchive_refreshes_updated_at(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("unarch-ts")
+        await sm.get_or_create("unarch-ts", actor=None)
         old = "2000-01-01T00:00:00+00:00"
         await db._write("UPDATE sessions SET updated_at = ? WHERE id = ?", (old, "unarch-ts"))
         await sm.archive_session("unarch-ts")
@@ -538,9 +538,9 @@ class TestArchiveAndCleanup:
             await sm.unarchive_session("does-not-exist")
 
     async def test_list_archived_only_archived(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("keep-live")
+        await sm.get_or_create("keep-live", actor=None)
         await db.update_session_fields("keep-live", {"status": "idle"})
-        await sm.get_or_create("arch-listed")
+        await sm.get_or_create("arch-listed", actor=None)
         await sm.archive_session("arch-listed")
         archived_ids = {s["id"] for s in await sm.list_archived_sessions()}
         assert "arch-listed" in archived_ids
@@ -551,17 +551,17 @@ class TestArchiveAndCleanup:
 
     async def test_count_archived_sessions(self, sm: SessionManager):
         assert await sm.count_archived_sessions() == 0
-        await sm.get_or_create("cnt-1")
+        await sm.get_or_create("cnt-1", actor=None)
         await sm.archive_session("cnt-1")
-        await sm.get_or_create("cnt-2")
+        await sm.get_or_create("cnt-2", actor=None)
         await sm.archive_session("cnt-2")
         assert await sm.count_archived_sessions() == 2
 
     async def test_archived_excludes_system_sources(self, sm: SessionManager):
         """Archived group holds conversations only; archived cron/hook excluded."""
-        await sm.get_or_create("arch-web", source="web")
+        await sm.get_or_create("arch-web", source="web", actor=None)
         await sm.archive_session("arch-web")
-        await sm.get_or_create("arch-cron", source="cron")
+        await sm.get_or_create("arch-cron", source="cron", actor=None)
         await sm.archive_session("arch-cron")
         ids = {s["id"] for s in await sm.list_archived_sessions()}
         assert "arch-web" in ids
@@ -570,7 +570,7 @@ class TestArchiveAndCleanup:
 
     async def test_star_archived_field_write_restores(self, sm: SessionManager, db: Database):
         """The update_session route composites star+unarchive; verify the write restores the row to a live, starred state."""
-        await sm.get_or_create("star-arch")
+        await sm.get_or_create("star-arch", actor=None)
         await sm.archive_session("star-arch")
         await db.update_session_fields(
             "star-arch", {"starred": 1, "status": "idle", "archived_at": None},
@@ -581,9 +581,9 @@ class TestArchiveAndCleanup:
         assert session["archived_at"] is None
 
     async def test_feed_excludes_system_and_archived(self, sm: SessionManager):
-        await sm.get_or_create("feed-web", source="web")
-        await sm.get_or_create("feed-cron", source="cron")
-        await sm.get_or_create("feed-arch", source="web")
+        await sm.get_or_create("feed-web", source="web", actor=None)
+        await sm.get_or_create("feed-cron", source="cron", actor=None)
+        await sm.get_or_create("feed-arch", source="web", actor=None)
         await sm.archive_session("feed-arch")
         ids = {s["id"] for s in await sm.list_conversation_sessions()}
         assert "feed-web" in ids
@@ -592,25 +592,25 @@ class TestArchiveAndCleanup:
 
     async def test_feed_keeps_unknown_sources(self, sm: SessionManager):
         """Sources split by exclusion: anything not cron/hook is a conversation, so a new source can never render nowhere."""
-        await sm.get_or_create("feed-workflow", source="workflow")
-        await sm.get_or_create("feed-external", source="external")
+        await sm.get_or_create("feed-workflow", source="workflow", actor=None)
+        await sm.get_or_create("feed-external", source="external", actor=None)
         ids = {s["id"] for s in await sm.list_conversation_sessions()}
         assert {"feed-workflow", "feed-external"} <= ids
 
     async def test_feed_is_unbounded_by_default(self, sm: SessionManager):
         # Regression: the old sidebar feed capped non-starred sessions at 50.
         for i in range(55):
-            await sm.get_or_create(f"many-{i}", source="web")
+            await sm.get_or_create(f"many-{i}", source="web", actor=None)
         feed = await sm.list_conversation_sessions()
         assert len([s for s in feed if s["id"].startswith("many-")]) == 55
 
     async def test_feed_page_window_ignores_system(self, sm: SessionManager):
         """The window applies AFTER system rows are excluded, so cron churn can never displace conversations."""
         for i in range(6):
-            await sm.get_or_create(f"chat-{i}", source="web")
+            await sm.get_or_create(f"chat-{i}", source="web", actor=None)
         for i in range(30):                      # cron churn arrives afterwards
-            await sm.get_or_create(f"cronrun-{i}", source="cron")
-        await sm.get_or_create("late-chat", source="web")
+            await sm.get_or_create(f"cronrun-{i}", source="cron", actor=None)
+        await sm.get_or_create("late-chat", source="web", actor=None)
         page = await sm.list_conversation_sessions(limit=5)
         assert len(page) == 5                    # 5 conversations, not 5 rows of cron
         assert all(s["source"] == "web" for s in page)
@@ -618,7 +618,7 @@ class TestArchiveAndCleanup:
 
     async def test_feed_pages_do_not_overlap(self, sm: SessionManager):
         for i in range(12):
-            await sm.get_or_create(f"page-{i:02d}", source="web")
+            await sm.get_or_create(f"page-{i:02d}", source="web", actor=None)
         first = await sm.list_conversation_sessions(limit=5, offset=0)
         second = await sm.list_conversation_sessions(limit=5, offset=5)
         rest = await sm.list_conversation_sessions(limit=5, offset=10)
@@ -631,10 +631,10 @@ class TestArchiveAndCleanup:
     async def test_starred_never_truncated(self, sm: SessionManager, db: Database):
         """Starred rows are off-budget: excluded from the page window and returned in full however small the page size is."""
         for i in range(8):
-            await sm.get_or_create(f"star-{i}", source="web")
+            await sm.get_or_create(f"star-{i}", source="web", actor=None)
             await db.update_session_fields(f"star-{i}", {"starred": 1})
         for i in range(4):
-            await sm.get_or_create(f"plain-{i}", source="web")
+            await sm.get_or_create(f"plain-{i}", source="web", actor=None)
         assert len(await sm.list_starred_sessions()) == 8
         page = await sm.list_conversation_sessions(limit=2)
         assert len(page) == 2
@@ -645,7 +645,7 @@ class TestArchiveAndCleanup:
         self, sm: SessionManager, db: Database,
     ):
         """Starring a cron session pins it in the feed and drops it from the System page, so every session shows in exactly one place."""
-        await sm.get_or_create("star-cron", source="cron")
+        await sm.get_or_create("star-cron", source="cron", actor=None)
         await db.update_session_fields("star-cron", {"starred": 1})
         assert "star-cron" in {s["id"] for s in await sm.list_starred_sessions()}
         assert "star-cron" not in {s["id"] for s in await sm.list_system_sessions()}
@@ -653,9 +653,9 @@ class TestArchiveAndCleanup:
 
     async def test_system_and_archived_paginate(self, sm: SessionManager):
         for i in range(7):
-            await sm.get_or_create(f"psys-{i}", source="cron")
+            await sm.get_or_create(f"psys-{i}", source="cron", actor=None)
         for i in range(6):
-            await sm.get_or_create(f"parch-{i}", source="web")
+            await sm.get_or_create(f"parch-{i}", source="web", actor=None)
             await sm.archive_session(f"parch-{i}")
         assert len(await sm.list_system_sessions(limit=3)) == 3
         assert len(await sm.list_system_sessions(limit=3, offset=6)) == 1
@@ -665,31 +665,31 @@ class TestArchiveAndCleanup:
         assert await sm.count_archived_sessions() == 6
 
     async def test_list_system_only_system(self, sm: SessionManager):
-        await sm.get_or_create("sys-cron", source="cron")
-        await sm.get_or_create("sys-hook", source="hook")
-        await sm.get_or_create("sys-web", source="web")
+        await sm.get_or_create("sys-cron", source="cron", actor=None)
+        await sm.get_or_create("sys-hook", source="hook", actor=None)
+        await sm.get_or_create("sys-web", source="web", actor=None)
         ids = {s["id"] for s in await sm.list_system_sessions()}
         assert {"sys-cron", "sys-hook"} <= ids
         assert "sys-web" not in ids
 
     async def test_count_system_sessions(self, sm: SessionManager):
         assert await sm.count_system_sessions() == 0
-        await sm.get_or_create("c-cron", source="cron")
-        await sm.get_or_create("c-hook", source="hook")
-        await sm.get_or_create("c-web", source="web")
-        await sm.get_or_create("c-arch", source="cron")
+        await sm.get_or_create("c-cron", source="cron", actor=None)
+        await sm.get_or_create("c-hook", source="hook", actor=None)
+        await sm.get_or_create("c-web", source="web", actor=None)
+        await sm.get_or_create("c-arch", source="cron", actor=None)
         await sm.archive_session("c-arch")
         assert await sm.count_system_sessions() == 2   # archived cron excluded
 
     async def test_archive_disconnects_client(self, sm: SessionManager):
-        await sm.get_or_create("arch-2")
+        await sm.get_or_create("arch-2", actor=None)
         # Simulate a client
         sm.set_client("arch-2", MockClient())
         await sm.archive_session("arch-2")
         assert sm.get_client("arch-2") is None
 
     async def test_cleanup_archives_stale(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("cleanup-1")
+        await sm.get_or_create("cleanup-1", actor=None)
         await db.update_session_fields("cleanup-1", {"status": "idle"})
         # Force old timestamp
         await db.db.execute(
@@ -705,7 +705,7 @@ class TestArchiveAndCleanup:
 
     async def test_cleanup_archives_all_stale_sessions(self, sm: SessionManager, db: Database):
         """No session gets special treatment — all stale sessions are archived."""
-        await sm.get_or_create("cleanup-any")
+        await sm.get_or_create("cleanup-any", actor=None)
         await db.update_session_fields("cleanup-any", {"status": "idle"})
         await db.db.execute(
             "UPDATE sessions SET updated_at = '2020-01-01T00:00:00' WHERE id = 'cleanup-any'"
@@ -728,7 +728,7 @@ class TestArchiveAndCleanup:
         self, sm: SessionManager, db: Database,
     ):
         """Default (interactive_archive_after_hours=0) must NOT close idle interactive sessions."""
-        await sm.get_or_create("idle-web", source="web")
+        await sm.get_or_create("idle-web", source="web", actor=None)
         await self._set_idle_hours_ago(db, "idle-web", hours=5)
 
         stats = await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=0)
@@ -739,7 +739,7 @@ class TestArchiveAndCleanup:
     async def test_cleanup_hours_enabled_archives_idle_interactive(
         self, sm: SessionManager, db: Database,
     ):
-        await sm.get_or_create("idle-web2", source="web")
+        await sm.get_or_create("idle-web2", source="web", actor=None)
         await self._set_idle_hours_ago(db, "idle-web2", hours=5)
 
         stats = await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=1)
@@ -751,7 +751,7 @@ class TestArchiveAndCleanup:
         self, sm: SessionManager, db: Database,
     ):
         """Cron sessions are never subject to the short interactive cutoff."""
-        await sm.get_or_create("idle-cron", source="cron")
+        await sm.get_or_create("idle-cron", source="cron", actor=None)
         await self._set_idle_hours_ago(db, "idle-cron", hours=5)
 
         await sm.run_cleanup(archive_after_days=30, interactive_archive_after_hours=1)
@@ -762,7 +762,7 @@ class TestArchiveAndCleanup:
         self, sm: SessionManager, db: Database,
     ):
         """A starred interactive session survives the short idle cutoff."""
-        await sm.get_or_create("idle-star", source="web")
+        await sm.get_or_create("idle-star", source="web", actor=None)
         await self._set_idle_hours_ago(db, "idle-star", hours=5)
         await sm.set_starred("idle-star", True)
 
@@ -777,7 +777,7 @@ class TestArchiveAndCleanup:
         self, sm: SessionManager, db: Database,
     ):
         """A starred session survives the long age backstop."""
-        await sm.get_or_create("stale-star")
+        await sm.get_or_create("stale-star", actor=None)
         await db.update_session_fields(
             "stale-star", {"status": "idle", "starred": 1},
         )
@@ -797,7 +797,7 @@ class TestArchiveAndCleanup:
         sessions over the cap triggers no overflow eviction at all."""
         for i in range(3):
             sid = f"star-{i}"
-            await sm.get_or_create(sid)
+            await sm.get_or_create(sid, actor=None)
             await db.update_session_fields(sid, {"status": "idle", "starred": 1})
 
         stats = await sm.run_cleanup(archive_after_days=30, max_sessions=1)
@@ -813,11 +813,11 @@ class TestArchiveAndCleanup:
         and untouched, while unstarred are evicted down to the limit."""
         for i in range(2):
             sid = f"kept-star-{i}"
-            await sm.get_or_create(sid)
+            await sm.get_or_create(sid, actor=None)
             await db.update_session_fields(sid, {"status": "idle", "starred": 1})
         for i in range(3):
             sid = f"disposable-{i}"
-            await sm.get_or_create(sid)
+            await sm.get_or_create(sid, actor=None)
             await db.update_session_fields(sid, {"status": "idle"})
 
         await sm.run_cleanup(archive_after_days=30, max_sessions=1)
@@ -833,7 +833,7 @@ class TestArchiveAndCleanup:
         assert len(live_unstarred) == 1
 
     async def test_set_and_toggle_starred(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("star-me")
+        await sm.get_or_create("star-me", actor=None)
         assert await sm.set_starred("star-me", True) is True
         assert (await db.get_session("star-me"))["starred"] == 1
         assert await sm.toggle_starred("star-me") is False
@@ -849,7 +849,7 @@ class TestOrphanRecovery:
     """Test orphan session recovery on startup."""
 
     async def test_recover_active_with_sdk_id(self, sm: SessionManager, db: Database):
-        await db.create_session("orphan-1", status="active")
+        await db.create_session("orphan-1", status="active", actor=None)
         await db.update_session_fields("orphan-1", {
             "status": "active", "sdk_session_id": "sdk-orphan",
         })
@@ -859,7 +859,7 @@ class TestOrphanRecovery:
         assert session["status"] == "idle"
 
     async def test_recover_active_without_sdk_id(self, sm: SessionManager, db: Database):
-        await db.create_session("orphan-2", status="active")
+        await db.create_session("orphan-2", status="active", actor=None)
         await db.update_session_fields("orphan-2", {"status": "active"})
         count = await sm.recover_orphaned_sessions()
         assert count >= 1
@@ -867,7 +867,7 @@ class TestOrphanRecovery:
         assert session["status"] == "stopped"
 
     async def test_recover_skips_live_clients(self, sm: SessionManager, db: Database):
-        await db.create_session("orphan-3", status="active")
+        await db.create_session("orphan-3", status="active", actor=None)
         await db.update_session_fields("orphan-3", {"status": "active"})
         # Simulate a live client
         sm.set_client("orphan-3", MockClient())
@@ -884,22 +884,22 @@ class TestListing:
     """Test session listing."""
 
     async def test_list_sessions(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("list-1", title="Alpha")
-        await sm.get_or_create("list-2", title="Beta")
+        await sm.get_or_create("list-1", title="Alpha", actor=None)
+        await sm.get_or_create("list-2", title="Beta", actor=None)
         sessions = await sm.list_sessions()
         ids = [s["id"] for s in sessions]
         assert "list-1" in ids
         assert "list-2" in ids
 
     async def test_list_excludes_archived(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("list-arch")
+        await sm.get_or_create("list-arch", actor=None)
         await sm.archive_session("list-arch")
         sessions = await sm.list_sessions(include_archived=False)
         ids = [s["id"] for s in sessions]
         assert "list-arch" not in ids
 
     async def test_list_includes_archived(self, sm: SessionManager, db: Database):
-        await sm.get_or_create("list-arch2")
+        await sm.get_or_create("list-arch2", actor=None)
         await sm.archive_session("list-arch2")
         sessions = await sm.list_sessions(include_archived=True)
         ids = [s["id"] for s in sessions]
@@ -917,7 +917,7 @@ class TestMemorizeCallback:
             memorized.append(sid)
 
         sm._on_memorize = mock_memorize
-        await sm.get_or_create("memo-arch")
+        await sm.get_or_create("memo-arch", actor=None)
         await sm.archive_session("memo-arch")
         assert "memo-arch" in memorized
 
@@ -929,7 +929,7 @@ class TestMemorizeCallback:
 
         sm._on_memorize = mock_memorize
         # Create an active session without sdk_session_id (non-resumable)
-        await db.create_session("memo-orphan", status="active")
+        await db.create_session("memo-orphan", status="active", actor=None)
         await db.update_session_fields("memo-orphan", {"status": "active"})
         await sm.recover_orphaned_sessions()
         assert "memo-orphan" in memorized
@@ -942,7 +942,7 @@ class TestMemorizeCallback:
 
         sm._on_memorize = mock_memorize
         # Create an active session WITH sdk_session_id (resumable)
-        await db.create_session("memo-resumable", status="active")
+        await db.create_session("memo-resumable", status="active", actor=None)
         await db.update_session_fields("memo-resumable", {
             "status": "active", "sdk_session_id": "sdk-123",
         })
@@ -953,7 +953,7 @@ class TestMemorizeCallback:
     async def test_no_callback_doesnt_crash(self, sm: SessionManager, db: Database):
         """Archive should work even without a memorize callback."""
         sm._on_memorize = None
-        await sm.get_or_create("memo-none")
+        await sm.get_or_create("memo-none", actor=None)
         await sm.archive_session("memo-none")
         session = await db.get_session("memo-none")
         assert session["status"] == "archived"
@@ -1032,7 +1032,7 @@ class TestUnarchiveRoute:
         assert resp.status_code == 404
 
     async def test_star_archived_restores_via_shared_path(self, setup):
-        await setup.sm.get_or_create("star-arch")
+        await setup.sm.get_or_create("star-arch", actor=None)
         await setup.sm.archive_session("star-arch")
         resp = setup.client.patch("/api/sessions/star-arch", json={"starred": True})
         assert resp.status_code == 200
@@ -1050,10 +1050,10 @@ class TestArchiveCascade:
 
     async def _tree(self, db: Database):
         """Build root -> {a -> a1, b} (a1 is a grandchild)."""
-        await db.create_session("root", source="web")
-        await db.create_session("a", source="web", parent_session_id="root")
-        await db.create_session("b", source="web", parent_session_id="root")
-        await db.create_session("a1", source="web", parent_session_id="a")
+        await db.create_session("root", source="web", actor=None)
+        await db.create_session("a", source="web", parent_session_id="root", actor=None)
+        await db.create_session("b", source="web", parent_session_id="root", actor=None)
+        await db.create_session("a1", source="web", parent_session_id="a", actor=None)
 
     async def _status(self, db: Database, sid: str) -> str:
         return (await db.get_session(sid))["status"]
@@ -1114,8 +1114,8 @@ class TestArchiveCascade:
         The seen-set guarantees termination; every node is accounted for in
         the structured result (archived or skipped), and the call returns.
         """
-        await db.create_session("c1", source="web")
-        await db.create_session("c2", source="web", parent_session_id="c1")
+        await db.create_session("c1", source="web", actor=None)
+        await db.create_session("c2", source="web", parent_session_id="c1", actor=None)
         # Force a cycle: c1's parent points back at its own child c2.
         await db.update_session_fields("c1", {"parent_session_id": "c2"})
 

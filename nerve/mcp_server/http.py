@@ -34,7 +34,13 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
 from nerve.agent.tools import ToolContext, ToolRegistry
-from nerve.gateway.auth import MCP_WORKER_CLAIM, effective_jwt_secret
+from nerve.gateway.auth import (
+    MCP_WORKER_CLAIM,
+    effective_jwt_secret,
+    identity_store,
+    resolve_actor_from_claims,
+)
+from nerve.identity import ActorResolutionError
 from nerve.mcp_server.audit import build_audit_writer
 from nerve.mcp_server.auth import (
     McpAuthError,
@@ -52,7 +58,6 @@ if TYPE_CHECKING:
     from nerve.config import NerveConfig
 
 logger = logging.getLogger(__name__)
-
 
 async def _send_status(send: Send, status: int, message: str) -> None:
     """Emit a small ASGI error response with a JSON body."""
@@ -122,8 +127,9 @@ def _bound_identity_from_request(
     notify/ask_user/memorize/task_* behave exactly like the in-process
     Claude MCP. Ordinary tokens return ``None`` → satellite attribution.
 
-    The signature was already verified at the ASGI mount; this re-decode
-    only extracts the (signed) claim — cheap HS256, per tool call.
+    The signature was already verified at the ASGI mount; this re-decode only
+    extracts the signed claim — cheap HS256, per tool call. Actor resolution
+    at the mount is an admission check; tool handling does not consume it.
     """
     secret = effective_jwt_secret(config)
     if not secret:
@@ -267,8 +273,23 @@ def mount_deferred(
             await _send_status(send, 400, "MCP endpoint requires HTTP")
             return
         try:
-            authenticate_mcp(scope, config)
+            claims = authenticate_mcp(scope, config)
         except McpAuthError as e:
+            await _send_status(send, 401, str(e))
+            return
+
+        # Who the frames that follow are attributed to. MCP and backend-agent
+        # credentials are the agent acting on its own behalf, so they resolve
+        # to the system principal; a person's own session token resolves to
+        # them — and is refused here once their account is disabled, which a
+        # signature check alone would never notice.
+        store = identity_store()
+        if store is None:
+            await _send_status(send, 503, "MCP server is starting up")
+            return
+        try:
+            await resolve_actor_from_claims(store, claims)
+        except ActorResolutionError as e:
             await _send_status(send, 401, str(e))
             return
 

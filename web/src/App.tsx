@@ -28,11 +28,15 @@ import { UltracodePage } from './pages/UltracodePage';
 import { WorkflowRunsPage } from './pages/WorkflowRunsPage';
 import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
+import { AccountsPage } from './pages/AccountsPage';
+import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { ShortcutsModal } from './components/ShortcutsModal';
 
 function App() {
-  const { authenticated, checking, checkAuth, sessionExpired } = useAuthStore();
+  const {
+    authenticated, ready, checkAuth, sessionExpired, loginMode,
+  } = useAuthStore();
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
@@ -47,7 +51,11 @@ function App() {
     return () => { unsub(); ws.disconnect(); };
   }, [authenticated]);
 
-  if (checking) return null;
+  // Wait for auth status before routing. A stored token does not distinguish a
+  // claimed instance from a passwordless one.
+  if (!ready) return null;
+  // While setup is required, the claim is the only permitted action.
+  if (loginMode === 'setup') return <SetupPage />;
   // Only a *cold* start gets the full-page login. A session that expired
   // under a mounted app keeps the app rendered and takes the password in an
   // overlay, so nothing you had typed is thrown away to ask for it.
@@ -67,7 +75,7 @@ function App() {
       <GlobalShortcuts />
       <Routes location={background ?? location}>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/" element={<Home />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
           <Route path="/tasks" element={<TasksPage />} />
@@ -84,6 +92,8 @@ function App() {
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
+          <Route path="/accounts" element={<AccountsPage />} />
+          <Route path="/setup" element={<SetupPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -98,6 +108,10 @@ function App() {
       <ShortcutsModal />
     </>
   );
+}
+
+function Home() {
+  return <Navigate to="/chat" replace />;
 }
 
 /**

@@ -121,9 +121,9 @@ def _post_jsonrpc(
         headers["mcp-session-id"] = session_id
     if authenticated:
         # The secret the lifespan bootstrap generated and pinned.
-        from nerve.gateway.auth import create_token, effective_jwt_secret
+        from nerve.gateway.auth import create_system_token, effective_jwt_secret
 
-        headers["Authorization"] = f"Bearer {create_token(effective_jwt_secret())}"
+        headers["Authorization"] = f"Bearer {create_system_token(effective_jwt_secret())}"
     return client.post("/mcp/v1/", json=body, headers=headers)
 
 

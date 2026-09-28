@@ -44,14 +44,14 @@ class TestSidebarListRoutes:
     async def _seed(self, sm: SessionManager, db: Database, *, chats=0, crons=0,
                     archived=0, starred=0) -> None:
         for i in range(chats):
-            await sm.get_or_create(f"chat-{i:03d}", source="web")
+            await sm.get_or_create(f"chat-{i:03d}", source="web", actor=None)
         for i in range(crons):
-            await sm.get_or_create(f"cron-{i:03d}", source="cron")
+            await sm.get_or_create(f"cron-{i:03d}", source="cron", actor=None)
         for i in range(archived):
-            await sm.get_or_create(f"arch-{i:03d}", source="web")
+            await sm.get_or_create(f"arch-{i:03d}", source="web", actor=None)
             await sm.archive_session(f"arch-{i:03d}")
         for i in range(starred):
-            await sm.get_or_create(f"star-{i:03d}", source="web")
+            await sm.get_or_create(f"star-{i:03d}", source="web", actor=None)
             await db.update_session_fields(f"star-{i:03d}", {"starred": 1})
 
     # ── Default page size ────────────────────────────────────────────────

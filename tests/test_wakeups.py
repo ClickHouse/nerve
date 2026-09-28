@@ -19,6 +19,15 @@ import pytest_asyncio
 from nerve.agent.engine import AgentEngine
 from nerve.cron.service import CronService, _resolve_wakeup_prompt
 
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
+
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
@@ -77,8 +86,8 @@ class TestWakeupFireAt:
 class TestWakeupStore:
     @pytest_asyncio.fixture
     async def seeded_db(self, db):
-        await db.create_session("s1", source="web")
-        await db.create_session("s2", source="web")
+        await db.create_session("s1", source="web", actor=None)
+        await db.create_session("s2", source="web", actor=None)
         return db
 
     @pytest.mark.asyncio
@@ -140,7 +149,7 @@ class TestWakeupStore:
 class TestWakeupSweep:
     @pytest_asyncio.fixture
     async def svc(self, db):
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         config = MagicMock()
         config.timezone = "UTC"
         engine = AsyncMock()
@@ -209,6 +218,33 @@ class TestWakeupSweep:
         svc.engine.run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_one_bad_wakeup_does_not_abandon_the_rest(self, svc):
+        """A sweep is a batch of unrelated rows; one that cannot be dispatched
+        must not take the others with it."""
+        await svc.db.create_session("s2", source="web", actor=None)
+        await svc.db.add_wakeup("s1", prompt="first", fire_at=_past())
+        await svc.db.add_wakeup("s2", prompt="second", fire_at=_past())
+
+        real_claim = svc.db.claim_wakeup
+        calls = {"n": 0}
+
+        async def _first_claim_explodes(wakeup_id: int) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database hiccup")
+            return await real_claim(wakeup_id)
+
+        svc.db.claim_wakeup = _first_claim_explodes
+        await svc._sweep_wakeups()
+        await asyncio.sleep(0.05)
+        svc.db.claim_wakeup = real_claim
+
+        svc.engine.run.assert_awaited_once()
+        assert svc.engine.run.await_args.kwargs["user_message"] == "second"
+        # The one that failed is still pending, so the next sweep retries it.
+        assert len(await svc.db.list_pending_wakeups("s1")) == 1
+
+    @pytest.mark.asyncio
     async def test_no_double_fire_across_sweeps(self, svc):
         await svc.db.add_wakeup("s1", prompt="ping", fire_at=_past())
         await svc._sweep_wakeups()
@@ -222,7 +258,7 @@ class TestRecordWakeup:
 
     @pytest_asyncio.fixture
     async def seeded_db(self, db):
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         return db
 
     @pytest.mark.asyncio

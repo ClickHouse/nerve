@@ -40,7 +40,7 @@ async def _actors(db: Database, kind: str) -> list[dict]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("password", "source"), [(True, "config"), (False, "none")])
+@pytest.mark.parametrize(("password", "source"), [(True, "local"), (False, "none")])
 async def test_bootstrap_creates_only_the_first_human_account(
     db: Database, password, source,
 ):
@@ -56,6 +56,7 @@ async def test_bootstrap_creates_only_the_first_human_account(
     (account,) = await _accounts(db)
     assert account["id"] != account["actor_id"] == human["id"]
     assert (human["display_name"], account["credential_source"]) == ("alice", source)
+    assert account["credential"] == (_HASH if password else None)
     assert account["enabled"] is True and account["created_at"]
 
     again = await bootstrap_identity(db, _config(password=password, secret=_SECRET))
@@ -80,9 +81,10 @@ async def test_disabled_account_is_not_recreated_and_mirror_preserves_state(db: 
     report = await bootstrap_identity(db, _config(password=True, secret=_SECRET))
     (still,) = await _accounts(db)
     assert not report.bootstrapped_account and report.updated_credential_source
+    assert report.migrated_config_credential
     assert still["id"] == account["id"]
     assert still["enabled"] is False
-    assert still["credential_source"] == "config"
+    assert (still["credential_source"], still["credential"]) == ("local", _HASH)
 
 
 @pytest.mark.asyncio
@@ -105,6 +107,7 @@ async def test_local_credential_is_never_mirrored_from_configuration(db: Databas
 async def test_dry_run_reports_without_writing(db: Database):
     report = await bootstrap_identity(db, _config(password=True), dry_run=True)
     assert report.bootstrapped_account and report.generated_jwt_secret
+    assert report.migrated_config_credential
     assert await _accounts(db) == []
     assert await _actors(db, "human") == []
     assert await db._get_instance_secret(JWT_SECRET_NAME) is None
@@ -200,6 +203,7 @@ def test_migrate_reports_existing_identity_without_writing(tmp_path, dry_run):
 
     assert not report.bootstrapped_account
     assert report.updated_credential_source
+    assert report.migrated_config_credential
     assert not report.generated_jwt_secret
     assert paths.db_path().read_bytes() == before
 
@@ -218,5 +222,6 @@ def test_cli_migrate_reports_bootstrap_without_creating_database(tmp_path, argv)
     assert "At its next start, the gateway will:" in result.output
     assert "- create the local owner account" in result.output
     assert "credential_source=config" in result.output
+    assert "- copy auth.password_hash" in result.output
     assert "- generate a JWT signing secret" in result.output
     assert not paths.db_path().exists()

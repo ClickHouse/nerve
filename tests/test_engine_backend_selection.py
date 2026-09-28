@@ -6,6 +6,18 @@ import pytest
 
 from nerve.agent.engine import AgentEngine
 from nerve.config import NerveConfig
+from nerve.identity import Actor
+from tests.actor_rows import ensure_actor_row
+
+# `require_auth` hands a route the actor the request resolved to. These tests
+# call the route functions directly, so they supply one; no route here reads
+# it, so any well-formed actor does.
+_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
 
 
 def _config(tmp_path, **agent_overrides) -> NerveConfig:
@@ -160,7 +172,7 @@ class TestScheduleWakeupTool:
         from nerve.agent.tools.registry import ToolContext
 
         engine = _engine(tmp_path, db)
-        await db.create_session("ext-1", source="external")
+        await db.create_session("ext-1", source="external", actor=None)
         ctx = ToolContext(session_id="ext-1", db=db, engine=engine)
         result = await schedule_wakeup_handler(ctx, {
             "delaySeconds": 120, "prompt": "check things",
@@ -174,7 +186,7 @@ class TestScheduleWakeupTool:
         from nerve.agent.tools.registry import ToolContext
 
         engine = _engine(tmp_path, db)
-        await db.create_session("web-1", source="web")
+        await db.create_session("web-1", source="web", actor=None)
         ctx = ToolContext(session_id="web-1", db=db, engine=engine)
         result = await schedule_wakeup_handler(ctx, {
             "delaySeconds": 120, "prompt": "check things", "reason": "test",
@@ -198,7 +210,7 @@ class TestResumeDroppedEnginePath:
         from nerve.agent.backends.base import BackendCapabilities
 
         engine = _engine(tmp_path, db)
-        await db.create_session("s-drop", source="web")
+        await db.create_session("s-drop", source="web", actor=None)
         await db.update_session_fields("s-drop", {
             "sdk_session_id": "stale-thread-1", "backend": "codex",
         })
@@ -271,7 +283,7 @@ class TestPreRecallFreeze:
         second = ["rearmed-gamma-7c1", "rearmed-delta-7c2"]
 
         engine = _engine(tmp_path, db)
-        await db.create_session("s-freeze", source="web", backend="codex")
+        await db.create_session("s-freeze", source="web", backend="codex", actor=None)
 
         bridge = MagicMock(available=True)
         bridge.recall = AsyncMock(
@@ -381,8 +393,12 @@ class TestCreateSessionRoute:
             lambda: SimpleNamespace(engine=engine, db=db),
         )
 
+        # The route stamps the request actor on the session row, and
+        # sessions.created_by_actor_id references actor_refs.
+        await ensure_actor_row(db, _ACTOR)
+
         created = await routes.create_session(
-            routes.SessionCreateRequest(backend="codex"), user={"sub": "user"},
+            routes.SessionCreateRequest(backend="codex"), actor=_ACTOR,
         )
         row = await db.get_session(created["id"])
         meta = json.loads(row.get("metadata") or "{}")
@@ -392,7 +408,7 @@ class TestCreateSessionRoute:
 
         # Omitted backend → no override, config default applies.
         plain = await routes.create_session(
-            routes.SessionCreateRequest(), user={"sub": "user"},
+            routes.SessionCreateRequest(), actor=_ACTOR,
         )
         plain_row = await db.get_session(plain["id"])
         plain_meta = json.loads(plain_row.get("metadata") or "{}")
@@ -403,6 +419,6 @@ class TestCreateSessionRoute:
         with pytest.raises(HTTPException) as excinfo:
             await routes.create_session(
                 routes.SessionCreateRequest(backend="geminy"),
-                user={"sub": "user"},
+                actor=_ACTOR,
             )
         assert excinfo.value.status_code == 400

@@ -15,6 +15,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+import pytest_asyncio
 
 from nerve.mcp_server.session import SatelliteSessionResolver
 from nerve.sources.codex_threads.base import ThreadEvent, WorkspaceFilter
@@ -22,6 +23,15 @@ from nerve.sources.codex_threads.ingester import (
     CodexIngester,
     codex_session_id,
 )
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 class _NullBroadcaster:
@@ -138,7 +148,7 @@ async def test_tool_call_via_mcp_dedups_with_synced_tool_call(db, tmp_path):
             "tool": "mcp__nerve__task_list",
             "input": {"limit": 3},
             "tool_use_id": call_id,
-        }],
+        }], actor=None,
     )
     assert msg_id is not None
 

@@ -17,7 +17,7 @@ from nerve.gateway.routes._deps import get_deps
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB per file
 MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB per request
@@ -45,7 +45,6 @@ def _uploads_dir() -> Path:
 async def upload_files(
     files: list[UploadFile] = File(...),
     session_id: str = Form(...),
-    user: dict = Depends(require_auth),
 ):
     """Upload one or more files, store on disk and track in DB."""
     deps = get_deps()
@@ -113,7 +112,6 @@ async def upload_files(
 @router.get("/api/files/uploads/{file_id}")
 async def get_uploaded_file(
     file_id: str,
-    user: dict = Depends(require_auth),
 ):
     """Serve an uploaded file by its ID (for image display in chat history)."""
     deps = get_deps()
@@ -135,7 +133,6 @@ async def get_uploaded_file(
 @router.get("/api/files/download")
 async def download_file(
     path: str,
-    user: dict = Depends(require_auth),
 ):
     """Download a workspace file by absolute path."""
     config = get_config()

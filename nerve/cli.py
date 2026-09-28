@@ -276,7 +276,9 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
 
     display_name = (choices.user_name or "").strip() or None
     try:
-        report = bootstrap_identity_sync(config, display_name=display_name)
+        report = bootstrap_identity_sync(
+            config, display_name=display_name, passwordless=choices.passwordless,
+        )
     except Exception as e:  # noqa: BLE001 - any failure means there is no account
         # The wizard deleted its checkpoint when it applied the configuration.
         # Save the answers again so a re-run keeps the name, then fail. The
@@ -304,6 +306,16 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    from nerve.db.accounts import read_setup_required
+
+    if read_setup_required(
+        paths.db_path(), configured_password=bool(config.auth.password_hash),
+    ):
+        click.echo(
+            "  Setup is not complete: no password was set and a passwordless "
+            "installation was not chosen. After the gateway starts, run "
+            "'nerve status' to read the setup token, then complete setup at /setup."
+        )
 
 
 @main.command()
@@ -593,6 +605,28 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         click.echo("Starting Nerve... new instance will start shortly.")
 
 
+def _echo_setup_token(config) -> None:
+    """Print the unclaimed instance's token only to this local terminal."""
+    from nerve.db.accounts import read_instance_secret
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    if not token:
+        return
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    click.echo()
+    click.secho(
+        "  Setup of this instance is not complete, and sign-in is refused "
+        "until it is. Complete it on the setup page with the token below.",
+        fg="yellow",
+    )
+    click.echo(f"  Setup page: http://{host}:{port}/setup")
+    click.echo(f"  Setup token: {token}")
+
+
 @main.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output (like tail -f)")
 @click.pass_context
@@ -604,6 +638,7 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
+        _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
@@ -649,6 +684,8 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
+
+    _echo_setup_token(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -1171,14 +1208,61 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] SSL not configured")
 
-    # Check auth
-    if config.auth.password_hash:
-        lines.append("[OK] Auth password hash configured")
-    else:
+    # Check auth. The credential lives on the account row, not in configuration:
+    # the startup migration copied auth.password_hash across and removed the key,
+    # so reading that key here would call a perfectly well-secured install
+    # "passwordless". Read-only, and tolerant of a database that does not exist
+    # yet (None) — that is a fresh install, which the wizard is about to shape.
+    #
+    # Which rows count as having a password is asked of the same function the
+    # login route asks, not restated: a `none` row reads auth.password_hash too
+    # (a reload that adds one takes effect before the next restart re-derives
+    # the row), so judging by the row alone told operators that an *active*
+    # password did nothing — and removing it on that advice would have opened
+    # the instance.
+    from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
+    from nerve.gateway.auth import source_authenticates
+
+    configured = bool(config.auth.password_hash)
+    identity_state = inspect_bootstrap_state(paths.db_path())
+    sources = identity_state[0] if identity_state is not None else None
+    usable = [
+        source for source in (sources or [])
+        if source_authenticates(source, configured_password=configured)
+    ]
+    if sources is None:
+        lines.append("[--] Accounts: nerve.db not created yet (first start will)")
+    elif not sources:
+        warnings.append("[WARN] No local account yet — the next start creates one")
+    elif not usable and read_setup_required(
+        paths.db_path(), configured_password=configured,
+    ):
         warnings.append(
-            "[WARN] Auth password not set — passwordless: anyone who can reach "
-            "the gateway acts as the owner"
+            "[WARN] Setup is not complete — sign-in is refused until it is. "
+            "Complete it at /setup with the setup token shown by `nerve status` "
+            "on the host"
         )
+    elif not usable:
+        warnings.append(
+            "[WARN] No password set — passwordless by choice: anyone who can "
+            "reach the gateway acts as the owner"
+        )
+    else:
+        lines.append(
+            f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
+        )
+    if configured and sources is not None:
+        reading = [source for source in sources if source != "local"]
+        if reading:
+            lines.append(
+                f"[OK] auth.password_hash is in use by {len(reading)} account(s) "
+                "— the next start copies it onto them and removes the key"
+            )
+        else:
+            warnings.append(
+                "[WARN] auth.password_hash is set but no account uses it — every "
+                "account has its own password now; the configured value does nothing"
+            )
 
     if config.auth.jwt_secret:
         lines.append("[OK] JWT secret configured")
@@ -1370,7 +1454,7 @@ def reload(ctx: click.Context) -> None:
     """
     import httpx
 
-    from nerve.gateway.auth import create_token
+    from nerve.gateway.auth import create_system_token
 
     config = ctx.obj["config"]
     if config is None:
@@ -1399,7 +1483,10 @@ def reload(ctx: click.Context) -> None:
     # gateway.host names a real host the certificate should match it, and a
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
-    headers = {"Authorization": f"Bearer {create_token(secret)}"}
+    # This shell is the instance talking to itself, not a person: the token
+    # resolves to the agent's system principal rather than standing in for
+    # whichever account happens to exist.
+    headers = {"Authorization": f"Bearer {create_system_token(secret)}"}
     try:
         resp = httpx.post(
             url,
@@ -2529,9 +2616,10 @@ def _gateway_request(
     headers = {}
     secret = _signing_secret(config)
     if secret:
-        from nerve.gateway.auth import create_token
+        # The instance acting on its own behalf — see `nerve reload`.
+        from nerve.gateway.auth import create_system_token
 
-        headers["Authorization"] = f"Bearer {create_token(secret)}"
+        headers["Authorization"] = f"Bearer {create_system_token(secret)}"
     try:
         # verify=False: gateway.ssl is normally a local self-signed cert,
         # and this call only ever targets loopback.

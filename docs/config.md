@@ -238,7 +238,7 @@ A reload is always explicit. Two things cause one:
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
-| Web gateway auth (`auth.*`) | partly. `auth.password_hash` follows the next login, and `auth.jwt_expiry_hours` follows the next token issue or refresh. `auth.jwt_secret` requires a restart (see the restart table) |
+| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -280,7 +280,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `auth.jwt_secret` | pinned at startup. A restart applies a changed value or generates a stored secret when the setting is removed |
+| `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
@@ -1267,7 +1267,7 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auth.password_hash` | string | - | bcrypt hash for login. When unset, anyone who can reach the gateway can act as the sole owner. Use passwordless mode only on a restricted gateway |
+| `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
 
 ## API Keys (config.local.yaml)

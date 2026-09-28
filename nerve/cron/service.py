@@ -858,6 +858,7 @@ class CronService:
         session_id = f"cron:{job_id}:{ts}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
+            actor=self.db.system_actor,
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -1345,12 +1346,17 @@ class CronService:
         logger.info(
             "Firing wakeup %s for session %s", wakeup["id"], session_id[:8],
         )
+        # The actor is the instance's own: a model-scheduled wakeup, or a
+        # deferral this service is delivering. Who wrote a run-later message
+        # is already recorded on the row the route persisted when they
+        # composed it.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
                 user_message=prompt,
                 source=source,
                 internal=True,
+                actor=self.db.system_actor,
                 # A run-later deferral is a message the user wrote and asked
                 # to be delivered now, so it belongs back at the top of the
                 # sidebar. A model's own ScheduleWakeup tick is the session

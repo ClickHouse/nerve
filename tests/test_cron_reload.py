@@ -882,7 +882,7 @@ class TestReloadRoute:
 
         monkeypatch.setattr(srv, "_cron_service", None, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 503
 
     @pytest.mark.asyncio
@@ -896,7 +896,7 @@ class TestReloadRoute:
             return_value={"added": ["a"], "removed": [], "updated": [], "enabled": 1}
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
-        result = await reload_cron_jobs(user={})
+        result = await reload_cron_jobs()
         assert result["reloaded"] is True
         assert result["added"] == ["a"]
 
@@ -912,7 +912,7 @@ class TestReloadRoute:
         fake.reload = AsyncMock(side_effect=ConfigError("bad cron file"))
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 400
         assert "bad cron file" in ei.value.detail
 
@@ -931,7 +931,7 @@ class TestReloadRoute:
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 400
         assert "typo" in ei.value.detail
 

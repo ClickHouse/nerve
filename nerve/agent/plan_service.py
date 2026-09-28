@@ -146,9 +146,15 @@ async def request_plan_revision(
     )
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
+        actor=engine.db.system_actor,
     )
     asyncio.create_task(
-        engine.run(session_id=session_id, user_message=prompt, source="cron")
+        engine.run(
+            session_id=session_id, user_message=prompt, source="cron",
+            # The revision prompt is built from a template here, not typed by
+            # the person who asked for the revision.
+            actor=engine.db.system_actor,
+        )
     )
 
     logger.info(

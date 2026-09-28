@@ -6,12 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 @router.post("/api/sources/{source_name}/sync")
-async def trigger_single_source_sync(source_name: str, user: dict = Depends(require_auth)):
+async def trigger_single_source_sync(source_name: str):
     """Manually trigger sync for a specific source."""
     from nerve.gateway.server import _cron_service
     deps = get_deps()
@@ -43,7 +42,7 @@ async def trigger_single_source_sync(source_name: str, user: dict = Depends(requ
 
 
 @router.post("/api/sources/sync-all")
-async def trigger_all_sources_sync(user: dict = Depends(require_auth)):
+async def trigger_all_sources_sync():
     """Manually trigger sync for all registered sources."""
     from nerve.gateway.server import _cron_service
     deps = get_deps()
@@ -76,7 +75,6 @@ async def trigger_all_sources_sync(user: dict = Depends(require_auth)):
 async def list_source_messages(
     source: str = "", limit: int = 50, before: str = "",
     session: str = "",
-    user: dict = Depends(require_auth),
 ):
     """Paginated list of source inbox messages, newest first."""
     deps = get_deps()
@@ -91,7 +89,7 @@ async def list_source_messages(
 
 
 @router.get("/api/sources/messages/{source:path}/{msg_id}")
-async def get_source_message(source: str, msg_id: str, user: dict = Depends(require_auth)):
+async def get_source_message(source: str, msg_id: str):
     """Get a single source message with full content and processed_content."""
     deps = get_deps()
     msg = await deps.db.get_source_message(source, msg_id)
@@ -101,7 +99,7 @@ async def get_source_message(source: str, msg_id: str, user: dict = Depends(requ
 
 
 @router.delete("/api/sources/messages")
-async def purge_source_messages(source: str = "", user: dict = Depends(require_auth)):
+async def purge_source_messages(source: str = ""):
     """Purge source messages. If source specified, only that source; otherwise all."""
     deps = get_deps()
     deleted = await deps.db.delete_source_messages(source=source or None)
@@ -109,7 +107,7 @@ async def purge_source_messages(source: str = "", user: dict = Depends(require_a
 
 
 @router.get("/api/sources/overview")
-async def source_overview(user: dict = Depends(require_auth)):
+async def source_overview():
     """Combined overview: message counts, storage, cursor status, 1h/24h stats."""
     deps = get_deps()
     from nerve.gateway.server import _cron_service
@@ -167,7 +165,6 @@ async def source_overview(user: dict = Depends(require_auth)):
 @router.get("/api/sources/runs")
 async def list_source_runs(
     source: str = "", limit: int = 50,
-    user: dict = Depends(require_auth),
 ):
     """Source run history with session links."""
     deps = get_deps()
@@ -179,7 +176,7 @@ async def list_source_runs(
 
 
 @router.get("/api/sources/stats")
-async def source_stats(hours: int = 24, user: dict = Depends(require_auth)):
+async def source_stats(hours: int = 24):
     """Per-source aggregate stats for the last N hours."""
     deps = get_deps()
     stats = await deps.db.get_source_stats(hours=min(hours, 168))  # Cap at 7 days
@@ -187,7 +184,7 @@ async def source_stats(hours: int = 24, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/sources/consumers")
-async def get_consumer_cursors(consumer: str | None = None, user: dict = Depends(require_auth)):
+async def get_consumer_cursors(consumer: str | None = None):
     """List active consumer cursors with unread counts."""
     deps = get_deps()
     cursors = await deps.db.list_consumer_cursors(consumer=consumer)
@@ -195,7 +192,7 @@ async def get_consumer_cursors(consumer: str | None = None, user: dict = Depends
 
 
 @router.get("/api/sources/health")
-async def get_source_health(user: dict = Depends(require_auth)):
+async def get_source_health():
     """Per-source circuit breaker health state."""
     from nerve.gateway.server import _cron_service
 

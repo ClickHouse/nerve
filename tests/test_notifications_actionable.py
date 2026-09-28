@@ -25,11 +25,21 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.db import Database
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.service import NotificationService
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 # ----------------------------------------------------------------------
@@ -211,7 +221,7 @@ class TestSchemaAndStore:
         assert "target_id" in cols
 
     async def test_create_notification_default_target_columns_null(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1",
             type="notify", title="hello",
@@ -222,7 +232,7 @@ class TestSchemaAndStore:
         assert notif["target_id"] is None
 
     async def test_create_notification_with_target(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1",
             type="approval", title="approve me",
@@ -235,7 +245,7 @@ class TestSchemaAndStore:
         assert notif["type"] == "approval"
 
     async def test_snooze_notification_queues_redelivery(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         future = (
             datetime.now(timezone.utc) + timedelta(hours=1)
         ).isoformat()
@@ -258,7 +268,7 @@ class TestSchemaAndStore:
         assert notif["status"] == "pending"
 
     async def test_snooze_notification_rejects_non_pending(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1", type="approval", title="t",
         )
@@ -288,7 +298,7 @@ class TestProposeAction:
         fake_engine: MagicMock,
         patch_broadcaster: list,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.propose_action(
             session_id="s1",
@@ -319,7 +329,7 @@ class TestProposeAction:
         fake_engine: MagicMock,
         patch_broadcaster: list,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         with pytest.raises(ValueError):
             await svc.propose_action(
@@ -337,7 +347,7 @@ class TestProposeAction:
         fake_engine: MagicMock,
         patch_broadcaster: list,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.propose_action(
             session_id="s1",
@@ -372,7 +382,7 @@ class TestHandleAnswerApproval:
         patch_broadcaster: list,
         workspace_with_scripts: Path,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.propose_action(
             session_id="s1",
@@ -430,7 +440,7 @@ class TestHandleAnswerApproval:
         patch_broadcaster: list,
         workspace_with_scripts: Path,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.propose_action(
             session_id="s1",
@@ -474,7 +484,7 @@ class TestHandleAnswerApproval:
         patch_broadcaster: list,
         workspace_with_scripts: Path,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.propose_action(
             session_id="s1",
@@ -503,7 +513,7 @@ class TestHandleAnswerApproval:
         flip the status so the row doesn't get re-delivered, and the
         audit log records the no-dispatcher state.
         """
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="orphan-1",
             session_id="s1",
@@ -528,7 +538,7 @@ class TestHandleAnswerApproval:
         """Type=question (no target_kind) must keep flowing through the
         session-injection path, untouched by the approval dispatch.
         """
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.ask_question(
             session_id="s1",
@@ -582,7 +592,7 @@ class TestBusySessionAnswerInjection:
         fake_engine: MagicMock,
         patch_broadcaster: list,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         result = await svc.ask_question(
             session_id="s1",
@@ -628,7 +638,7 @@ class TestBusySessionAnswerInjection:
         fake_engine: MagicMock,
         patch_broadcaster: list,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         first = await svc.ask_question(
             session_id="s1", title="first question", options=["a", "b"],

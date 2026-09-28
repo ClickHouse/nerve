@@ -14,8 +14,18 @@ from __future__ import annotations
 import json
 
 import pytest
+import pytest_asyncio
 
 from nerve.mcp_server.session import SatelliteSessionResolver
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 # ``db`` fixture is supplied by ``tests/conftest.py``.
 
