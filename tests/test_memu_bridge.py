@@ -19,6 +19,8 @@ from nerve.memory.memu_bridge import (
     _SEMANTIC_DEDUP_THRESHOLD,
     _content_hash_reinforce,
     _is_sqlite_locked_error,
+    _OPENAI_EMBED_BASE_URL,
+    build_embedding_profile,
 )
 
 
@@ -445,6 +447,75 @@ class TestConfigMemoryModels:
     def test_semantic_dedup_threshold_from_dict_default(self):
         config = MemoryConfig.from_dict({})
         assert config.semantic_dedup_threshold == 0.85
+
+    def test_embed_base_url_default_empty(self):
+        assert MemoryConfig().embed_base_url == ""
+        assert MemoryConfig.from_dict({}).embed_base_url == ""
+
+    def test_embed_base_url_from_dict(self):
+        config = MemoryConfig.from_dict({"embed_base_url": "https://llm.internal/v1"})
+        assert config.embed_base_url == "https://llm.internal/v1"
+
+    def test_embed_base_url_is_stripped(self):
+        config = MemoryConfig.from_dict({"embed_base_url": "  https://llm.internal/v1 "})
+        assert config.embed_base_url == "https://llm.internal/v1"
+
+    def test_embed_base_url_none_coerces_to_empty(self):
+        """A YAML key present with no value parses as None, not a string."""
+        assert MemoryConfig.from_dict({"embed_base_url": None}).embed_base_url == ""
+
+
+class TestBuildEmbeddingProfile:
+    """Gating, endpoint override and key fallback for the memU profile."""
+
+    def test_no_key_and_no_endpoint_disables_embeddings(self):
+        assert build_embedding_profile(
+            openai_api_key="", embed_base_url="", embed_model="text-embedding-3-small",
+        ) is None
+
+    def test_openai_key_alone_uses_openai_endpoint(self):
+        profile = build_embedding_profile(
+            openai_api_key="sk-test", embed_base_url="",
+            embed_model="text-embedding-3-small",
+        )
+        assert profile == {
+            "base_url": _OPENAI_EMBED_BASE_URL,
+            "api_key": "sk-test",
+            "embed_model": "text-embedding-3-small",
+            "client_backend": "sdk",
+        }
+
+    def test_endpoint_alone_enables_embeddings_without_a_key(self):
+        """Covers Bedrock installs, which have no OpenAI credential."""
+        profile = build_embedding_profile(
+            openai_api_key="", embed_base_url="https://llm.internal/v1",
+            embed_model="bge-large-en",
+        )
+        assert profile is not None
+        assert profile["base_url"] == "https://llm.internal/v1"
+        assert profile["embed_model"] == "bge-large-en"
+        # AsyncOpenAI rejects a None key, so a placeholder stands in.
+        assert profile["api_key"] == "placeholder"
+
+    def test_endpoint_overrides_openai_even_when_key_is_set(self):
+        profile = build_embedding_profile(
+            openai_api_key="sk-test", embed_base_url="https://llm.internal/v1",
+            embed_model="bge-large-en",
+        )
+        assert profile["base_url"] == "https://llm.internal/v1"
+        assert profile["api_key"] == "sk-test"
+
+    def test_endpoint_without_model_disables_rather_than_guessing(self):
+        """An empty model would be sent to the API as model=""."""
+        assert build_embedding_profile(
+            openai_api_key="", embed_base_url="https://llm.internal/v1",
+            embed_model="",
+        ) is None
+
+    def test_key_without_model_disables(self):
+        assert build_embedding_profile(
+            openai_api_key="sk-test", embed_base_url="", embed_model="",
+        ) is None
 
 
 class TestKnowledgeCustomPrompts:
