@@ -820,6 +820,7 @@ class PromptRewriteConfig:
 # are region-prefixed.
 DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
     "claude-opus-5",
+    "claude-opus-5-5",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
 )
@@ -890,6 +891,15 @@ class AgentConfig:
     # Substrings of model names that must never request the 1h cache TTL
     # (same matching semantics as context_1m_excluded_models).
     cache_ttl_excluded_models: list[str] = field(default_factory=list)
+    # Keep the appended system prompt byte-identical across sessions of the
+    # same workspace/source/tool set so Anthropic's exact-prefix prompt cache
+    # can share it: the per-session parts (session id, pre-recalled memories)
+    # are delivered in a <session-context> block at the top of the first user
+    # message instead of in the system prompt. With per-session bytes in the
+    # prompt, every session start is a cache WRITE of the whole block (on a
+    # fleet of ~800 cron sessions/day that was measured at ~$850/day) instead
+    # of a cache READ. False restores the legacy shape (id + recall inline).
+    static_system_prompt: bool = True
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -967,6 +977,7 @@ class AgentConfig:
             cache_ttl_excluded_models=_str_list(
                 d.get("cache_ttl_excluded_models")
             ),
+            static_system_prompt=d.get("static_system_prompt", True),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             cli_max_message_bytes=int(
                 d.get("cli_max_message_bytes", 64 * 1024 * 1024)
@@ -2311,7 +2322,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.154.0"            # exclusive
+    max_version: str = "0.156.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -2371,7 +2382,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.154.0")),
+            max_version=str(d.get("max_version", "0.156.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),

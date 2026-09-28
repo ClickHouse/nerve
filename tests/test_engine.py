@@ -30,6 +30,9 @@ from nerve.config import AgentConfig, NerveConfig
         ("xhigh",  "claude-opus-5",             "xhigh"),
         ("xhigh",  "claude-opus-5-20260720",    "xhigh"),
         ("max",    "us.anthropic.claude-opus-5", "max"),
+        # Opus 5.5 supports the full ladder
+        ("max",    "claude-opus-5-5",           "max"),
+        ("low",    "claude-opus-5-5",           "low"),
         # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
         ("max",    "claude-sonnet-5",           "max"),
         ("xhigh",  "claude-sonnet-5",           "xhigh"),
@@ -72,6 +75,21 @@ def test_effective_effort(value, model, expected):
 def test_effective_effort_model_default_none():
     # Signature symmetry with _parse_thinking_config
     assert ClaudeBackend._effective_effort("max") == "max"
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # Opus 5.5 rejects thinking.type="disabled"; send adaptive.
+        ("claude-opus-5-5",              {"type": "adaptive"}),
+        ("us.anthropic.claude-opus-5-5", {"type": "adaptive"}),
+        ("claude-opus-5",                {"type": "disabled"}),
+        ("claude-opus-4-8",              {"type": "disabled"}),
+        (None,                           {"type": "disabled"}),
+    ],
+)
+def test_parse_thinking_config_disabled(model, expected):
+    assert ClaudeBackend._parse_thinking_config("disabled", model) == expected
 
 
 @pytest.mark.parametrize(

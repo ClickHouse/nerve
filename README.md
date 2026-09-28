@@ -159,7 +159,7 @@ Semantic search over everything — conversations, facts, preferences, events. S
 
 - Four memory types: `profile`, `event`, `knowledge`, `behavior`
 - Automatic conversation indexing on session close
-- Pre-recall: relevant memories injected into system prompt when sessions start
+- Pre-recall: relevant memories delivered with the first message when sessions start (kept out of the system prompt so it stays cacheable across sessions)
 - 3-level quality filtering prevents generic facts from polluting memory
 - Semantic deduplication (cosine similarity 0.85 threshold)
 - Full audit log of all mutations
