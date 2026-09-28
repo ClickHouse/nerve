@@ -36,6 +36,10 @@ from nerve.config import AgentConfig, NerveConfig
         # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
         ("max",    "claude-sonnet-5",           "max"),
         ("xhigh",  "claude-sonnet-5",           "xhigh"),
+        # Sonnet 5.5 supports the full ladder (verified via Models API 2026-09-28)
+        ("max",    "claude-sonnet-5-5",         "max"),
+        ("xhigh",  "claude-sonnet-5-5",         "xhigh"),
+        ("low",    "claude-sonnet-5-5",         "low"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),
@@ -80,10 +84,12 @@ def test_effective_effort_model_default_none():
 @pytest.mark.parametrize(
     "model, expected",
     [
-        # Opus 5.5 rejects thinking.type="disabled"; send adaptive.
+        # Opus 5.5 and Sonnet 5.5 reject thinking.type="disabled"; send adaptive.
         ("claude-opus-5-5",              {"type": "adaptive"}),
         ("us.anthropic.claude-opus-5-5", {"type": "adaptive"}),
+        ("claude-sonnet-5-5",            {"type": "adaptive"}),
         ("claude-opus-5",                {"type": "disabled"}),
+        ("claude-sonnet-5",              {"type": "disabled"}),
         ("claude-opus-4-8",              {"type": "disabled"}),
         (None,                           {"type": "disabled"}),
     ],

@@ -17,6 +17,7 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
     "fable-5":    (10,  50, 1.00, 12.50, 20.00, 0.01),  # Fable 5 (Mythos-class, ~2x Opus)
     "opus-5-5":   (4,   20, 0.20,  5.00,  8.00, 0.01),  # Opus 5.5 standard (verified 2026-09-22)
     "opus-5":     (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 5 standard (verified 2026-07-28)
+    "sonnet-5-5": (2,   10, 0.20,  2.50,  4.00, 0.01),  # Sonnet 5.5 standard (verified 2026-09-28)
     "sonnet-5":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 5 standard (verified 2026-07-28)
     "opus-4-8":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.8 standard
     "opus-4-7":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.7 standard

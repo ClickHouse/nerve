@@ -935,9 +935,12 @@ class ClaudeBackend:
 
     @staticmethod
     def _model_rejects_disabled_thinking(model: str | None) -> bool:
-        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
-        # level. Effort is the only control.
-        return bool(model) and "opus-5-5" in model.lower()
+        # Opus 5.5 and Sonnet 5.5 return 400 for thinking.type="disabled" at
+        # every effort level, so send adaptive and let effort set the depth.
+        if not model:
+            return False
+        m = model.lower()
+        return "opus-5-5" in m or "sonnet-5-5" in m
 
     @staticmethod
     def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
@@ -974,6 +977,7 @@ class ClaudeBackend:
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
         "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
+        "sonnet-5-5": ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
