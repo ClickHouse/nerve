@@ -9,9 +9,9 @@ from nerve.db import Database
 
 async def _make(db, sid, source, updated_at, *, starred=False, msg=True,
                 status="idle"):
-    await db.create_session(sid, title=sid, source=source, status=status)
+    await db.create_session(sid, title=sid, source=source, status=status, actor=None)
     if msg:
-        await db.add_message(sid, "user", "hi")   # bumps updated_at → override below
+        await db.add_message(sid, "user", "hi", actor=None)   # bumps updated_at → override below
     if starred:
         await db.update_session_fields(sid, {"starred": 1})
     # updated_at is not settable via update_session_fields (it means "last

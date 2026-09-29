@@ -6,6 +6,7 @@ import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, Modifie
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
+import { bindSender, selfActorId } from './authStore';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
@@ -1090,8 +1091,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
+    //
+    // The gateway excludes this tab from its own `user_message` echo, so stamp
+    // the optimistic row with the same stable author id the stored row gets.
+    // Null identity follows the ordinary unattributed-history path.
+    const sender = selfActorId();
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString() }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
@@ -1157,6 +1163,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // deferred prompt into the current chat (fresh, virtual, or existing).
     // If a composer model/backend pick is in flight for a new chat, carry it
     // onto the created row so the header badge is right from the first render.
+    // Bind before the requests so the optimistic row uses the same actor as the
+    // server even if the tab signs out or changes account while they run.
+    const sender = bindSender();
     const vs = get().virtualSession;
     const effBackend = get().newChatBackend ?? null;
     const pickedModel = effBackend
@@ -1165,7 +1174,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const real: Session = await api.createSession(
       undefined, effBackend, undefined, null, pickedModel,
     );
+    // If auth changed, keep the server row but do not show it in this tab.
+    if (!sender.stillCurrent()) return;
     const res = await api.runLater(real.id, content, delay, fileIds, imageBlocks);
+    if (!sender.stillCurrent()) return;
     const now = new Date().toISOString();
     set((state) => {
       // Drop the transient new-chat state so we don't strand an empty virtual
@@ -1187,7 +1199,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' as const },
         messages: [
-          { role: 'user' as const, blocks: buildBlocks(), created_at: now },
+          // Attribute the deferred prompt to the requester; the Nerve-generated
+          // acknowledgement has no actor_id.
+          { role: 'user' as const, blocks: buildBlocks(), created_at: now, actor_id: sender.actorId },
           { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
         ],
       };

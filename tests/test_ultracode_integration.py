@@ -443,8 +443,7 @@ def test_dashboard_reader_is_bounded_read_only_and_redacts(tmp_path):
     assert read_dashboard_run(cfg, record["id"]) is None
 
 
-def test_dashboard_routes_are_feature_gated(monkeypatch, tmp_path):
-    from nerve.gateway.auth import require_auth
+def test_dashboard_routes_are_feature_gated(monkeypatch, tmp_path, bypass_auth):
     from nerve.gateway.routes import codex as codex_routes
 
     cfg = _config(tmp_path)
@@ -461,7 +460,7 @@ def test_dashboard_routes_are_feature_gated(monkeypatch, tmp_path):
     )
     app = FastAPI()
     app.include_router(codex_routes.router)
-    app.dependency_overrides[require_auth] = lambda: {"sub": "test"}
+    bypass_auth(app)  # these routes are about the feature gate, not about auth
     client = TestClient(app)
 
     status = client.get("/api/codex/ultracode/dashboard")

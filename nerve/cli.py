@@ -80,7 +80,7 @@ def _is_running(pid: int) -> bool:
 
 
 def _write_pid(pid: int, config_dir: Path | None = None) -> None:
-    paths.nerve_home().mkdir(parents=True, exist_ok=True)
+    paths.ensure_nerve_home()
     paths.pid_file().write_text(str(pid))
     if config_dir is not None:
         write_config_pointer(config_dir)
@@ -252,11 +252,12 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         ):
             return
 
+    wizard = None
     if non_interactive:
-        run_non_interactive(config_dir)
+        choices = run_non_interactive(config_dir)
     else:
         wizard = SetupWizard(config_dir, inside_docker=inside_docker)
-        wizard.run()
+        choices = wizard.run()
 
     # Remember where the config lives so every future `nerve` command
     # finds it regardless of the caller's working directory.
@@ -266,6 +267,55 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     config = load_config(config_dir)
     set_config(config)
     ctx.obj["config"] = config
+
+    # Create the owner account now, while the wizard's "Your name" answer is
+    # available. No file stores that answer, so the gateway would create the
+    # owner unnamed. Headless installs have no name. For docker, this runs
+    # inside the container (`--inside-docker`), not in the host-side wizard.
+    from nerve.migrate import bootstrap_identity_sync
+
+    display_name = (choices.user_name or "").strip() or None
+    try:
+        report = bootstrap_identity_sync(
+            config, display_name=display_name, passwordless=choices.passwordless,
+        )
+    except Exception as e:  # noqa: BLE001 - any failure means there is no account
+        # The wizard deleted its checkpoint when it applied the configuration.
+        # Save the answers again so a re-run keeps the name, then fail. The
+        # checkpoint write can fail for the same reason, so the message says
+        # whether it worked.
+        saved = wizard.checkpoint() if wizard is not None else False
+        if wizard is None:
+            remedy = " Fix the cause and run 'nerve init --non-interactive' again."
+        elif saved:
+            remedy = (
+                " Fix the cause and run 'nerve init' again; your answers, the name "
+                "included, are saved and will be reused."
+            )
+        else:
+            name = (choices.user_name or "").strip()
+            remedy = (
+                " Your answers could not be saved either; re-run 'nerve init' and "
+                "re-enter your details"
+                + (f' (your name was "{name}")' if name else "")
+                + "."
+            )
+        raise click.ClickException(
+            f"Setup wrote the configuration, but the local owner account could not "
+            f"be created: {e}.{remedy}"
+        ) from e
+    for action in report.identity_actions:
+        click.echo(f"  {action}")
+    from nerve.db.accounts import read_setup_required
+
+    if read_setup_required(
+        paths.db_path(), configured_password=bool(config.auth.password_hash),
+    ):
+        click.echo(
+            "  Setup is not complete: no password was set and a passwordless "
+            "installation was not chosen. After the gateway starts, run "
+            "'nerve status' to read the setup token, then complete setup at /setup."
+        )
 
 
 @main.command()
@@ -278,9 +328,12 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
+    # The gateway runs the identity bootstrap when it starts.
     if config is not None:
         from nerve.migrate import maybe_migrate
-        report = maybe_migrate(config_dir, workspace=getattr(config, "workspace", None))
+        report = maybe_migrate(
+            config_dir, workspace=getattr(config, "workspace", None), config=config,
+        )
         if report is not None and report.did_anything:
             # The config in hand was loaded from the old locations, and migration
             # has just moved the files out from under it — cron in particular now
@@ -350,7 +403,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
         cmd.extend(["start", "--foreground"])
 
         # Ensure log directory exists
-        paths.nerve_home().mkdir(parents=True, exist_ok=True)
+        paths.ensure_nerve_home()
 
         log_fd = open(paths.log_file(), "a")
         proc = subprocess.Popen(
@@ -450,7 +503,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     if resume_ids:
         ids = [s.strip() for s in resume_ids if s.strip()]
         if ids:
-            RESUME_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            paths.ensure_nerve_home()  # RESUME_QUEUE_FILE lives directly in the state dir
             with open(RESUME_QUEUE_FILE, "a") as fh:
                 fh.writelines(f"{sid}\n" for sid in ids)
             click.echo(f"Will resume {len(ids)} session(s) after restart.")
@@ -552,6 +605,28 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         click.echo("Starting Nerve... new instance will start shortly.")
 
 
+def _echo_setup_token(config) -> None:
+    """Print the unclaimed instance's token only to this local terminal."""
+    from nerve.db.accounts import read_instance_secret
+    from nerve.setup_token import SETUP_TOKEN_NAME
+
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    if not token:
+        return
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    click.echo()
+    click.secho(
+        "  Setup of this instance is not complete, and sign-in is refused "
+        "until it is. Complete it on the setup page with the token below.",
+        fg="yellow",
+    )
+    click.echo(f"  Setup page: http://{host}:{port}/setup")
+    click.echo(f"  Setup token: {token}")
+
+
 @main.command()
 @click.option("--follow", "-f", is_flag=True, help="Follow log output (like tail -f)")
 @click.pass_context
@@ -563,6 +638,7 @@ def status(ctx: click.Context, follow: bool) -> None:
     # Docker mode: proxy to docker compose ps
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
+        _echo_setup_token(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
@@ -608,6 +684,8 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo(f"  Logs: {paths.log_file()}")
     else:
         click.echo("Nerve is not running")
+
+    _echo_setup_token(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -800,12 +878,19 @@ def upgrade(ctx: click.Context, no_frontend: bool, no_deps: bool, no_pull: bool)
         if rc != 0:
             raise click.ClickException("npm run build failed")
 
-    # Migrate a legacy config layout to workspace/config (idempotent).
+    # Migrate a legacy config layout to workspace/config (idempotent), and show
+    # what the gateway will do to nerve.db at its next start.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
-            Path(ctx.obj["config_dir"]), workspace=getattr(config, "workspace", None)
+            Path(ctx.obj["config_dir"]),
+            workspace=getattr(config, "workspace", None),
+            config=config,
         )
+        if report and report.identity_actions:
+            click.echo("\nAt its next start, the gateway will:")
+            for action in report.identity_actions:
+                click.echo(f"  - {action}")
         if report and report.did_anything:
             click.echo("\nMigrated config to the workspace layout:")
             for action in report.actions:
@@ -1123,16 +1208,70 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] SSL not configured")
 
-    # Check auth
-    if config.auth.password_hash:
-        lines.append("[OK] Auth password hash configured")
+    # Check auth. The credential lives on the account row, not in configuration:
+    # the startup migration copied auth.password_hash across and removed the key,
+    # so reading that key here would call a perfectly well-secured install
+    # "passwordless". Read-only, and tolerant of a database that does not exist
+    # yet (None) — that is a fresh install, which the wizard is about to shape.
+    #
+    # Which rows count as having a password is asked of the same function the
+    # login route asks, not restated: a `none` row reads auth.password_hash too
+    # (a reload that adds one takes effect before the next restart re-derives
+    # the row), so judging by the row alone told operators that an *active*
+    # password did nothing — and removing it on that advice would have opened
+    # the instance.
+    from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
+    from nerve.gateway.auth import source_authenticates
+
+    configured = bool(config.auth.password_hash)
+    identity_state = inspect_bootstrap_state(paths.db_path())
+    sources = identity_state[0] if identity_state is not None else None
+    usable = [
+        source for source in (sources or [])
+        if source_authenticates(source, configured_password=configured)
+    ]
+    if sources is None:
+        lines.append("[--] Accounts: nerve.db not created yet (first start will)")
+    elif not sources:
+        warnings.append("[WARN] No local account yet — the next start creates one")
+    elif not usable and read_setup_required(
+        paths.db_path(), configured_password=configured,
+    ):
+        warnings.append(
+            "[WARN] Setup is not complete — sign-in is refused until it is. "
+            "Complete it at /setup with the setup token shown by `nerve status` "
+            "on the host"
+        )
+    elif not usable:
+        warnings.append(
+            "[WARN] No password set — passwordless by choice: anyone who can "
+            "reach the gateway acts as the owner"
+        )
     else:
-        warnings.append("[WARN] Auth password not set — running in dev mode (no auth)")
+        lines.append(
+            f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
+        )
+    if configured and sources is not None:
+        reading = [source for source in sources if source != "local"]
+        if reading:
+            lines.append(
+                f"[OK] auth.password_hash is in use by {len(reading)} account(s) "
+                "— the next start copies it onto them and removes the key"
+            )
+        else:
+            warnings.append(
+                "[WARN] auth.password_hash is set but no account uses it — every "
+                "account has its own password now; the configured value does nothing"
+            )
 
     if config.auth.jwt_secret:
         lines.append("[OK] JWT secret configured")
+    elif _signing_secret(config):
+        lines.append("[OK] JWT secret: generated on first start, kept in nerve.db")
     else:
-        warnings.append("[WARN] JWT secret not set — running in dev mode")
+        lines.append(
+            "[--] JWT secret: none configured — one is generated into nerve.db on first start"
+        )
 
     # Check DB
     db_path = paths.db_path()
@@ -1276,6 +1415,20 @@ def doctor(ctx: click.Context) -> None:
 _WILDCARD_BINDS = ("", "0.0.0.0", "::", "*")
 
 
+def _signing_secret(config) -> str:
+    """The JWT secret the local daemon signs with, read from a CLI process.
+
+    ``auth.jwt_secret`` if set, else the secret the daemon generated into
+    ``nerve.db``, read directly from the file. Empty if the daemon has never
+    started.
+    """
+    if config.auth.jwt_secret:
+        return config.auth.jwt_secret
+    from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
+
+    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME)
+
+
 def _gateway_url(config, path: str) -> str:
     """URL for a loopback call to this box's own gateway.
 
@@ -1301,7 +1454,7 @@ def reload(ctx: click.Context) -> None:
     """
     import httpx
 
-    from nerve.gateway.auth import create_token
+    from nerve.gateway.auth import create_system_token
 
     config = ctx.obj["config"]
     if config is None:
@@ -1309,13 +1462,18 @@ def reload(ctx: click.Context) -> None:
             f"Config could not be loaded ({ctx.obj.get('config_error')}); "
             "run 'nerve config validate' to see why."
         )
-    if not config.auth.jwt_secret and config.lockdown:
+    # Without a secret there is nothing to sign with, and the gateway refuses
+    # unauthenticated requests, so fail here with a clear message.
+    secret = _signing_secret(config)
+    if not secret:
         raise click.ClickException(
-            "No auth.jwt_secret in the config read here, and a locked gateway "
-            "never runs open, so nothing sent from this shell can be "
-            "authenticated. If the secret comes from ${ENV_VAR}, export it here "
-            "too; if the daemon has none either, it is refusing every request "
-            "and needs one before it can be reloaded."
+            "No signing secret is available to this shell: auth.jwt_secret is not "
+            "in the config read here and nerve.db holds no generated one yet. The "
+            "gateway refuses unauthenticated requests"
+            + (", and a locked gateway never runs open" if config.lockdown else "")
+            + ", so nothing sent from here can succeed. If the secret comes from "
+            "${ENV_VAR}, export it in this shell too; if the daemon has never "
+            "started, start it first."
         )
     url = _gateway_url(config, "/api/config/reload")
     # Certificate verification stands except in the one case where it cannot
@@ -1325,13 +1483,10 @@ def reload(ctx: click.Context) -> None:
     # gateway.host names a real host the certificate should match it, and a
     # failure there is worth hearing about rather than skipping past.
     verify = config.gateway.host not in _WILDCARD_BINDS
-    # A token when there is a secret to sign one with, and otherwise none: an
-    # unlocked gateway with no auth.jwt_secret does not ask for one (require_auth
-    # runs open there), so an empty secret is not a reason to refuse to call. The
-    # operator hand-editing config on a dev box is the likeliest caller of all.
-    headers = {}
-    if config.auth.jwt_secret:
-        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+    # This shell is the instance talking to itself, not a person: the token
+    # resolves to the agent's system principal rather than standing in for
+    # whichever account happens to exist.
+    headers = {"Authorization": f"Bearer {create_system_token(secret)}"}
     try:
         resp = httpx.post(
             url,
@@ -1397,6 +1552,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     scrubbed into config.local.yaml as ${ENV_VAR} refs), machine-local keys stay
     in config.yaml. Also moves ~/.nerve/cron → workspace/config/cron.
     Non-destructive (originals kept as *.migrated) and idempotent.
+
+    Also shows what the gateway will do to nerve.db at its next start: create
+    the local owner account and, if auth.jwt_secret is not set, a JWT signing
+    secret. This command does not write them.
     """
     from nerve.migrate import migrate as run_migrate
 
@@ -1404,18 +1563,28 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
     config_dir = Path(ctx.obj["config_dir"])
     workspace = getattr(config, "workspace", None) if config is not None else None
     try:
-        report = run_migrate(config_dir, workspace=workspace, dry_run=dry_run)
+        report = run_migrate(
+            config_dir, workspace=workspace, dry_run=dry_run, config=config,
+        )
     except Exception as e:  # e.g. a malformed config.local.yaml
         raise click.ClickException(f"Migration failed: {e}") from e
 
-    if not report.did_anything:
-        click.secho("Nothing to migrate — already on the workspace layout.", fg="green")
+    if not report.did_anything and not report.did_bootstrap:
+        click.secho(
+            "Nothing to migrate: already on the workspace layout, and the local "
+            "account is in place.",
+            fg="green",
+        )
         for warning in report.warnings:
             click.secho(f"  Note: {warning}", fg="yellow")
         return
     prefix = "[dry-run] would " if dry_run else ""
     for action in report.actions:
         click.echo(f"  {prefix}{action}")
+    if report.identity_actions:
+        click.echo("\n  At its next start, the gateway will:")
+        for action in report.identity_actions:
+            click.echo(f"  - {action}")
     for warning in report.warnings:
         click.secho(f"\n  Note: {warning}", fg="yellow")
     if report.secrets_moved:
@@ -1433,8 +1602,10 @@ def migrate(ctx: click.Context, dry_run: bool) -> None:
         )
     if dry_run:
         click.secho("\nDry run — no changes written.", fg="yellow")
-    else:
+    elif report.did_anything:
         click.secho("\nMigration complete. Review workspace/config/settings.yaml before committing.", fg="green")
+    else:
+        click.secho("\nThe config layout needs no migration.", fg="green")
 
 
 @main.group(name="config")
@@ -1636,9 +1807,9 @@ def codex_token(ctx: click.Context, hours: int) -> None:
     """
     from nerve.gateway.auth import create_external_mcp_token
 
-    secret = ctx.obj["config"].auth.jwt_secret
+    secret = _signing_secret(ctx.obj["config"])
     if not secret:
-        # Development mode bypasses MCP auth. An empty value is intentional.
+        # No secret yet (the daemon has never started), so print nothing.
         return
     click.echo(create_external_mcp_token(secret, ttl_seconds=hours * 60 * 60))
 
@@ -1762,10 +1933,10 @@ def sync(ctx: click.Context, source: str) -> None:
 
     async def _run():
         from nerve.agent.engine import AgentEngine
-        from nerve.db import init_db, close_db
+        from nerve.migrate import open_production_db
         from nerve.sources.registry import build_source_runners
 
-        db = await init_db()
+        db = await open_production_db(config)
         try:
             engine = AgentEngine(config, db)
             await engine.initialize()
@@ -1803,10 +1974,10 @@ def sync(ctx: click.Context, source: str) -> None:
                     error=result.error,
                 )
         finally:
-            await close_db()
+            await db.close()
 
     click.echo(f"Running sync: {source}")
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @main.command("setup-telegram")
@@ -1857,9 +2028,9 @@ def cron(ctx: click.Context, job_id: str) -> None:
 
     async def _run():
         from nerve.agent.engine import AgentEngine
-        from nerve.db import init_db, close_db
+        from nerve.migrate import open_production_db
 
-        db = await init_db()
+        db = await open_production_db(config)
         try:
             engine = AgentEngine(config, db)
             await engine.initialize()
@@ -1899,9 +2070,9 @@ def cron(ctx: click.Context, job_id: str) -> None:
                         f"{job.description or job.schedule} ({status})"
                     )
         finally:
-            await close_db()
+            await db.close()
 
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @main.command()
@@ -2283,6 +2454,21 @@ def _fmt_bytes(n: int) -> str:
     return f"{(n or 0) / (1024 * 1024):.1f} MB"
 
 
+def _run_against_db(ctx: click.Context, coro):
+    """``asyncio.run`` for a command that opens the state database.
+
+    Prints an :class:`InsecureStateStorage` refusal as an error message
+    instead of a traceback.
+    """
+    from nerve.migrate import InsecureStateStorage
+
+    try:
+        return asyncio.run(coro)
+    except InsecureStateStorage as e:
+        click.echo(f"[ERR] {e}")
+        ctx.exit(1)
+
+
 @main.group(name="db")
 def db_group() -> None:
     """Database maintenance (prune old data, vacuum to reclaim space)."""
@@ -2299,7 +2485,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
     Frees space inside the DB; run ``nerve db vacuum`` afterwards to shrink the
     file on disk.
     """
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
@@ -2316,8 +2502,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
     )
 
     async def _run() -> None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             report = await database.run_retention(
                 retention_days=days,
@@ -2343,7 +2528,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
         if not dry_run:
             click.echo("\nFreed space inside the DB. Run `nerve db vacuum` to shrink the file.")
 
-    asyncio.run(_run())
+    _run_against_db(ctx, _run())
 
 
 @db_group.command("vacuum")
@@ -2354,7 +2539,7 @@ def db_vacuum(ctx: click.Context) -> None:
     VACUUM takes a write lock and cannot run while the daemon holds the DB.
     Stop the daemon first (`nerve stop`) for a clean run.
     """
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
@@ -2374,8 +2559,7 @@ def db_vacuum(ctx: click.Context) -> None:
     click.echo(f"Vacuuming {db_path} ({_fmt_bytes(size_before)})...")
 
     async def _run() -> None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             await database.vacuum()
         finally:
@@ -2430,10 +2614,12 @@ def _gateway_request(
     scheme = "https" if config.gateway.ssl.enabled else "http"
     url = f"{scheme}://127.0.0.1:{config.gateway.port}{path}"
     headers = {}
-    if config.auth.jwt_secret:
-        from nerve.gateway.auth import create_token
+    secret = _signing_secret(config)
+    if secret:
+        # The instance acting on its own behalf — see `nerve reload`.
+        from nerve.gateway.auth import create_system_token
 
-        headers["Authorization"] = f"Bearer {create_token(config.auth.jwt_secret)}"
+        headers["Authorization"] = f"Bearer {create_system_token(secret)}"
     try:
         # verify=False: gateway.ssl is normally a local self-signed cert,
         # and this call only ever targets loopback.
@@ -2473,15 +2659,14 @@ def workflow_group() -> None:
 @click.pass_context
 def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
     """List workflow runs straight from the database (daemon not required)."""
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = _workflow_db_path(ctx)
 
     async def _run() -> list[dict]:
         # Read-only concurrent access is safe alongside the daemon (WAL).
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             return await database.list_workflow_runs(
                 status=status or None, limit=limit,
@@ -2489,7 +2674,7 @@ def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
         finally:
             await database.close()
 
-    runs = asyncio.run(_run())
+    runs = _run_against_db(ctx, _run())
     if not runs:
         click.echo("No workflow runs" + (f" with status '{status}'" if status else "") + ".")
         return
@@ -2502,20 +2687,19 @@ def workflow_list(ctx: click.Context, status: str, limit: int) -> None:
 @click.pass_context
 def workflow_status(ctx: click.Context, run_id: str) -> None:
     """Show one run's status, spend vs budget, session, and journal path."""
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
     db_path = _workflow_db_path(ctx)
 
     async def _run() -> dict | None:
-        database = Database(db_path, workspace=config.workspace)
-        await database.connect()
+        database = await open_production_db(config, db_path=db_path)
         try:
             return await database.get_workflow_run(run_id)
         finally:
             await database.close()
 
-    run = asyncio.run(_run())
+    run = _run_against_db(ctx, _run())
     if run is None:
         click.echo(f"[ERR] No such workflow run: {run_id}")
         ctx.exit(1)

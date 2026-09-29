@@ -1,6 +1,6 @@
 import {
   MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, Clock,
-  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, type Icon,
+  Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, Users, type Icon,
 } from '../ui/icons';
 
 export type NavItem = {
@@ -26,6 +26,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/sources', icon: Inbox, label: 'Sources' },
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },
+  { path: '/accounts', icon: Users, label: 'Accounts' },
   { path: '/diagnostics', icon: Activity, label: 'Diag' },
 ];
 
@@ -39,6 +40,7 @@ export const NAV_ITEMS: NavItem[] = [
  * reason to open the panel on a phone and is useless if it is hidden behind
  * a menu. The rest (files, skills, MCP, cron, memory, diagnostics, sources)
  * are configuration and inspection surfaces — reached deliberately, rarely
- * in a hurry.
+ * in a hurry. Accounts is the same kind of thing: opened once when somebody
+ * joins or leaves, never in a hurry.
  */
 export const PRIMARY_PATHS = ['/chat', '/tasks', '/notifications', '/plans'];

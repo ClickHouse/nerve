@@ -165,22 +165,23 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 1. User sends message via Telegram
 2. `TelegramChannel` receives it, resolves active session
 3. `AgentEngine.run()` is called with the message
-4. System prompt is built (SOUL.md + IDENTITY.md + memories)
+4. System prompt is built (SOUL.md + IDENTITY.md + MEMORY.md — identical across sessions); the session id and pre-recalled memories are prepended to the first message
 5. Claude Agent SDK processes the message with tools
 6. Streaming events broadcast to Telegram (edit-in-place) and any WebSocket clients
 7. Final response stored in SQLite
 
 ### User Message (Web UI)
 1. User sends message via WebSocket
-2. Gateway's WebSocket handler receives it
-3. `AgentEngine.run()` called in background task
-4. Streaming events sent back via WebSocket
-5. Client renders tokens in real-time
+2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept
+3. `AgentEngine.run()` called in background task, carrying that actor
+4. The user message is stored under it; the assistant's reply is stored unattributed
+5. Streaming events sent back via WebSocket
+6. Client renders tokens in real-time
 
 ### Cron Job
 1. APScheduler triggers at schedule
 2. Isolated per-run session created (`cron:{job_id}:{timestamp}`)
-3. Agent runs with job prompt and cron model
+3. Agent runs with job prompt and cron model, acting as the system principal — the session and the prompt are attributed to it, not to whoever wrote the schedule
 4. Agent uses `notify`/`ask_user` tools to communicate with user
 5. Run logged in `cron_logs` table
 
@@ -222,8 +223,8 @@ To add a new migration: create `nerve/db/migrations/v017_your_feature.py` with a
 ### Schema
 
 SQLite with WAL mode (schema version 16):
-- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`)
-- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads)
+- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
+- `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
 - `session_events` — Append-only lifecycle audit log (created, started, idle, stopped, archived, error)
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
@@ -241,6 +242,9 @@ SQLite with WAL mode (schema version 16):
 - `notifications` — Async notifications and questions (id, session_id, type, title, body, priority, status, options, answer, delivery tracking, expiry)
 - `mcp_servers` — MCP server registry (config is source of truth, DB tracks metadata)
 - `mcp_tool_usage` — MCP tool invocation tracking
+- `actor_refs`: attribution identity: stable id, `kind` (`human`/`system`), display name (see [Accounts and identity](accounts.md))
+- `accounts`: local login state, one per human actor: username, `credential_source` (`config`/`local`/`none`), credential, enabled
+- `instance_secrets`: machine-local secrets that are state, not configuration (the generated JWT signing secret)
 
 memU SQLite (`~/.nerve/memu.sqlite`):
 - `memu_resources` — Indexed source files/conversations
@@ -262,8 +266,8 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 
 ## Security
 
-- JWT authentication for all API/WebSocket access
+- JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode
 - bcrypt password hashing
 - Path traversal prevention on file operations
 - Self-signed HTTPS (mkcert)
-- Single-user system — no multi-tenancy
+- Local accounts with a stable actor identity per account (one owner account, created at first start; see [Accounts and identity](accounts.md)). No multi-tenancy

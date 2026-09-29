@@ -1303,6 +1303,8 @@ class TelegramChannel(BaseChannel):
             )
             return
         except Exception:
+            # Includes paths.InsecureFileError (nothing was saved). The user is
+            # paired only until restart, and the reply says so.
             logger.exception("Paired user %d but failed to persist to config", user_id)
             await update.message.reply_text(
                 "Paired for this run, but saving to config failed — check "
@@ -1507,6 +1509,9 @@ class TelegramChannel(BaseChannel):
         try:
             result = await approve_plan(
                 db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+                # Telegram users are not mapped to local identities yet, so
+                # the approval stays unattributed, like other Telegram input.
+                actor=None,
             )
         except (PlanNotFound, TaskNotFound):
             await query.answer("That plan is no longer available", show_alert=True)

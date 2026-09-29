@@ -26,6 +26,16 @@ from nerve.agent.plan_service import (
     request_plan_revision,
 )
 from nerve.db import Database
+from nerve.identity import Actor
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 class FakeSessionManager:
@@ -40,11 +50,14 @@ class FakeSessionManager:
         title: str | None = None,
         source: str = "web",
         metadata: dict | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
             "title": title,
             "source": source,
+            "actor": actor,
         })
         return {"id": session_id, "title": title or session_id, "source": source}
 
@@ -52,8 +65,11 @@ class FakeSessionManager:
 class FakeEngine:
     """Mimics AgentEngine.run + .sessions for revision dispatch tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         self.sessions = FakeSessionManager()
+        # The revision dispatcher resolves the system principal off the
+        # engine's database before it dispatches, so the fake carries one.
+        self.db = db
         self.runs: list[dict[str, Any]] = []
         # Event flipped after every run() call so tests can await
         # dispatch deterministically instead of sleeping.
@@ -64,11 +80,14 @@ class FakeEngine:
         session_id: str,
         user_message: str,
         source: str = "web",
+        *,
+        actor: Actor | None,
     ) -> None:
         self.runs.append({
             "session_id": session_id,
             "user_message": user_message,
             "source": source,
+            "actor": actor,
         })
         self.run_event.set()
 
@@ -89,7 +108,7 @@ async def _setup(db: Database, tmp_path) -> tuple[FakeEngine, str]:
         session_id="sess-proposer", version=1, plan_type="generic",
     )
 
-    engine = FakeEngine()
+    engine = FakeEngine(db)
     tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
     return engine, task_id
 
@@ -166,7 +185,7 @@ class TestRequestPlanRevision:
         await _setup(db, tmp_path)
         # Null out session_id to simulate a legacy plan.
         await db.update_plan("plan-orig", session_id=None)
-        engine = FakeEngine()
+        engine = FakeEngine(db)
         tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
 
         await request_plan_revision(
@@ -305,10 +324,11 @@ class TestHttpReviseRoute:
     to the right status codes and dispatches the same plan_update prompt."""
 
     @pytest_asyncio.fixture
-    async def app_setup(self, db: Database, tmp_path):
+    async def app_setup(self, db: Database, tmp_path, bypass_auth):
         """Build a minimal FastAPI app wired to a fake engine + this DB.
 
-        We bypass auth (no jwt_secret) and use TestClient for sync HTTP.
+        Auth is overridden on the app (these routes are not about it) and
+        TestClient gives sync HTTP.
         """
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -317,12 +337,9 @@ class TestHttpReviseRoute:
         from nerve.gateway.routes._deps import init_deps
         from nerve.gateway.routes.plans import router as plans_router
 
-        # Auth dependency reads get_config().auth.jwt_secret — set up a
-        # config with no secret so require_auth is a no-op.
         import nerve.config as cfg_mod
         cfg = NerveConfig()
         cfg.workspace = tmp_path
-        cfg.auth.jwt_secret = ""
         cfg_mod._config = cfg
 
         engine, task_id = await _setup(db, tmp_path)
@@ -330,6 +347,7 @@ class TestHttpReviseRoute:
 
         app = FastAPI()
         app.include_router(plans_router)
+        bypass_auth(app)
         client = TestClient(app)
 
         yield SimpleNamespace(client=client, engine=engine, db=db, task_id=task_id)

@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.153.3",
+  "codex_cli_version": "0.155.1",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-09-05",
-  "canonical_v2_schema_sha256": "73f9645eb8531f1caaa31b85c59fdd5c2db12cf79928bfb290a672a654fa9a14",
+  "verified_date": "2026-09-22",
+  "canonical_v2_schema_sha256": "4bd2cca110846b2bb604f635e2fa165a3156c0e2ecd3a32823cd3495bb6c716c",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.144.1 -> 0.153.3 was purely additive for every method and notification nerve uses (no removed fields; new: model/list includeHidden + Model.hidden/supportedReasoningEfforts, TokenUsageBreakdown.cacheWriteInputTokens)."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.153.3 -> 0.155.1 was purely additive for every method and notification nerve uses (no removed definitions or fields; new: thread/attachment/* methods + thread/attachment/updated notification, ResponseItem configuration_update variant, optional account/rateLimits/read params, additive props Thread.originator, McpServerStatus.toolsError, RateLimitSnapshot.normalModelSlug, GetAccountRateLimitsResponse.ordinaryUsageAllowed)."
 }

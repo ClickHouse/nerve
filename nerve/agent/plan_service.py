@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
+    from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -203,9 +204,15 @@ async def request_plan_revision(
     )
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
+        actor=engine.db.system_actor,
     )
     asyncio.create_task(
-        engine.run(session_id=session_id, user_message=prompt, source="cron")
+        engine.run(
+            session_id=session_id, user_message=prompt, source="cron",
+            # The revision prompt is built from a template here, not typed by
+            # the person who asked for the revision.
+            actor=engine.db.system_actor,
+        )
     )
 
     logger.info(
@@ -246,7 +253,8 @@ async def approve_plan(
     engine: "AgentEngine",
     plan_id: str,
     *,
-    actor: str = "system",
+    actor: Actor | None,
+    caller_session_id: str = "system",
 ) -> dict:
     """Approve a pending plan and spawn its implementation session.
 
@@ -254,8 +262,14 @@ async def approve_plan(
         db: Database instance (plan/task lookups + updates).
         engine: AgentEngine (session creation + run dispatch).
         plan_id: The pending plan to approve.
-        actor: Who approved, recorded in the task's status history: the
-            calling agent's session id, or ``"system"`` for the WebUI and chat.
+        actor: Who approved, stored as the creator of the implementation
+            session: the approving person on the WebUI, ``db.system_actor``
+            when the agent approves through its own tool, ``None`` for a
+            chat user with no local identity. Required keyword-only, like
+            the session store's own ``actor``.
+        caller_session_id: The session the task update runs under, which
+            the task's status history records: the calling agent's session
+            id, or ``"system"`` for the WebUI and chat.
 
     Returns:
         ``{"plan_id", "task_id", "impl_session_id"}`` on success.
@@ -274,8 +288,8 @@ async def approve_plan(
         - If creating the session or updating the task fails, the plan goes
           back to ``pending`` so it can be approved again.
         - Dispatches ``engine.run()`` in the background with the build
-          prompt; registers the task with the engine (when supported) so
-          ``/stop`` can cancel a stuck implementation.
+          prompt as the system actor; registers the task with the engine
+          (when supported) so ``/stop`` can cancel a stuck implementation.
     """
     from dataclasses import replace
     from nerve.agent.tools import _legacy_ctx
@@ -308,10 +322,11 @@ async def approve_plan(
     # The legacy ToolContext (db/engine overridden with the handed-in
     # instances) is the same pattern request_plan_revision relies on, so
     # tests with a config-less FakeEngine keep working.
-    task_ctx = replace(_legacy_ctx(actor), db=db, engine=engine)
+    task_ctx = replace(_legacy_ctx(caller_session_id), db=db, engine=engine)
     try:
         await engine.sessions.get_or_create(
             impl_session_id, title=f"Implement: {task['title']}", source="web",
+            actor=actor,
         )
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],
@@ -345,6 +360,11 @@ async def approve_plan(
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
+                # Nerve assembles the prompt from the task file and the
+                # approved plan, so the turn is the instance's own work even
+                # though an approval started it. The session carries who
+                # approved.
+                actor=db.system_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)
@@ -378,7 +398,7 @@ async def decline_plan(
     plan_id: str,
     feedback: str = "",
     *,
-    actor: str = "system",
+    caller_session_id: str = "system",
 ) -> dict:
     """Decline a pending plan and close its task as done.
 
@@ -391,8 +411,9 @@ async def decline_plan(
         engine: AgentEngine (only used to build the task-handler context).
         plan_id: The pending plan to decline.
         feedback: Optional free-text reason, recorded on plan + task note.
-        actor: Who declined, recorded in the task's status history: the
-            calling agent's session id, or ``"system"`` for the WebUI and chat.
+        caller_session_id: The session the task closure runs under, which
+            the task's status history records: the calling agent's session
+            id, or ``"system"`` for the WebUI and chat.
 
     Returns:
         ``{"plan_id", "task_id", "status": "declined", "feedback"}``.
@@ -433,7 +454,7 @@ async def decline_plan(
         note = f"Plan {plan_id} declined — {feedback}"
     else:
         note = f"Related plan {plan_id} was closed without a specified reason"
-    task_ctx = replace(_legacy_ctx(actor), db=db, engine=engine)
+    task_ctx = replace(_legacy_ctx(caller_session_id), db=db, engine=engine)
     try:
         await task_done_handler(task_ctx, {
             "task_id": plan["task_id"],

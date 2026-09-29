@@ -221,7 +221,10 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await approve_plan(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id,
-            actor=ctx.session_id or "system",
+            # The agent approved this plan through its own tool, so the
+            # implementation session is the instance's own work.
+            actor=ctx.db.system_actor,
+            caller_session_id=ctx.session_id or "system",
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")
@@ -254,7 +257,7 @@ async def plan_decline_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await decline_plan(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
-            actor=ctx.session_id or "system",
+            caller_session_id=ctx.session_id or "system",
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")

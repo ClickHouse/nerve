@@ -159,7 +159,7 @@ Semantic search over everything — conversations, facts, preferences, events. S
 
 - Four memory types: `profile`, `event`, `knowledge`, `behavior`
 - Automatic conversation indexing on session close
-- Pre-recall: relevant memories injected into system prompt when sessions start
+- Pre-recall: relevant memories delivered with the first message when sessions start (kept out of the system prompt so it stays cacheable across sessions)
 - 3-level quality filtering prevents generic facts from polluting memory
 - Semantic deduplication (cosine similarity 0.85 threshold)
 - Full audit log of all mutations
@@ -274,6 +274,7 @@ See [docs/config.md](docs/config.md) for all options.
 | [Architecture](docs/architecture.md) | System overview, modes, deployment, data flow |
 | [Setup](docs/setup.md) | Installation, config, Docker, HTTPS, systemd |
 | [Config](docs/config.md) | All config options with descriptions and defaults |
+| [Accounts](docs/accounts.md) | Local accounts, actor identity, the first-start bootstrap and the signing secret |
 | [Worker Guide](docs/worker-guide.md) | Worker mode setup, onboarding, plan-approve loop |
 | [API Reference](docs/api.md) | REST API and WebSocket protocol |
 | [SDK Sessions](docs/sdk-sessions.md) | Session lifecycle, resume, forking |

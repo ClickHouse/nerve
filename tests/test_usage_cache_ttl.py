@@ -35,7 +35,7 @@ class TestSchema:
     async def test_v027_columns_default_zero(self, db: Database):
         # Schema was rolled forward by the fixture — the new columns
         # must be addable to existing rows with a 0 default.
-        await db.create_session("sess-default", source="web")
+        await db.create_session("sess-default", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-default",
             input_tokens=100,
@@ -93,7 +93,7 @@ class TestExtractSplit:
 @pytest.mark.asyncio
 class TestPersistence:
     async def test_record_persists_split(self, db: Database):
-        await db.create_session("sess-split", source="web")
+        await db.create_session("sess-split", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-split",
             input_tokens=200,
@@ -116,7 +116,7 @@ class TestPersistence:
         assert row[1] == 100
 
     async def test_session_totals_include_split(self, db: Database):
-        await db.create_session("sess-totals", source="web")
+        await db.create_session("sess-totals", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-totals",
             input_tokens=200, output_tokens=80,

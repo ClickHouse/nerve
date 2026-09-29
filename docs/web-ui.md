@@ -26,7 +26,7 @@ web/src/
 │   ├── taskStore.ts    # Task list/detail state (Zustand)
 │   └── skillsStore.ts  # Skills CRUD + usage stats (Zustand)
 ├── components/
-│   ├── Auth/           # Login page
+│   ├── Auth/           # Login page and session-expired overlay
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
 │   │   ├── tools/      # Specialized tool call renderers
 │   │   ├── FileChangesPanel.tsx  # Modified files list + detail navigation
@@ -111,6 +111,59 @@ Generic tabbed panel that replaces the old plan-only preview panel. Auto-opens w
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
 - **Selection comments** — Select text in plan content to add/remove/improve/ask/note, same as in chat messages.
 
+### Accounts
+
+`/accounts` — the local accounts: username, display name, whether each is
+enabled and whether it has a password. Add someone, rename, disable and
+re-enable, and change your own password.
+
+Every account can do all of that to every other account; there are no roles, so
+adding a person gives them the power to disable you. Disabling is the only
+destructive action here — there is no delete — and it asks before it acts, with
+stronger wording for your own account, because the click that disables you is
+also the click that signs you out and getting back in needs somebody else. The
+only thing the server refuses outright is disabling the last enabled account. Two more refusals apply until the
+first account has both a password and a username, which is what has to be true
+before a second account can exist — the page shows the reason rather than
+guessing at it.
+
+A standalone instance with no password opens `/accounts` directly so its owner
+can name and secure the first account.
+
+### When a session expires
+
+The app stays mounted and asks for the password over the top, so nothing you had
+typed is lost. It unlocks **the account whose app is on screen** and no other:
+the username is shown rather than asked for, because everything underneath —
+unsent drafts, what has been read, the loaded session list — belongs to that
+person, and a form that took any username would let somebody else unlock a
+colleague's tab and inherit it. Using a different account goes through "log
+out", which is what discards all of that first.
+
+### Attribution
+
+Messages and sessions store stable actor ids, never names. The UI resolves their
+current names from `GET /api/actors`: Nerve is always labelled, while a human is
+labelled only when their actor id differs from the signed-in viewer. The viewer
+is the `actor` from `GET /api/auth/me`, not the account. Thus Alice
+does not see repeated labels on her own history, but Bob sees Alice throughout
+an Alice-only transcript and sidebar. The same rule applies to the open-session
+header; on phones it keeps the name visible and hides only the "Started by"
+verb visually.
+
+Null ids in legacy or unidentified-human history render no attribution element.
+Names are held only in memory. Equal rendered names get collision-safe id
+suffixes in visible text. A person without a display name is labelled by their
+username; `Unnamed account` appears only when they have neither. The system
+principal uses `Nerve` and a bot glyph.
+
+Optimistic and live messages carry actor ids so labels are correct before a
+reload. The actor directory coalesces concurrent reads and performs one
+follow-up for ids arriving while a read is in flight. Account mutations force a
+refresh, so same-tab renames update immediately without rewriting messages;
+renames in another tab converge on reload. Request generations prevent a stale
+lookup from repopulating the map after logout or overwriting a newer refresh.
+
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
 - **System** — Hostname, platform, memory (RSS), disk usage
@@ -155,6 +208,9 @@ cd web && npx vite build
 
 Uses Zustand for lightweight state management:
 - `authStore` — Login/logout, token management
+- `actorStore` — The actor id → display name map behind attribution labels. In
+  memory only; same-tab account mutations refresh it, while cross-tab renames
+  converge on reload
 - `chatStore` — Sessions, messages, streaming state, agent status, side panel state (tabs, visibility, width), pending interactions (mid-turn user input), sidebar collapsed state, text selection quotes, modified files tracking. WebSocket message handling is dispatched to domain-specific handler modules under `handlers/`, with stateless helpers under `helpers/`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync

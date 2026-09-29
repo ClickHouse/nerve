@@ -2,17 +2,67 @@
 
 ## REST API
 
-All endpoints require JWT authentication via `Authorization: Bearer <token>` header or `nerve_token` cookie.
+Unless noted otherwise, endpoints require a JWT in the `Authorization: Bearer
+<token>` header or `nerve_token` cookie.
 
 ### Auth
 
 #### `POST /api/auth/login`
-Login with password, receive JWT.
+Log in and receive a session token. Authentication is not required.
 
 ```json
-Request:  { "password": "..." }
+Request:  { "password": "...", "username": "alice" }
 Response: { "token": "eyJ..." }
 ```
+
+`username` is optional when one account exists and required when there are two
+or more. Use `GET /api/auth/status` to determine which fields to show. On a
+passwordless installation, any password is accepted for the sole account.
+
+Treat the returned token as opaque.
+
+| Outcome | Response |
+|---|---|
+| Invalid credentials or missing required username | `401` `Invalid username or password` |
+| Valid credentials for a disabled account | `401` |
+| Setup is not complete (`login` is `setup`) | `409` |
+| Authentication is not ready | `503` |
+
+#### Authenticated requests
+
+Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
+or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+
+Every request resolves its token to an account actor or the system principal.
+Unknown and disabled accounts fail with `401`; unavailable startup identity
+state fails with `503`. See [Accounts and identity](accounts.md) for token
+types and legacy-session compatibility.
+
+When a session is more than halfway to expiry, the response includes a refreshed
+token in `X-Nerve-Token`. Replace the current token with it. The header also
+upgrades sessions created before per-account login and is exposed through CORS.
+
+#### `GET /api/auth/status`
+Return the required login fields. Authentication is not required.
+
+```json
+Response: {
+  "auth_required": true,
+  "login": "password"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `login` | `setup`, `none`, `password`, or `username_password` |
+| `auth_required` | Compatibility field; equivalent to `login != "none"` |
+
+`setup` means setup is not complete: login is refused and only
+`POST /api/setup/claim` is permitted. `none` means the operator chose a
+passwordless installation.
+
+The response does not expose usernames or the account count. Before
+authentication is ready, it returns the fail-closed `username_password` state.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -20,6 +70,138 @@ Verify current authentication.
 ```json
 Response: { "authenticated": true }
 ```
+
+#### `GET /api/auth/me`
+Return the actor this credential acts as, and its local account.
+
+```json
+Response: {
+  "actor": { "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" },
+  "account": { "id": "…", "actor_id": "…", "username": "alice", "…": "…" }
+}
+```
+
+`actor` has the shape of one `GET /api/actors` row. `account` has the shape of
+`GET /api/accounts/me`, or is `null` when the credential has no account, such as
+the system principal's. The web UI compares message and session authors with
+`actor.id`.
+
+### Accounts
+
+Every signed-in account can manage accounts. System credentials cannot. Account
+responses never include password hashes or their storage location.
+
+An account is:
+
+```json
+{
+  "id": "…",
+  "actor_id": "…",
+  "username": "alice",
+  "display_name": "Alice",
+  "enabled": true,
+  "has_password": true,
+  "created_at": "…"
+}
+```
+
+`id` identifies the account. `actor_id` is the stable attribution ID and does
+not change when the username changes.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/accounts` | List accounts, oldest first; includes disabled accounts |
+| `GET /api/accounts/me` | Return the signed-in account |
+| `POST /api/accounts` | Create an account from `{username, password, display_name?}` |
+| `PATCH /api/accounts/{id}` | Update `{username?, display_name?}` |
+| `POST /api/accounts/{id}/disable` | Disable an account; idempotent |
+| `POST /api/accounts/{id}/enable` | Enable an account; idempotent |
+| `PUT /api/accounts/me/password` | Change the signed-in account's password using `{current_password?, new_password}` |
+
+Failures:
+
+| Response | When |
+|---|---|
+| `400` | Invalid username or password longer than 72 UTF-8 bytes |
+| `403` | System credential, or current password not supplied or incorrect |
+| `404` | Account not found |
+| `409` | Username or account-state conflict; the response explains the conflict |
+
+Disabling an account affects its next request and closes its open WebSockets.
+
+### Setup claim
+
+#### `POST /api/setup/claim`
+
+Complete setup of the one account on an install whose `login` status is
+`setup`. This is the only unauthenticated account write; every request must
+include the persisted setup token.
+
+```json
+Request: {
+  "username": "alice",
+  "password": "…",
+  "setup_token": "…",
+  "display_name": "Alice"
+}
+Response: { "token": "eyJ…" }
+```
+
+To keep the installation passwordless, send `"passwordless": true` and no
+`password`. `username` is then optional:
+
+```json
+Request: { "passwordless": true, "setup_token": "…" }
+```
+
+Send exactly one of `password` and `"passwordless": true`. `display_name` is
+optional. The response token is the client session minted after the claim;
+the actor and account are read through `GET /api/auth/me`, and names through
+the actor directory.
+
+The setup token is read locally with `nerve status`, sent only in the JSON
+body, and invalidated after success. It never appears in a URL, response,
+server log, or browser storage. Use HTTPS or a protected tunnel when claiming
+remotely.
+
+The claim and the setup completion record are one database transaction. Of
+concurrent claimants exactly one can win.
+
+| Response | When |
+|---|---|
+| `400` | both or neither of `password` and `"passwordless": true`; a password claim without a username; the username is malformed/reserved; or the password exceeds bcrypt's 72-byte limit |
+| `403` | the setup token is wrong or no stored token can match it; a concurrent loser may see this after the winner retires the token |
+| `409` | setup is already complete, including a request that passed token validation before a concurrent winner, or a configured password |
+| `422` | the setup token is missing/empty, the password is empty, or a field has the wrong type |
+| `503` | no signing secret, or identity startup is incomplete |
+
+### Actors
+
+An actor is *who* something is attributed to: a person, or the agent's system
+principal. Sessions and messages store an actor id, never a name, so this is
+where a name is looked up at render time — a rename changes every label and
+moves no stored row.
+
+```json
+{ "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" }
+```
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/actors` | `{ "actors": [...] }`, oldest first. One row per person plus the system principal, so a single call labels a whole list |
+
+`kind` is `human` or `system`.
+
+`username` is the login name of the account behind a human actor, or `null` for
+the system principal and for an account that has not been given one. It is here
+so a label can fall back to it when `display_name` is empty, and it is the same
+name every signed-in account already sees on `/accounts`.
+
+Otherwise this is an identity, not an account: nothing else from `accounts`
+appears here (no `enabled`, no `has_password`, no credential state), and an
+actor need not have an account at all — the system principal does not. A
+disabled person's actor is still readable, because their history stays in the
+UI after their access ends.
 
 ### Sessions
 
@@ -64,8 +246,12 @@ Create a new session.
 
 ```json
 Request:  { "title": "My Session" }
-Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web" }
+Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…" }
 ```
+
+`created_by_actor_id` is an actor id for [`GET /api/actors`](#actors), not an
+account id. It is `null` for legacy rows and sessions caused by an unidentified
+external person. Every session payload carries the field.
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -74,8 +260,15 @@ Get session details.
 Get messages for a session.
 
 ```json
-Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "..." }] }
+Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…" }] }
 ```
+
+`actor_id` is who supplied the message: the signed-in person who typed it, or
+the system principal for a prompt Nerve composed itself. It is `null` on
+Slack, Telegram, and imported Codex human input until identity mappings exist;
+on assistant/tool output; and on legacy history. `channel` stays transport
+provenance and is never identity. See
+[Accounts and identity](accounts.md) for what is and is not attributed.
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
@@ -558,7 +751,14 @@ Response: { "status": "ok", "version": "0.1.0" }
 
 ## WebSocket Protocol
 
-Connect to `ws[s]://host:port/ws?token=<jwt>`.
+Connect to `ws[s]://host:port/ws?token=<jwt>` (the `nerve_token` cookie works
+too). The token is resolved to an actor at admission. A credential that names
+nobody is refused with close code `4001`. The actor stays fixed until the socket
+reconnects. Disabling the account closes the socket with code `1008`.
+
+Unlike REST, a WebSocket never hands back a refreshed token — it has no
+response headers. The browser's ordinary REST traffic keeps the stored token
+fresh.
 
 ### Client → Server
 
@@ -611,6 +811,10 @@ Connect to `ws[s]://host:port/ws?token=<jwt>`.
 
 // Error occurred
 { type: "error", session_id: "main", error: "..." }
+
+// Another client of this session sent a message (the sender sees its own
+// optimistically; actor_id is who sent it, matching the stored row)
+{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…" }
 
 // Session switch confirmed (includes running state, lifecycle status, buffered events for reconnect)
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events: [...] }

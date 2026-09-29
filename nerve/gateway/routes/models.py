@@ -33,11 +33,11 @@ from nerve.ollama import discover_models
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 @router.get("/api/models")
-async def list_models(user: dict = Depends(require_auth)):
+async def list_models():
     """List selectable chat models for the composer's model picker.
 
     Returns:

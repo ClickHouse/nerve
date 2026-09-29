@@ -111,7 +111,7 @@ class ChannelRouter:
             )
         else:
             session_id = await self.engine.sessions.get_active_session(
-                msg.channel_key, source=msg.channel_name,
+                msg.channel_key, source=msg.channel_name, actor=None,
             )
 
         # Store message context for reaction support
@@ -198,6 +198,9 @@ class ChannelRouter:
                 source=msg.channel_name,
                 channel=msg.channel_name,
                 images=images,
+                # Provider-person mapping is not available yet, so external
+                # human input remains unidentified rather than guessed.
+                actor=None,
             )
         )
         self.engine.register_task(session_id, task)
@@ -259,6 +262,7 @@ class ChannelRouter:
                 source=last_msg.channel_name,
                 channel=last_msg.channel_name,
                 images=all_images or None,
+                actor=None,
             )
         )
         self.engine.register_task(session_id, task)
@@ -393,9 +397,9 @@ class ChannelRouter:
     async def get_active_session(
         self, channel_key: str, source: str,
     ) -> str:
-        """Get or create the active session for a channel."""
+        """Get or create the active session for an unidentified channel user."""
         return await self.engine.sessions.get_active_session(
-            channel_key, source=source,
+            channel_key, source=source, actor=None,
         )
 
     async def get_last_session(self, channel_key: str) -> str | None:
@@ -420,6 +424,7 @@ class ChannelRouter:
         session_id = str(uuid.uuid4())[:8]
         await self.engine.sessions.get_or_create(
             session_id, title=title, source=source,
+            actor=None,
         )
         await self.engine.sessions.set_active_session(
             channel_key, session_id,

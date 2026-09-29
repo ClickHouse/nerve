@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -153,6 +154,40 @@ class TestNonInteractiveSetup:
         # TASK.md should be created
         assert (ws / "TASK.md").exists()
         assert "Monitor CI" in (ws / "TASK.md").read_text()
+
+    @pytest.mark.parametrize("password, flag, expected", [
+        ("", "", False),
+        ("", "0", False),
+        ("", "1", True),
+        ("a-password", "", False),
+    ])
+    def test_passwordless_is_an_explicit_choice(
+        self, tmp_path: Path, password: str, flag: str, expected: bool,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+        assert choices.passwordless is expected
+
+    @pytest.mark.parametrize("password, flag", [("a-password", "1"), ("", "yes")])
+    def test_passwordless_flag_conflicts_are_refused(
+        self, tmp_path: Path, password: str, flag: str,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(click.ClickException, match="NERVE_PASSWORD"):
+                run_non_interactive(tmp_path)
+        assert not (tmp_path / "config.local.yaml").exists()
 
     def test_personal_mode_default_crons(self, tmp_path: Path) -> None:
         """Personal non-interactive should enable inbox-processor and task-planner."""
@@ -307,6 +342,66 @@ class TestConfigLocalPermissions:
         # Check permissions (Unix only)
         mode = oct(local_path.stat().st_mode)[-3:]
         assert mode == "600"
+
+    def test_it_is_never_created_at_a_wider_mode(self, tmp_path: Path) -> None:
+        """The file holds credentials, so it is created 0600, with no chmod
+        afterwards. The test runs under umask 000."""
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        old = os.umask(0o000)
+        try:
+            wizard._apply()
+        finally:
+            os.umask(old)
+
+        local_path = tmp_path / "config.local.yaml"
+        assert stat.S_IMODE(local_path.stat().st_mode) == 0o600
+        assert not local_path.with_name(local_path.name + ".tmp").exists()
+        local = yaml.safe_load(local_path.read_text())
+        assert local["auth"]["jwt_secret"] and local["auth"]["password_hash"]
+
+    def test_setup_fails_rather_than_write_secrets_a_filesystem_will_not_protect(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """On a filesystem that ignores the mode, setup writes no secrets file
+        and fails."""
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        with pytest.raises(click.ClickException) as ei:
+            wizard._apply()
+        assert "Nothing was written" in str(ei.value)
+        assert not (tmp_path / "config.local.yaml").exists()
+        assert not (tmp_path / "config.local.yaml.tmp").exists()
+
+    def test_nerve_init_exits_non_zero_on_that_filesystem(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        result = CliRunner().invoke(
+            main,
+            ["-c", str(tmp_path), "init", "--non-interactive"],
+            env={
+                "ANTHROPIC_API_KEY": "sk-ant-api03-clitest",
+                "NERVE_MODE": "personal",
+                "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            },
+        )
+        assert result.exit_code != 0
+        assert "owner-only" in result.output and "Nothing was written" in result.output
+        assert not (tmp_path / "config.local.yaml").exists()
 
 
 class TestInsideDockerFlag:
@@ -1438,3 +1533,28 @@ class TestPortableSettingsSplit:
         assert cfg.gateway.port == 8900                     # from config.yaml
         assert cfg.agent.thinking == "max"                  # from settings.yaml
         assert cfg.sessions.max_sessions == 500             # from settings.yaml
+
+
+class TestWizardPasswordStep:
+    """An empty password is passwordless only after explicit confirmation."""
+
+    def _run(self, tmp_path: Path, answers: list, confirms: list[bool]):
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step = lambda title: title
+        prompts = iter(answers)
+        decisions = iter(confirms)
+        with patch("click.clear"), \
+                patch("click.prompt", side_effect=lambda *a, **k: next(prompts)), \
+                patch("click.confirm", side_effect=lambda *a, **k: next(decisions)):
+            wizard._step_password()
+        return wizard.choices
+
+    def test_confirmed_empty_answer_is_passwordless(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, [""], [True])
+        assert choices.passwordless is True
+        assert choices.password == ""
+
+    def test_declined_confirmation_asks_for_a_password_again(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, ["", "pw-one", "pw-one"], [False])
+        assert choices.passwordless is False
+        assert choices.password == "pw-one"

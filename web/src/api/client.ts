@@ -1,5 +1,67 @@
 const API_BASE = '/api';
 
+/**
+ * What the login form has to collect. `setup` is an install whose setup is not
+ * complete: login is refused and only the setup-token claim is permitted.
+ * `none` is a passwordless install by choice, which is only ever one account;
+ * `password` is one account with a credential, which needs no username;
+ * `username_password` is two or more.
+ */
+export type LoginKind = 'setup' | 'none' | 'password' | 'username_password';
+
+/**
+ * `GET /api/auth/status` — unauthenticated, so it carries no username and no
+ * account count. The browser derives first-run routing from `login` itself.
+ */
+export interface AuthStatus {
+  /** Kept for older clients; `login !== 'none'`. */
+  auth_required: boolean;
+  login: LoginKind;
+}
+
+/** What `POST /api/setup/claim` hands back: a session for the account it just
+ *  set up, so the browser never has to re-type the password it set. */
+export interface SetupClaim {
+  token: string;
+}
+
+/** One local account, as `/api/accounts` returns it. Never carries a credential. */
+export interface Account {
+  id: string;
+  /**
+   * The permanent identity behind the login, and what attribution is written
+   * against — a different column from `id`, and the one that outlives every
+   * rename. This is how a view that has a message's author id finds a person.
+   */
+  actor_id: string;
+  username: string | null;
+  display_name: string | null;
+  enabled: boolean;
+  has_password: boolean;
+  created_at: string;
+}
+
+/** One actor, as `/api/actors` returns it: an identity plus the names to show
+ *  for it *right now*. Sessions and messages store the id, never the name, so
+ *  a rename changes every label without touching a stored row. `username` is
+ *  the login name of the account behind a human actor — a label falls back to
+ *  it when no display name is set — and `null` for an actor without one (the
+ *  agent's system principal has no account). Nothing else about the account
+ *  travels with it. */
+export interface ActorRef {
+  id: string;
+  kind: 'human' | 'system';
+  display_name: string | null;
+  username: string | null;
+}
+
+/** `GET /api/auth/me`: the actor this session acts as, and its local account.
+ *  `account` is `null` for a credential without an account. */
+export interface Viewer {
+  actor: ActorRef;
+  account: Account | null;
+}
+
 /** One page of a lazily-loaded sidebar group (Archived / System). */
 export interface Page {
   sessions: any[];
@@ -234,15 +296,25 @@ export interface WorkflowRunJournal {
 }
 
 let authToken: string | null = localStorage.getItem('nerve_token');
+let tokenRevision = 0;
 
-export function setToken(token: string) {
+/** Install a token and return the revision that owns it. */
+export function setToken(token: string): number {
   authToken = token;
+  tokenRevision += 1;
   localStorage.setItem('nerve_token', token);
+  return tokenRevision;
 }
 
-export function clearToken() {
+/** Clear the current token, optionally only if a caller still owns it. */
+export function clearToken(expectedRevision?: number): boolean {
+  if (expectedRevision !== undefined && expectedRevision !== tokenRevision) {
+    return false;
+  }
   authToken = null;
+  tokenRevision += 1;
   localStorage.removeItem('nerve_token');
+  return true;
 }
 
 export function getToken(): string | null {
@@ -258,9 +330,11 @@ const SESSION_TOKEN_HEADER = 'X-Nerve-Token';
  * talking to the server never expires — no daily re-login, no logout
  * mid-sentence.
  */
-function absorbRefreshedToken(res: Response): void {
+function absorbRefreshedToken(res: Response, requestRevision: number): void {
   const fresh = res.headers.get(SESSION_TOKEN_HEADER);
-  if (fresh && fresh !== authToken) setToken(fresh);
+  if (requestRevision === tokenRevision && fresh && fresh !== authToken) {
+    setToken(fresh);
+  }
 }
 
 /**
@@ -280,28 +354,32 @@ export function setUnauthorizedHandler(handler: () => void): void {
   onUnauthorized = handler;
 }
 
-function handleUnauthorized(): Error {
-  clearToken();
-  onUnauthorized?.();
+function handleUnauthorized(requestRevision: number): Error {
+  // A response belongs to the token revision that sent it. A logout, login,
+  // or accepted slide makes older 401s informational rather than authority to
+  // clear the new session or put its UI into the expiry state.
+  if (clearToken(requestRevision)) onUnauthorized?.();
   return new Error('Unauthorized');
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const requestToken = authToken;
+  const requestRevision = tokenRevision;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
   };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+  if (requestToken) {
+    headers['Authorization'] = `Bearer ${requestToken}`;
   }
 
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
 
-  absorbRefreshedToken(res);
-
   if (res.status === 401) {
-    throw handleUnauthorized();
+    throw handleUnauthorized(requestRevision);
   }
+
+  absorbRefreshedToken(res, requestRevision);
 
   if (!res.ok) {
     const body = await res.text();
@@ -313,15 +391,69 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Auth
-  login: (password: string) =>
+  /**
+   * `username` is optional while exactly one account exists and required once
+   * there are two or more: the account an upgrade created has none, so the
+   * server accepts a password on its own while there is exactly one. A username
+   * that does resolve is accepted at any time. Which shape to collect is what
+   * `authStatus().login` says.
+   */
+  login: (password: string, username?: string) =>
     request<{ token: string }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, username: username?.trim() || null }),
     }),
 
   checkAuth: () => request<{ authenticated: boolean }>('/auth/check'),
 
-  authStatus: () => request<{ auth_required: boolean }>('/auth/status'),
+  authStatus: () => request<AuthStatus>('/auth/status'),
+
+  /**
+   * Who this session acts as. Doubles as the authentication check at startup:
+   * it needs a valid session *and* answers which actor and account the session
+   * belongs to. Attribution compares authors with the actor; re-authentication
+   * is bound to the account.
+   */
+  getViewer: () => request<Viewer>('/auth/me'),
+
+  // The one unauthenticated write. The mandatory setup token is sent only
+  // in this JSON body and is never retained by the API client. Send either
+  // `password` or `passwordless: true`.
+  setupClaim: (body: {
+    username?: string; password?: string; passwordless?: boolean;
+    setup_token: string; display_name?: string;
+  }) => request<SetupClaim>('/setup/claim', {
+    method: 'POST', body: JSON.stringify(body),
+  }),
+
+  // Accounts
+  listAccounts: () => request<{ accounts: Account[] }>('/accounts'),
+
+  createAccount: (body: { username: string; password: string; display_name?: string }) =>
+    request<Account>('/accounts', { method: 'POST', body: JSON.stringify(body) }),
+
+  updateAccount: (id: string, body: { username?: string; display_name?: string }) =>
+    request<Account>(`/accounts/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  setAccountEnabled: (id: string, enabled: boolean) =>
+    request<Account>(
+      `/accounts/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    ),
+
+  changeOwnPassword: (body: { current_password?: string; new_password: string }) =>
+    request<Account>('/accounts/me/password', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+
+  // Actors — resolve the ids stored on sessions and messages to names.
+  // One row per person plus the system principal, so a single fetch labels a
+  // whole list; re-fetch after a rename rather than caching a name anywhere.
+  listActors: () => request<{ actors: ActorRef[] }>('/actors'),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any
@@ -763,8 +895,10 @@ export const api = {
     formData.append('session_id', sessionId);
     files.forEach(f => formData.append('files', f));
 
+    const requestToken = authToken;
+    const requestRevision = tokenRevision;
     const headers: Record<string, string> = {};
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    if (requestToken) headers['Authorization'] = `Bearer ${requestToken}`;
 
     const res = await fetch(`${API_BASE}/files/upload`, {
       method: 'POST',
@@ -772,11 +906,12 @@ export const api = {
       body: formData,
     });
 
-    absorbRefreshedToken(res);
-
     if (res.status === 401) {
-      throw handleUnauthorized();
+      throw handleUnauthorized(requestRevision);
     }
+
+    absorbRefreshedToken(res, requestRevision);
+
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`${res.status}: ${body}`);

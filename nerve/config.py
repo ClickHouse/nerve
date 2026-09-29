@@ -413,6 +413,36 @@ _UNRESOLVED_REF = "${"
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
 
+def _require_auth_mapping(value: Any, where: str) -> None:
+    """Refuse an ``auth`` section that is present but not a mapping.
+
+    Reading a malformed section as "no auth" would turn a broken or tampered
+    configuration into a passwordless instance.
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigError(
+            f"auth in {where} must be a mapping of settings, got "
+            f"{type(value).__name__} {value!r}. A malformed auth section is refused "
+            f"rather than read as 'no authentication'."
+        )
+
+
+def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
+    """Validate and normalise one layer's ``auth`` section before any merge.
+
+    A non-mapping ``auth`` is refused. A null ``auth:`` becomes ``{}``:
+    :func:`_deep_merge` replaces a lower section with ``None``, so a bare
+    ``auth:`` line would erase the ``password_hash`` and ``jwt_secret`` below
+    it. Other sections keep that merge behavior, because removing them resets
+    a default rather than removing protection.
+
+    Mutates and returns ``layer``.
+    """
+    _require_auth_mapping(layer.get("auth"), where)
+    if "auth" in layer and layer["auth"] is None:
+        layer["auth"] = {}
+    return layer
+
 
 def lockdown_anchor() -> bool:
     """Whether the environment forces this instance into lockdown.
@@ -625,6 +655,11 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     """
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
+    # Check each layer's ``auth`` before the merge. After it, a valid machine
+    # section would hide a broken tracked one, and a bare ``auth:`` would
+    # already have replaced the credentials below it.
+    _normalise_layer_auth(base, "config.yaml")
+    _normalise_layer_auth(local, "config.local.yaml")
 
     machine = _deep_merge(base, local)
     # An env-anchored instance takes its workspace from the environment too, so
@@ -648,6 +683,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
+    _normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
 
     # Lockdown is owned by the *tracked* settings file only, so a local edit to
     # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
@@ -855,6 +891,15 @@ class AgentConfig:
     # Substrings of model names that must never request the 1h cache TTL
     # (same matching semantics as context_1m_excluded_models).
     cache_ttl_excluded_models: list[str] = field(default_factory=list)
+    # Keep the appended system prompt byte-identical across sessions of the
+    # same workspace/source/tool set so Anthropic's exact-prefix prompt cache
+    # can share it: the per-session parts (session id, pre-recalled memories)
+    # are delivered in a <session-context> block at the top of the first user
+    # message instead of in the system prompt. With per-session bytes in the
+    # prompt, every session start is a cache WRITE of the whole block (on a
+    # fleet of ~800 cron sessions/day that was measured at ~$850/day) instead
+    # of a cache READ. False restores the legacy shape (id + recall inline).
+    static_system_prompt: bool = True
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
@@ -932,6 +977,7 @@ class AgentConfig:
             cache_ttl_excluded_models=_str_list(
                 d.get("cache_ttl_excluded_models")
             ),
+            static_system_prompt=d.get("static_system_prompt", True),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             cli_max_message_bytes=int(
                 d.get("cli_max_message_bytes", 64 * 1024 * 1024)
@@ -1924,6 +1970,9 @@ class RetentionConfig:
 @dataclass
 class AuthConfig:
     password_hash: str = ""
+    # Session-token signing secret. When unset, one is generated into nerve.db
+    # on first start (nerve.migrate.ensure_jwt_secret). Read the value in force
+    # through nerve.gateway.auth.effective_jwt_secret(), not this field.
     jwt_secret: str = ""
     # Web-session lifetime. This is an *idle* timeout, not a cap on a working
     # session: the gateway slides the token forward on every authenticated
@@ -2273,7 +2322,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.154.0"            # exclusive
+    max_version: str = "0.156.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -2333,7 +2382,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.154.0")),
+            max_version=str(d.get("max_version", "0.156.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
@@ -2961,7 +3010,7 @@ def write_config_pointer(config_dir: Path) -> None:
     """
     pointer = paths.config_pointer_file()
     try:
-        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # the state dir, owner-only
         pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write config pointer %s: %s", pointer, e)
@@ -3353,14 +3402,15 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
         return False
     users.append(user_id)
 
-    with open(local_path, "w", encoding="utf-8") as f:
-        f.write("# Nerve — Secrets (gitignored)\n")
-        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-    try:
-        os.chmod(local_path, 0o600)
-    except OSError:
-        pass
+    # The file holds the signing secret and the password hash, so it is written
+    # owner-only. ``paths.InsecureFileError`` propagates: ``False`` already
+    # means "the id was already there", so a failure must not return it.
+    paths.write_private_text(
+        local_path,
+        "# Nerve — Secrets (gitignored)\n"
+        "# API keys, tokens, and other sensitive configuration.\n\n"
+        + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+    )
     logger.info("Persisted Telegram user %d to %s", user_id, local_path)
     return True
 

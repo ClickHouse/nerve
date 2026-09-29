@@ -28,7 +28,10 @@ export type WSMessage =
   | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
-  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null }
+  // `actor_id` is the sender, so a second tab can label the bubble the moment
+  // it arrives rather than waiting for the stored row to be readable. Null
+  // whenever the ingress recorded nobody, which renders exactly as before.
+  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null; actor_id?: string | null }
   // pending_wakeup_at / has_background_tasks ride along with every transition:
   // a turn can end with the session still parked on scheduled or background
   // work, and the sidebar redraws that row straight from the event (it skips
@@ -73,12 +76,14 @@ export class NerveWebSocket {
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
   private _pending: Record<string, unknown>[] = [];
+  private shouldReconnect = true;
 
   get connected() {
     return this._connected;
   }
 
   connect() {
+    this.shouldReconnect = true;
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
     const token = getToken();
@@ -86,15 +91,18 @@ export class NerveWebSocket {
     const host = window.location.host;
     const url = `${protocol}//${host}/ws${token ? `?token=${token}` : ''}`;
 
-    this.ws = new WebSocket(url);
+    const socket = new WebSocket(url);
+    this.ws = socket;
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
       this._connected = true;
       this.startPing();
       this.flushPending();
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       try {
         const msg: WSMessage = JSON.parse(event.data);
         this.handlers.forEach((h) => h(msg));
@@ -103,22 +111,29 @@ export class NerveWebSocket {
       }
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
       this._connected = false;
       this.stopPing();
-      this.scheduleReconnect();
+      if (this.shouldReconnect) this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
+    socket.onerror = () => {
+      if (this.ws !== socket) return;
       this._connected = false;
     };
   }
 
   disconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.shouldReconnect = false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopPing();
-    this.ws?.close();
+    const socket = this.ws;
     this.ws = null;
+    socket?.close();
     this._connected = false;
     this._pending = [];
   }
@@ -206,7 +221,7 @@ export class NerveWebSocket {
   }
 
   private scheduleReconnect() {
-    if (this.reconnectTimer) return;
+    if (!this.shouldReconnect || this.reconnectTimer !== null) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();

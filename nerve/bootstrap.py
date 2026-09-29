@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import secrets
 import shutil
 import subprocess
@@ -182,6 +183,12 @@ _WORKER_MEMORY_CATEGORIES = [
     {"name": "agent_ops", "description": "Operational lessons about the worker itself: tool gotchas, performance observations"},
 ]
 
+PASSWORDLESS_WARNING = (
+    "Without a password, anyone who can reach the gateway port is the owner: "
+    "they can use the agent, its tools and its credentials. Keep the gateway "
+    "on localhost or behind a protected network."
+)
+
 
 @dataclass
 class SetupChoices:
@@ -204,6 +211,9 @@ class SetupChoices:
     # via `nerve pair` + /pair <code>.
     telegram_allowed_users: list[int] = field(default_factory=list)
     password: str = ""  # plaintext during wizard, hashed at write time
+    # The operator chose a passwordless installation. Without a password and
+    # without this, setup stays incomplete until the setup-token claim.
+    passwordless: bool = False
     enabled_crons: list[str] = field(default_factory=list)
     # sync sources
     github_sync: bool = False
@@ -438,11 +448,26 @@ def _init_state_file() -> Path:
     return paths.nerve_path("init-state.json")
 
 
-def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
-    """Checkpoint wizard progress (best-effort — never breaks the wizard)."""
+def _private_fd(fd: int) -> bool:
+    """True when the open file carries no group/world permission bits."""
+    try:
+        return (stat.S_IMODE(os.fstat(fd).st_mode) & 0o077) == 0
+    except OSError:
+        return False
+
+
+def _save_init_state(choices: SetupChoices, completed: set[str]) -> bool:
+    """Checkpoint wizard progress. Never breaks the wizard.
+
+    The file holds API keys, so it is created ``0600`` with ``O_EXCL`` and its
+    mode is checked before anything is written. Returns True only when the
+    checkpoint is on disk and owner-only; on any failure no file is left.
+    """
     import dataclasses
     from datetime import datetime
 
+    path = _init_state_file()
+    tmp = path.with_name(path.name + ".tmp")
     try:
         data = dataclasses.asdict(choices)
         data["workspace_path"] = str(choices.workspace_path)
@@ -451,12 +476,30 @@ def _save_init_state(choices: SetupChoices, completed: set[str]) -> None:
             "completed": sorted(completed),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path = _init_state_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state), encoding="utf-8")
-        os.chmod(path, 0o600)  # contains API keys
+        # Database.connect refuses a state directory that others can write to.
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if not _private_fd(fd):
+            os.close(fd)
+            tmp.unlink(missing_ok=True)
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+            path.unlink(missing_ok=True)
+            return False
+        return True
     except OSError:
-        pass
+        for p in (tmp, path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False
 
 
 def _load_init_state() -> dict | None:
@@ -525,6 +568,15 @@ class SetupWizard:
         step_fn()
         self._completed_steps.add(name)
         _save_init_state(self.choices, self._completed_steps)
+
+    def checkpoint(self) -> bool:
+        """Save the answers so a re-run resumes rather than starting over.
+
+        The installer calls this when owner-account creation fails after the
+        wizard has cleared its checkpoint. The owner's name is stored nowhere
+        else. Returns whether the checkpoint was written.
+        """
+        return _save_init_state(self.choices, self._completed_steps)
 
     def _maybe_resume(self) -> bool:
         """Offer to resume an interrupted setup. Returns True if resumed."""
@@ -1135,22 +1187,31 @@ class SetupWizard:
         click.secho(self._next_step("Web UI Password"), fg="cyan", bold=True)
         click.echo()
         click.secho(
-            "The web UI at localhost:8900 requires a password.\n"
-            "Set one now, or press Enter to skip (dev mode — no auth).",
+            "Set a password for the web UI at localhost:8900, or press Enter to\n"
+            "keep this installation passwordless.",
             dim=True,
         )
         click.echo()
 
         while True:
-            pw = click.prompt("Password (Enter to skip)", default="", hide_input=True)
+            pw = click.prompt(
+                "Password (Enter for passwordless)", default="", hide_input=True,
+            )
             if not pw:
                 click.echo()
-                click.secho("  → Skipping — running in dev mode (no password).", fg="yellow")
-                click.secho("    You can set one later in config.local.yaml.", dim=True)
-                break
+                click.secho(f"  {PASSWORDLESS_WARNING}", fg="yellow")
+                if click.confirm("  Keep this installation passwordless?", default=False):
+                    self.choices.password = ""
+                    self.choices.passwordless = True
+                    click.secho("  → Passwordless. You can set a password later "
+                                "in the web UI.", dim=True)
+                    break
+                click.echo()
+                continue
             pw2 = click.prompt("Confirm password", hide_input=True)
             if pw == pw2:
                 self.choices.password = pw
+                self.choices.passwordless = False
                 click.echo()
                 click.secho("  ✓ Password set", fg="green")
                 break
@@ -1569,7 +1630,9 @@ class SetupWizard:
         click.secho(f"  │  Mode:       {self.choices.mode:<33}│")
         click.secho(f"  │  Workspace:  {ws:<33}│")
         click.secho(f"  │  API keys:   {api_status:<33}│")
-        pw_status = "set" if self.choices.password else "none (dev mode)"
+        pw_status = "set" if self.choices.password else (
+            "none (passwordless)" if self.choices.passwordless else "none"
+        )
         click.secho(f"  │  Password:   {pw_status:<33}│")
 
         if self.choices.mode == "personal":
@@ -1711,8 +1774,7 @@ class SetupWizard:
         # 9. Create the machine-local state directory. Cron config no longer
         # lives here — it's in workspace/config/cron.
         click.echo(f"  Setting up {paths.home_label()}/...", nl=False)
-        nerve_dir = paths.nerve_home()
-        nerve_dir.mkdir(parents=True, exist_ok=True)
+        nerve_dir = paths.ensure_nerve_home()
         click.secho(" ✓", fg="green")
 
         # 10. Write cron jobs
@@ -2287,17 +2349,21 @@ class SetupWizard:
             auth["password_hash"] = hashed
         local["auth"] = auth
 
+        # The file holds the signing secret, the password hash and the API keys,
+        # so it is created owner-only. If the filesystem cannot keep it private,
+        # nothing is written and setup stops.
         local_path = self.config_dir / "config.local.yaml"
-        with open(local_path, "w", encoding="utf-8") as f:
-            f.write("# Nerve — Secrets (gitignored)\n")
-            f.write("# API keys, tokens, and other sensitive configuration.\n\n")
-            yaml.safe_dump(local, f, default_flow_style=False, sort_keys=False)
-
-        # Set restrictive permissions on the secrets file
         try:
-            os.chmod(local_path, 0o600)
-        except OSError:
-            pass  # Best-effort on platforms that don't support chmod
+            paths.write_private_text(
+                local_path,
+                "# Nerve — Secrets (gitignored)\n"
+                "# API keys, tokens, and other sensitive configuration.\n\n"
+                + yaml.safe_dump(local, default_flow_style=False, sort_keys=False),
+            )
+        except paths.InsecureFileError as e:
+            raise click.ClickException(
+                f"Setup stopped: {e} Nothing was written to {local_path}."
+            ) from e
 
     def _write_cron_jobs(self) -> None:
         """Write system crons to system.yaml and scaffold jobs.yaml for user crons."""
@@ -2584,6 +2650,18 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
                 f"user IDs, got: {allowed_raw!r}"
             )
     choices.password = os.environ.get("NERVE_PASSWORD", "")
+    passwordless_raw = os.environ.get("NERVE_PASSWORDLESS", "").strip()
+    if passwordless_raw not in ("", "0", "1"):
+        raise click.ClickException(
+            f"NERVE_PASSWORDLESS must be 1 or 0, got: {passwordless_raw!r}"
+        )
+    choices.passwordless = passwordless_raw == "1"
+    if choices.password and choices.passwordless:
+        raise click.ClickException(
+            "Set NERVE_PASSWORD or NERVE_PASSWORDLESS=1, not both"
+        )
+    if choices.passwordless:
+        click.secho(PASSWORDLESS_WARNING, fg="yellow")
 
     # Sources — auto-detect from available CLIs
     if choices.mode == "personal":

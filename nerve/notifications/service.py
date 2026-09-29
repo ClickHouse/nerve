@@ -697,6 +697,10 @@ class NotificationService:
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
         """
+        # The text is this service's — an answer relayed into the session, or
+        # a redelivery notice. The person who answered is recorded on the
+        # notification itself. This service generates the prompt, so assigning
+        # the responder as its author would be incorrect.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -704,6 +708,7 @@ class NotificationService:
                 source=source,
                 channel=channel,
                 internal=internal,
+                actor=self.db.system_actor,
             )
         )
         task.add_done_callback(self._on_answer_task_done)
