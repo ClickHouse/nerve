@@ -5,20 +5,7 @@ import type { ToolCallBlockData } from '../../../types/chat';
 import { api, type WorkflowRun, type WorkflowRunStatus } from '../../../api/client';
 import { useWorkflowRunStore, isActiveRun } from '../../../stores/workflowRunStore';
 import { Button } from '../../ui';
-
-/** Extract readable text from MCP content blocks. */
-function extractText(result: string): string {
-  try {
-    const parsed: unknown = JSON.parse(result);
-    if (Array.isArray(parsed)) {
-      return parsed
-        .filter(b => b && b.type === 'text')
-        .map(b => String(b.text))
-        .join('\n');
-    }
-  } catch { /* not JSON */ }
-  return result;
-}
+import { toolResultText } from '../../../utils/workflowRunCards';
 
 const RESULT_SNIPPET_CHARS = 300;
 
@@ -104,7 +91,7 @@ function SpendLine({ run }: { run: WorkflowRun }) {
 /** Raw-text fallback when the run no longer exists server-side (pruned). */
 function RawResultFallback({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
-  const text = block.result ? extractText(block.result) : '';
+  const text = block.result ? toolResultText(block.result) : '';
   return (
     <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
       <button
@@ -118,6 +105,44 @@ function RawResultFallback({ block }: { block: ToolCallBlockData }) {
           {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
         </div>
       </button>
+      {expanded && (
+        <div className="border-t border-border px-3 py-2">
+          <pre className="text-xs text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
+            {text || 'No result recorded.'}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Compact row for a workflow_run_* call whose run already has a card earlier in
+ * the same message. In practice that is a workflow_run_status call: a start
+ * always returns a new run id. The card is the live view of the run; this row
+ * only records the call, and expands to the result the agent got at that time.
+ */
+export function WorkflowRunRepeatBlock({ block, runId }: { block: ToolCallBlockData; runId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const text = block.result ? toolResultText(block.result) : '';
+  return (
+    <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
+      <Button
+        variant="subtle"
+        size="md"
+        fullWidth
+        onClick={() => setExpanded(!expanded)}
+        aria-expanded={expanded}
+        className="justify-start text-left rounded-none"
+      >
+        <Rocket size={14} className="text-text-muted shrink-0" />
+        <span className="text-sm leading-tight text-text-secondary shrink-0">Status check</span>
+        <span className="text-xs font-mono text-text-faint shrink-0">{runId}</span>
+        <span className="text-xs text-text-faint truncate">live status in the run card</span>
+        <div className="ml-auto shrink-0">
+          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
+        </div>
+      </Button>
       {expanded && (
         <div className="border-t border-border px-3 py-2">
           <pre className="text-xs text-text-muted font-mono whitespace-pre-wrap overflow-x-auto max-h-60 overflow-y-auto bg-bg rounded p-2 border border-border-subtle">
