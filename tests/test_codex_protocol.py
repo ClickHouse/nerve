@@ -473,9 +473,11 @@ async def test_failure_before_first_response_records_zero(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_context_window_exceeded_reset_is_clamped(tmp_path):
-    # codex-rs zeroes `total` on ContextWindowExceeded, so it can drop below the
-    # baseline. The clamped subtraction floors the turn's usage at zero.
+async def test_context_window_exceeded_reset_rebaselines_to_zero(tmp_path):
+    # On ContextWindowExceeded codex-rs zeroes `total`, and later responses
+    # re-accumulate from 0. The failing turn clamps to zero (total < baseline);
+    # the carried baseline becomes that reset, so the next turn counts from 0 —
+    # not against the old peak, which would record 0 for the rest of the thread.
     client = _client(tmp_path)
     await _feed_usage(client, _tok(200_000, 150_000, 10_000),
                       _tok(200_000, 150_000, 10_000))
@@ -483,15 +485,14 @@ async def test_context_window_exceeded_reset_is_clamped(tmp_path):
     client._reset_turn_usage_accounting()
     await _feed_usage(client, _tok(0, 0, 0), _tok(0, 0, 0))   # counters zeroed
     done = _complete(client, status="failed", error="context window exceeded")
-    assert done.usage.input_tokens == 0
+    assert done.usage.input_tokens == 0                  # clamp: total < baseline
     assert done.usage.cache_read_tokens == 0
     assert done.usage.output_tokens == 0
-    # The reset must not lower the carried baseline: a following turn whose
-    # total continues from the pre-error value baselines off that value, not 0.
+    # Next turn re-accumulates from 0; baseline is the carried reset (0).
     client._reset_turn_usage_accounting()
-    await _feed_usage(client, _tok(210_000, 155_000, 10_500),
+    await _feed_usage(client, _tok(10_000, 5_000, 500),
                       _tok(10_000, 5_000, 500))
     done2 = _complete(client)
-    assert done2.usage.input_tokens == 5_000        # (210k-200k) - (155k-150k)
-    assert done2.usage.cache_read_tokens == 5_000   # 155k - 150k
-    assert done2.usage.output_tokens == 500         # 10.5k - 10k
+    assert done2.usage.input_tokens == 5_000        # 10k - 5k cached
+    assert done2.usage.cache_read_tokens == 5_000
+    assert done2.usage.output_tokens == 500
