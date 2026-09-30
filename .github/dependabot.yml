@@ -1,0 +1,44 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Do not propose a release until it is 7 days old. Malicious releases
+    # (account takeover, typosquat) are usually found and yanked within days.
+    # Cooldown applies to version updates only, so security updates are not
+    # delayed.
+    cooldown:
+      default-days: 7
+    # uv.lock is what gets installed, and most of its pins are transitive.
+    # The default ("direct") would leave those pins to go stale.
+    allow:
+      - dependency-type: "all"
+    # Keep the floors in pyproject.toml as written, and change a bound only
+    # when the new version is outside it. The default for an app raises every
+    # floor to the latest version in every PR.
+    versioning-strategy: "increase-if-necessary"
+    # One PR for all minor and patch updates. Each major update gets its own
+    # PR. memu-py also gets its own PR: nerve monkey-patches its internals
+    # (memu_bridge._patch_sqlite_bugs), so a bump needs a manual review.
+    groups:
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+        exclude-patterns:
+          - "memu-py"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
