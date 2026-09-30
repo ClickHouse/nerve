@@ -123,3 +123,10 @@ class TestCaches:
         backoff.reset()
         assert Backoff(1.0, 4.0, rng=lambda: 0.0).next() == 0.5
         assert backoff.next() == 1.0
+
+    def test_backoff_stays_at_its_maximum_after_any_number_of_failures(self):
+        backoff = Backoff(0.5, 30.0, rng=lambda: 1.0)
+
+        delays = [backoff.next() for _ in range(5000)]
+
+        assert max(delays) == delays[-1] == 30.0
