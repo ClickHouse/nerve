@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import os
+import py_compile
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -570,6 +574,96 @@ class TestHotReloadReplace:
         with caplog.at_level(logging.WARNING):
             warn_vanished_gates(before)
         assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
+# No bytecode cache
+# ---------------------------------------------------------------------------
+
+# Two plugin versions with source of identical length, told apart by describe().
+_SIZED_PLUGIN = '''
+from nerve.cron.gates import CronGate
+
+
+class SizedGate(CronGate):
+    type = "sized_test"
+
+    async def is_satisfied(self, ctx):
+        return True
+
+    def describe(self):
+        return "version-{v}"
+
+    @classmethod
+    def from_config(cls, spec):
+        return cls()
+'''
+
+
+class TestNoBytecodeCache:
+    """The loader must not read or write ``__pycache__`` in the plugins dir.
+
+    The plugins dir is in the reviewed workspace surface. Config sync refuses to
+    merge while that surface holds an untracked file, so a cache written by the
+    import would block every sync after the first load.
+
+    Each test turns on bytecode writes into ``__pycache__`` beside the source.
+    If the environment set ``PYTHONDONTWRITEBYTECODE`` or
+    ``PYTHONPYCACHEPREFIX``, CPython would skip the cache or write it elsewhere,
+    and the assertions would pass without testing the loader.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _bytecode_writes_enabled(self, monkeypatch):
+        monkeypatch.setattr(sys, "dont_write_bytecode", False)
+        monkeypatch.setattr(sys, "pycache_prefix", None)
+
+    def test_load_writes_no_pycache(self, tmp_path, clean_registry):
+        _write(tmp_path, "always.py", _VALID_PLUGIN)
+        assert load_gate_plugins(tmp_path) == 1
+        assert not (tmp_path / "__pycache__").exists()
+
+    def test_replace_reload_writes_no_pycache(self, tmp_path, clean_registry):
+        # The hot-reload path is the one config sync runs after every merge.
+        _write(tmp_path, "always.py", _VALID_PLUGIN)
+        load_gate_plugins(tmp_path)
+        assert load_gate_plugins(tmp_path, replace=True) == 1
+        assert not (tmp_path / "__pycache__").exists()
+
+    def test_existing_pycache_is_never_read(self, tmp_path, clean_registry):
+        # A timestamp-mode .pyc is validated only by the source's whole-second
+        # mtime and its size. Seed a cache from version A, then change the
+        # source to version B with the same size and mtime: a loader that reads
+        # the cache would run A.
+        f = _write(tmp_path, "sized.py", _SIZED_PLUGIN.replace("{v}", "A"))
+        stat = f.stat()
+        py_compile.compile(
+            str(f),
+            cfile=importlib.util.cache_from_source(str(f)),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+        )
+
+        f.write_text(_SIZED_PLUGIN.replace("{v}", "B"), encoding="utf-8")
+        os.utime(f, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assert f.stat().st_size == stat.st_size
+
+        assert load_gate_plugins(tmp_path) == 1
+        assert build_gate({"type": "sized_test"}).describe() == "version-B"
+
+    def test_relative_dir_compiles_with_absolute_filename(
+        self, tmp_path, clean_registry, monkeypatch,
+    ):
+        # Tracebacks from plugin code must name the absolute file path, as the
+        # stock loader does, even when the plugins dir is configured relative.
+        gates_dir = tmp_path / "gates"
+        gates_dir.mkdir()
+        f = _write(gates_dir, "always.py", _VALID_PLUGIN)
+        monkeypatch.chdir(tmp_path)
+        assert load_gate_plugins(Path("gates")) == 1
+        filename = GATE_REGISTRY["always_test"].describe.__code__.co_filename
+        assert os.path.isabs(filename)
+        assert Path(filename).samefile(f)
 
 
 # ---------------------------------------------------------------------------
