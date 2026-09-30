@@ -67,6 +67,17 @@ jobs:
       - name: Run test suite
         run: .venv/bin/pytest tests/ -v
 
+      - name: Check new migrations are numbered above main's highest
+        # The runner skips versions at or below the database's current one. The base
+        # is fetched here, not read from the merge commit, so a re-run checks today's
+        # main; !cancelled() keeps it running when the tests fail.
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          python3 scripts/check_migration_numbers.py "origin/$BASE_REF"
+
   frontend-build:
     name: Frontend build (Vite)
     runs-on: ubuntu-latest

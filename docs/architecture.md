@@ -218,7 +218,7 @@ The `Database` class in `base.py` inherits all domain mixins, preserving a singl
 
 Migrations are individual Python files in `nerve/db/migrations/` named `vNNN_description.py`. Each exports an `async def up(db)` function. The runner discovers them by scanning the directory, applies pending ones in version order, and wraps each in a transaction. `SCHEMA_VERSION` is derived dynamically from the highest migration file number.
 
-To add a new migration: create `nerve/db/migrations/v017_your_feature.py` with an `up()` function.
+To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with an `up()` function, numbered above the highest version on `main`: the runner skips versions at or below the database's current one, and CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not.
 
 ### Schema
 
