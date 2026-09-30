@@ -22,6 +22,12 @@ const USAGE: ContextUsage = {
   cache_creation_input_tokens: 6000, max_context_tokens: 200000, num_turns: 2,
 };
 
+// A Codex turn with three calls whose inputs grow: 100k, 140k and 180k.
+const CODEX_USAGE: ContextUsage = {
+  input_tokens: 200_000, output_tokens: 1_500, cache_read_input_tokens: 220_000,
+  cache_creation_input_tokens: 0, max_context_tokens: 272_000, num_turns: 3,
+};
+
 const LIVE: SessionContext = {
   session_id: 's-1', live: true, can_compact: true,
   total_tokens: 20237, max_tokens: 200000, auto_compact_threshold: 167000,
@@ -59,6 +65,16 @@ describe('ContextBar', () => {
     expect(trigger()).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(getContext).not.toHaveBeenCalled();
+  });
+
+  it('shows the input of the last call when the backend reports it', () => {
+    renderBar({ usage: { ...CODEX_USAGE, context_tokens: 180_000 }, backend: 'codex' });
+    expect(trigger()).toHaveAccessibleName('Context window: 180.0k of 272.0k tokens');
+  });
+
+  it('divides the turn input by the number of calls otherwise', () => {
+    renderBar({ usage: CODEX_USAGE, backend: 'codex' });
+    expect(trigger()).toHaveAccessibleName('Context window: about 140.0k of 272.0k tokens');
   });
 
   it('opens the categories of a live session, with the threshold', async () => {

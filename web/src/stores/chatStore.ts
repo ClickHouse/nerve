@@ -187,7 +187,8 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
-    // Measured after a compact; the bar shows it instead of its estimate.
+    // Measured after a compact, or the input of the last model call (Codex);
+    // the bar shows it instead of its estimate.
     context_tokens?: number;
   } | null;
   backendStatus:{ subtype: string; data: Record<string, unknown> } | null;

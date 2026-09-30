@@ -12,7 +12,9 @@ export interface ContextUsage {
   cache_creation_1h_input_tokens?: number;
   max_context_tokens: number;
   num_turns: number;
-  /** The context use the runtime measured after a compact. */
+  /** The context use the runtime measured after a compact, or the input
+   *  tokens of the turn's last model call, when the backend reports them
+   *  (Codex). */
   context_tokens?: number;
 }
 
@@ -45,8 +47,9 @@ export function turnCalls(usage: ContextUsage): number {
 }
 
 /**
- * The context use: measured after a compact (`exact`), else estimated from
- * the last turn's usage.
+ * The context use: reported by the backend (`exact`: measured after a
+ * compact, or the last model call's input on Codex), else estimated from the
+ * last turn's usage.
  *
  * The SDK's ResultMessage.usage adds up the tokens of all model calls of a
  * turn (each tool use starts a new call), so cache_read can be N times the
