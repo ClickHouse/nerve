@@ -1272,9 +1272,9 @@ Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
 
-A reload that sets `slack.enabled: false` pauses hosted intake. Streams stay
-open, and events stay in the gateway's inbox until a reload sets `enabled`
-to `true` again.
+`slack.enabled: false` pauses hosted intake, at startup or after a reload.
+The stream endpoint still accepts streams, and events stay in the gateway's
+inbox until a reload sets `enabled` to `true`.
 
 Replies, notifications, reactions, and file transfers do not reach Slack in
 hosted mode yet. `slack.mode` and `channels.hosted.*` need a restart; a

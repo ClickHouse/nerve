@@ -561,6 +561,21 @@ class TestInvoke:
         hosted.config.slack.enabled = True
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
 
+    async def test_a_provider_off_before_the_first_stream_takes_events_once_turned_on(self, hosted):
+        hosted.config.slack.enabled = False
+        stream = await hosted.stream()
+        inbox_id = hosted.gateway.store(message_event(
+            conversation="D0DIRECT", conversation_kind="direct", message_id="8.4",
+        ))
+
+        await stream.nudge("invoke")
+        await asyncio.sleep(0.3)
+        assert hosted.gateway.reads == []
+
+        hosted.config.slack.enabled = True
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await hosted.turns.wait_for(1)
+
 
 class TestObserve:
     async def test_an_observation_reaches_the_source_inbox(self, hosted):

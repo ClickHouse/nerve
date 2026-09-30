@@ -65,11 +65,11 @@ class TestParsing:
 
         assert config.slack.enabled
 
-    def test_an_explicit_enabled_false_still_wins(self):
+    def test_an_explicit_enabled_false_still_wins_and_keeps_the_provider_hosted(self):
         config = NerveConfig.from_dict({"slack": {"mode": "hosted", "enabled": False}})
 
         assert not config.slack.enabled
-        assert hosted_providers(config) == []
+        assert hosted_providers(config) == ["slack"]
 
     def test_socket_mode_is_the_default(self):
         config = NerveConfig.from_dict({"slack": {"bot_token": "xoxb-1", "app_token": "xapp-1"}})
@@ -151,6 +151,16 @@ class TestDoctor:
         report = doctor_report(NerveConfig.from_dict({"slack": {"enabled": True}}))
 
         assert "bot_token, app_token not set" in report
+
+    def test_hosted_mode_switched_off_still_checks_the_hosted_settings(self, tmp_path):
+        config = hosted_config(gateway_jwks_file=str(tmp_path / "missing.json"))
+        config.slack.enabled = False
+
+        report = doctor_report(config)
+
+        assert "[--] Slack is hosted but switched off (slack.enabled is false)" in report
+        assert "[ERR] Slack is hosted but channels.hosted.gateway_jwks_file: cannot read" in report
+        assert "[--] Slack disabled" not in report
 
 
 class TestReload:
@@ -306,3 +316,18 @@ class TestHostedRuntime:
 
         with pytest.raises(RuntimeError, match="already registered"):
             await runtime.start()
+
+    async def test_a_switched_off_provider_gets_a_channel_that_waits_to_be_switched_on(self):
+        router = _Router()
+        config = hosted_config()
+        config.slack.enabled = False
+        runtime = HostedChannelRuntime(config, router, lambda: config)
+
+        await runtime.start()
+        try:
+            channel = router.channels["slack"]
+            assert not channel.can_accept()
+            config.slack.enabled = True
+            assert channel.can_accept()
+        finally:
+            await runtime.stop()

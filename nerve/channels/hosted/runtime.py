@@ -45,8 +45,13 @@ RECEIVE_LIMITS = StreamLimits(
 
 
 def hosted_providers(config: NerveConfig) -> list[str]:
-    """The providers whose traffic comes from the gateway."""
-    return ["slack"] if config.slack.enabled and config.slack.mode == "hosted" else []
+    """The providers whose traffic comes from the gateway.
+
+    A provider that is switched off is included. Its channel reads
+    ``enabled`` for each event, so intake stays paused until a reload
+    switches the provider on.
+    """
+    return ["slack"] if config.slack.mode == "hosted" else []
 
 
 class HostedChannelRuntime:
