@@ -2,9 +2,10 @@ version: 2
 updates:
   - package-ecosystem: "uv"
     directory: "/"
+    # Runs on the first day of each month. Security updates do not use this
+    # schedule.
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
     # Do not propose a release until it is 7 days old. Malicious releases
     # (account takeover, typosquat) are usually found and yanked within days.
     # Cooldown applies to version updates only, so security updates are not
@@ -33,8 +34,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
     cooldown:
       default-days: 7
     groups:
