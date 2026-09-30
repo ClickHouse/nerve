@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from nerve.channels.telegram import TelegramChannel, _fit_toast
+from nerve.channels.telegram import MAX_MSG_LEN, TelegramChannel, _fit_text
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.notifications.service import NotificationService
 
@@ -105,14 +105,15 @@ def _old_payload(notification_id: str, option: str) -> str:
     return option.encode("utf-8")[:room].decode("utf-8", errors="ignore")
 
 
-def _tap(data: str):
+def _tap(data: str, card_text: str = "Which one?"):
     """A callback-query update for a tap on a button carrying ``data``."""
     query = SimpleNamespace(
         data=data,
         from_user=SimpleNamespace(id=USER_ID),
-        message=SimpleNamespace(text="Which one?"),
+        message=SimpleNamespace(text=card_text),
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
     )
     return SimpleNamespace(callback_query=query), query
 
@@ -240,6 +241,42 @@ async def test_long_answer_toast_is_capped_but_the_card_keeps_it(
     assert toast == f"Answered: {option}"[:199] + "…"
     edited = query.edit_message_text.await_args.kwargs["text"]
     assert edited.endswith(f"Answered: {option}")
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_status_line_is_cut_to_keep_the_card_within_the_limit(
+    service, channel, db, bot,
+):
+    option = "Option " + "z" * 100
+    nid = await _ask(service, [option, "No"])
+    card_text = "q" * 3990
+
+    update, query = _tap(_buttons(bot)[0].callback_data, card_text=card_text)
+    await channel._handle_callback_query(update, None)
+
+    assert (await db.get_notification(nid))["answer"] == option
+    kwargs = query.edit_message_text.await_args.kwargs
+    assert kwargs["reply_markup"] is None
+    assert len(kwargs["text"]) == MAX_MSG_LEN
+    assert kwargs["text"].startswith(f"{card_text}\n\n✅ Answered: Option ")
+    assert kwargs["text"].endswith("…")
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_failed_card_edit_still_removes_the_buttons(
+    service, channel, db, bot,
+):
+    nid = await _ask(service, ["Yes", "No"])
+
+    update, query = _tap(_buttons(bot)[0].callback_data)
+    query.edit_message_text.side_effect = RuntimeError("edit refused")
+    await channel._handle_callback_query(update, None)
+
+    assert (await db.get_notification(nid))["answer"] == "Yes"
+    query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+    await asyncio.sleep(0)
 
 
 # ----------------------------------------------------------------------
@@ -276,6 +313,7 @@ async def test_old_cut_inside_a_multibyte_character_resolves(
     await channel._handle_callback_query(update, None)
 
     assert (await db.get_notification(nid))["answer"] == option
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -286,6 +324,7 @@ async def test_old_short_payload_is_the_option_itself(service, channel, db):
     await channel._handle_callback_query(update, None)
 
     assert (await db.get_notification(nid))["answer"] == "No"
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -336,20 +375,25 @@ async def test_web_answer_is_never_expanded(service, db):
 
 
 # ----------------------------------------------------------------------
-#  Toast fitting
+#  Text fitting
 # ----------------------------------------------------------------------
 
 
-def test_fit_toast_keeps_text_that_fits():
-    assert _fit_toast("Answered: Yes") == "Answered: Yes"
-    assert _fit_toast("a" * 200) == "a" * 200
+def test_fit_text_keeps_text_that_fits():
+    assert _fit_text("Answered: Yes", 200) == "Answered: Yes"
+    assert _fit_text("a" * 200, 200) == "a" * 200
 
 
-def test_fit_toast_cuts_long_text_with_an_ellipsis():
-    assert _fit_toast("a" * 201) == "a" * 199 + "…"
+def test_fit_text_cuts_long_text_with_an_ellipsis():
+    assert _fit_text("a" * 201, 200) == "a" * 199 + "…"
 
 
-def test_fit_toast_counts_an_emoji_as_two_units():
-    toast = _fit_toast("\U0001F680" * 150)  # 150 code points, 300 UTF-16 units
-    assert toast == "\U0001F680" * 99 + "…"
-    assert len(toast.encode("utf-16-le")) // 2 <= 200
+def test_fit_text_counts_an_emoji_as_two_units():
+    fitted = _fit_text("\U0001F680" * 150, 200)  # 150 code points, 300 UTF-16 units
+    assert fitted == "\U0001F680" * 99 + "…"
+    assert len(fitted.encode("utf-16-le")) // 2 <= 200
+
+
+def test_fit_text_does_not_split_an_emoji_at_the_limit():
+    fitted = _fit_text("a" * 198 + "\U0001F680" * 2, 200)
+    assert fitted == "a" * 198 + "…"

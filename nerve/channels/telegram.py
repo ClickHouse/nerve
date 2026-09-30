@@ -363,16 +363,18 @@ def _clip(text: str, cap: int) -> str:
 _TOAST_MAX_LEN = 200
 
 
-def _fit_toast(text: str) -> str:
-    """Cut `text` to fit a callback-query toast; '…' appended if cut."""
+def _fit_text(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters; '…' appended if cut."""
     # Count UTF-16 code units (an emoji is two). That is never less than the
     # code-point count, so the cut fits however Telegram counts characters.
-    if len(text.encode("utf-16-le")) // 2 <= _TOAST_MAX_LEN:
+    if len(text.encode("utf-16-le")) // 2 <= limit:
         return text
-    cut = text[: _TOAST_MAX_LEN - 1]
-    while len(cut.encode("utf-16-le")) // 2 > _TOAST_MAX_LEN - 1:
-        cut = cut[:-1]
-    return cut + "…"
+    units = 0
+    for end, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units >= limit:  # no room for this char and the ellipsis
+            break
+    return text[:end] + "…"
 
 
 def _fmt_local(iso: str, tz) -> "tuple[str, str]":
@@ -1996,15 +1998,19 @@ class TelegramChannel(BaseChannel):
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
                 )
                 toast = f"Snoozed until {snoozed_until}"
-            await query.answer(_fit_toast(toast))
+            await query.answer(_fit_text(toast, _TOAST_MAX_LEN))
             try:
                 original = query.message.text or ""
                 await query.edit_message_text(
-                    text=f"{original}\n\n{status_line}",
+                    text=_fit_text(f"{original}\n\n{status_line}", MAX_MSG_LEN),
                     reply_markup=None,
                 )
             except Exception:
-                pass
+                # Still retire the buttons: the notification is answered.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
         else:
             await query.answer("Already answered or expired", show_alert=True)
 
