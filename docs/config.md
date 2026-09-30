@@ -1053,6 +1053,16 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.allowed_users` | list[int] | `[]` | Telegram user IDs allowed to DM the bot |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 
+### Notification sink
+
+The `notify` tool and async questions/approvals go to the owner's DM by default,
+or to `notifications.telegram_chat_id` when set (e.g. a dedicated group).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.telegram_chat_id` | int | - | Chat that receives pushes instead of the owner's DM — e.g. a dedicated notification group |
+| `notifications.delivery_only_sink` | bool | `false` | When the sink is a group/supergroup, make it one-way: inbound messages and reactions there never start an agent turn. Off by default (backward-compatible); inline-button answers and `/reply` still work. |
+
 ### Pairing
 
 With `dm_policy: pairing` (the default), the bot only talks to users in

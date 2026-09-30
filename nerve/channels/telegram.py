@@ -1552,26 +1552,26 @@ class TelegramChannel(BaseChannel):
         return blocks, "\n".join(parts)
 
     def _is_delivery_only_sink(self, chat: Any) -> bool:
-        """True when ``chat`` is an opted-in, non-private notification sink.
+        """True when ``chat`` is an opted-in group/supergroup notification sink.
 
         ``notifications.telegram_chat_id`` can be pointed at a dedicated group
-        so pushes (the notify tool, async questions/approvals, tg-notify.sh)
-        land there instead of the owner's DM. When
-        ``notifications.delivery_only_sink`` is enabled, such a group is
-        delivery-only: inbound messages must not start an agent turn.
+        so pushes (the notify tool, async questions/approvals) land there
+        instead of the owner's DM. When ``notifications.delivery_only_sink`` is
+        enabled, such a group is delivery-only: an inbound update must not start
+        an agent turn.
 
         Gated behind the opt-in flag (default off) so an existing install that
-        used a group as the sink and still chatted there is unaffected. A DM
-        sink (chat id == the user's own private chat) stays interactive
-        regardless, hence the non-private requirement. Inline-button callbacks
-        are handled separately, so questions/approvals delivered here stay
+        used a group as the sink and still chatted there is unaffected. Only
+        groups and supergroups qualify: a DM sink (chat id == the user's own
+        private chat) stays interactive regardless. Inline-button callbacks are
+        handled separately, so questions/approvals delivered here stay
         answerable.
         """
         notif = self.config.notifications
         if not getattr(notif, "delivery_only_sink", False):
             return False
         notif_chat = notif.telegram_chat_id
-        return bool(notif_chat) and chat.id == notif_chat and chat.type != "private"
+        return bool(notif_chat) and chat.id == notif_chat and chat.type in ("group", "supergroup")
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
@@ -1685,6 +1685,15 @@ class TelegramChannel(BaseChannel):
 
         user = reaction_update.user
         if user is None or not self._is_authorized(user.id):
+            return
+
+        # Delivery-only notification sink: never start an agent turn on a
+        # reaction that arrives in the notifications group (a one-way channel).
+        if self._is_delivery_only_sink(reaction_update.chat):
+            logger.info(
+                "Ignoring reaction in delivery-only notification chat %s",
+                reaction_update.chat.id,
+            )
             return
 
         chat_id = reaction_update.chat.id
