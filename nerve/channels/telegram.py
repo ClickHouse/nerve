@@ -359,6 +359,22 @@ def _clip(text: str, cap: int) -> str:
     return _html.escape(t) if t else "(no text)"
 
 
+# Telegram caps a callback-query toast (answerCallbackQuery text) at 200 characters.
+_TOAST_MAX_LEN = 200
+
+
+def _fit_toast(text: str) -> str:
+    """Cut `text` to fit a callback-query toast; '…' appended if cut."""
+    # Count UTF-16 code units (an emoji is two). That is never less than the
+    # code-point count, so the cut fits however Telegram counts characters.
+    if len(text.encode("utf-16-le")) // 2 <= _TOAST_MAX_LEN:
+        return text
+    cut = text[: _TOAST_MAX_LEN - 1]
+    while len(cut.encode("utf-16-le")) // 2 > _TOAST_MAX_LEN - 1:
+        cut = cut[:-1]
+    return cut + "…"
+
+
 def _fmt_local(iso: str, tz) -> "tuple[str, str]":
     """Return (day label, HH:MM) for an ISO timestamp in the user's timezone."""
     try:
@@ -1943,16 +1959,23 @@ class TelegramChannel(BaseChannel):
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
+        # or, from a question button, "notifopt:{notification_id}:{option index}".
         parts = query.data.split(":", 2)
-        if len(parts) < 3 or parts[0] != "notif":
+        if len(parts) < 3 or parts[0] not in ("notif", "notifopt"):
             await query.answer()
             return
 
         notification_id = parts[1]
-        answer = parts[2]
 
         if not self._notification_service:
             await query.answer("Service unavailable", show_alert=True)
+            return
+
+        answer = await self._notification_service.resolve_telegram_answer(
+            notification_id, parts[2], by_index=parts[0] == "notifopt",
+        )
+        if answer is None:
+            await query.answer("Already answered or expired", show_alert=True)
             return
 
         success = await self._notification_service.handle_answer(
@@ -1973,7 +1996,7 @@ class TelegramChannel(BaseChannel):
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
                 )
                 toast = f"Snoozed until {snoozed_until}"
-            await query.answer(toast)
+            await query.answer(_fit_toast(toast))
             try:
                 original = query.message.text or ""
                 await query.edit_message_text(

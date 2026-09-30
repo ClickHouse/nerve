@@ -39,6 +39,53 @@ _APPROVAL_EMOJIS: dict[str, str] = {
     "snooze_24h": "\U0001F4A4",  # zzz
 }
 
+# Telegram caps an inline button's callback_data at 64 bytes.
+_CALLBACK_DATA_MAX_BYTES = 64
+
+
+def _fit_callback_value(notification_id: str, value: str) -> str:
+    """Cut ``value`` so ``notif:<id>:<value>`` fits the callback_data cap.
+
+    The cut falls on a byte offset, and a partial trailing UTF-8
+    character is dropped.
+    """
+    prefix = len(f"notif:{notification_id}:".encode("utf-8"))
+    room = _CALLBACK_DATA_MAX_BYTES - prefix
+    return value.encode("utf-8")[:room].decode("utf-8", errors="ignore")
+
+
+def _stored_options(notif: dict[str, Any] | None) -> list:
+    """Return the row's stored options, or ``[]`` when it has none."""
+    if not notif or not notif.get("options"):
+        return []
+    try:
+        options = json.loads(notif["options"])
+    except (TypeError, ValueError):
+        return []
+    return options if isinstance(options, list) else []
+
+
+def _uncut_answer(notification_id: str, payload: str, options: list) -> str:
+    """Map a ``notif:<id>:<payload>`` answer back to the option it came from.
+
+    Question buttons sent before option indexes carried the option text,
+    cut to fit the callback_data cap, so a long option arrives truncated.
+    Return the one stored option whose button sends exactly ``payload``.
+    When several different options send it, return the payload marked
+    ``[truncated]`` so the asking session sees the answer is incomplete.
+    When no option sends it, return it unchanged.
+    """
+    matches = {
+        option for option in options
+        if isinstance(option, str)
+        and _fit_callback_value(notification_id, option) == payload
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    if matches:
+        return f"[truncated] {payload}"
+    return payload
+
 
 def _resolve_workspace(config: NerveConfig | None) -> Path | None:
     """Resolve the workspace directory.
@@ -955,7 +1002,7 @@ class NotificationService:
         text = self._build_telegram_text(session_id, title, body, priority)
 
         if notif_type in ("question", "approval") and options:
-            button_labels: list[tuple[str, str]] = []
+            button_labels: list[str | tuple[str, str]] = []
             for value in options:
                 if notif_type == "approval":
                     label = (
@@ -964,9 +1011,9 @@ class NotificationService:
                     )
                     emoji = _APPROVAL_EMOJIS.get(value, "")
                     rendered = f"{emoji} {label}".strip() if emoji else label
+                    button_labels.append((rendered, value))
                 else:
-                    rendered = value
-                button_labels.append((rendered, value))
+                    button_labels.append(value)
             msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
             )
@@ -1015,15 +1062,22 @@ class NotificationService:
         chat_id: int,
         notification_id: str,
         text: str,
-        options: list[str] | list[tuple[str, str]],
+        options: list[str | tuple[str, str]],
         silent: bool = False,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons.
 
-        ``options`` accepts either a flat list of strings (legacy
-        question kind: label == callback value) or a list of
+        ``options`` accepts either a flat list of strings (question kind:
+        each option is both the label and the answer) or a list of
         ``(label, value)`` tuples (approval kind: emoji-prefixed label,
         canonical value sent back on the callback).
+
+        Question options are free text and can outgrow the 64-byte
+        callback_data cap, so a question button carries the option's
+        index (``notifopt:<id>:<index>``) and the tap handler maps it back
+        to the stored option (:meth:`resolve_telegram_answer`). An
+        approval button carries its short canonical value
+        (``notif:<id>:<value>``).
         """
         bot = self._get_telegram_bot()
         if not bot:
@@ -1032,17 +1086,16 @@ class NotificationService:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         buttons = []
-        for entry in options:
+        for index, entry in enumerate(options):
             if isinstance(entry, tuple):
                 label, value = entry
+                callback_data = (
+                    f"notif:{notification_id}:"
+                    f"{_fit_callback_value(notification_id, value)}"
+                )
             else:
-                label = value = entry
-            callback_data = f"notif:{notification_id}:{value}"
-            # Telegram callback_data max 64 bytes — truncate option if needed
-            if len(callback_data.encode("utf-8")) > 64:
-                max_opt_len = 64 - len(f"notif:{notification_id}:".encode("utf-8"))
-                truncated = value.encode("utf-8")[:max_opt_len].decode("utf-8", errors="ignore")
-                callback_data = f"notif:{notification_id}:{truncated}"
+                label = entry
+                callback_data = f"notifopt:{notification_id}:{index}"
             buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
         keyboard = InlineKeyboardMarkup(buttons)
@@ -1056,6 +1109,25 @@ class NotificationService:
         )
 
         return str(msg.message_id)
+
+    async def resolve_telegram_answer(
+        self, notification_id: str, payload: str, *, by_index: bool,
+    ) -> str | None:
+        """Return the answer a tapped inline button stands for.
+
+        A ``notifopt:`` question button (``by_index``) names an option by
+        index: resolve it to the stored option, or to ``None`` when the
+        row is gone or the index is out of range. A ``notif:`` button
+        carries the answer text itself (see :func:`_uncut_answer`).
+        """
+        options = _stored_options(await self.db.get_notification(notification_id))
+        if not by_index:
+            return _uncut_answer(notification_id, payload, options)
+        try:
+            index = int(payload)
+        except ValueError:
+            return None
+        return options[index] if 0 <= index < len(options) else None
 
     # ------------------------------------------------------------------ #
     #  Maintenance (called by the periodic background tick)                #
