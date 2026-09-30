@@ -148,7 +148,7 @@ that isn't true.
 ### Revisions (`revision`)
 
 Every write to a task row advances `tasks.revision` by one, added in
-migration v045. The row routes return it, and `task_read` ends with a
+migration v052. The row routes return it, and `task_read` ends with a
 `<!-- nerve: revision=N ... -->` line that `task_write` strips again.
 
 Pass the value you read as `expect_revision` to `task_update` or `task_done`
