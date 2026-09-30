@@ -1,4 +1,4 @@
-"""V45: a per-row revision token for tasks.
+"""V52: a per-row revision token for tasks.
 
 The task tools read a row, edit the markdown, then write the row back from
 that read, and ``upsert_task`` replaced the row unconditionally. A writer
@@ -24,4 +24,4 @@ logger = logging.getLogger(__name__)
 
 async def up(db: aiosqlite.Connection) -> None:
     await db.execute("ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
-    logger.info("v045: added tasks.revision")
+    logger.info("v052: added tasks.revision")
