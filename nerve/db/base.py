@@ -543,7 +543,9 @@ class Database(
         """Serialize a multi-statement write and make it a real transaction.
 
         Once a coroutine begins a multi-statement write, no other coroutine
-        can interleave writes before the commit. The body's statements are
+        can interleave writes before the commit. The transaction begins before
+        the body runs, so its reads and the writes based on them are one
+        transaction against other connections too. The body's statements are
         committed on success and rolled back on any exception — including
         task cancellation — so a failed body neither half-commits nor leaves
         the shared connection inside an open (poisoned) transaction.
@@ -554,6 +556,10 @@ class Database(
         async with self._write_lock:
             await self._heal_leaked_txn()
             try:
+                # IMMEDIATE takes the database write lock before the first read.
+                # A deferred BEGIN would pin a read snapshot that another
+                # connection's commit turns into SQLITE_BUSY_SNAPSHOT.
+                await self.db.execute("BEGIN IMMEDIATE")
                 yield
                 # Shield so a cancellation arriving mid-commit cannot abandon
                 # a half-finished transaction: the inner task runs to
