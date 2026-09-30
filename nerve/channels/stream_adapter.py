@@ -3,7 +3,8 @@
 Each inbound message gets a StreamAdapter that handles the response lifecycle:
 - For channels with STREAMING + edit support (Telegram): sends a placeholder,
   accumulates tokens, edits periodically, sends final edit on "done".
-- For channels without STREAMING: accumulates everything, sends once on "done".
+- For all other channels, and when no placeholder was created: accumulates
+  everything, sends once on "done".
 """
 
 from __future__ import annotations
@@ -174,14 +175,10 @@ class StreamAdapter:
                     await self.channel.delete_message(self.target, placeholder_id)
                 except Exception:
                     pass  # Duplicate is better than lost response
-        elif not self._supports_streaming or (
-            self._supports_edit and not self._placeholder_id
-        ):
-            # Non-streaming channel, or an edit-in-place channel whose
-            # placeholder never got created: send the accumulated response as
-            # one message. Without the second case a channel that reports a
-            # failed placeholder as None drops the entire reply — it matches
-            # neither the edit branch above nor a non-streaming channel.
+        else:
+            # No placeholder exists: the channel does not stream, it cannot
+            # edit, or the placeholder was not created. Nothing has shown the
+            # response yet, so send it as one message.
             text = self._normalize_text(self._buffer)
             if text:
                 formatted = self.channel.format_response(text)

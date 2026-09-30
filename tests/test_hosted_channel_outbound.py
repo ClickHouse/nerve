@@ -208,6 +208,19 @@ class TestStreamedReply:
         assert final["target"]["message"]["id"] == PLACEHOLDER_ID
         assert hosted.gateway.sent_operations("delete") == []
 
+    @pytest.mark.parametrize("operations", [["send"], ["send", "edit"]])
+    async def test_a_connection_that_cannot_replace_a_placeholder_gets_one_message(self, hosted, operations):
+        stream = await hosted.stream(advertise=False)
+        await stream.advertise(operations=operations)
+        hosted.router.engine.run = streaming_turn(["All ", "green."], 0.01)
+
+        await direct_turn(hosted, stream)
+        await hosted.gateway.wait_for(lambda: hosted.gateway.sent_operations("send"))
+        await asyncio.sleep(0.2)
+
+        assert [body(send) for send in hosted.gateway.sent_operations("send")] == ["All green."]
+        assert records(hosted, "edit") == records(hosted, "delete") == []
+
     async def test_throttled_edits_are_dropped_inside_the_interval_and_final_edits_wait(self, hosted):
         stream = await hosted.stream(advertise=False)
         await stream.advertise(edit_interval_millis=300)

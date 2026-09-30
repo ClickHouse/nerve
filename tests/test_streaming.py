@@ -41,6 +41,42 @@ class TestEditThrottle:
 
 
 @pytest.mark.asyncio
+class TestFinalMessage:
+    """A reply that has no placeholder is sent once when the turn is done."""
+
+    @pytest.mark.parametrize(("streaming", "editable", "placeholder"), [
+        (False, False, "1.1"),
+        (False, True, "1.1"),
+        (True, False, "1.1"),
+        (True, True, None),
+    ])
+    async def test_a_reply_without_a_placeholder_is_sent_once(self, streaming, editable, placeholder):
+        channel = MagicMock()
+        channel.capabilities = ChannelCapability.SEND_TEXT
+        if streaming:
+            channel.capabilities |= ChannelCapability.STREAMING
+        channel.constraints = ChannelConstraints(
+            max_message_length=4000, supports_message_edit=editable,
+        )
+        channel.format_response = lambda text: text
+        channel.send = AsyncMock()
+        channel.send_placeholder = AsyncMock(return_value=placeholder)
+        channel.edit_message = AsyncMock()
+        channel.delete_message = AsyncMock()
+        adapter = StreamAdapter(channel, "C1", "s1")
+
+        await adapter.initialize()
+        for token in ("All ", "green."):
+            await adapter.on_event("s1", {"type": "token", "content": token})
+        await adapter.on_event("s1", {"type": "done"})
+
+        [call] = channel.send.await_args_list
+        assert call.args[0].text == "All green."
+        channel.edit_message.assert_not_awaited()
+        channel.delete_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 class TestBroadcaster:
     """Test basic broadcast operations."""
 
