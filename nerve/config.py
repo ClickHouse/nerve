@@ -830,18 +830,13 @@ class AgentConfig:
     # ignored when `models` above is set explicitly, on Bedrock, without an
     # API key, or when the API is unreachable — the built-in list applies.
     model_discovery: bool = True
-    # Substrings of model IDs to drop from DISCOVERY results before they reach
-    # the picker (case-insensitive substring match; empty/whitespace patterns
-    # are ignored). A proxy/provider catalog is not a serving guarantee — e.g.
-    # CLIProxyAPI's GET /v1/models advertises retired IDs that 404 on send — so
-    # this prunes such entries from the dynamically discovered list without a
-    # code change, and hot-reloads (it is read at pick time, not baked into the
-    # discovery cache). Scope: applied ONLY to entries taken from discovery. The
-    # configured default (`model`) always leads and an explicit `models` list is
-    # authoritative — neither is ever filtered, so naming a model in config
-    # intentionally overrides an exclusion. Not a validator and not a denylist:
-    # excluding everything discovery returns just leaves the configured default,
-    # never a fallback that would re-introduce an excluded ID.
+    # Case-insensitive model-ID substrings pruned from the discovered catalog
+    # before it reaches the picker (empty/whitespace patterns ignored). A
+    # catalog advertising a model is not a serving guarantee — an advertised ID
+    # can still fail on send, and discovery runs no probe — so this drops such
+    # entries without a code change, and hot-reloads. Only discovered entries
+    # are filtered; the configured default and an explicit `models` list are
+    # authoritative, so naming a model in config overrides a pattern.
     model_discovery_excluded_models: list[str] = field(default_factory=list)
     max_turns: int = 100
     max_concurrent: int = 32
@@ -982,12 +977,8 @@ class AgentConfig:
         if not resolved:
             return False
         patterns = self.model_discovery_excluded_models
-        # Guard a malformed non-list value (e.g. a YAML mapping such as
-        # ``{haiku: false}``, which the coercion layer leaves untouched and
-        # warns about): iterating a dict would turn its keys into active
-        # patterns. Only a genuine list carries exclusions — anything else is
-        # invalid for this field and matches nothing. (A ``${VAR}`` reference
-        # is already coerced to a one-element list before this runs.)
+        # A non-list value (e.g. a YAML mapping) is invalid for this field and
+        # carries no patterns — never iterate a dict's keys as exclusions.
         if not isinstance(patterns, list):
             return False
         for tok in patterns:
@@ -2766,14 +2757,12 @@ class NerveConfig:
         Bedrock model IDs are region-prefixed, so neither discovery nor the
         bare built-ins apply there — Bedrock offers only configured models.
 
-        Exclusions are applied here, at pick time, to the *discovered* branch
-        only — so a hot-reloaded pattern takes effect against the cached raw
-        catalog without a refetch, and the configured default / an explicit
-        ``agent.models`` list are never filtered. When every discovered entry
-        is excluded the result is just the configured default: discovery is
-        still considered to have produced a catalog (it is not a failure), so
-        control does not fall through to the built-in list and re-introduce an
-        excluded ID.
+        Exclusions apply at pick time to the *discovered* branch only, so a
+        hot-reloaded pattern re-filters the cached catalog with no refetch, and
+        the configured default / an explicit ``agent.models`` list are never
+        filtered. If every discovered entry is excluded the result is just the
+        configured default — not a discovery failure, so it does not fall
+        through to the built-in list and re-introduce an excluded ID.
         """
         if self.agent.models:
             extras = list(self.agent.models)
