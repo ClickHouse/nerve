@@ -318,8 +318,19 @@ class HostedChannel(BaseChannel):
 
     @property
     def is_available(self) -> bool:
-        """Whether a stream advertises ``send`` for some connection now."""
-        return self._operations is not None and bool(self._operations.streams.connections("send"))
+        """Whether the provider is switched on and a stream advertises ``send`` now."""
+        return (
+            self._switched_on()
+            and self._operations is not None
+            and bool(self._operations.streams.connections("send"))
+        )
+
+    def _switched_on(self) -> bool:
+        """Whether the provider is enabled and in hosted mode, read per call."""
+        section = getattr(self._config(), self._provider, None)
+        return bool(
+            section is not None and section.enabled and getattr(section, "mode", "") == "hosted",
+        )
 
     async def start(self) -> None:
         self._running = True
@@ -685,6 +696,8 @@ class HostedChannel(BaseChannel):
         the agent may post when it gets the message, so a destination that
         passes here can still be refused by :meth:`send`.
         """
+        if not self._switched_on():
+            return Decision(False, f"{self._provider} is switched off ({self._provider}.enabled is false)")
         section = getattr(self._config(), self._provider, None)
         if not getattr(section, "allow_outbound", False):
             return Decision(
@@ -758,11 +771,7 @@ class HostedChannel(BaseChannel):
         The provider section is read per call, so turning the provider off
         by a reload stops intake until it is turned on again.
         """
-        section = getattr(self._config(), self._provider, None)
-        switched_on = bool(
-            section is not None and section.enabled and getattr(section, "mode", "") == "hosted",
-        )
-        return self._running and switched_on and len(self._inflight) < self._max_inflight
+        return self._running and self._switched_on() and len(self._inflight) < self._max_inflight
 
     async def deliver(self, event: Event) -> Disposition:
         """Dispatch one admitted event and say what happened to it."""

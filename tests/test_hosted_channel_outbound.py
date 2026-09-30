@@ -431,6 +431,17 @@ class TestSendTool:
         assert "slack.allow_outbound is not enabled" in text
         assert hosted.gateway.operations == []
 
+    async def test_a_switched_off_provider_refuses_the_tool(self, hosted):
+        await hosted.stream()
+        await hosted.gateway.wait_for(lambda: hosted.runtime.streams.connections("send"))
+        hosted.config.slack.enabled = False
+
+        text, _ = await send_tool(hosted)
+
+        assert "slack is switched off (slack.enabled is false)" in text
+        assert hosted.gateway.operations == []
+        assert not hosted.runtime.channels["slack"].is_available
+
     async def test_several_connections_without_history_are_refused(self, hosted):
         stream = await hosted.stream()
         await stream.advertise(connection_id=str(uuid.uuid4()), self_id="U_OTHER_AGENT")
@@ -1050,4 +1061,15 @@ class TestNotifications:
 
         await noticed.notifications.ask_question(session_id="s1", title="Deploy now?", options=["yes"])
 
+        assert noticed.gateway.sent_operations("send") == []
+
+    async def test_a_switched_off_provider_posts_no_notification(self, noticed):
+        await noticed.stream()
+        await noticed.gateway.wait_for(lambda: noticed.runtime.streams.connections("send"))
+        noticed.config.slack.enabled = False
+
+        await noticed.notifications.ask_question(session_id="s1", title="Deploy now?", options=["yes"])
+        posted = await noticed.runtime.channels["slack"].post_notification("n-off", "Deploy now?")
+
+        assert posted is None
         assert noticed.gateway.sent_operations("send") == []
