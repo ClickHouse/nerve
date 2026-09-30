@@ -177,6 +177,9 @@ class TurnCompleted:
     duration_api_ms: int | None = None
     num_turns: int | None = None
     context_window: int | None = None
+    # Input tokens of the turn's last model call, when the backend knows them.
+    # Without it, the context bar divides the turn's input by ``num_turns``.
+    context_tokens: int | None = None
     status: TurnStatus = "completed"
     error: str | None = None
 

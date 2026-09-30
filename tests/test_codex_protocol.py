@@ -253,10 +253,10 @@ def test_backend_notes_appended_to_developer_instructions(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Per-turn usage = cumulative-`total` delta over the turn.                      #
+# Per-turn usage = the sum of the increases in the cumulative `total`.          #
 # `total` is the per-thread cumulative counter, `last` a single response. The   #
-# baseline is the previous turn's carried `total`, or `total - last` on the     #
-# first notification for the first turn on a fresh client.                      #
+# baseline is the latest `total` on the client, or `total - last` of the first  #
+# notification when the client has none.                                        #
 # --------------------------------------------------------------------------- #
 
 
@@ -308,9 +308,8 @@ async def test_multi_step_turn_uses_total_not_last(tmp_path):
 
 @pytest.mark.asyncio
 async def test_second_turn_deltas_off_first_turn_end(tmp_path):
-    # Turn 2's baseline is derived from the live stream (total - last of its
-    # first notification), which equals turn 1's ending total — so turn 2 counts
-    # only its own increment, never the accumulated thread history.
+    # Turn 2 is counted from the total at the end of turn 1, so it counts only
+    # its own increment, never the accumulated thread history.
     client = _client(tmp_path)
     await _feed_usage(client, _tok(100, 0, 40), _tok(100, 0, 40))
     await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))
@@ -325,10 +324,10 @@ async def test_second_turn_deltas_off_first_turn_end(tmp_path):
 
 @pytest.mark.asyncio
 async def test_resume_does_not_overcount_full_thread_total(tmp_path):
-    # Resume/reconnect: a fresh client object (baseline None) attaches to a
-    # native thread whose `total` continues at ~66M and does NOT reset. The
-    # first post-resume turn must count only its own response, NOT the whole
-    # accumulated history. The baseline is recovered from (total - last) of the
+    # Resume/reconnect without the usage replay: a fresh client object
+    # (baseline None) attaches to a native thread whose `total` continues at
+    # ~66M and does NOT reset. The first post-resume turn must count only its
+    # own response, NOT the whole accumulated history. The baseline is recovered from (total - last) of the
     # first notification, so the delta is tiny even though `total` is huge.
     client = _client(tmp_path)
     await _feed_usage(
@@ -352,25 +351,11 @@ async def test_fallback_to_last_when_total_absent(tmp_path):
     assert await client._map_notification("thread/tokenUsage/updated", {
         "tokenUsage": {"last": _tok(10, 4, 2), "modelContextWindow": 400_000},
     }) == []
-    assert client._turn_total_base is None        # nothing to anchor a delta to
     done = _complete(client)
     assert done.usage.input_tokens == 6           # 10 - 4 cached
     assert done.usage.cache_read_tokens == 4
     assert done.usage.output_tokens == 2
     assert done.context_window == 400_000
-
-
-@pytest.mark.asyncio
-async def test_reset_turn_accounting_clears_state(tmp_path):
-    # start_turn()'s reset must clear the baseline and response count so nothing
-    # bleeds from the previous turn.
-    client = _client(tmp_path)
-    await _feed_usage(client, _tok(100, 0, 10), _tok(100, 0, 10))
-    assert client._turn_total_base is not None and client._turn_response_count == 1
-    client._reset_turn_usage_accounting()
-    assert client._turn_usage is None
-    assert client._turn_total_base is None
-    assert client._turn_response_count == 0
 
 
 @pytest.mark.asyncio
@@ -384,30 +369,18 @@ async def test_error_turn_still_records_partial_usage(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dropped_mid_turn_notification_self_heals(tmp_path):
-    # If a mid-turn notification is lost, the cumulative `total` on the NEXT
-    # notification still includes the missing response, so the total-delta
-    # recovers it — a sum-of-`last` scheme would have undercounted.
-    client = _client(tmp_path)
-    await _feed_usage(client, _tok(100, 0, 30), _tok(100, 0, 30))  # response 1
-    # (response 2's notification dropped — never delivered)
-    await _feed_usage(client, _tok(600, 0, 130), _tok(300, 0, 60))  # response 3
-    done = _complete(client)
-    assert done.usage.input_tokens == 600      # full cumulative, incl. the gap
-    assert done.usage.output_tokens == 130
-
-
-@pytest.mark.asyncio
 async def test_num_turns_counts_model_responses(tmp_path):
-    # num_turns is the count of model responses in the turn (one per tokenUsage
-    # notification), so the context bar can divide the turn-aggregate usage back
-    # to a single call's context occupancy.
+    # num_turns counts the notifications that increase `total`. A resend of the
+    # previous counts (a retry after a failed request) and a compaction (same
+    # `total`, `last` input 0) are not model responses.
     client = _client(tmp_path)
     await _feed_usage(client, _tok(100, 0, 40), _tok(100, 0, 40))
     await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))
     assert _complete(client).num_turns == 2
     client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(300, 50, 100), _tok(200, 50, 60))  # resend
     await _feed_usage(client, _tok(450, 80, 150), _tok(150, 30, 50))
+    await _feed_usage(client, _tok(450, 80, 150), _tok(0, 0, 0))      # compaction
     assert _complete(client).num_turns == 1
     # No tokenUsage at all still reports at least one call.
     client._reset_turn_usage_accounting()
@@ -415,19 +388,18 @@ async def test_num_turns_counts_model_responses(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_context_occupancy_is_recoverable_from_usage_and_num_turns(tmp_path):
-    # Three ~100k-token calls in a 272k window. The turn aggregates to ~300k
-    # input, but num_turns=3 lets the context bar recover a single call's ~100k
-    # occupancy (input + cache_read) / num_turns.
+async def test_context_tokens_is_the_last_response_input(tmp_path):
+    # The context grows over a tool loop, so the context bar needs the input of
+    # the last call (cached included), not the mean over the turn's calls.
     client = _client(tmp_path)
-    await _feed_usage(client, _tok(100_000, 0, 500), _tok(100_000, 0, 500), window=272_000)
-    await _feed_usage(client, _tok(200_000, 0, 1000), _tok(100_000, 0, 500))
-    await _feed_usage(client, _tok(300_000, 0, 1500), _tok(100_000, 0, 500))
+    await _feed_usage(client, _tok(100_000, 0, 500), _tok(100_000, 0, 500),
+                      window=272_000)
+    await _feed_usage(client, _tok(240_000, 90_000, 1_000),
+                      _tok(140_000, 90_000, 500))
+    await _feed_usage(client, _tok(420_000, 220_000, 1_500),
+                      _tok(180_000, 130_000, 500))
     done = _complete(client)
-    total_input = done.usage.input_tokens + done.usage.cache_read_tokens
-    assert total_input == 300_000        # turn aggregate (billing)
-    assert done.num_turns == 3
-    assert total_input // done.num_turns == 100_000   # single-call occupancy
+    assert done.context_tokens == 180_000   # the mean would be 140k
     assert done.context_window == 272_000
 
 
@@ -475,9 +447,9 @@ async def test_failure_before_first_response_records_zero(tmp_path):
 @pytest.mark.asyncio
 async def test_context_window_exceeded_reset_rebaselines_to_zero(tmp_path):
     # On ContextWindowExceeded codex-rs zeroes `total`, and later responses
-    # re-accumulate from 0. The failing turn clamps to zero (total < baseline);
-    # the carried baseline becomes that reset, so the next turn counts from 0 —
-    # not against the old peak, which would record 0 for the rest of the thread.
+    # re-accumulate from 0. The reset adds nothing to the failing turn, and the
+    # next turn counts from 0, not against the old peak, which would record 0
+    # for the rest of the thread.
     client = _client(tmp_path)
     await _feed_usage(client, _tok(200_000, 150_000, 10_000),
                       _tok(200_000, 150_000, 10_000))
@@ -485,10 +457,10 @@ async def test_context_window_exceeded_reset_rebaselines_to_zero(tmp_path):
     client._reset_turn_usage_accounting()
     await _feed_usage(client, _tok(0, 0, 0), _tok(0, 0, 0))   # counters zeroed
     done = _complete(client, status="failed", error="context window exceeded")
-    assert done.usage.input_tokens == 0                  # clamp: total < baseline
+    assert done.usage.input_tokens == 0
     assert done.usage.cache_read_tokens == 0
     assert done.usage.output_tokens == 0
-    # Next turn re-accumulates from 0; baseline is the carried reset (0).
+    # Next turn re-accumulates from 0; the baseline is the reset (0).
     client._reset_turn_usage_accounting()
     await _feed_usage(client, _tok(10_000, 5_000, 500),
                       _tok(10_000, 5_000, 500))
@@ -496,3 +468,44 @@ async def test_context_window_exceeded_reset_rebaselines_to_zero(tmp_path):
     assert done2.usage.input_tokens == 5_000        # 10k - 5k cached
     assert done2.usage.cache_read_tokens == 5_000
     assert done2.usage.output_tokens == 500
+
+
+@pytest.mark.asyncio
+async def test_context_window_exceeded_mid_turn_keeps_earlier_responses(tmp_path):
+    # Two responses, then the next request exceeds the context window and codex
+    # sets `total` to 0. The two responses are still the turn's usage.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(1_000_000, 900_000, 20_000),
+                      _tok(1_000_000, 900_000, 20_000))
+    _complete(client)
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(1_250_000, 1_140_000, 21_000),
+                      _tok(250_000, 240_000, 1_000))
+    await _feed_usage(client, _tok(1_510_000, 1_390_000, 22_500),
+                      _tok(260_000, 250_000, 1_500))
+    await _feed_usage(client, _tok(0, 0, 0), _tok(0, 0, 0))   # counters zeroed
+    done = _complete(client, status="failed", error="context window exceeded")
+    assert done.usage.input_tokens == 20_000        # 510k - 490k cached
+    assert done.usage.cache_read_tokens == 490_000
+    assert done.usage.output_tokens == 2_500
+
+
+@pytest.mark.asyncio
+async def test_notification_from_another_turn_keeps_the_baseline(tmp_path):
+    # A late notification of an earlier turn arrives when the client already
+    # has a baseline. It is dropped, and the next notification of the turn
+    # counts its tokens, so they are counted once.
+    client = _client(tmp_path)
+    await _feed_usage(client, _tok(100, 0, 10), _tok(100, 0, 10))
+    _complete(client)
+    client._reset_turn_usage_accounting()
+    client._take_usage_baseline({
+        "method": "thread/tokenUsage/updated",
+        "params": {"turnId": "old", "tokenUsage": {
+            "total": _tok(300, 0, 30), "last": _tok(200, 0, 20),
+        }},
+    })
+    await _feed_usage(client, _tok(700, 0, 70), _tok(400, 0, 40))
+    done = _complete(client)
+    assert done.usage.input_tokens == 600       # the late response and this one
+    assert done.usage.output_tokens == 60
