@@ -6,6 +6,7 @@ import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
+import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
 import { getToken } from '../../api/client';
 
 interface BlockRendererProps {
@@ -25,6 +26,7 @@ export function BlockRenderer({
   textClassName,
 }: BlockRendererProps) {
   const renderItems = useMemo(() => groupToolCalls(blocks), [blocks]);
+  const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
 
   return (
     <>
@@ -83,9 +85,9 @@ export function BlockRenderer({
           case 'thinking':
             return <ThinkingBlock key={i} content={item.content} streaming={isLast} />;
           case 'tool_call':
-            return <ToolCallBlock key={i} block={item} />;
+            return <ToolCallBlock key={i} block={item} repeatRunCard={repeatRunCalls.has(item.toolUseId)} />;
           case 'tool_call_group':
-            return <ToolCallGroupBlock key={i} group={item} />;
+            return <ToolCallGroupBlock key={i} group={item} repeatRunCalls={repeatRunCalls} />;
           case 'text': {
             const inner = (
               <>
