@@ -359,14 +359,13 @@ def _clip(text: str, cap: int) -> str:
     return _html.escape(t) if t else "(no text)"
 
 
-# Telegram caps a callback-query toast (answerCallbackQuery text) at 200 characters.
+# Telegram's limit for a callback-query toast (answerCallbackQuery text).
 _TOAST_MAX_LEN = 200
 
 
 def _fit_text(text: str, limit: int) -> str:
     """Cut `text` to at most `limit` characters; '…' appended if cut."""
-    # Count UTF-16 code units (an emoji is two). That is never less than the
-    # code-point count, so the cut fits however Telegram counts characters.
+    # Count UTF-16 code units (an emoji is two), which never undercounts.
     if len(text.encode("utf-16-le")) // 2 <= limit:
         return text
     units = 0
@@ -2006,7 +2005,7 @@ class TelegramChannel(BaseChannel):
                     reply_markup=None,
                 )
             except Exception:
-                # Still retire the buttons: the notification is answered.
+                # Remove the buttons anyway: the tap has been handled.
                 try:
                     await query.edit_message_reply_markup(reply_markup=None)
                 except Exception:

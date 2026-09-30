@@ -44,11 +44,7 @@ _CALLBACK_DATA_MAX_BYTES = 64
 
 
 def _fit_callback_value(notification_id: str, value: str) -> str:
-    """Cut ``value`` so ``notif:<id>:<value>`` fits the callback_data cap.
-
-    The cut falls on a byte offset, and a partial trailing UTF-8
-    character is dropped.
-    """
+    """Cut ``value`` so ``notif:<id>:<value>`` fits, dropping a split UTF-8 tail."""
     prefix = len(f"notif:{notification_id}:".encode("utf-8"))
     room = _CALLBACK_DATA_MAX_BYTES - prefix
     return value.encode("utf-8")[:room].decode("utf-8", errors="ignore")
@@ -66,14 +62,13 @@ def _stored_options(notif: dict[str, Any] | None) -> list:
 
 
 def _uncut_answer(notification_id: str, payload: str, options: list) -> str:
-    """Map a ``notif:<id>:<payload>`` answer back to the option it came from.
+    """Map a ``notif:<id>:<payload>`` answer back to the option that sent it.
 
-    Question buttons sent before option indexes carried the option text,
-    cut to fit the callback_data cap, so a long option arrives truncated.
-    Return the one stored option whose button sends exactly ``payload``.
-    When several different options send it, return the payload marked
-    ``[truncated]`` so the asking session sees the answer is incomplete.
-    When no option sends it, return it unchanged.
+    The payload is the option text cut to fit the callback_data cap, as sent
+    by approval buttons and by question buttons older than ``notifopt:``.
+    Return the one stored option that cuts to ``payload``; if several
+    different options do, the payload marked ``[truncated]``; if none does,
+    the payload unchanged.
     """
     matches = {
         option for option in options
@@ -1072,12 +1067,10 @@ class NotificationService:
         ``(label, value)`` tuples (approval kind: emoji-prefixed label,
         canonical value sent back on the callback).
 
-        Question options are free text and can outgrow the 64-byte
-        callback_data cap, so a question button carries the option's
-        index (``notifopt:<id>:<index>``) and the tap handler maps it back
-        to the stored option (:meth:`resolve_telegram_answer`). An
-        approval button carries its short canonical value
-        (``notif:<id>:<value>``).
+        Option text can outgrow the 64-byte callback_data cap, so a question
+        button sends ``notifopt:<id>:<index>``, which
+        :meth:`resolve_telegram_answer` maps back to the stored option. An
+        approval button sends ``notif:<id>:<value>``.
         """
         bot = self._get_telegram_bot()
         if not bot:

@@ -1,14 +1,8 @@
 """Telegram question buttons answer with the full option text.
 
-Telegram caps a button's callback_data at 64 bytes. A question button
-carries its option's index (``notifopt:<id>:<index>``) and the tap handler
-maps it back to the stored option, so an option of any length survives the
-round trip. Approval buttons keep their short canonical value
-(``notif:<id>:<value>``).
-
-Question buttons sent before option indexes carried the option text, cut to
-fit. The handler maps such a payload back to the one option it was cut from,
-and marks it ``[truncated]`` when several options share the cut.
+A question button sends its option's index (``notifopt:<id>:<index>``), so an
+option of any length survives the 64-byte callback_data cap. A cut
+``notif:<id>:<text>`` payload maps back to the option it was cut from.
 """
 
 from __future__ import annotations
@@ -100,7 +94,7 @@ def _buttons(bot: MagicMock) -> list:
 
 
 def _old_payload(notification_id: str, option: str) -> str:
-    """What a question button carried before option indexes: the text, cut."""
+    """The payload of a ``notif:`` button for ``option``: its text, cut to fit."""
     room = 64 - len(f"notif:{notification_id}:".encode("utf-8"))
     return option.encode("utf-8")[:room].decode("utf-8", errors="ignore")
 
@@ -280,7 +274,7 @@ async def test_failed_card_edit_still_removes_the_buttons(
 
 
 # ----------------------------------------------------------------------
-#  Buttons sent before option indexes
+#  Cut-text notif: payloads
 # ----------------------------------------------------------------------
 
 
