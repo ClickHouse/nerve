@@ -139,15 +139,17 @@ class Backoff:
         self._initial = initial
         self._maximum = maximum
         self._rng = rng
-        self._attempt = 0
+        self._delay = min(maximum, initial)
 
     def next(self) -> float:
-        delay = min(self._maximum, self._initial * (2 ** self._attempt))
-        self._attempt += 1
+        # The delay doubles up to the maximum and then stays there, so any
+        # number of failures in a row gives a finite value.
+        delay = self._delay
+        self._delay = min(self._maximum, delay * 2)
         return delay / 2 + self._rng() * delay / 2
 
     def reset(self) -> None:
-        self._attempt = 0
+        self._delay = min(self._maximum, self._initial)
 
 
 class InboxReader:
