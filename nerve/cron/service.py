@@ -1229,7 +1229,7 @@ class CronService:
                             "Continue executing these instructions each time."
                         )
 
-                response = await self.engine.run_persistent_cron(
+                result = await self.engine.run_persistent_cron(
                     job_id=job.id,
                     prompt=prompt,
                     model=model,
@@ -1239,7 +1239,7 @@ class CronService:
                     cause=attribution.caused_by_actor_id,
                 )
             else:
-                response = await self.engine.run_cron(
+                result = await self.engine.run_cron(
                     job_id=job.id,
                     prompt=base_prompt,
                     model=model,
@@ -1249,15 +1249,23 @@ class CronService:
                     cause=attribution.caused_by_actor_id,
                 )
 
+            response = result.text
             # Keep the tail of the response — for multi-message runs the
             # final summary lives at the end, not the beginning.
             output = response if len(response) <= 2000 else "…" + response[-2000:]
             if rotated:
                 output = "[context rotated] " + output
-            await self.db.log_cron_finish(
-                log_id, "success", output=output, session_id=session_id,
-            )
-            logger.info("Cron job %s completed (%d chars)", job.id, len(response))
+            if result.outcome.ok:
+                await self.db.log_cron_finish(
+                    log_id, "success", output=output, session_id=session_id,
+                )
+                logger.info("Cron job %s completed (%d chars)", job.id, len(response))
+            else:
+                error = result.outcome.describe()
+                await self.db.log_cron_finish(
+                    log_id, "error", output=output, error=error, session_id=session_id,
+                )
+                logger.warning("Cron job %s ended with %s", job.id, error)
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)

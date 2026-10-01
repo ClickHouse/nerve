@@ -51,6 +51,7 @@ def _make_engine() -> AgentEngine:
     engine._session_models = {}
     engine._observed_models = {}
     engine.agents = AgentRegistry.for_tests()
+    engine._turn_watches = {}
     return engine
 
 
