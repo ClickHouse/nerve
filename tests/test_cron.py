@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron.jobs import CronJob
 from nerve.cron.service import (
     CronService,
@@ -66,8 +67,8 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     config.sessions.cron_session_mode = "per_run"
 
     engine = AsyncMock()
-    engine.run_cron = AsyncMock(return_value="ok")
-    engine.run_persistent_cron = AsyncMock(return_value="ok")
+    engine.run_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
+    engine.run_persistent_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
 
     db = AsyncMock()
     db.log_cron_start = AsyncMock(return_value=1)
@@ -690,7 +691,7 @@ class TestJobLock:
             call_order.append("start")
             await asyncio.sleep(0.1)
             call_order.append("end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job = _make_job(id="locked-job", lock=True)
@@ -712,7 +713,7 @@ class TestJobLock:
             call_order.append("start")
             await asyncio.sleep(0.1)
             call_order.append("end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job = _make_job(id="unlocked-job", lock=False)
@@ -734,7 +735,7 @@ class TestJobLock:
             call_order.append(f"start")
             await asyncio.sleep(0.1)
             call_order.append(f"end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job_a = _make_job(id="job-a", lock=True)
@@ -1252,7 +1253,7 @@ class TestRunLogOutput:
     @pytest.mark.asyncio
     async def test_stores_tail_of_long_response(self, cron_service):
         long = "begin " + ("x" * 3000) + " THE END"
-        cron_service.engine.run_cron = AsyncMock(return_value=long)
+        cron_service.engine.run_cron = AsyncMock(return_value=TurnResult(long, TurnOutcome()))
         job = _make_job()
 
         await cron_service._run_job_inner(job)
@@ -1265,7 +1266,7 @@ class TestRunLogOutput:
 
     @pytest.mark.asyncio
     async def test_stores_short_response_verbatim(self, cron_service):
-        cron_service.engine.run_cron = AsyncMock(return_value="all done")
+        cron_service.engine.run_cron = AsyncMock(return_value=TurnResult("all done", TurnOutcome()))
         job = _make_job()
 
         await cron_service._run_job_inner(job)
@@ -1323,7 +1324,7 @@ class TestLiveSessionLink:
 
         async def _run(**kwargs):
             order.append("run")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = AsyncMock(side_effect=_run)
         job = _make_job(id="live-job")

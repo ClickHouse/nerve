@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -39,6 +40,7 @@ from nerve.agent.backends import (
     TurnInput,
     build_backends,
 )
+from nerve.agent.backends.events import TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
@@ -182,6 +184,38 @@ class _TurnState:
     last_model: str | None = None
     # True once any AssistantMessage was received (gates CLI-crash retry)
     got_content: bool = False
+    status: TurnStatus = "completed"
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """How one agent turn ended. Independent of session health (``sessions.status``)."""
+
+    status: TurnStatus = "completed"
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "completed"
+
+    def describe(self) -> str:
+        return f"turn {self.status}" + (f": {self.error}" if self.error else "")
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """What one ``run`` invocation produced and how its own turn ended."""
+
+    text: str
+    outcome: TurnOutcome
+
+
+@dataclass(eq=False)
+class TurnWatch:
+    """Latest outcome of a watched session's turns (see ``AgentEngine.watch_turns``)."""
+
+    outcome: TurnOutcome | None = None
 
 
 class AgentEngine:
@@ -240,6 +274,7 @@ class AgentEngine:
         # add_stop_listener) — lets workflow-run lifecycle owners record
         # "this was a stop" before engine.run swallows the interrupt.
         self._stop_listeners: list[Any] = []
+        self._turn_watches: dict[str, list[TurnWatch]] = {}
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
@@ -1470,6 +1505,28 @@ class AgentEngine:
         distinguish "stopped" from "completed"."""
         self._stop_listeners.append(callback)
 
+    @contextlib.contextmanager
+    def watch_turns(self, session_id: str) -> Iterator[TurnWatch]:
+        """Record how each persisted turn of ``session_id`` ends while the block runs.
+
+        For a caller that owns the whole session: autonomous (background-
+        continuation) turns end outside any ``run()``. The latest one wins.
+        """
+        watch = TurnWatch()
+        self._turn_watches.setdefault(session_id, []).append(watch)
+        try:
+            yield watch
+        finally:
+            watches = self._turn_watches.get(session_id, [])
+            watches.remove(watch)
+            if not watches:
+                self._turn_watches.pop(session_id, None)
+
+    def _end_turn(self, session_id: str, outcome: TurnOutcome) -> TurnOutcome:
+        for watch in self._turn_watches.get(session_id, ()):
+            watch.outcome = outcome
+        return outcome
+
     async def stop_session(self, session_id: str) -> bool:
         """Stop a running session."""
         for cb in self._stop_listeners:
@@ -1964,14 +2021,16 @@ class AgentEngine:
                 "context_window": event.context_window,
                 "status": event.status,
             }
-            if event.status == "failed" and event.error:
-                # Failed turns still complete: surface the error inline so
-                # the conversation shows what happened (the runtime's
-                # transport stays healthy — this is a model/API failure).
-                note = f"⚠️ Turn failed: {event.error}"
-                st.full_response_text += (
-                    ("\n\n" + note) if st.full_response_text else note
+            st.status, st.error = event.status, event.error
+            if event.status != "completed":
+                # Abnormal ends still complete: surface them inline so the
+                # conversation shows what happened (the runtime itself stays healthy).
+                logger.warning(
+                    "Turn %s for session %s: %s",
+                    event.status, session_id, event.error or "no detail",
                 )
+                note = f"⚠️ Turn {event.status}" + (f": {event.error}" if event.error else "")
+                st.full_response_text += ("\n\n" + note) if st.full_response_text else note
                 st.ordered_blocks.append({"type": "text", "content": note})
                 await broadcaster.broadcast_token(session_id, note)
             return True
@@ -2283,6 +2342,23 @@ class AgentEngine:
     async def _finalize_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
         bump_updated_at: bool = True,
+    ) -> TurnOutcome:
+        """Persist the turn (``_persist_turn``), then publish its outcome."""
+        try:
+            await self._persist_turn(
+                session_id, st, channel, bump_updated_at=bump_updated_at,
+            )
+        except asyncio.CancelledError:
+            self._end_turn(session_id, TurnOutcome("interrupted", "stopped while saving the turn"))
+            raise
+        except Exception as e:
+            self._end_turn(session_id, TurnOutcome("failed", f"turn not persisted: {e}"))
+            raise
+        return self._end_turn(session_id, TurnOutcome(st.status, st.error))
+
+    async def _persist_turn(
+        self, session_id: str, st: _TurnState, channel: str | None,
+        bump_updated_at: bool = True,
     ) -> None:
         """Persist a completed turn and emit the terminal ``done`` event.
 
@@ -2507,6 +2583,36 @@ class AgentEngine:
                       trigger message", and plenty of internal turns (a
                       run-later deferral, the star hook) are user-requested.
         """
+        return (await self._run_turn(
+            session_id=session_id,
+            user_message=user_message,
+            source=source,
+            channel=channel,
+            model=model,
+            effort_override=effort_override,
+            internal=internal,
+            images=images,
+            image_refs=image_refs,
+            bump_updated_at=bump_updated_at,
+            actor=actor,
+        )).text
+
+    async def _run_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        source: str = "web",
+        channel: str | None = None,
+        model: str | None = None,
+        effort_override: str | None = None,
+        internal: bool = False,
+        images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
+    ) -> TurnResult:
+        """``run()`` plus how the invocation's turn ended."""
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -2584,7 +2690,7 @@ class AgentEngine:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
-    ) -> str:
+    ) -> TurnResult:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source, actor=actor)
 
@@ -2675,7 +2781,9 @@ class AgentEngine:
             # Check for deferred /stop that arrived while we were setting up
             if self.sessions.pop_stop_request(session_id):
                 logger.info("Stop requested before agent turn — aborting session %s", session_id)
-                return ""
+                return TurnResult("", self._end_turn(
+                    session_id, TurnOutcome("interrupted", "stopped before the turn started"),
+                ))
 
             # Drain autonomous-turn messages that buffered while no run was
             # active (background task settled in the race window before the
@@ -2842,6 +2950,7 @@ class AgentEngine:
                     break  # success — exit retry loop
 
         except asyncio.CancelledError:
+            outcome = self._end_turn(session_id, TurnOutcome("interrupted", "stopped by user"))
             logger.info("Session %s cancelled by user", session_id)
             partial = st.full_response_text + (
                 "\n\n[Stopped by user]"
@@ -2892,7 +3001,7 @@ class AgentEngine:
                 )
             # Memorize in background — don't block the stop path
             await self.schedule_memorize(session_id)
-            return partial
+            return TurnResult(partial, outcome)
 
         except Exception as e:
             error_msg = f"Agent error: {e}"
@@ -2969,17 +3078,18 @@ class AgentEngine:
             if client:
                 await self._safe_disconnect(client)
             st.full_response_text = error_msg
+            st.status, st.error = "failed", error_msg
 
         # Persist the turn (assistant message + usage) and broadcast done.
         # Background-task continuation is handled by the CLI itself: when a
         # run_in_background task settles, the CLI runs an autonomous turn
         # which the idle stream watcher drains to the UI — no Nerve-side
         # output-file polling needed (the old regex watcher lived here).
-        await self._finalize_turn(
+        outcome = await self._finalize_turn(
             session_id, st, channel, bump_updated_at=bump_updated_at,
         )
 
-        return st.full_response_text
+        return TurnResult(st.full_response_text, outcome)
 
     # ------------------------------------------------------------------ #
     #  Autonomous turns — CLI activity between run() calls                 #
@@ -3136,6 +3246,7 @@ class AgentEngine:
                             if st.full_response_text
                             else "[Background turn interrupted: runtime went silent]"
                         )
+                        st.status, st.error = "interrupted", "runtime went silent"
                         await _close_turn()
                         raise
                     if batch is None:
@@ -3143,6 +3254,7 @@ class AgentEngine:
                             "Agent stream ended mid-autonomous-turn for session %s",
                             session_id,
                         )
+                        st.status, st.error = "failed", "agent stream ended mid-turn"
                         await _close_turn()
                         break
 
@@ -3207,6 +3319,7 @@ class AgentEngine:
             # /stop (or teardown) cancelled the drain mid-turn — persist
             # what we have so the partial turn isn't lost.
             if st is not None and _turn_has_content():
+                self._end_turn(session_id, TurnOutcome("interrupted", "stopped by user"))
                 st.full_response_text += (
                     "\n\n[Stopped by user]"
                     if st.full_response_text
@@ -3432,7 +3545,7 @@ class AgentEngine:
         run_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
-    ) -> str:
+    ) -> TurnResult:
         """Run an agent turn for a cron job in an isolated session.
 
         The SDK client is normally discarded immediately after the run
@@ -3440,6 +3553,8 @@ class AgentEngine:
         unless the run yielded with a live ``run_in_background`` task, in which
         case it is kept alive so the agent can resume when the task completes
         (see ``_teardown_oneshot_client``).
+
+        Returns the run's text and how its turn ended.
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -3452,7 +3567,7 @@ class AgentEngine:
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
         try:
-            return await self.run(
+            return await self._run_turn(
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",
@@ -3471,7 +3586,7 @@ class AgentEngine:
         session_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
-    ) -> str:
+    ) -> TurnResult:
         """Run a persistent cron job that maintains context across runs.
 
         The caller (CronService) resolves which generation chat session the
@@ -3486,6 +3601,8 @@ class AgentEngine:
         which would collide with the parked task — so a persistent-cron
         background task that outlives its run is not resumed (use an
         isolated cron for long background work).
+
+        Returns the run's text and how its turn ended.
         """
         session_id = session_id or f"cron:{job_id}"
         actor = self.db.system_actor
@@ -3494,7 +3611,7 @@ class AgentEngine:
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
-            return await self.run(
+            return await self._run_turn(
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",

@@ -32,9 +32,10 @@ Stop-vs-done disambiguation: ``engine.run`` swallows both graceful
 interrupts and hard cancels (it returns partial text), so this service
 registers an engine *stop listener* that CASes the run terminal BEFORE
 any stop touches the session — exactly the ordering the kill/budget paths
-already use. ``_execute`` additionally re-checks the row and the session
-status after ``engine.run`` returns, so a stopped/errored turn can never
-be recorded as ``done``.
+already use. ``_execute`` additionally re-checks the row after
+``engine.run`` returns and classifies the run by the outcome of the
+session's last persisted turn (``engine.watch_turns``), so a
+stopped/errored turn can never be recorded as ``done``.
 
 Runs do not survive a daemon restart: the startup recovery pass marks
 orphaned active runs ``failed`` and notifies, so a paid job can never
@@ -44,6 +45,7 @@ burn unmetered.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -483,6 +485,7 @@ class WorkflowRunService:
             # Per-leg sandbox override, read at codex client build
             # (SessionSpec.extra["sandbox"] beats the global codex.sandbox).
             metadata = {"codex_sandbox": str(spec["sandbox"])}
+        watches = contextlib.ExitStack()
         try:
             # Nest the leg under the session it was started from and name it
             # "[<parent title>] <slug>"; engine skips the fork path for
@@ -520,6 +523,7 @@ class WorkflowRunService:
             self._write_run_json(run)
             await self._broadcast(run)
 
+            turns = watches.enter_context(self.engine.watch_turns(session_id))
             response = await self.engine.run(
                 session_id=session_id,
                 user_message=self._build_prompt(run),
@@ -576,25 +580,22 @@ class WorkflowRunService:
             fresh = await self.db.get_workflow_run(run_id)
             if fresh is None or fresh["status"] != "running":
                 return
-            session = await self.db.get_session(session_id)
-            session_status = str((session or {}).get("status") or "")
-            if session_status in ("stopped", "error"):
-                # The turn was stopped or died and engine.run swallowed it.
+            outcome = turns.outcome
+            error = (
+                "no turn outcome recorded" if outcome is None
+                else None if outcome.ok else outcome.describe()
+            )
+            if error is not None:
                 await self._refresh_spend(run_id, final=True)
-                to_status = "killed" if session_status == "stopped" else "failed"
                 flipped = await self.db.transition_workflow_run(
-                    run_id, to_status, expect=("running",),
-                    error=f"session {session_status}",
+                    run_id, "failed", expect=("running",), error=error[:_ERROR_MAX],
                 )
                 if flipped:
-                    await self._finalize_terminal(
-                        run_id, to_status, {"reason": f"session {session_status}"},
-                    )
-                    if to_status == "failed" and not self._is_quiet(run):
+                    await self._finalize_terminal(run_id, "failed", {"error": error[:500]})
+                    if not self._is_quiet(run):
                         await self._notify(
                             f"Workflow run {run_id} failed",
-                            f"{run.get('title') or run['engine']}: session "
-                            "errored mid-run; partial output is in the journal.",
+                            f"{run.get('title') or run['engine']}: {error[:500]}",
                             priority="high",
                         )
                 return
@@ -665,6 +666,7 @@ class WorkflowRunService:
                         priority="high",
                     )
         finally:
+            watches.close()
             self._exec_tasks.pop(run_id, None)
             self._codex_live_base.pop(run_id, None)
             fresh = await self.db.get_workflow_run(run_id)

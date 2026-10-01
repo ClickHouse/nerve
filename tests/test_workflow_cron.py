@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 import nerve.workflows
+from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron.jobs import CronJob, load_jobs, save_jobs
 from nerve.cron.service import CronService
 
@@ -43,8 +44,8 @@ def _make_cron_service() -> CronService:
     config.sessions.cron_session_mode = "per_run"
 
     engine = AsyncMock()
-    engine.run_cron = AsyncMock(return_value="ok")
-    engine.run_persistent_cron = AsyncMock(return_value="ok")
+    engine.run_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
+    engine.run_persistent_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
 
     db = AsyncMock()
     db.log_cron_start = AsyncMock(return_value=1)

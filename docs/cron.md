@@ -498,7 +498,7 @@ See [sources.md](sources.md) for full documentation.
 Every cron and source run is logged in the `cron_logs` SQLite table:
 - `job_id` — Which job ran (e.g., `morning-briefing` or `source:gmail`)
 - `started_at` / `finished_at` — Timestamps
-- `status` — `success` or `error`
+- `status` — `success` or `error`; a run whose agent turn failed or was interrupted is logged as `error`, with the reason in `error` (for example `turn failed: max turns (50) exhausted`).
 - `output` — First 2000 chars of response / summary
 - `error` — Error message if failed
 
