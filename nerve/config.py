@@ -115,6 +115,32 @@ def _str_list(value: object, *, clean: bool = False) -> object:
     if clean:
         return [s for s in (str(v or "").strip() for v in value) if s]
     return list(value)
+
+
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _model_effort(value: object) -> dict[str, str]:
+    """Parse ``agent.model_effort``, keeping file order. Entries with an empty
+    key or an unknown effort level are dropped with a warning, so a typo falls
+    back to ``agent.effort`` instead of sending no effort at all."""
+    if not value:
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("agent.model_effort must be a mapping, got %r; ignored", value)
+        return {}
+    parsed: dict[str, str] = {}
+    for key, level in value.items():
+        name = str(key or "").strip()
+        lvl = str(level or "").strip().lower()
+        if not name or lvl not in _EFFORT_LEVELS:
+            logger.warning(
+                "agent.model_effort: ignoring %r: %r (level must be one of %s)",
+                key, level, ", ".join(_EFFORT_LEVELS),
+            )
+            continue
+        parsed[name] = lvl
+    return parsed
 class ConfigError(ValueError):
     """Raised when configuration cannot be loaded (e.g. an unresolved
     required ``${ENV_VAR}`` reference)."""
@@ -874,6 +900,12 @@ class AgentConfig:
     # spend. Applied by the claude backend when source is "cron" or "hook";
     # interactive sources (web, telegram, wakeup) keep the full `effort`.
     cron_effort: str = "medium"  # max, xhigh, high, medium, low
+    # Per-model replacement for `effort` above, e.g. {"opus-5-5": "high"}.
+    # Keys are case-insensitive substrings of the session's model name,
+    # checked in order (first match wins); unmatched models keep `effort`.
+    # Cron/hook turns keep `cron_effort`, and an explicit per-job or per-run
+    # effort still wins.
+    model_effort: dict[str, str] = field(default_factory=dict)
     context_1m: bool = True     # Enable 1M context window beta
     # Substrings of model names for which the context-1m beta header must NOT
     # be sent (some subscriptions reject the beta for specific models — e.g.
@@ -969,6 +1001,7 @@ class AgentConfig:
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", "max")),
             cron_effort=str(d.get("cron_effort", "medium")),
+            model_effort=_model_effort(d.get("model_effort")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=_str_list(
                 d.get("context_1m_excluded_models")
@@ -997,6 +1030,16 @@ class AgentConfig:
         return not any(
             tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
         )
+
+    def effort_for_model(self, model: str | None) -> str:
+        """Interactive effort for *model* (or the default model when None):
+        the first ``model_effort`` entry whose key occurs in the model
+        name, else ``effort``."""
+        resolved = (model or self.model).lower()
+        for key, level in self.model_effort.items():
+            if key.lower() in resolved:
+                return level
+        return self.effort
 
 
 @dataclass
