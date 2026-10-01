@@ -572,7 +572,9 @@ class _ScriptedClient:
     """Minimal AgentClient whose receive_turn follows a script.
 
     Script items: ``("text", str)``, ``("result", session_id)``,
-    ``("raise",)`` -> TransportDiedError, as a pre-result EOF produces.
+    ``("result", session_id, overrides)`` -> ``_result_msg(session_id,
+    **overrides)``, ``("raise",)`` -> TransportDiedError, as a pre-result
+    EOF produces, ``("hang",)`` -> waits forever (a turn still in flight).
     """
 
     def __init__(self, script: list[tuple], label: str):
@@ -595,7 +597,12 @@ class _ScriptedClient:
         for item in self._script:
             if item[0] == "raise":
                 raise TransportDiedError("claude runtime ended the turn without a result")
-            msg = _text_msg(item[1]) if item[0] == "text" else _result_msg(item[1])
+            if item[0] == "hang":
+                await asyncio.Event().wait()
+            if item[0] == "text":
+                msg = _text_msg(item[1])
+            else:
+                msg = _result_msg(item[1], **(item[2] if len(item) > 2 else {}))
             for event in translate_message(msg):
                 yield event
 

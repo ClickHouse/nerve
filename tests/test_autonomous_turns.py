@@ -46,6 +46,7 @@ def _make_engine() -> AgentEngine:
     engine._session_locks = {}
     engine._session_models = {}
     engine._observed_models = {}
+    engine._turn_watches = {}
     return engine
 
 

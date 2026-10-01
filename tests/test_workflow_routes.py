@@ -9,6 +9,7 @@ so the routes exercise genuine validation/lifecycle against a fake engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.db import Database
 
 from tests.actor_rows import ensure_system_principal
@@ -78,6 +80,9 @@ class FakeEngine:
 
     def add_stop_listener(self, callback) -> None:
         pass
+
+    def watch_turns(self, session_id: str):
+        return contextlib.nullcontext(TurnWatch(TurnOutcome()))
 
 
 async def _drain(setup) -> None:
