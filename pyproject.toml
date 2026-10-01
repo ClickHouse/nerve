@@ -42,7 +42,7 @@ dependencies = [
     # dependency is declared rather than borrowed from claude-agent-sdk.
     "jsonschema>=4.20",
     "apscheduler>=3.11.0",
-    "pyjwt>=2.10.0",
+    "pyjwt>=2.15.0",
     "bcrypt>=4.2.0",
     "httpx>=0.28.0",
     "websockets>=14.0",
