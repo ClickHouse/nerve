@@ -5,8 +5,10 @@ The Claude side of ``GET /api/models`` used to be a hardcoded list
 ``agent.models`` named, so every model Anthropic released after that constant
 was written stayed invisible in the UI even when the configured credentials
 could use it. This module asks the Anthropic Models API (``GET /v1/models``)
-which models the account can actually reach, so new releases show up without
-a code change or a config edit.
+which models the configured credentials' catalog endpoint advertises, so new
+releases show up without a code change or a config edit. Catalog membership is
+not a serving guarantee — an advertised ID can still fail on send, and
+discovery performs no serving probe.
 
 Discovery is best-effort and never raises. It returns an empty list — and the
 caller falls back to the built-in list — when:
@@ -83,7 +85,9 @@ def _fingerprint(config: NerveConfig) -> tuple[str, str, str]:
 def fetch_models(
     config: NerveConfig, timeout: float = _DISCOVERY_TIMEOUT,
 ) -> list[str]:
-    """Return Claude model IDs the configured credentials can reach.
+    """Return Claude model IDs advertised by the configured credentials'
+    Models API catalog (catalog membership is not a serving guarantee; no
+    serving probe is performed).
 
     Queries ``GET /v1/models`` (newest first, as the API orders it). Blocking
     — call it from a worker thread. Never raises: returns ``[]`` when

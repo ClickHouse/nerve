@@ -60,10 +60,13 @@ agent:
   # models:
   #   - claude-opus-5
   #   - claude-sonnet-4-6
-  # Ask the Anthropic Models API (GET /v1/models) at startup which models
-  # the configured credentials can reach, so a newly released model shows up
-  # in the picker without a config edit. Ignored when `models` above is set,
-  # on Bedrock, or without an API key. false → always use the built-in list.
+  # Ask the Anthropic Models API (GET /v1/models) at startup which models the
+  # configured credentials' catalog endpoint advertises, so a newly released
+  # model shows up in the picker without a config edit. Catalog membership is
+  # not a serving guarantee — an advertised ID can still fail on send, and
+  # discovery runs no serving probe (see model_discovery_excluded_models to
+  # prune such entries). Ignored when `models` above is set, on Bedrock, or
+  # without an API key. false → always use the built-in list.
   model_discovery: true
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
