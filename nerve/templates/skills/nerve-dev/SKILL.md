@@ -233,7 +233,7 @@ npm install
 
 5. **Config files:** `config.yaml` (committed) + `config.local.yaml` (gitignored, secrets). Never put API keys in `config.yaml`.
 
-6. **Database migrations:** Each migration is a numbered Python file in `nerve/db/migrations/` (e.g. `v018_your_feature.py`) exporting an `async def up(db)` function. `SCHEMA_VERSION` is derived automatically from the highest migration file number. To add a new migration, create the next numbered file — no other changes needed.
+6. **Database migrations:** Each migration is a numbered Python file in `nerve/db/migrations/` (e.g. `vNNN_your_feature.py`) exporting an `async def up(db)` function. `SCHEMA_VERSION` is derived automatically from the highest migration file number. To add a new migration, create a file numbered above the highest version on `main` (CI checks this with `scripts/check_migration_numbers.py`); no other changes needed.
 
 7. **Database domain modules:** Data access methods are organized into mixin classes by domain (sessions, tasks, plans, etc.) under `nerve/db/`. The `Database` class in `base.py` inherits all mixins. Add new methods to the appropriate domain mixin, not to base.py.
 
