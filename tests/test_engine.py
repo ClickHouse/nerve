@@ -133,6 +133,43 @@ def test_agent_config_cron_effort_default_and_override():
     assert cfg.effort == "max"
 
 
+def test_agent_config_model_effort_replaces_effort_for_matching_models():
+    cfg = AgentConfig.from_dict({
+        "model": "claude-opus-4-8",
+        "effort": "max",
+        "model_effort": {"opus-5-5": "high"},
+    })
+    # Case-insensitive substring match on the model name.
+    assert cfg.effort_for_model("claude-opus-5-5") == "high"
+    assert cfg.effort_for_model("us.anthropic.Claude-Opus-5-5") == "high"
+    # Other models keep `effort`; None means the default model.
+    assert cfg.effort_for_model("claude-opus-4-8") == "max"
+    assert cfg.effort_for_model(None) == "max"
+    # Cron and hook turns keep cron_effort.
+    assert AgentEngine._base_effort_for_source(
+        "cron", cfg.effort_for_model("claude-opus-5-5"), cfg.cron_effort,
+    ) == "medium"
+
+
+def test_agent_config_model_effort_order_and_validation():
+    cfg = AgentConfig.from_dict({"model_effort": {
+        "opus-5": "medium",   # first match wins, so this shadows the next key
+        "opus-5-5": "HIGH",
+        "sonnet": "turbo",    # unknown level: dropped
+        "": "low",            # empty key: dropped
+    }})
+    assert cfg.model_effort == {"opus-5": "medium", "opus-5-5": "high"}
+    assert cfg.effort_for_model("claude-opus-5-5") == "medium"
+    assert cfg.effort_for_model("claude-sonnet-5") == "max"
+
+
+def test_agent_config_model_effort_default_and_malformed():
+    assert AgentConfig.from_dict({}).model_effort == {}
+    assert AgentConfig.from_dict({}).effort_for_model("claude-opus-5-5") == "max"
+    # A non-mapping value is ignored rather than failing the load.
+    assert AgentConfig.from_dict({"model_effort": ["opus-5-5"]}).model_effort == {}
+
+
 def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     """Codex-only runbook semantics must never alter Claude's prompt."""
     cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})

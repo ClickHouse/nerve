@@ -1311,7 +1311,7 @@ class AgentEngine:
                 source=source,
                 model=requested_model,
                 effort=effort_override or self._base_effort_for_source(
-                    source, self.config.agent.effort,
+                    source, self.config.agent.effort_for_model(requested_model),
                     self.config.agent.cron_effort,
                 ),
                 system_prompt=system_prompt,
