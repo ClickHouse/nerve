@@ -160,8 +160,7 @@ class WorkflowRunService:
                 "survive the restart; restart them explicitly if still needed.",
                 priority="high",
             )
-        # Reap Codex workflow-run cgroup scopes left by a previous incarnation,
-        # before the monitor loop dispatches anything new.
+        # Reap Codex workflow-run scopes left by the previous daemon.
         await self._reconcile_codex_lifecycle()
         interval = max(5, int(self.config.workflows.poll_interval_seconds))
         self._monitor_task = asyncio.create_task(self._monitor_loop(interval))
@@ -719,8 +718,7 @@ class WorkflowRunService:
                 logger.exception(
                     "workflow run completion listener failed for %s", run_id,
                 )
-        # Reap this run's contained descendants from its durable record,
-        # detached so it never blocks the terminal path (no-op without a record).
+        # Reap the run's contained descendants in the background.
         if str(run.get("engine") or "") == ENGINE_CODEX:
             self._spawn_detached(
                 self._reap_codex_lifecycle(run_id),
@@ -738,9 +736,8 @@ class WorkflowRunService:
     # ------------------------------------------------------------------ #
 
     async def _reconcile_codex_lifecycle(self) -> None:
-        """Reap cgroup scopes recorded by a previous run. Runs regardless of the
-        current mode so disabling containment does not strand a crashed run's
-        scope. Best effort — never blocks the monitor loop."""
+        """Reap scopes recorded by earlier runs, in every mode. Errors are
+        logged."""
         try:
             results = await asyncio.to_thread(
                 codex_lifecycle.reconcile, self.runs_dir(),

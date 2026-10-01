@@ -660,12 +660,9 @@ _WORKFLOW_SESSION_PREFIX = "workflow:"
 def _workflow_containment(
     backend: "CodexBackend", spec: SessionSpec,
 ) -> lifecycle.WorkflowContainment | None:
-    """cgroup containment for a Codex ``workflow:`` session in strict mode, else
-    None (interactive/cron sessions and disabled mode launch unchanged).
-
-    The run id is validated and the run dir confined under ``runs_dir`` so a
-    crafted session id can neither escape the directory nor claim signalling
-    authority."""
+    """Containment for a ``workflow:`` session in strict mode. None for other
+    sessions, disabled mode, or a run id that isn't a run dir under
+    ``runs_dir``."""
     sid = spec.session_id or ""
     if not sid.startswith(_WORKFLOW_SESSION_PREFIX):
         return None

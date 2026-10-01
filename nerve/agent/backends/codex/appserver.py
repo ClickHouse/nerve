@@ -150,8 +150,7 @@ class CodexAppServerClient:
         self._client_version = client_version
         self._request_timeout = request_timeout
         self._on_server_request = server_request_handler
-        # cgroup containment for a Codex *workflow* run (None otherwise — the
-        # launch then behaves exactly as before). See codex/lifecycle.py.
+        # Set only for contained Codex workflow runs (codex/lifecycle.py).
         self._containment = containment
         self._lifecycle_record: lifecycle.LifecycleRecord | None = None
 
@@ -184,9 +183,7 @@ class CodexAppServerClient:
             args.extend(["--config", kv])
         args.extend(["app-server", "--listen", "stdio://"])
 
-        # For a contained workflow run, `prepare_launch` records the owner and
-        # returns the scope-wrapped argv; it raises before exec if the host
-        # can't contain the run.
+        # Wrap the argv in a systemd scope; raises before exec on failure.
         containment = self._containment
         if containment is not None:
             try:
@@ -216,8 +213,7 @@ class CodexAppServerClient:
                 f"Failed to spawn codex app-server ({self._bin_path}): {e}"
             ) from e
 
-        # Record the scope's InvocationID + resolved cgroup now that systemd-run
-        # created it.
+        # Record the scope's InvocationID + cgroup.
         if containment is not None and self._lifecycle_record is not None:
             try:
                 self._lifecycle_record = await asyncio.to_thread(

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -21,7 +20,6 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 
 from nerve.utils.fs import atomic_write_text
 
@@ -216,7 +214,7 @@ def build_scope_argv(unit: str, inner_argv: list[str]) -> list[str]:
 
 def _unit_identity(unit: str) -> dict[str, str] | None:
     """``systemctl --user show`` the unit's identity props, or None if the query
-    itself failed (which must never be read as 'the scope is gone')."""
+    failed."""
     try:
         proc = subprocess.run(
             ["systemctl", "--user", "show", unit,
@@ -315,11 +313,10 @@ class WorkflowContainment:
 def prepare_launch(
     containment: WorkflowContainment, inner_argv: list[str],
 ) -> tuple[list[str], LifecycleRecord]:
-    """Record the owner, then return the scope-wrapped argv. Raises before
-    anything execs if the host can't contain the run, if the record can't be
-    written, or if a previous attempt's scope is not confirmed reaped — the
-    engine can recreate a crashed client for the same run, and a fresh launch
-    must not overwrite (and orphan) a still-live prior scope."""
+    """Record the owner, then return the scope-wrapped argv. A record left by an
+    earlier launch of the same run is reaped first. Raises before exec if the
+    host can't contain the run, the record can't be written, or the prior scope
+    isn't confirmed reaped."""
     caps = detect_capabilities()
     if not caps.ok:
         raise ContainmentUnavailable(f"strict cgroup containment unavailable: {caps.reason}")
@@ -371,14 +368,12 @@ def reap(run_dir: Path) -> Receipt:
     try:
         write_record(run_dir, record)
     except OSError as e:
-        # A stop we can't durably record cannot be reported complete.
         return Receipt(outcome="pending_retry", error=f"receipt not persisted: {e}")
     return receipt
 
 
 def _do_reap(record: LifecycleRecord) -> Receipt:
-    # A reboot leaves no process alive, and the unit name may now be foreign —
-    # resolve without signalling.
+    # Recorded on a previous boot: nothing from it is alive; don't signal.
     if record.boot_id and _boot_id() and record.boot_id != _boot_id():
         return Receipt(outcome="complete")
 
@@ -386,8 +381,7 @@ def _do_reap(record: LifecycleRecord) -> Receipt:
     if ident is None:
         return Receipt(outcome="pending_retry", error="unit query failed")
     if ident.get("LoadState", "") == "not-found":
-        # A transient scope's cgroup is removed only once empty, so a
-        # not-found unit means the tree is gone. No signal sent.
+        # A transient scope is unloaded only once its cgroup is empty.
         return Receipt(outcome="complete")
 
     # Verify identity before signalling: an exact InvocationID when recorded, or
@@ -411,8 +405,7 @@ def _do_reap(record: LifecycleRecord) -> Receipt:
 
 def reconcile(runs_dir: Path) -> list[tuple[str, Receipt]]:
     """Reap every run's scope from its record. Called at startup, after active
-    runs have been marked failed, so no record belongs to a live run; reap is
-    idempotent, so already-complete records are no-ops."""
+    runs have been marked failed."""
     root = Path(runs_dir)
     if not root.is_dir():
         return []
