@@ -1,8 +1,14 @@
-"""Notification tool handlers — notify, ask_user, propose_action, react, send_sticker, send_file.
+"""Notification tool handlers — notify, ask_user, propose_action, react,
+send_sticker, send_file, send_channel_message.
 
-All six tools need ``ctx.session_id`` so the channel router can deliver
-to the correct chat (web, Telegram). The session_id arrives via
+Most of these need ``ctx.session_id`` so the channel router can deliver to
+the correct chat (web, Telegram). The session_id arrives via
 :class:`ToolContext`; there's no per-tool special-casing left.
+
+``send_channel_message`` is the exception: it addresses a conversation the
+caller names, so it never reads the session's message context. That is what
+makes it usable from a cron run, and it is why the destination has to clear
+the channel's own write policy first.
 
 ``propose_action`` files an ``approval``-kind notification whose answer
 routes through a server-side dispatcher (``ctx.notification_service``)
@@ -29,6 +35,7 @@ from nerve.agent.tools.schemas import (
     NOTIFY_SCHEMA,
     PROPOSE_ACTION_SCHEMA,
     REACT_SCHEMA,
+    SEND_CHANNEL_MESSAGE_SCHEMA,
     SEND_FILE_SCHEMA,
     SEND_STICKER_SCHEMA,
 )
@@ -438,6 +445,58 @@ async def send_file_handler(ctx: ToolContext, args: dict) -> ToolResult:
     )
 
 
+async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Post to a conversation the caller names, on the transport it names.
+
+    The target is passed straight through and never inferred from the
+    session's last inbound message, so this works from a cron run with no
+    chat context — and cannot silently retarget a different conversation
+    when it does have one.
+
+    A policy refusal comes back as plain text, not ``is_error``: the agent
+    asked a reasonable question and got a reasoned "no", which is an answer
+    rather than a malfunction. A transport failure *is* ``is_error``, so
+    turn telemetry does not record a message that never arrived as a
+    successful call.
+    """
+    if not ctx.engine:
+        return ToolResult.text("Engine not available.", is_error=True)
+
+    channel = args.get("channel", "").strip()
+    target = args.get("target", "").strip()
+    text = args.get("text", "")
+
+    if not channel:
+        return ToolResult.text("Error: channel is required.", is_error=True)
+    if not target:
+        return ToolResult.text("Error: target is required.", is_error=True)
+    if not text.strip():
+        return ToolResult.text("Error: text is required.", is_error=True)
+
+    try:
+        decision = await ctx.engine.router.deliver_addressed(
+            channel, target, text, session_id=ctx.session_id,
+        )
+    except Exception as e:
+        logger.error("send_channel_message dispatch failed: %s", e)
+        # A long message is split into several posts, so a failure partway
+        # through leaves the earlier parts delivered. Say so: a plain
+        # "failed" reads as "nothing happened" and invites a retry that
+        # posts those parts a second time.
+        return ToolResult.text(
+            f"Failed to send message on {channel}: {e}. If the message was "
+            f"long, earlier parts of it may already have been posted — check "
+            f"the conversation before retrying.",
+            is_error=True,
+        )
+
+    if decision.allowed:
+        return ToolResult.text(f"Message sent to {channel} target {target}.")
+    return ToolResult.text(
+        f"Refused: cannot send to {channel} target {target} — {decision.reason}"
+    )
+
+
 NOTIFY_SPEC = ToolSpec(
     name="notify",
     description=(
@@ -527,6 +586,22 @@ SEND_FILE_SPEC = ToolSpec(
     handler=send_file_handler,
 )
 
+SEND_CHANNEL_MESSAGE_SPEC = ToolSpec(
+    name="send_channel_message",
+    description=(
+        "Post a message to a chat conversation you name, on the transport "
+        "you name — e.g. a Slack channel. Unlike 'notify', this does not go "
+        "to the user's notification inbox, and unlike a normal reply it is "
+        "not tied to the current chat, so it works from a cron run with no "
+        "conversation attached. The destination must be approved by that "
+        "channel's write policy (Slack: it must match slack.allow_channels); "
+        "a refusal comes back with the reason. Unsolicited direct messages "
+        "are not supported."
+    ),
+    input_schema=SEND_CHANNEL_MESSAGE_SCHEMA,
+    handler=send_channel_message_handler,
+)
+
 
 NOTIFICATION_SPECS = [
     NOTIFY_SPEC,
@@ -536,4 +611,5 @@ NOTIFICATION_SPECS = [
     REACT_SPEC,
     SEND_STICKER_SPEC,
     SEND_FILE_SPEC,
+    SEND_CHANNEL_MESSAGE_SPEC,
 ]

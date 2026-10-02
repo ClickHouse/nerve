@@ -183,9 +183,30 @@ class AgentBackend(Protocol):
         ...
 
     def excluded_tools(self) -> set[str]:
-        """Nerve-registry tool names NOT to expose for this backend."""
+        """Nerve-registry tool names NOT to expose for this backend.
+
+        Union the runtime's own exclusions with
+        :func:`config_excluded_tools`, which every backend shares.
+        """
         ...
 
     async def validate_model(self, model: str) -> None:
         """Raise :class:`BackendError` when *model* cannot be served."""
         ...
+
+
+def config_excluded_tools(config: Any) -> set[str]:
+    """Registry tools the configuration leaves nothing to serve.
+
+    Separate from a backend's own exclusions, which turn on the runtime
+    rather than the config. Read per session, so a reload takes effect
+    without a restart.
+
+    A tool that is offered but can only refuse costs a turn to find that
+    out. ``send_channel_message`` is the case: outbound is off by default,
+    and with it off no destination is reachable.
+    """
+    excluded: set[str] = set()
+    if not config.outbound_channels:
+        excluded.add("send_channel_message")
+    return excluded

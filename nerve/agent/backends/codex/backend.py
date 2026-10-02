@@ -40,6 +40,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
@@ -237,7 +238,7 @@ class CodexBackend:
         return self.codex.model
 
     def excluded_tools(self) -> set[str]:
-        return set()
+        return config_excluded_tools(self.config)
 
     async def validate_model(self, model: str) -> None:
         """Reject obvious cross-backend model leakage before spawning Codex.
