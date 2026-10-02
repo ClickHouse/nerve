@@ -1,4 +1,4 @@
-import { getToken } from './client';
+import { authUrl, isHosted, probeSession } from './hosted';
 import type { ReviewLoop, Task, WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
 
@@ -69,6 +69,12 @@ export type SendStatus = 'sent' | 'queued' | 'dropped';
 // payload wins. The caller still gets 'queued' for the surviving payload.
 const MAX_PENDING = 5;
 
+/** A chat message that waits in the queue for an open socket. */
+export interface QueuedMessage {
+  session_id: string;
+  content: string;
+}
+
 export class NerveWebSocket {
   private ws: WebSocket | null = null;
   private handlers: Set<MessageHandler> = new Set();
@@ -77,6 +83,8 @@ export class NerveWebSocket {
   private _connected = false;
   private _pending: Record<string, unknown>[] = [];
   private shouldReconnect = true;
+  /** The gateway session check that runs before the next retry (hosted only). */
+  private probe: Promise<void> | null = null;
 
   get connected() {
     return this._connected;
@@ -86,10 +94,9 @@ export class NerveWebSocket {
     this.shouldReconnect = true;
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
-    const token = getToken();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const url = `${protocol}//${host}/ws${token ? `?token=${token}` : ''}`;
+    const url = authUrl(`${protocol}//${host}/ws`);
 
     const socket = new WebSocket(url);
     this.ws = socket;
@@ -115,7 +122,19 @@ export class NerveWebSocket {
       if (this.ws !== socket) return;
       this._connected = false;
       this.stopPing();
-      if (this.shouldReconnect) this.scheduleReconnect();
+      if (!this.shouldReconnect) return;
+      // Behind the gateway, ask about the session before the next retry. The
+      // browser does not show why a socket closed: a refused upgrade closes
+      // it before it opens, Nerve closes a socket that it cannot authenticate
+      // with code 4001, and the gateway closes an open socket when it removes
+      // access. The check must run before the next upgrade, because the
+      // gateway removes its session cookie when it refuses an upgrade, and
+      // after that the check gets 401, not 403.
+      if (isHosted()) {
+        this.probeThenReconnect();
+        return;
+      }
+      this.scheduleReconnect();
     };
 
     socket.onerror = () => {
@@ -130,6 +149,7 @@ export class NerveWebSocket {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.probe = null;
     this.stopPing();
     const socket = this.ws;
     this.ws = null;
@@ -143,10 +163,11 @@ export class NerveWebSocket {
       this.ws.send(JSON.stringify(data));
       return 'sent';
     }
-    // Queue while the socket is mid-handshake or a reconnect is scheduled.
-    // The drain happens in `onopen` once the new socket is OPEN.
+    // Queue while the socket is mid-handshake, a reconnect is scheduled, or
+    // the gateway session check runs. The drain happens in `onopen` once the
+    // new socket is OPEN.
     const connecting = this.ws?.readyState === WebSocket.CONNECTING;
-    if (connecting || this.reconnectTimer !== null) {
+    if (connecting || this.reconnectTimer !== null || this.probe !== null) {
       if (this._pending.length >= MAX_PENDING) {
         this._pending.shift();
       }
@@ -193,6 +214,25 @@ export class NerveWebSocket {
     return () => this.handlers.delete(handler);
   }
 
+  /**
+   * Remove the chat messages from the queue and return them, so that their
+   * text can go back into the drafts. Other queued frames stay.
+   */
+  takePendingMessages(): QueuedMessage[] {
+    const messages: QueuedMessage[] = [];
+    const rest: Record<string, unknown>[] = [];
+    for (const data of this._pending) {
+      if (data.type === 'message' && typeof data.content === 'string'
+        && typeof data.session_id === 'string') {
+        messages.push({ session_id: data.session_id, content: data.content });
+      } else {
+        rest.push(data);
+      }
+    }
+    this._pending = rest;
+    return messages;
+  }
+
   private startPing() {
     this.pingInterval = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
@@ -226,6 +266,22 @@ export class NerveWebSocket {
       this.reconnectTimer = null;
       this.connect();
     }, 3000);
+  }
+
+  /**
+   * Check the gateway session, then retry only if the check allows it. When
+   * the check starts re-entry or shows a screen, the socket stays closed.
+   */
+  private probeThenReconnect() {
+    if (this.probe !== null) return;
+    const probe: Promise<void> = probeSession().catch(() => true).then((retry) => {
+      // A disconnect during the check makes its answer obsolete.
+      if (this.probe !== probe) return;
+      this.probe = null;
+      if (retry) this.scheduleReconnect();
+      else this.shouldReconnect = false;
+    });
+    this.probe = probe;
   }
 }
 
