@@ -3,6 +3,9 @@ import {
   api, setToken, clearToken, getToken, setUnauthorizedHandler,
   type Account, type ActorRef, type LoginKind, type Viewer,
 } from '../api/client';
+import {
+  hostedLogout, isHosted, setAuthMode, showProblem, useHostedStore,
+} from '../api/hosted';
 import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
@@ -249,6 +252,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   logout: () => {
     beginAuthSession();
+    if (isHosted()) {
+      // The gateway owns the hosted session, and this tab holds no token.
+      purgeAccountScopedState();
+      sessionEstablished = false;
+      set({
+        authenticated: false, loading: false, sessionExpired: false,
+        error: null, viewer: null, account: null,
+      });
+      void hostedLogout();
+      return;
+    }
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
     // browser. Only on a *deliberate* logout — an expired session must never
@@ -289,6 +303,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     applyStatus(generation, status);
 
     if (!isCurrentAuthSession(authSession)) return;
+
+    if (isHosted()) {
+      await enterHosted(authSession, status !== null);
+      return;
+    }
 
     if (token && identityOutcome.status === 'fulfilled' && identityOutcome.value) {
       sessionEstablished = true;
@@ -345,12 +364,54 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 }));
 
 /**
+ * Finish startup in hosted mode. The gateway admitted this tab before the
+ * page loaded, so there is no login form and no passwordless login:
+ * `/api/auth/me` names the actor, or the gateway answer shows why the app
+ * cannot open.
+ *
+ * `statusRead` is `false` when the status call failed. Behind the gateway,
+ * that failure already gives the reason, and `/api/auth/me` would fail the
+ * same way, so it is not called.
+ */
+async function enterHosted(authSession: number, statusRead: boolean): Promise<void> {
+  let viewer: Viewer | null = null;
+  if (statusRead) {
+    try {
+      viewer = await api.getViewer();
+    } catch {
+      viewer = null;
+    }
+    if (!isCurrentAuthSession(authSession)) return;
+  }
+
+  if (viewer) {
+    sessionEstablished = true;
+    useAuthStore.setState({
+      authenticated: true, ready: true, sessionExpired: false,
+      ...identityOf(viewer),
+    });
+    return;
+  }
+  useAuthStore.setState({
+    authenticated: false, ready: true, sessionExpired: false,
+    viewer: null, account: null,
+  });
+  // A gateway 401 started re-entry, and a gateway error showed its own
+  // screen. Any other failure shows the unavailable screen, because there is
+  // no login form to show. A session check that a 401 from Nerve started can
+  // still replace it with re-entry or a screen that stops the app.
+  if (!useHostedStore.getState().reentering) showProblem('unavailable');
+}
+
+/**
  * Apply one status response, if it is still the newest one asked for.
  *
  * `null` means the read failed: keep the last known answer over a transient
  * failure, and fail closed only when there has never been one.
  */
 function applyStatus(generation: number, status: Awaited<ReturnType<typeof api.authStatus>> | null): void {
+  // The mode is fixed for the life of the backend, so every answer can set it.
+  if (status) setAuthMode(status.mode);
   if (generation !== statusGeneration) return;   // a newer request is in flight
   if (status) {
     useAuthStore.setState({

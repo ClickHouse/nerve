@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Outlet } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthStatus } from './api/client';
@@ -50,8 +50,13 @@ vi.mock('./components/Notifications/NotificationToast', () => ({
 }));
 
 import { api, getToken } from './api/client';
+import {
+  ApiError, handleHostedError, reportError, showProblem, useHostedStore,
+} from './api/hosted';
+import { ws } from './api/websocket';
 import App from './App';
 import { useAuthStore } from './stores/authStore';
+import { useChatStore } from './stores/chatStore';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
@@ -253,5 +258,192 @@ describe('startup with no token', () => {
     await waitFor(() =>
       expect(useAuthStore.getState().loginMode).toBe('username_password'));
     expect(apiLogin).not.toHaveBeenCalled();
+  });
+});
+
+describe('hosted startup', () => {
+  /** The actor of a gateway principal: no account, so no login name. */
+  function hostedMe() {
+    return {
+      actor: { id: 'principal-1', kind: 'human', display_name: 'Carol', username: null },
+      account: null,
+    };
+  }
+
+  function renderAt(path: string) {
+    return render(<MemoryRouter initialEntries={[path]}><App /></MemoryRouter>);
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    authStatus.mockResolvedValue(status({ mode: 'external', login: 'password' }));
+    getViewer.mockResolvedValue(hostedMe());
+  });
+
+  it('opens the app without a token or a login page', async () => {
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(apiLogin).not.toHaveBeenCalled();
+    expect(ws.connect).toHaveBeenCalled();
+  });
+
+  it('never shows the setup page', async () => {
+    authStatus.mockResolvedValue(status({ mode: 'external', login: 'setup' }));
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Claim this instance' })).not.toBeInTheDocument();
+  });
+
+  it('has no accounts page', async () => {
+    // The router warns that no route matches, which is the point.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    renderAt('/accounts');
+
+    await waitFor(() => expect(useAuthStore.getState().authenticated).toBe(true));
+    expect(screen.queryByText('the accounts page')).not.toBeInTheDocument();
+    warn.mockRestore();
+  });
+
+  it('keeps the accounts page in local mode', async () => {
+    authStatus.mockResolvedValue(status());
+    tokenInStorage.mockReturnValue('a-stored-token');
+    getViewer.mockResolvedValue(me());
+
+    renderAt('/accounts');
+
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+  });
+
+  it('shows the no-access screen, and not the app or a login', async () => {
+    getViewer.mockImplementation(async () => {
+      const error = new ApiError(403, '{"reason":"access_denied","requestId":"r-1"}');
+      reportError(error);
+      throw error;
+    });
+
+    renderApp();
+
+    const screenMain = await screen.findByRole('main', { name: 'No access' });
+    expect(screenMain).toHaveAccessibleDescription(/do not have access/);
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(ws.connect).not.toHaveBeenCalled();
+  });
+
+  it('replaces a live app with the no-access screen and closes the socket', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => showProblem('access_denied'));
+
+    expect(screen.getByRole('main', { name: 'No access' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(ws.disconnect).toHaveBeenCalled();
+  });
+
+  it('shows the archived screen', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => showProblem('agent_archived'));
+
+    expect(screen.getByRole('main', { name: 'Agent archived' })).toBeInTheDocument();
+  });
+
+  it('offers a retry when the agent is unavailable at startup', async () => {
+    getViewer.mockRejectedValueOnce(new TypeError('network'));
+
+    renderApp();
+    fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(authStatus).toHaveBeenCalledTimes(2);
+    expect(useHostedStore.getState().problem).toBeNull();
+  });
+
+  it('shows the unavailable dialog over a live app and keeps the app', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    const loadSessions = useChatStore.getState().loadSessions as ReturnType<typeof vi.fn>;
+    loadSessions.mockClear();
+
+    act(() => showProblem('unavailable'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent unavailable' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(screen.getByRole('button', { name: 'Try again' })).toHaveFocus();
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(screen.queryByRole('dialog', { name: 'Agent unavailable' })).not.toBeInTheDocument();
+    expect(loadSessions).toHaveBeenCalledOnce();
+  });
+
+  it('shows no session-expired overlay', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => useAuthStore.setState({ sessionExpired: true }));
+
+    expect(screen.queryByRole('dialog', { name: 'Session expired' })).not.toBeInTheDocument();
+  });
+});
+
+describe('startup when the status call fails behind the gateway', () => {
+  /** A status call that fails the way `api/client` fails it for this body. */
+  function statusFailsOnce(status: number, body: string) {
+    authStatus.mockImplementationOnce(async () => {
+      const error = new ApiError(status, body);
+      handleHostedError(error);
+      throw error;
+    });
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    authStatus.mockResolvedValue(status({ mode: 'external' }));
+    getViewer.mockResolvedValue({
+      actor: { id: 'principal-1', kind: 'human', display_name: 'Carol', username: null },
+      account: null,
+    });
+  });
+
+  it('shows the unavailable screen with a retry, and no login page', async () => {
+    statusFailsOnce(503, '{"reason":"agent_starting","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'Agent unavailable' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('shows the no-access screen for access_denied', async () => {
+    statusFailsOnce(403, '{"reason":"access_denied","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'No access' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+  });
+
+  it('shows the login page for a failure without a gateway body', async () => {
+    // The login page reads the status again, so every read fails.
+    authStatus.mockRejectedValue(new ApiError(502, '<html>Bad Gateway</html>'));
+
+    renderApp();
+
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(useHostedStore.getState().mode).toBe('local');
   });
 });

@@ -4,6 +4,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
+import { useHostedStore } from '../../api/hosted';
 import { Drawer, IconButton } from '../ui';
 import { MoreHorizontal, LogOut, X } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
@@ -28,6 +29,7 @@ export function BottomNav() {
   const pendingCount = useNotificationStore(s => s.pendingCount);
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
+  const hosted = useHostedStore(s => s.mode === 'external');
   const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
@@ -36,7 +38,8 @@ export function BottomNav() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const available = NAV_ITEMS.filter(i => !(i.feature === 'ultracode' && !ultracodeEnabled));
+  const available = NAV_ITEMS.filter(i =>
+    !(i.feature === 'ultracode' && !ultracodeEnabled) && !(i.feature === 'accounts' && hosted));
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));

@@ -3,12 +3,14 @@ import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-
 import type { Location } from 'react-router-dom';
 import { useAuthStore } from './stores/authStore';
 import { ws } from './api/websocket';
+import { clearUnavailable, stopsApp, useHostedStore } from './api/hosted';
 import { useChatStore } from './stores/chatStore';
 import { useUIStore } from './stores/uiStore';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import type { ShortcutDef } from './utils/keyboard';
 import { LoginPage } from './components/Auth/LoginPage';
 import { SessionExpiredOverlay } from './components/Auth/SessionExpiredOverlay';
+import { HostedProblemScreen } from './components/Auth/HostedProblemScreen';
 import { AppShell } from './components/Layout/AppShell';
 import { ChatPage } from './pages/ChatPage';
 import { FilesPage } from './pages/FilesPage';
@@ -40,26 +42,44 @@ function App() {
   const { handleWSMessage, loadSessions } = useChatStore();
   // Above the early returns — hooks can't run conditionally.
   const location = useLocation();
+  // Hosted Nerve signs in through the gateway, so it has no login, setup or
+  // accounts pages. A gateway answer can stop the app. A stopped app has no
+  // WebSocket and loads nothing.
+  const hosted = useHostedStore((s) => s.mode === 'external');
+  const problem = useHostedStore((s) => s.problem);
+  const stopped = stopsApp(problem);
+  const live = authenticated && !stopped;
 
   useEffect(() => { checkAuth(); }, []);
 
   useEffect(() => {
-    if (!authenticated) return;
+    if (!live) return;
     ws.connect();
     const unsub = ws.onMessage(handleWSMessage);
     loadSessions();
     return () => { unsub(); ws.disconnect(); };
-  }, [authenticated]);
+  }, [live]);
 
   // Wait for auth status before routing. A stored token does not distinguish a
   // claimed instance from a passwordless one.
   if (!ready) return null;
-  // While setup is required, the claim is the only permitted action.
-  if (loginMode === 'setup') return <SetupPage />;
-  // Only a *cold* start gets the full-page login. A session that expired
-  // under a mounted app keeps the app rendered and takes the password in an
-  // overlay, so nothing you had typed is thrown away to ask for it.
-  if (!authenticated && !sessionExpired) return <LoginPage />;
+  if (hosted) {
+    if (stopsApp(problem)) return <HostedProblemScreen problem={problem} />;
+    // Without an actor there is no app to show. A tab on its way to the
+    // gateway login shows nothing.
+    if (!authenticated) {
+      return problem
+        ? <HostedProblemScreen problem={problem} onRetry={() => { clearUnavailable(); void checkAuth(); }} />
+        : null;
+    }
+  } else {
+    // While setup is required, the claim is the only permitted action.
+    if (loginMode === 'setup') return <SetupPage />;
+    // Only a *cold* start gets the full-page login. A session that expired
+    // under a mounted app keeps the app rendered and takes the password in an
+    // overlay, so nothing you had typed is thrown away to ask for it.
+    if (!authenticated && !sessionExpired) return <LoginPage />;
+  }
 
   // Background-location routing: when a route is entered with a
   // `background` location in history state, render *that* location's route
@@ -71,7 +91,14 @@ function App() {
 
   return (
     <>
-      {sessionExpired && <SessionExpiredOverlay />}
+      {!hosted && sessionExpired && <SessionExpiredOverlay />}
+      {hosted && problem === 'unavailable' && (
+        <HostedProblemScreen
+          problem={problem}
+          overlay
+          onRetry={() => { clearUnavailable(); void loadSessions(); }}
+        />
+      )}
       <GlobalShortcuts />
       <Routes location={background ?? location}>
         <Route element={<AppShell />}>
@@ -92,8 +119,8 @@ function App() {
           <Route path="/sources" element={<SourcesPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
-          <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/setup" element={<SetupPage />} />
+          {!hosted && <Route path="/accounts" element={<AccountsPage />} />}
+          {!hosted && <Route path="/setup" element={<SetupPage />} />}
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>

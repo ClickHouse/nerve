@@ -1,3 +1,8 @@
+import {
+  ApiError, csrfHeaders, handleHostedError, isHosted, setTokenReader,
+  type AuthMode,
+} from './hosted';
+
 const API_BASE = '/api';
 
 /**
@@ -17,6 +22,9 @@ export interface AuthStatus {
   /** Kept for older clients; `login !== 'none'`. */
   auth_required: boolean;
   login: LoginKind;
+  /** `external` is hosted Nerve behind the gateway. Absent from an older
+   *  backend, which is local. */
+  mode?: AuthMode;
 }
 
 /** What `POST /api/setup/claim` hands back: a session for the account it just
@@ -321,6 +329,8 @@ export function getToken(): string | null {
   return authToken;
 }
 
+setTokenReader(getToken);
+
 /** Response header carrying a server-refreshed session token. */
 const SESSION_TOKEN_HEADER = 'X-Nerve-Token';
 
@@ -338,8 +348,8 @@ function absorbRefreshedToken(res: Response, requestRevision: number): void {
 }
 
 /**
- * What to do when the server says 401. Registered by the auth store so this
- * module doesn't have to import it (that would be a cycle).
+ * What to do when the server says 401 in local mode. Registered by the auth
+ * store so this module doesn't have to import it (that would be a cycle).
  *
  * The default is deliberately NOT `window.location.reload()`: a reload is how
  * an expired token used to destroy whatever you were typing. Any background
@@ -362,30 +372,47 @@ function handleUnauthorized(requestRevision: number): Error {
   return new Error('Unauthorized');
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const requestToken = authToken;
+/**
+ * Send one API request with the credentials of the current mode. Every API
+ * `fetch` goes through here.
+ *
+ * Local mode sends the session token as a bearer and adopts a slid token.
+ * Hosted mode sends no bearer, because the gateway treats every bearer as an
+ * API token, and the cookie of the gateway session goes with the request. An
+ * unsafe method gets the CSRF header that the gateway requires. A failed
+ * response goes to `handleHostedError`, which also sets hosted mode when the
+ * body is a gateway error.
+ */
+async function send(
+  path: string, init: RequestInit, headers: Record<string, string>,
+): Promise<Response> {
+  const hosted = isHosted();
+  const requestToken = hosted ? null : authToken;
   const requestRevision = tokenRevision;
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string> || {}),
-  };
   if (requestToken) {
     headers['Authorization'] = `Bearer ${requestToken}`;
   }
+  if (hosted) Object.assign(headers, csrfHeaders(init.method));
 
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
 
-  if (res.status === 401) {
-    throw handleUnauthorized(requestRevision);
+  if (res.ok) {
+    if (!hosted) absorbRefreshedToken(res, requestRevision);
+    return res;
   }
 
+  const error = new ApiError(res.status, await res.text());
+  if (handleHostedError(error)) throw error;
+  if (res.status === 401) throw handleUnauthorized(requestRevision);
   absorbRefreshedToken(res, requestRevision);
+  throw error;
+}
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`${res.status}: ${body}`);
-  }
-
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await send(path, options, {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string> || {}),
+  });
   return res.json();
 }
 
@@ -895,27 +922,8 @@ export const api = {
     formData.append('session_id', sessionId);
     files.forEach(f => formData.append('files', f));
 
-    const requestToken = authToken;
-    const requestRevision = tokenRevision;
-    const headers: Record<string, string> = {};
-    if (requestToken) headers['Authorization'] = `Bearer ${requestToken}`;
-
-    const res = await fetch(`${API_BASE}/files/upload`, {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
-
-    if (res.status === 401) {
-      throw handleUnauthorized(requestRevision);
-    }
-
-    absorbRefreshedToken(res, requestRevision);
-
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`${res.status}: ${body}`);
-    }
+    // No Content-Type: the browser sets the multipart boundary.
+    const res = await send('/files/upload', { method: 'POST', body: formData }, {});
     return res.json();
   },
 

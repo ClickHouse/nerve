@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthStatus } from '../api/client';
 
 vi.mock('../api/client', () => ({
@@ -18,6 +18,7 @@ vi.mock('./helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 
 const client = await import('../api/client');
 const { useAuthStore, selfActorId } = await import('./authStore');
+const { ApiError, handleHostedError, useHostedStore } = await import('../api/hosted');
 
 const api = client.api as unknown as {
   login: ReturnType<typeof vi.fn>;
@@ -355,5 +356,146 @@ describe('overlapping status refreshes', () => {
     rejectFirst(new Error('network'));
     await first;
     expect(useAuthStore.getState().loginMode).toBe('none');
+  });
+});
+
+describe('hosted mode', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let assign: ReturnType<typeof vi.fn>;
+
+  /** The actor of a gateway principal: no account, so no login name. */
+  function hostedMe() {
+    return {
+      actor: { id: 'principal-1', kind: 'human' as const, display_name: 'Carol', username: null },
+      account: null,
+    };
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    getToken.mockReturnValue(null);
+    fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    assign = vi.fn();
+    vi.stubGlobal('location', { ...window.location, pathname: '/chat', search: '', assign });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+  });
+
+  it('reads the actor without a token and never logs in', async () => {
+    api.authStatus.mockResolvedValue(status({ mode: 'external', login: 'none' }));
+    api.getViewer.mockResolvedValue(hostedMe());
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(api.getViewer).toHaveBeenCalledOnce();
+    expect(api.login).not.toHaveBeenCalled();
+    expect(setToken).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      authenticated: true, ready: true, sessionExpired: false, account: null,
+    });
+    expect(selfActorId()).toBe('principal-1');
+  });
+
+  it('shows the unavailable screen when the actor cannot be read', async () => {
+    api.authStatus.mockResolvedValue(status({ mode: 'external' }));
+    api.getViewer.mockRejectedValue(new TypeError('network'));
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(api.login).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({ authenticated: false, ready: true });
+    expect(useHostedStore.getState().problem).toBe('unavailable');
+  });
+
+  it('shows nothing more while the tab goes to the gateway login', async () => {
+    api.authStatus.mockResolvedValue(status({ mode: 'external' }));
+    api.getViewer.mockImplementation(async () => {
+      useHostedStore.setState({ reentering: true });
+      throw new Error('401: {"reason":"login_required"}');
+    });
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useAuthStore.getState().ready).toBe(true);
+    expect(useHostedStore.getState().problem).toBeNull();
+  });
+
+  /** A status call that fails the way `api/client` fails it for this body. */
+  function statusFails(status: number, body: string) {
+    api.authStatus.mockImplementation(async () => {
+      const error = new ApiError(status, body);
+      handleHostedError(error);
+      throw error;
+    });
+  }
+
+  it('opens hosted mode when the status call fails with a gateway error body', async () => {
+    statusFails(503, '{"reason":"agent_starting","requestId":"r-1"}');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'external', problem: 'unavailable' });
+    // The status answer already gives the reason.
+    expect(api.getViewer).not.toHaveBeenCalled();
+    expect(api.login).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({ authenticated: false, ready: true });
+  });
+
+  it('shows the stop screen when the status call fails with access_denied', async () => {
+    statusFails(403, '{"reason":"access_denied","requestId":"r-1"}');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'external', problem: 'access_denied' });
+  });
+
+  it('keeps the local path when the status call fails without a gateway body', async () => {
+    statusFails(502, '<html>Bad Gateway</html>');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'local', problem: null });
+    expect(useAuthStore.getState()).toMatchObject({
+      authenticated: false, ready: true, loginMode: 'username_password',
+    });
+  });
+
+  it('keeps the local behavior for an unknown mode', async () => {
+    api.authStatus.mockResolvedValue(
+      status({ mode: 'other' as never, login: 'none', auth_required: false }),
+    );
+    api.login.mockResolvedValue({ token: 'a-token' });
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState().mode).toBe('local');
+    expect(api.login).toHaveBeenCalledWith('');
+  });
+
+  it('logs out through the gateway after it purges the account state', async () => {
+    useHostedStore.setState({ mode: 'external' });
+    useAuthStore.setState({
+      authenticated: true,
+      viewer: hostedMe().actor,
+      account: null,
+    });
+
+    useAuthStore.getState().logout();
+
+    expect(clearAllDrafts).toHaveBeenCalled();
+    expect(clearAllReads).toHaveBeenCalled();
+    expect(clearToken).not.toHaveBeenCalled();
+    expect(api.authStatus).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      authenticated: false, viewer: null, account: null,
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/_nerve/logout');
+    expect(init).toMatchObject({ method: 'POST', headers: { 'X-Nerve-CSRF': '1' } });
+    await vi.waitFor(() => expect(assign).toHaveBeenCalledWith('/'));
   });
 });

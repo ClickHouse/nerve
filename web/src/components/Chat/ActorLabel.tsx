@@ -22,7 +22,7 @@ function useAttribution(actorId: string | null | undefined): Attribution {
   }, [actorId, resolve]);
 
   const actor = actorId ? actors[actorId] : undefined;
-  const base = actorName(actor);
+  const base = actorName(actor, actorId ?? null);
   const system = isSystemActor(actor);
   const discriminator = actorId ? actorDiscriminators(actors).get(actorId) : undefined;
   return {
