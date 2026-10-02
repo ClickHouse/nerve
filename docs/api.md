@@ -729,7 +729,7 @@ Response: {
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
-runners).
+runners and missed runs).
 
 ```json
 Response: {
