@@ -335,7 +335,7 @@ async def _status(install: _Install) -> dict:
 @pytest.mark.asyncio
 class TestSetupState:
     async def test_setup_required_refuses_login_and_reports_setup(self, install):
-        assert await _status(install) == {"auth_required": True, "login": "setup"}
+        assert await _status(install) == {"mode": "local", "auth_required": True, "login": "setup"}
         async with _client(install.app) as http:
             response = await http.post("/api/auth/login", json={"password": ""})
         assert response.status_code == 409
@@ -353,7 +353,7 @@ class TestSetupState:
         assert account["username"] is None
         assert await install.db.setup_completed()
         assert await setup_token.stored_setup_token(install.db) == ""
-        assert await _status(install) == {"auth_required": False, "login": "none"}
+        assert await _status(install) == {"mode": "local", "auth_required": False, "login": "none"}
 
         async with _client(install.app, token=claimed) as http:
             assert (await http.get("/api/accounts/me")).status_code == 200
@@ -402,7 +402,7 @@ class TestSetupState:
                 "/api/accounts/me/password", json={"new_password": _PASSWORD},
             )
         assert response.status_code == 200, response.text
-        assert await _status(install) == {"auth_required": True, "login": "password"}
+        assert await _status(install) == {"mode": "local", "auth_required": True, "login": "password"}
 
     async def test_password_claim_records_setup_complete(self, install):
         assert (await _claim(install)).status_code == 200
@@ -414,7 +414,7 @@ class TestSetupState:
         set_config(NerveConfig(auth=AuthConfig(
             jwt_secret=_SECRET, password_hash=hash_password(_PASSWORD),
         )))
-        assert await _status(install) == {"auth_required": True, "login": "password"}
+        assert await _status(install) == {"mode": "local", "auth_required": True, "login": "password"}
 
 
 @pytest.mark.asyncio

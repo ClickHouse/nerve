@@ -28,9 +28,14 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import (
+    ACTOR_CONTEXT_HEADER,
+    AUTH_MODE_EXTERNAL,
     SESSION_TOKEN_HEADER,
+    auth_mode_from_env,
     authenticate_websocket,
     identity_store,
+    is_external_mode,
+    pin_auth_mode,
 )
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
 from nerve.gateway.routes import (
@@ -139,8 +144,14 @@ WS_ACCOUNT_DISABLED_REASON = "Account disabled"
 
 
 async def _account_enabled(actor: Actor) -> bool:
-    """Whether the actor may still use a socket. The system principal may."""
+    """Whether the actor may still use a socket. The system principal may.
+
+    In external mode, a person that the gateway names has no local account,
+    and the gateway decides access.
+    """
     if actor.is_system:
+        return True
+    if is_external_mode() and actor.account_id is None:
         return True
     store = identity_store()
     if store is None or not actor.account_id:
@@ -351,12 +362,16 @@ async def lifespan(app: FastAPI):
             logger.info("Identity bootstrap: %s", action)
 
         # Create the setup token before serving. Never log it: `nerve status`
-        # reads it from the database.
+        # reads it from the database. External mode has no local setup, so a
+        # token left from local mode is deleted.
         from nerve import setup_token
 
         await setup_token.ensure_setup_token(
             db,
-            unclaimed=await setup_token.instance_is_unclaimed(db, config),
+            unclaimed=(
+                not is_external_mode()
+                and await setup_token.instance_is_unclaimed(db, config)
+            ),
         )
 
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
@@ -932,7 +947,20 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    """Create and configure the FastAPI application."""
+    """Create and configure the FastAPI application.
+
+    Reads ``NERVE_AUTH_MODE`` once and pins it before any route is
+    registered. An unknown value raises :class:`ConfigError` and stops
+    startup.
+    """
+    pin_auth_mode(auth_mode_from_env())
+    if is_external_mode():
+        logger.warning(
+            "Authentication mode is %s: Nerve trusts the %s header without a "
+            "signature check. Only the gateway must be able to reach this server.",
+            AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER,
+        )
+
     app = FastAPI(
         title="Nerve",
         description="Personal AI Assistant",

@@ -404,7 +404,7 @@ class TestTheOldPasswordStillWorks:
 
         assert good.status_code == 200, good.text
         assert bad.status_code == 401
-        assert status.json() == {"auth_required": True, "login": "password"}
+        assert status.json() == {"mode": "local", "auth_required": True, "login": "password"}
 
 
 # --------------------------------------------------------------------------- #

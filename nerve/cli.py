@@ -326,6 +326,17 @@ def start(ctx: click.Context, foreground: bool) -> None:
     config_dir = Path(ctx.obj["config_dir"])
     config = ctx.obj["config"]
 
+    # The server reads NERVE_AUTH_MODE when it starts and refuses an unknown
+    # value. Check it here too, so that this command shows the error and
+    # does not start a daemon that stops at once.
+    from nerve.config import ConfigError
+    from nerve.gateway.auth import auth_mode_from_env
+
+    try:
+        auth_mode_from_env()
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
     # The gateway runs the identity bootstrap when it starts.
@@ -1336,8 +1347,18 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
+    #
+    # In external mode, the gateway names people and local accounts are not
+    # used, so the account checks do not apply.
+    from nerve.config import ConfigError
     from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
-    from nerve.gateway.auth import source_authenticates
+    from nerve.gateway.auth import is_external_mode, source_authenticates
+
+    try:
+        external = is_external_mode()
+    except ConfigError as e:
+        external = False
+        errors.append(f"[ERR] {e} The gateway does not start with this value.")
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -1346,7 +1367,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         source for source in (sources or [])
         if source_authenticates(source, configured_password=configured)
     ]
-    if sources is None:
+    if external:
+        lines.append(
+            "[OK] Auth mode: external. The gateway names the person behind "
+            "each request; local accounts are not used"
+        )
+    elif sources is None:
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
@@ -1367,7 +1393,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append(
             f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
         )
-    if configured and sources is not None:
+    if configured and sources is not None and not external:
         reading = [source for source in sources if source != "local"]
         if reading:
             lines.append(
