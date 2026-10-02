@@ -62,7 +62,6 @@ FAST_READER = ReaderSettings(
     request_timeout=1.5,
     poll_interval=30.0,
     observe_interval=0.5,
-    deferred_retry=30.0,
     backoff_initial=0.05,
     backoff_maximum=0.2,
     capacity_poll=0.01,
@@ -489,17 +488,18 @@ class TestInvoke:
         await asyncio.wait_for(hosted.turns.started.wait(), EVENT_TIMEOUT)
         assert not hosted.turns.release.is_set()
 
-    async def test_an_unaddressed_thread_reply_is_rejected_without_a_session(self, hosted):
+    async def test_a_thread_reply_starts_a_turn_without_a_session(self, hosted):
         stream = await hosted.stream()
         inbox_id = hosted.gateway.store(message_event(
-            message_id="1700000500.000200", thread="1700000500.000100",
+            text="is it done?", message_id="1700000500.000200", thread="1700000500.000100",
         ))
 
         await stream.nudge("invoke")
 
-        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "rejected"
-        assert hosted.gateway.acks[-1][0]["reason_code"] == "admission_rejected"
-        assert hosted.turns.runs == []
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await hosted.turns.wait_for(1)
+        assert await hosted.db.get_channel_session("slack:C_FIXTURE_CHANNEL:1700000500.000100")
+        assert hosted.turns.runs[0]["user_message"] == "is it done?"
 
     async def test_a_reply_in_a_thread_with_a_session_continues_it(self, hosted):
         session_id = await hosted.router.create_session(
@@ -516,20 +516,17 @@ class TestInvoke:
         await hosted.turns.wait_for(1)
         assert hosted.turns.runs[0]["session_id"] == session_id
 
-    async def test_a_mention_waits_for_the_agent_identity(self, hosted):
+    async def test_a_mention_does_not_wait_for_capabilities(self, hosted):
         stream = await hosted.stream(advertise=False)
-        inbox_id = hosted.gateway.store(message_event(mention_agent=True, message_id="1700000700.000100"))
-        await stream.nudge("invoke")
-        await hosted.gateway.wait_for(
-            lambda: any(inbox_id in read.get("served", ()) for read in hosted.gateway.reads),
-        )
-        await asyncio.sleep(0.1)
-        assert inbox_id not in hosted.gateway.acknowledged
+        inbox_id = hosted.gateway.store(message_event(
+            text="summarize", mention_agent=True, message_id="1700000700.000100",
+        ))
 
-        await stream.advertise()
+        await stream.nudge("invoke")
 
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
         await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["user_message"] == "summarize"
 
     async def test_an_unsupported_kind_is_rejected(self, hosted):
         stream = await hosted.stream()

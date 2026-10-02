@@ -5,6 +5,7 @@ extraction of attachments."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import uuid
 import zipfile
@@ -42,13 +43,13 @@ def text(body: str, format: str = "markdown") -> dict[str, Any]:
     return {"kind": "text", "text": {"format": format, "body": body}}
 
 
-def reference(**members: str) -> dict[str, Any]:
+def reference(**members: Any) -> dict[str, Any]:
     return {"kind": "reference", "reference": members}
 
 
 # The content of the gateway's sample events.
 LINKS_AND_MENTIONS = [
-    reference(kind="mention", mention_kind="user", id="U_FIXTURE_AGENT", label="Nerve"),
+    reference(kind="mention", mention_kind="user", id="U_FIXTURE_AGENT", label="Nerve", self=True),
     text(" please summarize "),
     reference(kind="link", url="https://example.com/release-notes", label="the release notes"),
     text(" for "),
@@ -58,7 +59,8 @@ LINKS_AND_MENTIONS = [
     reference(kind="unsupported", id="slack.canvas", label="[Canvas: Release checklist]"),
 ]
 MESSAGE = [
-    text("Could someone review the deployment notes?"),
+    reference(kind="mention", mention_kind="user", id="U_FIXTURE_AGENT", label="Nerve", self=True),
+    text(" Could someone review the deployment notes?"),
     reference(kind="mention", mention_kind="user", id="U_FIXTURE_REVIEWER", label="Reviewer"),
 ]
 MESSAGE_UTF8 = [
@@ -73,18 +75,22 @@ def content(parts: list[dict[str, Any]]) -> tuple[ContentPart, ...]:
 
 class TestRenderContent:
     def test_mentions_links_and_unsupported_content_become_text(self):
-        rendered = render_content(content(LINKS_AND_MENTIONS), "U_FIXTURE_AGENT")
+        rendered = render_content(content(LINKS_AND_MENTIONS))
 
         assert rendered == (
             "please summarize the release notes (https://example.com/release-notes) "
             "for @here and post it in #announcements[Canvas: Release checklist]"
         )
 
-    def test_the_agent_mention_stays_when_the_agent_is_unknown(self):
-        assert render_content(content(LINKS_AND_MENTIONS)).startswith("@Nerve please summarize")
+    def test_a_mention_without_the_self_flag_stays(self):
+        parts = content(LINKS_AND_MENTIONS)
+        mention = parts[0]
+        plain = dataclasses.replace(mention, reference=dataclasses.replace(mention.reference, self=False))
+
+        assert render_content((plain, *parts[1:])).startswith("@Nerve please summarize")
 
     def test_another_member_is_named_by_label(self):
-        assert render_content(content(MESSAGE), "U_FIXTURE_AGENT") == (
+        assert render_content(content(MESSAGE)) == (
             "Could someone review the deployment notes?@Reviewer"
         )
 

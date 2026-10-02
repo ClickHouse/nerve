@@ -63,8 +63,7 @@ def bearer_token(websocket: WebSocket) -> str | None:
 class StreamManager:
     """Accept authenticated gateway streams and choose among them.
 
-    ``on_ready``, ``on_nudge``, and ``on_capabilities`` report stream events to
-    the inbox reader and the hosted channels.
+    ``on_ready`` and ``on_nudge`` report stream events to the inbox reader.
     """
 
     def __init__(
@@ -76,9 +75,6 @@ class StreamManager:
         timing: StreamTiming = StreamTiming(),
         on_ready: Callable[[ChannelStream], None] = lambda stream: None,
         on_nudge: Callable[[ChannelStream, str], None] = lambda stream, purpose: None,
-        on_capabilities: Callable[[ChannelStream, uuid.UUID, Capabilities], None] = (
-            lambda stream, connection_id, capabilities: None
-        ),
     ) -> None:
         self._verifier = verifier
         self._receive_limits = receive_limits
@@ -86,7 +82,6 @@ class StreamManager:
         self._timing = timing
         self._on_ready = on_ready
         self._on_nudge = on_nudge
-        self._on_capabilities = on_capabilities
         self._streams: dict[int, ChannelStream] = {}
         self._ids = itertools.count(1)
         self._changed = asyncio.Event()
@@ -248,7 +243,6 @@ class StreamManager:
         self, stream: ChannelStream, connection_id: uuid.UUID, capabilities: Capabilities,
     ) -> None:
         self._notify()
-        self._on_capabilities(stream, connection_id, capabilities)
 
     def stream_changed(self, stream: ChannelStream) -> None:
         self._notify()

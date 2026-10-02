@@ -8,10 +8,10 @@ does not rebuild provider payloads.
 Invoke events start agent turns with the self-hosted session keys:
 ``<provider>:<conversation>`` for a direct conversation, and
 ``<provider>:<conversation>:<thread>`` elsewhere, where a top-level message
-roots its own thread. The gateway decides admission, and this channel keeps
-its own addressed-message check as a second layer: outside a direct
-conversation, a message must mention the agent or continue a thread that
-already has a session.
+roots its own thread. The gateway decides admission: an invoke event is a
+direct message, a mention of the agent, a reply in a thread that the agent
+takes part in, a reaction, an interaction, or a command. A mention of the
+agent carries the ``self`` flag, so intake needs no capabilities.
 
 Observe events go to the source inbox through ``router.observe`` under the
 provider's local source grant (for Slack, ``slack.source``). The display
@@ -58,7 +58,7 @@ from nerve.channels.base import (
     OutboundRefused,
 )
 from nerve.channels.hosted.attachments import extract_attachments
-from nerve.channels.hosted.contract import Capabilities, ContentPart, Event
+from nerve.channels.hosted.contract import ContentPart, Event
 from nerve.channels.hosted.contract.model import (
     MAX_TRANSFER_BYTES,
     AttachmentReference,
@@ -132,12 +132,13 @@ def _markdown(text: str) -> tuple[ContentPart, ...]:
     return (ContentPart(kind="text", text=TextContent(format="markdown", body=text)),)
 
 
-def render_content(parts: tuple[ContentPart, ...], self_id: str | None = None) -> str:
+def render_content(parts: tuple[ContentPart, ...]) -> str:
     """Turn contract content into prompt text.
 
-    A mention of the agent itself is left out, as the self-hosted channel
-    strips its own mention. Other mentions become ``@name`` or ``#name``, and
-    a link with a label becomes ``label (url)``. Action elements are not text.
+    A mention flagged as the agent itself is left out, as the self-hosted
+    channel strips its own mention. Other mentions become ``@name`` or
+    ``#name``, and a link with a label becomes ``label (url)``. Action
+    elements are not text.
     """
     out: list[str] = []
     for part in parts:
@@ -146,7 +147,7 @@ def render_content(parts: tuple[ContentPart, ...], self_id: str | None = None) -
         elif part.reference is not None:
             reference = part.reference
             if reference.kind == "mention":
-                if reference.mention_kind == "user" and self_id and reference.id == self_id:
+                if reference.self:
                     continue
                 prefix = "#" if reference.mention_kind == "conversation" else "@"
                 out.append(prefix + (reference.label or reference.id).lstrip("@#"))
@@ -193,16 +194,6 @@ def _snoozed_until(notification: dict[str, Any]) -> str | None:
         return None
 
 
-def mentions(event: Event, author_id: str) -> bool:
-    return any(
-        part.reference is not None
-        and part.reference.kind == "mention"
-        and part.reference.mention_kind == "user"
-        and part.reference.id == author_id
-        for part in event.content
-    )
-
-
 class HostedChannel(BaseChannel):
     """One provider's traffic through the gateway, under the provider's name.
 
@@ -240,8 +231,6 @@ class HostedChannel(BaseChannel):
         self._running = False
         # conversation -> the connection it last arrived on.
         self._connections: collections.OrderedDict[str, uuid.UUID] = collections.OrderedDict()
-        # connection -> the agent's own author ID, from capabilities.
-        self._self_ids: dict[uuid.UUID, str] = {}
         self._inflight: set[asyncio.Task] = set()
         # (conversation, message) -> (target, text snippet), for reactions.
         self._message_cache: collections.OrderedDict[tuple[str, str], tuple[str, str]] = (
@@ -735,17 +724,6 @@ class HostedChannel(BaseChannel):
     #  Connection knowledge                                                #
     # ------------------------------------------------------------------ #
 
-    def note_capabilities(self, connection_id: uuid.UUID, capabilities: Capabilities) -> None:
-        """Remember the agent's own identity on *connection_id*.
-
-        Capabilities expire with their stream for operations, but the
-        provider identity of the agent does not change, so it is kept.
-        """
-        self._self_ids[connection_id] = capabilities.self.id
-
-    def self_id(self, connection_id: uuid.UUID) -> str | None:
-        return self._self_ids.get(connection_id)
-
     def connection_for(self, conversation_id: str) -> uuid.UUID | None:
         """The connection that the conversation's latest accepted event came on."""
         return self._connections.get(conversation_id)
@@ -806,39 +784,15 @@ class HostedChannel(BaseChannel):
         thread_id = event.thread.id if event.thread is not None else event.message.id
         return f"{conversation.id}:{thread_id}"
 
-    async def _addressed(self, event: Event, channel_key: str) -> Disposition | None:
-        """``None`` when the message is addressed to the agent, else a disposition.
-
-        A direct message always is. Elsewhere the message must mention the
-        agent, or continue a thread that already has a session. Without the
-        agent's identity for the connection, a mention cannot be ruled out,
-        so the row waits for capabilities.
-        """
-        if event.conversation.kind == "direct":
-            return None
-        self_id = self.self_id(event.connection_id)
-        if self_id is not None and mentions(event, self_id):
-            return None
-        reply = event.thread is not None and event.thread.id != event.message.id
-        if reply and await self.router.get_last_session(channel_key):
-            return None
-        if self_id is None:
-            return Disposition.deferred(
-                f"no {self._provider} capabilities for connection {event.connection_id}",
-                until_capabilities=True,
-            )
-        return Disposition.rejected(
-            "admission_rejected", "the message neither mentions the agent nor continues its thread",
-        )
-
     async def _invoke_message(self, event: Event) -> Disposition:
+        """Start a turn for a message that addresses the agent.
+
+        A thread reply needs no local session: the agent also takes part in
+        threads that it started with its own posts.
+        """
         target = self._target(event)
         channel_key = f"{self._provider}:{target}"
-        refusal = await self._addressed(event, channel_key)
-        if refusal is not None:
-            return refusal
-
-        body = render_content(event.content, self.self_id(event.connection_id))
+        body = render_content(event.content)
         attachments = describe_attachments(event)
         text = f"{attachments}\n\n{body}" if attachments and body else attachments or body
         if not text:
@@ -1099,7 +1053,7 @@ class HostedChannel(BaseChannel):
         if not verdict.allowed:
             return Disposition.rejected("policy_denied", verdict.reason)
 
-        text = render_content(event.content, self.self_id(event.connection_id))
+        text = render_content(event.content)
         attachments = describe_attachments(event)
         if attachments:
             text = f"{attachments}\n\n{text}" if text else attachments
@@ -1133,4 +1087,4 @@ class HostedChannel(BaseChannel):
         return Disposition.accepted()
 
 
-__all__ = ["HostedChannel", "describe_attachments", "mentions", "render_content"]
+__all__ = ["HostedChannel", "describe_attachments", "render_content"]
