@@ -453,6 +453,7 @@ export function handleDone(
       cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
       max_context_tokens: msg.max_context_tokens || 200_000,
       num_turns: msg.num_turns || 1,
+      context_tokens: msg.context_tokens,
     };
   }
   if (state.streamingBlocks.length > 0) {

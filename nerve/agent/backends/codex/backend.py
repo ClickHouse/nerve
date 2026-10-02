@@ -119,6 +119,9 @@ def _toml_str(value: str) -> str:
 # down to what the serving model advertises.
 _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
+# Token counters in the `total` and `last` of a codex tokenUsage payload.
+_USAGE_KEYS = ("inputTokens", "cachedInputTokens", "outputTokens")
+
 
 def _catalog_entries(result: dict) -> list[dict]:
     """The model entries of a ``model/list`` result (defensive)."""
@@ -710,17 +713,16 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
-        # Cumulative `total` at the end of the previous turn on this client,
-        # kept across turns; the baseline for the next turn's delta when known.
-        self._prev_total_usage: dict | None = None
-        # Fallback baseline for the first turn on a fresh client (no previous
-        # total yet): (total - last) from the turn's first tokenUsage
-        # notification. Reset per turn.
-        self._turn_total_base: dict[str, int] | None = None
-        # Count of model responses (tokenUsage notifications) in this turn,
-        # reported as num_turns so the context bar can divide the turn-aggregate
-        # usage back down to a single call's context occupancy.
+        # Cumulative `total` from the latest tokenUsage notification on this
+        # client, kept across turns. It is the baseline for the next
+        # notification. None until known.
+        self._last_total: dict | None = None
+        # This turn's usage: the sum of the increases in `total`.
+        self._turn_counts: dict[str, int] | None = None
+        # Model responses in this turn, reported as num_turns.
         self._turn_response_count: int = 0
+        # Input tokens of the turn's latest model response.
+        self._turn_context_tokens: int | None = None
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -913,9 +915,10 @@ class CodexClient(AgentClient):
         # (late tokenUsage updates etc.) so they can't bleed into this one.
         while not self._transport.notifications.empty():
             try:
-                self._transport.notifications.get_nowait()
+                note = self._transport.notifications.get_nowait()
             except Exception:
                 break
+            self._take_usage_baseline(note)
 
         params: dict[str, Any] = {
             "threadId": self._thread_id,
@@ -1037,6 +1040,7 @@ class CodexClient(AgentClient):
             note_turn = params.get("turnId")
             if note_turn and self._turn_id and note_turn != self._turn_id:
                 logger.debug("codex: dropping stale notification %s", method)
+                self._take_usage_baseline(note)
                 continue
 
             for event in await self._map_notification(method, params):
@@ -1074,8 +1078,7 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
-                self._turn_response_count += 1
-                self._capture_turn_total_base(usage)
+                self._record_token_usage(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
                     self._context_window = window
@@ -1360,12 +1363,12 @@ class CodexClient(AgentClient):
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
-        baseline = (
-            self._prev_total_usage
-            if self._prev_total_usage is not None
-            else self._turn_total_base
-        )
-        usage = self._normalize_usage(self._turn_usage, baseline)
+        counts = self._turn_counts
+        if counts is None and self._turn_usage:
+            # No cumulative total available: use the single last response.
+            last = self._turn_usage.get("last")
+            counts = last if isinstance(last, dict) else None
+        usage = self._normalize_usage(counts, self._turn_usage)
         if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
             # notification. Child usage is still authoritative and must not
@@ -1392,7 +1395,7 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(self._turn_usage, baseline)
+            parent_usage = self._normalize_usage(counts, self._turn_usage)
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1416,13 +1419,6 @@ class CodexClient(AgentClient):
             cost = None
             cost_basis = "unknown"
             estimated_cost = estimate
-        # Carry this turn's ending cumulative total as the next turn's baseline.
-        # A ContextWindowExceeded error resets total to 0 and later responses
-        # re-accumulate from 0, so the latest total is always the baseline.
-        if isinstance(self._turn_usage, dict) and isinstance(
-            self._turn_usage.get("total"), dict
-        ):
-            self._prev_total_usage = self._turn_usage["total"]
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
@@ -1435,81 +1431,102 @@ class CodexClient(AgentClient):
             duration_api_ms=None,
             num_turns=max(1, self._turn_response_count),
             context_window=self._context_window,
+            context_tokens=self._turn_context_tokens,
             status=status,  # type: ignore[arg-type]
             error=error,
         )
 
     def _reset_turn_usage_accounting(self) -> None:
-        """Clear per-turn token-accounting state (latest tokenUsage payload,
-        turn-start cumulative baseline, response count) at turn start."""
+        """Clear the per-turn token accounting at turn start. The cumulative
+        baseline in ``_last_total`` stays."""
         self._turn_usage = None
-        self._turn_total_base = None
+        self._turn_counts = None
         self._turn_response_count = 0
+        self._turn_context_tokens = None
 
-    def _capture_turn_total_base(self, usage: dict) -> None:
-        """Record the fallback turn-start baseline from the turn's first
-        tokenUsage notification, used only when no previous-turn total is
-        carried (the first turn on a fresh client).
+    def _take_usage_baseline(self, note: dict) -> None:
+        """Use a tokenUsage notification from outside the turn as the
+        baseline when this client has none.
 
-        ``tokenUsage.total`` is the per-thread cumulative counter and
-        ``tokenUsage.last`` the most recent single response, so ``total - last``
-        on that first notification is the cumulative total just before the
-        turn's first response.
+        After ``thread/resume`` and ``thread/fork``, app-server sends the
+        restored usage of the thread with the id of an earlier turn. Its
+        ``total`` is the exact baseline for the first turn. When the client
+        already has a baseline, the notification is ignored, and the next
+        notification of the turn counts its tokens.
         """
-        if self._turn_total_base is not None:
+        if self._last_total is not None:
             return
+        if note.get("method") != "thread/tokenUsage/updated":
+            return
+        usage = (note.get("params") or {}).get("tokenUsage")
+        total = usage.get("total") if isinstance(usage, dict) else None
+        if isinstance(total, dict):
+            self._last_total = total
+
+    def _record_token_usage(self, usage: dict) -> None:
+        """Add a tokenUsage notification of the turn to the turn's usage.
+
+        ``total`` is the cumulative counter of the thread and ``last`` its
+        latest model response. The usage of the turn is the sum of the
+        increases in ``total``. A notification that does not increase
+        ``total`` is not a model response: codex also sends one after a
+        failed request, on a usage limit and after a compaction. A
+        ContextWindowExceeded error sets ``total`` to 0, and after that it
+        increases from 0.
+        """
         total = usage.get("total")
         if not isinstance(total, dict):
             return
         last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
-        self._turn_total_base = {
-            key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
-            for key in ("inputTokens", "cachedInputTokens", "outputTokens")
+        base = self._last_total
+        if base is None:
+            # No baseline (a resumed thread without the usage replay): use
+            # the total before this notification's response.
+            base = {
+                key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
+                for key in _USAGE_KEYS
+            }
+        if int(total.get("inputTokens") or 0) < int(base.get("inputTokens") or 0):
+            base = {}  # the counters were reset to 0
+        increase = {
+            key: max(0, int(total.get(key) or 0) - int(base.get(key) or 0))
+            for key in _USAGE_KEYS
         }
+        self._last_total = total
+        counts = self._turn_counts or dict.fromkeys(_USAGE_KEYS, 0)
+        self._turn_counts = {key: counts[key] + increase[key] for key in _USAGE_KEYS}
+        if any(increase.values()):
+            self._turn_response_count += 1
+            self._turn_context_tokens = int(last.get("inputTokens") or 0)
 
     @staticmethod
     def _normalize_usage(
-        usage: dict | None,
-        baseline: dict | None = None,
+        counts: dict | None,
+        usage: dict | None = None,
     ) -> ev.NormalizedUsage | None:
-        """``thread/tokenUsage/updated`` → NormalizedUsage.
+        """Codex token counts → NormalizedUsage.
 
-        The turn's usage is the cumulative-``total`` delta over the turn:
-        ``total`` minus ``baseline`` (the cumulative counters as of turn start).
-        When no cumulative ``total`` is present, ``last`` — the most recent
-        single response — is used instead.
+        ``counts`` has codex's ``inputTokens``, ``cachedInputTokens`` and
+        ``outputTokens``. ``usage`` is the latest tokenUsage payload, which
+        goes into ``raw``.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
         price only), so the cached count is subtracted out here — the
         pricing module and the usage-dict contract both rely on it.
         """
-        if not usage:
+        if counts is None:
             return None
-        total = usage.get("total") if isinstance(usage.get("total"), dict) else None
-        last = usage.get("last") if isinstance(usage.get("last"), dict) else None
-        if total is not None:
-            # Per-turn delta of the cumulative thread total (clamped at zero).
-            base = baseline or {}
-            raw_input = max(0, int(total.get("inputTokens") or 0)
-                            - int(base.get("inputTokens") or 0))
-            raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
-                             - int(base.get("cachedInputTokens") or 0))
-            raw_output = max(0, int(total.get("outputTokens") or 0)
-                             - int(base.get("outputTokens") or 0))
-        elif last is not None:
-            # No cumulative total available: use the single last response.
-            raw_input = int(last.get("inputTokens") or 0)
-            raw_cached = int(last.get("cachedInputTokens") or 0)
-            raw_output = int(last.get("outputTokens") or 0)
-        else:
-            return None
+        raw_input = int(counts.get("inputTokens") or 0)
+        raw_cached = int(counts.get("cachedInputTokens") or 0)
+        raw_output = int(counts.get("outputTokens") or 0)
+        usage = usage or {}
         return ev.NormalizedUsage(
             input_tokens=max(0, raw_input - raw_cached),
             output_tokens=raw_output,
             cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
-            raw={"last": last, "total": usage.get("total")},
+            raw={"last": usage.get("last"), "total": usage.get("total")},
         )
 
     @staticmethod

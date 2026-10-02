@@ -8,7 +8,7 @@ export type WSMessage =
   | { type: 'tool_use'; session_id: string; tool: string; input: Record<string, unknown>; tool_use_id?: string; parent_tool_use_id?: string }
   | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string }
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
-  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number }
+  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number; context_tokens?: number }
   | { type: 'stopped'; session_id: string }
   | { type: 'error'; session_id: string; error: string }
   | { type: 'session_switched'; session_id: string }
