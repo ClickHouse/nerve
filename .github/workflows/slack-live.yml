@@ -1,0 +1,82 @@
+name: Slack live integration
+
+# Kept out of ci.yml because it needs a concurrency policy the rest of CI
+# must not have. These tests drive one real Slack workspace, and Slack hands
+# each event to exactly one of an app's open Socket Mode connections — so two
+# runs at once steal each other's messages, and collide on reactions and on
+# deleting each other's posts. The workspace is the shared resource, not the
+# branch, so the lock below is global rather than per-ref.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize against the shared workspace and let active runs finish so
+# unacknowledged envelopes cannot retry into the next job. GitHub keeps only
+# one queued run per group; a displaced queued check can simply be rerun.
+concurrency:
+  group: slack-live-workspace
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  slack-live-tests:
+    name: Slack live integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The constraint is forks, not pull requests: a fork cannot read the
+    # secrets, so the job would have nothing to run against. A pull request
+    # from a branch in this repository can, and is exactly where the result
+    # is worth having — waiting until merge means finding out too late.
+    #
+    # A clone without the secrets configured skips every test rather than
+    # failing, so this stays green outside ClickHouse/nerve.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Kept in step with the backend job above; bump both together.
+          version: "0.12.0"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install project and test dependencies
+        run: uv sync --extra test --locked --python "3.13"
+
+      # Inbound first, and in its own process. The outbound module now keeps
+      # an ack-only socket open around all of its Web API mutations, which
+      # prevents it from scheduling retries that poison the next run. Keep
+      # inbound first for retry schedules left by older revisions or an
+      # interrupted job, and keep the process split so the outbound sink can
+      # never steal an inbound test event. `if: always()` on outbound means a
+      # failure in the first step still reports the second.
+      - name: Run live Slack tests (inbound)
+        env:
+          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
+          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
+          NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
+          NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
+        # -s exposes the credential-free `SLACK_LIVE {json}` diagnostics from
+        # the harness even on successful runs; pytest otherwise captures them.
+        run: .venv/bin/pytest tests/test_slack_live_inbound.py -v -s
+
+      - name: Run live Slack tests (outbound)
+        if: always()
+        env:
+          NERVE_SLACK_TEST_BOT_TOKEN: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN }}
+          NERVE_SLACK_TEST_APP_TOKEN: ${{ secrets.NERVE_SLACK_TEST_APP_TOKEN }}
+          NERVE_SLACK_TEST_CHANNEL: ${{ secrets.NERVE_SLACK_TEST_CHANNEL }}
+          NERVE_SLACK_TEST_USER_TOKEN: ${{ secrets.NERVE_SLACK_TEST_USER_TOKEN }}
+          NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL: ${{ secrets.NERVE_SLACK_TEST_BOT_TOKEN_NO_EMAIL }}
+        run: .venv/bin/pytest tests/test_slack_live.py -v -s
