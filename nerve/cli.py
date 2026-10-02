@@ -318,11 +318,28 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         )
 
 
+def _refuse_unknown_auth_mode() -> None:
+    """Stop the command when ``NERVE_AUTH_MODE`` has an unknown value.
+
+    The server reads the variable when it starts and refuses an unknown
+    value. ``start`` and ``restart`` check it first, so that they show the
+    error, and do not stop the running daemon or start one that stops at once.
+    """
+    from nerve.config import ConfigError
+    from nerve.gateway.auth import auth_mode_from_env
+
+    try:
+        auth_mode_from_env()
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+
+
 @main.command()
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 @click.pass_context
 def start(ctx: click.Context, foreground: bool) -> None:
     """Start the Nerve server."""
+    _refuse_unknown_auth_mode()
     config_dir = Path(ctx.obj["config_dir"])
     config = ctx.obj["config"]
 
@@ -495,6 +512,8 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     the restart: their ids are written to the resume queue now, and the fresh
     daemon re-drives each interrupted turn on startup.
     """
+    _refuse_unknown_auth_mode()
+
     # Enroll ids before anything else so the queue file is on disk — and
     # survives even a hard kill — by the time the new instance reads it.
     # Append mode lets concurrent enrollments from different sessions coexist.
@@ -1336,8 +1355,32 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
+    #
+    # In external mode, the gateway names people and local accounts are not
+    # used, so the account checks do not apply. The doctor does not ask the
+    # running server for its mode: it reads NERVE_AUTH_MODE in its own shell,
+    # and the environment of the daemon can be different.
+    from nerve.config import ConfigError
     from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
-    from nerve.gateway.auth import source_authenticates
+    from nerve.gateway.auth import (
+        AUTH_MODE_ENV,
+        AUTH_MODE_EXTERNAL,
+        auth_mode_from_env,
+        source_authenticates,
+    )
+
+    mode_source = f"from {AUTH_MODE_ENV} in this shell, not from the running server"
+    try:
+        mode = auth_mode_from_env()
+    except ConfigError as e:
+        mode = None
+        errors.append(
+            f"[ERR] Auth mode ({mode_source}): {e} The server does not start "
+            "with this value."
+        )
+    else:
+        lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
+    external = mode == AUTH_MODE_EXTERNAL
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -1346,7 +1389,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         source for source in (sources or [])
         if source_authenticates(source, configured_password=configured)
     ]
-    if sources is None:
+    if external:
+        lines.append(
+            "[--] Accounts: not used in external mode; the gateway names the "
+            "person behind each request"
+        )
+    elif sources is None:
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
@@ -1367,7 +1415,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append(
             f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
         )
-    if configured and sources is not None:
+    if configured and sources is not None and not external:
         reading = [source for source in sources if source != "local"]
         if reading:
             lines.append(

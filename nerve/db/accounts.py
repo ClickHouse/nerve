@@ -182,6 +182,30 @@ class AccountStore:
         )
         return await self.get_actor_ref(actor_id)
 
+    async def upsert_external_actor(
+        self, actor_id: str, display_name: str | None,
+    ) -> None:
+        """Add a human actor that the gateway names, or write its new name.
+
+        ``_external_actor_names`` holds the last name written for each ID in
+        this process. When the name is the same, no statement runs, so a
+        normal request does not take the SQLite write lock.
+
+        Raises :class:`sqlite3.IntegrityError` for the system actor's ID: the
+        trigger ``system_actor_cannot_be_replaced`` aborts the insert.
+        """
+        written = self._external_actor_names
+        if actor_id in written and written[actor_id] == display_name:
+            return
+        await self._write(
+            """INSERT INTO actor_refs (id, kind, display_name, created_at)
+               VALUES (?, 'human', ?, ?)
+               ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name
+               WHERE actor_refs.display_name IS NOT excluded.display_name""",
+            (actor_id, display_name, _now()),
+        )
+        written[actor_id] = display_name
+
     # -- accounts ------------------------------------------------------------
 
     async def get_account(self, account_id: str) -> dict | None:

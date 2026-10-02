@@ -341,6 +341,8 @@ class Database(
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
         self._system_actor: Actor | None = None
+        # Actor ID to the last display name upsert_external_actor() wrote.
+        self._external_actor_names: dict[str, str | None] = {}
         # The state-file modes connect() found after its repair. The identity
         # bootstrap reads this before it stores a signing secret in the
         # database (nerve.migrate._refuse_insecure_secret_storage).
@@ -513,6 +515,7 @@ class Database(
             await self._db.close()
             self._db = None
             self._system_actor = None
+            self._external_actor_names.clear()
 
     @property
     def db(self) -> aiosqlite.Connection:

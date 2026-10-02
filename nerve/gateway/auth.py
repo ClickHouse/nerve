@@ -2,21 +2,33 @@
 
 Signing uses the secret pinned at startup. Verified tokens are resolved against
 the database on every request; a valid signature alone is not an identity.
+
+The authentication mode is pinned at startup from ``NERVE_AUTH_MODE``. In
+``external`` mode, the gateway names the person behind a request in the
+``X-Nerve-Actor-Context`` header (see :func:`decode_actor_context`), and local
+logins and session tokens are not accepted.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
+import os
+import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, WebSocket
 
-from nerve.config import NerveConfig, get_config
+from nerve.config import ConfigError, NerveConfig, get_config
 from nerve.identity import (
+    ACTOR_KIND_HUMAN,
     Actor,
     ActorResolutionError,
     actor_for_account,
@@ -185,6 +197,84 @@ def effective_jwt_secret(config: NerveConfig | None = None) -> str:
     return cfg.auth.jwt_secret or ""
 
 
+# How this instance learns who makes a request. ``local``: local accounts and
+# session tokens. ``external``: the gateway names the person in the actor
+# context header. Only the environment sets the mode, and only at startup.
+AUTH_MODE_ENV = "NERVE_AUTH_MODE"
+AUTH_MODE_LOCAL = "local"
+AUTH_MODE_EXTERNAL = "external"
+AUTH_MODES = (AUTH_MODE_LOCAL, AUTH_MODE_EXTERNAL)
+
+
+def parse_auth_mode(value: str | None) -> str:
+    """Parse an authentication mode, and refuse a mode that does not exist.
+
+    Unset or blank is ``local``. An unknown value is an error and does not
+    fall back to ``local``: an operator who asks for one mode must not get a
+    different mode without notice.
+    """
+    if value is None:
+        return AUTH_MODE_LOCAL
+    text = str(value).strip().lower()
+    if not text:
+        return AUTH_MODE_LOCAL
+    if text in AUTH_MODES:
+        return text
+    accepted = ", ".join(repr(mode) for mode in AUTH_MODES)
+    raise ConfigError(
+        f"{AUTH_MODE_ENV} must be one of {accepted}, got {value!r}. "
+        f"Unset {AUTH_MODE_ENV} to run in local mode."
+    )
+
+
+def auth_mode_from_env() -> str:
+    """Read and parse ``NERVE_AUTH_MODE``."""
+    return parse_auth_mode(os.environ.get(AUTH_MODE_ENV))
+
+
+# Pinned once by create_app(). A configuration reload does not read it.
+_pinned_auth_mode: str | None = None
+
+
+def pin_auth_mode(mode: str) -> None:
+    """Pin the authentication mode for this process.
+
+    A second pin of the same mode has no effect. A different mode raises
+    :class:`ConfigError`, because the mode changes only with a restart.
+    """
+    global _pinned_auth_mode
+    if mode not in AUTH_MODES:
+        raise ValueError(f"unknown authentication mode {mode!r}")
+    if _pinned_auth_mode is not None and _pinned_auth_mode != mode:
+        raise ConfigError(
+            f"The authentication mode {_pinned_auth_mode!r} is already pinned for "
+            f"this process; {mode!r} was offered. Restart to change {AUTH_MODE_ENV}."
+        )
+    _pinned_auth_mode = mode
+
+
+def unpin_auth_mode() -> None:
+    """Clear the pinned authentication mode for tests."""
+    global _pinned_auth_mode
+    _pinned_auth_mode = None
+
+
+def auth_mode() -> str:
+    """Return the pinned mode, or the mode in the environment before startup.
+
+    CLI commands such as ``nerve init`` and ``nerve doctor`` do not start the
+    gateway, so they read the environment.
+    """
+    if _pinned_auth_mode is not None:
+        return _pinned_auth_mode
+    return auth_mode_from_env()
+
+
+def is_external_mode() -> bool:
+    """Whether the gateway names the person behind each request."""
+    return auth_mode() == AUTH_MODE_EXTERNAL
+
+
 def create_session_token(
     jwt_secret: str, account_id: str, expiry_hours: int | None = None,
 ) -> str:
@@ -333,14 +423,27 @@ def identity_store() -> "Database | None":
     return getattr(deps, "db", None)
 
 
+EXTERNAL_SESSION_DETAIL = (
+    "Session tokens are not accepted in external mode; the gateway names the "
+    "person behind each request"
+)
+
+
 async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
-    """Resolve verified token claims to their current actor."""
+    """Resolve verified token claims to their current actor.
+
+    In external mode, session tokens name no actor: only system and MCP
+    tokens are accepted, and they give the system actor.
+    """
     if claims.get("aud") == MCP_AUDIENCE:
         return store.system_actor
 
     token_type = claims.get(TOKEN_TYPE_CLAIM)
     if token_type == TOKEN_TYPE_SYSTEM:
         return store.system_actor
+    is_session = token_type == TOKEN_TYPE_SESSION or is_legacy_session_token(claims)
+    if is_session and is_external_mode():
+        raise ActorResolutionError(EXTERNAL_SESSION_DETAIL)
     if token_type == TOKEN_TYPE_SESSION:
         return await actor_for_account(store, claims.get("sub"))
     if is_legacy_session_token(claims):
@@ -349,11 +452,123 @@ async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     raise ActorResolutionError("This credential names no actor")
 
 
+# In external mode, the gateway sends the person behind a request in this
+# header, as a compact JWS.
+ACTOR_CONTEXT_HEADER = "X-Nerve-Actor-Context"
+
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*")
+
+
+class ActorContextError(ValueError):
+    """The actor context header cannot be read."""
+
+
+def decode_actor_context(value: str) -> tuple[str, str | None]:
+    """Return the principal ID and display name in an actor context header.
+
+    The value is a compact JWS. This function decodes the payload and does
+    not check the signature, so it trusts every caller that can reach Nerve.
+    External mode needs the gateway to be the only caller. Every reader of
+    the header calls this function.
+
+    The principal ID is returned as a canonical lower-case UUID string.
+    Raises :class:`ActorContextError` when the value cannot be read.
+    """
+    parts = value.split(".")
+    if len(parts) != 3:
+        raise ActorContextError("The actor context is not a compact JWS")
+    segment = parts[1]
+    if not _BASE64URL.fullmatch(segment):
+        raise ActorContextError("The actor context payload is not base64url")
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (binascii.Error, ValueError, RecursionError) as e:
+        # RecursionError: JSON that is nested too deeply to parse.
+        raise ActorContextError("The actor context payload is not base64url JSON") from e
+    if not isinstance(claims, dict):
+        raise ActorContextError("The actor context payload is not a JSON object")
+
+    principal = claims.get("principal_id")
+    if not isinstance(principal, str):
+        raise ActorContextError("The actor context names no principal")
+    try:
+        principal_id = str(UUID(principal))
+    except ValueError as e:
+        raise ActorContextError("The actor context principal is not a UUID") from e
+
+    profile = claims.get("profile")
+    if profile is None:
+        return principal_id, None
+    if not isinstance(profile, dict):
+        raise ActorContextError("The actor context profile is not a JSON object")
+    display_name = profile.get("display_name")
+    if display_name is None:
+        return principal_id, None
+    if not isinstance(display_name, str):
+        raise ActorContextError("The actor context display name is not a string")
+    try:
+        # JSON can carry a lone UTF-16 surrogate, which SQLite cannot store.
+        display_name.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ActorContextError("The actor context display name is not valid UTF-8") from e
+    return principal_id, display_name
+
+
+async def resolve_external_actor(store: "Database", values: list[str]) -> Actor:
+    """Resolve the actor context header of a request to a human actor.
+
+    ``values`` holds each actor context header of the request. A request
+    must have exactly one, so that no reader can take a different value.
+
+    Adds the ``actor_refs`` row on first sight and writes a changed display
+    name, before the request can write anything that refers to the actor.
+    The actor has no local account.
+    """
+    if len(values) != 1:
+        raise ActorResolutionError(
+            f"The request must have one {ACTOR_CONTEXT_HEADER} header, "
+            f"not {len(values)}"
+        )
+    try:
+        actor_id, display_name = decode_actor_context(values[0])
+    except ActorContextError as e:
+        raise ActorResolutionError(str(e)) from e
+    try:
+        await store.upsert_external_actor(actor_id, display_name)
+    except sqlite3.IntegrityError as e:
+        # A schema trigger refuses the system actor's ID.
+        raise ActorResolutionError(
+            "The actor context names an actor that cannot act as a person"
+        ) from e
+    return Actor(
+        actor_id=actor_id,
+        kind=ACTOR_KIND_HUMAN,
+        account_id=None,
+        display_name=display_name,
+    )
+
+
 async def require_auth(request: Request) -> Actor:
-    """Authenticate an HTTP request and return its request-local actor."""
+    """Authenticate an HTTP request and return its request-local actor.
+
+    In external mode, a request with the actor context header acts as the
+    person it names, and its tokens and cookies are ignored. A request
+    without the header can authenticate only with a system or MCP token.
+    """
     secret = effective_jwt_secret(get_config())
     if not secret:
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
+
+    external = is_external_mode()
+    contexts = request.headers.getlist(ACTOR_CONTEXT_HEADER) if external else []
+    if contexts:
+        store = identity_store()
+        if store is None:
+            raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
+        try:
+            return await resolve_external_actor(store, contexts)
+        except ActorResolutionError as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
 
     token = get_token_from_request(request)
     payload = decode_token(token, secret)
@@ -366,6 +581,10 @@ async def require_auth(request: Request) -> Actor:
     except ActorResolutionError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
 
+    if external:
+        # External mode accepts no session tokens, so it has none to refresh.
+        return actor
+
     # Middleware emits this without changing route response models.
     if is_legacy_session_token(payload) and actor.account_id:
         request.state.refreshed_token = create_session_token(secret, actor.account_id)
@@ -377,10 +596,26 @@ async def require_auth(request: Request) -> Actor:
 
 
 async def authenticate_websocket(websocket: WebSocket) -> Actor | None:
-    """Resolve a WebSocket actor when the connection is admitted."""
+    """Resolve a WebSocket actor when the connection is admitted.
+
+    In external mode, the gateway signs the upgrade request, so the actor
+    context header names the person, as for HTTP requests.
+    """
     secret = effective_jwt_secret(get_config())
     if not secret:
         return None  # fail closed, as require_auth does
+
+    if is_external_mode():
+        contexts = websocket.headers.getlist(ACTOR_CONTEXT_HEADER)
+        if contexts:
+            store = identity_store()
+            if store is None:
+                return None
+            try:
+                return await resolve_external_actor(store, contexts)
+            except ActorResolutionError as e:
+                logger.info("WebSocket refused: %s", e)
+                return None
 
     token = websocket.query_params.get("token") or websocket.cookies.get("nerve_token")
     if not token:

@@ -1740,6 +1740,29 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 | `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
 
+### Authentication mode
+
+The environment variable `NERVE_AUTH_MODE` sets how Nerve finds the person
+behind a request. It is not a configuration key. Nerve reads it once, when the
+server starts. A configuration reload does not change it; a restart does.
+
+| Value | Behavior |
+|---|---|
+| `local` | Default, also when the variable is unset or empty. Local accounts, login and session tokens. |
+| `external` | A gateway in front of Nerve names the person behind each request in the `X-Nerve-Actor-Context` header. Local login, account management and the setup page are not available. See [External mode](accounts.md#external-mode). |
+
+Any other value stops `nerve start`, `nerve restart` and the server with an
+error. `nerve restart` checks the value before it stops the running daemon.
+
+`nerve doctor` shows the mode that `NERVE_AUTH_MODE` sets in the shell that
+runs `nerve doctor`. It does not ask the running server, so the mode of a
+daemon that started with a different environment can be different.
+
+> **Warning:** In external mode, Nerve trusts the `X-Nerve-Actor-Context`
+> header and does not check its signature. A caller that can send a request to
+> Nerve can act as any person. Use external mode only when the gateway is the
+> only caller that can reach Nerve.
+
 ## API Keys (config.local.yaml)
 
 | Key | Type | Description |

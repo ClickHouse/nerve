@@ -27,8 +27,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
 
-# ``actor_refs.kind``. A human is a person with a local account; the system
-# principal is the identity used for the agent's autonomous work.
+# ``actor_refs.kind``. A human is a person: the owner of a local account, or,
+# in external mode, a person that the gateway names. The system principal is
+# the identity used for the agent's autonomous work.
 ACTOR_KIND_HUMAN = "human"
 ACTOR_KIND_SYSTEM = "system"
 ACTOR_KINDS = (ACTOR_KIND_HUMAN, ACTOR_KIND_SYSTEM)
@@ -45,7 +46,8 @@ class Actor:
     actor_id: str
     kind: str
     # The local login behind a human actor. ``None`` for the system principal,
-    # which has no account and cannot log in.
+    # which has no account and cannot log in, and for a person that the
+    # gateway names in external mode.
     account_id: str | None = None
     # Presentation snapshot, never an identity or authorization key.
     display_name: str | None = None

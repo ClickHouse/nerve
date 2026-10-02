@@ -288,7 +288,8 @@ def mount_deferred(
         # credentials are the agent acting on its own behalf, so they resolve
         # to the system principal; a person's own session token resolves to
         # them — and is refused here once their account is disabled, which a
-        # signature check alone would never notice.
+        # signature check alone would never notice. In external mode, every
+        # session token is refused here.
         store = identity_store()
         if store is None:
             await _send_status(send, 503, "MCP server is starting up")
