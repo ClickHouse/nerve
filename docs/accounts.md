@@ -134,11 +134,12 @@ and names the person behind each request. See
 The header is a compact JWS. Nerve reads `principal_id` and
 `profile.display_name` from its payload. It does not check the signature or
 any other claim. `principal_id` must be a UUID, and Nerve uses its lowercase
-form as the actor ID. A header that Nerve cannot read, or that names the system
-actor, gives `401`. When the header is present, Nerve does not read
-`Authorization`, the `nerve_token` cookie or `?token=`. The gateway also sends
-the header on the WebSocket upgrade request. The connection keeps the actor of
-that request until it closes.
+form as the actor ID. `profile.display_name` must be a string, `null`, or
+absent. A header that Nerve cannot read, a header that names the system actor,
+and a request with more than one header give `401`. When the header is
+present, Nerve does not read `Authorization`, the `nerve_token` cookie or
+`?token=`. The gateway also sends the header on the WebSocket upgrade request.
+The connection keeps the actor of that request until it closes.
 
 Nerve adds an `actor_refs` row of kind `human` when it sees a principal for the
 first time, and writes the display name again when it changes. The row has no

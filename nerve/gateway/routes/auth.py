@@ -197,7 +197,8 @@ async def _local_login_only() -> None:
     """Answer 404 in external mode, where the gateway signs people in.
 
     FastAPI runs this dependency before it validates the login fields, so a
-    request with missing or wrong fields also gets 404.
+    JSON body with missing or wrong fields also gets 404. A body that is not
+    valid JSON gets 422.
     """
     if is_external_mode():
         raise HTTPException(status_code=404, detail="Not Found")
