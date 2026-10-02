@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
 import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
 import { Button, IconButton, Select, TextField } from '../ui';
-import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
+import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
@@ -104,6 +104,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   }, [cancelDraftFlush, setDraft]);
   // Clear any pending draft write when the composer unmounts.
   useEffect(() => cancelDraftFlush, [cancelDraftFlush]);
+  // Re-entry leaves the page at once, so it writes the text without the delay.
+  useEffect(() => registerComposerFlush(() => {
+    cancelDraftFlush();
+    setDraft(activeSession, input);
+  }), [activeSession, input, cancelDraftFlush, setDraft]);
 
   // Backend selector renders only while the chat is virtual (unsent):
   // the choice binds at server-side session creation and is sticky.

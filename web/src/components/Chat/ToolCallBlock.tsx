@@ -3,7 +3,7 @@ import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2, 
 import { Button } from '../ui';
 import { getToolSummary } from '../../utils/toolSummary';
 import type { ToolCallBlockData } from '../../types/chat';
-import { getToken } from '../../api/client';
+import { authUrl } from '../../api/hosted';
 import { EditToolBlock } from './tools/EditToolBlock';
 import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
@@ -150,7 +150,7 @@ function SendFileBlock({ block }: { block: ToolCallBlockData }) {
   return (
     <div className="my-2">
       <a
-        href={`${downloadUrl}&token=${getToken()}`}
+        href={authUrl(downloadUrl)}
         download={filename}
         className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
       >

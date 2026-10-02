@@ -9,8 +9,9 @@ export type NavItem = {
    *  has, so NavRail and BottomNav can both render it as `<Icon size={n}/>`. */
   icon: Icon;
   label: string;
-  /** Hidden unless the named feature is enabled. */
-  feature?: 'ultracode';
+  /** Hidden unless the named feature is enabled. `accounts` is enabled in
+   *  local mode only: hosted Nerve has no local accounts. */
+  feature?: 'ultracode' | 'accounts';
 };
 
 export const NAV_ITEMS: NavItem[] = [
@@ -26,7 +27,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/sources', icon: Inbox, label: 'Sources' },
   { path: '/cron', icon: Clock, label: 'Cron' },
   { path: '/memory', icon: Brain, label: 'Memory' },
-  { path: '/accounts', icon: Users, label: 'Accounts' },
+  { path: '/accounts', icon: Users, label: 'Accounts', feature: 'accounts' },
   { path: '/diagnostics', icon: Activity, label: 'Diag' },
 ];
 
