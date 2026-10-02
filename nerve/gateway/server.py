@@ -67,6 +67,9 @@ _codex_thread_sync = None
 # lifespan once the config is loaded so the periodic sweep starts the
 # moment the gateway accepts traffic.
 _external_agents_sync = None
+# HostedChannelRuntime assigned during lifespan when a provider is in hosted
+# mode. The channel stream endpoint refuses every upgrade while it is None.
+_hosted_channels = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -303,7 +306,7 @@ async def _periodic_backup(notification_service) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _hosted_channels
     config = get_config()
     # Create the state directory owner-only before anything writes to it.
     # Database.connect refuses a state directory that other users can write to.
@@ -494,6 +497,21 @@ async def lifespan(app: FastAPI):
             # Slack is optional; its runtime leaves a failed candidate absent and
             # retryable while the web UI and other channels continue starting.
             logger.error("Slack bot failed to start: %s", e, exc_info=True)
+
+        # Hosted channels: a shared gateway holds the provider connections and
+        # streams admitted events to /_internal/channel/v1/stream. Optional like
+        # Slack: a failure leaves the endpoint refusing upgrades.
+        from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_providers
+
+        if hosted_providers(config):
+            try:
+                runtime = HostedChannelRuntime(config, _engine.router, get_config)
+                await runtime.start()
+                startup_cleanups.append(("hosted channels", runtime.stop))
+                _hosted_channels = runtime
+                _engine.register_channel_runtime("hosted", runtime)
+            except Exception as e:
+                logger.error("Hosted channels failed to start: %s", e, exc_info=True)
 
         # Start cron service
         global _cron_service
@@ -856,6 +874,12 @@ async def lifespan(app: FastAPI):
     # tasks. Background task cancellation propagates through anyio cancel
     # scopes (Starlette runs the lifespan in an anyio context), which can kill
     # the polling and socket tasks before we get a chance to stop them cleanly.
+    if _hosted_channels is not None:
+        try:
+            await _hosted_channels.stop()
+        except Exception as e:
+            logger.warning("Hosted channel shutdown raised: %s", e)
+        _hosted_channels = None
     if telegram_channel:
         await telegram_channel.stop()
     await slack_runtime.shutdown()
@@ -1208,6 +1232,31 @@ def create_app() -> FastAPI:
             if active_session is not None:
                 await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")
+
+    # Gateway channel streams. A separate endpoint from /ws with its own
+    # authentication: a gateway-signed token in the Authorization header,
+    # never the web session token, a cookie, or a query parameter.
+    from nerve.channels.hosted.manager import STREAM_PATH, refuse_upgrade
+
+    @app.websocket(STREAM_PATH)
+    async def channel_stream_endpoint(websocket: WebSocket):
+        runtime = _hosted_channels
+        if runtime is None:
+            await refuse_upgrade(websocket, 404)
+            return
+        await runtime.serve(websocket)
+
+    # Nothing under /_internal/ is a web UI route. Answer plain HTTP there with
+    # 404 before the SPA catch-all would serve index.html for it.
+    @app.api_route(
+        "/_internal/{path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def internal_not_found(path: str):
+        from fastapi.responses import Response
+
+        return Response(status_code=404)
 
     # Health check (no auth required) — must be before static mount
     @app.get("/health")

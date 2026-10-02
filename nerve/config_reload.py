@@ -43,6 +43,7 @@ _ERROR_PREFIX = "error: "
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
     "auth.jwt_secret",
+    "channels.hosted",
     "codex.home_dir",
     "external_agents.enabled",
     "gateway.host",
@@ -58,6 +59,7 @@ _RESTART_ONLY_PATHS = (
     "mcp_endpoint.path",
     "memory",
     "proxy",
+    "slack.mode",
     "sync.codex",
     "telegram.allowed_users",
     "telegram.bot_token",
@@ -260,6 +262,21 @@ async def _reconcile_slack(new_config, engine) -> str | None:
         return f"{_ERROR_PREFIX}{detail}"
 
 
+def _reload_hosted_keys(engine) -> str | None:
+    """Read the gateway key file of the running hosted channels again."""
+    if engine is None:
+        return None
+    try:
+        runtime = engine.get_channel_runtime("hosted")
+        if runtime is None:
+            return None
+        return runtime.reload_keys()
+    except Exception as e:  # noqa: BLE001 - report the subsystem and continue
+        detail = str(e) or type(e).__name__
+        logger.warning("Hosted channel key reload failed: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     """Re-read config and hot-reload all reloadable subsystems.
 
@@ -306,6 +323,9 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
         slack = await _reconcile_slack(new_config, engine)
         if slack is not None:
             summary["slack"] = slack
+        hosted = _reload_hosted_keys(engine)
+        if hosted is not None:
+            summary["hosted"] = hosted
 
     # 2. Cron jobs + sources.
     if cron_service is not None:

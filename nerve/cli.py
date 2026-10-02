@@ -1196,7 +1196,35 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Telegram disabled")
 
     # Check Slack
-    if config.slack.enabled:
+    if config.slack.mode == "hosted":
+        # A gateway holds the tokens, so there are none to check here. The
+        # settings are checked also when Slack is switched off, because the
+        # hosted channel is built at startup and a reload cannot repair it.
+        from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
+        if not config.slack.enabled:
+            lines.append(
+                "[--] Slack is hosted but switched off (slack.enabled is false); "
+                "events wait in the gateway inbox"
+            )
+        hosted = config.channels.hosted
+        problems = hosted.problems()
+        if not problems:
+            try:
+                keys = read_key_file(hosted.gateway_jwks_file)
+            except KeyFileError as error:
+                problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+        if problems:
+            errors.extend(
+                f"[ERR] Slack is hosted but {problem}" for problem in problems
+            )
+        else:
+            lines.append(
+                f"[OK] Slack hosted by the channel gateway: agent "
+                f"{hosted.agent_id}, {len(keys)} gateway key(s) from "
+                f"{hosted.gateway_jwks_file}"
+            )
+    elif config.slack.enabled:
         missing = [
             name for name, value in (
                 ("bot_token", config.slack.bot_token),

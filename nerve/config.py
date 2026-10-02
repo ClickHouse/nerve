@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1321,6 +1322,9 @@ SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
 # in a channel as well, for the unrelated reason that a slash payload carries
 # no thread to bind a session to — see ``_THREADED_CHANNEL_REFUSAL``.
 SLACK_HOST_COMMANDS: tuple[str, ...] = ("doctor", "restart")
+# How Slack traffic reaches this process: its own Socket Mode connection, or
+# streams from a shared channel gateway.
+SLACK_MODES: tuple[str, ...] = ("socket", "hosted")
 
 
 def _slack_commands(raw: object) -> list[str] | None:
@@ -1357,10 +1361,12 @@ def _slack_commands(raw: object) -> list[str] | None:
 
 @dataclass
 class SlackConfig:
-    """Slack Socket Mode and access settings.
+    """Slack transport and access settings.
 
     Direct messages require explicit opt-in. Sender and channel patterns match
     Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
+    In hosted mode the tokens and access lists are unused; the source grant
+    still decides what reaches the inbox.
     """
 
     # Off until the workspace is set up. Slack reaches an installation that
@@ -1390,6 +1396,11 @@ class SlackConfig:
     # Channels whose traffic feeds the inbox. Its own grant, not derived
     # from allow_channels — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # "socket": this process holds the tokens and a Socket Mode connection.
+    # "hosted": a shared channel gateway holds them and streams events here
+    # (see HostedChannelsConfig). The access lists above apply to socket
+    # mode only; in hosted mode the gateway admits each event.
+    mode: str = "socket"
 
     @classmethod
     @_coerced
@@ -1402,17 +1413,27 @@ class SlackConfig:
                 stream_mode,
             )
             stream_mode = "partial"
+        mode = str(d.get("mode") or "socket").strip().lower()
+        if mode not in SLACK_MODES:
+            logger.warning(
+                "slack.mode %r is not one of %s; falling back to 'socket'",
+                mode, SLACK_MODES,
+            )
+            mode = "socket"
         bot_token = d.get("bot_token", "")
         app_token = d.get("app_token", "")
-        # Explicit `enabled` wins. Otherwise both tokens enable Slack, except
-        # under lockdown where the machine-local opt-in is unavailable. Invalid
-        # boolean values fail closed.
+        # Explicit `enabled` wins. Otherwise hosted mode enables Slack, since
+        # naming the mode is an explicit opt-in that needs no token. In socket
+        # mode both tokens enable it, except under lockdown where the
+        # machine-local opt-in is unavailable. Invalid boolean values fail
+        # closed.
         enabled = (
             _as_bool(d["enabled"], False, label="SlackConfig.enabled")
             if "enabled" in d
-            else bool(bot_token and app_token) and not locked
+            else mode == "hosted" or (bool(bot_token and app_token) and not locked)
         )
         return cls(
+            mode=mode,
             enabled=enabled,
             bot_token=bot_token,
             app_token=app_token,
@@ -2403,14 +2424,83 @@ class NotificationsConfig:
         )
 
 
+HOSTED_CHANNEL_ISSUER = "nerve-gateway"
+HOSTED_CHANNEL_AUDIENCE = "nerve-channel"
+_HOSTED_MAX_STREAMS = 64
+
+
+@dataclass
+class HostedChannelsConfig:
+    """Streams from a shared channel gateway, for providers in hosted mode.
+
+    In hosted mode (``slack.mode: hosted``) Nerve holds no provider tokens.
+    Gateway replicas open streams to ``/_internal/channel/v1/stream`` on the
+    gateway port, and Nerve accepts a stream only with a token that the
+    gateway signs: a key from the local JWK Set file ``gateway_jwks_file``,
+    ``issuer`` and ``audience``, and exactly ``tenant_id`` and ``agent_id``.
+    ``max_streams`` bounds the streams open at one time; a gateway normally
+    holds one per replica.
+    """
+
+    gateway_jwks_file: Path | None = None
+    issuer: str = HOSTED_CHANNEL_ISSUER
+    audience: str = HOSTED_CHANNEL_AUDIENCE
+    tenant_id: str = ""
+    agent_id: str = ""
+    max_streams: int = 8
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> HostedChannelsConfig:
+        return cls(
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            issuer=str(d.get("issuer") or HOSTED_CHANNEL_ISSUER).strip(),
+            audience=str(d.get("audience") or HOSTED_CHANNEL_AUDIENCE).strip(),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            max_streams=d.get("max_streams", 8),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot authenticate a stream. Empty when they can.
+
+        The key file itself is read by the stream verifier and by ``nerve doctor``.
+        """
+        found: list[str] = []
+        if self.gateway_jwks_file is None:
+            found.append("channels.hosted.gateway_jwks_file must name the gateway's public key file")
+        elif not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("channels.hosted.gateway_jwks_file must be an absolute path")
+        if not self.issuer:
+            found.append("channels.hosted.issuer must not be empty")
+        if not self.audience:
+            found.append("channels.hosted.audience must not be empty")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"channels.hosted.{key} must be a lowercase UUID")
+        if not 1 <= self.max_streams <= _HOSTED_MAX_STREAMS:
+            found.append(
+                f"channels.hosted.max_streams must be from 1 to {_HOSTED_MAX_STREAMS}",
+            )
+        return found
+
+
 @dataclass
 class ChannelsConfig:
     """Global channel settings."""
 
+    hosted: HostedChannelsConfig = field(default_factory=HostedChannelsConfig)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> ChannelsConfig:
-        return cls()
+        return cls(hosted=HostedChannelsConfig.from_dict(d.get("hosted") or {}))
 
 
 @dataclass

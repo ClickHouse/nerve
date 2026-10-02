@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -281,6 +281,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1186,6 +1187,7 @@ deny-eligible, where a spoofable name can only subtract access.
 | `slack.deny_channels` | list[str] | `[]` | Blocked shared conversations |
 | `slack.stream_mode` | string | `partial` | `partial` (edit one message) or `full` |
 | `slack.commands` | list[str] | see below | Enabled `/nerve` subcommands |
+| `slack.mode` | string | `socket` | `socket` (this process holds the tokens) or `hosted` (a shared channel gateway holds them; see [Hosted mode](#hosted-mode)) |
 
 Put both tokens in `config.local.yaml`. Reloading can start or stop Slack, and
 same-workspace token changes reconnect with rollback on failure. Credentials
@@ -1194,7 +1196,79 @@ behavior apply to the next event.
 
 Slack runs when `enabled: true`. If the key is omitted, it runs only when both
 tokens are present; under lockdown, `enabled: true` is always required. An
-explicit `true` also makes `nerve doctor` report missing tokens.
+explicit `true` also makes `nerve doctor` report missing tokens. In hosted
+mode no token is needed, and `mode: hosted` alone turns Slack on.
+
+### Hosted mode
+
+In hosted mode a shared channel gateway holds the Slack connection, and this
+process needs no Slack token. Each gateway replica opens a WebSocket to
+`/_internal/channel/v1/stream` on the gateway port, and Nerve pulls the events
+that the gateway admitted from the gateway's inbox.
+
+```yaml
+slack:
+  mode: hosted
+channels:
+  hosted:
+    gateway_jwks_file: /etc/nerve/gateway-jwks.json
+    tenant_id: 6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04
+    agent_id: b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `channels.hosted.gateway_jwks_file` | absolute path | - | JWK Set file with the gateway's public P-256 keys |
+| `channels.hosted.issuer` | string | `nerve-gateway` | Required token issuer (`iss`) |
+| `channels.hosted.audience` | string | `nerve-channel` | Required token audience (`aud`) |
+| `channels.hosted.tenant_id` | UUID | - | This agent's tenant |
+| `channels.hosted.agent_id` | UUID | - | This agent |
+| `channels.hosted.max_streams` | int | `8` | Streams open at one time; more are refused with `503` |
+
+The gateway signs each stream token with a private key. Nerve verifies the
+token with the matching public key from `gateway_jwks_file` and never fetches
+keys over the network. The file must hold only public keys: a file with a
+private key member is refused. Nerve reads the file at startup and on each
+reload, and again, at most once per minute, when a token names an unknown
+`kid`. When a later read fails, the keys from the last good read stay in use.
+`nerve doctor` reads the file and reports a problem as an error. When the
+file is missing or unusable at startup, Nerve logs an error and the stream
+endpoint answers every upgrade with `404`. A reload cannot correct this:
+correct the file and restart Nerve.
+
+A stream opens only with one `Authorization: Bearer` header and no `Origin`
+header, which every browser sends. The token must be ES256 with a `kid` from
+the key file and have all of `iss`, `aud`, `sub`, `tenant_id`, `agent_id`,
+`iat`, `nbf`, `exp`, and `jti`. The issuer and audience must be the values
+above. `exp`, `nbf`, and `iat` must be valid now, with 60 seconds of clock
+skew, and the token may live at most 300 seconds (`exp - iat`). The subject,
+`tenant_id`, and `agent_id` must name this exact agent. Any other upgrade gets
+`401` with no detail. The token authorizes only the upgrade; an open stream
+outlives it. The web session token never opens a stream, and a stream token
+never reaches the web UI or the API.
+
+To rotate a key, add the new public key to the file on every agent host and
+reload, switch the gateway to the new key, then remove the old public key and
+reload again.
+
+The gateway admits each event, so `allow_users`, `allow_channels`, and
+`allow_direct_messages` do not apply. Nerve still checks that a channel message
+mentions the agent or continues a thread that has a session. `slack.source`
+still decides what reaches the inbox, but only a channel ID can grant: a
+channel or sender name comes from the event, so it can only deny.
+
+Nerve accepts events from every Slack connection that the gateway serves
+for this agent. For each conversation, Nerve records the connection of the
+latest accepted event.
+
+`slack.enabled: false` pauses hosted intake, at startup or after a reload.
+The stream endpoint still accepts streams, and events stay in the gateway's
+inbox until a reload sets `enabled` to `true`.
+
+Replies, notifications, reactions, and file transfers do not reach Slack in
+hosted mode yet. `slack.mode` and `channels.hosted.*` need a restart; a
+reload of running hosted channels reads the key file again. Changing
+`mode` from `socket` to `hosted` stops the Socket Mode connection at once.
 
 ### Setting up the Slack app
 

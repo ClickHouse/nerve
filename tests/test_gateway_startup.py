@@ -246,3 +246,41 @@ async def test_a_successful_startup_still_stops_everything_at_shutdown(harness):
     assert harness["proxy"].stops == 1
     assert harness["closed"] == ["db"]
     assert harness["engine"].shutdown.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, monkeypatch):
+    """Hosted channels that started are stopped when a later step fails."""
+    import nerve.channels.hosted.runtime as hosted_module
+
+    hosted = _Recorder()
+    monkeypatch.setattr(hosted_module, "hosted_providers", lambda cfg: ["slack"])
+    monkeypatch.setattr(hosted_module, "HostedChannelRuntime", lambda *a, **k: hosted)
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+    harness["engine"].resume_enrolled_sessions = MagicMock(
+        side_effect=RuntimeError("late failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="late failure"):
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    assert hosted.starts == 1 and hosted.stops == 1
+
+
+@pytest.mark.asyncio
+async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkeypatch):
+    """A reload can switch hosted Slack on only if its runtime exists."""
+    import nerve.channels.hosted.runtime as hosted_module
+
+    hosted = _Recorder()
+    monkeypatch.setattr(hosted_module, "HostedChannelRuntime", lambda *a, **k: hosted)
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+    harness["config"].slack.mode = "hosted"
+    harness["config"].slack.enabled = False
+
+    async with harness["server"].lifespan(MagicMock()):
+        assert hosted.starts == 1
+        assert harness["server"]._hosted_channels is hosted
+
+    assert hosted.stops == 1

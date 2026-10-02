@@ -92,8 +92,12 @@ class SlackRuntime:
                 ) from error
 
     async def _reconcile_locked(self, desired: NerveConfig) -> str | None:
-        """Move to *desired*, assuming the lifecycle lock is held."""
-        if not desired.slack.enabled:
+        """Move to *desired*, assuming the lifecycle lock is held.
+
+        Hosted mode is Socket Mode switched off: a gateway holds the
+        connection, and a second connection here would split Slack's events.
+        """
+        if not desired.slack.enabled or desired.slack.mode != "socket":
             if self._channel is None:
                 return None
             await self._stop_locked(drain=True)
