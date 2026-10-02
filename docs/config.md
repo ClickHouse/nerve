@@ -1751,8 +1751,12 @@ server starts. A configuration reload does not change it; a restart does.
 | `local` | Default, also when the variable is unset or empty. Local accounts, login and session tokens. |
 | `external` | A gateway in front of Nerve names the person behind each request in the `X-Nerve-Actor-Context` header. Local login, account management and the setup page are not available. See [External mode](accounts.md#external-mode). |
 
-Any other value stops `nerve start` and the server with an error. `nerve doctor`
-shows the mode.
+Any other value stops `nerve start`, `nerve restart` and the server with an
+error. `nerve restart` checks the value before it stops the running daemon.
+
+`nerve doctor` shows the mode that `NERVE_AUTH_MODE` sets in the shell that
+runs `nerve doctor`. It does not ask the running server, so the mode of a
+daemon that started with a different environment can be different.
 
 > **Warning:** In external mode, Nerve trusts the `X-Nerve-Actor-Context`
 > header and does not check its signature. A caller that can send a request to

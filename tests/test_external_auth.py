@@ -25,7 +25,8 @@ import pytest
 import pytest_asyncio
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.datastructures import Headers
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from nerve import paths
 from nerve.agent.engine import AgentEngine
@@ -44,6 +45,7 @@ from nerve.gateway.auth import (
     SESSION_TOKEN_HEADER,
     ActorContextError,
     auth_mode,
+    authenticate_websocket,
     create_external_mcp_token,
     create_mcp_session_token,
     create_session_token,
@@ -83,6 +85,17 @@ def _context(principal_id: object, display_name: str | None = None, **claims) ->
 
 def _as(principal_id: str, display_name: str | None = None) -> dict:
     return {ACTOR_CONTEXT_HEADER: _context(principal_id, display_name)}
+
+
+def _as_both(*people: tuple[str, str]) -> httpx.Headers:
+    """One actor context header for each person, in one request."""
+    return httpx.Headers([
+        (ACTOR_CONTEXT_HEADER, _context(pid, name)) for pid, name in people
+    ])
+
+
+# Valid JSON and a Python string, but SQLite cannot store a lone surrogate.
+_SURROGATE_NAME = _context(ALICE, profile={"display_name": "\ud800"})
 
 
 def _bearer(token: str) -> dict:
@@ -339,12 +352,14 @@ class TestDecodeActorContext:
             _context(ALICE[:-1]),
             _context(ALICE, profile="Alice"),
             _context(ALICE, profile={"display_name": 42}),
+            _SURROGATE_NAME,
         ],
         ids=[
             "empty", "one-part", "two-parts", "four-parts", "not-base64url",
             "not-json", "not-utf8", "nested-too-deep", "not-an-object",
             "no-principal", "number-principal",
             "name-principal", "short-uuid", "profile-not-object", "name-not-string",
+            "name-lone-surrogate",
         ],
     )
     def test_a_malformed_value_is_refused(self, value):
@@ -375,8 +390,12 @@ class TestHttpAuthentication:
         assert res.status_code == 401
 
     @pytest.mark.parametrize(
-        "value", ["", "abc", "a.b.c.d", _context("alice"), _context(42)],
-        ids=["empty", "one-part", "four-parts", "not-a-uuid", "number"],
+        "value",
+        ["", "abc", "a.b.c.d", _context("alice"), _context(42), _SURROGATE_NAME],
+        ids=[
+            "empty", "one-part", "four-parts", "not-a-uuid", "number",
+            "lone-surrogate-name",
+        ],
     )
     async def test_a_malformed_header_is_refused(self, install, value):
         async with _client(_whoami_app()) as client:
@@ -384,6 +403,29 @@ class TestHttpAuthentication:
                 "/api/whoami", headers={ACTOR_CONTEXT_HEADER: value},
             )
         assert res.status_code == 401
+        assert await install.humans() == []
+
+    async def test_a_lone_surrogate_in_the_name_is_refused_not_a_server_error(
+        self, install,
+    ):
+        async with _client(server.create_app()) as client:
+            res = await client.get(
+                "/api/auth/me", headers={ACTOR_CONTEXT_HEADER: _SURROGATE_NAME},
+            )
+        assert res.status_code == 401
+        assert "display name" in res.json()["detail"]
+        assert await install.humans() == []
+
+    @pytest.mark.parametrize(
+        "people",
+        [((ALICE, "Alice"), (BOB, "Bob")), ((ALICE, "Alice"), (ALICE, "Alice"))],
+        ids=["two-people", "the-same-person-twice"],
+    )
+    async def test_more_than_one_header_is_refused(self, install, people):
+        async with _client(_whoami_app()) as client:
+            res = await client.get("/api/whoami", headers=_as_both(*people))
+        assert res.status_code == 401
+        assert ACTOR_CONTEXT_HEADER in res.json()["detail"]
         assert await install.humans() == []
 
     async def test_an_upper_case_uuid_is_the_same_actor(self, install):
@@ -772,23 +814,24 @@ class _RecordingEngine:
         return None
 
 
-async def _open_external_db(db_path, config) -> Database:
+async def _open_bootstrapped_db(db_path, config) -> Database:
     database = Database(db_path)
     await database.connect()
     await bootstrap_identity(database, config)
     return database
 
 
-@pytest.fixture
-def ws_instance(tmp_path, external, wire_identity_store, monkeypatch):
-    """The real ``/ws`` endpoint of ``create_app()`` in external mode."""
+def _serve_ws(tmp_path, wire_identity_store, monkeypatch):
+    """The real ``/ws`` endpoint of ``create_app()``, in the mode in force."""
     config = _config(tmp_path)
     set_config(config)
     app = server.create_app()
     app.router.lifespan_context = _no_lifespan
     engine = _RecordingEngine()
     with TestClient(app) as client:
-        database = client.portal.call(_open_external_db, tmp_path / "nerve.db", config)
+        database = client.portal.call(
+            _open_bootstrapped_db, tmp_path / "nerve.db", config,
+        )
         wire_identity_store(database)
         monkeypatch.setattr(server, "_engine", engine, raising=False)
         try:
@@ -796,6 +839,18 @@ def ws_instance(tmp_path, external, wire_identity_store, monkeypatch):
         finally:
             client.portal.call(database.close)
     set_config(NerveConfig())
+
+
+@pytest.fixture
+def ws_instance(tmp_path, external, wire_identity_store, monkeypatch):
+    """``/ws`` in external mode."""
+    yield from _serve_ws(tmp_path, wire_identity_store, monkeypatch)
+
+
+@pytest.fixture
+def local_ws_instance(tmp_path, wire_identity_store, monkeypatch):
+    """``/ws`` in local mode."""
+    yield from _serve_ws(tmp_path, wire_identity_store, monkeypatch)
 
 
 def _wait_for(predicate, *, within: float = 5.0) -> None:
@@ -806,7 +861,9 @@ def _wait_for(predicate, *, within: float = 5.0) -> None:
         time.sleep(0.01)
 
 
-def _close_code(client: TestClient, url: str, headers: dict | None = None) -> int:
+def _close_code(
+    client: TestClient, url: str, headers: dict | httpx.Headers | None = None,
+) -> int:
     with pytest.raises(WebSocketDisconnect) as ei:
         with client.websocket_connect(url, headers=headers or {}) as socket:
             socket.receive_json()
@@ -856,6 +913,30 @@ class TestWebSocket:
         assert _close_code(
             client, "/ws", _as(ws_instance.db.system_actor_id, "Mallory"),
         ) == 4001
+        assert _close_code(
+            client, "/ws", {ACTOR_CONTEXT_HEADER: _SURROGATE_NAME},
+        ) == 4001
+        # The test client joins repeated headers into one value with a comma,
+        # as some proxies do. TestWebSocketHeaders sends them separately.
+        assert _close_code(
+            client, "/ws", _as_both((ALICE, "Alice"), (BOB, "Bob")),
+        ) == 4001
+        assert _close_code(
+            client, "/ws", _as_both((ALICE, "Alice"), (ALICE, "Alice")),
+        ) == 4001
+        assert server._live_sockets == {}
+        humans = client.portal.call(
+            functools.partial(ws_instance.db.list_actor_refs, kind="human"),
+        )
+        assert ALICE not in {row["id"] for row in humans}
+        assert BOB not in {row["id"] for row in humans}
+
+    def test_the_header_alone_is_refused_in_local_mode(self, local_ws_instance):
+        """In local mode, ``/ws`` does not read the header at all."""
+        client, database = local_ws_instance.client, local_ws_instance.db
+        assert _close_code(client, "/ws", _as(ALICE, "Alice")) == 4001
+        assert client.portal.call(database.get_actor_ref, ALICE) is None
+        assert local_ws_instance.engine.session_actors == []
 
     def test_a_system_token_is_still_admitted(self, ws_instance):
         token = create_system_token(_SECRET)
@@ -865,11 +946,49 @@ class TestWebSocket:
             assert connection.actor.is_system
 
 
+def _upgrade_request(*values: str) -> WebSocket:
+    """A WebSocket upgrade request with one header entry for each value."""
+    scope = {
+        "type": "websocket",
+        "path": "/ws",
+        "query_string": b"",
+        "headers": [(ACTOR_CONTEXT_HEADER.lower().encode(), v.encode()) for v in values],
+    }
+
+    async def _receive():
+        return {"type": "websocket.disconnect", "code": 1000}
+
+    async def _send(_message):
+        return None
+
+    return WebSocket(scope, _receive, _send)
+
+
+@pytest.mark.asyncio
+class TestWebSocketHeaders:
+    async def test_one_header_names_the_person(self, install):
+        actor = await authenticate_websocket(_upgrade_request(_context(ALICE, "Alice")))
+        assert actor == Actor(
+            actor_id=ALICE, kind="human", account_id=None, display_name="Alice",
+        )
+
+    @pytest.mark.parametrize(
+        "people",
+        [((ALICE, "Alice"), (BOB, "Bob")), ((ALICE, "Alice"), (ALICE, "Alice"))],
+        ids=["two-people", "the-same-person-twice"],
+    )
+    async def test_more_than_one_header_refuses_the_socket(self, install, people):
+        request = _upgrade_request(*(_context(pid, name) for pid, name in people))
+        assert len(request.headers.getlist(ACTOR_CONTEXT_HEADER)) == 2
+        assert await authenticate_websocket(request) is None
+        assert await install.humans() == []
+
+
 class _Socket:
     """The parts of a WebSocket that the ``/ws`` handler touches."""
 
     def __init__(self, headers: dict, frames: list[dict]):
-        self.headers = headers
+        self.headers = Headers(headers=headers)
         self.query_params = {}
         self.cookies = {}
         self.sent: list[dict] = []
@@ -1014,18 +1133,25 @@ class TestStartup:
         import nerve.proxy.service as proxy_module
         from nerve import setup_token
 
-        database = Database(paths.db_path())
-        await database.connect()
-        try:
-            assert await setup_token.ensure_setup_token(database, unclaimed=True)
-        finally:
-            await database.close()
-
         config = NerveConfig()
         config.workspace = tmp_path / "ws"
         config.workspace.mkdir()
         config.proxy.enabled = True
         config.mcp_endpoint.enabled = False
+
+        # A local install with unclaimed setup: one account without a
+        # password, and a setup token. Local mode keeps that token.
+        database = Database(paths.db_path())
+        await database.connect()
+        try:
+            assert (
+                await database._bootstrap_first_account(credential_source="none")
+            ).created
+            assert await setup_token.instance_is_unclaimed(database, config)
+            assert await setup_token.ensure_setup_token(database, unclaimed=True)
+        finally:
+            await database.close()
+
         set_config(config)
         try:
             monkeypatch.setenv(AUTH_MODE_ENV, "external")
@@ -1037,7 +1163,8 @@ class TestStartup:
         finally:
             set_config(NerveConfig())
 
-        assert inspect_bootstrap_state(paths.db_path()) == ([], True)
+        # The account is left as it is, and no new one is made.
+        assert inspect_bootstrap_state(paths.db_path()) == (["none"], True)
         assert read_instance_secret(paths.db_path(), setup_token.SETUP_TOKEN_NAME) == ""
 
     def test_nerve_start_refuses_an_unknown_mode(self, tmp_path, monkeypatch):
@@ -1055,6 +1182,32 @@ class TestStartup:
         result = CliRunner().invoke(cli.main, ["-c", str(tmp_path / "cfg"), "start"])
         assert result.exit_code == 1
         assert f"{AUTH_MODE_ENV} must be one of" in result.output
+
+    @pytest.mark.parametrize("resume", [[], ["--resume", "sess-1"]], ids=["plain", "resume"])
+    def test_nerve_restart_refuses_an_unknown_mode_and_keeps_the_daemon(
+        self, tmp_path, monkeypatch, resume,
+    ):
+        """The command stops before it stops the running daemon."""
+        from click.testing import CliRunner
+
+        from nerve import cli
+
+        TestDoctor._config(tmp_path)
+
+        def _must_not_run(*_args, **_kwargs):
+            pytest.fail("restart must stop before it touches the daemon")
+
+        for name in ("_get_daemon_status", "_is_docker_mode", "_is_systemd_managed"):
+            monkeypatch.setattr(cli, name, _must_not_run)
+        monkeypatch.setattr(cli.os, "kill", _must_not_run)
+        monkeypatch.setattr(cli.subprocess, "Popen", _must_not_run)
+        monkeypatch.setenv(AUTH_MODE_ENV, "hosted")
+        result = CliRunner().invoke(
+            cli.main, ["-c", str(tmp_path / "cfg"), "restart", *resume],
+        )
+        assert result.exit_code == 1
+        assert f"{AUTH_MODE_ENV} must be one of" in result.output
+        assert not cli.RESUME_QUEUE_FILE.exists()
 
 
 class TestDoctor:
@@ -1078,15 +1231,21 @@ class TestDoctor:
         await database.close()
         config = self._config(tmp_path)
 
-        assert "No local account" in doctor_report(config)
+        local = doctor_report(config)
+        assert "No local account" in local
+        assert f"[OK] Auth mode: local (from {AUTH_MODE_ENV} in this shell" in local
+
         monkeypatch.setenv(AUTH_MODE_ENV, "external")
         report = doctor_report(config)
         assert "No local account" not in report
-        assert "Auth mode: external" in report
+        assert f"[OK] Auth mode: external (from {AUTH_MODE_ENV} in this shell" in report
+        assert "not from the running server" in report
 
     def test_an_unknown_mode_is_an_error(self, tmp_path, monkeypatch):
         from nerve.cli import doctor_report
 
         monkeypatch.setenv(AUTH_MODE_ENV, "hosted")
         report = doctor_report(self._config(tmp_path))
-        assert f"[ERR] {AUTH_MODE_ENV} must be one of" in report
+        assert "[ERR] Auth mode" in report
+        assert f"{AUTH_MODE_ENV} must be one of" in report
+        assert "[OK] Auth mode" not in report

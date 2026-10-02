@@ -502,20 +502,35 @@ def decode_actor_context(value: str) -> tuple[str, str | None]:
     if not isinstance(profile, dict):
         raise ActorContextError("The actor context profile is not a JSON object")
     display_name = profile.get("display_name")
-    if display_name is not None and not isinstance(display_name, str):
+    if display_name is None:
+        return principal_id, None
+    if not isinstance(display_name, str):
         raise ActorContextError("The actor context display name is not a string")
+    try:
+        # JSON can carry a lone UTF-16 surrogate, which SQLite cannot store.
+        display_name.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ActorContextError("The actor context display name is not valid UTF-8") from e
     return principal_id, display_name
 
 
-async def resolve_external_actor(store: "Database", value: str) -> Actor:
-    """Resolve an actor context header to a human actor.
+async def resolve_external_actor(store: "Database", values: list[str]) -> Actor:
+    """Resolve the actor context header of a request to a human actor.
+
+    ``values`` holds each actor context header of the request. A request
+    must have exactly one, so that no reader can take a different value.
 
     Adds the ``actor_refs`` row on first sight and writes a changed display
     name, before the request can write anything that refers to the actor.
     The actor has no local account.
     """
+    if len(values) != 1:
+        raise ActorResolutionError(
+            f"The request must have one {ACTOR_CONTEXT_HEADER} header, "
+            f"not {len(values)}"
+        )
     try:
-        actor_id, display_name = decode_actor_context(value)
+        actor_id, display_name = decode_actor_context(values[0])
     except ActorContextError as e:
         raise ActorResolutionError(str(e)) from e
     try:
@@ -545,13 +560,13 @@ async def require_auth(request: Request) -> Actor:
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
 
     external = is_external_mode()
-    context = request.headers.get(ACTOR_CONTEXT_HEADER) if external else None
-    if context is not None:
+    contexts = request.headers.getlist(ACTOR_CONTEXT_HEADER) if external else []
+    if contexts:
         store = identity_store()
         if store is None:
             raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
         try:
-            return await resolve_external_actor(store, context)
+            return await resolve_external_actor(store, contexts)
         except ActorResolutionError as e:
             raise HTTPException(status_code=401, detail=str(e)) from e
 
@@ -591,13 +606,13 @@ async def authenticate_websocket(websocket: WebSocket) -> Actor | None:
         return None  # fail closed, as require_auth does
 
     if is_external_mode():
-        context = websocket.headers.get(ACTOR_CONTEXT_HEADER)
-        if context is not None:
+        contexts = websocket.headers.getlist(ACTOR_CONTEXT_HEADER)
+        if contexts:
             store = identity_store()
             if store is None:
                 return None
             try:
-                return await resolve_external_actor(store, context)
+                return await resolve_external_actor(store, contexts)
             except ActorResolutionError as e:
                 logger.info("WebSocket refused: %s", e)
                 return None
