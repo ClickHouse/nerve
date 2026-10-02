@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  ApiError, authUrl, csrfHeaders, hostedLogout, isHosted, loginUrl, probeSession,
-  problemOf, reenter, reportError, setAuthMode, setBeforeReenter, setTokenReader,
-  showProblem, useHostedStore,
+  ApiError, authUrl, csrfHeaders, handleHostedError, hostedLogout, isHosted, loginUrl,
+  probeSession, problemOf, reenter, reportError, setAuthMode, setBeforeReenter,
+  setTokenReader, showProblem, useHostedStore,
 } from './hosted';
 
 let assign: ReturnType<typeof vi.fn>;
@@ -99,18 +99,30 @@ describe('ApiError', () => {
   it('has no reason for a body that is not a gateway error', () => {
     expect(new ApiError(500, 'Internal Server Error').reason).toBeNull();
     expect(new ApiError(404, '{"detail":"Not Found"}').reason).toBeNull();
-    expect(new ApiError(400, '{"reason":7}').reason).toBeNull();
+    expect(new ApiError(400, '{"reason":7,"requestId":"r-1"}').reason).toBeNull();
+    // Nerve error details, also with a reason, are not a gateway body.
+    expect(new ApiError(409, '{"detail":{"reason":"refused"}}').reason).toBeNull();
+    expect(new ApiError(409, '{"reason":"refused"}').reason).toBeNull();
   });
 });
 
 describe('problemOf', () => {
-  it('maps the gateway answers that stop or pause the app', () => {
+  it('maps the gateway answers that stop the app', () => {
     expect(problemOf(403, 'access_denied')).toBe('access_denied');
     expect(problemOf(410, 'agent_archived')).toBe('agent_archived');
     expect(problemOf(503, 'agent_archived')).toBe('agent_archived');
-    expect(problemOf(503, 'unavailable')).toBe('unavailable');
-    expect(problemOf(503, 'backend_unavailable')).toBe('unavailable');
-    expect(problemOf(502, 'backend_unavailable')).toBe('unavailable');
+  });
+
+  it.each([
+    [503, 'unavailable'],
+    [503, 'backend_unavailable'],
+    [502, 'backend_unavailable'],
+    [503, 'agent_starting'],
+    [503, 'agent_paused'],
+    [503, 'agent_unavailable'],
+    [504, 'backend_timeout'],
+  ])('maps %i %s to the unavailable screen', (status, reason) => {
+    expect(problemOf(status, reason)).toBe('unavailable');
   });
 
   it('ignores every other answer', () => {
@@ -119,12 +131,16 @@ describe('problemOf', () => {
     expect(problemOf(404, 'unknown_agent')).toBeNull();
     expect(problemOf(500, null)).toBeNull();
     expect(problemOf(503, null)).toBeNull();
+    expect(problemOf(502, 'backend_invalid_response')).toBeNull();
+    // A known reason with another status is not that answer.
+    expect(problemOf(500, 'agent_starting')).toBeNull();
+    expect(problemOf(503, 'backend_timeout')).toBeNull();
   });
 });
 
 describe('showProblem', () => {
   it('does not let a temporary problem replace one that stops the app', () => {
-    reportError(new ApiError(403, '{"reason":"access_denied"}'));
+    showProblem('access_denied');
     showProblem('unavailable');
 
     expect(useHostedStore.getState().problem).toBe('access_denied');
@@ -235,6 +251,78 @@ describe('probeSession', () => {
     await expect(probeSession()).resolves.toBe(true);
 
     expect(assign).not.toHaveBeenCalled();
+  });
+});
+
+describe('reportError and handleHostedError', () => {
+  /** A gateway error body. */
+  const gateway = (reason: string) => JSON.stringify({ reason, requestId: 'r-1' });
+
+  beforeEach(() => setAuthMode('external'));
+
+  it('signs in again at once on a gateway 401', async () => {
+    await reportError(new ApiError(401, gateway('login_required')));
+
+    expect(assign).toHaveBeenCalledWith('/_nerve/login?return_to=%2Fchat%2Fs1%3Fq%3D1');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('checks the session, and does not sign in, on a 401 from Nerve', async () => {
+    fetchMock.mockResolvedValue(reply(200, { authenticated: true }));
+
+    await reportError(new ApiError(401, '{"detail":"Invalid actor context"}'));
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/_nerve/session');
+    expect(assign).not.toHaveBeenCalled();
+    expect(useHostedStore.getState().problem).toBe('unavailable');
+  });
+
+  it('signs in again when the session check after a 401 from Nerve gets 401', async () => {
+    fetchMock.mockResolvedValue(reply(401, { reason: 'login_required', requestId: 'r-2' }));
+
+    await reportError(new ApiError(401, '{"detail":"Not authenticated"}'));
+
+    expect(assign).toHaveBeenCalledOnce();
+  });
+
+  it.each([[403, 'access_denied'], [410, 'agent_archived']] as const)(
+    'shows the screen when the session check after a 401 from Nerve gets %i',
+    async (status, problem) => {
+      fetchMock.mockResolvedValue(reply(status, {}));
+
+      await reportError(new ApiError(401, '{"detail":"Not authenticated"}'));
+
+      expect(useHostedStore.getState().problem).toBe(problem);
+      expect(assign).not.toHaveBeenCalled();
+    });
+
+  it('runs one session check for 401s from Nerve at the same time', async () => {
+    fetchMock.mockResolvedValue(reply(200, {}));
+
+    await Promise.all([
+      reportError(new ApiError(401, '{"detail":"a"}')),
+      reportError(new ApiError(401, '{"detail":"b"}')),
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('sets external mode for a gateway error body in local mode', () => {
+    setAuthMode('local');
+
+    expect(handleHostedError(new ApiError(503, gateway('agent_starting')))).toBe(true);
+
+    expect(isHosted()).toBe(true);
+    expect(useHostedStore.getState().problem).toBe('unavailable');
+  });
+
+  it('leaves a local error without a gateway body to the caller', () => {
+    setAuthMode('local');
+
+    expect(handleHostedError(new ApiError(503, '{"detail":"busy"}'))).toBe(false);
+
+    expect(isHosted()).toBe(false);
+    expect(useHostedStore.getState().problem).toBeNull();
   });
 });
 

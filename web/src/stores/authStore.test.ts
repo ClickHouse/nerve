@@ -18,7 +18,7 @@ vi.mock('./helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 
 const client = await import('../api/client');
 const { useAuthStore, selfActorId } = await import('./authStore');
-const { useHostedStore } = await import('../api/hosted');
+const { ApiError, handleHostedError, useHostedStore } = await import('../api/hosted');
 
 const api = client.api as unknown as {
   login: ReturnType<typeof vi.fn>;
@@ -422,6 +422,46 @@ describe('hosted mode', () => {
 
     expect(useAuthStore.getState().ready).toBe(true);
     expect(useHostedStore.getState().problem).toBeNull();
+  });
+
+  /** A status call that fails the way `api/client` fails it for this body. */
+  function statusFails(status: number, body: string) {
+    api.authStatus.mockImplementation(async () => {
+      const error = new ApiError(status, body);
+      handleHostedError(error);
+      throw error;
+    });
+  }
+
+  it('opens hosted mode when the status call fails with a gateway error body', async () => {
+    statusFails(503, '{"reason":"agent_starting","requestId":"r-1"}');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'external', problem: 'unavailable' });
+    // The status answer already gives the reason.
+    expect(api.getViewer).not.toHaveBeenCalled();
+    expect(api.login).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({ authenticated: false, ready: true });
+  });
+
+  it('shows the stop screen when the status call fails with access_denied', async () => {
+    statusFails(403, '{"reason":"access_denied","requestId":"r-1"}');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'external', problem: 'access_denied' });
+  });
+
+  it('keeps the local path when the status call fails without a gateway body', async () => {
+    statusFails(502, '<html>Bad Gateway</html>');
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(useHostedStore.getState()).toMatchObject({ mode: 'local', problem: null });
+    expect(useAuthStore.getState()).toMatchObject({
+      authenticated: false, ready: true, loginMode: 'username_password',
+    });
   });
 
   it('keeps the local behavior for an unknown mode', async () => {

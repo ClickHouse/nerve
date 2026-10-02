@@ -135,12 +135,53 @@ describe('local requests', () => {
     expect((error as InstanceType<typeof ApiError>).status).toBe(404);
   });
 
-  it('show no gateway screen for a gateway-shaped error', async () => {
-    fetchMock.mockResolvedValue(gatewayError(403, 'access_denied'));
+  it('keep the local handling for an error without a gateway body', async () => {
+    fetchMock.mockResolvedValue(
+      new Response('{"detail":{"reason":"refused"}}', { status: 409 }),
+    );
 
-    await expect(api.getSession('s1')).rejects.toThrow('403: ');
+    await expect(api.getSession('s1')).rejects.toThrow('409: ');
 
+    expect(useHostedStore.getState().mode).toBe('local');
     expect(useHostedStore.getState().problem).toBeNull();
+  });
+});
+
+describe('a gateway error body in local mode', () => {
+  let assign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    setBeforeReenter(null);
+    assign = vi.fn();
+    vi.stubGlobal('location', {
+      ...window.location, pathname: '/', search: '', assign,
+    });
+  });
+
+  afterEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+  });
+
+  it('sets hosted mode and shows the screen when the status call fails', async () => {
+    fetchMock.mockResolvedValue(gatewayError(503, 'agent_starting'));
+
+    await expect(api.authStatus()).rejects.toThrow('503: ');
+
+    expect(useHostedStore.getState().mode).toBe('external');
+    expect(useHostedStore.getState().problem).toBe('unavailable');
+  });
+
+  it('signs in through the gateway on a gateway 401, not through the local login', async () => {
+    setToken('session-one');
+    fetchMock.mockResolvedValue(gatewayError(401, 'login_required'));
+
+    await expect(api.authStatus()).rejects.toThrow('401: ');
+
+    expect(useHostedStore.getState().mode).toBe('external');
+    expect(assign).toHaveBeenCalledWith('/_nerve/login?return_to=%2F');
+    expect(unauthorized).not.toHaveBeenCalled();
+    expect(getToken()).toBe('session-one');
   });
 });
 
@@ -204,6 +245,48 @@ describe('hosted requests', () => {
     expect(init.headers).toEqual({ 'X-Nerve-CSRF': '1' });
   });
 
+  it('do not sign in again on a 401 from Nerve while the gateway session is valid', async () => {
+    // Nerve refuses the request, for example for an actor header that it
+    // cannot read. A login would come back to the same 401.
+    fetchMock.mockImplementation(async (url: string) => (
+      url === '/_nerve/session'
+        ? new Response('{"authenticated":true}', { status: 200 })
+        : new Response('{"detail":"Invalid actor context"}', { status: 401 })
+    ));
+
+    await expect(api.listSessions()).rejects.toThrow('401: ');
+    await vi.waitFor(() => expect(useHostedStore.getState().problem).toBe('unavailable'));
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(['/api/sessions?offset=0', '/_nerve/session']);
+    expect(assign).not.toHaveBeenCalled();
+    expect(useHostedStore.getState().reentering).toBe(false);
+  });
+
+  it('apply the same rule to a 401 from Nerve on an upload', async () => {
+    fetchMock.mockImplementation(async (url: string) => (
+      url === '/_nerve/session'
+        ? new Response('{"authenticated":true}', { status: 200 })
+        : new Response('{"detail":"Invalid actor context"}', { status: 401 })
+    ));
+
+    await expect(api.uploadFiles([new File(['x'], 'a.txt')], 's1')).rejects.toThrow('401: ');
+    await vi.waitFor(() => expect(useHostedStore.getState().problem).toBe('unavailable'));
+
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it('sign in again after a 401 from Nerve when the gateway session is gone', async () => {
+    fetchMock.mockImplementation(async (url: string) => (
+      url === '/_nerve/session'
+        ? gatewayError(401, 'login_required')
+        : new Response('{"detail":"Not authenticated"}', { status: 401 })
+    ));
+
+    await expect(api.listSessions()).rejects.toThrow('401: ');
+
+    await vi.waitFor(() => expect(assign).toHaveBeenCalledWith('/_nerve/login?return_to=%2Fchat%2Fs1'));
+  });
+
   it('keep the drafts and sign in again through the gateway on 401', async () => {
     const keep = vi.fn();
     setBeforeReenter(keep);
@@ -219,6 +302,15 @@ describe('hosted requests', () => {
     // The local expiry path does not run.
     expect(unauthorized).not.toHaveBeenCalled();
     expect(getToken()).toBe('stale');
+  });
+
+  it('sign in again at once on a gateway 401 to an upload', async () => {
+    fetchMock.mockResolvedValue(gatewayError(401, 'login_required'));
+
+    await expect(api.uploadFiles([new File(['x'], 'a.txt')], 's1')).rejects.toThrow('401: ');
+
+    expect(assign).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it('show the no-access screen on 403 access_denied, without a login', async () => {
@@ -258,12 +350,14 @@ describe('hosted requests', () => {
     expect(useHostedStore.getState().problem).toBe('agent_archived');
   });
 
-  it.each(['unavailable', 'backend_unavailable'])(
-    'show the unavailable screen on 503 %s', async (reason) => {
-      fetchMock.mockResolvedValue(gatewayError(503, reason));
+  it.each([
+    [503, 'unavailable'], [503, 'backend_unavailable'], [503, 'agent_starting'],
+    [503, 'agent_paused'], [503, 'agent_unavailable'], [504, 'backend_timeout'],
+  ])('show the unavailable screen on %i %s', async (status, reason) => {
+    fetchMock.mockResolvedValue(gatewayError(status, reason));
 
-      await expect(api.listSessions()).rejects.toThrow('503: ');
+    await expect(api.listSessions()).rejects.toThrow(`${status}: `);
 
-      expect(useHostedStore.getState().problem).toBe('unavailable');
-    });
+    expect(useHostedStore.getState().problem).toBe('unavailable');
+  });
 });

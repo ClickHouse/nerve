@@ -50,7 +50,9 @@ vi.mock('./components/Notifications/NotificationToast', () => ({
 }));
 
 import { api, getToken } from './api/client';
-import { ApiError, reportError, showProblem, useHostedStore } from './api/hosted';
+import {
+  ApiError, handleHostedError, reportError, showProblem, useHostedStore,
+} from './api/hosted';
 import { ws } from './api/websocket';
 import App from './App';
 import { useAuthStore } from './stores/authStore';
@@ -319,7 +321,7 @@ describe('hosted startup', () => {
 
   it('shows the no-access screen, and not the app or a login', async () => {
     getViewer.mockImplementation(async () => {
-      const error = new ApiError(403, '{"reason":"access_denied"}');
+      const error = new ApiError(403, '{"reason":"access_denied","requestId":"r-1"}');
       reportError(error);
       throw error;
     });
@@ -391,5 +393,57 @@ describe('hosted startup', () => {
     act(() => useAuthStore.setState({ sessionExpired: true }));
 
     expect(screen.queryByRole('dialog', { name: 'Session expired' })).not.toBeInTheDocument();
+  });
+});
+
+describe('startup when the status call fails behind the gateway', () => {
+  /** A status call that fails the way `api/client` fails it for this body. */
+  function statusFailsOnce(status: number, body: string) {
+    authStatus.mockImplementationOnce(async () => {
+      const error = new ApiError(status, body);
+      handleHostedError(error);
+      throw error;
+    });
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    authStatus.mockResolvedValue(status({ mode: 'external' }));
+    getViewer.mockResolvedValue({
+      actor: { id: 'principal-1', kind: 'human', display_name: 'Carol', username: null },
+      account: null,
+    });
+  });
+
+  it('shows the unavailable screen with a retry, and no login page', async () => {
+    statusFailsOnce(503, '{"reason":"agent_starting","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'Agent unavailable' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('shows the no-access screen for access_denied', async () => {
+    statusFailsOnce(403, '{"reason":"access_denied","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'No access' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+  });
+
+  it('shows the login page for a failure without a gateway body', async () => {
+    // The login page reads the status again, so every read fails.
+    authStatus.mockRejectedValue(new ApiError(502, '<html>Bad Gateway</html>'));
+
+    renderApp();
+
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(useHostedStore.getState().mode).toBe('local');
   });
 });

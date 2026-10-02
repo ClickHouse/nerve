@@ -1,5 +1,5 @@
 import {
-  ApiError, csrfHeaders, isHosted, reenter, reportError, setTokenReader,
+  ApiError, csrfHeaders, handleHostedError, isHosted, setTokenReader,
   type AuthMode,
 } from './hosted';
 
@@ -379,9 +379,9 @@ function handleUnauthorized(requestRevision: number): Error {
  * Local mode sends the session token as a bearer and adopts a slid token.
  * Hosted mode sends no bearer, because the gateway treats every bearer as an
  * API token, and the cookie of the gateway session goes with the request. An
- * unsafe method gets the CSRF header that the gateway requires. A 401 signs in
- * again through the gateway, and a gateway error with a known reason shows its
- * screen (see `problemOf`).
+ * unsafe method gets the CSRF header that the gateway requires. A failed
+ * response goes to `handleHostedError`, which also sets hosted mode when the
+ * body is a gateway error.
  */
 async function send(
   path: string, init: RequestInit, headers: Record<string, string>,
@@ -396,20 +396,16 @@ async function send(
 
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
 
-  if (res.status === 401) {
-    if (!hosted) throw handleUnauthorized(requestRevision);
-    reenter();
-    throw new ApiError(res.status, await res.text());
+  if (res.ok) {
+    if (!hosted) absorbRefreshedToken(res, requestRevision);
+    return res;
   }
 
-  if (!hosted) absorbRefreshedToken(res, requestRevision);
-
-  if (!res.ok) {
-    const error = new ApiError(res.status, await res.text());
-    if (hosted) reportError(error);
-    throw error;
-  }
-  return res;
+  const error = new ApiError(res.status, await res.text());
+  if (handleHostedError(error)) throw error;
+  if (res.status === 401) throw handleUnauthorized(requestRevision);
+  absorbRefreshedToken(res, requestRevision);
+  throw error;
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {

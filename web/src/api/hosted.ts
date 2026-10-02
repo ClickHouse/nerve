@@ -82,8 +82,10 @@ export function authUrl(url: string): string {
 
 /**
  * A response that is not OK. The message is `"<status>: <body>"`, which
- * `errorDetail` parses. `reason` is the reason code of a gateway error body
- * (`{"reason": "..."}`), and `null` for every other body.
+ * `errorDetail` parses. `reason` is the reason code of a gateway error body,
+ * and `null` for every other body. Only the gateway writes a body with both
+ * a string `reason` and a string `requestId`. Nerve puts its own error
+ * details below `detail`.
  */
 export class ApiError extends Error {
   readonly status: number;
@@ -92,15 +94,15 @@ export class ApiError extends Error {
   constructor(status: number, body: string) {
     super(`${status}: ${body}`);
     this.status = status;
-    this.reason = reasonOf(body);
+    this.reason = gatewayReasonOf(body);
   }
 }
 
-function reasonOf(body: string): string | null {
+function gatewayReasonOf(body: string): string | null {
   try {
     const parsed: unknown = JSON.parse(body);
-    if (parsed && typeof parsed === 'object' && 'reason' in parsed
-      && typeof parsed.reason === 'string') {
+    if (parsed && typeof parsed === 'object' && 'reason' in parsed && 'requestId' in parsed
+      && typeof parsed.reason === 'string' && typeof parsed.requestId === 'string') {
       return parsed.reason;
     }
   } catch {
@@ -109,16 +111,24 @@ function reasonOf(body: string): string | null {
   return null;
 }
 
+/** Gateway reasons that mean the agent cannot answer at this time. */
+const TEMPORARY_REASONS: Record<number, readonly string[]> = {
+  // 502: the connection to the agent VM broke before a response.
+  502: ['backend_unavailable'],
+  // 503: the gateway has no access data yet, the agent VM is not ready or
+  // cannot be reached, or the machine plane cannot start it.
+  503: ['unavailable', 'backend_unavailable', 'agent_starting', 'agent_paused', 'agent_unavailable'],
+  // 504: the agent VM took the request and sent no response in time.
+  504: ['backend_timeout'],
+};
+
 /** The problem that a gateway error shows, or `null` for an ordinary error. */
 export function problemOf(status: number, reason: string | null): HostedProblem | null {
   if (status === 403 && reason === 'access_denied') return 'access_denied';
   // The gateway answers 410 for an archived agent host, and 503 when the
   // machine plane cannot start an archived agent.
   if ((status === 410 || status === 503) && reason === 'agent_archived') return 'agent_archived';
-  if (status === 503 && reason === 'unavailable') return 'unavailable';
-  // 503 before the relay confirmed the agent VM, 502 when the connection to
-  // the VM broke before a response.
-  if ((status === 502 || status === 503) && reason === 'backend_unavailable') return 'unavailable';
+  if (reason !== null && TEMPORARY_REASONS[status]?.includes(reason)) return 'unavailable';
   return null;
 }
 
@@ -139,10 +149,30 @@ export function showProblem(problem: HostedProblem): void {
   ));
 }
 
-/** Show the screen of a failed API request, if the gateway sent it. */
-export function reportError(error: ApiError): void {
+/**
+ * Act on a failed API request in hosted mode. A 401 signs in again or checks
+ * the session (see `reportUnauthorized`). A gateway error with a known
+ * reason shows its screen. The promise settles when any session check has
+ * answered.
+ */
+export function reportError(error: ApiError): Promise<void> {
+  if (error.status === 401) return reportUnauthorized(error);
   const problem = problemOf(error.status, error.reason);
   if (problem) showProblem(problem);
+  return Promise.resolve();
+}
+
+/**
+ * Act on a failed API request that the gateway or hosted mode can explain.
+ * A gateway error body proves that the page runs behind the gateway, so it
+ * sets the mode to external, also when the status has not answered. Returns
+ * `false` in local mode, and the caller handles the error.
+ */
+export function handleHostedError(error: ApiError): boolean {
+  if (error.reason !== null) setAuthMode('external');
+  if (!isHosted()) return false;
+  void reportError(error);
+  return true;
 }
 
 /** Remove the `unavailable` screen, so that the app can try again. */
@@ -203,7 +233,8 @@ export function reenter(): void {
 /**
  * Ask the gateway if the session of this tab is still valid. The WebSocket
  * calls this before it opens a new socket, because the browser does not show
- * why an upgrade failed.
+ * why an upgrade failed. An API request calls it after a 401 that the gateway
+ * did not send.
  *
  * A 401 starts re-entry. A 403 or a 410 shows its screen. Returns `true` when
  * the caller can retry: the session is valid (so the backend is down), or the
@@ -232,6 +263,37 @@ export async function probeSession(): Promise<boolean> {
     default:
       return true;
   }
+}
+
+/** The reason of a gateway 401: the request has no valid gateway session. */
+const LOGIN_REQUIRED = 'login_required';
+
+/** The session check after a 401 that the gateway did not send. */
+let refusalCheck: Promise<void> | null = null;
+
+/**
+ * Act on a 401 in hosted mode. The gateway answers `login_required` when the
+ * request has no valid session, so that 401 signs in again at once.
+ *
+ * Any other 401 comes from Nerve, for example for an actor header that it
+ * cannot read. A login does not change that, and an immediate re-entry would
+ * repeat the login forever. Ask the gateway about the session first: a 401
+ * there signs in again, and a 403 or a 410 shows its screen. A valid session,
+ * or no decision, shows the unavailable screen. Requests that fail at the
+ * same time share one check.
+ */
+function reportUnauthorized(error: ApiError): Promise<void> {
+  if (error.reason === LOGIN_REQUIRED) {
+    reenter();
+    return Promise.resolve();
+  }
+  if (!refusalCheck) {
+    refusalCheck = probeSession().catch(() => true).then((noDecision) => {
+      refusalCheck = null;
+      if (noDecision) showProblem('unavailable');
+    });
+  }
+  return refusalCheck;
 }
 
 /**
