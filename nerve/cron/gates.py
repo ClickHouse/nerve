@@ -145,6 +145,9 @@ class MessagesGate(CronGate):
         # unread messages. Read-only and expiry-agnostic — it never
         # initializes or advances a cursor (unlike get_consumer_cursor) and
         # still sees a backlog after a quiet inbox's cursors pass their TTL.
+        # With zero cursor rows (fresh install, or cursor cleanup after a
+        # quiet stretch) it fails open when any messages exist, so the gated
+        # job can run once and seed the cursors its next evaluations need.
         return await ctx.db.consumer_has_unread(self.consumer)
 
     def describe(self) -> str:
