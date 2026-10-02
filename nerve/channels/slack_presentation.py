@@ -181,6 +181,20 @@ def split_message(text: str, limit: int = MAX_MSG_LEN) -> list[str]:
     return chunks
 
 
+def slack_emoji_by_name() -> dict[str, str]:
+    """Map each known Slack short name to its emoji, fully qualified when known."""
+    names: dict[str, str] = {}
+    for emoji, name in _EMOJI_TO_SLACK.items():
+        if name not in names or "\ufe0f" in emoji:
+            names[name] = emoji
+    return names
+
+
+def approval_style(value: str) -> str:
+    """The button style for a notification answer: ``primary``, ``danger``, or ``""``."""
+    return _APPROVAL_STYLES.get(value.lower(), "")
+
+
 def slack_emoji_name(emoji: str) -> str | None:
     """Map a unicode emoji or existing short name to a Slack short name."""
     cleaned = emoji.strip().strip(":")

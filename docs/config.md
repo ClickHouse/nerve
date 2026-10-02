@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1252,7 +1252,7 @@ reload, switch the gateway to the new key, then remove the old public key and
 reload again.
 
 The gateway admits each event, so `allow_users`, `allow_channels`, and
-`allow_direct_messages` do not apply. Nerve still checks that a channel message
+`allow_direct_messages` do not apply to incoming messages. Nerve still checks that a channel message
 mentions the agent or continues a thread that has a session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
@@ -1261,14 +1261,50 @@ Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
 
-`slack.enabled: false` pauses hosted intake, at startup or after a reload.
-The stream endpoint still accepts streams, and events stay in the gateway's
-inbox until a reload sets `enabled` to `true`.
+`slack.enabled: false` pauses the hosted channel, at startup or after a
+reload. The stream endpoint still accepts streams, and events stay in the
+gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
+Nerve sends no notifications and refuses `send_channel_message`. A turn that
+is already running still sends its reply.
 
-Replies, notifications, reactions, and file transfers do not reach Slack in
-hosted mode yet. `slack.mode` and `channels.hosted.*` need a restart; a
-reload of running hosted channels reads the key file again. Changing
-`mode` from `socket` to `hosted` stops the Socket Mode connection at once.
+Replies, reactions, and `send_channel_message` go to Slack as operations on
+a gateway stream that advertises them for the connection. A reply goes on the
+connection of the conversation's latest accepted event; a conversation
+without one uses the only connection that can send. Nerve splits a message at
+the connection's advisory character limit and paces streaming edits by its
+edit interval. The typing indicator is an `eyes` reaction on the message that
+started the turn. `slack.allow_outbound` still decides whether the agent may
+use `send_channel_message`. When `allow_channels` or `deny_channels` is set,
+the conversation ID must also pass them. Hosted events carry no trusted
+conversation names, so rules match conversation IDs only: a name rule in
+`allow_channels` allows nothing, and a name or glob rule in `deny_channels`
+refuses every conversation. Without these rules, Nerve does not limit the
+destination, including direct messages; the gateway decides. The gateway
+decides in every case, and the agent gets a refusal without the gateway's
+reason. A message whose result is lost is not sent again, because it may
+already be in Slack.
+
+`send_file` uploads a file of up to the connection's advertised file limit
+in chunks after its operation. The attachments of a message that starts a
+turn are read through the gateway before the turn, with the Socket Mode
+rules: text files go into the prompt, images and PDFs are attached, and ZIP
+files are unpacked one level. One file is read up to 16 MiB less one byte.
+The files of one message are read up to 32 MiB together, and the content
+unpacked from ZIP files counts against the same limit.
+
+Notifications go to the same conversation as in Socket Mode
+(`notifications.slack_channel_id`, else the first literal conversation ID in
+`slack.allow_channels`), with one button for each answer. A button press
+answers the notification only in the conversation where it was delivered,
+and the card then shows the answer without buttons. A press that answers
+nothing, for example a second press, gets a short notice and the card stays.
+An expired card is edited without buttons. `/nerve` commands, including the host commands
+`doctor` and `restart`, are not available in hosted mode; `nerve doctor`
+reports this and the local settings that still apply.
+
+`slack.mode` and `channels.hosted.*` need a restart; a reload of running
+hosted channels reads the key file again. Changing `mode` from `socket` to
+`hosted` stops the Socket Mode connection at once.
 
 ### Setting up the Slack app
 
@@ -1515,6 +1551,8 @@ from a cron run with no conversation attached.
 
 It is **off by default**: `slack.allow_outbound: true` enables the capability,
 and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
+In hosted mode the channel gateway also decides where it may go, and a name
+rule in `allow_channels` cannot grant (see [Hosted mode](#hosted-mode)).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

@@ -32,17 +32,29 @@ DELIVERY_MODE_PULL = "pull"
 MAX_FRAME_BYTES = 256 * 1024
 MIN_FRAME_BYTES = 16 * 1024
 MAX_TRANSFER_BYTES = 16 * 1024 * 1024
+MAX_TRANSFER_CHUNK_BYTES = 64 * 1024
+# Limits of the gateway's checks, which Nerve's own values must respect.
+MAX_IDENTIFIER_BYTES = 256
+MAX_DISPLAY_NAME_BYTES = 256
+MAX_TEXT_BYTES = 128 * 1024
+MAX_ACTION_ELEMENTS = 10
 
 NIL_UUID = uuid.UUID(int=0)
 ZERO_TIME = datetime(1, 1, 1, tzinfo=timezone.utc)
 
 # The frame kinds that the gateway sends and Nerve handles.
 GATEWAY_FRAME_KINDS = frozenset({
-    "nudge", "inbox_read_result", "inbox_ack_result", "connection_status",
-    "capabilities", "heartbeat", "drain", "negotiation",
+    "nudge", "inbox_read_result", "inbox_ack_result", "operation_result",
+    "connection_status", "capabilities", "heartbeat", "drain", "negotiation",
+    "transfer",
 })
 # The frame kinds whose envelope names a logical connection.
-CONNECTION_SCOPED_KINDS = frozenset({"connection_status", "capabilities"})
+CONNECTION_SCOPED_KINDS = frozenset({"operation_result", "connection_status", "capabilities", "transfer"})
+OPERATION_OUTCOMES = (
+    "succeeded", "unsupported", "forbidden", "rate_limited", "unavailable", "ambiguous",
+)
+# Operations that the gateway may run again without a second provider effect.
+RETRY_SAFE_OPERATIONS = frozenset({"file_read", "typing"})
 
 
 def byte_length(value: str) -> int:
@@ -76,8 +88,32 @@ class ThreadReference:
 
 
 @_record
+class TopicReference:
+    id: str = ""
+
+
+@_record
 class MessageReference:
     id: str = ""
+
+
+@_record
+class MessageContainer:
+    """The conversation, and optional thread and topic, that holds messages."""
+
+    conversation: ConversationReference = struct(ConversationReference)
+    thread: ThreadReference | None = omit_empty(None)
+    topic: TopicReference | None = omit_empty(None)
+
+
+@_record
+class MessageTarget:
+    """One provider message in its conversation."""
+
+    conversation: ConversationReference = struct(ConversationReference)
+    thread: ThreadReference | None = omit_empty(None)
+    topic: TopicReference | None = omit_empty(None)
+    message: MessageReference = struct(MessageReference)
 
 
 @_record
@@ -91,7 +127,18 @@ class AuthorReference:
 
 @_record
 class AttachmentReference:
+    """Retrievable content, without credentials or a download URL."""
+
+    id: str = ""
     name: str = omit_empty()
+    media_type: str = omit_empty()
+    size_bytes: int = omit_empty(0)
+
+
+@_record
+class AttachmentTarget:
+    origin: MessageTarget = struct(MessageTarget)
+    attachment: AttachmentReference = struct(AttachmentReference)
 
 
 @_record
@@ -112,12 +159,29 @@ class ContentReference:
 
 
 @_record
+class ActionElement:
+    """A button or a select."""
+
+    kind: str = ""
+    action_id: str = ""
+    label: str = ""
+    value: str = omit_empty()
+    style: str = omit_empty()
+
+
+@_record
+class ActionsContent:
+    elements: tuple[ActionElement, ...] = ()
+
+
+@_record
 class ContentPart:
     """One part of a message. ``kind`` names the member that is set."""
 
     kind: str = ""
     text: TextContent | None = omit_empty(None)
     reference: ContentReference | None = omit_empty(None)
+    actions: ActionsContent | None = omit_empty(None)
 
 
 @_record
@@ -129,6 +193,16 @@ class Reaction:
 # ---------------------------------------------------------------------- #
 #  Events                                                                 #
 # ---------------------------------------------------------------------- #
+
+
+@_record
+class InteractionReference:
+    """Input from an interactive element, without a callback URL."""
+
+    id: str = ""
+    kind: str = ""
+    action_id: str = ""
+    selections: tuple[str, ...] = omit_empty(())
 
 
 @_record
@@ -164,6 +238,7 @@ class Event:
     kind: str = ""
     conversation: ConversationReference = struct(ConversationReference)
     thread: ThreadReference | None = omit_empty(None)
+    topic: TopicReference | None = omit_empty(None)
     message: MessageReference | None = omit_empty(None)
     author: AuthorReference | None = omit_empty(None)
     admission: EventAdmission | None = omit_empty(None)
@@ -172,6 +247,7 @@ class Event:
     content: tuple[ContentPart, ...] = omit_empty(())
     attachments: tuple[AttachmentReference, ...] = omit_empty(())
     reaction: Reaction | None = omit_empty(None)
+    interaction: InteractionReference | None = omit_empty(None)
 
     def validate(self) -> None:
         """Check the members that intake and the hosted channel read."""
@@ -188,6 +264,8 @@ class Event:
             malformed(f"{self.kind} event has no message or author")
         if self.kind == "reaction_added" and self.reaction is None:
             malformed("reaction event has no reaction")
+        if self.kind == "interaction" and (self.message is None or self.interaction is None):
+            malformed("interaction event has no message or interaction")
 
 
 # ---------------------------------------------------------------------- #
@@ -277,10 +355,29 @@ class ConnectionStatus:
 
 
 @_record
+class ConnectionLimits:
+    """The gateway's bounds for one provider connection."""
+
+    in_flight_operations: int = 0
+    operation_deadline_millis: int = 0
+    text_characters: int = 0
+    edit_interval_millis: int = 0
+    file_bytes: int = 0
+
+
+@_record
 class Capabilities:
-    """A connection's own identity."""
+    """A connection's own identity, operations, and limits."""
 
     self: AuthorReference = struct(AuthorReference)
+    operations: tuple[str, ...] = omit_empty(())
+    limits: ConnectionLimits = struct(ConnectionLimits)
+
+    def validate(self) -> None:
+        # Nerve paces, splits, and times out operations by these limits.
+        limits = self.limits
+        if min(limits.in_flight_operations, limits.operation_deadline_millis, limits.text_characters) < 1:
+            reject(RejectionReason.LIMIT_EXCEEDED, "capabilities have no usable operation or text limit")
 
 
 @_record
@@ -318,6 +415,143 @@ class Negotiation:
             reject(RejectionReason.LIMIT_EXCEEDED, "negotiation has no usable frame or request limit")
 
 
+@_record
+class TransferChunk:
+    """One segment of a file read or a file upload."""
+
+    transfer_id: str = ""
+    offset: int = 0
+    total_bytes: int = 0
+    data: bytes = b""
+    final: bool = False
+
+    def validate(self) -> None:
+        end = self.offset + len(self.data)
+        if self.offset < 0 or end > self.total_bytes:
+            reject(RejectionReason.LIMIT_EXCEEDED, "transfer chunk is outside its transfer")
+        if self.final != (end == self.total_bytes):
+            malformed("transfer final marker does not match its byte range")
+
+
+# ---------------------------------------------------------------------- #
+#  Operations                                                             #
+# ---------------------------------------------------------------------- #
+
+
+@_record
+class SendOperation:
+    destination: MessageContainer = struct(MessageContainer)
+    content: tuple[ContentPart, ...] = ()
+
+
+@_record
+class EditOperation:
+    target: MessageTarget = struct(MessageTarget)
+    content: tuple[ContentPart, ...] = ()
+
+
+@_record
+class DeleteOperation:
+    target: MessageTarget = struct(MessageTarget)
+
+
+@_record
+class ReactionOperation:
+    target: MessageTarget = struct(MessageTarget)
+    reaction: Reaction = struct(Reaction)
+
+
+@_record
+class InteractionTarget:
+    origin: MessageTarget = struct(MessageTarget)
+    interaction_id: str = ""
+
+
+@_record
+class InteractionOperation:
+    target: InteractionTarget = struct(InteractionTarget)
+    response: str = ""
+    visibility: str = omit_empty()
+    content: tuple[ContentPart, ...] = omit_empty(())
+
+
+@_record
+class FileReadOperation:
+    target: AttachmentTarget = struct(AttachmentTarget)
+    offset_bytes: int = 0
+    length_bytes: int = 0
+
+
+@_record
+class FileUpload:
+    transfer_id: str = ""
+    name: str = ""
+    media_type: str = ""
+    total_bytes: int = 0
+
+
+@_record
+class FileSendOperation:
+    destination: MessageContainer = struct(MessageContainer)
+    file: FileUpload = struct(FileUpload)
+    content: tuple[ContentPart, ...] = omit_empty(())
+
+
+@_record
+class TypingOperation:
+    target: MessageContainer = struct(MessageContainer)
+    status: str = omit_empty()
+
+
+@_record
+class Operation:
+    """A bounded provider action; ``kind`` names the payload member."""
+
+    kind: str = ""
+    deadline_millis: int = 0
+    send: SendOperation | None = omit_empty(None)
+    edit: EditOperation | None = omit_empty(None)
+    delete: DeleteOperation | None = omit_empty(None)
+    reaction: ReactionOperation | None = omit_empty(None)
+    interaction: InteractionOperation | None = omit_empty(None)
+    file_read: FileReadOperation | None = omit_empty(None)
+    file_send: FileSendOperation | None = omit_empty(None)
+    typing: TypingOperation | None = omit_empty(None)
+
+
+@_record
+class TransferResult:
+    transfer_id: str = ""
+    total_bytes: int = 0
+
+
+@_record
+class OperationResult:
+    kind: str = ""
+    outcome: str = ""
+    target: MessageTarget | None = omit_empty(None)
+    transfer: TransferResult | None = omit_empty(None)
+    retry_after_millis: int = omit_empty(0)
+    reason_code: str = omit_empty()
+
+    def validate(self) -> None:
+        _one_of("operation outcome", self.outcome, OPERATION_OUTCOMES)
+
+
+def validate_operation_result(operation: Operation, result: OperationResult) -> None:
+    """Check that a result answers its operation with the output that Nerve reads."""
+    if result.kind != operation.kind:
+        reject(RejectionReason.SCOPE_MISMATCH, "result kind does not match its operation")
+    if result.transfer is not None and (result.outcome != "succeeded" or operation.kind != "file_read"):
+        malformed("only a successful file read carries a transfer")
+    if result.outcome != "succeeded":
+        return
+    if operation.kind == "send" and result.target is None:
+        malformed("successful send has no message target")
+    if operation.kind == "file_read" and result.transfer is None:
+        malformed("successful file read has no transfer")
+
+
 # ---------------------------------------------------------------------- #
 #  Envelope                                                               #
 # ---------------------------------------------------------------------- #
@@ -332,11 +566,14 @@ class Payload:
     inbox_read_result: InboxReadResult | None = omit_empty(None)
     inbox_ack: InboxAck | None = omit_empty(None)
     inbox_ack_result: InboxAckResult | None = omit_empty(None)
+    operation: Operation | None = omit_empty(None)
+    operation_result: OperationResult | None = omit_empty(None)
     connection_status: ConnectionStatus | None = omit_empty(None)
     capabilities: Capabilities | None = omit_empty(None)
     heartbeat: Heartbeat | None = omit_empty(None)
     drain: Drain | None = omit_empty(None)
     negotiation: Negotiation | None = omit_empty(None)
+    transfer: TransferChunk | None = omit_empty(None)
 
 
 @_record
@@ -344,7 +581,8 @@ class Envelope:
     """One versioned stream frame.
 
     ``request_id`` names a new request frame, one-way frames included.
-    ``correlation_id`` names the request that a response answers.
+    ``correlation_id`` names the request that a response answers, or the
+    operation that owns a transfer chunk.
     """
 
     version: str = ""

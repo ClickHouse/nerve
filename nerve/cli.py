@@ -969,6 +969,55 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
         return False, f"{model}: {detail}"
 
 
+def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
+    """Doctor lines for the local Slack settings that still apply in hosted mode.
+
+    The gateway decides admission and where the agent may post, so only the
+    send tool switch, its local conversation limit, and the notification
+    conversation are reported. Slash commands do not reach Nerve.
+    """
+    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.config import SLACK_HOST_COMMANDS
+
+    slack = config.slack
+    lines: list[str] = []
+    if not slack.allow_outbound:
+        lines.append("[--] Slack send tool off (slack.allow_outbound is false)")
+    elif slack.allow_channels or slack.deny_channels:
+        lines.append(
+            f"[OK] Slack send tool on, limited to {len(slack.allow_channels)} allow "
+            f"and {len(slack.deny_channels)} deny rule(s); the gateway also decides"
+        )
+        if any(not is_slack_id(rule) for rule in slack.deny_channels):
+            warnings.append(
+                "[WARN] slack.deny_channels has a rule that is not a conversation "
+                "id; in hosted mode the send tool then refuses every conversation"
+            )
+        if any(not is_slack_id(rule) for rule in slack.allow_channels):
+            warnings.append(
+                "[WARN] slack.allow_channels has a rule that is not a conversation "
+                "id; in hosted mode rules match conversation ids only"
+            )
+    else:
+        lines.append("[OK] Slack send tool on; the gateway decides where it may post")
+    target = notification_target(config)
+    if target:
+        lines.append(f"[OK] Slack notifications go to {target}")
+    else:
+        warnings.append(
+            "[WARN] Slack notifications have no conversation: set "
+            "notifications.slack_channel_id"
+        )
+    lines.append("[--] Slack /nerve commands are not available in hosted mode")
+    host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
+    if host:
+        warnings.append(
+            f"[WARN] slack.commands enables {', '.join(host)}, but host commands "
+            "are not available in hosted mode"
+        )
+    return lines
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1224,6 +1273,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 f"{hosted.agent_id}, {len(keys)} gateway key(s) from "
                 f"{hosted.gateway_jwks_file}"
             )
+            lines.extend(_hosted_slack_lines(config, warnings))
     elif config.slack.enabled:
         missing = [
             name for name, value in (
