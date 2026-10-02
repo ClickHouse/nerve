@@ -28,6 +28,7 @@ import signal
 from typing import Any, Awaitable, Callable
 
 from nerve.agent.backends.base import TransportDiedError
+from nerve.agent.backends.codex import lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ class CodexAppServerClient:
         client_name: str = "nerve",
         client_version: str = "1.0.0",
         request_timeout: float = 60.0,
+        containment: lifecycle.WorkflowContainment | None = None,
     ) -> None:
         self._bin_path = bin_path
         self._cwd = cwd
@@ -148,6 +150,9 @@ class CodexAppServerClient:
         self._client_version = client_version
         self._request_timeout = request_timeout
         self._on_server_request = server_request_handler
+        # Set only for contained Codex workflow runs (codex/lifecycle.py).
+        self._containment = containment
+        self._lifecycle_record: lifecycle.LifecycleRecord | None = None
 
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -178,6 +183,20 @@ class CodexAppServerClient:
             args.extend(["--config", kv])
         args.extend(["app-server", "--listen", "stdio://"])
 
+        # Wrap the argv in a systemd scope; raises before exec on failure.
+        containment = self._containment
+        if containment is not None:
+            try:
+                args, self._lifecycle_record = await asyncio.to_thread(
+                    lifecycle.prepare_launch, containment, args,
+                )
+            except lifecycle.ContainmentUnavailable as e:
+                raise TransportDiedError(str(e)) from e
+            except (lifecycle.LifecycleError, OSError) as e:
+                raise TransportDiedError(
+                    f"codex workflow containment could not be persisted: {e}"
+                ) from e
+
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -193,6 +212,19 @@ class CodexAppServerClient:
             raise TransportDiedError(
                 f"Failed to spawn codex app-server ({self._bin_path}): {e}"
             ) from e
+
+        # Record the scope's InvocationID + cgroup.
+        if containment is not None and self._lifecycle_record is not None:
+            try:
+                self._lifecycle_record = await asyncio.to_thread(
+                    lifecycle.record_launched,
+                    containment.run_dir, self._lifecycle_record,
+                )
+            except (lifecycle.LifecycleError, OSError) as e:
+                await self.close()
+                raise TransportDiedError(
+                    f"codex workflow scope did not register: {e}"
+                ) from e
 
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name=f"codex-reader:{self._proc.pid}",
@@ -215,10 +247,26 @@ class CodexAppServerClient:
                 },
             })
             await self.notify("initialized", None)
-            return response
         except BaseException:
             await self.close()
             raise
+
+        # Verify the app-server is inside its scope cgroup before returning.
+        if (
+            containment is not None
+            and self._lifecycle_record is not None
+            and self._proc is not None and self._proc.pid is not None
+        ):
+            member = await asyncio.to_thread(
+                lifecycle.verify_membership,
+                self._lifecycle_record.control_group, self._proc.pid,
+            )
+            if not member:
+                await self.close()
+                raise TransportDiedError(
+                    "codex app-server is not contained in its cgroup scope"
+                )
+        return response
 
     def is_alive(self) -> bool:
         return (
