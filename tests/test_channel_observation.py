@@ -1,0 +1,1426 @@
+"""Channel → source bridge — what gets watched, buffered, and drained.
+
+Three layers, tested separately because they fail differently:
+
+* the observation policy, which is the one place a mistake is a security
+  bug rather than a missing feature;
+* the buffer, whose id must stay monotonic across pruning or the drain
+  silently skips messages;
+* :class:`ChannelSource`, which turns buffered rows into inbox records and
+  hands the rest — filtering, TTL, health, cursor — to ``SourceRunner``.
+
+What is *not* here is anything that turns on the events Slack actually
+sends. These hand ``_observe`` an event dict the test wrote, so they settle
+the policy branches and nothing about whether a real message carries the
+fields the payload is built from. Those live in
+``TestChannelSourceCollectsRealTraffic`` in
+:mod:`tests.test_slack_live_inbound`, driven by a real person posting into a
+real channel. Kept here: the pure branches, and the conversation kinds a
+live test cannot provoke.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from nerve.channels.access import Identity, PatternGate
+from nerve.channels.base import ObservedMessage
+from nerve.channels.observation import ObservationPolicy
+from nerve.channels.router import ChannelRouter
+from nerve.channels.slack import SlackChannel
+from nerve.config import (
+    ChannelSourceConfig,
+    NerveConfig,
+    SlackConfig,
+    TelegramConfig,
+)
+from nerve.db.observations import _TRIM_EVERY
+from nerve.sources.channel import ChannelSource
+from nerve.sources.models import FetchResult, SourceRecord
+from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import _MAX_PASSES, SourceRunner
+
+pytestmark = pytest.mark.asyncio
+
+
+# ---------------------------------------------------------------------- #
+#  Helpers                                                                #
+# ---------------------------------------------------------------------- #
+
+
+def _policy(**kwargs) -> ObservationPolicy:
+    return ObservationPolicy(
+        enabled=kwargs.pop("enabled", True),
+        conversations=PatternGate(
+            "conversation",
+            allow=kwargs.pop("allow_conversations", ["C0123ABCD"]),
+            deny=kwargs.pop("deny_conversations", []),
+        ),
+        senders=PatternGate(
+            "sender",
+            allow=kwargs.pop("allow_senders", []),
+            deny=kwargs.pop("deny_senders", []),
+        ),
+    )
+
+
+def _slack_channel(
+    router=None, allow_channels=None, **source_kwargs,
+) -> SlackChannel:
+    """A Slack channel with a stub transport and an observe policy.
+
+    ``allow_channels`` is the *access* grant, deliberately separate from the
+    observe kwargs — the two policies are independent and the tests here
+    depend on that.
+    """
+    cfg = NerveConfig()
+    cfg.slack = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-test",
+        app_token="xapp-test",
+        allow_channels=list(allow_channels or []),
+        source=ChannelSourceConfig(**source_kwargs),
+    )
+    channel = SlackChannel(cfg, router=router or MagicMock())
+    channel._web = MagicMock()
+    channel._web.chat_postMessage = AsyncMock(return_value={"ts": "1.1"})
+    channel._web.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "general"}},
+    )
+    channel._web.users_info = AsyncMock(
+        return_value={"user": {"name": "alice", "profile": {}}},
+    )
+    channel._state = "running"
+    channel._bot_user_id = "U0BOT"
+    if router is None:
+        channel.router.observe = AsyncMock(return_value=True)
+        channel.router.get_last_session = AsyncMock(return_value=None)
+        channel.router.handle_message = AsyncMock(return_value="done")
+    return channel
+
+
+def _event(**kwargs) -> dict:
+    base = {
+        "type": "message",
+        "channel": "C0123ABCD",
+        "channel_type": "channel",
+        "user": "U0456DEFG",
+        "ts": "1700000000.000100",
+        "text": "just chatting",
+    }
+    base.update(kwargs)
+    return base
+
+
+# ---------------------------------------------------------------------- #
+#  Observation policy — the part where a mistake is a security bug        #
+# ---------------------------------------------------------------------- #
+
+
+class TestObservationPolicy:
+    def test_an_allowed_conversation_is_observed(self):
+        verdict = _policy().check(Identity(id="C0123ABCD"), Identity(id="U1"))
+
+        assert verdict.allowed
+
+    def test_disabled_observes_nothing(self):
+        verdict = _policy(enabled=False).check(
+            Identity(id="C0123ABCD"), Identity(id="U1"),
+        )
+
+        assert not verdict.allowed
+        assert "not enabled" in verdict.reason
+
+    def test_an_empty_allow_list_means_nothing_not_everything(self):
+        # The inverse of PatternGate's own default, and the whole reason
+        # this policy exists separately. A standing grant to record other
+        # people's messages must be written down, not inferred from silence.
+        verdict = _policy(allow_conversations=[]).check(
+            Identity(id="C0123ABCD"), Identity(id="U1"),
+        )
+
+        assert not verdict.allowed
+        assert "no conversations are approved" in verdict.reason
+
+    def test_an_unlisted_conversation_is_refused(self):
+        verdict = _policy().check(Identity(id="C0999ZZZZ"), Identity(id="U1"))
+
+        assert not verdict.allowed
+
+    def test_a_denied_conversation_is_refused(self):
+        verdict = _policy(
+            allow_conversations=["*"], deny_conversations=["C0999ZZZZ"],
+        ).check(Identity(id="C0999ZZZZ"), Identity(id="U1"))
+
+        assert not verdict.allowed
+        assert "deny" in verdict.reason
+
+    def test_a_denied_sender_is_refused_in_an_allowed_conversation(self):
+        verdict = _policy(deny_senders=["U0BOT"]).check(
+            Identity(id="C0123ABCD"), Identity(id="U0BOT"),
+        )
+
+        assert not verdict.allowed
+
+    def test_active_requires_both_enabled_and_a_grant(self):
+        assert _policy().active
+        assert not _policy(enabled=False).active
+        assert not _policy(allow_conversations=[]).active
+
+    def test_observation_is_not_the_access_policy(self):
+        # Observing a room the agent takes no orders from is the point.
+        # If these two were the same object, enabling one would enable the
+        # other, which is the failure this separation exists to prevent.
+        cfg = SlackConfig(allow_channels=["C0AAA1111"])
+        channel = _slack_channel(
+            enabled=True, allow_conversations=["C0BBB2222"],
+        )
+        channel.config.slack.allow_channels = cfg.allow_channels
+
+        assert channel.policy.channels.allow == ["C0AAA1111"]
+        assert channel.observation.conversations.allow == ["C0BBB2222"]
+
+
+# ---------------------------------------------------------------------- #
+#  Slack hook                                                             #
+# ---------------------------------------------------------------------- #
+
+
+class TestSlackRouting:
+    """The two routes are decided independently, then reconciled.
+
+    Live handling needs the message addressed to the agent and its sender
+    authorized; the source needs its own grant and neither of those. Every
+    combination is reachable, so every combination is pinned here.
+    """
+
+    async def test_source_only_when_the_sender_may_not_drive_the_agent(self):
+        # Addressed, but access refuses it. The source grant is its own
+        # question, so the message still reaches the inbox — which is the
+        # point of watching a channel the agent takes no orders from.
+        channel = _slack_channel(
+            allow_channels=["C0OTHER"],
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+        )
+
+        await channel._handle_message_event(
+            _event(text="<@U0BOT> hello", type="app_mention"),
+        )
+
+        channel.router.handle_message.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_channel_only_when_the_source_does_not_want_it(self):
+        channel = _slack_channel(
+            allow_channels=["C0123ABCD"],
+            enabled=True,
+            allow_conversations=["C0AAA1111"],
+        )
+
+        await channel._handle_message_event(
+            _event(text="<@U0BOT> hello", type="app_mention"),
+        )
+
+        channel.router.handle_message.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_neither_route_takes_an_unaddressed_unwatched_message(self):
+        channel = _slack_channel(
+            allow_channels=["C0123ABCD"],
+            enabled=True,
+            allow_conversations=["C0AAA1111"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.handle_message.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+
+class TestSlackObserve:
+    async def test_observation_off_buffers_nothing(self):
+        channel = _slack_channel(enabled=False, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(_event())
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_direct_message_is_never_observed(self):
+        # Declining to answer a DM is a refusal. Filing it away instead is
+        # not what the silence led the sender to expect.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(
+            _event(channel="D0123ABCD", channel_type="im"),
+        )
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_group_dm_is_never_observed(self):
+        # An MPIM arrives as channel_type="mpim" on a `G` id. Checking only
+        # for `D` would file a group DM away as if it were a channel.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(
+            _event(channel="G0123ABCD", channel_type="mpim"),
+        )
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_private_channel_is_observed(self):
+        # The other half of the `G` ambiguity: a real private channel must
+        # still be watchable.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(
+            _event(channel="G0123ABCD", channel_type="group"),
+        )
+
+        channel.router.observe.assert_awaited_once()
+
+    async def test_an_ambiguous_g_conversation_is_not_observed(self):
+        # No channel_type to disambiguate: decline rather than guess.
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+        event = _event(channel="G0123ABCD")
+        event.pop("channel_type")
+
+        await channel._handle_message_event(event)
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_join_and_leave_noise_is_not_buffered(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._handle_message_event(_event(subtype="channel_join"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_another_app_is_not_buffered(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["*"])
+        channel._web.users_info = AsyncMock(
+            return_value={"user": {"is_bot": True, "profile": {}}},
+        )
+
+        await channel._handle_message_event(_event(bot_id="B0OTHER"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_an_id_only_policy_costs_no_api_call(self):
+        # Observation sits on the dispatch path of a busy channel. A lookup
+        # per message would make watching one expensive.
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(_event())
+
+        channel._web.conversations_info.assert_not_awaited()
+        channel._web.users_info.assert_not_awaited()
+
+    async def test_a_lowercase_id_matches_at_the_cost_of_a_lookup(self):
+        # Shaped like both an id and a name, so it is resolved rather than
+        # assumed. It still matches; it just costs the lookup.
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["c0123abcd"],
+            deny_senders=["u0999zzzz"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.observe.assert_awaited_once()
+        channel._web.conversations_info.assert_awaited()
+        channel._web.users_info.assert_awaited()
+
+    async def test_a_name_shaped_like_an_id_can_still_deny(self):
+        # Read as an id, `buildstatus` is never matched against the resolved
+        # name and the deny rule silently stops working.
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+            deny_conversations=["buildstatus"],
+        )
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "buildstatus"}},
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_the_thread_is_recorded_for_a_reader_to_expand(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+        channel.router.get_last_session = AsyncMock(return_value=None)
+
+        await channel._handle_message_event(
+            _event(thread_ts="1699999999.000000"),
+        )
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.metadata["thread_ts"] == "1699999999.000000"
+
+    async def test_an_unwatched_channel_costs_no_sender_lookup(self):
+        # The conversation settles this without a lookup. Resolving the
+        # sender first would cost a users.info call for every message in
+        # every channel the bot sits in.
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0111AAAA"],
+            deny_senders=["spam-bot"],
+        )
+
+        await channel._handle_message_event(_event(channel="C0999BBBB"))
+
+        channel._web.users_info.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_watched_channel_still_resolves_the_sender(self):
+        channel = _slack_channel(
+            enabled=True,
+            allow_conversations=["C0123ABCD"],
+            deny_senders=["spam-bot"],
+        )
+
+        await channel._handle_message_event(_event())
+
+        channel._web.users_info.assert_awaited_once()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_an_upload_is_recorded_by_name_not_as_a_blank(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(
+            _event(text="", files=[{"name": "outage.pdf"}]),
+        )
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: outage.pdf]"
+
+    async def test_an_upload_with_a_comment_keeps_both(self):
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(
+            _event(text="see attached", files=[{"name": "outage.pdf"}]),
+        )
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: outage.pdf]\n\nsee attached"
+
+    async def test_a_message_carrying_nothing_at_all_is_not_buffered(self):
+        # No text and no file name is nothing worth a row.
+        channel = _slack_channel(enabled=True, allow_conversations=["C0123ABCD"])
+
+        await channel._handle_message_event(_event(text=""))
+
+        channel.router.observe.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------- #
+#  Telegram hook                                                          #
+# ---------------------------------------------------------------------- #
+
+
+def _tg_channel(**source_kwargs):
+    """A Telegram channel with a stub router and a source policy."""
+    from nerve.channels.telegram import TelegramChannel
+
+    cfg = NerveConfig()
+    cfg.telegram.source = ChannelSourceConfig(**source_kwargs)
+    cfg.telegram.allowed_users = [999]
+    channel = TelegramChannel.__new__(TelegramChannel)
+    channel._config = lambda: cfg
+    channel._allowed_users = set(cfg.telegram.allowed_users)
+    channel._last_update_time = 0.0
+    channel.router = MagicMock()
+    channel.router.observe = AsyncMock(return_value=True)
+    # Every routing test drives _handle_message, whose live branch is long.
+    # A media group short-circuits it at the first step, so these assert on
+    # which route was taken without stubbing the whole extraction pipeline.
+    channel._collect_media_group = AsyncMock()
+    return channel
+
+
+def _tg_update(
+    chat_id=-100123, chat_type="supergroup", title="ops-room",
+    user_id=42, username="mallory", is_bot=False,
+    sticker=None, document=None, photo=None,
+):
+    """A plain text group message, unless an attachment is asked for.
+
+    The attachment fields have to be set even when absent. A real
+    ``telegram.Message`` reports ``None`` for the ones it does not carry,
+    where a MagicMock hands back a truthy stand-in for every attribute. This
+    double would then look like a message carrying all three at once.
+    """
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.effective_chat.type = chat_type
+    update.effective_chat.title = title
+    update.effective_chat.username = None
+    update.effective_user.id = user_id
+    update.effective_user.username = username
+    update.effective_user.first_name = "M"
+    update.effective_user.last_name = None
+    update.effective_user.full_name = "M"
+    update.effective_user.is_bot = is_bot
+    update.message.text = "overheard"
+    update.message.caption = None
+    update.message.message_id = 7
+    update.message.date = None
+    update.message.reply_to_message = None
+    update.message.media_group_id = "album"
+    update.message.sticker = sticker
+    update.message.document = document
+    update.message.photo = photo
+    return update
+
+
+def _tg_command_application(channel, callback_name="_handle_new_session"):
+    """Build the real PTB dispatch table with command callbacks isolated."""
+    from telegram import User
+
+    channel.config.telegram.bot_token = "123:ABC"
+    command_callback = AsyncMock()
+    generic_callback = AsyncMock(wraps=channel._handle_message)
+    setattr(channel, callback_name, command_callback)
+    channel._handle_message = generic_callback
+    app = channel._build_application()
+    # process_update only needs the initialized flag for these blocking,
+    # persistence-free handlers. Setting the bot user avoids a getMe request.
+    app._initialized = True
+    app.bot._bot_user = User(
+        id=1000, first_name="Nerve", is_bot=True, username="nerve_bot",
+    )
+    return app, command_callback, generic_callback
+
+
+def _tg_command_update(app, text="/new", user_id=42, *, missing_user=False):
+    """A real Telegram command update, so PTB chooses the production handler."""
+    from telegram import Update
+
+    command = text.split(maxsplit=1)[0]
+    message = {
+        "message_id": 7,
+        "date": 1_700_000_000,
+        "chat": {"id": -100123, "type": "supergroup", "title": "Room"},
+        "text": text,
+        "entities": [{
+            "type": "bot_command", "offset": 0, "length": len(command),
+        }],
+    }
+    if not missing_user:
+        message["from"] = {
+            "id": user_id, "is_bot": False, "first_name": "Alice",
+        }
+    return Update.de_json({"update_id": 1, "message": message}, app.bot)
+
+
+def _tg_caption_update(app, caption="/pair 654321", user_id=42):
+    """A real Telegram photo caption, which PTB sends to MessageHandler."""
+    from telegram import Update
+
+    command = caption.split(maxsplit=1)[0]
+    return Update.de_json({
+        "update_id": 1,
+        "message": {
+            "message_id": 7,
+            "date": 1_700_000_000,
+            "chat": {"id": -100123, "type": "supergroup", "title": "Room"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Alice"},
+            "photo": [{
+                "file_id": "photo-id",
+                "file_unique_id": "photo-unique-id",
+                "width": 1,
+                "height": 1,
+                "file_size": 1,
+            }],
+            "caption": caption,
+            "caption_entities": [{
+                "type": "bot_command", "offset": 0, "length": len(command),
+            }],
+        },
+    }, app.bot)
+
+
+class TestTelegramRouting:
+    """Same independent routing as Slack, decided by authorization.
+
+    Telegram has no "addressed to me" test, so authorization alone settles the
+    live route for each message.
+    The source grant is asked either way.
+    """
+
+    async def test_source_only_for_a_sender_who_may_not_drive_the_agent(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._handle_message(_tg_update(user_id=42), None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_channel_only_when_the_source_does_not_want_the_chat(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100999"])
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_handled_message_is_not_also_collected_by_default(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_include_handled_messages_sends_it_to_both(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+
+        await channel._handle_message(_tg_update(user_id=999), None)
+
+        channel._collect_media_group.assert_awaited_once()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_neither_route_takes_a_refused_sender_in_an_unwatched_chat(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100999"])
+
+        await channel._handle_message(_tg_update(user_id=42), None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_message_without_an_effective_user_is_ignored(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update()
+        update.effective_user = None
+
+        await channel._handle_message(update, None)
+
+        channel._collect_media_group.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+
+class TestTelegramCommandRouting:
+    async def test_an_unauthorized_command_reaches_the_source(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=42))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_a_handled_command_stays_on_the_live_route_by_default(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=999))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_handled_command_can_reach_both_routes(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, user_id=999))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_awaited_once()
+
+    async def test_a_pairing_code_is_never_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_command_update(
+            app, text="/pair 654321", user_id=42,
+        ))
+
+        command_callback.assert_awaited_once()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_pairing_code_addressed_to_another_bot_is_not_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_command_update(
+            app, text="/pair@other_bot 654321", user_id=42,
+        ))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_pairing_code_in_a_media_caption_is_not_collected(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["-100123"],
+            include_handled_messages=True,
+        )
+        app, command_callback, generic_callback = _tg_command_application(
+            channel, callback_name="_handle_pair",
+        )
+
+        await app.process_update(_tg_caption_update(app, user_id=42))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_awaited_once()
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_command_without_an_effective_user_is_ignored(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        app, command_callback, generic_callback = _tg_command_application(channel)
+
+        await app.process_update(_tg_command_update(app, missing_user=True))
+
+        command_callback.assert_not_awaited()
+        generic_callback.assert_not_awaited()
+        channel.router.observe.assert_not_awaited()
+
+
+class TestTelegramObserve:
+    async def test_pairing_is_refused_outside_a_private_human_chat(
+        self, monkeypatch,
+    ):
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+        update = _tg_update()
+        update.message.sender_chat = None
+        update.message.reply_text = AsyncMock()
+        verify = MagicMock(return_value=True)
+        monkeypatch.setattr("nerve.pairing.verify_pairing_code", verify)
+        context = MagicMock(args=["654321"])
+
+        await channel._handle_pair(update, context)
+
+        verify.assert_not_called()
+        assert 42 not in channel._allowed_users
+        update.message.reply_text.assert_not_awaited()
+
+    async def test_a_granted_group_is_observed(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+
+        await channel._observe(_tg_update())
+
+        channel.router.observe.assert_awaited_once()
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.channel_name == "telegram"
+        assert observed.conversation_id == "-100123"
+        assert observed.text == "overheard"
+
+    async def test_a_spoofed_title_does_not_grant_access(self):
+        # A group's title is set by whoever runs it. If a title could satisfy
+        # an allow rule, anyone could create a group named "ops-room" and
+        # walk into a grant meant for a different one.
+        channel = _tg_channel(enabled=True, allow_conversations=["ops-room"])
+
+        await channel._observe(_tg_update(chat_id=-100999, title="ops-room"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_title_can_still_deny(self):
+        # Spoofable names may only ever subtract access.
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            deny_conversations=["ops-room"],
+        )
+
+        await channel._observe(_tg_update(title="ops-room"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_spoofed_username_does_not_grant_a_sender(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            allow_senders=["mallory"],
+        )
+
+        await channel._observe(_tg_update(username="mallory"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_full_profile_name_can_deny_a_sender(self):
+        channel = _tg_channel(
+            enabled=True,
+            allow_conversations=["*"],
+            deny_senders=["Alice Smith"],
+        )
+        update = _tg_update()
+        update.effective_user.first_name = "Alice"
+        update.effective_user.last_name = "Smith"
+        update.effective_user.full_name = "Alice Smith"
+
+        await channel._observe(update)
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_private_chat_is_never_observed(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._observe(_tg_update(chat_type="private"))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_another_bot_is_not_observed(self):
+        # Two agents filling each other's inboxes is no better than two
+        # agents answering each other.
+        channel = _tg_channel(enabled=True, allow_conversations=["*"])
+
+        await channel._observe(_tg_update(is_bot=True))
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_the_source_off_collects_nothing(self):
+        channel = _tg_channel(enabled=False, allow_conversations=["*"])
+
+        await channel._observe(_tg_update())
+
+        channel.router.observe.assert_not_awaited()
+
+    async def test_a_sticker_is_recorded_by_its_emoji(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(sticker=MagicMock(emoji="🔥"))
+        update.message.text = None
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[Sticker: 🔥]"
+
+    async def test_an_uncaptioned_photo_is_recorded_as_one(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(photo=[MagicMock()])
+        update.message.text = None
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[Photo]"
+
+    async def test_a_document_keeps_its_caption(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update(document=MagicMock(file_name="runbook.md"))
+        update.message.text = None
+        update.message.caption = "the one we wrote in March"
+
+        await channel._observe(update)
+
+        observed = channel.router.observe.await_args.args[0]
+        assert observed.text == "[File: runbook.md]\n\nthe one we wrote in March"
+
+    async def test_a_message_carrying_nothing_at_all_is_not_buffered(self):
+        channel = _tg_channel(enabled=True, allow_conversations=["-100123"])
+        update = _tg_update()
+        update.message.text = None
+
+        await channel._observe(update)
+
+        channel.router.observe.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------- #
+#  Router seam                                                            #
+# ---------------------------------------------------------------------- #
+
+
+def _observed(**kwargs) -> ObservedMessage:
+    base = dict(
+        channel_name="slack",
+        channel_key="slack:C0123ABCD",
+        conversation_id="C0123ABCD",
+        sender_id="U0456DEFG",
+        text="hello",
+        message_id="1700000000.000100",
+        timestamp="2023-11-14T22:13:20+00:00",
+    )
+    base.update(kwargs)
+    return ObservedMessage(**base)
+
+
+class TestRouterObserve:
+    async def test_an_observation_reaches_the_database(self, db):
+        engine = MagicMock()
+        engine.db = db
+        router = ChannelRouter(engine)
+
+        assert await router.observe(_observed())
+
+        rows = await db.read_channel_observations("slack")
+        assert len(rows) == 1
+        assert rows[0][1]["text"] == "hello"
+
+    async def test_a_database_failure_does_not_escape(self):
+        # This runs on the dispatch path of a channel that already decided
+        # not to answer. A DB hiccup must not take down message handling for
+        # traffic the agent was never going to act on.
+        engine = MagicMock()
+        engine.db.insert_channel_observation = AsyncMock(
+            side_effect=RuntimeError("boom"),
+        )
+        router = ChannelRouter(engine)
+
+        assert not await router.observe(_observed())
+
+
+# ---------------------------------------------------------------------- #
+#  Buffer                                                                  #
+# ---------------------------------------------------------------------- #
+
+
+class TestBuffer:
+    async def test_rows_come_back_in_order_past_a_cursor(self, db):
+        for i in range(5):
+            await db.insert_channel_observation(
+                "slack", "slack:C1", {"n": i},
+            )
+
+        rows = await db.read_channel_observations("slack", after_id=0, limit=3)
+
+        assert [p["n"] for _, p in rows] == [0, 1, 2]
+        rest = await db.read_channel_observations("slack", after_id=rows[-1][0])
+        assert [p["n"] for _, p in rest] == [3, 4]
+
+    async def test_channels_do_not_see_each_other(self, db):
+        await db.insert_channel_observation("slack", "slack:C1", {"n": 1})
+        await db.insert_channel_observation("telegram", "telegram:9", {"n": 2})
+
+        rows = await db.read_channel_observations("slack")
+
+        assert [p["n"] for _, p in rows] == [1]
+
+    async def test_ids_keep_climbing_after_a_prune(self, db):
+        # The reason the migration uses AUTOINCREMENT. A plain rowid is
+        # reused once the highest row is deleted, so a drained-and-pruned
+        # buffer would reissue ids the cursor has already passed and the next
+        # observations would be skipped for good.
+        first = await db.insert_channel_observation("slack", "k", {"n": 1})
+        await db._write("DELETE FROM channel_observations", ())
+
+        second = await db.insert_channel_observation("slack", "k", {"n": 2})
+
+        assert second > first
+
+    async def test_the_row_cap_drops_the_oldest(self, db):
+        # Trimming is amortized, so the cap is a bound the buffer returns to
+        # rather than one it never crosses: it may overshoot by up to one
+        # trim interval. That beats a COUNT on the dispatch path.
+        cap = 5
+        written = _TRIM_EVERY * 2 + cap
+        for i in range(written):
+            await db.insert_channel_observation(
+                "slack", "k", {"n": i}, max_rows=cap,
+            )
+
+        rows = await db.read_channel_observations("slack", limit=10_000)
+
+        assert len(rows) <= cap + _TRIM_EVERY
+        assert len(rows) < written
+        # What survives is the newest end — a stale backlog nobody drained
+        # is the right thing to lose.
+        assert rows[-1][1]["n"] == written - 1
+
+    async def test_an_expired_observation_is_swept(self, db):
+        await db.insert_channel_observation("slack", "k", {"n": 1}, ttl_days=-1)
+        await db.insert_channel_observation("slack", "k", {"n": 2}, ttl_days=7)
+
+        deleted = await db.cleanup_expired_channel_observations()
+
+        assert deleted == 1
+        rows = await db.read_channel_observations("slack")
+        assert [p["n"] for _, p in rows] == [2]
+
+    async def test_an_unreadable_payload_is_reported_not_hidden(self, db):
+        # It comes back with a None payload rather than being dropped, so
+        # the drain can skip the row and still advance past its id.
+        await db.insert_channel_observation("slack", "k", {"n": 1})
+        await _write_garbage(db)
+        await db.insert_channel_observation("slack", "k", {"n": 3})
+
+        rows = await db.read_channel_observations("slack")
+
+        assert [p["n"] if p else None for _, p in rows] == [1, None, 3]
+
+
+# ---------------------------------------------------------------------- #
+#  ChannelSource                                                          #
+# ---------------------------------------------------------------------- #
+
+
+async def _write_garbage(db) -> None:
+    """Put a row in the buffer whose payload will never parse."""
+    await db._write(
+        "INSERT INTO channel_observations "
+        "(channel, channel_key, payload, created_at, expires_at) "
+        "VALUES ('slack', 'k', 'not json', '2026-01-01', '2099-01-01')",
+        (),
+    )
+
+
+class TestChannelSource:
+    async def test_buffered_rows_become_records(self, db):
+        await db.insert_channel_observation(
+            "slack", "slack:C0123ABCD",
+            {
+                "conversation_id": "C0123ABCD",
+                "conversation_title": "general",
+                "sender_id": "U0456DEFG",
+                "sender_name": "alice",
+                "text": "ship it",
+                "message_id": "1700000000.000100",
+                "timestamp": "2023-11-14T22:13:20+00:00",
+                "channel_key": "slack:C0123ABCD",
+                "metadata": {"thread_ts": "1699999999.000000"},
+            },
+        )
+
+        result = await ChannelSource("slack", db).fetch(None)
+
+        assert len(result.records) == 1
+        record = result.records[0]
+        assert record.id == "C0123ABCD:1700000000.000100"
+        assert record.source == "slack:observed"
+        assert record.record_type == "slack_message"
+        assert record.summary == "[general] alice: ship it"
+        assert record.content == "ship it"
+        assert record.metadata["thread_ts"] == "1699999999.000000"
+        assert record.metadata["conversation_id"] == "C0123ABCD"
+
+    async def test_the_cursor_is_the_buffer_id(self, db):
+        last = 0
+        for i in range(3):
+            last = await db.insert_channel_observation(
+                "slack", "k", {"text": str(i), "message_id": str(i)},
+            )
+
+        result = await ChannelSource("slack", db).fetch(None)
+
+        assert result.next_cursor == str(last)
+
+    async def test_a_cursor_resumes_where_it_left_off(self, db):
+        source = ChannelSource("slack", db)
+        for i in range(3):
+            await db.insert_channel_observation(
+                "slack", "k", {"text": str(i), "message_id": str(i)},
+            )
+        first = await source.fetch(None, limit=2)
+
+        second = await source.fetch(first.next_cursor)
+
+        assert [r.content for r in first.records] == ["0", "1"]
+        assert [r.content for r in second.records] == ["2"]
+
+    async def test_a_full_batch_reports_more(self, db):
+        for i in range(4):
+            await db.insert_channel_observation(
+                "slack", "k", {"text": str(i), "message_id": str(i)},
+            )
+
+        result = await ChannelSource("slack", db).fetch(None, limit=2)
+
+        assert result.has_more
+
+    async def test_an_empty_buffer_holds_the_cursor(self, db):
+        result = await ChannelSource("slack", db).fetch("42")
+
+        assert result.records == []
+        assert result.next_cursor == "42"
+        assert not result.has_more
+
+    async def test_an_unreadable_cursor_starts_over_rather_than_failing(self, db):
+        # source_messages is keyed (source, id), so re-reading a bounded,
+        # TTL-capped buffer re-inserts nothing. Failing closed here would
+        # instead wedge the source until someone edited the database.
+        await db.insert_channel_observation(
+            "slack", "k", {"text": "hi", "message_id": "1"},
+        )
+
+        result = await ChannelSource("slack", db).fetch("not-a-number")
+
+        assert len(result.records) == 1
+
+    async def test_an_unreadable_row_is_skipped_and_passed(self, db):
+        # The wedge this guards against: if the cursor only ever advanced to
+        # the last row that *parsed*, a batch of entirely unreadable rows
+        # would move it nowhere, be re-read every run, and hide everything
+        # behind them for good.
+        source = ChannelSource("slack", db)
+        await _write_garbage(db)
+        await _write_garbage(db)
+
+        first = await source.fetch(None)
+
+        assert first.records == []
+        assert first.next_cursor == "2"
+
+        await db.insert_channel_observation(
+            "slack", "k", {"text": "reachable", "message_id": "3"},
+        )
+        second = await source.fetch(first.next_cursor)
+        assert [r.content for r in second.records] == ["reachable"]
+
+    async def test_valid_json_that_is_not_an_object_is_skipped(self, db):
+        # `[]` parses fine and then has no .get(). Letting that raise out of
+        # fetch would leave the cursor behind the row forever.
+        await db._write(
+            "INSERT INTO channel_observations "
+            "(channel, channel_key, payload, created_at, expires_at) "
+            "VALUES ('slack', 'k', '[]', '2026-01-01', '2099-01-01')",
+            (),
+        )
+        await db.insert_channel_observation(
+            "slack", "k", {"text": "reachable", "message_id": "2"},
+        )
+
+        result = await ChannelSource("slack", db).fetch(None)
+
+        assert [r.content for r in result.records] == ["reachable"]
+        assert result.next_cursor == "2"
+
+    async def test_the_same_message_observed_twice_lands_once(self, db):
+        payload = {
+            "conversation_id": "C1",
+            "message_id": "1700000000.000100",
+            "text": "hi",
+            "timestamp": "2023-11-14T22:13:20+00:00",
+        }
+        await db.insert_channel_observation("slack", "k", payload)
+        await db.insert_channel_observation("slack", "k", dict(payload))
+
+        result = await ChannelSource("slack", db).fetch(None)
+        inserted = await db.insert_source_messages(result.records, source="slack")
+
+        assert len(result.records) == 2
+        assert inserted == 1
+
+
+# ---------------------------------------------------------------------- #
+#  Draining a backlog                                                     #
+# ---------------------------------------------------------------------- #
+
+
+async def _fill(db, count, channel="slack"):
+    for i in range(count):
+        await db.insert_channel_observation(
+            channel, "slack:C1",
+            {
+                "conversation_id": "C1",
+                "message_id": str(i),
+                "text": f"message {i}",
+            },
+        )
+
+
+class TestDrainKeepsUp:
+    """A backlog deeper than one batch has to drain, not accumulate.
+
+    A watched channel busier than ``batch_size`` per tick would otherwise
+    fall permanently behind, and the buffer's own row cap then trims from the
+    old end, dropping the messages the drain had not reached yet.
+    """
+
+    async def test_a_backlog_past_one_batch_drains_in_one_run(self, db):
+        await _fill(db, 120)
+        runner = SourceRunner(
+            source=ChannelSource("slack", db), db=db, batch_size=50,
+        )
+
+        result = await runner.run()
+
+        assert result.records_ingested == 120
+        assert await db.get_sync_cursor("slack:observed") == "120"
+
+    async def test_the_run_stops_at_the_pass_bound_and_keeps_its_place(self, db):
+        # A bound, not a promise to empty the buffer. The next run resumes
+        # exactly where this one stopped.
+        await _fill(db, _MAX_PASSES * 2 + 5)
+        runner = SourceRunner(
+            source=ChannelSource("slack", db), db=db, batch_size=2,
+        )
+
+        first = await runner.run()
+        second = await runner.run()
+
+        assert first.records_ingested == _MAX_PASSES * 2
+        assert second.records_ingested == 5
+
+    async def test_a_source_that_never_advances_does_not_spin(self, db):
+        # has_more with a standing cursor re-reads the same batch, for nothing.
+        stuck = MagicMock()
+        stuck.source_name = "stuck:observed"
+        stuck.fetch = AsyncMock(return_value=FetchResult(
+            records=[SourceRecord(
+                id="1", source="stuck:observed", record_type="x",
+                summary="s", content="c", timestamp="",
+            )],
+            next_cursor=None,
+            has_more=True,
+        ))
+        stuck.preprocess = AsyncMock(side_effect=lambda r: r)
+        runner = SourceRunner(source=stuck, db=db, batch_size=1)
+
+        await runner.run()
+
+        assert stuck.fetch.await_count == 1
+
+    async def test_a_failure_mid_backlog_keeps_what_landed(self, db):
+        await _fill(db, 60)
+        source = ChannelSource("slack", db)
+        real_fetch = source.fetch
+        calls = []
+
+        async def fetch(cursor, limit=100):
+            calls.append(cursor)
+            if len(calls) > 1:
+                raise RuntimeError("buffer went away")
+            return await real_fetch(cursor, limit=limit)
+
+        source.fetch = fetch
+        runner = SourceRunner(source=source, db=db, batch_size=50)
+
+        result = await runner.run()
+
+        assert result.error == "buffer went away"
+        assert result.records_ingested == 50
+        # The first batch's cursor is durable, so the retry resumes past it.
+        assert await db.get_sync_cursor("slack:observed") == "50"
+
+
+# ---------------------------------------------------------------------- #
+#  Registry wiring                                                        #
+# ---------------------------------------------------------------------- #
+
+
+class TestRegistry:
+    def test_an_observing_channel_gets_a_runner(self, tmp_path):
+        cfg = NerveConfig()
+        cfg.slack.source = ChannelSourceConfig(
+            enabled=True, allow_conversations=["C0123ABCD"], schedule="*/7 * * * *",
+        )
+
+        runners = build_source_runners(cfg, MagicMock())
+
+        slack = [r for r in runners if r.source.source_name == "slack:observed"]
+        assert len(slack) == 1
+        # The runner carries its own cadence: the config lives at
+        # slack.source, and CronService would otherwise find no
+        # config.sync.slack section and never schedule it.
+        assert slack[0].schedule == "*/7 * * * *"
+
+    def test_the_carried_schedule_is_what_cron_uses(self):
+        # Without this the runner is built and then silently never
+        # scheduled: there is no config.sync.slack section to look up, so
+        # the lookup returns None and _plan_source_runners drops it.
+        from nerve.cron.service import CronService
+
+        service = CronService.__new__(CronService)
+        service.config = NerveConfig()
+        runner = MagicMock()
+        runner.source.source_name = "slack:observed"
+        runner.schedule = "*/7 * * * *"
+
+        assert service._source_schedule(runner) == "*/7 * * * *"
+
+    def test_a_non_string_schedule_is_ignored(self):
+        # _source_schedule reads a duck-typed attribute, and a bare
+        # MagicMock answers truthily to anything asked of it — which would
+        # otherwise put a mock where a crontab expression belongs.
+        from nerve.cron.service import CronService
+
+        service = CronService.__new__(CronService)
+        service.config = NerveConfig()
+        runner = MagicMock()
+        runner.source.source_name = "github"
+
+        assert service._source_schedule(runner) == NerveConfig().sync.github.schedule
+
+    def test_no_runner_without_a_conversation_grant(self, tmp_path):
+        cfg = NerveConfig()
+        cfg.slack.source = ChannelSourceConfig(enabled=True, allow_conversations=[])
+
+        runners = build_source_runners(cfg, MagicMock())
+
+        assert not [r for r in runners if r.source.source_name == "slack:observed"]
+
+    def test_no_runner_when_observation_is_off(self, tmp_path):
+        cfg = NerveConfig()
+
+        runners = build_source_runners(cfg, MagicMock())
+
+        assert not [r for r in runners if r.source.source_name == "slack:observed"]
+
+    def test_telegram_gets_the_same_treatment(self, tmp_path):
+        cfg = NerveConfig()
+        cfg.telegram.source = ChannelSourceConfig(
+            enabled=True, allow_conversations=["-100123"],
+        )
+
+        runners = build_source_runners(cfg, MagicMock())
+
+        assert [
+            r for r in runners if r.source.source_name == "telegram:observed"
+        ]
+
+
+class TestConfig:
+    def test_the_source_block_parses(self):
+        cfg = SlackConfig.from_dict({
+            "source": {
+                "enabled": True,
+                "allow_channels": ["C1"],
+                "deny_senders": ["U0BOT"],
+                "schedule": "*/9 * * * *",
+            },
+        })
+
+        assert cfg.source.enabled
+        assert cfg.source.allow_conversations == ["C1"]
+        assert cfg.source.deny_senders == ["U0BOT"]
+        assert cfg.source.schedule == "*/9 * * * *"
+
+    def test_the_source_is_off_by_default(self):
+        cfg = SlackConfig.from_dict({})
+
+        assert not cfg.source.enabled
+        assert cfg.source.allow_conversations == []
+
+    def test_handled_messages_are_left_to_the_live_route_by_default(self):
+        assert not SlackConfig.from_dict(
+            {"source": {}},
+        ).source.include_handled_messages
+        assert not TelegramConfig.from_dict(
+            {"source": {}},
+        ).source.include_handled_messages
+
+    @pytest.mark.parametrize("subject", ["slack", "telegram"])
+    def test_include_handled_messages_parses_on_both_transports(self, subject):
+        parse = SlackConfig.from_dict if subject == "slack" else (
+            TelegramConfig.from_dict
+        )
+        cfg = parse({"source": {"include_handled_messages": True}})
+
+        assert cfg.source.include_handled_messages
+
+    def test_a_mapping_allow_list_does_not_become_a_wildcard(self):
+        # {"*": false} reads like a disabled wildcard, and list() of it
+        # yields its keys. Guessing at intent would turn a config that looks
+        # switched off into one that grants everything.
+        cfg = SlackConfig.from_dict({
+            "source": {"enabled": True, "allow_channels": {"*": False}},
+        })
+
+        assert cfg.source.allow_conversations == []
+        assert not cfg.source.active if hasattr(
+            cfg.source, "active",
+        ) else True
+
+    @pytest.mark.parametrize("bad", [{"C1": True}, {"*": False}, None])
+    def test_a_mapping_or_missing_allow_list_grants_nothing(self, bad):
+        cfg = SlackConfig.from_dict({
+            "source": {"enabled": True, "allow_channels": bad},
+        })
+
+        assert cfg.source.allow_conversations == []
+
+    def test_a_bare_string_is_one_pattern_not_many(self):
+        # This is how `allow_conversations: ${OBSERVE_ROOMS}` arrives after
+        # interpolation. Dropping it would break the documented env-var
+        # idiom; splitting it would invent patterns nobody wrote.
+        cfg = SlackConfig.from_dict({
+            "source": {"allow_channels": "C0123ABCD"},
+        })
+
+        assert cfg.source.allow_conversations == ["C0123ABCD"]
+
+    def test_scalar_entries_are_kept_and_junk_dropped(self):
+        cfg = SlackConfig.from_dict({
+            "source": {"allow_channels": [{"a": 1}, "C1", "  ", "C2"]},
+        })
+
+        assert cfg.source.allow_conversations == ["C1", "C2"]
+
+    @pytest.mark.parametrize("bad", [5, "", "   ", None])
+    def test_an_unusable_schedule_falls_back(self, bad):
+        # There is no sync.slack section to fall back to, so an ignored
+        # schedule would leave the buffer filling with nothing draining it.
+        cfg = SlackConfig.from_dict({"source": {"schedule": bad}})
+
+        assert cfg.source.schedule == "*/5 * * * *"
+
+    @pytest.mark.parametrize("bad", [0, -1, 5])
+    def test_a_row_target_that_would_empty_the_buffer_is_refused(self, bad):
+        # Zero reads like "no limit" and means the opposite: the trim keeps
+        # no rows. SQLite reads a negative OFFSET as zero, so it does the same.
+        cfg = SlackConfig.from_dict({"source": {"max_stored_messages": bad}})
+
+        assert cfg.source.max_stored_messages == 100
+
+    def test_a_usable_row_target_is_kept(self):
+        cfg = SlackConfig.from_dict({"source": {"max_stored_messages": 250}})
+
+        assert cfg.source.max_stored_messages == 250
+
+    def test_each_transport_uses_its_own_noun(self):
+        # On Telegram a "channel" is a specific entity type distinct from a
+        # group, so one shared noun could not name both correctly.
+        slack = SlackConfig.from_dict({"source": {"allow_channels": ["C1"]}})
+        tg = TelegramConfig.from_dict({"source": {"allow_chats": ["-100"]}})
+
+        assert slack.source.allow_conversations == ["C1"]
+        assert tg.source.allow_conversations == ["-100"]
+
+    def test_the_other_transports_key_grants_nothing(self):
+        # Fail closed on a key this transport does not read, rather than
+        # quietly accepting it and collecting nothing anyway.
+        cfg = SlackConfig.from_dict({"source": {"allow_chats": ["C1"]}})
+
+        assert cfg.source.allow_conversations == []
+
+    @pytest.mark.parametrize(
+        "written,matched",
+        [
+            ("#eng-backend", "eng-backend"),
+            ("@alice", "alice"),
+            ("eng-backend", "eng-backend"),
+            ("*@example.com", "*@example.com"),
+        ],
+    )
+    def test_a_pasted_display_name_still_matches(self, written, matched):
+        # A chat client renders "#eng-backend"; the API name has no sigil and
+        # matching is literal, so left alone the paste would match nothing
+        # and an allow list would leave the inbox silently empty.
+        cfg = SlackConfig.from_dict({"source": {"allow_channels": [written]}})
+
+        assert cfg.source.allow_conversations == [matched]
+
+    def test_enabling_without_a_grant_warns(self, caplog):
+        with caplog.at_level("WARNING"):
+            SlackConfig.from_dict({"source": {"enabled": True}})
+
+        assert "allow_channels" in caplog.text
