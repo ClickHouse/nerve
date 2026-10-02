@@ -305,7 +305,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (!isCurrentAuthSession(authSession)) return;
 
     if (isHosted()) {
-      await enterHosted(authSession);
+      await enterHosted(authSession, status !== null);
       return;
     }
 
@@ -368,15 +368,21 @@ export const useAuthStore = create<AuthState>((set, get) => ({
  * page loaded, so there is no login form and no passwordless login:
  * `/api/auth/me` names the actor, or the gateway answer shows why the app
  * cannot open.
+ *
+ * `statusRead` is `false` when the status call failed. Behind the gateway,
+ * that failure already gives the reason, and `/api/auth/me` would fail the
+ * same way, so it is not called.
  */
-async function enterHosted(authSession: number): Promise<void> {
-  let viewer: Viewer | null;
-  try {
-    viewer = await api.getViewer();
-  } catch {
-    viewer = null;
+async function enterHosted(authSession: number, statusRead: boolean): Promise<void> {
+  let viewer: Viewer | null = null;
+  if (statusRead) {
+    try {
+      viewer = await api.getViewer();
+    } catch {
+      viewer = null;
+    }
+    if (!isCurrentAuthSession(authSession)) return;
   }
-  if (!isCurrentAuthSession(authSession)) return;
 
   if (viewer) {
     sessionEstablished = true;
@@ -390,9 +396,10 @@ async function enterHosted(authSession: number): Promise<void> {
     authenticated: false, ready: true, sessionExpired: false,
     viewer: null, account: null,
   });
-  // A 401 started re-entry, and a gateway error showed its own screen. Any
-  // other failure shows the unavailable screen, because there is no login
-  // form to show.
+  // A gateway 401 started re-entry, and a gateway error showed its own
+  // screen. Any other failure shows the unavailable screen, because there is
+  // no login form to show. A session check that a 401 from Nerve started can
+  // still replace it with re-entry or a screen that stops the app.
   if (!useHostedStore.getState().reentering) showProblem('unavailable');
 }
 
