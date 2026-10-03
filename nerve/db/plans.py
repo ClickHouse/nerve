@@ -69,6 +69,22 @@ class PlanStore:
             f"UPDATE plans SET {sets} WHERE id = ?", tuple(vals),
         )
 
+    async def transition_plan(self, plan_id: str, from_status: str, **fields) -> bool:
+        """Update a plan only if it is still in ``from_status``.
+
+        The status check and the write are one statement, so when several
+        callers race to act on the same plan exactly one of them gets
+        ``True``; the others get ``False`` and must not act.
+        """
+        if not fields:
+            raise ValueError("transition_plan needs at least one field to set")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        result = await self._write(
+            f"UPDATE plans SET {sets} WHERE id = ? AND status = ?",
+            (*fields.values(), plan_id, from_status),
+        )
+        return (result.rowcount or 0) == 1
+
     async def get_plans_for_task(self, task_id: str) -> list[dict]:
         async with self.db.execute(
             "SELECT * FROM plans WHERE task_id = ? ORDER BY version DESC",
