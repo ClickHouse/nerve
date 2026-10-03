@@ -359,6 +359,23 @@ def _clip(text: str, cap: int) -> str:
     return _html.escape(t) if t else "(no text)"
 
 
+# Telegram's limit for a callback-query toast (answerCallbackQuery text).
+_TOAST_MAX_LEN = 200
+
+
+def _fit_text(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters; '…' appended if cut."""
+    # Count UTF-16 code units (an emoji is two), which never undercounts.
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return text
+    units = 0
+    for end, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units >= limit:  # no room for this char and the ellipsis
+            break
+    return text[:end] + "…"
+
+
 def _fmt_local(iso: str, tz) -> "tuple[str, str]":
     """Return (day label, HH:MM) for an ISO timestamp in the user's timezone."""
     try:
@@ -1943,16 +1960,23 @@ class TelegramChannel(BaseChannel):
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"
+        # or, from a question button, "notifopt:{notification_id}:{option index}".
         parts = query.data.split(":", 2)
-        if len(parts) < 3 or parts[0] != "notif":
+        if len(parts) < 3 or parts[0] not in ("notif", "notifopt"):
             await query.answer()
             return
 
         notification_id = parts[1]
-        answer = parts[2]
 
         if not self._notification_service:
             await query.answer("Service unavailable", show_alert=True)
+            return
+
+        answer = await self._notification_service.resolve_telegram_answer(
+            notification_id, parts[2], by_index=parts[0] == "notifopt",
+        )
+        if answer is None:
+            await query.answer("Already answered or expired", show_alert=True)
             return
 
         success = await self._notification_service.handle_answer(
@@ -1973,15 +1997,19 @@ class TelegramChannel(BaseChannel):
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
                 )
                 toast = f"Snoozed until {snoozed_until}"
-            await query.answer(toast)
+            await query.answer(_fit_text(toast, _TOAST_MAX_LEN))
             try:
                 original = query.message.text or ""
                 await query.edit_message_text(
-                    text=f"{original}\n\n{status_line}",
+                    text=_fit_text(f"{original}\n\n{status_line}", MAX_MSG_LEN),
                     reply_markup=None,
                 )
             except Exception:
-                pass
+                # Remove the buttons anyway: the tap has been handled.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
         else:
             await query.answer("Already answered or expired", show_alert=True)
 
