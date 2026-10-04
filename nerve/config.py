@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from nerve import paths
 from nerve.coerce import FALSY, TRUTHY
@@ -43,6 +44,34 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _normalize_anthropic_base_url(value: Any) -> str:
+    """Return ``anthropic_base_url`` without a trailing ``/`` or ``/v1``.
+
+    The SDK clients and the Claude CLI add ``/v1/...`` themselves, so a value
+    that ends in ``/v1`` would otherwise request ``/v1/v1/messages``. Raises
+    ValueError for a value that is not an http or https URL with a host. The
+    URL may not carry credentials: it is logged, and the key goes in
+    ``anthropic_api_key``.
+    """
+    url = "" if value is None else str(value).strip()
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            "anthropic_base_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    url = url.rstrip("/")
+    return url.removesuffix("/v1")
 
 
 def _expand_path(p: str | None) -> Path | None:
@@ -2757,6 +2786,11 @@ class NerveConfig:
     openai_api_key: str = ""
     brave_search_api_key: str = ""
 
+    # Anthropic-compatible endpoint for every model request: the Claude CLI,
+    # the direct SDK calls and memU. Empty means api.anthropic.com. Stored
+    # without a trailing "/" or "/v1".
+    anthropic_base_url: str = ""
+
     # Where this config was loaded from (set by load_config, not a YAML key).
     # Used by anything that needs to write back (e.g. Telegram pairing
     # persisting allowed_users to config.local.yaml).
@@ -2764,11 +2798,17 @@ class NerveConfig:
 
     @property
     def anthropic_api_base_url(self) -> str:
-        """Effective Anthropic API base URL — proxy or direct."""
+        """Effective Anthropic API base URL, ending in ``/v1/``.
+
+        The local proxy comes first, then ``anthropic_base_url``, then
+        api.anthropic.com. Bedrock uses none.
+        """
         if self.provider.is_bedrock:
             return ""  # Bedrock doesn't use Anthropic base URL
         if self.proxy.enabled:
             return f"http://{self.proxy.host}:{self.proxy.port}/v1/"
+        if self.anthropic_base_url:
+            return f"{self.anthropic_base_url}/v1/"
         return "https://api.anthropic.com/v1/"
 
     @property
@@ -2947,7 +2987,25 @@ class NerveConfig:
     def from_dict(cls, d: dict) -> NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
+        config._validate_anthropic_base_url()
         return config
+
+    def _validate_anthropic_base_url(self) -> None:
+        """Refuse ``anthropic_base_url`` together with another endpoint setting.
+
+        The proxy and Bedrock each decide the endpoint, so the key would be
+        ignored without a word.
+        """
+        if not self.anthropic_base_url:
+            return
+        if self.proxy.enabled:
+            raise ValueError(
+                "anthropic_base_url cannot be set together with proxy.enabled"
+            )
+        if self.provider.is_bedrock:
+            raise ValueError(
+                "anthropic_base_url cannot be set together with provider.type: bedrock"
+            )
 
     @classmethod
     def _build_from_dict(cls, d: dict) -> NerveConfig:
@@ -2994,6 +3052,9 @@ class NerveConfig:
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
+            anthropic_base_url=_normalize_anthropic_base_url(
+                d.get("anthropic_base_url"),
+            ),
         )
 
 

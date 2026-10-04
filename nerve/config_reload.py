@@ -70,6 +70,7 @@ _ERROR_PREFIX = "error: "
 # the field.
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
+    "anthropic_base_url",
     "auth.jwt_secret",
     "codex.home_dir",
     "external_agents.enabled",

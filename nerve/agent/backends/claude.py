@@ -718,9 +718,10 @@ class ClaudeBackend:
             api_key = config.effective_api_key
             if api_key:
                 env["ANTHROPIC_API_KEY"] = api_key
-            if config.proxy.enabled:
+            if config.proxy.enabled or config.anthropic_base_url:
+                # The endpoint of Nerve's own SDK clients. The CLI adds /v1.
                 env["ANTHROPIC_BASE_URL"] = (
-                    f"http://{config.proxy.host}:{config.proxy.port}"
+                    config.anthropic_api_base_url.removesuffix("/v1/")
                 )
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron

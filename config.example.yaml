@@ -26,6 +26,11 @@ timezone: America/New_York
 #   port: 8317
 #   host: 127.0.0.1
 
+# Anthropic-compatible endpoint (optional), for example an LLM gateway. Every
+# model request goes here in place of api.anthropic.com: the Claude CLI, the
+# direct SDK calls and memU. Not with proxy.enabled or Bedrock.
+# anthropic_base_url: https://llm-gateway.example.com
+
 # Local Ollama — expose locally-installed Ollama models as selectable chat
 # models in the web composer's model picker. Ollama speaks an OpenAI-compatible
 # API, so this requires proxy.enabled: true (the proxy translates the
