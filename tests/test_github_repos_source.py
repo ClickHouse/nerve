@@ -165,6 +165,75 @@ async def test_one_repo_error_does_not_block_others():
     repos_seen = {r.metadata["repo_name"] for r in result.records}
     assert repos_seen == {"owner/repo-a"}
     assert len(result.records) == 2
+    assert result.next_cursor == "2026-06-12T08:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_keeps_cursor_until_missed_item_can_be_fetched():
+    src = GitHubReposSource(config={"repos": ["owner/repo-a", "owner/repo-b"]})
+    repo_b_available = False
+    data = {
+        "owner/repo-a": [
+            _issue(1, 101, "2026-06-12T11:00:00Z", "Issue A"),
+        ],
+        "owner/repo-b": [
+            _issue(2, 102, "2026-06-12T10:30:00Z", "Issue B"),
+        ],
+    }
+
+    async def flaky_gh_api_get(endpoint, timeout=30):
+        match = re.match(r"repos/([^/]+/[^/]+)/issues", endpoint)
+        repo = match.group(1)
+        if repo == "owner/repo-b" and not repo_b_available:
+            return None
+        return data[repo]
+
+    src._gh_api_get = flaky_gh_api_get
+
+    first = await src.fetch(cursor="2026-06-12T10:00:00Z")
+
+    assert [record.id for record in first.records] == ["101"]
+    assert first.next_cursor == "2026-06-12T10:00:00Z"
+
+    repo_b_available = True
+    second = await src.fetch(cursor=first.next_cursor)
+
+    assert [record.id for record in second.records] == ["102", "101"]
+    assert second.next_cursor == "2026-06-12T11:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_first_run_waits_for_every_repository_before_setting_baseline():
+    src = GitHubReposSource(config={"repos": ["owner/repo-a", "owner/repo-b"]})
+
+    async def flaky_gh_api_get(endpoint, timeout=30):
+        if "repo-b" in endpoint:
+            return None
+        return _REPO_DATA["owner/repo-a"]
+
+    src._gh_api_get = flaky_gh_api_get
+    result = await src.fetch(cursor=None)
+
+    assert result.records == []
+    assert result.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_empty_repository_response_does_not_prevent_cursor_advance():
+    src = _make_source(
+        ["owner/repo-a", "owner/repo-b"],
+        data={
+            "owner/repo-a": [
+                _issue(1, 101, "2026-06-12T11:00:00Z", "Issue A"),
+            ],
+            "owner/repo-b": [],
+        },
+    )
+
+    result = await src.fetch(cursor="2026-06-12T10:00:00Z")
+
+    assert [record.id for record in result.records] == ["101"]
+    assert result.next_cursor == "2026-06-12T11:00:00Z"
 
 
 @pytest.mark.asyncio
