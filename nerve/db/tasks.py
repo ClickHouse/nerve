@@ -116,6 +116,8 @@ class TaskStore:
             # search works without rewriting the key — and the key stays joinable.
             await self._record_status_event(task_id, previous_status, status, actor)
 
+            if getattr(self, "persistent_task_content", False):
+                await self.db.execute("UPDATE tasks SET content=? WHERE id=?", (content, task_id))
             fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
             await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
             await self.db.execute(

@@ -279,7 +279,7 @@ async def session_context_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
 
 def _fetch_history_rows(
-    db_path: str, date: str, end_date: str, limit: int,
+    db_path: str, date: str, end_date: str, limit: int, config=None,
 ) -> list[dict]:
     """Query items by happened_at range.  Sync — call via asyncio.to_thread.
 
@@ -287,7 +287,8 @@ def _fetch_history_rows(
     memu_memory_items; with 20K+ rows it takes long enough to matter on
     the event loop.
     """
-    db = sqlite3.connect(db_path, timeout=10)
+    from nerve.memory.storage import connect_memory
+    db = connect_memory(db_path, config)
     db.row_factory = sqlite3.Row
     try:
         rows = db.execute(
@@ -304,10 +305,11 @@ def _fetch_history_rows(
 
 
 def _fetch_records_rows(
-    db_path: str, date: str, end_date: str, limit: int, include_updated: bool,
+    db_path: str, date: str, end_date: str, limit: int, include_updated: bool, config=None,
 ) -> list[dict]:
     """Query items by created/updated range.  Sync — call via asyncio.to_thread."""
-    db = sqlite3.connect(db_path, timeout=10)
+    from nerve.memory.storage import connect_memory
+    db = connect_memory(db_path, config)
     db.row_factory = sqlite3.Row
     try:
         if include_updated:
@@ -343,7 +345,7 @@ async def conversation_history_handler(ctx: ToolContext, args: dict) -> ToolResu
     try:
         db_path = _resolve_memu_db_path(ctx)
         rows = await asyncio.to_thread(
-            _fetch_history_rows, db_path, date, end_date, limit,
+            _fetch_history_rows, db_path, date, end_date, limit, ctx.config,
         )
 
         if not rows:
@@ -373,7 +375,7 @@ async def memory_records_by_date_handler(ctx: ToolContext, args: dict) -> ToolRe
         db_path = _resolve_memu_db_path(ctx)
         rows = await asyncio.to_thread(
             _fetch_records_rows, db_path, date, end_date, limit,
-            bool(include_updated),
+            bool(include_updated), ctx.config,
         )
 
         if not rows:

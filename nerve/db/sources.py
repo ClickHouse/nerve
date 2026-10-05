@@ -158,10 +158,13 @@ class SourceStore:
                         # (while the old row still counts toward the max) and insert
                         # at that explicit rowid so it is always above every prior
                         # rowid and every consumer cursor.
-                        async with self.db.execute(
-                            "SELECT COALESCE(MAX(rowid), 0) + 1 FROM source_messages"
-                        ) as cursor:
-                            forced_rowid = (await cursor.fetchone())[0]
+                        if hasattr(self, "next_source_sequence"):
+                            forced_rowid = await self.next_source_sequence()
+                        else:
+                            async with self.db.execute(
+                                "SELECT COALESCE(MAX(rowid), 0) + 1 FROM source_messages"
+                            ) as cursor:
+                                forced_rowid = (await cursor.fetchone())[0]
                         await self.db.execute(
                             "DELETE FROM source_messages WHERE source = ? AND id = ?",
                             (source, r.id),

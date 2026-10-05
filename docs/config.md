@@ -272,6 +272,10 @@ reload cannot inspect, and are documented here only.
 |--------|-----|
 | `gateway.host`, `.port`, `.ssl.*` | the socket is already bound |
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
+| `use_postgresql` | PostgreSQL selection; requires restart |
+| `postgresql_dsn` | Connection string; requires restart |
+| `tenant_id` | Storage tenant; requires restart |
+| `workflow_id` | Storage workflow; requires restart |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
 | `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
@@ -1381,3 +1385,11 @@ active runs `failed` and notifies. See [workflow-runs.md](workflow-runs.md).
 | `workflows.kill_grace_seconds` | int | `30` | After the graceful stop at 100% budget, how long to wait before force-discarding the session's client (kills its subprocess) |
 | `workflows.max_concurrent_runs` | int | `2` | Runs dispatched concurrently; excess queues in status `pending`. Each running workflow occupies one `agent.max_concurrent` slot for its whole turn — keep this well below that limit |
 | `workflows.allow_unbudgeted` | bool | `false` | Permit starting runs without `budget_usd`. Budget enforcement is the point of this surface, so off by default |
+
+
+### PostgreSQL
+
+Set `use_postgresql: true`, `postgresql_dsn: ${NERVE_POSTGRES_DSN}`, and stable
+`tenant_id` / `workflow_id` values to keep task, session and memory state in
+PostgreSQL. SQLite remains the default. See [PostgreSQL storage](postgresql.md)
+for schema provisioning, ephemeral caches and backup requirements.

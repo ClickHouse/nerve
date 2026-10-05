@@ -1611,6 +1611,20 @@ class MemUBridge:
         self._start_memu_loop()
         return await self._submit(self._initialize_impl())
 
+    def _memory_sql_connection(self, path, timeout=10):
+        if self.config.use_postgresql:
+            from nerve.db.postgres.reader import SyncConnection
+            return SyncConnection(self.config, memory=True)
+        import sqlite3
+        return sqlite3.connect(path, timeout=timeout)
+
+    async def _storage_call(self, operation, **kwargs):
+        if not self.config.use_postgresql:
+            return await getattr(self._service, operation)(**kwargs)
+        async with self._service.database.guard():
+            self._service.database.restore_resources(self._service.database.cache_dir)
+            return await getattr(self._service, operation)(**kwargs)
+
     async def _initialize_impl(self) -> bool:
         """Initialize the memU service with SQLite persistence (memU loop)."""
         try:
@@ -1632,13 +1646,15 @@ class MemUBridge:
             # DateTime.  SQLAlchemy's datetime.fromisoformat() crashes on
             # non-string values, breaking list_items() and the entire item
             # cache.  Sanitize on startup and add a defensive type adapter.
-            self._sanitize_memu_datetimes(sqlite_dsn)
+            if not self.config.use_postgresql:
+                self._sanitize_memu_datetimes(sqlite_dsn)
 
             # ── SQLite tuning ──
             # Convert to WAL once (persistent) so writers stop blocking
             # readers; per-connection pragmas are attached to the engine
             # right after the service is constructed.
-            self._setup_sqlite_pragmas(sqlite_dsn)
+            if not self.config.use_postgresql:
+                self._setup_sqlite_pragmas(sqlite_dsn)
 
             # ── Bedrock detection ──
             # When provider is Bedrock, anthropic_api_base_url and
@@ -1697,14 +1713,18 @@ class MemUBridge:
                 }
                 memorize_profile = "memorize"
 
+            if self.config.use_postgresql:
+                from nerve.memory.postgres import MemoryScope
+
             self._service = MemoryService(
+                user_config={"model": MemoryScope} if self.config.use_postgresql else None,
                 llm_profiles=llm_profiles,
                 blob_config={
                     "resources_dir": str(resources_dir),
                 },
                 database_config={
                     "metadata_store": {
-                        "provider": "sqlite",
+                        "provider": "inmemory" if self.config.use_postgresql else "sqlite",
                         "dsn": sqlite_dsn,
                     },
                 },
@@ -1759,13 +1779,20 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
+            if self.config.use_postgresql:
+                from nerve.memory.postgres import MemoryStore
+                self._service.database = MemoryStore(self.config)
+                self._service.database.cache_dir = resources_dir
+                async with self._service.database.guard():
+                    self._service.database.restore_resources(resources_dir)
             self._available = True
             self._metrics.service_available = True
             self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
-            logger.info("memU service initialized with SQLite at %s", sqlite_dsn)
+            logger.info("memU service initialized (%s)", "postgresql" if self.config.use_postgresql else "sqlite")
 
             # Per-connection pragmas (busy_timeout, synchronous=NORMAL).
-            self._attach_engine_pragmas()
+            if not self.config.use_postgresql:
+                self._attach_engine_pragmas()
 
             # Hot-path indexes memu-py's schema is missing (idempotent; the
             # first run on a large corpus pays a one-time build). Must run
@@ -1779,7 +1806,8 @@ class MemUBridge:
                 "__tablename__",
                 None,
             ) or "memu_memory_items"
-            self._ensure_sqlite_indexes(sqlite_dsn, item_table)
+            if not self.config.use_postgresql:
+                self._ensure_sqlite_indexes(sqlite_dsn, item_table)
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
@@ -2063,9 +2091,13 @@ class MemUBridge:
             return True
 
         except ImportError:
+            if self.config.use_postgresql:
+                raise RuntimeError("PostgreSQL memory dependencies are required") from None
             logger.warning("memU not installed — memory recall will be unavailable")
             return False
         except Exception as e:
+            if self.config.use_postgresql:
+                raise RuntimeError("PostgreSQL memory initialization failed; verify storage and model configuration") from None
             logger.error("Failed to initialize memU: %s", e, exc_info=True)
             return False
 
@@ -2475,7 +2507,7 @@ class MemUBridge:
                 # dedicated memU loop.  Cancellation (wait_for timeout)
                 # propagates through _submit to the memU-loop task.
                 response = await asyncio.wait_for(
-                    self._submit(self._service.memorize(
+                    self._submit(self._storage_call("memorize",
                         resource_url=file_path,
                         modality=modality,
                     )),
@@ -2718,10 +2750,11 @@ class MemUBridge:
 
         db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
         try:
-            db = sqlite3.connect(db_path, timeout=30)
+            db = self._memory_sql_connection(db_path, timeout=30)
             db.row_factory = sqlite3.Row
-            db.execute("PRAGMA busy_timeout=30000")
-            db.execute("PRAGMA synchronous=NORMAL")
+            if not self.config.use_postgresql:
+                db.execute("PRAGMA busy_timeout=30000")
+                db.execute("PRAGMA synchronous=NORMAL")
 
             cutoff = (
                 datetime.now(timezone.utc)
@@ -3023,7 +3056,7 @@ class MemUBridge:
         try:
             # Retrieve runs vector search (numpy) and possibly SQLite reads
             # inline — keep it on the memU loop.
-            result = await self._submit(self._service.retrieve(
+            result = await self._submit(self._storage_call("retrieve",
                 queries=[{"role": "user", "content": query}],
             ))
 
@@ -3108,7 +3141,7 @@ class MemUBridge:
             import sqlite3
 
             dsn = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
-            db = sqlite3.connect(dsn)
+            db = self._memory_sql_connection(dsn)
             db.row_factory = sqlite3.Row
             try:
                 crow = db.execute(
@@ -3485,7 +3518,7 @@ class MemUBridge:
             pass
 
         try:
-            db = _sqlite3.connect(db_path, timeout=10)
+            db = self._memory_sql_connection(db_path, timeout=10)
             db.row_factory = _sqlite3.Row
             stats["total_items"] = db.execute("SELECT COUNT(*) FROM memu_memory_items").fetchone()[0]
             stats["total_categories"] = db.execute("SELECT COUNT(*) FROM memu_memory_categories").fetchone()[0]

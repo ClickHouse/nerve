@@ -65,6 +65,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4", "pgvector>=0.4,<1"]
 # Test/dev dependencies. Install with: uv sync --extra test
 # Upper bounds guard CI against surprise major-version breaks (notably the
 # pytest-asyncio 1.x event_loop changes the suite's conftest relies on).

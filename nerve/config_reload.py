@@ -69,6 +69,10 @@ _ERROR_PREFIX = "error: "
 # or the individual values are what an operator needs to read, the entry names
 # the field.
 _RESTART_ONLY_PATHS = (
+    "use_postgresql",
+    "postgresql_dsn",
+    "tenant_id",
+    "workflow_id",
     "agent.max_concurrent",
     "auth.jwt_secret",
     "codex.home_dir",
@@ -133,7 +137,7 @@ def _describe(path: str, before, after) -> str:
     be: a secret, and a whole section, whose repr is both unreadable and liable
     to hold one (``proxy`` carries the local proxy's API key).
     """
-    if path in _SECRET_PATHS or dataclasses.is_dataclass(before):
+    if path == "postgresql_dsn" or path in _SECRET_PATHS or dataclasses.is_dataclass(before):
         return f"{path}: changed"
     return f"{path}: {before!r} → {after!r}"
 
@@ -293,6 +297,11 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     # 1. Config object — so lockdown and settings changes engage everywhere.
     try:
         new_config = load_config(config_dir)
+        if old_config is not None and any(
+            getattr(old_config, key, None) != getattr(new_config, key, None)
+            for key in ("use_postgresql", "postgresql_dsn", "tenant_id", "workflow_id")
+        ):
+            raise ValueError("Storage configuration changes require a restart")
         set_config(new_config)
     except Exception as e:  # noqa: BLE001 — e.g. an invalid edit; report, keep going
         summary["config"] = f"{_ERROR_PREFIX}{e}"
