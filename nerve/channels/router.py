@@ -58,6 +58,11 @@ class ChannelRouter:
         self._pending_batches: dict[
             str, list[tuple[InboundMessage, asyncio.Future[str]]]
         ] = {}
+        # Where each session was last messaged from: session_id ->
+        # (channel_name, target). Autonomous turns stream back there.
+        self._last_inbound: dict[str, tuple[str, str]] = {}
+        # Open autonomous-turn streams: session_id -> (listener_id, adapter)
+        self._autonomous: dict[str, tuple[str, StreamAdapter]] = {}
 
     # ------------------------------------------------------------------ #
     #  Channel registry                                                    #
@@ -113,6 +118,8 @@ class ChannelRouter:
             session_id = await self.engine.sessions.get_active_session(
                 msg.channel_key, source=msg.channel_name, actor=None,
             )
+
+        self._last_inbound[session_id] = (msg.channel_name, msg.sender_id)
 
         # Store message context for reaction support
         msg_id = msg.metadata.get("message_id") if msg.metadata else None
@@ -490,6 +497,57 @@ class ChannelRouter:
             text=formatted,
             session_id=session_id or "",
         ))
+
+    # ------------------------------------------------------------------ #
+    #  Autonomous turns: engine → channel                                  #
+    # ------------------------------------------------------------------ #
+    #
+    # When a background task settles, the CLI runs an autonomous turn
+    # that no inbound message started. The engine streams it to the
+    # broadcaster, which reaches the web UI, but a channel's adapter only
+    # lives for the run of the message it answers. Without the methods
+    # below, a Telegram session never saw anything said in an autonomous
+    # turn.
+
+    async def open_autonomous_stream(self, session_id: str) -> None:
+        """Stream an autonomous turn to the channel that last messaged the
+        session.
+
+        A no-op when the session was never messaged through a router
+        channel (web UI, cron, workflow runs), or when a user run is
+        already streaming to the same target (the turn then reaches it
+        through that run's adapter).
+        """
+        if session_id in self._autonomous:
+            return
+        last = self._last_inbound.get(session_id)
+        if last is None:
+            return
+        channel_name, target = last
+        channel = self._channels.get(channel_name)
+        if channel is None or (channel_name, target) in self._adapters:
+            return
+
+        adapter = StreamAdapter(channel, target, session_id, send_empty=False)
+        listener_id = f"{channel_name}:{target}:autonomous"
+        self._autonomous[session_id] = (listener_id, adapter)
+        await adapter.initialize()
+        await broadcaster.register(session_id, listener_id, adapter.on_event)
+
+    async def close_autonomous_stream(self, session_id: str) -> None:
+        """End a session's autonomous-turn stream (idempotent).
+
+        If the turn ended without a ``done`` event (cancelled, failed),
+        the adapter is finished here: whatever text arrived is sent, and
+        an empty placeholder is deleted.
+        """
+        entry = self._autonomous.pop(session_id, None)
+        if entry is None:
+            return
+        listener_id, adapter = entry
+        await broadcaster.unregister(session_id, listener_id)
+        if not adapter.finished:
+            await adapter.on_event(session_id, {"type": "done"})
 
     # ------------------------------------------------------------------ #
     #  Streaming adapter lifecycle                                         #
