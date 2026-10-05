@@ -158,13 +158,15 @@ export function BottomNav() {
           })}
         </div>
 
-        <button
-          onClick={logout}
-          className="flex w-full cursor-pointer items-center gap-3 border-t border-border-subtle px-4 py-3 text-left text-sm text-text-faint hover:bg-surface-hover"
-        >
-          <LogOut size={18} />
-          Log out
-        </button>
+        {!hosted && (
+          <button
+            onClick={logout}
+            className="flex w-full cursor-pointer items-center gap-3 border-t border-border-subtle px-4 py-3 text-left text-sm text-text-faint hover:bg-surface-hover"
+          >
+            <LogOut size={18} />
+            Log out
+          </button>
+        )}
       </Drawer>
     </>
   );

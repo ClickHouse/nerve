@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  ApiError, authUrl, csrfHeaders, handleHostedError, hostedLogout, isHosted, loginUrl,
+  ApiError, authUrl, bindHostedPrincipal, csrfHeaders, handleHostedError, isHosted, loginUrl,
   probeSession, problemOf, reenter, reportError, setAuthMode, setBeforeReenter,
   setTokenReader, showProblem, useHostedStore,
 } from './hosted';
@@ -20,7 +20,7 @@ function reply(status: number, body: unknown = {}): Response {
 }
 
 beforeEach(() => {
-  useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+  useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
   setBeforeReenter(null);
   setTokenReader(() => null);
   assign = vi.fn();
@@ -148,6 +148,20 @@ describe('showProblem', () => {
 });
 
 describe('reenter', () => {
+  it('saves queued work before subscribers disconnect the app', () => {
+    const events: string[] = [];
+    setBeforeReenter(() => events.push('save'));
+    const unsubscribe = useHostedStore.subscribe((state) => {
+      if (state.reentering) events.push('disconnect');
+    });
+    assign.mockImplementation(() => events.push('navigate'));
+
+    reenter();
+    unsubscribe();
+
+    expect(events).toEqual(['save', 'disconnect', 'navigate']);
+  });
+
   it('keeps the unsent text, then goes to the gateway login for this page', () => {
     const order: string[] = [];
     setBeforeReenter(() => order.push('keep'));
@@ -209,7 +223,8 @@ describe('reenter', () => {
 
 describe('probeSession', () => {
   it('asks the gateway and allows a retry when the session is valid', async () => {
-    fetchMock.mockResolvedValue(reply(200, { authenticated: true }));
+    bindHostedPrincipal('alice');
+    fetchMock.mockResolvedValue(reply(200, { authenticated: true, principalId: 'alice' }));
 
     await expect(probeSession()).resolves.toBe(true);
 
@@ -243,15 +258,35 @@ describe('probeSession', () => {
     expect(useHostedStore.getState().problem).toBe('agent_archived');
   });
 
-  it('allows a retry when the gateway gives no decision', async () => {
+  it('does not admit a new socket when the gateway gives no decision', async () => {
     fetchMock.mockResolvedValueOnce(reply(503, { reason: 'unavailable' }));
-    await expect(probeSession()).resolves.toBe(true);
+    await expect(probeSession()).resolves.toBe(false);
 
     fetchMock.mockRejectedValueOnce(new TypeError('network'));
-    await expect(probeSession()).resolves.toBe(true);
+    await expect(probeSession()).resolves.toBe(false);
 
     expect(assign).not.toHaveBeenCalled();
   });
+
+  it('keeps the old principals work and re-enters when the cookie names another person', async () => {
+    bindHostedPrincipal('alice');
+    const keep = vi.fn();
+    setBeforeReenter(keep);
+    fetchMock.mockResolvedValue(reply(200, { authenticated: true, principalId: 'bob' }));
+
+    await expect(probeSession()).resolves.toBe(false);
+
+    expect(keep).toHaveBeenCalledOnce();
+    expect(assign).toHaveBeenCalledOnce();
+    expect(useHostedStore.getState().principalId).toBe('alice');
+  });
+
+  it.each([{}, { authenticated: true }, { authenticated: false, principalId: 'alice' }])(
+    'requires a complete authenticated identity: %j', async (body) => {
+      fetchMock.mockResolvedValue(reply(200, body));
+      await expect(probeSession()).resolves.toBe(false);
+      expect(assign).not.toHaveBeenCalled();
+    });
 });
 
 describe('reportError and handleHostedError', () => {
@@ -323,27 +358,5 @@ describe('reportError and handleHostedError', () => {
 
     expect(isHosted()).toBe(false);
     expect(useHostedStore.getState().problem).toBeNull();
-  });
-});
-
-describe('hostedLogout', () => {
-  it('ends the gateway session with the CSRF header, then goes to the root', async () => {
-    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
-
-    await hostedLogout();
-
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('/_nerve/logout');
-    expect(init.method).toBe('POST');
-    expect(init.headers).toEqual({ 'X-Nerve-CSRF': '1' });
-    expect(assign).toHaveBeenCalledWith('/');
-  });
-
-  it('goes to the root also when the request fails', async () => {
-    fetchMock.mockRejectedValue(new TypeError('network'));
-
-    await hostedLogout();
-
-    expect(assign).toHaveBeenCalledWith('/');
   });
 });

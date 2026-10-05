@@ -47,8 +47,9 @@ function App() {
   // WebSocket and loads nothing.
   const hosted = useHostedStore((s) => s.mode === 'external');
   const problem = useHostedStore((s) => s.problem);
+  const reentering = useHostedStore((s) => s.reentering);
   const stopped = stopsApp(problem);
-  const live = authenticated && !stopped;
+  const live = ready && authenticated && !stopped && !reentering;
 
   useEffect(() => { checkAuth(); }, []);
 
@@ -64,6 +65,7 @@ function App() {
   // claimed instance from a passwordless one.
   if (!ready) return null;
   if (hosted) {
+    if (reentering) return null;
     if (stopsApp(problem)) return <HostedProblemScreen problem={problem} />;
     // Without an actor there is no app to show. A tab on its way to the
     // gateway login shows nothing.

@@ -10,9 +10,11 @@
 // localStorage is full or disabled the draft simply stays in memory — typing
 // is never blocked.
 
+import { viewerStorageKey } from './viewerStorage';
+
 const PREFIX = 'nerve_draft_';
 
-const keyFor = (sessionId: string) => `${PREFIX}${sessionId}`;
+const keyFor = (sessionId: string) => viewerStorageKey(`${PREFIX}${sessionId}`);
 
 /** Collect the session ids of all persisted draft keys (safe if storage is off). */
 function draftKeys(): string[] {
@@ -20,7 +22,7 @@ function draftKeys(): string[] {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && k.startsWith(PREFIX)) keys.push(k);
+      if (k && k.startsWith(viewerStorageKey(PREFIX)) && k !== viewerStorageKey(ORPHAN_KEY)) keys.push(k);
     }
   } catch { /* storage unavailable */ }
   return keys;
@@ -32,7 +34,7 @@ export function loadDrafts(): Record<string, string> {
   for (const k of draftKeys()) {
     try {
       const text = localStorage.getItem(k);
-      if (text) out[k.slice(PREFIX.length)] = text;
+      if (text) out[k.slice(viewerStorageKey(PREFIX).length)] = text;
     } catch { /* ignore a single unreadable key */ }
   }
   return out;
@@ -60,7 +62,7 @@ const ORPHAN_GRACE_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days
 
 function readOrphans(): Record<string, number> {
   try {
-    const raw = localStorage.getItem(ORPHAN_KEY);
+    const raw = localStorage.getItem(viewerStorageKey(ORPHAN_KEY));
     const parsed = raw ? JSON.parse(raw) : null;
     return parsed && typeof parsed === 'object' ? parsed as Record<string, number> : {};
   } catch { return {}; }
@@ -68,8 +70,8 @@ function readOrphans(): Record<string, number> {
 
 function writeOrphans(map: Record<string, number>): void {
   try {
-    if (Object.keys(map).length) localStorage.setItem(ORPHAN_KEY, JSON.stringify(map));
-    else localStorage.removeItem(ORPHAN_KEY);
+    if (Object.keys(map).length) localStorage.setItem(viewerStorageKey(ORPHAN_KEY), JSON.stringify(map));
+    else localStorage.removeItem(viewerStorageKey(ORPHAN_KEY));
   } catch { /* quota / disabled — bookkeeping is best-effort */ }
 }
 
@@ -91,7 +93,7 @@ export function pruneDrafts(keep: Set<string>): void {
   let changed = false;
 
   for (const k of draftKeys()) {
-    const id = k.slice(PREFIX.length);
+    const id = k.slice(viewerStorageKey(PREFIX).length);
 
     if (keep.has(id)) {
       // Recognized again — clear any pending reclaim.
@@ -122,7 +124,7 @@ export function pruneDrafts(keep: Set<string>): void {
 export function orphanedDrafts(keep: Set<string>): Array<{ id: string; text: string }> {
   const out: Array<{ id: string; text: string }> = [];
   for (const k of draftKeys()) {
-    const id = k.slice(PREFIX.length);
+    const id = k.slice(viewerStorageKey(PREFIX).length);
     if (keep.has(id)) continue;
     try {
       const text = localStorage.getItem(k);

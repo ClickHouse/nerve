@@ -372,7 +372,7 @@ describe('hosted mode', () => {
   }
 
   beforeEach(() => {
-    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
     getToken.mockReturnValue(null);
     fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -382,7 +382,7 @@ describe('hosted mode', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
   });
 
   it('reads the actor without a token and never logs in', async () => {
@@ -476,7 +476,7 @@ describe('hosted mode', () => {
     expect(api.login).toHaveBeenCalledWith('');
   });
 
-  it('logs out through the gateway after it purges the account state', async () => {
+  it('leaves hosted identity and account controls with the control plane', () => {
     useHostedStore.setState({ mode: 'external' });
     useAuthStore.setState({
       authenticated: true,
@@ -486,16 +486,14 @@ describe('hosted mode', () => {
 
     useAuthStore.getState().logout();
 
-    expect(clearAllDrafts).toHaveBeenCalled();
-    expect(clearAllReads).toHaveBeenCalled();
+    expect(clearAllDrafts).not.toHaveBeenCalled();
+    expect(clearAllReads).not.toHaveBeenCalled();
     expect(clearToken).not.toHaveBeenCalled();
     expect(api.authStatus).not.toHaveBeenCalled();
     expect(useAuthStore.getState()).toMatchObject({
-      authenticated: false, viewer: null, account: null,
+      authenticated: true, viewer: hostedMe().actor, account: null,
     });
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('/_nerve/logout');
-    expect(init).toMatchObject({ method: 'POST', headers: { 'X-Nerve-CSRF': '1' } });
-    await vi.waitFor(() => expect(assign).toHaveBeenCalledWith('/'));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(assign).not.toHaveBeenCalled();
   });
 });

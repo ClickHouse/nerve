@@ -384,10 +384,10 @@ function handleUnauthorized(requestRevision: number): Error {
  * body is a gateway error.
  */
 async function send(
-  path: string, init: RequestInit, headers: Record<string, string>,
+  path: string, init: RequestInit, headers: Record<string, string>, authenticate = true,
 ): Promise<Response> {
   const hosted = isHosted();
-  const requestToken = hosted ? null : authToken;
+  const requestToken = hosted || !authenticate ? null : authToken;
   const requestRevision = tokenRevision;
   if (requestToken) {
     headers['Authorization'] = `Bearer ${requestToken}`;
@@ -397,22 +397,22 @@ async function send(
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
 
   if (res.ok) {
-    if (!hosted) absorbRefreshedToken(res, requestRevision);
+    if (!hosted && authenticate) absorbRefreshedToken(res, requestRevision);
     return res;
   }
 
   const error = new ApiError(res.status, await res.text());
   if (handleHostedError(error)) throw error;
-  if (res.status === 401) throw handleUnauthorized(requestRevision);
-  absorbRefreshedToken(res, requestRevision);
+  if (res.status === 401 && authenticate) throw handleUnauthorized(requestRevision);
+  if (authenticate) absorbRefreshedToken(res, requestRevision);
   throw error;
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, authenticate = true): Promise<T> {
   const res = await send(path, options, {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
-  });
+  }, authenticate);
   return res.json();
 }
 
@@ -433,7 +433,9 @@ export const api = {
 
   checkAuth: () => request<{ authenticated: boolean }>('/auth/check'),
 
-  authStatus: () => request<AuthStatus>('/auth/status'),
+  // Mode discovery must work even when a local JWT is left in storage on a
+  // now-hosted origin. A bearer would override the valid gateway cookie.
+  authStatus: () => request<AuthStatus>('/auth/status', {}, false),
 
   /**
    * Who this session acts as. Doubles as the authentication check at startup:

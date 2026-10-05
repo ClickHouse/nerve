@@ -7,8 +7,8 @@ import { create } from 'zustand';
  * gateway signs the browser in with its own session cookie and tells Nerve
  * who the actor is. The browser holds no Nerve token: it sends no
  * `Authorization` header and adds no `?token=` to a URL. The gateway owns
- * login (`/_nerve/login`), the session check (`/_nerve/session`) and logout
- * (`/_nerve/logout`).
+ * login (`/_nerve/login`) and the session check (`/_nerve/session`). Hosted
+ * account controls belong to the control plane; the agent UI has no logout.
  *
  * `GET /api/auth/status` reports the mode. The mode is local until the status
  * answers, and also when the status has no `mode` or an unknown one, so the UI
@@ -27,6 +27,8 @@ export type HostedProblem = 'access_denied' | 'agent_archived' | 'unavailable';
 
 interface HostedState {
   mode: AuthMode;
+  /** Fixed for this page after /api/auth/me verifies the viewer. */
+  principalId: string | null;
   problem: HostedProblem | null;
   /** The page is on its way to the gateway login. */
   reentering: boolean;
@@ -34,6 +36,7 @@ interface HostedState {
 
 export const useHostedStore = create<HostedState>(() => ({
   mode: 'local',
+  principalId: null,
   problem: null,
   reentering: false,
 }));
@@ -46,6 +49,22 @@ export function setAuthMode(mode: unknown): void {
 /** Whether this Nerve runs in external mode behind the gateway. */
 export function isHosted(): boolean {
   return useHostedStore.getState().mode === 'external';
+}
+
+/** A different person must enter a fresh page, with their own saved state. */
+export function bindHostedPrincipal(principalId: string): boolean {
+  const current = useHostedStore.getState().principalId;
+  if (current !== null && current !== principalId) {
+    reenter();
+    return false;
+  }
+  useHostedStore.setState({ principalId });
+  return true;
+}
+
+export function hostedSessionActive(): boolean {
+  const { principalId, reentering, problem } = useHostedStore.getState();
+  return principalId !== null && !reentering && !stopsApp(problem);
 }
 
 /** The path prefix that the gateway keeps for its own routes. */
@@ -181,6 +200,7 @@ export function clearUnavailable(): void {
 }
 
 let beforeReenter: (() => void) | null = null;
+let preparingReentry = false;
 
 /**
  * Install the work that keeps unsent text before the page leaves for the
@@ -216,16 +236,20 @@ export function loginUrl(): string {
  */
 export function reenter(): void {
   const { reentering, problem } = useHostedStore.getState();
-  if (reentering || stopsApp(problem)) return;
+  if (preparingReentry || reentering || stopsApp(problem)) return;
   if (window.location.pathname.startsWith(GATEWAY_PREFIX)) {
     showProblem('unavailable');
     return;
   }
-  useHostedStore.setState({ reentering: true });
+  // Save before subscribers unmount the composer or disconnect its socket.
+  preparingReentry = true;
   try {
     beforeReenter?.();
   } catch (e) {
     console.error('Could not keep the unsent text:', e);
+  } finally {
+    useHostedStore.setState({ reentering: true });
+    preparingReentry = false;
   }
   window.location.assign(loginUrl());
 }
@@ -236,11 +260,12 @@ export function reenter(): void {
  * why an upgrade failed. An API request calls it after a 401 that the gateway
  * did not send.
  *
- * A 401 starts re-entry. A 403 or a 410 shows its screen. Returns `true` when
- * the caller can retry: the session is valid (so the backend is down), or the
- * gateway gave no decision.
+ * A 401 starts re-entry. A 403 or a 410 shows its screen. A changed principal
+ * starts re-entry too, saving this person's queued text before leaving.
+ * Only a valid session for the same person permits opening another socket.
+ * An unavailable check can be retried, but cannot authorize a new connection.
  */
-export async function probeSession(): Promise<boolean> {
+export async function probeSession(stillCurrent: () => boolean = () => true): Promise<boolean> {
   let res: Response;
   try {
     res = await fetch(`${GATEWAY_PREFIX}session`, {
@@ -248,9 +273,28 @@ export async function probeSession(): Promise<boolean> {
       credentials: 'same-origin',
     });
   } catch {
-    return true;
+    return false;
   }
+  if (!stillCurrent()) return false;
   switch (res.status) {
+    case 200: {
+      try {
+        const body: unknown = await res.json();
+        if (!stillCurrent()) return false;
+        if (!body || typeof body !== 'object' || !('authenticated' in body)
+          || body.authenticated !== true || !('principalId' in body)
+          || typeof body.principalId !== 'string' || !body.principalId) return false;
+        const { principalId, reentering, problem } = useHostedStore.getState();
+        if (reentering || stopsApp(problem)) return false;
+        if (principalId !== null && body.principalId !== principalId) {
+          reenter();
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
     case 401:
       reenter();
       return false;
@@ -261,7 +305,7 @@ export async function probeSession(): Promise<boolean> {
       showProblem('agent_archived');
       return false;
     default:
-      return true;
+      return false;
   }
 }
 
@@ -288,27 +332,10 @@ function reportUnauthorized(error: ApiError): Promise<void> {
     return Promise.resolve();
   }
   if (!refusalCheck) {
-    refusalCheck = probeSession().catch(() => true).then((noDecision) => {
+    refusalCheck = probeSession().catch(() => false).then(() => {
       refusalCheck = null;
-      if (noDecision) showProblem('unavailable');
+      if (!useHostedStore.getState().reentering) showProblem('unavailable');
     });
   }
   return refusalCheck;
-}
-
-/**
- * End the gateway session, then go to the root page. The gateway sends a
- * navigation without a session to its login.
- */
-export async function hostedLogout(): Promise<void> {
-  try {
-    await fetch(`${GATEWAY_PREFIX}logout`, {
-      method: 'POST',
-      headers: { [CSRF_HEADER]: '1' },
-      credentials: 'same-origin',
-    });
-  } catch {
-    // Go to the root page all the same. A session that is still valid opens the app again.
-  }
-  window.location.assign('/');
 }

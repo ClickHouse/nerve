@@ -4,11 +4,12 @@ import {
   type Account, type ActorRef, type LoginKind, type Viewer,
 } from '../api/client';
 import {
-  hostedLogout, isHosted, setAuthMode, showProblem, useHostedStore,
+  bindHostedPrincipal, isHosted, setAuthMode, showProblem, useHostedStore,
 } from '../api/hosted';
 import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
+import { selectViewerStorage } from './helpers/viewerStorage';
 
 /** Who a session belongs to. Enough to tell one person's session from another's. */
 export interface SignedInAccount {
@@ -172,7 +173,7 @@ async function loadIdentity(): Promise<Identity | null> {
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
-  authenticated: !!getToken(),
+  authenticated: false,
   loading: false,
   ready: false,
   error: null,
@@ -251,18 +252,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
+    // Hosted identity belongs to the control plane. Only local mode exposes
+    // logout; clearing an agent cookie would immediately start another handoff.
+    if (isHosted()) return;
     beginAuthSession();
-    if (isHosted()) {
-      // The gateway owns the hosted session, and this tab holds no token.
-      purgeAccountScopedState();
-      sessionEstablished = false;
-      set({
-        authenticated: false, loading: false, sessionExpired: false,
-        error: null, viewer: null, account: null,
-      });
-      void hostedLogout();
-      return;
-    }
     clearToken();
     // Purge unsent drafts so nothing leaks to the next user on a shared
     // browser. Only on a *deliberate* logout — an expired session must never
@@ -287,33 +280,30 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   checkAuth: async () => {
     const authSession = beginAuthSession();
-    const token = getToken();
     const generation = ++statusGeneration;
-    // Both at once. Nothing renders until both have answered — that is what
-    // `ready` means — so asking in sequence would double the blank screen.
-    // `/api/auth/me` *is* the session check: it needs a valid token and it
-    // says which actor and account the token belongs to, which is one request
-    // rather than two for strictly more than `/api/auth/check` answered.
-    const [statusOutcome, identityOutcome] = await Promise.allSettled([
-      api.authStatus(),
-      token ? api.getViewer() : Promise.resolve(null),
-    ]);
-
-    const status = statusOutcome.status === 'fulfilled' ? statusOutcome.value : null;
-    applyStatus(generation, status);
-
+    // Discover the mode without a bearer before reading local credentials.
+    // A stored JWT is not a gateway API token and would defeat its cookie.
+    let status: Awaited<ReturnType<typeof api.authStatus>> | null = null;
+    try {
+      status = await api.authStatus();
+    } catch { /* A gateway error can establish hosted mode too. */ }
     if (!isCurrentAuthSession(authSession)) return;
+    applyStatus(generation, status);
 
     if (isHosted()) {
       await enterHosted(authSession, status !== null);
       return;
     }
 
-    if (token && identityOutcome.status === 'fulfilled' && identityOutcome.value) {
+    selectViewerStorage(null);
+    const token = getToken();
+    const identity = token ? await loadIdentity() : null;
+    if (!isCurrentAuthSession(authSession)) return;
+    if (token && identity) {
       sessionEstablished = true;
       set({
         authenticated: true, ready: true,
-        ...identityOf(identityOutcome.value),
+        ...identity,
       });
       return;
     }
@@ -385,6 +375,8 @@ async function enterHosted(authSession: number, statusRead: boolean): Promise<vo
   }
 
   if (viewer) {
+    if (!bindHostedPrincipal(viewer.actor.id)) return;
+    selectViewerStorage(viewer.actor.id);
     sessionEstablished = true;
     useAuthStore.setState({
       authenticated: true, ready: true, sessionExpired: false,
@@ -410,9 +402,8 @@ async function enterHosted(authSession: number, statusRead: boolean): Promise<vo
  * failure, and fail closed only when there has never been one.
  */
 function applyStatus(generation: number, status: Awaited<ReturnType<typeof api.authStatus>> | null): void {
-  // The mode is fixed for the life of the backend, so every answer can set it.
-  if (status) setAuthMode(status.mode);
   if (generation !== statusGeneration) return;   // a newer request is in flight
+  if (status) setAuthMode(status.mode);
   if (status) {
     useAuthStore.setState({
       loginMode: status.login,

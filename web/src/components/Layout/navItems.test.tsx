@@ -37,11 +37,12 @@ beforeEach(() => {
   useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
 });
 
-describe('the Accounts destination', () => {
+describe('local account controls', () => {
   it('shows in the nav rail in local mode', async () => {
     await renderNav('rail');
 
     expect(screen.getByRole('button', { name: 'Accounts' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Logout' })).toBeInTheDocument();
   });
 
   it('is absent from the nav rail in hosted mode', async () => {
@@ -50,6 +51,7 @@ describe('the Accounts destination', () => {
     await renderNav('rail');
 
     expect(screen.queryByRole('button', { name: 'Accounts' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Logout' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Memory' })).toBeInTheDocument();
   });
 
@@ -58,6 +60,7 @@ describe('the Accounts destination', () => {
     openMore();
 
     expect(screen.getByRole('button', { name: 'Accounts' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeInTheDocument();
   });
 
   it('is absent from the bottom bar menu in hosted mode', async () => {
@@ -67,6 +70,7 @@ describe('the Accounts destination', () => {
     openMore();
 
     expect(screen.queryByRole('button', { name: 'Accounts' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Log out' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Memory' })).toBeInTheDocument();
   });
 });

@@ -83,9 +83,11 @@ export function NavRail() {
         <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
         <ThemeToggle />
-        <IconButton label="Logout" size="md" onClick={logout}>
-          <LogOut size={16} />
-        </IconButton>
+        {!hosted && (
+          <IconButton label="Logout" size="md" onClick={logout}>
+            <LogOut size={16} />
+          </IconButton>
+        )}
       </div>
     </div>
   );

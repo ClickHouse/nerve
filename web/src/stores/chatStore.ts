@@ -14,6 +14,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
+import { onViewerStorageChange } from './helpers/viewerStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
@@ -1330,3 +1331,14 @@ export function registerComposerFlush(flush: () => void): () => void {
 }
 
 setBeforeReenter(() => useChatStore.getState().keepUnsentWork());
+
+onViewerStorageChange(() => {
+  clearAllAutoCloseTimers();
+  useChatStore.setState({
+    ...useChatStore.getInitialState(),
+    drafts: loadDrafts(),
+    reads: loadReads(),
+    readsBaseline: loadBaseline(),
+    virtualSession: restoreVirtualSession(),
+  });
+});

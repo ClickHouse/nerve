@@ -107,14 +107,16 @@ describe('NerveWebSocket', () => {
   });
 });
 
-const { setAuthMode, setTokenReader, useHostedStore } = await import('./hosted');
+const { setAuthMode, setBeforeReenter, setTokenReader, useHostedStore } = await import('./hosted');
 
 describe('NerveWebSocket credentials and session checks', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
   let assign: ReturnType<typeof vi.fn>;
 
-  function session(status: number): Response {
-    return new Response('{}', { status, headers: { 'Content-Type': 'application/json' } });
+  function session(status: number, principalId = 'alice'): Response {
+    return new Response(JSON.stringify({ authenticated: status === 200, principalId }), {
+      status, headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   /** Let the session check answer. */
@@ -126,7 +128,8 @@ describe('NerveWebSocket credentials and session checks', () => {
     MockWebSocket.instances = [];
     vi.stubGlobal('WebSocket', MockWebSocket);
     vi.useFakeTimers();
-    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    useHostedStore.setState({ mode: 'local', principalId: 'alice', problem: null, reentering: false });
+    setBeforeReenter(null);
     setTokenReader(() => 'tok');
     fetchMock = vi.fn(async () => session(200));
     vi.stubGlobal('fetch', fetchMock);
@@ -138,7 +141,8 @@ describe('NerveWebSocket credentials and session checks', () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     setTokenReader(() => null);
-    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
+    setBeforeReenter(null);
   });
 
   it('puts the local token in the URL', () => {
@@ -147,10 +151,12 @@ describe('NerveWebSocket credentials and session checks', () => {
     expect(MockWebSocket.instances[0].url).toMatch(/\/ws\?token=tok$/);
   });
 
-  it('adds no token in hosted mode', () => {
+  it('checks the principal before opening a hosted socket without a token', async () => {
     setAuthMode('external');
 
     new NerveWebSocket().connect();
+    expect(MockWebSocket.instances).toHaveLength(0);
+    await settle();
 
     expect(MockWebSocket.instances[0].url).toMatch(/\/ws$/);
     expect(MockWebSocket.instances[0].url).not.toContain('token=');
@@ -168,32 +174,36 @@ describe('NerveWebSocket credentials and session checks', () => {
   it('checks the gateway session after a failed connect, then retries', async () => {
     setAuthMode('external');
     new NerveWebSocket().connect();
+    await settle();
 
     MockWebSocket.instances[0].closeUnexpectedly();
     expect(fetchMock).toHaveBeenCalledWith('/_nerve/session', expect.anything());
     await settle();
     expect(MockWebSocket.instances).toHaveLength(1);
-    vi.advanceTimersByTime(3000);
+    await vi.advanceTimersByTimeAsync(3000);
 
     expect(MockWebSocket.instances).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('checks the gateway session after an open socket closes', async () => {
     setAuthMode('external');
     new NerveWebSocket().connect();
+    await settle();
     MockWebSocket.instances[0].open();
 
     // A close with 4001 from Nerve, or a close by the gateway.
     MockWebSocket.instances[0].closeUnexpectedly();
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('signs in again and stops retrying when the session is gone', async () => {
     setAuthMode('external');
-    fetchMock.mockImplementation(async () => session(401));
     const client = new NerveWebSocket();
     client.connect();
+    await settle();
+    fetchMock.mockImplementation(async () => session(401));
 
     MockWebSocket.instances[0].closeUnexpectedly();
     await settle();
@@ -206,9 +216,10 @@ describe('NerveWebSocket credentials and session checks', () => {
   it.each([[403, 'access_denied'], [410, 'agent_archived']] as const)(
     'shows the screen and stops retrying on %i', async (status, problem) => {
       setAuthMode('external');
-      fetchMock.mockImplementation(async () => session(status));
       const client = new NerveWebSocket();
       client.connect();
+      await settle();
+      fetchMock.mockImplementation(async () => session(status));
 
       MockWebSocket.instances[0].closeUnexpectedly();
       await settle();
@@ -225,7 +236,6 @@ describe('NerveWebSocket credentials and session checks', () => {
     fetchMock.mockReturnValue(new Promise(() => {}));
     const client = new NerveWebSocket();
     client.connect();
-    MockWebSocket.instances[0].closeUnexpectedly();
 
     expect(client.sendMessage('hello', 's1')).toBe('queued');
   });
@@ -236,16 +246,73 @@ describe('NerveWebSocket credentials and session checks', () => {
     fetchMock.mockReturnValue(new Promise<Response>((done) => { answer = done; }));
     const client = new NerveWebSocket();
     client.connect();
-    MockWebSocket.instances[0].closeUnexpectedly();
 
     client.disconnect();
+    fetchMock.mockImplementation(async () => session(200));
     client.connect();
-    answer(session(200));
+    answer(session(401));
     await settle();
     vi.advanceTimersByTime(3000);
 
-    // The old answer schedules no retry beside the new socket.
-    expect(MockWebSocket.instances).toHaveLength(2);
+    // The old refusal neither redirects nor schedules another connection.
+    expect(assign).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('saves queued work instead of sending it through another principals cookie', async () => {
+    setAuthMode('external');
+    const client = new NerveWebSocket();
+    client.connect();
+    await settle();
+    const first = MockWebSocket.instances[0];
+    first.open();
+    let saved: unknown;
+    setBeforeReenter(() => { saved = client.takePendingMessages(); });
+    fetchMock.mockImplementation(async () => session(200, 'bob'));
+
+    first.closeUnexpectedly();
+    expect(client.sendMessage('Alice private text', 'shared')).toBe('queued');
+    await settle();
+    await vi.advanceTimersByTimeAsync(6000);
+
+    expect(saved).toEqual([{ session_id: 'shared', content: 'Alice private text' }]);
+    expect(assign).toHaveBeenCalledOnce();
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(first.send).not.toHaveBeenCalled();
+    expect(client.sendMessage('late text', 'shared')).toBe('dropped');
+  });
+
+  it('waits for positive confirmation after an unavailable probe, then flushes for the same actor', async () => {
+    setAuthMode('external');
+    fetchMock.mockResolvedValueOnce(session(503));
+    const client = new NerveWebSocket();
+    client.connect();
+    expect(client.sendMessage('keep this', 's1')).toBe('queued');
+    await settle();
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    MockWebSocket.instances[0].open();
+    expect(MockWebSocket.instances[0].send).toHaveBeenCalledWith(JSON.stringify({
+      type: 'message', content: 'keep this', session_id: 's1',
+    }));
+    client.disconnect();
+  });
+
+  it('checks for an identity change during the reconnect delay', async () => {
+    setAuthMode('external');
+    const client = new NerveWebSocket();
+    client.connect();
+    await settle();
+    MockWebSocket.instances[0].closeUnexpectedly();
+    await settle();
+    fetchMock.mockImplementation(async () => session(200, 'bob'));
+
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(assign).toHaveBeenCalledOnce();
+    expect(MockWebSocket.instances).toHaveLength(1);
   });
 
   it('hands back queued chat messages and keeps other frames', () => {

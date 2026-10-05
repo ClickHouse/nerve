@@ -1,4 +1,4 @@
-import { authUrl, isHosted, probeSession } from './hosted';
+import { authUrl, hostedSessionActive, isHosted, probeSession } from './hosted';
 import type { ReviewLoop, Task, WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
 
@@ -92,8 +92,15 @@ export class NerveWebSocket {
 
   connect() {
     this.shouldReconnect = true;
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
+    if (isHosted()) {
+      this.checkSession(true);
+      return;
+    }
+    this.openSocket();
+  }
 
+  private openSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const url = authUrl(`${protocol}//${host}/ws`);
@@ -103,6 +110,10 @@ export class NerveWebSocket {
 
     socket.onopen = () => {
       if (this.ws !== socket) return;
+      if (isHosted() && !hostedSessionActive()) {
+        this.disconnect();
+        return;
+      }
       this._connected = true;
       this.startPing();
       this.flushPending();
@@ -131,7 +142,7 @@ export class NerveWebSocket {
       // gateway removes its session cookie when it refuses an upgrade, and
       // after that the check gets 401, not 403.
       if (isHosted()) {
-        this.probeThenReconnect();
+        this.checkSession(false);
         return;
       }
       this.scheduleReconnect();
@@ -159,6 +170,7 @@ export class NerveWebSocket {
   }
 
   send(data: Record<string, unknown>): SendStatus {
+    if (isHosted() && !hostedSessionActive()) return 'dropped';
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
       return 'sent';
@@ -269,17 +281,20 @@ export class NerveWebSocket {
   }
 
   /**
-   * Check the gateway session, then retry only if the check allows it. When
-   * the check starts re-entry or shows a screen, the socket stays closed.
+   * Check immediately after a close to capture a denial before its cookie
+   * disappears, and again before every upgrade. An unavailable check is
+   * retried without opening a socket or flushing another person's work.
    */
-  private probeThenReconnect() {
+  private checkSession(open: boolean) {
     if (this.probe !== null) return;
-    const probe: Promise<void> = probeSession().catch(() => true).then((retry) => {
+    if (!hostedSessionActive()) return;
+    const probe: Promise<void> = probeSession(() => this.probe === probe).catch(() => false).then((valid) => {
       // A disconnect during the check makes its answer obsolete.
       if (this.probe !== probe) return;
       this.probe = null;
-      if (retry) this.scheduleReconnect();
-      else this.shouldReconnect = false;
+      if (!hostedSessionActive()) this.shouldReconnect = false;
+      else if (valid && open) this.openSocket();
+      else this.scheduleReconnect();
     });
     this.probe = probe;
   }

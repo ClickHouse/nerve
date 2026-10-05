@@ -152,6 +152,7 @@ describe('startup with a token already in storage', () => {
     expect(container).toBeEmptyDOMElement();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(ws.connect).not.toHaveBeenCalled();
 
     answer(status({ login: 'setup' }));
     expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
