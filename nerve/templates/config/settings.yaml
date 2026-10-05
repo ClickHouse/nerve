@@ -48,6 +48,10 @@
 # gateway:
 #   host: 0.0.0.0
 #   port: 8900
+#   # Event loop handed to uvicorn: asyncio (default) | uvloop | auto. The stdlib
+#   # loop spawns subprocesses with vfork(); uvloop uses a full fork(), which stalls
+#   # the whole gateway for seconds per spawn once the process is large. Startup only.
+#   loop: asyncio
 
 # Provider and region. Bedrock model IDs are geography-scoped to aws_region
 # (us./eu./apac.) and must match it or every call is rejected, so they belong

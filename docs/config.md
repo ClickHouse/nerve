@@ -24,7 +24,7 @@ and migration splits a legacy `config.yaml` on the same table:
 | Layer | Gets |
 |-------|------|
 | `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir` |
-| `settings.yaml` | `timezone`, `gateway.host`/`port`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+| `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
 paths, credential handles, whose mailboxes this person syncs, which agent
@@ -271,6 +271,7 @@ reload cannot inspect, and are documented here only.
 | Change | Why |
 |--------|-----|
 | `gateway.host`, `.port`, `.ssl.*` | the socket is already bound |
+| `gateway.loop` | the event loop is chosen when uvicorn starts. `asyncio` (the default) spawns subprocesses with `vfork()`; `uvloop` (also what `auto` picks when it is installed) uses a full `fork()`, which blocks the loop for seconds per spawn once the process is large |
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |

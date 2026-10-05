@@ -732,19 +732,41 @@ class SSLConfig:
         return self.cert is not None and self.key is not None
 
 
+# Event-loop implementations uvicorn can be asked for (its ``--loop`` option).
+# ``auto`` is uvicorn's own default: uvloop whenever it is importable, which it is
+# here because ``uvicorn[standard]`` pulls it in.
+_GATEWAY_LOOPS = ("asyncio", "uvloop", "auto")
+
+
 @dataclass
 class GatewayConfig:
     host: str = "0.0.0.0"
     port: int = 8900
     ssl: SSLConfig = field(default_factory=SSLConfig)
+    # The stdlib loop is the default on purpose. uvloop spawns subprocesses with a
+    # full ``fork()``, which copies the parent's page tables: at the ~100 GB RSS a
+    # memU-loaded gateway reaches, every spawn — each agent CLI session, each
+    # ``gh api`` call of the GitHub source, each cron-gate plugin — blocks the
+    # loop for seconds, and the gateway's own HTTP/WebSocket traffic stalls with
+    # it. The stdlib loop spawns with ``vfork()`` (milliseconds, independent of
+    # process size); uvloop's faster I/O buys nothing at the gateway's request
+    # rates. ``uvloop``/``auto`` remain available for a deployment that wants
+    # them. Takes effect at startup only.
+    loop: str = "asyncio"
 
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> GatewayConfig:
+        loop = _setting_str(d.get("loop"), "asyncio").lower()
+        if loop not in _GATEWAY_LOOPS:
+            raise ValueError(
+                f"gateway.loop must be one of {_GATEWAY_LOOPS}, got {loop!r}"
+            )
         return cls(
             host=d.get("host", "0.0.0.0"),
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
+            loop=loop,
         )
 
 
