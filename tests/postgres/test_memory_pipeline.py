@@ -6,7 +6,6 @@ from xml.sax.saxutils import escape
 import pytest
 
 from nerve.config import NerveConfig
-from nerve.memory.postgres import MemoryService, MemoryStore, MemoryScope
 
 
 class FixtureModel:
@@ -28,6 +27,8 @@ class FixtureModel:
 
 @pytest.mark.asyncio
 async def test_extract_reconnect_retrieve(db_scope, tmp_path):
+    from nerve.memory.postgres import MemoryService, MemoryScope, MemoryStore
+
     config = NerveConfig.from_dict(
         {
             "use_postgresql": True,
