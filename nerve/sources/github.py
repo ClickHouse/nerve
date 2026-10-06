@@ -114,14 +114,14 @@ class GitHubSource(Source):
 
         On first run (cursor=None): fetches from the last 24 hours.
         """
-        # GitHub's `since` is inclusive (>=), so advance by 1s to skip
-        # already-seen notifications.
+        # `since` is not advanced past the cursor: a notification can land in the
+        # cursor's own second. A re-listed unchanged thread is skipped by storage.
         # IMPORTANT: use Z suffix, not +00:00 — the `+` in a URL query
         # string is interpreted as a space, silently breaking the filter.
         if cursor:
             try:
                 cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
-                since = (cursor_dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                since = cursor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             except ValueError:
                 since = cursor
         else:
@@ -144,9 +144,10 @@ class GitHubSource(Source):
                 logger.error("gh api notifications failed: %s", stderr.decode())
                 return FetchResult(records=[], next_cursor=cursor)
 
+            # gh prints one JSON value per line; `splitlines()` also splits on U+0085 in a string.
             listing = [
                 json.loads(line)
-                for line in stdout.decode().splitlines()
+                for line in stdout.decode().split("\n")
                 if line.strip()
             ]
             notifications = list({n.get("id", ""): n for n in listing}.values())
@@ -287,8 +288,8 @@ class GitHubSource(Source):
                     },
                 ))
 
-            # The first item came from the first page, so its `updated_at` stays
-            # below any notification that arrives while later pages are read.
+            # The first item came from the first page, so no notification that arrives
+            # while later pages are read is older than its `updated_at`.
             next_cursor = (listing[0].get("updated_at") or cursor) if listing else cursor
             return FetchResult(
                 records=records,
