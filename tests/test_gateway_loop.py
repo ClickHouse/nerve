@@ -6,7 +6,7 @@ that has loaded its memory index is large, so every spawn then blocks the loop
 for seconds. The stdlib loop spawns with ``vfork()`` and is the default here.
 
 These tests pin three things: the default is the stdlib loop, the value reaches
-``uvicorn.run`` verbatim (an ``auto`` sneaking back in would be invisible at
+``uvicorn.Config`` verbatim (an ``auto`` sneaking back in would be invisible at
 runtime — the process still serves, just slowly), and a typo is refused at load
 rather than handed to uvicorn, whose own error names the option but not the file.
 """
@@ -64,8 +64,18 @@ class TestRunServerHandsTheLoopToUvicorn:
 
         from nerve.gateway import server as gw
 
+        class _FakeServer:
+            started = True
+
+            def __init__(self, config):
+                pass
+
+            def run(self):
+                pass
+
         calls: list[dict] = []
-        monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+        monkeypatch.setattr(uvicorn, "Config", lambda app, **kw: calls.append(kw))
+        monkeypatch.setattr(gw, "_DrainingServer", _FakeServer)
         monkeypatch.setattr(gw, "create_app", lambda: object())
         return calls
 

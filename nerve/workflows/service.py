@@ -355,7 +355,8 @@ class WorkflowRunService:
 
     async def _maybe_dispatch(self) -> None:
         """Promote queued pending runs into free concurrency slots (FIFO)."""
-        if self._stopping:
+        # During a drain, keep runs pending: engine.run would refuse them.
+        if self._stopping or not self.engine.accepting_turns:
             return
         async with self._dispatch_lock:
             limit = max(1, int(self.config.workflows.max_concurrent_runs))

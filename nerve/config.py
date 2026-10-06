@@ -753,6 +753,11 @@ class GatewayConfig:
     # rates. ``uvloop``/``auto`` remain available for a deployment that wants
     # them. Takes effect at startup only.
     loop: str = "asyncio"
+    # On SIGTERM or SIGINT, how long to wait for running turns to end before
+    # the shutdown. New turns are refused during the wait. 0 means no wait.
+    # Under Kubernetes, set it below terminationGracePeriodSeconds so the
+    # shutdown that follows can finish. Read when the signal arrives.
+    drain_timeout_seconds: int = 0
 
     @classmethod
     @_coerced
@@ -767,6 +772,7 @@ class GatewayConfig:
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
             loop=loop,
+            drain_timeout_seconds=d.get("drain_timeout_seconds", 0),
         )
 
 

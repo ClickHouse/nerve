@@ -14,6 +14,7 @@ import pytest
 from nerve import cli, paths
 from nerve.agent.engine import AgentEngine, _RESUME_AFTER_RESTART_PROMPT
 from nerve.agent.sessions import SessionStatus
+from nerve.config import GatewayConfig
 from tests.actor_rows import FAKE_SYSTEM_ACTOR
 
 
@@ -159,7 +160,7 @@ def _invoke_restart(tmp_path, resume_ids, *, redirect_queue=True):
             qf = cli.RESUME_QUEUE_FILE
         ctx = click.Context(cli.restart)
         ctx.obj = {
-            "config": SimpleNamespace(deployment="server"),
+            "config": SimpleNamespace(deployment="server", gateway=GatewayConfig()),
             "config_dir": str(tmp_path),
             "verbose": False,
         }

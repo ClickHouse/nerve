@@ -60,6 +60,7 @@ class FakeEngine:
         self.stop_session = AsyncMock()
         self._discard_client = AsyncMock()
         self.notification_service = None
+        self.accepting_turns = True
 
     def register_task(self, session_id: str, task: asyncio.Task) -> None:
         pass

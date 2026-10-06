@@ -102,6 +102,15 @@ def _get_daemon_status() -> tuple[bool, int | None]:
     return False, None
 
 
+def _shutdown_wait_ticks(config) -> int:
+    """Half-second checks to make after SIGTERM before the SIGKILL.
+
+    The daemon first drains for up to ``gateway.drain_timeout_seconds``, then
+    gets 15 seconds for the rest of its shutdown.
+    """
+    return (max(0, config.gateway.drain_timeout_seconds) + 15) * 2
+
+
 # --- Systemd helpers ---
 
 def _is_systemd_managed() -> bool:
@@ -448,11 +457,17 @@ def stop(ctx: click.Context) -> None:
         click.echo("Nerve is not running")
         return
 
-    click.echo(f"Stopping Nerve (PID {pid})...")
+    drain = config.gateway.drain_timeout_seconds
+    if drain > 0:
+        click.echo(
+            f"Stopping Nerve (PID {pid}). Running turns get up to {drain}s to end..."
+        )
+    else:
+        click.echo(f"Stopping Nerve (PID {pid})...")
     os.kill(pid, signal.SIGTERM)
 
-    # Wait for graceful shutdown (up to 15 seconds)
-    for i in range(30):
+    # Wait for graceful shutdown: the drain, then up to 15 seconds
+    for i in range(_shutdown_wait_ticks(config)):
         time.sleep(0.5)
         if not _is_running(pid):
             _remove_pid()
@@ -557,7 +572,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
         "        os.kill(old_pid, signal.SIGTERM)\n"
         "    except ProcessLookupError:\n"
         "        pass\n"
-        "    for _ in range(30):\n"
+        f"    for _ in range({_shutdown_wait_ticks(config)}):\n"
         "        time.sleep(0.5)\n"
         "        try:\n"
         "            os.kill(old_pid, 0)\n"
