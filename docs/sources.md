@@ -4,7 +4,7 @@
 
 Sources are cursor-based data streams that pull records from external services and persist them to a local inbox (`source_messages` table). The architecture follows a **producer/consumer** pattern inspired by Kafka:
 
-- **Producers** (source runners) — Fetch records from external APIs, preprocess and condense them, persist to the inbox, and advance the source cursor. No agent processing happens here.
+- **Producers** (source runners) — Fetch records from external APIs, preprocess them, persist them to the inbox, condense long ones, and advance the source cursor. No agent processing happens here.
 - **Consumers** (agent tools) — Read from the inbox using independent persistent cursors. Multiple consumers can read the same messages without interfering with each other.
 
 ```
@@ -32,12 +32,11 @@ CONSUMERS (agent tools):
 ### Ingestion (Producer Side)
 
 1. **Fetch** — The source adapter calls an external API (gh CLI, gog CLI, Telethon) and returns normalized `SourceRecord` objects with an opaque cursor
-2. **Preprocess** — Two-stage content cleanup:
-   - **Source-specific** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
-   - **LLM condensation** (`condense: true`) — Records still over 800 chars are sent to a fast model (Haiku) that extracts only essential information. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
+2. **Preprocess** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
 3. **Guardrail** — An optional `InboxFilter` drops records that fail the source's allow/deny rules (see [Guardrails](#guardrails-inbox-filtering)). Dropped records are never persisted
-4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL. A record identical to the stored one is skipped; only stored records are condensed and counted as ingested.
-5. **Advance** — Source cursor is saved to SQLite after successful persistence
+4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL. A record identical to the stored one is skipped: it is not condensed and not counted as ingested.
+5. **LLM condensation** (`condense: true`) — Stored records over 800 chars are sent to a fast model (Haiku) that extracts only essential information, saved as `processed_content`. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
+6. **Advance** — Source cursor is saved to SQLite after successful persistence
 
 ### Consumption (Consumer Side)
 
@@ -244,7 +243,7 @@ sync:
 | `enabled` | bool | `true` | Enable/disable this source |
 | `schedule` | string | varies | Crontab expression or interval (`2h`, `30m`) |
 | `batch_size` | int | `50` | Max records per fetch cycle |
-| `condense` | bool | `false` | LLM-condense long records via `memory.fast_model` before storing |
+| `condense` | bool | `false` | LLM-condense long stored records via `memory.fast_model` |
 | `message_ttl_days` | int | `7` | How long to keep inbox messages |
 | `consumer_cursor_ttl_days` | int | `2` | Consumer cursors expire after N days of inactivity |
 
@@ -658,7 +657,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 
 **Consumer cursors**: Stored in `consumer_cursors` table with composite key `(consumer, source)`. Each consumer has an independent cursor per source, using the implicit `rowid` of `source_messages` as the offset. New cursors initialize to `MAX(rowid)` (no backlog). Cursors expire after `consumer_cursor_ttl_days` of inactivity.
 
-**Inclusive APIs:** Both GitHub and Gmail APIs use inclusive cursor semantics (returning records `>= cursor`). Sources handle this by advancing the cursor at query time (+1s) and applying client-side dedup as a safety net.
+**Inclusive APIs:** Both GitHub and Gmail APIs use inclusive cursor semantics (returning records `>= cursor`). Gmail advances the cursor at query time (+1s) and applies client-side dedup as a safety net. GitHub queries the cursor itself, because a notification can land in the cursor's own second; storage skips the unchanged thread listed again.
 
 **Concurrency safety:** Each `SourceRunner` holds an `asyncio.Lock` to prevent concurrent execution of the same source. If a cron schedule fires while a manual sync is in progress, the second call returns immediately with 0 records.
 
