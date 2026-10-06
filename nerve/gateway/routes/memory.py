@@ -127,14 +127,15 @@ def _require_memu():
     return deps.engine._memory_bridge
 
 
-def _read_memu_snapshot_sync(db_path: str) -> str:
+def _read_memu_snapshot_sync(db_path: str, config=None) -> str:
     """Read the full memU snapshot and JSON-encode it.
 
     Sync — call via asyncio.to_thread.  With 20K+ items this is a multi-MB
     payload; both the table scans AND the json.dumps are deliberately done
     in the worker thread so the event loop never pays for them.
     """
-    db = sqlite3.connect(db_path, timeout=10)
+    from nerve.memory.storage import connect_memory
+    db = connect_memory(db_path, config)
     db.row_factory = sqlite3.Row
     try:
         categories = []
@@ -196,7 +197,7 @@ async def get_memu_data():
     db_path = dsn.replace("sqlite:///", "")
 
     try:
-        payload = await asyncio.to_thread(_read_memu_snapshot_sync, db_path)
+        payload = await asyncio.to_thread(_read_memu_snapshot_sync, db_path, config)
         return Response(content=payload, media_type="application/json")
     except Exception as e:
         logger.error("Failed to read memU data: %s", e)

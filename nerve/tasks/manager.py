@@ -47,6 +47,11 @@ class TaskManager:
         ``status`` is different. It lives only in the DB, so this loop reads
         it from the stored row and always supplies it.
         """
+        if getattr(self.db, "persistent_task_content", False):
+            rows = await self.db.list_tasks()
+            for row in rows:
+                await self.db.get_task(row["id"])
+            return len(rows)
         await self.db.rebuild_fts()
         count = 0
 

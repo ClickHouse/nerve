@@ -309,7 +309,7 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
     from nerve.db.accounts import read_setup_required
 
     if read_setup_required(
-        paths.db_path(), configured_password=bool(config.auth.password_hash),
+        paths.db_path(), configured_password=bool(config.auth.password_hash), config=config,
     ):
         click.echo(
             "  Setup is not complete: no password was set and a passwordless "
@@ -610,7 +610,7 @@ def _echo_setup_token(config) -> None:
     from nerve.db.accounts import read_instance_secret
     from nerve.setup_token import SETUP_TOKEN_NAME
 
-    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME, config=config)
     if not token:
         return
     host = config.gateway.host if config is not None else "localhost"
@@ -1224,7 +1224,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     from nerve.gateway.auth import source_authenticates
 
     configured = bool(config.auth.password_hash)
-    identity_state = inspect_bootstrap_state(paths.db_path())
+    identity_state = inspect_bootstrap_state(paths.db_path(), config=config)
     sources = identity_state[0] if identity_state is not None else None
     usable = [
         source for source in (sources or [])
@@ -1235,7 +1235,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
     elif not usable and read_setup_required(
-        paths.db_path(), configured_password=configured,
+        paths.db_path(), configured_password=configured, config=config,
     ):
         warnings.append(
             "[WARN] Setup is not complete — sign-in is refused until it is. "
@@ -1275,7 +1275,9 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
 
     # Check DB
     db_path = paths.db_path()
-    if db_path.exists():
+    if config.use_postgresql:
+        lines.append("[OK] Storage configured: PostgreSQL")
+    elif db_path.exists():
         lines.append(f"[OK] Database: {db_path} ({db_path.stat().st_size / 1024:.1f} KB)")
     else:
         lines.append(f"[--] Database will be created at: {db_path}")
@@ -1426,7 +1428,7 @@ def _signing_secret(config) -> str:
         return config.auth.jwt_secret
     from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
 
-    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME)
+    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME, config=config)
 
 
 def _gateway_url(config, path: str) -> str:
@@ -2091,6 +2093,8 @@ def backup(ctx: click.Context, output: str | None, state_only: bool, no_secrets:
     from nerve import backup as backup_mod
 
     config = ctx.obj["config"]
+    if config.use_postgresql:
+        raise click.ClickException("Use PostgreSQL backups (pg_dump/PITR); local bundles do not contain PostgreSQL state")
     config_dir = Path(ctx.obj["config_dir"])
 
     target = output or config.backup.target_dir
@@ -2246,7 +2250,8 @@ def migrate_openclaw(ctx: click.Context, sessions_dir: str, dry_run: bool, min_m
     try:
         import sqlite3
         db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
-        db = sqlite3.connect(db_path)
+        from nerve.memory.memu_bridge import MemUBridge
+        db = MemUBridge(config)._memory_sql_connection(db_path)
         for (url,) in db.execute("SELECT url FROM memu_resources WHERE url LIKE '%/session-%'"):
             # url looks like /home/.../.nerve/memu-conversations/session-{uuid}-{ts}.json
             fname = Path(url).stem  # session-{uuid}-{ts}
@@ -2375,12 +2380,13 @@ def backfill_timestamps(ctx: click.Context, dry_run: bool) -> None:
     config = ctx.obj["config"]
     db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
 
-    if not Path(db_path).exists():
+    if not config.use_postgresql and not Path(db_path).exists():
         click.echo(f"[ERR] memU database not found: {db_path}")
         ctx.exit(1)
         return
 
-    db = sqlite3.connect(db_path)
+    from nerve.memory.memu_bridge import MemUBridge
+    db = MemUBridge(config)._memory_sql_connection(db_path)
     db.row_factory = sqlite3.Row
 
     # Find items without happened_at that have a linked resource
@@ -2489,7 +2495,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
         return
@@ -2542,8 +2548,10 @@ def db_vacuum(ctx: click.Context) -> None:
     from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
+    if config.use_postgresql:
+        raise click.ClickException("PostgreSQL vacuum is managed by the database administrator")
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
         return
@@ -2595,7 +2603,7 @@ def _format_workflow_run(run: dict) -> str:
 
 def _workflow_db_path(ctx: click.Context) -> Path:
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
     return db_path

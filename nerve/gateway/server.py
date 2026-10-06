@@ -248,7 +248,7 @@ async def _periodic_backup(notification_service) -> None:
         bcfg = config.backup
         interval_s = max(1, bcfg.interval_hours) * 3600
         target = Path(bcfg.target_dir).expanduser() if bcfg.target_dir else None
-        if not bcfg.enabled or target is None:
+        if config.use_postgresql or not bcfg.enabled or target is None:
             continue
         try:
             age = await asyncio.to_thread(
@@ -337,9 +337,9 @@ async def lifespan(app: FastAPI):
         # state files, a migration, the identity bootstrap), and it does not
         # need the proxy, so such a failure leaves nothing to clean up.
         db_path = paths.db_path()
-        db = await init_db(db_path, workspace=config.workspace)
+        db = await init_db(db_path, workspace=config.workspace, config=config)
         startup_cleanups.append(("database", close_db))
-        logger.info("Database initialized at %s", db_path)
+        logger.info("Database initialized (%s)", "postgresql" if config.use_postgresql else "sqlite")
 
         # Create the owner account and signing secret if they do not exist.
         # This must run before anything mints or checks a token. A failure

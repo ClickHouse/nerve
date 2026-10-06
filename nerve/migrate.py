@@ -1556,7 +1556,7 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
     from nerve.db.accounts import inspect_bootstrap_state
 
     source = _credential_source_for(config)
-    state = inspect_bootstrap_state(db_path)
+    state = inspect_bootstrap_state(db_path, config=config)
     sources, stored = state if state is not None else ([], False)
     if not sources:  # no database / pre-v047 schema, or zero accounts
         report.bootstrapped_account = True
@@ -1637,9 +1637,9 @@ async def _bootstrap_with_own_connection(
     display_name: str | None = None,
     passwordless: bool = False,
 ) -> None:
-    from nerve.db import Database
+    from nerve.db import create_database
 
-    db = Database(db_path, workspace=config.workspace)
+    db = create_database(config, db_path=db_path, workspace=config.workspace)
     await db.connect()
     try:
         await bootstrap_identity(db, config, report=report, display_name=display_name)
@@ -1679,9 +1679,9 @@ async def open_production_db(
     loading the secret fails, the connection is closed before the error
     propagates.
     """
-    from nerve.db import Database
+    from nerve.db import create_database
 
-    db = Database(db_path or paths.db_path(), workspace=config.workspace)
+    db = create_database(config, db_path=db_path, workspace=config.workspace)
     await db.connect()
     report = MigrationReport()
     try:

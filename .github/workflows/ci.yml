@@ -86,6 +86,46 @@ jobs:
           fi
           python3 scripts/check_migration_numbers.py "$base"
 
+  postgres-tests:
+    name: PostgreSQL storage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: owner-test-only
+          POSTGRES_DB: nerve_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.0"
+      - run: uv sync --extra test --extra postgres --locked --python 3.13
+      - name: Provision schema with owner credentials
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGDATABASE: nerve_test
+          PGPASSWORD: owner-test-only
+        run: |
+          psql -v ON_ERROR_STOP=1 -f nerve/db/postgres/schema.sql
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE nerve_runtime LOGIN PASSWORD 'runtime-test-only';
+          GRANT USAGE ON SCHEMA nerve_pg TO nerve_runtime;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA nerve_pg TO nerve_runtime;
+          REVOKE INSERT, UPDATE, DELETE ON nerve_pg.storage_version FROM nerve_runtime;
+          GRANT USAGE ON ALL SEQUENCES IN SCHEMA nerve_pg TO nerve_runtime;
+          SQL
+      - name: Exercise storage with a DML-only role
+        env:
+          NERVE_TEST_POSTGRES_DSN: postgresql://nerve_runtime:runtime-test-only@localhost:5432/nerve_test
+        run: .venv/bin/pytest tests/postgres -v
+
   frontend-build:
     name: Frontend build (Vite)
     runs-on: ubuntu-latest
