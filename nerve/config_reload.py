@@ -74,6 +74,7 @@ _RESTART_ONLY_PATHS = (
     "codex.home_dir",
     "external_agents.enabled",
     "gateway.host",
+    "gateway.loop",
     "gateway.port",
     "gateway.ssl.cert",
     "gateway.ssl.key",

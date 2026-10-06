@@ -1331,6 +1331,10 @@ def run_server(config: NerveConfig | None = None) -> None:
         create_app(),
         host=config.gateway.host,
         port=config.gateway.port,
+        # Explicit, never uvicorn's ``auto``: that picks uvloop whenever it is
+        # installed, and uvloop spawns subprocesses with a full ``fork()`` — see
+        # GatewayConfig.loop for why that stalls a large gateway.
+        loop=config.gateway.loop,
         log_level="info",
         **ssl_config,
     )
