@@ -1,6 +1,7 @@
 """GitHub source — fetches notifications via the gh CLI.
 
-Cursor semantics: ISO 8601 timestamp of the newest notification's `updated_at`.
+Cursor semantics: ISO 8601 `updated_at` of the first notification in the last
+listing (GitHub lists the most recently notified thread first).
 On first run (no cursor), fetches from the last 24 hours.
 
 Each notification is enriched with actual content from the subject (PR/issue),
@@ -129,9 +130,11 @@ class GitHubSource(Source):
         try:
             # Query params go in the URL — -f flags would force POST
             endpoint = f"notifications?since={since}&participating=true"
+            # `since` filters on when a thread last notified, not on the
+            # returned `updated_at`, so read every page of the window.
             proc = await asyncio.create_subprocess_exec(
                 "gh", "api", endpoint,
-                "--jq", ".",
+                "--paginate", "--jq", ".[]",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -141,8 +144,12 @@ class GitHubSource(Source):
                 logger.error("gh api notifications failed: %s", stderr.decode())
                 return FetchResult(records=[], next_cursor=cursor)
 
-            stdout_text = stdout.decode()
-            notifications = json.loads(stdout_text) if stdout_text.strip() else []
+            listing = [
+                json.loads(line)
+                for line in stdout.decode().splitlines()
+                if line.strip()
+            ]
+            notifications = list({n.get("id", ""): n for n in listing}.values())
 
             # Enrich notifications with actual content in parallel
             sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
@@ -153,7 +160,6 @@ class GitHubSource(Source):
             enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
 
             records: list[SourceRecord] = []
-            newest_ts: str | None = None
 
             for notif, extra in zip(notifications, enriched):
                 subject = notif.get("subject", {})
@@ -281,10 +287,9 @@ class GitHubSource(Source):
                     },
                 ))
 
-                if newest_ts is None or updated_at > (newest_ts or ""):
-                    newest_ts = updated_at
-
-            next_cursor = newest_ts if newest_ts else cursor
+            # The first item came from the first page, so its `updated_at` stays
+            # below any notification that arrives while later pages are read.
+            next_cursor = (listing[0].get("updated_at") or cursor) if listing else cursor
             return FetchResult(
                 records=records,
                 next_cursor=next_cursor,

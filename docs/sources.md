@@ -139,7 +139,8 @@ visible rather than failing the fetch.
 
 ### GitHub
 - **Adapter:** `nerve/sources/github.py` — uses `gh api notifications` CLI
-- **Cursor:** ISO 8601 timestamp of the newest notification's `updated_at`
+- **Cursor:** ISO 8601 `updated_at` of the first notification in the last listing (GitHub lists the most recently notified thread first)
+- **Paging:** every page since the cursor is read in one run (`gh api --paginate`), so a backlog after downtime is ingested in full; `batch_size` does not cap this source
 - **First run:** Fetches from the last 24 hours
 - **Subsequent runs:** Uses `since=<cursor + 1s>` with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
 - **Filter:** `participating=true` (assigned, review requested, mentioned). Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` with `all=true`, 0 with `participating=true`)
