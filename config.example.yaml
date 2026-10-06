@@ -105,6 +105,9 @@ gateway:
   ssl:
     cert: ~/.nerve/certs/cert.pem
     key: ~/.nerve/certs/key.pem
+  # On shutdown, wait up to this many seconds for running turns to end.
+  # 0 (the default) means no wait. See "Shutdown Sequence" in docs/architecture.md.
+  # drain_timeout_seconds: 0
 
 # Channels
 telegram:

@@ -264,6 +264,17 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 8. Start Telegram bot if configured
 9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session
 
+## Shutdown Sequence
+
+The first SIGTERM or SIGINT starts a drain:
+
+1. The engine stops accepting new turns. A turn that starts after this is refused, also one that was queued behind a running turn: the web UI shows an error, REST routes that wait for the turn return 503, and Telegram replies with the error. The user message is not stored.
+2. Cron jobs, session wakeups and queued workflow runs do not start. After the restart, the cron catch-up runs each missed job that has `catchup` on, and the wakeup sweep fires the due wakeups. Queued workflow runs stay pending, and the recovery pass at the next start marks them failed (see [Workflow runs](workflow-runs.md)).
+3. The gateway waits up to `gateway.drain_timeout_seconds` for running turns to end. It continues to serve during the wait, so clients still get the stream of a running turn. A background task that finishes during the wait can start a continuation turn, and the wait includes that turn.
+4. The usual shutdown follows: uvicorn closes connections, then the lifespan stops the services and the engine. Turns that are still running end when the engine disconnects their clients.
+
+A second signal skips the rest of the wait. `drain_timeout_seconds` is 0 by default, which skips step 3. Under Kubernetes, set it below `terminationGracePeriodSeconds` so step 4 can finish before the SIGKILL. `nerve stop` and `nerve restart` wait `drain_timeout_seconds` plus 15 seconds before they send SIGKILL. Under systemd or Docker, set `TimeoutStopSec` or `stop_grace_period` to cover the same time.
+
 ## Security
 
 - JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode
