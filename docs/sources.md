@@ -36,7 +36,7 @@ CONSUMERS (agent tools):
    - **Source-specific** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
    - **LLM condensation** (`condense: true`) — Records still over 800 chars are sent to a fast model (Haiku) that extracts only essential information. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
 3. **Guardrail** — An optional `InboxFilter` drops records that fail the source's allow/deny rules (see [Guardrails](#guardrails-inbox-filtering)). Dropped records are never persisted
-4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL
+4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL. A record identical to the stored one is skipped; only stored records are condensed and counted as ingested.
 5. **Advance** — Source cursor is saved to SQLite after successful persistence
 
 ### Consumption (Consumer Side)
