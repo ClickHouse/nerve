@@ -86,9 +86,9 @@ def _install_fake_gh(monkeypatch, state: dict[str, dict], between_pages=None) ->
 
         jq = argv[argv.index("--jq") + 1] if "--jq" in argv else None
         if jq == ".[]":
-            lines = [json.dumps(t) for page in pages for t in page]
+            lines = [json.dumps(t, ensure_ascii=False) for page in pages for t in page]
         else:
-            lines = [json.dumps(page) for page in pages]
+            lines = [json.dumps(page, ensure_ascii=False) for page in pages]
         return _FakeProc("\n".join(lines).encode())
 
     monkeypatch.setattr(
@@ -118,18 +118,22 @@ async def test_backlog_with_updated_at_ahead_of_listing_key_is_never_skipped(mon
 
     cursor = _ts(-10)
     calls = []
+    seen: set[str] = set()
     while len(calls) < 10:
         result = await src.fetch(cursor, limit=30)
         calls.append(result)
         cursor = result.next_cursor
-        if not result.records:
+        new = {r.id for r in result.records} - seen
+        seen |= new
+        if not new:
             break
 
-    returned = [r.id for call in calls for r in call.records]
-    assert set(returned) == {t["id"] for t in threads}
-    assert len(returned) == len(set(returned))
+    assert seen == {t["id"] for t in threads}
     assert len(calls[0].records) == 120
+    assert len({r.id for r in calls[0].records}) == 120
     assert calls[0].next_cursor == _ts(60 * 119)
+    assert [r.id for r in calls[1].records] == ["t119"]
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -154,4 +158,39 @@ async def test_notification_landing_between_pages_is_listed_by_the_next_call(mon
     assert first.next_cursor == _ts(60 * 59)
 
     second = await src.fetch(first.next_cursor, limit=30)
-    assert [r.id for r in second.records] == ["x"]
+    assert [r.id for r in second.records] == ["x", "t059"]
+
+
+@pytest.mark.asyncio
+async def test_notification_landing_in_the_cursor_second_is_listed_by_the_next_call(monkeypatch):
+    state = {t["id"]: t for t in (_thread(f"t{i:03d}", 60 * i) for i in range(60))}
+
+    def between_pages(state):
+        state["x"] = _thread("x", 60 * 59)
+
+    _install_fake_gh(monkeypatch, state, between_pages)
+    src = _source(monkeypatch)
+
+    first = await src.fetch(_ts(-10), limit=30)
+    ids = [r.id for r in first.records]
+    assert len(ids) == 60
+    assert "x" not in ids
+    assert first.next_cursor == _ts(60 * 59)
+
+    second = await src.fetch(first.next_cursor, limit=30)
+    second_ids = {r.id for r in second.records}
+    assert "x" in second_ids
+    assert second_ids <= {"x", "t059"}
+
+
+@pytest.mark.asyncio
+async def test_raw_unicode_line_separators_inside_strings_are_parsed(monkeypatch):
+    threads = [_thread("a", 0), _thread("b", 60)]
+    threads[1]["subject"]["title"] = "Fix\u0085parser edge"
+    _install_fake_gh(monkeypatch, {t["id"]: t for t in threads})
+    src = _source(monkeypatch)
+
+    result = await src.fetch(_ts(-10), limit=30)
+    assert len(result.records) == 2
+    by_id = {r.id: r for r in result.records}
+    assert "Fix\u0085parser edge" in by_id["b"].summary
