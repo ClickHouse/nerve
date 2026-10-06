@@ -93,9 +93,18 @@ memory:
   recall_model: claude-sonnet-4-6         # recall routing
   memorize_model: claude-sonnet-4-6       # writing memories back
   fast_model: claude-haiku-4-5-20251001   # extraction & categorization
-  # embed_model: text-embedding-3-small   # only needed with openai_api_key
+  # embed_model: text-embedding-3-small   # required when embeddings are enabled
+  # embed_base_url: https://llm.internal/v1  # OpenAI-compatible endpoint; empty = OpenAI
   categories: [...]  # see Categories section above
 ```
+
+Embeddings can come from any endpoint that implements OpenAI
+`/v1/embeddings`. Set `memory.embed_base_url`, or use
+`NERVE_EMBEDDINGS_API_ENDPOINT` and `NERVE_EMBEDDINGS_MODEL` with
+`nerve init --non-interactive`. A base URL alone is enough — the endpoint
+authenticates however it likes, so `openai_api_key` is then optional and
+memory text stays on your own infrastructure. On **Bedrock** installs this is
+the only way to get vector recall.
 
 > On a **Bedrock** install the three model keys are machine-local instead:
 > `nerve init` writes region-scoped inference-profile IDs into `config.yaml`,
