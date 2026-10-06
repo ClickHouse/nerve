@@ -3067,6 +3067,9 @@ class AgentEngine:
             await broadcaster.broadcast(session_id, {
                 "type": "auto_turn", "session_id": session_id,
             })
+            # The broadcaster only reaches the web UI; channels such as
+            # Telegram need their own stream for a turn nobody asked for.
+            await self._open_autonomous_channel_stream(session_id)
 
         def _turn_has_content() -> bool:
             return st is not None and (
@@ -3091,6 +3094,9 @@ class AgentEngine:
             # Empty turn (init arrived but content never did) — drop it;
             # the finally backstop ships a synthetic done if framing opened.
             st = None
+            # After finalize's "done" reached the channel. For an empty
+            # turn this removes the channel's placeholder instead.
+            await self._close_autonomous_channel_stream(session_id)
 
         try:
             while True:
@@ -3237,8 +3243,37 @@ class AgentEngine:
                 broadcaster.stop_buffering(session_id)
                 with contextlib.suppress(Exception):
                     await self._broadcast_session_running(session_id, False)
+            # A turn cut short (cancelled, stream failure) never reached
+            # _close_turn; flush and release its channel stream.
+            await self._close_autonomous_channel_stream(session_id)
 
         return turns
+
+    async def _open_autonomous_channel_stream(self, session_id: str) -> None:
+        """Ask the channel router to stream an autonomous turn (best effort)."""
+        router = getattr(self, "_router", None)
+        if router is None:
+            return
+        try:
+            await router.open_autonomous_stream(session_id)
+        except Exception as e:
+            logger.warning(
+                "Could not open channel stream for autonomous turn in %s: %s",
+                session_id, e,
+            )
+
+    async def _close_autonomous_channel_stream(self, session_id: str) -> None:
+        """Release a session's autonomous-turn channel stream (idempotent)."""
+        router = getattr(self, "_router", None)
+        if router is None:
+            return
+        try:
+            await router.close_autonomous_stream(session_id)
+        except Exception as e:
+            logger.warning(
+                "Could not close channel stream for autonomous turn in %s: %s",
+                session_id, e,
+            )
 
     def _start_idle_watcher(
         self, session_id: str, client: Any, source: str,

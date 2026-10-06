@@ -29,6 +29,8 @@ class StreamAdapter:
 
     Created per inbound message by the ChannelRouter, registered as a
     broadcaster listener, and torn down after the agent run completes.
+    The router also creates one for each autonomous turn (see
+    ``ChannelRouter.open_autonomous_stream``).
     """
 
     def __init__(
@@ -36,10 +38,16 @@ class StreamAdapter:
         channel: BaseChannel,
         target: str,
         session_id: str,
+        *,
+        send_empty: bool = True,
     ):
         self.channel = channel
         self.target = target
         self.session_id = session_id
+        # A user run always answers, even if only with "(no response)". An
+        # autonomous turn that produced nothing should leave no trace.
+        self._send_empty = send_empty
+        self.finished = False
 
         # Streaming state
         self._buffer: str = ""
@@ -143,6 +151,16 @@ class StreamAdapter:
                 pass  # Edit failures are non-fatal
 
     async def _handle_done(self) -> None:
+        if self.finished:
+            return  # a backstop "done" after the real one must not resend
+        self.finished = True
+        if not self._send_empty and not self._normalize_text(self._buffer):
+            if self._placeholder_id:
+                try:
+                    await self.channel.delete_message(self.target, self._placeholder_id)
+                except Exception:
+                    pass
+            return
         if self._supports_streaming and self._supports_edit and self._placeholder_id:
             # Send final text as a new message (triggers notification),
             # then delete the streaming placeholder.
