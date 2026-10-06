@@ -288,7 +288,7 @@ class SourceRunner:
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
         try:
-            await self._persist_to_inbox(records)
+            stored_ids = set(await self._persist_to_inbox(records))
         except Exception as e:
             logger.error(
                 "Source %s persistence failed: %s",
@@ -299,6 +299,8 @@ class SourceRunner:
                 records_dropped=dropped_count,
                 error=str(e),
             )
+        # Storage skips an unchanged record; condense and count only what it stored.
+        records = [r for r in records if r.id in stored_ids]
 
         # 3. LLM-based condensation for still-long records (configurable per source)
         if self.condense:
@@ -326,9 +328,9 @@ class SourceRunner:
     # Inbox persistence
     # ------------------------------------------------------------------
 
-    async def _persist_to_inbox(self, records: list[SourceRecord]) -> None:
+    async def _persist_to_inbox(self, records: list[SourceRecord]) -> list[str]:
         """Save records to the source_messages table for inbox display."""
-        await self.db.insert_source_messages(
+        return await self.db.insert_source_messages(
             records, source=self.source.source_name, ttl_days=self.ttl_days,
         )
 

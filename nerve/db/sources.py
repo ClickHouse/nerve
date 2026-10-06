@@ -108,11 +108,14 @@ class SourceStore:
         records: list,
         source: str,
         ttl_days: int = 7,
-    ) -> int:
-        """Bulk insert source records into the inbox. Returns count inserted.
+    ) -> list[str]:
+        """Bulk insert source records into the inbox. Returns the ids it stored.
 
         The batch is atomic; if any record cannot be persisted, no records are
         committed and the exception is propagated.
+
+        A record identical to the stored one (same metadata and content) is
+        skipped and not returned.
 
         If a record with the same (source, id) already exists but has different
         metadata or content, the old record is deleted and re-inserted at a
@@ -124,7 +127,7 @@ class SourceStore:
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(days=ttl_days)).isoformat()
         now_iso = now.isoformat()
-        inserted = 0
+        stored: list[str] = []
         async with self._atomic():
             for r in records:
                 try:
@@ -192,14 +195,14 @@ class SourceStore:
                              r.timestamp, new_metadata,
                              now_iso, expires),
                         )
-                    inserted += 1
+                    stored.append(r.id)
                 except Exception as e:
                     logger.warning(
                         "Failed to persist source message %s/%s: %s",
                         source, r.id, e,
                     )
                     raise
-        return inserted
+        return stored
 
     async def update_source_messages_processed(
         self,
