@@ -1759,6 +1759,11 @@ class MemUBridge:
                        if not self.config.openai_api_key else {}),
                 },
             )
+            # memU's own update step breaks memory_update in two ways, so
+            # Nerve swaps in its own step (see _update_item_step). This runs
+            # before the service is marked available, so if it raises,
+            # memU is reported as unavailable.
+            self._install_update_step()
             self._available = True
             self._metrics.service_available = True
             self._metrics.initialized_at = datetime.now(timezone.utc).isoformat()
@@ -1813,8 +1818,10 @@ class MemUBridge:
 
             # When no embedding provider is configured, replace the
             # memorize pipeline's "categorize_items" step with one that
-            # stores items and resources with embedding=None.  This
-            # avoids KeyError on the missing "embedding" LLM profile.
+            # stores items and resources with embedding=None.  Without an
+            # "embedding" profile memU falls back to the "default" chat
+            # profile, and that endpoint has no embeddings route, so the
+            # call fails (on the Anthropic API with a 404).
             if not self.config.openai_api_key:
                 from memu.workflow.step import WorkflowStep as _WfStep
 
@@ -3218,6 +3225,102 @@ class MemUBridge:
         except Exception as e:
             logger.error("update_item failed for %s: %s", memory_id, e)
             return False
+
+    def _install_update_step(self) -> None:
+        """Replace memU's ``update_memory_item`` step with ``_update_item_step``.
+
+        The replacement keeps memU's step contract (``requires``, ``produces``,
+        ``capabilities``, ``config``), so the rest of the ``patch_update``
+        pipeline (category-summary patching, response building) runs unchanged.
+        """
+        from memu.workflow.step import WorkflowStep
+
+        self._service.replace_step(
+            target_step_id="update_memory_item",
+            new_step=WorkflowStep(
+                step_id="update_memory_item",
+                role="patch",
+                handler=self._update_item_step,
+                requires={"memory_id", "memory_payload", "ctx", "store", "user"},
+                produces={"memory_item", "category_updates"},
+                capabilities={"db", "llm"},
+                config={"embed_llm_profile": "embedding"},
+            ),
+            pipeline="patch_update",
+        )
+
+    async def _update_item_step(self, state: dict, step_context: Any) -> dict:
+        """Nerve's version of memU's ``update_memory_item`` workflow step.
+
+        It fixes two problems in memU's step:
+
+        1. memU embeds new content unconditionally. Without an embedding
+           provider, the "embedding" profile falls back to the chat endpoint,
+           which has no embeddings route, so every content update failed (on
+           the Anthropic API with a 404). Here we embed only when a provider
+           is configured.
+        2. memU treats ``categories=None`` as an empty list and unlinks the
+           item from every category, so an update that only changed the text
+           silently dropped all of the item's category links. Here ``None``
+           means "leave the category links alone".
+        """
+        memory_id = state["memory_id"]
+        payload = state["memory_payload"]
+        store = state["store"]
+        user = state["user"]
+
+        item = store.memory_item_repo.get_item(memory_id)
+        if not item:
+            raise ValueError(f"Memory item with id {memory_id} not found")
+        old_content = item.summary
+        old_cat_ids = [
+            rel.category_id
+            for rel in store.category_item_repo.get_item_categories(memory_id)
+        ]
+
+        content = payload["content"]
+        if content == old_content:
+            # The web UI resends the full text with every edit, so an
+            # unchanged summary must not trigger a re-embed or a category
+            # summary rewrite.
+            content = None
+        embedding = None
+        if content and self._has_embeddings:
+            client = self._service._get_step_embedding_client(step_context)
+            embedding = (await client.embed([content]))[0]
+
+        if payload["type"] or content:
+            item = store.memory_item_repo.update_item(
+                item_id=memory_id,
+                memory_type=payload["type"],
+                summary=content,
+                embedding=embedding,
+            )
+
+        if payload["categories"] is None:
+            new_cat_ids = old_cat_ids
+        else:
+            new_cat_ids = self._service._map_category_names_to_ids(
+                payload["categories"], state["ctx"],
+            )
+
+        # (content before, content after) per touched category, consumed by
+        # memU's persist step to patch the category summaries.
+        category_updates: dict[str, tuple[str | None, str | None]] = {}
+        for cid in set(old_cat_ids) - set(new_cat_ids):
+            store.category_item_repo.unlink_item_category(memory_id, cid)
+            category_updates[cid] = (old_content, None)
+        for cid in set(new_cat_ids) - set(old_cat_ids):
+            store.category_item_repo.link_item_category(
+                memory_id, cid, user_data=dict(user or {}),
+            )
+            category_updates[cid] = (None, item.summary)
+        if content:
+            for cid in set(old_cat_ids) & set(new_cat_ids):
+                category_updates[cid] = (old_content, item.summary)
+
+        state.update({"memory_item": item, "category_updates": category_updates})
+        return state
 
     async def delete_item(self, memory_id: str, source: str = "bridge") -> bool:
         """Delete a memory item by ID."""

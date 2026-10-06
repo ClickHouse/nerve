@@ -1258,22 +1258,28 @@ class TestEnsureSqliteIndexes:
 
 
 _upstream_reinforce = None  # memu-py's create_item_reinforce, captured pre-patch
-_shared_memu_repo = None  # module singleton — memu model classes are process-global
+_shared_memu_db = None  # module singleton — memu model classes are process-global
 
 
 def _memu_repo():
-    """Build a real SQLiteMemoryItemRepo the way production does.
+    """The shared database's real SQLiteMemoryItemRepo (see ``_memu_db``)."""
+    return _memu_db().memory_item_repo
+
+
+def _memu_db():
+    """Build a real memU SQLite database the way production does.
 
     memu-py 1.4.0's sqlite factory only works after the bridge's
     monkey-patches (``_patch_sqlite_bugs``), and the patched model classes
     are process-global (a second ``build_database`` re-binds the same Column
     objects and fails) — so build ONE database for the test process, exactly
-    like production, and isolate tests by user scope. The pristine upstream
-    ``create_item_reinforce`` is captured before the patch swaps it out.
+    like production, and isolate tests by user scope or unique ids. The
+    pristine upstream ``create_item_reinforce`` is captured before the patch
+    swaps it out.
     """
-    global _shared_memu_repo, _upstream_reinforce
-    if _shared_memu_repo is not None:
-        return _shared_memu_repo
+    global _shared_memu_db, _upstream_reinforce
+    if _shared_memu_db is not None:
+        return _shared_memu_db
 
     import tempfile
 
@@ -1298,8 +1304,8 @@ def _memu_repo():
         ),
         user_model=DefaultUserModel,
     )
-    _shared_memu_repo = db.memory_item_repo
-    return _shared_memu_repo
+    _shared_memu_db = db
+    return _shared_memu_db
 
 
 def _scope_count(repo, user_id: str) -> int:
@@ -1403,3 +1409,243 @@ class TestContentHashReinforce:
             assert port.extra["reinforcement_count"] == up.extra["reinforcement_count"]
 
         assert _scope_count(repo, "par-port") == _scope_count(repo, "par-up") == 3
+
+
+# ---------------------------------------------------------------------------
+# _update_item_step — Nerve's replacement for memU's update_memory_item step
+# ---------------------------------------------------------------------------
+
+
+def _embed_404() -> Exception:
+    """What the Anthropic endpoint answers when memU's OpenAI-SDK client
+    POSTs to /embeddings on it."""
+    return Exception(
+        "Error code: 404 - {'type': 'error', 'error': "
+        "{'type': 'not_found_error', 'message': 'Not found'}}"
+    )
+
+
+def _fake_llm_client(*, embed_result=None, chat_result=None) -> MagicMock:
+    client = MagicMock()
+    client.chat_model = "fake-chat"
+    client.embed_model = "fake-embed"
+    client.embed = (
+        AsyncMock(side_effect=_embed_404()) if embed_result is None
+        else AsyncMock(return_value=embed_result)
+    )
+    client.chat = AsyncMock(return_value=chat_result)
+    return client
+
+
+class TestUpdateItemStep:
+    """memory_update runs memU's ``patch_update`` pipeline. memU's own update
+    step embedded new content unconditionally, so without an embedding
+    provider every content update failed with a 404; and it read
+    ``categories=None`` as "no categories" and unlinked the item from all
+    of them. These tests run the real pipeline (memU's validation, client
+    resolution, persist and response steps) against a real SQLite store."""
+
+    @staticmethod
+    def _bridge(tmp_path, *, openai_key="", embed_result=None):
+        """A bridge over a real MemoryService minus __init__'s client and
+        database setup. Only the per-profile base clients are fakes.
+
+        "default" is the chat endpoint: its embed() fails like the Anthropic
+        API does. Without an OpenAI key memU aliases "embedding" to it; with
+        a key, "embedding" is a separate client that returns vectors.
+        """
+        from types import SimpleNamespace
+
+        from memu.app.service import MemoryService
+        from memu.llm.wrapper import LLMInterceptorRegistry
+
+        config = _make_config(tmp_path)
+        config.openai_api_key = openai_key
+        bridge = MemUBridge(config)
+
+        default = _fake_llm_client(
+            chat_result='{"need_update": true, "updated_content": "patched"}',
+        )
+        embedding = (
+            _fake_llm_client(embed_result=embed_result) if openai_key else default
+        )
+        svc = object.__new__(MemoryService)
+        svc.llm_profiles = SimpleNamespace(profiles={})
+        svc._llm_clients = {"default": default, "embedding": embedding}
+        svc._llm_interceptors = LLMInterceptorRegistry()
+        bridge._service = svc
+        return bridge, default, embedding
+
+    @staticmethod
+    def _seed():
+        """An item linked to category "work"; category "personal" exists unlinked."""
+        import uuid
+        from types import SimpleNamespace
+
+        db = _memu_db()
+        tag = uuid.uuid4().hex[:8]
+        work, personal = (
+            db.memory_category_repo.get_or_create_category(
+                name=f"{name}-{tag}", description=name, embedding=None, user_data={},
+            )
+            for name in ("work", "personal")
+        )
+        item = db.memory_item_repo.create_item(
+            resource_id=None, memory_type="knowledge", summary="old fact",
+            embedding=None, user_data={},
+        )
+        db.category_item_repo.link_item_category(item.id, work.id, user_data={})
+        ctx = SimpleNamespace(
+            category_ids=[work.id, personal.id],
+            category_name_to_id={
+                work.name.lower(): work.id, personal.name.lower(): personal.id,
+            },
+        )
+        return db, item, work, personal, ctx
+
+    @staticmethod
+    async def _run_update(bridge, db, ctx, item_id, *, install=True, **payload):
+        """Run ``patch_update`` the way ``MemoryService.update_memory_item``
+        does, minus its context setup."""
+        from memu.workflow.pipeline import PipelineManager
+        from memu.workflow.step import run_steps
+
+        svc = bridge._service
+        pipelines = PipelineManager(
+            available_capabilities={"llm", "vector", "db", "io", "vision"},
+            llm_profiles={"default", "embedding"},
+        )
+        pipelines.register(
+            "patch_update",
+            svc._build_update_memory_item_workflow(),
+            initial_state_keys=svc._list_update_memory_item_initial_keys(),
+        )
+        svc.replace_step = lambda *, target_step_id, new_step, pipeline: (
+            pipelines.replace_step(pipeline, target_step_id, new_step)
+        )
+        if install:
+            bridge._install_update_step()
+        state = {
+            "memory_id": item_id,
+            "memory_payload": {
+                "type": None, "content": None, "categories": None, **payload,
+            },
+            "ctx": ctx,
+            "store": db,
+            "category_ids": list(ctx.category_ids),
+            "user": None,
+        }
+        return await run_steps("patch_update", pipelines.build("patch_update"), state)
+
+    @staticmethod
+    def _linked(db, item_id) -> set[str]:
+        return {rel.category_id for rel in db.category_item_repo.get_item_categories(item_id)}
+
+    def test_initialize_installs_the_step(self):
+        """_initialize_impl can't run in-process (it would build a second
+        memU database, see _memu_db), so guard its call site directly."""
+        import inspect
+
+        source = inspect.getsource(MemUBridge._initialize_impl)
+        assert "self._install_update_step()" in source
+
+    @pytest.mark.asyncio
+    async def test_upstream_step_still_embeds_without_a_provider(self, tmp_path):
+        """Canary: if memU stops embedding unconditionally, revisit whether
+        Nerve still needs its own step."""
+        bridge, default, _ = self._bridge(tmp_path)
+        db, item, _, _, ctx = self._seed()
+
+        with pytest.raises(Exception, match="404"):
+            await self._run_update(
+                bridge, db, ctx, item.id, install=False, content="new fact",
+            )
+        default.embed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_content_update_without_embedding_provider(self, tmp_path):
+        bridge, default, _ = self._bridge(tmp_path)
+        db, item, work, _, ctx = self._seed()
+
+        state = await self._run_update(bridge, db, ctx, item.id, content="new fact")
+
+        default.embed.assert_not_awaited()
+        assert db.memory_item_repo.get_item(item.id).summary == "new fact"
+        assert state["response"]["memory_item"]["summary"] == "new fact"
+        # The category link survives, and its summary is patched old → new.
+        assert self._linked(db, item.id) == {work.id}
+        assert state["category_updates"] == {work.id: ("old fact", "new fact")}
+        default.chat.assert_awaited_once()
+        assert db.memory_category_repo.categories[work.id].summary == "patched"
+
+    @pytest.mark.asyncio
+    async def test_type_only_update_keeps_category_links(self, tmp_path):
+        bridge, default, _ = self._bridge(tmp_path)
+        db, item, work, _, ctx = self._seed()
+
+        state = await self._run_update(bridge, db, ctx, item.id, type="profile")
+
+        stored = db.memory_item_repo.get_item(item.id)
+        assert (stored.memory_type, stored.summary) == ("profile", "old fact")
+        assert self._linked(db, item.id) == {work.id}
+        assert state["category_updates"] == {}
+        default.embed.assert_not_awaited()
+        default.chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_categories_relink(self, tmp_path):
+        bridge, _, _ = self._bridge(tmp_path)
+        db, item, work, personal, ctx = self._seed()
+
+        state = await self._run_update(
+            bridge, db, ctx, item.id, categories=[personal.name],
+        )
+
+        assert self._linked(db, item.id) == {personal.id}
+        assert state["category_updates"] == {
+            work.id: ("old fact", None),
+            personal.id: (None, "old fact"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_embeds_via_the_embedding_profile_when_configured(self, tmp_path):
+        bridge, default, embedding = self._bridge(
+            tmp_path, openai_key="sk-test", embed_result=[[0.25, 0.5, 0.75, 1.0]],
+        )
+        db, item, work, _, ctx = self._seed()
+
+        await self._run_update(bridge, db, ctx, item.id, content="new fact")
+
+        embedding.embed.assert_awaited_once_with(["new fact"])
+        default.embed.assert_not_awaited()
+        stored = db.memory_item_repo.get_item(item.id)
+        assert list(stored.embedding) == pytest.approx([0.25, 0.5, 0.75, 1.0])
+        assert self._linked(db, item.id) == {work.id}
+
+    @pytest.mark.asyncio
+    async def test_unchanged_content_skips_embed_and_summary_rewrite(self, tmp_path):
+        """The web UI resends the full text when only a category changes."""
+        bridge, default, embedding = self._bridge(
+            tmp_path, openai_key="sk-test", embed_result=[[0.1, 0.2, 0.3, 0.4]],
+        )
+        db, item, work, personal, ctx = self._seed()
+
+        state = await self._run_update(
+            bridge, db, ctx, item.id,
+            content="old fact", type="knowledge",
+            categories=[work.name, personal.name],
+        )
+
+        embedding.embed.assert_not_awaited()
+        assert self._linked(db, item.id) == {work.id, personal.id}
+        # Only the newly linked category is touched.
+        assert state["category_updates"] == {personal.id: (None, "old fact")}
+        default.chat.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_item_raises(self, tmp_path):
+        bridge, _, _ = self._bridge(tmp_path)
+        db, _, _, _, ctx = self._seed()
+
+        with pytest.raises(ValueError, match="not found"):
+            await self._run_update(bridge, db, ctx, "no-such-id", content="x")
