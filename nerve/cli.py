@@ -1037,6 +1037,41 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
+def _mcp_gateway_lines(config, external: bool, warnings: list[str]) -> list[str]:
+    """Doctor lines for the MCP gateway, which external mode uses.
+
+    The report shows the configuration only. The applied catalog generation is
+    in the running server's ``GET /api/diagnostics``.
+    """
+    lines: list[str] = []
+    url = config.mcp_gateway_url
+    if not external:
+        if url:
+            warnings.append(
+                "[WARN] mcp_gateway_url has no effect in local mode; Nerve uses "
+                "mcp_servers"
+            )
+        return lines
+    if url:
+        lines.append(f"[OK] MCP gateway: {url} (the only source of MCP servers)")
+    else:
+        warnings.append(
+            "[WARN] MCP gateway: mcp_gateway_url is not set; sessions start "
+            "without MCP servers other than Nerve's own"
+        )
+    if config.mcp_servers:
+        lines.append(
+            f"[--] mcp_servers: {len(config.mcp_servers)} server(s) in the "
+            "configuration, not used in external mode"
+        )
+    if config.codex.ultracode.enabled:
+        warnings.append(
+            "[WARN] codex.ultracode has no effect in external mode: Codex "
+            "plugins are off"
+        )
+    return lines
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1381,6 +1416,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
     external = mode == AUTH_MODE_EXTERNAL
+    lines.extend(_mcp_gateway_lines(config, external, warnings))
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())

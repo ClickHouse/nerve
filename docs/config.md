@@ -1811,6 +1811,11 @@ directly and give the message to the model unchanged.
 The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
 
+`GET /api/diagnostics` and the Diagnostics page show the applied catalog
+generation, its servers, and the result of the last catalog request (see
+[`GET /api/diagnostics`](api.md#get-apidiagnostics)). `nerve doctor` shows
+the configured `mcp_gateway_url`; it does not ask the running server.
+
 ## Auth
 
 | Key | Type | Default | Description |

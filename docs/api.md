@@ -765,6 +765,26 @@ Response: {
 }
 ```
 
+In external mode the response also has `mcp_gateway`: the catalog of the MCP
+gateway that new sessions use, and the result of the last catalog request.
+`generation`, `digest` and `applied_at` are `null` before the first catalog.
+`error` is the problem of the last request, or `null` after a success.
+`retrying` is true while the background retry runs. The block is absent in
+local mode.
+
+```json
+"mcp_gateway": {
+  "url": "http://192.0.2.1:8080",
+  "generation": 7,
+  "digest": "sha256:3f9a…",
+  "servers": ["docs", "github"],
+  "applied_at": "2026-10-08T10:00:00+00:00",
+  "checked_at": "2026-10-08T10:05:00+00:00",
+  "error": null,
+  "retrying": false
+}
+```
+
 #### `GET /api/cron/logs?job_id=&limit=50&offset=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
