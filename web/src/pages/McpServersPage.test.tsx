@@ -93,6 +93,28 @@ describe('McpServersPage in external mode', () => {
     expect(within(nerve).queryByText('Managed by organization')).not.toBeInTheDocument();
   });
 
+  it('shows a server that Codex sessions do not get', async () => {
+    api.listMcpServers.mockResolvedValue({
+      managed_by: 'organization',
+      servers: [
+        server('docs', {
+          managed_by: 'organization',
+          display_name: 'Docs',
+          not_applied: { codex: 'name used by the system configuration (/etc/codex/config.toml)' },
+        }),
+        server('github', { managed_by: 'organization', display_name: 'GitHub', not_applied: {} }),
+      ],
+    });
+    await renderPage();
+
+    const docs = screen.getByRole('article', { name: 'Docs' });
+    expect(within(docs).getByRole('alert')).toHaveTextContent(
+      'Not applied to Codex: name used by the system configuration (/etc/codex/config.toml)',
+    );
+    const github = screen.getByRole('article', { name: 'GitHub' });
+    expect(within(github).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('does not point at the configuration files', async () => {
     api.listMcpServers.mockResolvedValue({ managed_by: 'organization', servers: [] });
     await renderPage();
