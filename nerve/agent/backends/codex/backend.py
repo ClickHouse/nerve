@@ -131,6 +131,11 @@ _CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
 # Names tried for a copy of config.toml before Nerve gives up.
 _BACKUP_NAME_ATTEMPTS = 8
 
+# Default of the ``managed`` argument: read the applied catalog at the call.
+# A client build reads it once and passes that snapshot to every step, so a
+# catalog change during the build cannot mix two generations.
+_LIVE_CATALOG = object()
+
 
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
 # app-server catalog, weakest first. Used only to clamp a requested effort
@@ -297,12 +302,15 @@ class CodexBackend:
 
     async def create_client(self, spec: SessionSpec) -> "CodexClient":
         await self._check_cli_version()
+        # One catalog snapshot for the whole build: the cleanup of colliding
+        # servers, the environment and the overrides use the same servers,
+        # also when a new catalog arrives while the cleanup waits for Codex.
         managed = self._managed_mcp_servers()
         if managed is not None:
             await self._remove_colliding_user_mcp_servers(managed)
-        if self._ultracode_enabled:
+        if self._ultracode_on(managed):
             await ensure_ultracode_installed(self.config)
-        client = CodexClient(self, spec)
+        client = CodexClient(self, spec, managed=managed)
         try:
             await client.connect()
             return client
@@ -443,7 +451,9 @@ class CodexBackend:
 
     # -- config assembly (used by CodexClient) --------------------------- #
 
-    def build_env(self, spec: SessionSpec) -> dict[str, str]:
+    def build_env(self, spec: SessionSpec, managed: Any = _LIVE_CATALOG) -> dict[str, str]:
+        """Environment of the app-server. ``managed``: the catalog snapshot."""
+        managed = self._resolve_managed(managed)
         env = os.environ.copy()
         env["CODEX_HOME"] = self._home_dir()
         # Session-bound bearer token for the nerve MCP endpoint —
@@ -464,8 +474,7 @@ class CodexBackend:
         # environment names referenced by ``env_http_headers``. External mode
         # uses no configured server, and the gateway servers take no secret.
         configured = (
-            self._deps.external_mcp_servers()
-            if self._managed_mcp_servers() is None else []
+            self._deps.external_mcp_servers() if managed is None else []
         )
         for srv in configured:
             if not srv.enabled or srv.name == "nerve":
@@ -484,7 +493,7 @@ class CodexBackend:
                         str(srv.name), str(header), "HTTP",
                     )
                     env[secret_name] = str(value)
-        if self._ultracode_enabled:
+        if self._ultracode_on(managed):
             wrapper = materialize_worker_wrapper(self._home_dir())
             env["CODEX_CLI_PATH"] = str(wrapper)
             env["NERVE_CODEX_REAL_BIN"] = self.codex.bin_path
@@ -503,8 +512,13 @@ class CodexBackend:
             env["NERVE_MCP_PARENT_SESSION_ID"] = spec.session_id
         return env
 
-    def build_config_overrides(self, spec: SessionSpec) -> list[str]:
+    def build_config_overrides(
+        self, spec: SessionSpec, managed: Any = _LIVE_CATALOG,
+    ) -> list[str]:
         """``-c key=value`` process-level config overrides.
+
+        ``managed`` is the catalog snapshot of the client build (the applied
+        catalog when not given).
 
         Process == session here, so spawn-level overrides ARE per-session
         config. This is the same mechanism the official SDKs use and is
@@ -557,7 +571,7 @@ class CodexBackend:
                 "or token minter unavailable", spec.session_id,
             )
 
-        managed = self._managed_mcp_servers()
+        managed = self._resolve_managed(managed)
         if managed is None:
             # External MCP servers (grafana, langfuse, ...) — translate the
             # nerve config into codex's mcp_servers shape. Claude-plugin MCPs
@@ -599,10 +613,17 @@ class CodexBackend:
         source = getattr(self._deps, "managed_mcp_servers", None)
         return source() if source is not None else None
 
+    def _resolve_managed(self, managed: Any) -> tuple | None:
+        """The catalog snapshot: ``managed``, or the applied catalog now."""
+        return self._managed_mcp_servers() if managed is _LIVE_CATALOG else managed
+
+    def _ultracode_on(self, managed: tuple | None) -> bool:
+        """Ultracode is a Codex plugin, and external mode turns plugins off."""
+        return bool(self.codex.ultracode.enabled) and managed is None
+
     @property
     def _ultracode_enabled(self) -> bool:
-        """Ultracode is a Codex plugin, and external mode turns plugins off."""
-        return bool(self.codex.ultracode.enabled) and self._managed_mcp_servers() is None
+        return self._ultracode_on(self._managed_mcp_servers())
 
     @staticmethod
     def _names_mcp_servers(key: str) -> bool:
@@ -881,12 +902,16 @@ class CodexBackend:
 class CodexClient(AgentClient):
     """One live ``codex app-server`` subprocess for one nerve session."""
 
-    def __init__(self, backend: CodexBackend, spec: SessionSpec):
+    def __init__(
+        self, backend: CodexBackend, spec: SessionSpec, managed: Any = _LIVE_CATALOG,
+    ):
         self._backend = backend
         self._spec = spec
-        config_overrides = backend.build_config_overrides(spec)
-        env = backend.build_env(spec)
-        if backend._ultracode_enabled:
+        # The catalog snapshot of this build (see CodexBackend.create_client).
+        managed = backend._resolve_managed(managed)
+        config_overrides = backend.build_config_overrides(spec, managed)
+        env = backend.build_env(spec, managed)
+        if backend._ultracode_on(managed):
             # Child workers inherit the parent session's FULL MCP surface —
             # the Nerve bridge and external servers alike — with the same
             # permissions as the session itself (no worker-side tool
