@@ -2,8 +2,8 @@ import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
 import { Badge, Button } from '../components/ui';
-import { useMcpStore, type McpServer } from '../stores/mcpStore';
-import { formatMcpName } from '../utils/formatMcpName';
+import { ManagedBadge } from '../components/Mcp/ManagedBadge';
+import { isManaged, mcpServerTitle, useMcpStore, type McpServer } from '../stores/mcpStore';
 
 /** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
@@ -22,19 +22,24 @@ function ServerCard({ server }: { server: McpServer }) {
   const typeClass = TYPE_COLORS[server.type] || 'text-text-muted bg-surface-raised';
 
   return (
-    <div
+    <article
+      aria-label={mcpServerTitle(server)}
       className="bg-surface-raised border border-border rounded-lg p-4 hover:border-border cursor-pointer transition-colors"
       onClick={() => navigate(`/mcp/${encodeURIComponent(server.name)}`)}
     >
       <div className="flex items-start justify-between mb-2">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="text-sm font-medium text-text truncate">{formatMcpName(server.name)}</h3>
+            <h3 className="text-sm font-medium text-text truncate">{mcpServerTitle(server)}</h3>
             <span className={`text-2xs px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
               {server.type}
             </span>
           </div>
+          {isManaged(server) && server.description && (
+            <p className="text-xs text-text-dim mt-1 line-clamp-2">{server.description}</p>
+          )}
         </div>
+        {isManaged(server) && <ManagedBadge className="ml-2 shrink-0" />}
         {!server.enabled && (
           <Badge tone="warning" className="ml-2">disabled</Badge>
         )}
@@ -66,12 +71,14 @@ function ServerCard({ server }: { server: McpServer }) {
           </div>
         )}
       </div>
-    </div>
+    </article>
   );
 }
 
 export function McpServersPage() {
-  const { servers, loading, reloading, loadServers, reloadServers } = useMcpStore();
+  const {
+    servers, managedByOrganization, loading, reloading, loadServers, reloadServers,
+  } = useMcpStore();
 
   useEffect(() => { loadServers(); }, []);
 
@@ -83,32 +90,46 @@ export function McpServersPage() {
           <h1 className="text-sm font-medium text-text">MCP Servers</h1>
           <Badge>{servers.length}</Badge>
         </div>
-        <Button
-          variant="subtle"
-          size="xs"
-          onClick={reloadServers}
-          disabled={reloading}
-          title="Reload MCP config from YAML files"
-        >
-          <RefreshCw size={12} className={reloading ? 'animate-spin' : ''} />
-          Reload
-        </Button>
+        {/* External mode: the MCP gateway decides the servers, so there is no
+            configuration to reload. */}
+        {!managedByOrganization && (
+          <Button
+            variant="subtle"
+            size="xs"
+            onClick={reloadServers}
+            disabled={reloading}
+            title="Reload MCP config from YAML files"
+          >
+            <RefreshCw size={12} className={reloading ? 'animate-spin' : ''} />
+            Reload
+          </Button>
+        )}
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
+        {managedByOrganization && (
+          <p className="text-xs text-text-dim mb-4" role="note">
+            Your organization manages the MCP servers of this agent through the
+            MCP gateway. They are read-only here. New sessions get the current
+            list; to add a server or a tool, ask an administrator of your
+            organization.
+          </p>
+        )}
         {loading ? (
           <div className="text-center text-text-dim text-sm py-12">Loading MCP servers...</div>
         ) : servers.length === 0 ? (
           <div className="text-center py-12">
             <Plug size={32} className="mx-auto text-text-faint mb-3" />
             <p className="text-sm text-text-dim mb-1">No MCP servers registered</p>
-            <p className="text-xs text-text-faint">
-              Add external MCP servers in{' '}
-              <code className="text-accent">config.yaml</code>
-              {' '}under the{' '}
-              <code className="text-accent">mcp_servers</code> key.
-            </p>
+            {!managedByOrganization && (
+              <p className="text-xs text-text-faint">
+                Add external MCP servers in{' '}
+                <code className="text-accent">config.yaml</code>
+                {' '}under the{' '}
+                <code className="text-accent">mcp_servers</code> key.
+              </p>
+            )}
           </div>
         ) : (
           <div className="grid gap-3 grid-cols-1 md:grid-cols-2 xl:grid-cols-3">
