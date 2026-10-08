@@ -467,6 +467,10 @@ def _is_unresolved(value: Any) -> bool:
 #: tests/test_config_validate.py: a new ``Path`` setting has to be listed here or
 #: exempted there.
 _WORKING_DIR_PATH_KEYS: dict[tuple[str, ...], str] = {
+    ("channels", "hosted", "gateway_jwks_file"): (
+        "hosted channels would try to read a directory as the gateway's public "
+        "key file, so they do not start and every stream upgrade is refused"
+    ),
     ("workspace",): (
         "the entire workspace (settings.yaml, the cron config, memory, "
         "everything nerve syncs) would be read from and written to whatever "

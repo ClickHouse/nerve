@@ -1,0 +1,394 @@
+"""Slack end-to-end over a real Socket Mode connection.
+
+These drive the whole channel — connect, receive an envelope, ack it,
+authorize, dispatch, reply — against :mod:`tests.fake_slack` rather than
+mocks. What they cover that the unit tests cannot: the transport wiring,
+the ack contract, and the shape of the calls actually put on the wire.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import time
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+
+from nerve.channels.slack import SlackChannel
+from nerve.config import NerveConfig, SlackConfig
+from tests.fake_slack import FakeSlack
+from tests.slack_live import (
+    ignore_stale_events,
+    start_event_sink,
+    wait_until_receiving,
+)
+
+
+def _config(**slack_kwargs) -> NerveConfig:
+    cfg = NerveConfig()
+    cfg.slack = SlackConfig(
+        enabled=True,
+        bot_token="xoxb-fake",
+        app_token="xapp-fake",
+        **slack_kwargs,
+    )
+    return cfg
+
+
+@pytest_asyncio.fixture
+async def slack():
+    async with FakeSlack() as server:
+        yield server
+
+
+async def _started(server: FakeSlack, monkeypatch, **slack_kwargs):
+    """Bring a SlackChannel up against the fake, with a stub router."""
+    cfg = _config(**slack_kwargs)
+    router = MagicMock()
+    router.handle_message = AsyncMock(return_value="ok")
+    router.get_last_session = AsyncMock(return_value=None)
+    channel = SlackChannel(cfg, router)
+    server.patch_client(monkeypatch)
+    await channel.start()
+    await server.wait_connected()
+    return channel, router
+
+
+@pytest.mark.asyncio
+class TestSocketMode:
+    async def test_an_ack_only_sink_consumes_events_without_dispatching(
+        self, slack, monkeypatch, capsys,
+    ):
+        slack.patch_client(monkeypatch)
+        sink = await start_event_sink(
+            "xoxb-fake", "xapp-fake", diagnostics_label="fake-sink",
+        )
+        routed: list[str] = []
+
+        async def route(_client, req):
+            event = (req.payload or {}).get("event") or {}
+            if event.get("ts"):
+                routed.append(event["ts"])
+
+        sink.socket_mode_request_listeners.append(route)
+        channel = MagicMock()
+        channel._client = sink
+        ignore_stale_events(channel)
+        try:
+            class ProbeClient:
+                # Slack stamps a message ts with the epoch second it was
+                # sent, and the harness calibrates its staleness clock from
+                # one, so a counter here would leave the cutoff blind.
+                def __init__(self):
+                    self.sent: list[str] = []
+
+                async def chat_postMessage(self, **kwargs):
+                    ts = f"{time.time():.6f}"
+                    self.sent.append(ts)
+                    event = {
+                        "type": "message", "channel": kwargs["channel"],
+                        "channel_type": "channel", "user": "U0BOT",
+                        "ts": ts, "text": kwargs["text"],
+                    }
+                    if len(self.sent) == 2:
+                        # The first probe missed the immediate attempts and
+                        # arrives only as a retry. Readiness must ack it before
+                        # returning, or its next retry poisons a later run.
+                        await slack.push_event(
+                            {**event, "ts": self.sent[0]},
+                            retry_attempt=2,
+                            retry_reason="timeout",
+                        )
+                        await slack.push_event(event)
+                    return {"ok": True, "ts": ts}
+
+                async def chat_delete(self, **kwargs):
+                    await slack.push_event({
+                        "type": "message", "subtype": "message_deleted",
+                        "channel": kwargs["channel"], "ts": "2.1",
+                        "deleted_ts": kwargs["ts"],
+                    })
+                    return {"ok": True}
+
+            probe = ProbeClient()
+            await wait_until_receiving(
+                sink,
+                timeout=2.0,
+                web_client=probe,
+                probe_interval=0.05,
+            )
+            await slack.push("events_api", {
+                "event_time": time.time() - 30,
+                "event": {"type": "message", "ts": "3.1"},
+            })
+            await slack.settle()
+            assert len(slack.acks) == 5
+            assert probe.sent[0] not in routed, "a marked retry reached the router"
+            assert probe.sent[1] in routed, "the fresh probe never arrived"
+            assert "3.1" not in routed, "an unmarked stale event reached the router"
+        finally:
+            await sink.close()
+            sink._live_diagnostics.emit_summary()
+
+        output = capsys.readouterr().out
+        records = [
+            json.loads(line.removeprefix("SLACK_LIVE "))
+            for line in output.splitlines()
+            if line.startswith("SLACK_LIVE ")
+        ]
+        events = {record["event"] for record in records}
+        assert {
+            "socket_hello",
+            "retry_envelope",
+            "delayed_unmarked_envelope",
+            "probe_missed",
+            "delivery_barrier_complete",
+            "socket_summary",
+        } <= events
+        assert "xoxb-fake" not in output
+        assert "nerve socket readiness probe" not in output
+
+    async def test_the_channel_connects_and_learns_its_own_id(
+        self, slack, monkeypatch,
+    ):
+        channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        try:
+            assert channel._bot_user_id == "U0BOT"
+            assert slack.calls_to("auth.test")
+            assert slack.calls_to("apps.connections.open")
+        finally:
+            await channel.stop()
+
+    async def test_credentials_rotate_on_the_running_channel(
+        self, slack, monkeypatch,
+    ):
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
+        )
+        old_client = channel._client
+        try:
+            config = copy.deepcopy(channel.config)
+            config.slack.bot_token = "xoxb-replaced"
+            config.slack.app_token = "xapp-replaced"
+            await channel.reload_credentials(config)
+
+            assert channel._client is not old_client
+            assert not await old_client.is_connected()
+            assert await channel._client.is_connected()
+            assert channel._web.token == "xoxb-replaced"
+            assert channel._active_app_token == "xapp-replaced"
+
+            await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "after rotation",
+            })
+            await slack.settle()
+            router.handle_message.assert_called_once()
+        finally:
+            await channel.stop()
+
+    @pytest.mark.parametrize(("failed_method", "bot_token", "app_token"), [
+        ("auth.test", "xoxb-invalid", "xapp-replaced"),
+        ("apps.connections.open", "xoxb-replaced", "xapp-invalid"),
+    ])
+    async def test_invalid_new_credentials_keep_the_old_connection(
+        self, slack, monkeypatch, failed_method, bot_token, app_token,
+    ):
+        channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        old_client = channel._client
+        slack.errors[failed_method] = "invalid_auth"
+        try:
+            with pytest.raises(RuntimeError, match="token failed validation"):
+                config = copy.deepcopy(channel.config)
+                config.slack.bot_token = bot_token
+                config.slack.app_token = app_token
+                await channel.reload_credentials(config)
+
+            assert channel._client is old_client
+            assert await old_client.is_connected()
+            assert channel._active_bot_token == "xoxb-fake"
+            assert channel._active_app_token == "xapp-fake"
+        finally:
+            await channel.stop()
+
+    async def test_every_envelope_is_acked(self, slack, monkeypatch):
+        # Slack redelivers anything unacked within three seconds, and an
+        # agent turn is far longer than that.
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
+        )
+        try:
+            envelope_id = await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "hello",
+            })
+            await slack.settle()
+            assert envelope_id in slack.acks
+            router.handle_message.assert_called_once()
+        finally:
+            await channel.stop()
+
+    async def test_an_unauthorized_envelope_is_still_acked(
+        self, slack, monkeypatch,
+    ):
+        # A refusal must not look like a delivery failure, or Slack retries
+        # the same rejected message until it gives up.
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U-other"],
+            allow_direct_messages=True,
+        )
+        try:
+            envelope_id = await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "hello",
+            })
+            await slack.settle()
+            assert envelope_id in slack.acks
+            router.handle_message.assert_not_called()
+        finally:
+            await channel.stop()
+
+    async def test_stop_closes_the_socket(self, slack, monkeypatch):
+        channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        client = channel._client
+        await channel.stop()
+        assert channel._client is None
+        assert not await client.is_connected()
+
+
+@pytest.mark.asyncio
+class TestConversation:
+    async def test_a_direct_message_produces_a_reply_in_the_dm(
+        self, slack, monkeypatch,
+    ):
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"],
+            allow_direct_messages=True,
+        )
+        try:
+            async def _reply(msg):
+                from nerve.channels.base import OutboundMessage
+                await channel.send(
+                    OutboundMessage(target=msg.sender_id, text="**done**"),
+                )
+                return "done"
+
+            router.handle_message = AsyncMock(side_effect=_reply)
+            await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "run it",
+            })
+            posted = await slack.wait_for("chat.postMessage")
+            assert posted[0]["channel"] == "D1"
+            assert posted[0]["text"] == "*done*"
+        finally:
+            await channel.stop()
+
+    async def test_a_channel_mention_replies_inside_a_thread(
+        self, slack, monkeypatch,
+    ):
+        channel, router = await _started(slack, monkeypatch, allow_users=["U1"])
+        try:
+            captured = {}
+
+            async def _capture(msg):
+                captured["key"] = msg.channel_key
+                from nerve.channels.base import OutboundMessage
+                await channel.send(OutboundMessage(target=msg.sender_id, text="hi"))
+                return "hi"
+
+            router.handle_message = AsyncMock(side_effect=_capture)
+            await slack.push_event({
+                "type": "app_mention", "channel": "C1", "channel_type": "channel",
+                "user": "U1", "ts": "1.1", "text": "<@U0BOT> status",
+            })
+            posted = await slack.wait_for("chat.postMessage")
+            assert captured["key"] == "slack:C1:1.1"
+            assert posted[0]["thread_ts"] == "1.1"
+        finally:
+            await channel.stop()
+
+    async def test_a_name_allow_list_resolves_through_the_api(
+        self, slack, monkeypatch,
+    ):
+        slack.users["U1"] = {
+            "id": "U1", "name": "alex.soffronow",
+            "profile": {"email": "alex@example.com"},
+        }
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["alex.soffronow"],
+            allow_direct_messages=True,
+        )
+        try:
+            await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "hello",
+            })
+            await slack.settle()
+            router.handle_message.assert_called_once()
+            assert slack.calls_to("users.info")
+        finally:
+            await channel.stop()
+
+    async def test_a_channel_glob_is_checked_against_the_real_name(
+        self, slack, monkeypatch,
+    ):
+        slack.conversations["C1"] = {"id": "C1", "name": "eng-platform"}
+        slack.conversations["C2"] = {"id": "C2", "name": "random"}
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"], allow_channels=["eng-*"],
+        )
+        try:
+            await slack.push_event({
+                "type": "app_mention", "channel": "C2", "channel_type": "channel",
+                "user": "U1", "ts": "1.1", "text": "<@U0BOT> hi",
+            })
+            await slack.settle()
+            router.handle_message.assert_not_called()
+
+            await slack.push_event({
+                "type": "app_mention", "channel": "C1", "channel_type": "channel",
+                "user": "U1", "ts": "2.1", "text": "<@U0BOT> hi",
+            })
+            await slack.settle()
+            router.handle_message.assert_called_once()
+        finally:
+            await channel.stop()
+
+    async def test_a_denied_lookup_refuses_rather_than_guesses(
+        self, slack, monkeypatch,
+    ):
+        # users.info fails, and a deny list cannot be evaluated without it.
+        slack.errors["users.info"] = "missing_scope"
+        channel, router = await _started(
+            slack, monkeypatch, allow_users=["U1"], deny_users=["*-bot"],
+            allow_direct_messages=True,
+        )
+        try:
+            await slack.push_event({
+                "type": "message", "channel": "D1", "channel_type": "im",
+                "user": "U1", "ts": "1.1", "text": "hello",
+            })
+            await slack.settle()
+            router.handle_message.assert_not_called()
+        finally:
+            await channel.stop()
+
+
+@pytest.mark.asyncio
+class TestStreaming:
+    async def test_a_placeholder_is_posted_then_edited(self, slack, monkeypatch):
+        channel, _ = await _started(slack, monkeypatch, allow_users=["U1"])
+        try:
+            message_id = await channel.send_placeholder("D1", "s1")
+            assert message_id
+            await channel.edit_message("D1", message_id, "partial **output**")
+            edits = await slack.wait_for("chat.update")
+            assert edits[0]["ts"] == message_id
+            assert edits[0]["text"] == "partial *output*"
+        finally:
+            await channel.stop()

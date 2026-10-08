@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
-import io
 import html as _html
 import logging
 import re
@@ -18,23 +17,31 @@ import socket
 import subprocess
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
+from nerve.channels.archives import (
+    IMAGE_EXT_TO_MIME,
+    MAX_TEXT_SIZE,
+    TEXT_EXTENSIONS,
+    extract_zip,
+)
+from nerve.channels.access import Identity, PatternGate
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     ChannelConstraints,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
+from nerve.channels.observation import ObservationPolicy
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -220,6 +227,23 @@ def _format_reply_context(message: Any) -> str:
             parts.append(f'[Quoted: "{quote_text}"]')
 
     return "\n".join(parts)
+
+
+def _describe_telegram_attachment(message: Any) -> str:
+    """Name a message's attachment without downloading it.
+
+    An uncaptioned photo or sticker still says something. ``_extract_sticker``
+    and ``_extract_document`` say more but fetch the file to do it.
+    """
+    sticker = getattr(message, "sticker", None)
+    if sticker:
+        return f"[Sticker: {sticker.emoji}]" if sticker.emoji else "[Sticker]"
+    document = getattr(message, "document", None)
+    if document:
+        return f"[File: {document.file_name or 'unnamed'}]"
+    if getattr(message, "photo", None):
+        return "[Photo]"
+    return ""
 
 
 # Inline-keyboard /sessions rendering ------------------------------------- #
@@ -554,18 +578,42 @@ class TelegramChannel(BaseChannel):
         )
         app = builder.build()
 
-        # Register handlers
-        app.add_handler(CommandHandler("start", self._handle_start))
-        app.add_handler(CommandHandler("pair", self._handle_pair))
-        app.add_handler(CommandHandler("session", self._handle_session))
-        app.add_handler(CommandHandler("sessions", self._handle_sessions))
-        app.add_handler(CommandHandler("star", self._handle_star))
-        app.add_handler(CommandHandler("unstar", self._handle_unstar))
-        app.add_handler(CommandHandler("new", self._handle_new_session))
-        app.add_handler(CommandHandler("stop", self._handle_stop))
-        app.add_handler(CommandHandler("restart", self._handle_restart))
-        app.add_handler(CommandHandler("doctor", self._handle_doctor))
-        app.add_handler(CommandHandler("reply", self._handle_reply))
+        # A CommandHandler wins over the generic MessageHandler in this group,
+        # so commands need the source hook on their own callback.
+        app.add_handler(CommandHandler(
+            "start", self._source_routed_command(self._handle_start),
+        ))
+        # Never persist a one-time pairing code in the source buffer.
+        app.add_handler(CommandHandler(
+            "pair", self._source_routed_command(self._handle_pair, collect=False),
+        ))
+        app.add_handler(CommandHandler(
+            "session", self._source_routed_command(self._handle_session),
+        ))
+        app.add_handler(CommandHandler(
+            "sessions", self._source_routed_command(self._handle_sessions),
+        ))
+        app.add_handler(CommandHandler(
+            "star", self._source_routed_command(self._handle_star),
+        ))
+        app.add_handler(CommandHandler(
+            "unstar", self._source_routed_command(self._handle_unstar),
+        ))
+        app.add_handler(CommandHandler(
+            "new", self._source_routed_command(self._handle_new_session),
+        ))
+        app.add_handler(CommandHandler(
+            "stop", self._source_routed_command(self._handle_stop),
+        ))
+        app.add_handler(CommandHandler(
+            "restart", self._source_routed_command(self._handle_restart),
+        ))
+        app.add_handler(CommandHandler(
+            "doctor", self._source_routed_command(self._handle_doctor),
+        ))
+        app.add_handler(CommandHandler(
+            "reply", self._source_routed_command(self._handle_reply),
+        ))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
@@ -636,7 +684,8 @@ class TelegramChannel(BaseChannel):
             code = pairing.get_or_create_pairing_code()
             logger.info(
                 "Telegram: no allowed_users configured — pairing mode active. "
-                "Send the bot:  /pair %s  to authorize your account "
+                "In a private chat, send the bot:  /pair %s  to authorize "
+                "your account "
                 "(code valid for 1h; run `nerve pair` to get a fresh one).",
                 code,
             )
@@ -848,8 +897,16 @@ class TelegramChannel(BaseChannel):
         msg = await self._app.bot.send_message(chat_id=chat_id, text="⏳")
         return str(msg.message_id)
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
-        """Edit a previously sent message (for streaming updates)."""
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
+        """Edit a previously sent message (for streaming updates).
+
+        Telegram limits edits per chat and one chat is one session here, so
+        the caller's per-adapter interval already covers it and ``throttle``
+        needs no extra shedding.
+        """
         if self._app is None:
             return
         chat_id = int(target)
@@ -1007,6 +1064,31 @@ class TelegramChannel(BaseChannel):
         """Record that we received an update from Telegram."""
         self._last_update_time = time.monotonic()
 
+    def _source_routed_command(
+        self,
+        callback: Callable[[Update, Any], Awaitable[None]],
+        *,
+        collect: bool = True,
+    ) -> Callable[[Update, Any], Awaitable[None]]:
+        """Add source routing to a command without changing PTB precedence."""
+
+        async def wrapped(update: Update, context: Any) -> None:
+            chat = update.effective_chat
+            user = update.effective_user
+            message = update.message
+            if chat is None or user is None or message is None:
+                return
+
+            source = self.config.telegram.source
+            if collect and source.enabled and source.allow_conversations:
+                await self._observe(
+                    update,
+                    handled=self._is_authorized(user.id),
+                )
+            await callback(update, context)
+
+        return wrapped
+
     async def _handle_start(self, update: Update, context: Any) -> None:
         """Handle /start command."""
         self._touch()
@@ -1022,7 +1104,8 @@ class TelegramChannel(BaseChannel):
                 await update.message.reply_text(
                     "This Nerve instance isn't paired with your account.\n"
                     f"Your Telegram ID: {user_id}\n\n"
-                    "To pair, run `nerve pair` on the server, then send me:\n"
+                    "To pair, run `nerve pair` on the server, then open a "
+                    "private chat with me and send:\n"
                     "/pair <code>"
                 )
             return
@@ -1031,9 +1114,21 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _handle_pair(self, update: Update, context: Any) -> None:
-        """Handle /pair <code> — authorize a user via a one-time pairing code."""
+        """Authorize a user who sends /pair <code> in a private chat."""
         self._touch()
-        user_id = update.effective_user.id
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if (
+            chat.type != "private"
+            or user.is_bot
+            or getattr(message, "sender_chat", None) is not None
+        ):
+            logger.warning("Ignoring /pair outside a private human chat")
+            return
+        user_id = user.id
 
         if self._is_authorized(user_id):
             await update.message.reply_text("Already paired — you're authorized.")
@@ -1209,7 +1304,7 @@ class TelegramChannel(BaseChannel):
         # Stop the current session before creating a new one
         prev = await self.router.get_last_session(channel_key)
         if prev:
-            stopped = await self.router.engine.stop_session(prev)
+            stopped = await self.router.stop_session(prev)
             if stopped:
                 await update.message.reply_text(
                     f"Stopped session `{prev}`.",
@@ -1238,7 +1333,7 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("No active session.")
             return
 
-        stopped = await self.router.engine.stop_session(session_id)
+        stopped = await self.router.stop_session(session_id)
         if stopped:
             await update.message.reply_text(
                 f"Stopped session `{session_id}`.",
@@ -1358,26 +1453,18 @@ class TelegramChannel(BaseChannel):
         "application/csv",
     }
 
-    # Extensions treated as text when MIME type is missing or generic
-    _TEXT_EXTENSIONS: set[str] = {
-        ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
-        ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
-        ".md", ".rst", ".csv", ".tsv", ".sql", ".sh", ".bash", ".zsh",
-        ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
-        ".swift", ".lua", ".r", ".m", ".pl", ".php", ".env", ".ini", ".cfg",
-        ".conf", ".log", ".diff", ".patch", ".vue", ".svelte",
-    }
+    # Extensions treated as text when MIME type is missing or generic. Shared
+    # with the Slack channel and with the archive unpacker, so a file type
+    # read inline here is read inline everywhere.
+    _TEXT_EXTENSIONS = TEXT_EXTENSIONS
 
     _IMAGE_MIMES: set[str] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
     _ARCHIVE_MIMES: set[str] = {"application/zip", "application/x-zip-compressed"}
 
-    _IMAGE_EXT_TO_MIME: dict[str, str] = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-    }
+    _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
-    _MAX_TEXT_SIZE: int = 512 * 1024       # 512 KB — inline text cap
+    _MAX_TEXT_SIZE: int = MAX_TEXT_SIZE    # 512 KB — inline text cap
     _MAX_DOWNLOAD_SIZE: int = 20_000_000   # ~20 MB — Telegram Bot API limit
 
     async def _extract_document(
@@ -1471,7 +1558,12 @@ class TelegramChannel(BaseChannel):
     async def _extract_zip(
         self, doc: Any, file_name: str, meta_line: str,
     ) -> tuple[list[dict[str, str]], str]:
-        """Extract ZIP archive contents — text inline, images/PDFs as blocks."""
+        """Extract ZIP archive contents — text inline, images/PDFs as blocks.
+
+        The 20 MB download cap is on the compressed archive, so the bounds on
+        what it expands to live in :mod:`nerve.channels.archives`, shared with
+        the Slack channel.
+        """
         try:
             tg_file = await doc.get_file()
             data = await tg_file.download_as_bytearray()
@@ -1479,79 +1571,7 @@ class TelegramChannel(BaseChannel):
             logger.warning("Failed to download ZIP %s: %s", file_name, e)
             return [], meta_line
 
-        buf = io.BytesIO(bytes(data))
-        if not zipfile.is_zipfile(buf):
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        buf.seek(0)
-
-        blocks: list[dict[str, str]] = []
-        parts: list[str] = [meta_line]
-
-        try:
-            with zipfile.ZipFile(buf) as zf:
-                entries = [
-                    i for i in zf.infolist()
-                    if not i.is_dir() and not i.filename.startswith("__MACOSX/")
-                ]
-                parts.append(f"Archive contains {len(entries)} file(s):")
-
-                total_text = 0
-                for info in entries:
-                    ename = info.filename
-                    esize = info.file_size
-                    eext = ""
-                    if "." in ename.rsplit("/", 1)[-1]:
-                        eext = "." + ename.rsplit(".", 1)[-1].lower()
-
-                    is_text = eext in self._TEXT_EXTENSIONS
-                    is_image = eext in self._IMAGE_EXT_TO_MIME
-                    is_pdf = eext == ".pdf"
-
-                    if is_text and total_text + esize <= self._MAX_TEXT_SIZE:
-                        try:
-                            raw = zf.read(info.filename)
-                            total_text += len(raw)
-                            text_content = raw.decode("utf-8", errors="replace")
-                            parts.append(
-                                f"--- {ename} ({esize} bytes) ---\n"
-                                f"```\n{text_content}\n```"
-                            )
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_text:
-                        parts.append(f"- {ename} ({esize} bytes) [text, too large to inline]")
-                    elif is_image:
-                        try:
-                            raw = zf.read(info.filename)
-                            img_mime = self._IMAGE_EXT_TO_MIME.get(eext, "image/png")
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": img_mime,
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [image]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_pdf:
-                        try:
-                            raw = zf.read(info.filename)
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": "application/pdf",
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [PDF]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    else:
-                        parts.append(f"- {ename} ({esize} bytes)")
-        except zipfile.BadZipFile:
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        except RuntimeError as e:
-            # Password-protected archives
-            return [], f"{meta_line}\n(Cannot extract: {e})"
-
-        return blocks, "\n".join(parts)
+        return extract_zip(bytes(data), meta_line)
 
     def _is_delivery_only_sink(self, chat: Any) -> bool:
         """True when ``chat`` is an opted-in group/supergroup notification sink.
@@ -1574,11 +1594,149 @@ class TelegramChannel(BaseChannel):
             return False
         notif_chat = notif.telegram_chat_id
         return bool(notif_chat) and chat.id == notif_chat and chat.type in ("group", "supergroup")
+    @property
+    def observation(self) -> ObservationPolicy:
+        """The source grant, rebuilt per read so reloads apply at once."""
+        source = self.config.telegram.source
+        return ObservationPolicy(
+            enabled=source.enabled,
+            conversations=PatternGate(
+                "chat",
+                allow=list(source.allow_conversations),
+                deny=list(source.deny_conversations),
+            ),
+            senders=PatternGate(
+                "sender",
+                allow=list(source.allow_senders),
+                deny=list(source.deny_senders),
+            ),
+        )
+
+    async def _observe(self, update: Update, handled: bool = False) -> None:
+        """Buffer a group message for the source inbox, if the grant allows.
+
+        Asked of every group message, whatever ``telegram.allowed_users``
+        decided: the source is its own grant, so a sender being authorized
+        neither earns nor forfeits a place in the inbox. ``handled`` says the
+        live route accepted this message, and by default that is where it
+        stops — one message should not arrive twice.
+        ``include_handled_messages`` turns the copy back on for a source
+        meant as a record.
+
+        Private chats are never a source. A stranger's DM is a refusal, and
+        filing it away is not what the silence led them to expect; a group an
+        operator listed is a different matter.
+
+        The bot must be a group administrator, or have privacy mode disabled
+        via BotFather, for Telegram to deliver ordinary group traffic at all.
+        Without that it only sees commands and replies to itself, and this
+        collects almost nothing however the grant is written.
+        """
+        # Cheapest gates first: this runs on every message now, not only the
+        # ones from a sender the allowlist refused.
+        source = self.config.telegram.source
+        if not source.enabled:
+            return
+        if handled and not source.include_handled_messages:
+            return
+        policy = self.observation
+        if not policy.active:
+            return
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if chat.type == "private":
+            return
+        # Pairing codes are credentials. A command addressed to another bot
+        # bypasses our CommandHandler and reaches the generic message handler,
+        # so enforce this exclusion at the source gate too.
+        text = message.text or message.caption or ""
+        words = text.split(maxsplit=1)
+        command = words[0].partition("@")[0].casefold() if words else ""
+        if command == "/pair":
+            return
+        # Telegram delivers other bots' messages to group handlers under
+        # bot-to-bot mode. Slack drops them via _is_another_app_talking, and
+        # two agents feeding each other's inboxes is no better than two
+        # agents answering each other.
+        if user.is_bot:
+            return
+
+        # Only the numeric id is stable. A chat title is set by whoever runs
+        # the group, so treating it as allow-eligible would let anyone create
+        # a group called "ops-room" and walk into a grant meant for someone
+        # else's; a @username is claimable and movable for the same reason.
+        # Both stay deny-eligible, where a spoofable name can only ever
+        # subtract access.
+        conversation = Identity(
+            id=str(chat.id),
+            self_set_names=tuple(n for n in (chat.username, chat.title) if n),
+        )
+        sender = Identity(
+            id=str(user.id),
+            self_set_names=tuple(
+                n for n in (
+                    user.username, user.full_name, user.first_name, user.last_name,
+                ) if n
+            ),
+        )
+
+        verdict = policy.check(conversation, sender)
+        if not verdict.allowed:
+            logger.debug("Telegram did not observe a message: %s", verdict.reason)
+            return
+
+        text = message.text or message.caption or ""
+        attachment = _describe_telegram_attachment(message)
+        if attachment:
+            text = f"{attachment}\n\n{text}" if text else attachment
+        # Neither text nor an attachment is nothing worth a row.
+        if not text:
+            return
+
+        sent_at = message.date or datetime.now(timezone.utc)
+        observed = ObservedMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat.id}",
+            conversation_id=str(chat.id),
+            sender_id=str(user.id),
+            text=text,
+            message_id=str(message.message_id),
+            timestamp=sent_at.isoformat(),
+            conversation_title=chat.title or chat.username or "",
+            sender_name=user.username or user.full_name or "",
+            metadata={
+                "chat_type": chat.type or "",
+                "reply_to_message_id": (
+                    str(message.reply_to_message.message_id)
+                    if message.reply_to_message
+                    else ""
+                ),
+            },
+        )
+        await self.router.observe(
+            observed,
+            ttl_days=self.config.sync.message_ttl_days,
+            max_stored_messages=source.max_stored_messages,
+        )
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
-        if not self._is_authorized(update.effective_user.id):
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        # Two independent routes, as on Slack. Authorization decides the live
+        # one; the source has its own grant and is asked either way, so a
+        # group can feed the inbox whether or not its members may also drive
+        # the agent.
+        handled = self._is_authorized(user.id)
+        await self._observe(update, handled=handled)
+        if not handled:
             return
 
         # Delivery-only notification sink: never start an agent turn on a
@@ -1995,19 +2153,21 @@ class TelegramChannel(BaseChannel):
             await query.answer("Service unavailable", show_alert=True)
             return
 
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer,
-            answered_by="telegram",
+        result = await self._notification_service.answer_delivered_notification(
+            notification_id,
+            answer,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(query.from_user.id),
         )
 
-        if success:
+        if result:
             status_line = f"\u2705 Answered: {answer}"
             toast = f"Answered: {answer}"
             # A snooze keeps the row pending with redeliver_at stamped \u2014
             # confirm on the card that it will come back, instead of the
             # generic answered state (which read as "handled, gone").
-            snoozed_until = await self._get_snoozed_until(notification_id)
+            snoozed_until = self._snoozed_until(result)
             if snoozed_until:
                 status_line = (
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
@@ -2025,26 +2185,17 @@ class TelegramChannel(BaseChannel):
         else:
             await query.answer("Already answered or expired", show_alert=True)
 
-    async def _get_snoozed_until(self, notification_id: str) -> str | None:
-        """Return a human-readable re-delivery time if the row was snoozed.
-
-        After ``handle_answer`` succeeds, a snoozed approval is the only
-        outcome that leaves the row ``pending`` with ``redeliver_at``
-        set. Rendered in the host's local timezone. None when the answer
-        was a final decision (or anything fails \u2014 this is cosmetic).
-        """
+    @staticmethod
+    def _snoozed_until(notification: dict[str, Any]) -> str | None:
+        """Render the next delivery time when an answer snoozed the row."""
         try:
-            notif = await self._notification_service.db.get_notification(
-                notification_id,
-            )
             if (
-                not notif
-                or notif.get("status") != "pending"
-                or not notif.get("redeliver_at")
+                notification.get("status") != "pending"
+                or not notification.get("redeliver_at")
             ):
                 return None
             from datetime import datetime
-            dt = datetime.fromisoformat(notif["redeliver_at"])
+            dt = datetime.fromisoformat(notification["redeliver_at"])
             return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
         except Exception:
             return None
@@ -2063,21 +2214,16 @@ class TelegramChannel(BaseChannel):
 
         answer_text = " ".join(context.args)
 
-        pending = await self._notification_service.db.list_notifications(
-            status="pending", type="question", limit=1,
-        )
-        if not pending:
-            await update.message.reply_text("No pending questions.")
-            return
-
-        notification_id = pending[0]["id"]
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer_text,
-            answered_by="telegram",
+        result = await self._notification_service.answer_latest_question(
+            answer_text,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(update.effective_user.id),
         )
 
-        if success:
-            await update.message.reply_text(f"Answer recorded for: {pending[0]['title']}")
+        if result:
+            await update.message.reply_text(
+                f"Answer recorded for: {result['title']}",
+            )
         else:
-            await update.message.reply_text("Failed to record answer.")
+            await update.message.reply_text("No pending questions in this chat.")

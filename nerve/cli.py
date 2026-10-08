@@ -318,11 +318,28 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         )
 
 
+def _refuse_unknown_auth_mode() -> None:
+    """Stop the command when ``NERVE_AUTH_MODE`` has an unknown value.
+
+    The server reads the variable when it starts and refuses an unknown
+    value. ``start`` and ``restart`` check it first, so that they show the
+    error, and do not stop the running daemon or start one that stops at once.
+    """
+    from nerve.config import ConfigError
+    from nerve.gateway.auth import auth_mode_from_env
+
+    try:
+        auth_mode_from_env()
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+
+
 @main.command()
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 @click.pass_context
 def start(ctx: click.Context, foreground: bool) -> None:
     """Start the Nerve server."""
+    _refuse_unknown_auth_mode()
     config_dir = Path(ctx.obj["config_dir"])
     config = ctx.obj["config"]
 
@@ -495,6 +512,8 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     the restart: their ids are written to the resume queue now, and the fresh
     daemon re-drives each interrupted turn on startup.
     """
+    _refuse_unknown_auth_mode()
+
     # Enroll ids before anything else so the queue file is on disk — and
     # survives even a hard kill — by the time the new instance reads it.
     # Append mode lets concurrent enrollments from different sessions coexist.
@@ -969,6 +988,55 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
         return False, f"{model}: {detail}"
 
 
+def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
+    """Doctor lines for the local Slack settings that still apply in hosted mode.
+
+    The gateway decides admission and where the agent may post, so only the
+    send tool switch, its local conversation limit, and the notification
+    conversation are reported. Slash commands do not reach Nerve.
+    """
+    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.config import SLACK_HOST_COMMANDS
+
+    slack = config.slack
+    lines: list[str] = []
+    if not slack.allow_outbound:
+        lines.append("[--] Slack send tool off (slack.allow_outbound is false)")
+    elif slack.allow_channels or slack.deny_channels:
+        lines.append(
+            f"[OK] Slack send tool on, limited to {len(slack.allow_channels)} allow "
+            f"and {len(slack.deny_channels)} deny rule(s); the gateway also decides"
+        )
+        if any(not is_slack_id(rule) for rule in slack.deny_channels):
+            warnings.append(
+                "[WARN] slack.deny_channels has a rule that is not a conversation "
+                "id; in hosted mode the send tool then refuses every conversation"
+            )
+        if any(not is_slack_id(rule) for rule in slack.allow_channels):
+            warnings.append(
+                "[WARN] slack.allow_channels has a rule that is not a conversation "
+                "id; in hosted mode rules match conversation ids only"
+            )
+    else:
+        lines.append("[OK] Slack send tool on; the gateway decides where it may post")
+    target = notification_target(config)
+    if target:
+        lines.append(f"[OK] Slack notifications go to {target}")
+    else:
+        warnings.append(
+            "[WARN] Slack notifications have no conversation: set "
+            "notifications.slack_channel_id"
+        )
+    lines.append("[--] Slack /nerve commands are not available in hosted mode")
+    host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
+    if host:
+        warnings.append(
+            f"[WARN] slack.commands enables {', '.join(host)}, but host commands "
+            "are not available in hosted mode"
+        )
+    return lines
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1188,12 +1256,79 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 warnings.append(
                     "[WARN] telegram.allowed_users is empty — the bot rejects "
                     "all DMs until you pair (run 'nerve pair', then send the "
-                    "bot /pair <code>)"
+                    "bot /pair <code> in a private chat)"
                 )
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
         lines.append("[--] Telegram disabled")
+
+    # Check Slack
+    if config.slack.mode == "hosted":
+        # A gateway holds the tokens, so there are none to check here. The
+        # settings are checked also when Slack is switched off, because the
+        # hosted channel is built at startup and a reload cannot repair it.
+        from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
+        if not config.slack.enabled:
+            lines.append(
+                "[--] Slack is hosted but switched off (slack.enabled is false); "
+                "events wait in the gateway inbox"
+            )
+        hosted = config.channels.hosted
+        problems = hosted.problems()
+        if not problems:
+            try:
+                keys = read_key_file(hosted.gateway_jwks_file)
+            except KeyFileError as error:
+                problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+        if problems:
+            errors.extend(
+                f"[ERR] Slack is hosted but {problem}" for problem in problems
+            )
+        else:
+            lines.append(
+                f"[OK] Slack hosted by the channel gateway: agent "
+                f"{hosted.agent_id}, {len(keys)} gateway key(s) from "
+                f"{hosted.gateway_jwks_file}"
+            )
+            lines.extend(_hosted_slack_lines(config, warnings))
+    elif config.slack.enabled:
+        missing = [
+            name for name, value in (
+                ("bot_token", config.slack.bot_token),
+                ("app_token", config.slack.app_token),
+            ) if not value
+        ]
+        if missing:
+            errors.append(
+                f"[ERR] Slack enabled but {', '.join(missing)} not set "
+                "(Socket Mode needs both)"
+            )
+        else:
+            lines.append(f"[OK] Slack bot token: ...{config.slack.bot_token[-4:]}")
+            slack = config.slack
+            if not (
+                slack.allow_users
+                or slack.allow_channels
+                or slack.allow_direct_messages
+            ):
+                warnings.append(
+                    "[WARN] slack.allow_users and slack.allow_channels are "
+                    "empty and slack.allow_direct_messages is false — the bot "
+                    "refuses every message. Add your Slack member id to "
+                    "slack.allow_users"
+                )
+            else:
+                lines.append(
+                    f"[OK] Slack guardrails: {len(slack.allow_users)} allowed "
+                    f"user(s), {len(slack.allow_channels)} allowed channel(s), "
+                    f"{len(slack.deny_users) + len(slack.deny_channels)} deny "
+                    f"rule(s), direct messages "
+                    f"{'allowed' if slack.allow_direct_messages else 'refused'}"
+                )
+    else:
+        lines.append("[--] Slack disabled")
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -1220,8 +1355,32 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
+    #
+    # In external mode, the gateway names people and local accounts are not
+    # used, so the account checks do not apply. The doctor does not ask the
+    # running server for its mode: it reads NERVE_AUTH_MODE in its own shell,
+    # and the environment of the daemon can be different.
+    from nerve.config import ConfigError
     from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
-    from nerve.gateway.auth import source_authenticates
+    from nerve.gateway.auth import (
+        AUTH_MODE_ENV,
+        AUTH_MODE_EXTERNAL,
+        auth_mode_from_env,
+        source_authenticates,
+    )
+
+    mode_source = f"from {AUTH_MODE_ENV} in this shell, not from the running server"
+    try:
+        mode = auth_mode_from_env()
+    except ConfigError as e:
+        mode = None
+        errors.append(
+            f"[ERR] Auth mode ({mode_source}): {e} The server does not start "
+            "with this value."
+        )
+    else:
+        lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
+    external = mode == AUTH_MODE_EXTERNAL
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -1230,7 +1389,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         source for source in (sources or [])
         if source_authenticates(source, configured_password=configured)
     ]
-    if sources is None:
+    if external:
+        lines.append(
+            "[--] Accounts: not used in external mode; the gateway names the "
+            "person behind each request"
+        )
+    elif sources is None:
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
@@ -1251,7 +1415,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append(
             f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
         )
-    if configured and sources is not None:
+    if configured and sources is not None and not external:
         reading = [source for source in sources if source != "local"]
         if reading:
             lines.append(
@@ -1884,8 +2048,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
 def pair(ctx: click.Context) -> None:
     """Generate a Telegram pairing code.
 
-    Send /pair <code> to your bot within an hour to authorize your
-    Telegram account. The paired user ID is persisted to
+    Send /pair <code> to your bot in a private chat within an hour to
+    authorize your Telegram account. The paired user ID is persisted to
     config.local.yaml (telegram.allowed_users).
     """
     config = ctx.obj["config"]
@@ -1912,7 +2076,7 @@ def pair(ctx: click.Context) -> None:
     click.echo()
     click.secho(f"  Pairing code: {code}", bold=True)
     click.echo()
-    click.echo(f"  Send this to your bot:  /pair {code}")
+    click.echo(f"  In a private chat, send this to your bot:  /pair {code}")
     click.echo(f"  Valid for {CODE_TTL_SECONDS // 60} minutes, single use.")
     if not running:
         click.echo()

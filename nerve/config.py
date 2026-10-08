@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1057,6 +1058,203 @@ class AgentConfig:
         return False
 
 
+_DEFAULT_CHANNEL_SOURCE_SCHEDULE = "*/5 * * * *"
+
+
+def _pattern_list(value: object, label: str) -> list[str]:
+    """Coerce a ``source`` allow/deny value to a list of patterns.
+
+    Stricter than the generic coercion, because these lists decide whose
+    messages get recorded. The case that matters is a **mapping**:
+    ``allow_conversations: {"*": false}`` survives the general coercion
+    unchanged, and ``list()`` of it yields its *keys* — so a rule that reads
+    like a disabled wildcard silently becomes one that grants everything.
+    A mapping is discarded rather than salvaged.
+
+    A bare scalar still wraps to a single pattern. That is how a ``${VAR}``
+    env reference arrives, and dropping it would break the documented way to
+    configure a list field from the environment.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (dict, set)):
+        logger.warning(
+            "source.%s must be a list of patterns, got %s — discarding it. "
+            "A mapping's keys would read as patterns, so a rule that looks "
+            "switched off would grant them.",
+            label, type(value).__name__,
+        )
+        return []
+    if not isinstance(value, (list, tuple)):
+        text = _strip_display_sigil(value)
+        return [text] if text else []
+    patterns: list[str] = []
+    for entry in value:
+        if isinstance(entry, (dict, list, tuple, set)):
+            logger.warning(
+                "source.%s: ignoring non-scalar entry %r", label, entry,
+            )
+            continue
+        text = _strip_display_sigil(entry)
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def _strip_display_sigil(value: object) -> str:
+    """Drop a leading ``#`` or ``@`` from a pattern.
+
+    Chat UIs render a channel as ``#eng-backend`` and a person as ``@alice``,
+    so that is what an operator copies — but the API names carry no sigil and
+    matching is literal. Left alone, ``#eng-backend`` matches nothing, which
+    on an allow list means an inbox that stays empty with no error to explain
+    why.
+
+    Unambiguous to strip: neither platform lets a channel, chat, or user name
+    begin with ``#`` or ``@``. A ``@`` *inside* the value is untouched, so an
+    email pattern like ``*@example.com`` still works.
+    """
+    text = str(value).strip()
+    return text[1:].strip() if text[:1] in "#@" else text
+
+
+_MIN_STORED_MESSAGES = 100
+
+
+def _stored_message_target(value: object, default: int) -> int:
+    """Coerce a ``source.max_stored_messages``, holding it above a floor.
+
+    Zero is the case to catch: it reads like "no limit" and tells the trim to
+    keep no rows, emptying the buffer before the drain reads it. A negative
+    does the same, since SQLite reads a negative OFFSET as zero.
+    """
+    target = _lenient_int(value, default, label="source.max_stored_messages")
+    if target >= _MIN_STORED_MESSAGES:
+        return target
+    logger.warning(
+        "source.max_stored_messages is %r, which would trim the buffer to "
+        "nothing before the drain reads it. Using %d instead.",
+        value, _MIN_STORED_MESSAGES,
+    )
+    return _MIN_STORED_MESSAGES
+
+
+def _channel_source_schedule(value: object) -> str:
+    """Coerce a ``source.schedule``, falling back to the default.
+
+    A channel source carries its own schedule, so an unusable value has
+    no ``sync.<name>`` section to fall back to — it would leave the channel
+    buffering with nothing ever draining it. Fall back loudly instead.
+    """
+    if value is None:
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    if not isinstance(value, str) or not value.strip():
+        logger.warning(
+            "source.schedule must be a non-empty crontab or interval "
+            "string, got %r — falling back to %r. Left unset, the buffer "
+            "would fill with nothing draining it.",
+            value, _DEFAULT_CHANNEL_SOURCE_SCHEDULE,
+        )
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    return value.strip()
+
+
+@dataclass
+class ChannelSourceConfig:
+    """Which conversations feed the inbox, independent of live routing.
+
+    A separate grant from the access rules, and evaluated independently of
+    them. "May this person drive the agent?" and "may this room's traffic
+    reach the agent's inbox?" are different questions. A message can qualify
+    for the live route, the source route, both, or neither. Deriving one answer
+    from the other would block watching a channel the agent takes no orders
+    from, or widen command access to everything worth watching.
+
+    Fail-closed twice over: off unless ``enabled``, and collecting nothing
+    unless the allow list names something. An empty allow list here means
+    "nothing", not "everything" — the opposite of the access gates, because
+    this one is a standing grant to record other people's messages rather
+    than a check that already ran a sender rule first.
+
+    The fields are transport-neutral, but the YAML keys are not: each channel
+    passes the ``subject`` its own users would recognise, so Slack reads
+    ``allow_channels`` and Telegram reads ``allow_chats``. Sharing one noun
+    was worse than it looks — on Telegram a "channel" is a specific entity
+    type distinct from a group, so ``allow_channels`` there would name the
+    wrong thing, and "conversations" named nothing anyone could act on.
+
+    What actually matches is per transport and documented in ``config.md``;
+    the short version is that a platform id always works, and a name works
+    only where the platform, not the subject, controls it.
+
+    ``schedule`` is the drain cadence, not a poll: the messages are already
+    in the buffer by the time it fires.
+    """
+
+    enabled: bool = False
+    allow_conversations: list[str] = field(default_factory=list)
+    deny_conversations: list[str] = field(default_factory=list)
+    allow_senders: list[str] = field(default_factory=list)
+    deny_senders: list[str] = field(default_factory=list)
+    schedule: str = _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    batch_size: int = 50
+    # Off by default: most chat messages are shorter than the runner's
+    # 800-char condense threshold, so this would build an LLM client that
+    # never gets used.
+    condense: bool = False
+    # Trim target per transport, checked every 100 writes. One budget for all
+    # of a transport's watched conversations, not one each.
+    max_stored_messages: int = 10_000
+    # Whether a message accepted for live routing is also collected.
+    # Off by default. Turn it on only when source consumers should receive the
+    # same message later, such as when the source is an archive or digest.
+    include_handled_messages: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(
+        cls, d: dict, *, subject: str = "conversations",
+    ) -> ChannelSourceConfig:
+        """Parse a ``<channel>.source`` block.
+
+        ``subject`` is the noun this transport calls the thing being watched
+        — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
+        the YAML keys and every warning, so an operator is told about the key
+        they actually wrote.
+        """
+        enabled = _as_bool(
+            d.get("enabled", False), False, label="source.enabled",
+        )
+        allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
+        allow = _pattern_list(d.get(allow_key), allow_key)
+        if enabled and not allow:
+            logger.warning(
+                "source.enabled is set but source.%s names nothing usable — "
+                "nothing will be collected. List the %s to watch; an empty "
+                "list is not a wildcard here.",
+                allow_key, subject,
+            )
+        return cls(
+            enabled=enabled,
+            allow_conversations=allow,
+            deny_conversations=_pattern_list(d.get(deny_key), deny_key),
+            allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
+            deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
+            schedule=_channel_source_schedule(d.get("schedule")),
+            batch_size=d.get("batch_size", 50),
+            condense=_as_bool(
+                d.get("condense", False), False, label="source.condense",
+            ),
+            max_stored_messages=_stored_message_target(
+                d.get("max_stored_messages"), 10_000,
+            ),
+            include_handled_messages=_as_bool(
+                d.get("include_handled_messages", False), False,
+                label="source.include_handled_messages",
+            ),
+        )
+
+
 @dataclass
 class TelegramConfig:
     enabled: bool = True
@@ -1070,6 +1268,8 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -1113,6 +1313,166 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="chats",
+            ),
+        )
+
+
+# Every `/nerve` subcommand, and the set enabled when the operator says
+# nothing. Kept here rather than in the channel so config validation can
+# name them without importing the transport.
+SLACK_ALL_COMMANDS: tuple[str, ...] = (
+    "sessions", "new", "stop", "star", "unstar", "reply", "doctor", "restart",
+)
+# `sessions` is absent on purpose: it reaches every interactive session in the
+# instance, and Slack has no ownership model yet to narrow that list. Replies
+# are safe by default because notification lookup is delivery-target scoped.
+SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
+    "new", "stop", "star", "unstar", "reply",
+)
+# Subcommands that act on the host rather than on the conversation they were
+# typed in, and are refused in a shared channel however the allow lists read.
+# Enabling one is a decision about this instance; letting any member of a
+# shared channel invoke it is a second decision, and `commands` — one flat
+# list — cannot express the difference.
+#
+# The rest stay channel-usable because they cannot reach past the conversation:
+# `stop`, `star` and `unstar` choose among that channel's own thread sessions,
+# and `reply` answers a question already delivered there, which is the whole
+# point of `notifications.slack_channel_id`. `sessions` and `new` are refused
+# in a channel as well, for the unrelated reason that a slash payload carries
+# no thread to bind a session to — see ``_THREADED_CHANNEL_REFUSAL``.
+SLACK_HOST_COMMANDS: tuple[str, ...] = ("doctor", "restart")
+# How Slack traffic reaches this process: its own Socket Mode connection, or
+# streams from a shared channel gateway.
+SLACK_MODES: tuple[str, ...] = ("socket", "hosted")
+
+
+def _slack_commands(raw: object) -> list[str] | None:
+    """Normalize ``slack.commands``.
+
+    Absence keeps the defaults, an empty list disables commands, and a sole
+    ``all`` or ``*`` enables every command. Unknown names are warned and dropped.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "slack.commands must be a list — ignoring %r and keeping the "
+            "default set", raw,
+        )
+        return None
+
+    names = [str(v).strip().lstrip("/").lower() for v in raw if str(v).strip()]
+    if names == ["all"] or names == ["*"]:
+        return list(SLACK_ALL_COMMANDS)
+
+    kept, unknown = [], []
+    for name in names:
+        (kept if name in SLACK_ALL_COMMANDS else unknown).append(name)
+    if unknown:
+        logger.warning(
+            "slack.commands has no such subcommand(s): %s — known ones are %s",
+            ", ".join(sorted(set(unknown))), ", ".join(SLACK_ALL_COMMANDS),
+        )
+    return kept
+
+
+@dataclass
+class SlackConfig:
+    """Slack transport and access settings.
+
+    Direct messages require explicit opt-in. Sender and channel patterns match
+    Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
+    In hosted mode the tokens and access lists are unused; the source grant
+    still decides what reaches the inbox.
+    """
+
+    # Off until the workspace is set up. Slack reaches an installation that
+    # never asked for it, so an absent or credential-less section resolves to
+    # disabled and `nerve doctor` stays quiet about a channel nobody uses.
+    enabled: bool = False
+    bot_token: str = ""      # xoxb-… — Web API calls
+    app_token: str = ""      # xapp-… — Socket Mode connection
+    allow_users: list[str] = field(default_factory=list)
+    deny_users: list[str] = field(default_factory=list)
+    # Direct messages are a distinct conversation kind, not a channel name.
+    # Keep them opt-in even when a sender allow-list grants access elsewhere.
+    allow_direct_messages: bool = False
+    allow_channels: list[str] = field(default_factory=list)
+    deny_channels: list[str] = field(default_factory=list)
+    # Whether an agent may post to a conversation it names, unprompted
+    # (send_channel_message). Off by default and separate from the read
+    # grant: allow_channels is set by nearly every Slack deployment for
+    # inbound access, so deriving writes from it alone would hand every
+    # cron run a megaphone into those channels on upgrade. Turning this on
+    # never widens where writes may go — allow_channels still bounds that.
+    allow_outbound: bool = False
+    stream_mode: str = "partial"
+    # None keeps safe defaults; [] disables commands. Host-wide and
+    # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
+    commands: list[str] | None = None
+    # Channels whose traffic feeds the inbox. Its own grant, not derived
+    # from allow_channels — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # "socket": this process holds the tokens and a Socket Mode connection.
+    # "hosted": a shared channel gateway holds them and streams events here
+    # (see HostedChannelsConfig). The access lists above apply to socket
+    # mode only; in hosted mode the gateway admits each event.
+    mode: str = "socket"
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict, locked: bool = False) -> SlackConfig:
+        stream_mode = d.get("stream_mode", "partial")
+        if stream_mode not in ("partial", "full"):
+            logger.warning(
+                "slack.stream_mode %r is not one of ('partial', 'full') — "
+                "falling back to 'partial'",
+                stream_mode,
+            )
+            stream_mode = "partial"
+        mode = str(d.get("mode") or "socket").strip().lower()
+        if mode not in SLACK_MODES:
+            logger.warning(
+                "slack.mode %r is not one of %s; falling back to 'socket'",
+                mode, SLACK_MODES,
+            )
+            mode = "socket"
+        bot_token = d.get("bot_token", "")
+        app_token = d.get("app_token", "")
+        # Explicit `enabled` wins. Otherwise hosted mode enables Slack, since
+        # naming the mode is an explicit opt-in that needs no token. In socket
+        # mode both tokens enable it, except under lockdown where the
+        # machine-local opt-in is unavailable. Invalid boolean values fail
+        # closed.
+        enabled = (
+            _as_bool(d["enabled"], False, label="SlackConfig.enabled")
+            if "enabled" in d
+            else mode == "hosted" or (bool(bot_token and app_token) and not locked)
+        )
+        return cls(
+            mode=mode,
+            enabled=enabled,
+            bot_token=bot_token,
+            app_token=app_token,
+            allow_users=d.get("allow_users") or [],
+            deny_users=d.get("deny_users") or [],
+            allow_direct_messages=d.get("allow_direct_messages", False),
+            allow_channels=d.get("allow_channels") or [],
+            deny_channels=d.get("deny_channels") or [],
+            allow_outbound=_as_bool(
+                d.get("allow_outbound", False), False,
+                label="SlackConfig.allow_outbound",
+            ),
+            stream_mode=stream_mode,
+            commands=_slack_commands(d.get("commands")),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="channels",
+            ),
         )
 
 
@@ -2052,7 +2412,9 @@ class AuthConfig:
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
-    channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
+    channels: list[str] = field(
+        default_factory=lambda: ["web", "telegram", "slack"],
+    )
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
@@ -2060,6 +2422,7 @@ class NotificationsConfig:
     # false to preserve the historical behaviour where a group set as the sink
     # still responds to messages.
     delivery_only_sink: bool = False
+    slack_channel_id: str = ""                # Target conversation; falls back to a literal id in slack.allow_channels
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
     max_redeliveries: int = 3                 # Per-row cap on snooze/re-delivery cycles
     priority_prefixes: dict[str, str] = field(default_factory=lambda: {
@@ -2076,9 +2439,10 @@ class NotificationsConfig:
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
-            channels=d.get("channels", ["web", "telegram"]),
+            channels=d.get("channels", ["web", "telegram", "slack"]),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
+            slack_channel_id=str(d.get("slack_channel_id") or ""),
             default_expiry_hours=d.get("default_expiry_hours", 48),
             max_redeliveries=d.get("max_redeliveries", 3),
             priority_prefixes=d.get("priority_prefixes", {
@@ -2089,14 +2453,83 @@ class NotificationsConfig:
         )
 
 
+HOSTED_CHANNEL_ISSUER = "nerve-gateway"
+HOSTED_CHANNEL_AUDIENCE = "nerve-channel"
+_HOSTED_MAX_STREAMS = 64
+
+
+@dataclass
+class HostedChannelsConfig:
+    """Streams from a shared channel gateway, for providers in hosted mode.
+
+    In hosted mode (``slack.mode: hosted``) Nerve holds no provider tokens.
+    Gateway replicas open streams to ``/_internal/channel/v1/stream`` on the
+    gateway port, and Nerve accepts a stream only with a token that the
+    gateway signs: a key from the local JWK Set file ``gateway_jwks_file``,
+    ``issuer`` and ``audience``, and exactly ``tenant_id`` and ``agent_id``.
+    ``max_streams`` bounds the streams open at one time; a gateway normally
+    holds one per replica.
+    """
+
+    gateway_jwks_file: Path | None = None
+    issuer: str = HOSTED_CHANNEL_ISSUER
+    audience: str = HOSTED_CHANNEL_AUDIENCE
+    tenant_id: str = ""
+    agent_id: str = ""
+    max_streams: int = 8
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> HostedChannelsConfig:
+        return cls(
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            issuer=str(d.get("issuer") or HOSTED_CHANNEL_ISSUER).strip(),
+            audience=str(d.get("audience") or HOSTED_CHANNEL_AUDIENCE).strip(),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            max_streams=d.get("max_streams", 8),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot authenticate a stream. Empty when they can.
+
+        The key file itself is read by the stream verifier and by ``nerve doctor``.
+        """
+        found: list[str] = []
+        if self.gateway_jwks_file is None:
+            found.append("channels.hosted.gateway_jwks_file must name the gateway's public key file")
+        elif not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("channels.hosted.gateway_jwks_file must be an absolute path")
+        if not self.issuer:
+            found.append("channels.hosted.issuer must not be empty")
+        if not self.audience:
+            found.append("channels.hosted.audience must not be empty")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"channels.hosted.{key} must be a lowercase UUID")
+        if not 1 <= self.max_streams <= _HOSTED_MAX_STREAMS:
+            found.append(
+                f"channels.hosted.max_streams must be from 1 to {_HOSTED_MAX_STREAMS}",
+            )
+        return found
+
+
 @dataclass
 class ChannelsConfig:
     """Global channel settings."""
 
+    hosted: HostedChannelsConfig = field(default_factory=HostedChannelsConfig)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> ChannelsConfig:
-        return cls()
+        return cls(hosted=HostedChannelsConfig.from_dict(d.get("hosted") or {}))
 
 
 @dataclass
@@ -2759,6 +3192,7 @@ class NerveConfig:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -2817,6 +3251,17 @@ class NerveConfig:
         the Anthropic↔OpenAI translation layer Ollama is reached through).
         """
         return self.ollama.enabled and self.proxy.enabled
+
+    @property
+    def outbound_channels(self) -> list[str]:
+        """Transports an agent may post to unprompted.
+
+        A channel that is not running has nothing to post through, and one
+        without its own outbound switch refuses every target. Empty means
+        ``send_channel_message`` can only refuse, which is what decides
+        whether it is offered at all.
+        """
+        return ["slack"] if self.slack.enabled and self.slack.allow_outbound else []
 
     def selectable_claude_models(
         self, discovered: list[str] | None = None,
@@ -2999,6 +3444,7 @@ class NerveConfig:
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
+            slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
@@ -3390,8 +3836,20 @@ def lockdown_machine_local_notes(
 # YAML keys that are intentionally not dataclass fields — keyed by dotted
 # prefix ("" is the top level). claude_oauth_token / github_token are read
 # from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+#
+# The `<channel>.source` entries are the transport's own spelling of
+# ChannelSourceConfig's `allow_conversations` / `deny_conversations`:
+# `from_dict` reads `allow_{subject}`, so Slack writes `allow_channels` and
+# Telegram `allow_chats`. The validator compares against dataclass field
+# names, which inverts the answer without these — the two spellings that
+# work would be reported as ignored, and `allow_conversations`, which no
+# transport ever reads, would validate clean. Listing them here rather than
+# teaching the walk about the remap keeps a real typo (`allow_channel`)
+# reported, which making the subtree opaque would not.
 _EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
     "": {"claude_oauth_token", "github_token"},
+    "slack.source": {"allow_channels", "deny_channels"},
+    "telegram.source": {"allow_chats", "deny_chats"},
 }
 
 # Subtrees we don't descend into: free-form mappings or lists of mappings

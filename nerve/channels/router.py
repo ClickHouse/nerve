@@ -13,17 +13,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
 
 from nerve.agent.interactive import get_handler
 from nerve.agent.streaming import broadcaster
+from nerve.channels.access import Decision
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
+    OutboundRefused,
 )
 from nerve.channels.stream_adapter import StreamAdapter
+from nerve.db.observations import DEFAULT_MAX_ROWS
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -70,6 +75,14 @@ class ChannelRouter:
             "Registered channel: %s (capabilities: %s)",
             channel.name, channel.capabilities,
         )
+
+    def unregister(self, channel: BaseChannel) -> bool:
+        """Remove *channel* only if it is still the registered instance."""
+        if self._channels.get(channel.name) is not channel:
+            return False
+        del self._channels[channel.name]
+        logger.info("Unregistered channel: %s", channel.name)
+        return True
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a registered channel by name."""
@@ -362,6 +375,44 @@ class ChannelRouter:
         return await chan_obj.send_file(target, file_path)
 
     # ------------------------------------------------------------------ #
+    #  Observation buffer                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def observe(
+        self,
+        msg: ObservedMessage,
+        ttl_days: int = 7,
+        max_stored_messages: int = DEFAULT_MAX_ROWS,
+    ) -> bool:
+        """Buffer a message a channel collected for the source inbox.
+
+        Channels reach the database through the router, never through the
+        engine directly, so this is the seam. Returns True if the record was
+        buffered.
+
+        A failure is swallowed and logged. This sits on a channel's dispatch
+        path, ahead of any live handling, so a database hiccup must not take
+        down message handling for the sake of a buffered copy.
+        """
+        db = getattr(self.engine, "db", None)
+        if db is None:
+            return False
+        try:
+            await db.insert_channel_observation(
+                channel=msg.channel_name,
+                channel_key=msg.channel_key,
+                payload=asdict(msg),
+                ttl_days=ttl_days,
+                max_rows=max_stored_messages,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to buffer an observation from %s: %s", msg.channel_name, e,
+            )
+            return False
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 
@@ -446,9 +497,27 @@ class ChannelRouter:
             limit=limit, offset=offset, current_id=current_id,
         )
 
+    async def list_conversation_sessions(
+        self, channel_key: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List live mappings for one exact conversation and its children."""
+        return await self.engine.db.list_channel_sessions_for_conversation(
+            channel_key,
+            limit=limit,
+            exclude_statuses=("archived", "stopped"),
+        )
+
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop a session through the engine lifecycle boundary."""
+        return await self.engine.stop_session(session_id)
+
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
         return await self.engine.sessions.set_starred(session_id, starred)
+
+    async def toggle_session_starred(self, session_id: str) -> bool:
+        """Toggle a session's starred state."""
+        return await self.engine.sessions.toggle_starred(session_id)
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""
@@ -477,19 +546,60 @@ class ChannelRouter:
     ) -> None:
         """Deliver a complete message to a channel target.
 
-        Used by cron jobs and other non-interactive output delivery.
+        Used by cron jobs and other non-interactive output delivery, which
+        have no return value to read — see :meth:`deliver_addressed` for the
+        same send with the refusal reason attached.
+        """
+        await self.deliver_addressed(channel_name, target, message, session_id)
+
+    async def deliver_addressed(
+        self,
+        channel_name: str,
+        target: str,
+        message: str,
+        session_id: str | None = None,
+    ) -> Decision:
+        """Deliver to a target the caller names, reporting why if refused.
+
+        The target is always supplied by the caller and never inferred from
+        ``_message_context``, so a cron run cannot spill into whatever chat
+        last touched the session — the same reasoning as :meth:`send_file`.
+
+        The channel authorizes the destination first, because only it knows
+        what a target means; see :meth:`BaseChannel.authorize_outbound`.
+        Returning the :class:`~nerve.channels.access.Decision` lets a caller
+        say why nothing was sent instead of only that nothing was.
+
+        A transport failure propagates rather than becoming a refusal: "the
+        policy said no" and "Slack was down" are different answers. A channel
+        whose policy is checked at delivery raises
+        :class:`~nerve.channels.base.OutboundRefused`, which becomes a refusal.
         """
         channel = self._channels.get(channel_name)
         if not channel:
             logger.warning("Cannot deliver to unknown channel: %s", channel_name)
-            return
+            return Decision(False, f"unknown channel {channel_name!r}")
+
+        verdict = await channel.authorize_outbound(target)
+        if not verdict.allowed:
+            logger.info(
+                "Refused addressed delivery to %s: %s", channel_name, verdict.reason,
+            )
+            return verdict
 
         formatted = channel.format_response(message)
-        await channel.send(OutboundMessage(
-            target=target,
-            text=formatted,
-            session_id=session_id or "",
-        ))
+        try:
+            await channel.send(OutboundMessage(
+                target=target,
+                text=formatted,
+                session_id=session_id or "",
+            ))
+        except OutboundRefused as refusal:
+            logger.info(
+                "Refused addressed delivery to %s at delivery: %s", channel_name, refusal.reason,
+            )
+            return Decision(False, refusal.reason)
+        return verdict
 
     # ------------------------------------------------------------------ #
     #  Streaming adapter lifecycle                                         #

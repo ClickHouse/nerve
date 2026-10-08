@@ -78,8 +78,13 @@ Abstract communication layer with three components:
 - **ChannelRouter** — centralized session resolution, streaming adapter lifecycle, interactive tool routing, and cron output delivery. Replaces per-channel session management.
 - **StreamAdapter** — translates `StreamBroadcaster` events into channel-appropriate output (edit-in-place for Telegram, accumulated send for simple channels). Created per inbound message.
 
+- **Access matching** (`access.py`) — transport-neutral identity aliases and fail-closed allow/deny pattern matching. Channels compose these primitives into their own policy before creating an `InboundMessage`.
+- **Archives** (`archives.py`) — bounded one-level ZIP unpacking shared by Telegram and Slack. The download cap is on compressed bytes, so entry count, per-entry and aggregate uncompressed size, and compression ratio are all checked against the archive directory before an entry is read.
+
 Implementations:
 - **Telegram** — python-telegram-bot v21+ with partial message streaming (edit-in-place, 1.5s rate limit), inline keyboard buttons for notification questions, `/reply` command for free-text answers
+- **Slack** — slack_sdk Socket Mode (outbound WebSocket, no public URL) with partial streaming via `chat.update`, Block Kit buttons, `/nerve` slash command, and per-thread sessions. `SlackAccessPolicy` (`slack_access.py`) composes user, channel, and DM guardrails; in channels the bot answers only on mention or in a thread it already owns.
+- **Hosted** (`hosted/`): provider traffic that a shared channel gateway holds (`slack.mode: hosted`). Nerve has no provider tokens. Each gateway replica opens a WebSocket to `/_internal/channel/v1/stream`, authenticated with a token that the gateway signs (ES256, issuer `nerve-gateway`, audience `nerve-channel`, subject naming this exact tenant and agent, at most 300 seconds of lifetime). One inbox reader pulls admitted events over the preferred stream: read, process, acknowledge, and read again until a page is empty. `HostedChannel` registers under the provider's name, so the router and tools see `slack` as with Socket Mode, and uses the same session keys. The gateway decides which events invoke the agent: a direct message, a mention of the agent, a thread reply, a reaction, an interaction, or a command. A mention of the agent carries the `self` flag, so intake needs no capabilities. Outbound messages are contract operations: `OperationRunner` (`hosted/operations.py`) sends each on a stream that advertised it for the connection, within the stream and connection in-flight limits, and never sends a side-effecting operation again after its result is lost. File uploads and attachment reads use transfers on the stream of their operation; a read is sent only while its length fits Nerve's stream memory limit. Notification cards carry buttons, and a press arrives as an `interaction` event that answers the notification. `hosted/contract/` holds the version 1 channel contract frames that Nerve reads and sends. The gateway checks the contract; Nerve checks only the members and values that its code uses, and its size limits.
 - **Web** — Passive channel using gateway WebSocket
 
 Adding a new channel (Discord, WhatsApp, etc.) requires implementing ~5 methods and zero session/routing logic.
@@ -89,8 +94,8 @@ Async notification system for agent→user communication:
 - **`notify` tool** — fire-and-forget notifications (status updates, alerts, reminders)
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
-- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons for questions
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
+- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
@@ -267,6 +272,7 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 ## Security
 
 - JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode
+- Channel gateway streams (`/_internal/channel/v1/stream`) have their own authentication: a gateway-signed token in the `Authorization` header, verified against the public keys in a local key file (`channels.hosted.gateway_jwks_file`). Nerve fetches no keys over the network. The web session token never opens a stream, a stream token never reaches the web UI or the API, and an upgrade with an `Origin` header (every browser sends one) is refused
 - bcrypt password hashing
 - Path traversal prevention on file operations
 - Self-signed HTTPS (mkcert)

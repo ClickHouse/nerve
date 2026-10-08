@@ -18,6 +18,7 @@ from nerve.config import (
     CronConfig,
     NerveConfig,
     ProxyConfig,
+    SlackConfig,
     SSLConfig,
     TelegramConfig,
     WorkflowRunsConfig,
@@ -157,11 +158,52 @@ class TestValidateConfigKeys:
                 "dm_policy": "pairing",
                 "allowed_users": [1],
                 "stream_mode": "partial",
+                "source": {"enabled": True, "allow_chats": [-100123]},
+            },
+            "slack": {
+                "enabled": True,
+                "allow_channels": ["C0123ABC"],
+                "source": {
+                    "enabled": True,
+                    "allow_channels": ["C0123ABC"],
+                    "deny_channels": ["*-social"],
+                    "deny_senders": ["*-bot"],
+                },
             },
             "agent": {"model": "claude-opus-4-8"},
             "auth": {"jwt_secret": "s"},
         }
         assert validate_config_keys(merged) == []
+
+    def test_channel_source_subject_keys_are_not_unknown(self):
+        """``<channel>.source`` names the conversations in the transport's own
+        noun, so the working keys are not the dataclass field names.
+
+        Reported as unknown, they told an operator following the docs that a
+        key Nerve does read was being ignored — while
+        ``allow_conversations``, which no transport reads, passed silently.
+        """
+        assert validate_config_keys(
+            {"slack": {"source": {"allow_channels": ["*"], "deny_channels": []}}},
+        ) == []
+        assert validate_config_keys(
+            {"telegram": {"source": {"allow_chats": [1], "deny_chats": []}}},
+        ) == []
+
+    def test_a_typo_in_a_channel_source_is_still_reported(self):
+        """The allowance is per key, not per subtree: the near-misses these
+        keys invite are exactly what the validator exists to catch."""
+        warnings = validate_config_keys(
+            {"slack": {"source": {"allow_channel": ["*"]}}},   # singular
+        )
+        assert len(warnings) == 1
+        assert "slack.source.allow_channel" in warnings[0]
+
+        warnings = validate_config_keys(
+            {"telegram": {"source": {"allow_channels": [1]}}},  # Slack's noun
+        )
+        assert len(warnings) == 1
+        assert "telegram.source.allow_channels" in warnings[0]
 
     def test_unknown_top_level_key(self):
         warnings = validate_config_keys({"workspaec": "~/ws"})
@@ -198,6 +240,102 @@ class TestTelegramDmPolicy:
     def test_allowed_users_coerced_to_int(self):
         cfg = TelegramConfig.from_dict({"allowed_users": ["123", 456]})
         assert cfg.allowed_users == [123, 456]
+
+
+class TestSlackIsOptIn:
+    """Slack must not switch itself on for installations that predate it.
+
+    Every existing config has no ``slack`` section. Reading that as enabled
+    made ``nerve doctor`` report missing tokens and exit 1 on all of them.
+    """
+
+    def test_a_config_with_no_slack_section_is_disabled(self):
+        assert NerveConfig.from_dict({"model": "x"}).slack.enabled is False
+
+    def test_an_empty_slack_section_is_disabled(self):
+        assert SlackConfig.from_dict({}).enabled is False
+
+    def test_a_section_without_tokens_is_disabled(self):
+        assert SlackConfig.from_dict({"allow_users": ["U0123ABC"]}).enabled is False
+
+    def test_both_tokens_turn_it_on_without_an_enabled_key(self):
+        cfg = SlackConfig.from_dict({"bot_token": "xoxb-1", "app_token": "xapp-1"})
+        assert cfg.enabled is True
+
+    def test_one_token_alone_is_not_enough(self):
+        assert SlackConfig.from_dict({"bot_token": "xoxb-1"}).enabled is False
+
+    def test_an_explicit_false_wins_over_the_tokens(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": False, "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_an_explicit_true_is_honoured_without_tokens(self):
+        # Someone who asks for Slack and forgets the tokens should be told
+        # so by the doctor, not silently left with the channel off.
+        assert SlackConfig.from_dict({"enabled": True}).enabled is True
+
+    def test_lockdown_keeps_a_token_bearing_section_off(self):
+        # Lockdown drops the machine-local layer that decides whether this
+        # box answers Slack, so shared settings alone must not start it.
+        cfg = SlackConfig.from_dict(
+            {"bot_token": "xoxb-1", "app_token": "xapp-1"}, locked=True,
+        )
+        assert cfg.enabled is False
+
+    def test_an_unreadable_value_falls_back_to_off(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": "${SLACK_ON}", "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_direct_messages_are_an_explicit_opt_in(self):
+        assert SlackConfig.from_dict({}).allow_direct_messages is False
+        cfg = SlackConfig.from_dict({"allow_direct_messages": "true"})
+        assert cfg.allow_direct_messages is True
+
+    def test_the_doctor_says_nothing_about_an_unconfigured_slack(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"model": "x"}))
+        assert "Slack enabled but" not in report
+        assert "[--] Slack disabled" in report
+
+    def test_the_doctor_still_reports_missing_tokens_when_asked_for(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"slack": {"enabled": True}}))
+        assert "[ERR] Slack enabled but bot_token, app_token not set" in report
+
+    def test_the_doctor_counts_direct_messages_as_a_guardrail(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({
+            "slack": {
+                "enabled": True,
+                "bot_token": "xoxb-test",
+                "app_token": "xapp-test",
+                "allow_direct_messages": True,
+            },
+        }))
+        assert "direct messages allowed" in report
+        assert "bot refuses every message" not in report
+
+
+class TestSlackDefaultCommands:
+    def test_only_globally_scoped_session_listing_is_off_by_default(self):
+        from nerve.config import SLACK_DEFAULT_COMMANDS
+
+        assert "sessions" not in SLACK_DEFAULT_COMMANDS
+        assert "reply" in SLACK_DEFAULT_COMMANDS
+
+    def test_they_are_still_available_on_request(self):
+        from nerve.config import SLACK_ALL_COMMANDS
+
+        cfg = SlackConfig.from_dict({"commands": ["sessions", "reply"]})
+        assert cfg.commands == ["sessions", "reply"]
+        assert {"sessions", "reply"} <= set(SLACK_ALL_COMMANDS)
 
 
 class TestAppendTelegramAllowedUser:

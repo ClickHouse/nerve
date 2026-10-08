@@ -27,6 +27,7 @@ Treat the returned token as opaque.
 | Valid credentials for a disabled account | `401` |
 | Setup is not complete (`login` is `setup`) | `409` |
 | Authentication is not ready | `503` |
+| External mode (`mode` is `external`) | `404` |
 
 #### Authenticated requests
 
@@ -36,17 +37,21 @@ or as `?token=` (for `<img src>` and downloads, which cannot set headers).
 Every request resolves its token to an account actor or the system principal.
 Unknown and disabled accounts fail with `401`; unavailable startup identity
 state fails with `503`. See [Accounts and identity](accounts.md) for token
-types and legacy-session compatibility.
+types and legacy-session compatibility. In external mode, the gateway names the
+person in the `X-Nerve-Actor-Context` header and session tokens are refused; see
+[External mode](accounts.md#external-mode).
 
 When a session is more than halfway to expiry, the response includes a refreshed
 token in `X-Nerve-Token`. Replace the current token with it. The header also
 upgrades sessions created before per-account login and is exposed through CORS.
 
 #### `GET /api/auth/status`
-Return the required login fields. Authentication is not required.
+Return the authentication mode and the required login fields. Authentication is
+not required.
 
 ```json
 Response: {
+  "mode": "local",
   "auth_required": true,
   "login": "password"
 }
@@ -54,6 +59,7 @@ Response: {
 
 | Field | Meaning |
 |---|---|
+| `mode` | `local` or `external`; see [Authentication mode](config.md#authentication-mode) |
 | `login` | `setup`, `none`, `password`, or `username_password` |
 | `auth_required` | Compatibility field; equivalent to `login != "none"` |
 
@@ -63,6 +69,11 @@ passwordless installation.
 
 The response does not expose usernames or the account count. Before
 authentication is ready, it returns the fail-closed `username_password` state.
+
+In `external` mode, the gateway signs people in and local login is not
+available. The response does not read local login state and always returns
+`auth_required: true` and `login: "username_password"`. Use `mode` to decide
+whether to show a login form.
 
 #### `GET /api/auth/check`
 Verify current authentication.

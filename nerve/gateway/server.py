@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import os
-import ssl
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,7 +20,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
@@ -31,9 +28,14 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.gateway.auth import (
+    ACTOR_CONTEXT_HEADER,
+    AUTH_MODE_EXTERNAL,
     SESSION_TOKEN_HEADER,
+    auth_mode_from_env,
     authenticate_websocket,
     identity_store,
+    is_external_mode,
+    pin_auth_mode,
 )
 from nerve.identity import Actor, ActorResolutionError, actor_for_account
 from nerve.gateway.routes import (
@@ -70,6 +72,9 @@ _codex_thread_sync = None
 # lifespan once the config is loaded so the periodic sweep starts the
 # moment the gateway accepts traffic.
 _external_agents_sync = None
+# HostedChannelRuntime assigned during lifespan when a provider is in hosted
+# mode. The channel stream endpoint refuses every upgrade while it is None.
+_hosted_channels = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -139,8 +144,14 @@ WS_ACCOUNT_DISABLED_REASON = "Account disabled"
 
 
 async def _account_enabled(actor: Actor) -> bool:
-    """Whether the actor may still use a socket. The system principal may."""
+    """Whether the actor may still use a socket. The system principal may.
+
+    In external mode, a person that the gateway names has no local account,
+    and the gateway decides access.
+    """
     if actor.is_system:
+        return True
+    if is_external_mode() and actor.account_id is None:
         return True
     store = identity_store()
     if store is None or not actor.account_id:
@@ -306,7 +317,7 @@ async def _periodic_backup(notification_service) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _hosted_channels
     config = get_config()
     # Create the state directory owner-only before anything writes to it.
     # Database.connect refuses a state directory that other users can write to.
@@ -351,12 +362,16 @@ async def lifespan(app: FastAPI):
             logger.info("Identity bootstrap: %s", action)
 
         # Create the setup token before serving. Never log it: `nerve status`
-        # reads it from the database.
+        # reads it from the database. External mode has no local setup, so a
+        # token left from local mode is deleted.
         from nerve import setup_token
 
         await setup_token.ensure_setup_token(
             db,
-            unclaimed=await setup_token.instance_is_unclaimed(db, config),
+            unclaimed=(
+                not is_external_mode()
+                and await setup_token.instance_is_unclaimed(db, config)
+            ),
         )
 
         # Start CLIProxyAPI if enabled (must be up before engine/memU initializes)
@@ -481,6 +496,40 @@ async def lifespan(app: FastAPI):
             await telegram_channel.start()
             startup_cleanups.append(("Telegram bot", telegram_channel.stop))
             logger.info("Telegram bot started")
+
+        # Install the lifecycle owner even when Slack starts disabled, so a later
+        # reload can enable it without rebuilding gateway state.
+        from nerve.channels.slack_runtime import SlackRuntime
+
+        slack_runtime = SlackRuntime(_engine.router, notification_service)
+        _engine.register_channel_runtime("slack", slack_runtime)
+        startup_cleanups.append(("Slack runtime", slack_runtime.shutdown))
+        try:
+            slack_outcome = await slack_runtime.reconcile(config)
+            if slack_outcome:
+                logger.info("Slack bot %s", slack_outcome)
+        except Exception as e:
+            # Slack is optional; its runtime leaves a failed candidate absent and
+            # retryable while the web UI and other channels continue starting.
+            logger.error("Slack bot failed to start: %s", e, exc_info=True)
+
+        # Hosted channels: a shared gateway holds the provider connections and
+        # streams admitted events to /_internal/channel/v1/stream. Optional like
+        # Slack: a failure leaves the endpoint refusing upgrades.
+        from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_providers
+
+        if hosted_providers(config):
+            try:
+                runtime = HostedChannelRuntime(
+                    config, _engine.router, get_config,
+                    notification_service=notification_service,
+                )
+                await runtime.start()
+                startup_cleanups.append(("hosted channels", runtime.stop))
+                _hosted_channels = runtime
+                _engine.register_channel_runtime("hosted", runtime)
+            except Exception as e:
+                logger.error("Hosted channels failed to start: %s", e, exc_info=True)
 
         # Start cron service
         global _cron_service
@@ -839,12 +888,19 @@ async def lifespan(app: FastAPI):
             logger.warning("External-agents sync shutdown raised: %s", e)
         _external_agents_sync = None
 
-    # Shutdown: stop telegram FIRST, before cancelling background tasks.
-    # Background task cancellation propagates through anyio cancel scopes
-    # (Starlette runs the lifespan in an anyio context), which can kill
-    # the telegram polling task before we get a chance to stop it cleanly.
+    # Shutdown: stop the chat channels FIRST, before cancelling background
+    # tasks. Background task cancellation propagates through anyio cancel
+    # scopes (Starlette runs the lifespan in an anyio context), which can kill
+    # the polling and socket tasks before we get a chance to stop them cleanly.
+    if _hosted_channels is not None:
+        try:
+            await _hosted_channels.stop()
+        except Exception as e:
+            logger.warning("Hosted channel shutdown raised: %s", e)
+        _hosted_channels = None
     if telegram_channel:
         await telegram_channel.stop()
+    await slack_runtime.shutdown()
     if ws_sync_task:
         # Exit through the loop's own stop path rather than cancelling it where
         # it stands: a cycle interrupted between the merge and the reload leaves
@@ -891,7 +947,20 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    """Create and configure the FastAPI application."""
+    """Create and configure the FastAPI application.
+
+    Reads ``NERVE_AUTH_MODE`` once and pins it before any route is
+    registered. An unknown value raises :class:`ConfigError` and stops
+    startup.
+    """
+    pin_auth_mode(auth_mode_from_env())
+    if is_external_mode():
+        logger.warning(
+            "Authentication mode is %s: Nerve trusts the %s header without a "
+            "signature check. Only the gateway must be able to reach this server.",
+            AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER,
+        )
+
     app = FastAPI(
         title="Nerve",
         description="Personal AI Assistant",
@@ -1194,6 +1263,31 @@ def create_app() -> FastAPI:
             if active_session is not None:
                 await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")
+
+    # Gateway channel streams. A separate endpoint from /ws with its own
+    # authentication: a gateway-signed token in the Authorization header,
+    # never the web session token, a cookie, or a query parameter.
+    from nerve.channels.hosted.manager import STREAM_PATH, refuse_upgrade
+
+    @app.websocket(STREAM_PATH)
+    async def channel_stream_endpoint(websocket: WebSocket):
+        runtime = _hosted_channels
+        if runtime is None:
+            await refuse_upgrade(websocket, 404)
+            return
+        await runtime.serve(websocket)
+
+    # Nothing under /_internal/ is a web UI route. Answer plain HTTP there with
+    # 404 before the SPA catch-all would serve index.html for it.
+    @app.api_route(
+        "/_internal/{path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def internal_not_found(path: str):
+        from fastapi.responses import Response
+
+        return Response(status_code=404)
 
     # Health check (no auth required) — must be before static mount
     @app.get("/health")

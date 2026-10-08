@@ -146,7 +146,8 @@ _SECRET_VALUE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:"
     r"sk-[A-Za-z0-9_-]{20,}"                        # OpenAI / Anthropic-style keys
     r"|gh[pousr]_[A-Za-z0-9]{20,}"                  # GitHub tokens
-    r"|xox[abposr]-[A-Za-z0-9-]{12,}"               # Slack tokens
+    r"|xox[abposr]-[A-Za-z0-9-]{12,}"               # Slack bot/user tokens
+    r"|xapp-[A-Za-z0-9-]{12,}"                      # Slack app-level tokens
     r"|AKIA[0-9A-Z]{12,}"                           # AWS access key ids
     r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."   # JWTs
     r")"
@@ -237,6 +238,7 @@ _MACHINE_LOCAL_PATHS = frozenset({
     "proxy",
     "docker",
     "telegram.enabled",
+    "slack.enabled",
     "sync.gmail.accounts",
     # Written into config.yaml after the fact, once the wizard has paired the
     # external agents this box runs. The gateway also rewrites it on every
@@ -1406,8 +1408,18 @@ async def bootstrap_identity(
     bootstrap. ``local`` accounts are not changed.
 
     Results go to ``report``. With ``dry_run``, nothing is written.
+
+    In external mode, the gateway names people, so no account is created or
+    changed. The signing secret is still made, because system and MCP tokens
+    need it.
     """
+    from nerve.gateway.auth import is_external_mode
+
     report = MigrationReport(dry_run=dry_run) if report is None else report
+    if is_external_mode():
+        await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
+        return report
+
     source = _credential_source_for(config)
     # Include accounts a dry run would create with the transitional source so
     # credential migration can report what it would do with them.
@@ -1554,10 +1566,26 @@ def _preview_identity(
 def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationReport) -> None:
     """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only."""
     from nerve.db.accounts import inspect_bootstrap_state
+    from nerve.gateway.auth import is_external_mode
 
-    source = _credential_source_for(config)
     state = inspect_bootstrap_state(db_path)
     sources, stored = state if state is not None else ([], False)
+    if not is_external_mode():
+        _inspect_accounts(config, sources, report)
+    if config.auth.jwt_secret:
+        if stored:
+            report.retired_stored_secret = True
+            report.identity_actions.append(_retire_action(dry_run=True))
+    elif not stored:
+        report.generated_jwt_secret = True
+        report.identity_actions.append(_secret_action(dry_run=True))
+
+
+def _inspect_accounts(
+    config: NerveConfig, sources: list[str], report: MigrationReport,
+) -> None:
+    """Report the account steps of :func:`bootstrap_identity`."""
+    source = _credential_source_for(config)
     if not sources:  # no database / pre-v047 schema, or zero accounts
         report.bootstrapped_account = True
         report.identity_actions.append(_account_action(source, dry_run=True))
@@ -1586,13 +1614,6 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
             current in ("config", "none") for current in settled
         ):
             _retire_config_password(config, report, dry_run=True)
-    if config.auth.jwt_secret:
-        if stored:
-            report.retired_stored_secret = True
-            report.identity_actions.append(_retire_action(dry_run=True))
-    elif not stored:
-        report.generated_jwt_secret = True
-        report.identity_actions.append(_secret_action(dry_run=True))
 
 
 def bootstrap_identity_sync(
@@ -1611,6 +1632,9 @@ def bootstrap_identity_sync(
     ``passwordless`` records the operator's choice of a passwordless
     installation, which completes setup. It has no effect on an account that
     has a password.
+
+    In external mode, no account is created and ``display_name`` and
+    ``passwordless`` have no effect. Only the signing secret is made.
     """
     try:
         asyncio.get_running_loop()
@@ -1638,12 +1662,13 @@ async def _bootstrap_with_own_connection(
     passwordless: bool = False,
 ) -> None:
     from nerve.db import Database
+    from nerve.gateway.auth import is_external_mode
 
     db = Database(db_path, workspace=config.workspace)
     await db.connect()
     try:
         await bootstrap_identity(db, config, report=report, display_name=display_name)
-        if passwordless:
+        if passwordless and not is_external_mode():
             await _confirm_passwordless(db, config, report)
     finally:
         await db.close()

@@ -4,6 +4,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
+import { useHostedStore } from '../../api/hosted';
 import { IconButton } from '../ui';
 import { LogOut } from '../ui/icons';
 import { ThemeToggle } from './ThemeToggle';
@@ -16,6 +17,7 @@ export function NavRail() {
   const pendingCount = useNotificationStore(s => s.pendingCount);
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
+  const hosted = useHostedStore(s => s.mode === 'external');
 
   // Load notification count + feature flags on mount
   useEffect(() => {
@@ -27,6 +29,7 @@ export function NavRail() {
 
   const visibleItems = NAV_ITEMS.filter(item => {
     if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
+    if (item.feature === 'accounts' && hosted) return false;
     return true;
   });
 
@@ -80,9 +83,11 @@ export function NavRail() {
         <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
         <ThemeToggle />
-        <IconButton label="Logout" size="md" onClick={logout}>
-          <LogOut size={16} />
-        </IconButton>
+        {!hosted && (
+          <IconButton label="Logout" size="md" onClick={logout}>
+            <LogOut size={16} />
+          </IconButton>
+        )}
       </div>
     </div>
   );

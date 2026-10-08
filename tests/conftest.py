@@ -95,6 +95,22 @@ def _unpin_jwt_secret():
     unpin_jwt_secret()
 
 
+@pytest.fixture(autouse=True)
+def _unpin_auth_mode(monkeypatch):
+    """Clear the authentication mode before and after each test.
+
+    ``create_app()`` pins the mode once per process, and before a pin the mode
+    comes from ``NERVE_AUTH_MODE``. Each test starts in local mode, whatever
+    the shell sets, and a test that pins a mode does not leave it in force.
+    """
+    from nerve.gateway.auth import AUTH_MODE_ENV, unpin_auth_mode
+
+    monkeypatch.delenv(AUTH_MODE_ENV, raising=False)
+    unpin_auth_mode()
+    yield
+    unpin_auth_mode()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _deterministic_umask():
     """Run the suite under umask 022, whatever the developer's shell has.
