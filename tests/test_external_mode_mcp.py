@@ -104,6 +104,32 @@ def _gateway_overrides(overrides: list[str]) -> list[str]:
             and not o.startswith("mcp_servers.nerve.")]
 
 
+def _record_codex_launches(monkeypatch, backend) -> list[dict]:
+    """Record what each Codex client would launch with, without launching it.
+
+    The real ``CodexClient`` builds the configuration; only its app-server
+    transport and the version check are replaced.
+    """
+    import nerve.agent.backends.codex.backend as codex_module
+
+    launches: list[dict] = []
+
+    class Transport:
+        def __init__(self, **kwargs):
+            launches.append(kwargs)
+
+    async def no_connect(self):
+        pass
+
+    async def version_ok():
+        return "codex-cli 0.155.1"
+
+    monkeypatch.setattr(codex_module, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(codex_module.CodexClient, "connect", no_connect)
+    monkeypatch.setattr(backend, "_check_cli_version", version_ok)
+    return launches
+
+
 class TestClaudeConfiguration:
     @pytest.mark.asyncio
     async def test_gateway_servers_only(self, tmp_path, db, gateway, external):
@@ -164,6 +190,30 @@ class TestClaudeConfiguration:
         assert options.mcp_servers["nerve"] != {
             "type": "http", "url": f"{gateway.url}/s/nerve/mcp",
         }
+        assert options.allowed_tools == ["mcp__docs"]
+
+
+class TestClaudeSnapshot:
+    def test_options_come_from_one_catalog_read(self, tmp_path, db, external, monkeypatch):
+        """Servers and permissions of one Claude client match one catalog."""
+        from nerve.mcp_gateway import GatewayServer
+
+        engine = AgentEngine(_config(tmp_path), db)
+        claude = engine._backends["claude"]
+        snapshots = iter([
+            (GatewayServer(id="docs", url="http://192.0.2.1:8080/s/docs/mcp", tools=("search",)),),
+            (GatewayServer(id="jira", url="http://192.0.2.1:8080/s/jira/mcp", tools=("create",)),),
+        ])
+        reads = []
+
+        def catalog():
+            reads.append(1)
+            return next(snapshots)
+
+        monkeypatch.setattr(claude._deps, "managed_mcp_servers", catalog)
+        options = _claude_options(engine, _spec(engine.config))
+        assert len(reads) == 1
+        assert set(options.mcp_servers) == {"nerve", "docs"}
         assert options.allowed_tools == ["mcp__docs"]
 
 
@@ -264,27 +314,11 @@ class TestCodexConfiguration:
                 encoding="utf-8",
             )
 
-        async def version_ok():
-            return "codex-cli 0.155.1"
-
-        class StubClient:
-            def __init__(self, backend, spec):
-                self.overrides = backend.build_config_overrides(spec)
-
-            async def connect(self):
-                pass
-
-            async def disconnect(self):
-                pass
-
         monkeypatch.setattr(backend, "_write_codex_config", write)
-        monkeypatch.setattr(backend, "_check_cli_version", version_ok)
-        monkeypatch.setattr(
-            "nerve.agent.backends.codex.backend.CodexClient", StubClient,
-        )
+        launches = _record_codex_launches(monkeypatch, backend)
         await engine._mcp_gateway.start()
         try:
-            client = await backend.create_client(_spec(cfg))
+            await backend.create_client(_spec(cfg))
             # A second session finds nothing more to remove.
             await backend.create_client(_spec(cfg, session_id="s2"))
         finally:
@@ -297,8 +331,9 @@ class TestCodexConfiguration:
         assert len(backups) == 1
         assert backups[0].read_text(encoding="utf-8") == original
         assert backups[0].stat().st_mode & 0o777 == 0o600
-        assert f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"' in client.overrides
-        assert "mcp_servers.personal.enabled=false" in client.overrides
+        overrides = launches[0]["config_overrides"]
+        assert f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"' in overrides
+        assert "mcp_servers.personal.enabled=false" in overrides
 
     @pytest.mark.asyncio
     async def test_a_failed_removal_stops_the_session_with_the_reason(
@@ -346,23 +381,11 @@ class TestCodexConfiguration:
         async def write(path, edits):
             calls.append(edits)
 
-        async def version_ok():
-            return "codex-cli 0.155.1"
-
-        class StubClient:
-            def __init__(self, backend, spec):
-                pass
-
-            async def connect(self):
-                pass
-
         monkeypatch.setattr(backend, "_write_codex_config", write)
-        monkeypatch.setattr(backend, "_check_cli_version", version_ok)
-        monkeypatch.setattr(
-            "nerve.agent.backends.codex.backend.CodexClient", StubClient,
-        )
+        launches = _record_codex_launches(monkeypatch, backend)
         await backend.create_client(_spec(engine.config))
         assert calls == []
+        assert len(launches) == 1
         assert not list(home.glob("config.toml.nerve-mcp-backup-*"))
 
     @pytest.mark.asyncio
@@ -500,6 +523,91 @@ class TestCodexConfiguration:
         assert second.name == "config.toml.nerve-mcp-backup-20261008T120000Z-bbbbbbbbbbbb"
         assert taken.read_text() == "[mcp_servers.docs]\n"
         assert second.read_text() == "[mcp_servers.jira]\n"
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_change_during_cleanup_does_not_reach_the_launch(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The launch uses the catalog snapshot that the cleanup used.
+
+        The config writer is held while the catalog changes from generation 7
+        (docs, github) to generation 8 (docs, jira). The user file has a stdio
+        ``jira`` too. The session must launch with generation 7 only: no
+        ``jira`` URL over the file's stdio entry, and that entry turned off.
+        """
+        import asyncio
+
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text(
+            '[mcp_servers.docs]\ncommand = "/usr/bin/true"\n'
+            '[mcp_servers.jira]\ncommand = "/usr/bin/true"\n',
+            encoding="utf-8",
+        )
+        cfg = _config(tmp_path, mcp_gateway_url=gateway.url)
+        engine = AgentEngine(cfg, db)
+        backend = engine._backends["codex"]
+        writing = asyncio.Event()
+        release = asyncio.Event()
+        written = []
+
+        async def held_write(path, edits):
+            written.append([edit["keyPath"] for edit in edits])
+            writing.set()
+            await release.wait()
+            names = {edit["keyPath"].split(".", 1)[1] for edit in edits}
+            path.write_text("".join(
+                f'[mcp_servers.{name}]\ncommand = "/usr/bin/true"\n'
+                for name in ("docs", "jira") if name not in names
+            ), encoding="utf-8")
+
+        monkeypatch.setattr(backend, "_write_codex_config", held_write)
+        launches = _record_codex_launches(monkeypatch, backend)
+        await engine._mcp_gateway.start()
+        try:
+            build = asyncio.ensure_future(backend.create_client(_spec(cfg)))
+            await asyncio.wait_for(writing.wait(), 5)
+            gateway.catalog = catalog_payload(8, {"docs": ["search"], "jira": ["create"]})
+            await engine._mcp_gateway.refresh()
+            assert engine.mcp_gateway_status()["generation"] == 8
+            release.set()
+            await asyncio.wait_for(build, 5)
+        finally:
+            await engine._mcp_gateway.close()
+
+        assert written == [["mcp_servers.docs"]]
+        overrides = launches[0]["config_overrides"]
+        assert f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"' in overrides
+        assert f'mcp_servers.github.url="{gateway.url}/s/github/mcp"' in overrides
+        assert not any(o.startswith("mcp_servers.jira.url=") for o in overrides)
+        assert "mcp_servers.jira.enabled=false" in overrides
+
+    def test_one_build_reads_the_catalog_once(
+        self, tmp_path, db, external, monkeypatch,
+    ):
+        """Overrides and environment of one launch come from one catalog read."""
+        from nerve.agent.backends.codex.backend import CodexClient
+        from nerve.mcp_gateway import GatewayServer
+
+        engine = AgentEngine(_config(tmp_path), db)
+        backend = engine._backends["codex"]
+        snapshots = iter([
+            (GatewayServer(id="docs", url="http://192.0.2.1:8080/s/docs/mcp", tools=("search",)),),
+            (GatewayServer(id="jira", url="http://192.0.2.1:8080/s/jira/mcp", tools=("create",)),),
+        ])
+        reads = []
+
+        def catalog():
+            reads.append(1)
+            return next(snapshots)
+
+        monkeypatch.setattr(backend._deps, "managed_mcp_servers", catalog)
+        launches = _record_codex_launches(monkeypatch, backend)
+        CodexClient(backend, _spec(engine.config))
+        assert len(reads) == 1
+        overrides = launches[0]["config_overrides"]
+        assert any(o.startswith("mcp_servers.docs.url=") for o in overrides)
+        assert not any(o.startswith("mcp_servers.jira.") for o in overrides)
 
     def test_ultracode_is_off_in_external_mode(self, tmp_path, db, external):
         cfg = _config(tmp_path, codex={
