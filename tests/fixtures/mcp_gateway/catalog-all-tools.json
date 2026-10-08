@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 2,
+  "generation": 7,
+  "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+  "desiredRevision": "sha256:aa6abdf4e6fbfad28cb54d899b4e3e736faac0be6916fc024c1118b94a326af8",
+  "servers": [
+    {
+      "id": "docs",
+      "displayName": "Docs",
+      "description": "Search the product documentation.",
+      "path": "/s/docs/mcp",
+      "toolPolicy": {
+        "mode": "selected",
+        "tools": [
+          "fetch_page",
+          "search"
+        ]
+      },
+      "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+      "inventory": {
+        "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+        "toolCount": 2,
+        "observedAt": "2026-10-17T12:00:00Z",
+        "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+      },
+      "health": {
+        "inventoryState": "current",
+        "checkedAt": "2026-10-17T12:00:00Z",
+        "failure": null
+      }
+    },
+    {
+      "id": "wiki",
+      "displayName": "Wiki",
+      "description": "Read and edit the pages of the team wiki.",
+      "path": "/s/wiki/mcp",
+      "toolPolicy": {
+        "mode": "all",
+        "tools": null
+      },
+      "desiredRevision": "sha256:cb04f969ce79fac8f12dfda11236673e1385376fbd3a77ec67c4954a83b385b3",
+      "inventory": {
+        "revision": "sha256:303bc7a9bcb7baa6c50e154144abaccf9d4856e7a597f0c848e2c7a4916a1d26",
+        "toolCount": 2,
+        "observedAt": "2026-10-17T12:00:00Z",
+        "desiredRevision": "sha256:cb04f969ce79fac8f12dfda11236673e1385376fbd3a77ec67c4954a83b385b3"
+      },
+      "health": {
+        "inventoryState": "current",
+        "checkedAt": "2026-10-17T12:00:00Z",
+        "failure": null
+      }
+    }
+  ]
+}

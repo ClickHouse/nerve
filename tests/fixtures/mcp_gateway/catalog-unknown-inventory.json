@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "generation": 7,
+  "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+  "desiredRevision": "sha256:d3339087ee2c56ee9eb712dc5e0d5bfe65dd64ea8dd0bf1aa10626caa56b661f",
+  "servers": [
+    {
+      "id": "docs",
+      "displayName": "Docs",
+      "description": "Search the product documentation.",
+      "path": "/s/docs/mcp",
+      "toolPolicy": {
+        "mode": "selected",
+        "tools": [
+          "fetch_page",
+          "search"
+        ]
+      },
+      "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+      "inventory": null,
+      "health": {
+        "inventoryState": "unknown",
+        "checkedAt": null,
+        "failure": null
+      }
+    },
+    {
+      "id": "github",
+      "displayName": "GitHub",
+      "description": "",
+      "path": "/s/github/mcp",
+      "toolPolicy": {
+        "mode": "selected",
+        "tools": [
+          "create_issue",
+          "get_issue",
+          "list_issues"
+        ]
+      },
+      "desiredRevision": "sha256:1878e9f6a5f2e80bf7e0379e638c03ae003183c1f9e5b18ad663d181e58e013c",
+      "inventory": null,
+      "health": {
+        "inventoryState": "unknown",
+        "checkedAt": "2026-10-17T12:00:00Z",
+        "failure": "credential_rejected"
+      }
+    }
+  ]
+}

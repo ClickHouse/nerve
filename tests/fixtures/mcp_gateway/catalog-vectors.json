@@ -1,0 +1,2342 @@
+{
+  "accept": [
+    {
+      "name": "the base catalog",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown members in every object",
+      "catalog": {
+        "futureMember": {
+          "nested": [
+            1,
+            "x"
+          ]
+        },
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "futureMember": null,
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "futureMember": true,
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "futureMember": "x",
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "futureMember": 0,
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown tool mode without tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "future_mode",
+              "tools": null
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown tool mode with tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "future_mode",
+              "tools": [
+                "fetch_page"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "selected mode without a tool",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": []
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "all mode",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "all",
+              "tools": null
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "review of tool changes",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ],
+              "changes": "review"
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown tool change behavior",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ],
+              "changes": "future_behavior"
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown failure reason",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "stale",
+              "checkedAt": "2026-10-17T12:05:00Z",
+              "failure": "future_reason"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stale without a failure under the current desired revision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "stale",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown inventory after a failed read",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": null,
+            "health": {
+              "inventoryState": "unknown",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": "credential_missing"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown inventory never read",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": null,
+            "health": {
+              "inventoryState": "unknown",
+              "checkedAt": null,
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "observed empty list",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:8b45b016b2d15a3a5611f4b40be9ce8d249387aa7ad95cd0b12e6eb7e041de4e",
+              "toolCount": 0,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "longest server ID",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:7ead35e89439cb1cc6cd8f9166d616d48b042eec7729b034faef2401c5db1c99",
+        "servers": [
+          {
+            "id": "a000000000000000000000000000000z",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/a000000000000000000000000000000z/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "reject": [
+    {
+      "name": "array instead of an object",
+      "catalog": []
+    },
+    {
+      "name": "schema version 1",
+      "field": "schemaVersion",
+      "catalog": {
+        "schemaVersion": 1,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "schema version 3",
+      "field": "schemaVersion",
+      "catalog": {
+        "schemaVersion": 3,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "schema version as a string",
+      "field": "schemaVersion",
+      "catalog": {
+        "schemaVersion": "2",
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "negative generation",
+      "field": "generation",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": -1,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fractional generation",
+      "field": "generation",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7.5,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "short digest",
+      "field": "digest",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:abc",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "uppercase digest",
+      "field": "digest",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "SHA256:3F9A0C1D2B4E5F60718293A4B5C6D7E8F9A0B1C2D3E4F5061728394A5B6C7D8E",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed desired revision",
+      "field": "desiredRevision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:abc",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "wrong desired revision",
+      "field": "desiredRevision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "desired revision without the last server",
+      "field": "desiredRevision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          },
+          {
+            "id": "github",
+            "displayName": "GitHub",
+            "description": "",
+            "path": "/s/github/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "create_issue",
+                "get_issue",
+                "list_issues"
+              ]
+            },
+            "desiredRevision": "sha256:1878e9f6a5f2e80bf7e0379e638c03ae003183c1f9e5b18ad663d181e58e013c",
+            "inventory": {
+              "revision": "sha256:bac5ddf243b39e54eca155186b2cc5ca4be4d469ab58217f6866b834171336fd",
+              "toolCount": 3,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:1878e9f6a5f2e80bf7e0379e638c03ae003183c1f9e5b18ad663d181e58e013c"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "null servers",
+      "field": "servers",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": null
+      }
+    },
+    {
+      "name": "invalid server ID",
+      "field": "servers[0].id",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:2008995a9dde898405825ad2c8036ce2058007c136212a5b76abfe2146574490",
+        "servers": [
+          {
+            "id": "Docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/Docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "servers out of order",
+      "field": "servers[1].id order",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:74b450b46d125b33a96f8aff0bd78cc63f7b8d519c24d035e380095c832c7a27",
+        "servers": [
+          {
+            "id": "github",
+            "displayName": "GitHub",
+            "description": "",
+            "path": "/s/github/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "create_issue",
+                "get_issue",
+                "list_issues"
+              ]
+            },
+            "desiredRevision": "sha256:1878e9f6a5f2e80bf7e0379e638c03ae003183c1f9e5b18ad663d181e58e013c",
+            "inventory": {
+              "revision": "sha256:bac5ddf243b39e54eca155186b2cc5ca4be4d469ab58217f6866b834171336fd",
+              "toolCount": 3,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:1878e9f6a5f2e80bf7e0379e638c03ae003183c1f9e5b18ad663d181e58e013c"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          },
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "repeated server",
+      "field": "servers[1].id order",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:565c388f403f936207fac3ae7b23cf02cc39cae57c0334575dbb68015c2d3504",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          },
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "path of another server",
+      "field": "servers[0].path",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/other/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "no tool mode",
+      "field": "servers[0].toolPolicy.mode",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "null tool policy",
+      "field": "servers[0].toolPolicy.mode",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": null,
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "uppercase tool mode",
+      "field": "servers[0].toolPolicy.mode",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "Selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool mode too long",
+      "field": "servers[0].toolPolicy.mode",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "uppercase tool change behavior",
+      "field": "servers[0].toolPolicy.changes",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ],
+              "changes": "Review"
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "tool change behavior too long",
+      "field": "servers[0].toolPolicy.changes",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ],
+              "changes": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "selected mode with null tools",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": null
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unsorted tools",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "search",
+                "fetch_page"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "repeated tool",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "search",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid tool name",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "bad tool"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "all mode with tools",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "all",
+              "tools": [
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown tool mode with unsorted tools",
+      "field": "servers[0].toolPolicy.tools",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "future_mode",
+              "tools": [
+                "b",
+                "a"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed server desired revision",
+      "field": "servers[0].desiredRevision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:8c0db4354a8feb04e23b576e38c0addf16ecb9bc98b0693a27f4d7e331661db2",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:abc",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed inventory revision",
+      "field": "servers[0].inventory.revision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:abc",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "negative tool count",
+      "field": "servers[0].inventory.toolCount",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": -1,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "fractional tool count",
+      "field": "servers[0].inventory.toolCount",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 1.5,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "observation time with an offset",
+      "field": "servers[0].inventory.observedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00+00:00",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "observation time with a fraction",
+      "field": "servers[0].inventory.observedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00.5Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "observation time in lowercase",
+      "field": "servers[0].inventory.observedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17t12:00:00z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "observation time of no day",
+      "field": "servers[0].inventory.observedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-02-30T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed observation desired revision",
+      "field": "servers[0].inventory.desiredRevision",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:abc"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown inventory state",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "fresh",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "null health",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "unknown state with an inventory",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "unknown",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "current state without an inventory",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": null,
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stale state without an inventory",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": null,
+            "health": {
+              "inventoryState": "stale",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "current state after a failed read",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:05:00Z",
+              "failure": "upstream_timeout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "current state under another desired revision",
+      "field": "servers[0].health.inventoryState",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "failure without a read time",
+      "field": "servers[0].health.checkedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": null,
+            "health": {
+              "inventoryState": "unknown",
+              "checkedAt": null,
+              "failure": "upstream_error"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "inventory without a read time",
+      "field": "servers[0].health.checkedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": null,
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "read before the observation",
+      "field": "servers[0].health.checkedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17T11:59:59Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed read time",
+      "field": "servers[0].health.checkedAt",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "current",
+              "checkedAt": "2026-10-17 12:00:00Z",
+              "failure": null
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "failure reason with spaces",
+      "field": "servers[0].health.failure",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "stale",
+              "checkedAt": "2026-10-17T12:05:00Z",
+              "failure": "Upstream Timeout"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "failure reason too long",
+      "field": "servers[0].health.failure",
+      "catalog": {
+        "schemaVersion": 2,
+        "generation": 7,
+        "digest": "sha256:3f9a0c1d2b4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5061728394a5b6c7d8e",
+        "desiredRevision": "sha256:b6a7da9cbe7578419f9c06e2c4ec5f9b965445d7d88eb6ab45dfe452ba340a1b",
+        "servers": [
+          {
+            "id": "docs",
+            "displayName": "Docs",
+            "description": "Search the product documentation.",
+            "path": "/s/docs/mcp",
+            "toolPolicy": {
+              "mode": "selected",
+              "tools": [
+                "fetch_page",
+                "search"
+              ]
+            },
+            "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08",
+            "inventory": {
+              "revision": "sha256:a7d6f55653d59357069d5c0371f6f992914da45cb7d548943238ef192f4f8359",
+              "toolCount": 2,
+              "observedAt": "2026-10-17T12:00:00Z",
+              "desiredRevision": "sha256:775d487544a1e1c25dfe48cede09a8228ef2e7d6a186f56c16665dd7df067b08"
+            },
+            "health": {
+              "inventoryState": "stale",
+              "checkedAt": "2026-10-17T12:05:00Z",
+              "failure": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
