@@ -276,6 +276,7 @@ reload cannot inspect, and are documented here only.
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
 | `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
+| `anthropic_base_url` | memU builds its model clients once at startup. New sessions and the other direct calls would follow a reload and memory would not, so they would use different endpoints |
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
@@ -1289,6 +1290,28 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 | `anthropic_api_key` | string | Anthropic API key (agent + memU chat). Not required when proxy is enabled. |
 | `openai_api_key` | string | OpenAI API key (optional — enables vector-based memory search via embeddings; without it, LLM-based recall is used) |
 | `brave_search_api_key` | string | Brave Search API key (optional) |
+
+## Anthropic-compatible endpoint
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `anthropic_base_url` | string | `""` | Base URL of an Anthropic-compatible endpoint, for example an LLM gateway. Empty means `https://api.anthropic.com`. A trailing `/` or `/v1` is removed |
+
+When set, every model request goes to this endpoint: the Claude CLI (as
+`ANTHROPIC_BASE_URL`), the direct SDK calls (session titles, prompt rewrite,
+source condensing, image description, `nerve doctor`), memU and model discovery.
+Nerve sends `anthropic_api_key` as the key.
+
+Setting `ANTHROPIC_BASE_URL` in Nerve's environment is not the same. The CLI
+inherits it, but the direct calls and memU still go to `api.anthropic.com`.
+
+The endpoint must serve `POST /v1/messages`. memU also needs
+`POST /v1/chat/completions`, and model discovery uses `GET /v1/models`. The model
+IDs in `agent.*` and `memory.*` must be ones the endpoint serves, including the
+CLI aliases in `agent.model_aliases`.
+
+It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
+change needs a restart.
 
 ## Proxy (CLIProxyAPI)
 
