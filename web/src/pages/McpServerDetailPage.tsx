@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
 import { Badge, IconButton } from '../components/ui';
 import { ManagedBadge } from '../components/Mcp/ManagedBadge';
-import { isManaged, mcpServerTitle, useMcpStore } from '../stores/mcpStore';
+import { isManaged, mcpServerTitle, notAppliedLines, useMcpStore } from '../stores/mcpStore';
 
 /** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
@@ -80,6 +80,9 @@ export function McpServerDetailPage() {
               and decides which of its tools the agent can call. It is
               read-only here.
             </p>
+            {notAppliedLines(s).map(line => (
+              <p key={line} className="text-warning" role="alert">{line}</p>
+            ))}
           </div>
         )}
         <div className="flex flex-col lg:flex-row gap-4 p-4">

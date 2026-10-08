@@ -619,8 +619,11 @@ class CodexBackend:
         Codex merges a server table of a file with the overrides of the same
         name, and an override cannot remove a key. A gateway server that has
         the name of a server in the system file is therefore left out, and the
-        file's server is turned off; the user file in CODEX_HOME has no such
-        server after :meth:`_remove_colliding_user_mcp_servers`.
+        file's server is turned off; the session starts with the other
+        servers. :meth:`managed_mcp_conflicts` reports such a server, and the
+        engine shows it in diagnostics and in the MCP server API. The user
+        file in CODEX_HOME has no such server after
+        :meth:`_remove_colliding_user_mcp_servers`.
         """
         system = self._mcp_server_names(_CODEX_SYSTEM_CONFIG)
         out: list[str] = []
@@ -629,11 +632,10 @@ class CodexBackend:
             if server.id == "nerve":
                 continue
             if server.id in system:
-                logger.error(
-                    "MCP gateway server %r is not used for Codex: %s names an "
-                    "MCP server with the same name, and Codex cannot merge the "
-                    "two. Remove it from that file.",
-                    server.id, _CODEX_SYSTEM_CONFIG,
+                # The engine logs this once for each catalog generation.
+                logger.debug(
+                    "MCP gateway server %r left out for Codex: %s",
+                    server.id, self._system_conflict_reason(),
                 )
                 continue
             names.add(server.id)
@@ -652,6 +654,24 @@ class CodexBackend:
             out.append(f"mcp_servers.{name}.enabled=false")
         out += [f"features.{name}=false" for name in _MANAGED_MCP_DISABLED_FEATURES]
         return out
+
+    def managed_mcp_conflicts(self, managed: tuple) -> dict[str, str]:
+        """Gateway servers that Codex sessions do not get, with the reason.
+
+        A server is left out when ``/etc/codex/config.toml`` names an MCP
+        server with the same ID: Nerve does not change that file, and Codex
+        cannot merge the two.
+        """
+        system = self._mcp_server_names(_CODEX_SYSTEM_CONFIG)
+        reason = self._system_conflict_reason()
+        return {
+            server.id: reason for server in managed
+            if server.id != "nerve" and server.id in system
+        }
+
+    @staticmethod
+    def _system_conflict_reason() -> str:
+        return f"name used by the system configuration ({_CODEX_SYSTEM_CONFIG})"
 
     def _user_config_path(self) -> Path:
         return Path(self._home_dir()) / "config.toml"

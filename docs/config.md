@@ -1801,9 +1801,16 @@ The clients get this configuration:
   Codex session starts, Nerve removes such a server from `config.toml` in
   `codex.home_dir`, with Codex's own configuration writer, and keeps a copy of
   the file as `config.toml.nerve-mcp-backup-<UTC time>`. If that fails, the
-  session does not start and the error names the file. A gateway server whose
-  name is also in `/etc/codex/config.toml` is not given to Codex, and the
-  file's server is turned off.
+  session does not start and the error names the file.
+
+  Nerve does not change `/etc/codex/config.toml`. A gateway server whose name
+  is also in that file is not given to Codex, the file's server is turned off,
+  and the Codex session starts with the other servers, so that one server
+  does not stop all work. Nerve logs an error once for each catalog
+  generation, and `GET /api/diagnostics` (`mcp_gateway.not_applied`), the MCP
+  server API (`not_applied`) and the MCP Servers page show "Not applied to
+  Codex: name used by the system configuration". Claude sessions are not
+  affected.
 
 In external mode Nerve does not read `mcp_servers` from any configuration file
 and does not load Claude Code plugins. The catalog servers are read-only and

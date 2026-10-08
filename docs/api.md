@@ -650,7 +650,10 @@ The routes above then change as follows:
   response.
 - Each listed server has `managed_by`: `"organization"` for a catalog server,
   `null` for `nerve`. A catalog server also has `display_name` and
-  `description` from the catalog. These servers are read-only.
+  `description` from the catalog, and `not_applied`: the agent backends whose
+  sessions do not get the server, each with the reason, for example
+  `{"codex": "name used by the system configuration (/etc/codex/config.toml)"}`;
+  `{}` when all do. These servers are read-only.
 - `GET /api/mcp-servers/{name}` and `GET /api/mcp-servers/{name}/usage`
   return `404` for a server that is not listed, for example one from an
   earlier local mode.
@@ -662,7 +665,7 @@ Response: {
   "servers": [{
     "name": "docs", "type": "http", "enabled": true, "tool_count": 2,
     "managed_by": "organization", "display_name": "Docs",
-    "description": "Search the product documentation.", ...
+    "description": "Search the product documentation.", "not_applied": {}, ...
   }]
 }
 ```
@@ -770,8 +773,9 @@ In external mode the response also has `mcp_gateway`: the catalog of the MCP
 gateway that new sessions use, and the result of the last catalog request.
 `generation`, `digest` and `applied_at` are `null` before the first catalog.
 `error` is the problem of the last request, or `null` after a success.
-`retrying` is true while the background retry runs. The block is absent in
-local mode.
+`retrying` is true while the background retry runs. `not_applied` maps a
+catalog server ID to the backends that leave it out, each with the reason (see
+the MCP server routes above). The block is absent in local mode.
 
 ```json
 "mcp_gateway": {
@@ -782,7 +786,8 @@ local mode.
   "applied_at": "2026-10-08T10:00:00+00:00",
   "checked_at": "2026-10-08T10:05:00+00:00",
   "error": null,
-  "retrying": false
+  "retrying": false,
+  "not_applied": {}
 }
 ```
 

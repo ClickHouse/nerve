@@ -29,8 +29,18 @@ def _managed_servers() -> dict | None:
     return {server.id: server for server in engine.managed_mcp_servers() or ()}
 
 
-def _present(row: dict, managed: dict | None) -> dict:
-    """Add the organization fields to a server row in external mode."""
+def _conflicts() -> dict[str, dict[str, str]]:
+    """Catalog servers that a backend leaves out: ID -> backend -> reason."""
+    report = getattr(get_deps().engine, "managed_mcp_conflicts", None)
+    return report() if report is not None else {}
+
+
+def _present(row: dict, managed: dict | None, conflicts: dict) -> dict:
+    """Add the organization fields to a server row in external mode.
+
+    ``not_applied`` names the backends whose sessions do not get the server,
+    each with the reason; it is empty when every backend uses it.
+    """
     if managed is None:
         return row
     server = managed.get(row["name"])
@@ -41,6 +51,7 @@ def _present(row: dict, managed: dict | None) -> dict:
         "managed_by": MANAGED_BY_ORGANIZATION,
         "display_name": server.display_name,
         "description": server.description,
+        "not_applied": conflicts.get(server.id, {}),
     }
 
 
@@ -81,8 +92,9 @@ async def list_mcp_servers():
     servers = await _server_rows(managed)
     if managed is None:
         return {"servers": servers}
+    conflicts = _conflicts()
     return {
-        "servers": [_present(row, managed) for row in servers],
+        "servers": [_present(row, managed, conflicts) for row in servers],
         "managed_by": MANAGED_BY_ORGANIZATION,
     }
 
@@ -100,7 +112,11 @@ async def get_mcp_server_detail(server_name: str):
     tools = await deps.db.get_mcp_tool_breakdown(server_name)
     usage = await deps.db.get_mcp_server_usage(server_name, limit=30)
 
-    return {**_present(server, managed), "tools": tools, "recent_usage": usage}
+    conflicts = _conflicts() if managed is not None else {}
+    return {
+        **_present(server, managed, conflicts),
+        "tools": tools, "recent_usage": usage,
+    }
 
 
 @router.get("/api/mcp-servers/{server_name}/usage")

@@ -3,7 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
 import { Badge, Button } from '../components/ui';
 import { ManagedBadge } from '../components/Mcp/ManagedBadge';
-import { isManaged, mcpServerTitle, useMcpStore, type McpServer } from '../stores/mcpStore';
+import {
+  isManaged, mcpServerTitle, notAppliedLines, useMcpStore, type McpServer,
+} from '../stores/mcpStore';
 
 /** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
@@ -38,6 +40,9 @@ function ServerCard({ server }: { server: McpServer }) {
           {isManaged(server) && server.description && (
             <p className="text-xs text-text-dim mt-1 line-clamp-2">{server.description}</p>
           )}
+          {notAppliedLines(server).map(line => (
+            <p key={line} className="text-xs text-warning mt-1" role="alert">{line}</p>
+          ))}
         </div>
         {isManaged(server) && <ManagedBadge className="ml-2 shrink-0" />}
         {!server.enabled && (

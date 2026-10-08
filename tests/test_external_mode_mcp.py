@@ -366,24 +366,71 @@ class TestCodexConfiguration:
         assert not list(home.glob("config.toml.nerve-mcp-backup-*"))
 
     @pytest.mark.asyncio
-    async def test_a_system_file_collision_leaves_the_gateway_server_out(
-        self, tmp_path, db, gateway, external, monkeypatch,
+    async def test_a_system_file_collision_is_left_out_and_reported(
+        self, tmp_path, db, gateway, external, monkeypatch, caplog,
     ):
+        """Nerve does not change /etc/codex/config.toml, and Codex cannot merge
+        a stdio server with a gateway server of the same name.
+
+        The session starts without that gateway server; diagnostics and the
+        MCP server API name it, and the error is logged once per generation.
+        """
+        import logging
+
+        from nerve.gateway.routes import _deps
+        from nerve.gateway.routes.mcp_servers import (
+            get_mcp_server_detail,
+            list_mcp_servers,
+        )
+
         system = tmp_path / "etc-codex-config.toml"
         system.write_text('[mcp_servers.docs]\ncommand = "/usr/bin/true"\n')
         monkeypatch.setattr(
             "nerve.agent.backends.codex.backend._CODEX_SYSTEM_CONFIG", system,
         )
+        reason = f"name used by the system configuration ({system})"
         cfg = _config(tmp_path, mcp_gateway_url=gateway.url)
         engine = AgentEngine(cfg, db)
-        await engine._mcp_gateway.start()
+        codex = engine._backends["codex"]
+        previous = _deps._deps
+        caplog.set_level(logging.ERROR, logger="nerve.agent.engine")
         try:
-            overrides = engine._backends["codex"].build_config_overrides(_spec(cfg))
+            await engine._mcp_gateway.start()
+            # Three sessions of one generation: one error.
+            built = [codex.build_config_overrides(_spec(cfg, session_id=f"s{i}"))
+                     for i in range(3)]
+            await engine._mcp_gateway.refresh()
+            errors = [r for r in caplog.records if "not applied to codex" in r.getMessage()]
+            assert len(errors) == 1
+            assert "'docs' (catalog generation 7)" in errors[0].getMessage()
+            assert reason in errors[0].getMessage()
+
+            status = engine.mcp_gateway_status()
+            assert status["not_applied"] == {"docs": {"codex": reason}}
+            _deps.init_deps(engine, db)
+            rows = {row["name"]: row for row in (await list_mcp_servers())["servers"]}
+            assert rows["docs"]["not_applied"] == {"codex": reason}
+            assert rows["github"]["not_applied"] == {}
+            assert (await get_mcp_server_detail("docs"))["not_applied"] == {"codex": reason}
+
+            # A new generation logs it again.
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            await engine._mcp_gateway.refresh()
+            errors = [r for r in caplog.records if "not applied to codex" in r.getMessage()]
+            assert len(errors) == 2
+            assert "(catalog generation 8)" in errors[1].getMessage()
+
+            # The system file is fixed: the report follows at once.
+            system.write_text("")
+            assert engine.mcp_gateway_status()["not_applied"] == {}
         finally:
+            _deps._deps = previous
             await engine._mcp_gateway.close()
-        assert not any(o.startswith("mcp_servers.docs.url=") for o in overrides)
-        assert "mcp_servers.docs.enabled=false" in overrides
-        assert f'mcp_servers.github.url="{gateway.url}/s/github/mcp"' in overrides
+
+        for overrides in built:
+            assert not any(o.startswith("mcp_servers.docs.url=") for o in overrides)
+            assert "mcp_servers.docs.enabled=false" in overrides
+            assert f'mcp_servers.github.url="{gateway.url}/s/github/mcp"' in overrides
 
     def test_ultracode_is_off_in_external_mode(self, tmp_path, db, external):
         cfg = _config(tmp_path, codex={

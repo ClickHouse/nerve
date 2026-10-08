@@ -24,11 +24,28 @@ export interface McpServer {
   /** Text from the organization's catalog, for a managed server. */
   display_name?: string;
   description?: string;
+  /**
+   * For a managed server: the agent backends (`codex`, `claude`) whose
+   * sessions do not get it, each with the reason. Empty when all do.
+   */
+  not_applied?: Record<string, string>;
 }
 
 /** Whether a server, or a server list, is managed by the organization. */
 export function isManaged(item: { managed_by?: string | null } | null | undefined): boolean {
   return item?.managed_by === MANAGED_BY_ORGANIZATION;
+}
+
+const BACKEND_LABELS: Record<string, string> = { claude: 'Claude', codex: 'Codex' };
+
+/**
+ * One line per backend that leaves the server out, for example
+ * "Not applied to Codex: name used by the system configuration (...)".
+ */
+export function notAppliedLines(server: { not_applied?: Record<string, string> }): string[] {
+  return Object.entries(server.not_applied ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([backend, reason]) => `Not applied to ${BACKEND_LABELS[backend] ?? backend}: ${reason}`);
 }
 
 /** The name to show: the catalog's display name for a managed server. */
