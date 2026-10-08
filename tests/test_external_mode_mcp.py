@@ -209,7 +209,6 @@ class TestCodexConfiguration:
         home.mkdir()
         (home / "config.toml").write_text(
             '[mcp_servers.personal]\nurl = "https://mcp.example.com/p"\n'
-            '[mcp_servers.docs]\nurl = "https://other.example.com/docs"\n'
             '[mcp_servers."has.dot"]\ncommand = "/usr/bin/true"\n',
             encoding="utf-8",
         )
@@ -230,12 +229,161 @@ class TestCodexConfiguration:
 
         assert "mcp_servers.personal.enabled=false" in overrides
         assert "mcp_servers.fleet.enabled=false" in overrides
-        # A catalog server keeps its name; the gateway URL replaces the file's.
-        assert "mcp_servers.docs.enabled=false" not in overrides
-        assert overrides.index(
-            f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"',
-        ) > 0
+        assert f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"' in overrides
         assert not any("has.dot" in o for o in overrides)
+
+    @pytest.mark.asyncio
+    async def test_a_colliding_user_server_is_removed_before_codex_starts(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A stdio server named like a gateway server must not stop Codex.
+
+        Codex merges the file's table with the overrides, so the session would
+        fail with "url is not supported for stdio". The entry is removed from
+        the user file first; a copy of the file stays next to it.
+        """
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        original = (
+            '# operator note\n'
+            '[mcp_servers.docs]\ncommand = "/usr/bin/true"\n'
+            '[mcp_servers.personal]\nurl = "https://mcp.example.com/p"\n'
+        )
+        (home / "config.toml").write_text(original, encoding="utf-8")
+        cfg = _config(tmp_path, mcp_gateway_url=gateway.url)
+        engine = AgentEngine(cfg, db)
+        backend = engine._backends["codex"]
+        written: list = []
+
+        async def write(path, edits):
+            written.append((path, edits))
+            # What Codex's writer does with these edits.
+            path.write_text(
+                '# operator note\n'
+                '[mcp_servers.personal]\nurl = "https://mcp.example.com/p"\n',
+                encoding="utf-8",
+            )
+
+        async def version_ok():
+            return "codex-cli 0.155.1"
+
+        class StubClient:
+            def __init__(self, backend, spec):
+                self.overrides = backend.build_config_overrides(spec)
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+        monkeypatch.setattr(backend, "_write_codex_config", write)
+        monkeypatch.setattr(backend, "_check_cli_version", version_ok)
+        monkeypatch.setattr(
+            "nerve.agent.backends.codex.backend.CodexClient", StubClient,
+        )
+        await engine._mcp_gateway.start()
+        try:
+            client = await backend.create_client(_spec(cfg))
+            # A second session finds nothing more to remove.
+            await backend.create_client(_spec(cfg, session_id="s2"))
+        finally:
+            await engine._mcp_gateway.close()
+
+        assert written == [(home / "config.toml", [
+            {"keyPath": "mcp_servers.docs", "value": None, "mergeStrategy": "replace"},
+        ])]
+        backups = list(home.glob("config.toml.nerve-mcp-backup-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == original
+        assert backups[0].stat().st_mode & 0o777 == 0o600
+        assert f'mcp_servers.docs.url="{gateway.url}/s/docs/mcp"' in client.overrides
+        assert "mcp_servers.personal.enabled=false" in client.overrides
+
+    @pytest.mark.asyncio
+    async def test_a_failed_removal_stops_the_session_with_the_reason(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        from nerve.agent.backends.base import BackendError
+
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text(
+            '[mcp_servers.github]\ncommand = "/usr/bin/true"\n', encoding="utf-8",
+        )
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        backend = engine._backends["codex"]
+
+        async def write(path, edits):
+            raise RuntimeError("config file is read-only")
+
+        monkeypatch.setattr(backend, "_write_codex_config", write)
+        await engine._mcp_gateway.start()
+        try:
+            with pytest.raises(BackendError) as refused:
+                await backend._remove_colliding_user_mcp_servers(
+                    engine.managed_mcp_servers(),
+                )
+        finally:
+            await engine._mcp_gateway.close()
+        assert "github" in str(refused.value)
+        assert str(home / "config.toml") in str(refused.value)
+        assert "config file is read-only" in str(refused.value)
+
+    @pytest.mark.asyncio
+    async def test_local_mode_leaves_the_user_file_alone(
+        self, tmp_path, db, monkeypatch,
+    ):
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text(
+            '[mcp_servers.docs]\ncommand = "/usr/bin/true"\n', encoding="utf-8",
+        )
+        engine = AgentEngine(_config(tmp_path), db)
+        backend = engine._backends["codex"]
+        calls = []
+
+        async def write(path, edits):
+            calls.append(edits)
+
+        async def version_ok():
+            return "codex-cli 0.155.1"
+
+        class StubClient:
+            def __init__(self, backend, spec):
+                pass
+
+            async def connect(self):
+                pass
+
+        monkeypatch.setattr(backend, "_write_codex_config", write)
+        monkeypatch.setattr(backend, "_check_cli_version", version_ok)
+        monkeypatch.setattr(
+            "nerve.agent.backends.codex.backend.CodexClient", StubClient,
+        )
+        await backend.create_client(_spec(engine.config))
+        assert calls == []
+        assert not list(home.glob("config.toml.nerve-mcp-backup-*"))
+
+    @pytest.mark.asyncio
+    async def test_a_system_file_collision_leaves_the_gateway_server_out(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        system = tmp_path / "etc-codex-config.toml"
+        system.write_text('[mcp_servers.docs]\ncommand = "/usr/bin/true"\n')
+        monkeypatch.setattr(
+            "nerve.agent.backends.codex.backend._CODEX_SYSTEM_CONFIG", system,
+        )
+        cfg = _config(tmp_path, mcp_gateway_url=gateway.url)
+        engine = AgentEngine(cfg, db)
+        await engine._mcp_gateway.start()
+        try:
+            overrides = engine._backends["codex"].build_config_overrides(_spec(cfg))
+        finally:
+            await engine._mcp_gateway.close()
+        assert not any(o.startswith("mcp_servers.docs.url=") for o in overrides)
+        assert "mcp_servers.docs.enabled=false" in overrides
+        assert f'mcp_servers.github.url="{gateway.url}/s/github/mcp"' in overrides
 
     def test_ultracode_is_off_in_external_mode(self, tmp_path, db, external):
         cfg = _config(tmp_path, codex={
@@ -256,12 +404,22 @@ class TestCodexConfiguration:
         """Codex refuses an unknown key with ``--strict-config``.
 
         Runs the Codex binary on PATH when its version is in the range that
-        Nerve supports, and checks the effective configuration.
+        Nerve supports, and checks the effective configuration. The user file
+        has a stdio server with a gateway server's name, which Codex's own
+        writer removes before the session.
         """
         cfg = _config(tmp_path, mcp_gateway_url=gateway.url)
         codex = shutil.which(cfg.codex.bin_path)
         if codex is None:
             pytest.skip("no Codex binary on PATH")
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text(
+            '# operator note\nmodel_verbosity = "low"\n\n'
+            '[mcp_servers.docs]\ncommand = "/usr/bin/true"\n\n'
+            '[mcp_servers.personal]\nurl = "https://mcp.example.com/p"\n',
+            encoding="utf-8",
+        )
         engine = AgentEngine(cfg, db)
         backend = engine._backends["codex"]
         try:
@@ -270,15 +428,22 @@ class TestCodexConfiguration:
             pytest.skip(f"Codex on PATH is not a supported version: {e}")
         await engine._mcp_gateway.start()
         try:
+            await backend._remove_colliding_user_mcp_servers(engine.managed_mcp_servers())
             overrides = backend.build_config_overrides(_spec(cfg))
         finally:
             await engine._mcp_gateway.close()
 
-        effective = _codex_effective_config(codex, overrides, str(tmp_path / "codex-home"))
+        remaining = (home / "config.toml").read_text(encoding="utf-8")
+        assert "[mcp_servers.docs]" not in remaining
+        assert "[mcp_servers.personal]" in remaining
+        assert '# operator note\nmodel_verbosity = "low"' in remaining
+        effective = _codex_effective_config(codex, overrides, str(home))
         servers = effective["mcp_servers"]
         assert servers["docs"]["url"] == f"{gateway.url}/s/docs/mcp"
+        assert "command" not in servers["docs"]
         assert servers["docs"]["default_tools_approval_mode"] == "approve"
         assert servers["github"]["default_tools_approval_mode"] == "approve"
+        assert servers["personal"]["enabled"] is False
         features = effective["features"]
         assert features["apps"] is False
         assert features["plugins"] is False

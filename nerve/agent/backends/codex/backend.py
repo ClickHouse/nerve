@@ -56,6 +56,7 @@ from nerve.agent.backends.codex.ultracode import (
     read_verified_run_journal,
 )
 from nerve.agent.backends.images import validate_image_data
+from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,7 @@ class CodexBackend:
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
         self._preflight_cache: tuple[float, dict[str, Any]] | None = None
         self._preflight_lock = asyncio.Lock()
+        self._mcp_file_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
 
@@ -292,6 +294,9 @@ class CodexBackend:
 
     async def create_client(self, spec: SessionSpec) -> "CodexClient":
         await self._check_cli_version()
+        managed = self._managed_mcp_servers()
+        if managed is not None:
+            await self._remove_colliding_user_mcp_servers(managed)
         if self._ultracode_enabled:
             await ensure_ultracode_installed(self.config)
         client = CodexClient(self, spec)
@@ -610,17 +615,33 @@ class CodexBackend:
         approved them at the gateway. The servers that Codex's own
         configuration files name are turned off, and so are the features that
         add MCP servers.
+
+        Codex merges a server table of a file with the overrides of the same
+        name, and an override cannot remove a key. A gateway server that has
+        the name of a server in the system file is therefore left out, and the
+        file's server is turned off; the user file in CODEX_HOME has no such
+        server after :meth:`_remove_colliding_user_mcp_servers`.
         """
+        system = self._mcp_server_names(_CODEX_SYSTEM_CONFIG)
         out: list[str] = []
         names = set()
         for server in managed:
             if server.id == "nerve":
                 continue
+            if server.id in system:
+                logger.error(
+                    "MCP gateway server %r is not used for Codex: %s names an "
+                    "MCP server with the same name, and Codex cannot merge the "
+                    "two. Remove it from that file.",
+                    server.id, _CODEX_SYSTEM_CONFIG,
+                )
+                continue
             names.add(server.id)
             base = f"mcp_servers.{server.id}"
             out.append(f"{base}.url={_toml_str(server.url)}")
             out.append(f'{base}.default_tools_approval_mode="approve"')
-        for name in sorted(self._file_mcp_server_names() - names - {"nerve"}):
+        files = self._mcp_server_names(self._user_config_path()) | system
+        for name in sorted(files - names - {"nerve"}):
             if not self._TOML_KEY_RE.fullmatch(name):
                 logger.warning(
                     "Codex configuration names MCP server %r, which Nerve cannot "
@@ -632,24 +653,85 @@ class CodexBackend:
         out += [f"features.{name}=false" for name in _MANAGED_MCP_DISABLED_FEATURES]
         return out
 
-    def _file_mcp_server_names(self) -> set[str]:
-        """Names in the ``mcp_servers`` tables of Codex's configuration files."""
+    def _user_config_path(self) -> Path:
+        return Path(self._home_dir()) / "config.toml"
+
+    @staticmethod
+    def _mcp_server_names(path: Path) -> set[str]:
+        """Names in the ``mcp_servers`` table of one Codex configuration file."""
         import tomllib
 
-        names: set[str] = set()
-        for path in (Path(self._home_dir()) / "config.toml", _CODEX_SYSTEM_CONFIG):
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except FileNotFoundError:
+            return set()
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            logger.warning("Cannot read MCP servers from %s: %s", path, e)
+            return set()
+        table = data.get("mcp_servers")
+        return {str(name) for name in table} if isinstance(table, dict) else set()
+
+    async def _remove_colliding_user_mcp_servers(self, managed: tuple) -> None:
+        """Remove servers of the user file that have a gateway server's name.
+
+        External mode only. Codex merges a server table of ``config.toml``
+        with the overrides of the same name, and an override cannot remove a
+        key. A stdio entry then stops Codex from starting, and other keys
+        (``enabled``, tool filters, headers) change the gateway server. The
+        file is in Nerve's own CODEX_HOME, so Nerve removes these entries with
+        Codex's own configuration writer, which keeps the rest of the file.
+        A copy of the file is kept next to it first.
+        """
+        names = {server.id for server in managed if server.id != "nerve"}
+        path = self._user_config_path()
+        async with self._mcp_file_lock:
+            colliding = sorted(self._mcp_server_names(path) & names)
+            if not colliding:
+                return
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            backup = path.with_name(f"{path.name}.nerve-mcp-backup-{stamp}")
             try:
-                with open(path, "rb") as f:
-                    data = tomllib.load(f)
-            except FileNotFoundError:
-                continue
-            except (OSError, tomllib.TOMLDecodeError) as e:
-                logger.warning("Cannot read MCP servers from %s: %s", path, e)
-                continue
-            table = data.get("mcp_servers")
-            if isinstance(table, dict):
-                names.update(str(name) for name in table)
-        return names
+                atomic_write_text(backup, path.read_text(encoding="utf-8"), mode=0o600)
+                await self._write_codex_config(path, [
+                    {"keyPath": f"mcp_servers.{name}", "value": None,
+                     "mergeStrategy": "replace"}
+                    for name in colliding
+                ])
+            except Exception as e:
+                raise BackendError(
+                    f"Codex cannot start: {path} names MCP server(s) "
+                    f"{', '.join(colliding)}, which the MCP gateway also "
+                    f"provides, and Nerve could not remove them ({e}). Remove "
+                    "them from that file."
+                ) from e
+            logger.warning(
+                "Removed MCP server(s) %s from %s: in external mode the MCP "
+                "gateway provides servers with these names. Copy of the file: %s",
+                ", ".join(colliding), path, backup,
+            )
+
+    async def _write_codex_config(self, path: Path, edits: list[dict]) -> None:
+        """Apply edits to one Codex configuration file with Codex's writer."""
+        async def _decline(method: str, params: dict) -> dict:
+            return {}
+
+        transport = CodexAppServerClient(
+            bin_path=self.codex.bin_path,
+            cwd=self._home_dir(),
+            env={**os.environ, "CODEX_HOME": self._home_dir()},
+            server_request_handler=_decline,
+            request_timeout=10,
+        )
+        try:
+            await transport.start()
+            await transport.request(
+                "config/batchWrite",
+                {"edits": edits, "filePath": str(path)},
+                timeout=10,
+            )
+        finally:
+            await transport.close()
 
     _TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 

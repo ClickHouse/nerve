@@ -1793,6 +1793,15 @@ The clients get this configuration:
   `mcp_servers` are not used. Ultracode is a Codex plugin, so
   `codex.ultracode` has no effect.
 
+  Codex merges a server of its configuration files with a gateway server of
+  the same name, and Nerve cannot remove a key with an override. So before a
+  Codex session starts, Nerve removes such a server from `config.toml` in
+  `codex.home_dir`, with Codex's own configuration writer, and keeps a copy of
+  the file as `config.toml.nerve-mcp-backup-<UTC time>`. If that fails, the
+  session does not start and the error names the file. A gateway server whose
+  name is also in `/etc/codex/config.toml` is not given to Codex, and the
+  file's server is turned off.
+
 In external mode Nerve does not read `mcp_servers` from any configuration file
 and does not load Claude Code plugins. The catalog servers are read-only and
 show as managed by the organization on the MCP Servers page and in the API
