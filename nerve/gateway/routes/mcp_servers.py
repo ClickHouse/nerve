@@ -48,19 +48,41 @@ def _visible(name: str, managed: dict | None) -> bool:
     return managed is None or name == BUILTIN_SERVER_NAME or name in managed
 
 
+def _catalog_row(server) -> dict:
+    """A server row for a catalog server that has no database row yet.
+
+    The database rows follow the catalog after each change. This row keeps
+    the list equal to the applied catalog when a database write failed.
+    """
+    applied_at = (get_deps().engine.mcp_gateway_status() or {}).get("applied_at")
+    return {
+        "name": server.id, "type": "http", "enabled": True,
+        "tool_count": len(server.tools), "first_seen_at": applied_at,
+        "last_seen_at": applied_at, "total_invocations": 0, "success_count": 0,
+        "avg_duration_ms": None, "last_used": None,
+    }
+
+
+async def _server_rows(managed: dict | None) -> list[dict]:
+    """Server rows with usage stats; in external mode the visible ones only."""
+    rows = await get_deps().db.get_mcp_server_stats()
+    if managed is None:
+        return rows
+    rows = [row for row in rows if _visible(row["name"], managed)]
+    missing = set(managed) - {row["name"] for row in rows}
+    rows += [_catalog_row(managed[name]) for name in missing]
+    return sorted(rows, key=lambda row: row["name"])
+
+
 @router.get("/api/mcp-servers")
 async def list_mcp_servers():
     """List all MCP servers with aggregated usage stats."""
-    deps = get_deps()
-    servers = await deps.db.get_mcp_server_stats()
     managed = _managed_servers()
+    servers = await _server_rows(managed)
     if managed is None:
         return {"servers": servers}
     return {
-        "servers": [
-            _present(row, managed) for row in servers
-            if _visible(row["name"], managed)
-        ],
+        "servers": [_present(row, managed) for row in servers],
         "managed_by": MANAGED_BY_ORGANIZATION,
     }
 
@@ -70,9 +92,9 @@ async def get_mcp_server_detail(server_name: str):
     """Get detailed info for a specific MCP server."""
     deps = get_deps()
     managed = _managed_servers()
-    stats_list = await deps.db.get_mcp_server_stats()
+    stats_list = await _server_rows(managed)
     server = next((s for s in stats_list if s["name"] == server_name), None)
-    if not server or not _visible(server_name, managed):
+    if not server:
         raise HTTPException(status_code=404, detail="MCP server not found")
 
     tools = await deps.db.get_mcp_tool_breakdown(server_name)
@@ -87,6 +109,8 @@ async def get_mcp_server_usage(
 ):
     """Get usage history for an MCP server."""
     deps = get_deps()
+    if not _visible(server_name, _managed_servers()):
+        raise HTTPException(status_code=404, detail="MCP server not found")
     usage = await deps.db.get_mcp_server_usage(server_name, limit=min(limit, 200))
     return {"usage": usage}
 

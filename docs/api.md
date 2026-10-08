@@ -651,8 +651,9 @@ The routes above then change as follows:
 - Each listed server has `managed_by`: `"organization"` for a catalog server,
   `null` for `nerve`. A catalog server also has `display_name` and
   `description` from the catalog. These servers are read-only.
-- `GET /api/mcp-servers/{name}` returns `404` for a server that is not
-  listed, for example one from an earlier local mode.
+- `GET /api/mcp-servers/{name}` and `GET /api/mcp-servers/{name}/usage`
+  return `404` for a server that is not listed, for example one from an
+  earlier local mode.
 - `POST /api/mcp-servers/reload` returns `409` and reads no file.
 
 ```json
