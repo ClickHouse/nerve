@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -56,7 +57,6 @@ from nerve.agent.backends.codex.ultracode import (
     read_verified_run_journal,
 )
 from nerve.agent.backends.images import validate_image_data
-from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,9 @@ _MANAGED_MCP_DISABLED_FEATURES = ("apps", "plugins", "skill_mcp_dependency_insta
 # Codex's system configuration file. It and the user file in CODEX_HOME can
 # name MCP servers that are not in the overrides that Nerve passes.
 _CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
+
+# Names tried for a copy of config.toml before Nerve gives up.
+_BACKUP_NAME_ATTEMPTS = 8
 
 
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
@@ -709,10 +712,8 @@ class CodexBackend:
             colliding = sorted(self._mcp_server_names(path) & names)
             if not colliding:
                 return
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            backup = path.with_name(f"{path.name}.nerve-mcp-backup-{stamp}")
             try:
-                atomic_write_text(backup, path.read_text(encoding="utf-8"), mode=0o600)
+                backup = self._write_backup(path)
                 await self._write_codex_config(path, [
                     {"keyPath": f"mcp_servers.{name}", "value": None,
                      "mergeStrategy": "replace"}
@@ -730,6 +731,30 @@ class CodexBackend:
                 "gateway provides servers with these names. Copy of the file: %s",
                 ", ".join(colliding), path, backup,
             )
+
+    @staticmethod
+    def _write_backup(path: Path) -> Path:
+        """Copy ``path`` to a new file next to it and return the copy's path.
+
+        The name has the UTC time and a random part, and the file is created
+        exclusively (mode 0600), so a copy never replaces an earlier copy.
+        """
+        content = path.read_bytes()
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        for _ in range(_BACKUP_NAME_ATTEMPTS):
+            backup = path.with_name(
+                f"{path.name}.nerve-mcp-backup-{stamp}-{uuid.uuid4().hex[:12]}",
+            )
+            try:
+                fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            return backup
+        raise OSError(f"no free name for a copy of {path}")
 
     async def _write_codex_config(self, path: Path, edits: list[dict]) -> None:
         """Apply edits to one Codex configuration file with Codex's writer."""
