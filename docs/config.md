@@ -1878,6 +1878,15 @@ directly and give the message to the model unchanged.
 The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
 
+`GET /api/diagnostics` and the Diagnostics page show the catalog that Nerve
+read last: its desired revision and generation, and for each server what the
+gateway observed (tool count, whether the list is current or stale, and the
+reason of a failed last read). They also show the result of the last catalog
+request (see [`GET /api/diagnostics`](api.md#get-apidiagnostics)). A catalog
+that Nerve read is what new sessions get; it does not show what a running
+session loaded. `nerve doctor` shows the configured `mcp_gateway_url`; it does
+not ask the running server.
+
 ## Auth
 
 | Key | Type | Default | Description |

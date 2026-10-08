@@ -831,3 +831,134 @@ class TestApiInLocalMode:
         finally:
             _deps._deps = previous
         assert "mcp_reload" not in config_excluded_tools(engine.config)
+
+
+class TestDiagnostics:
+    @pytest_asyncio.fixture
+    async def diagnostics_of(self, db):
+        import nerve.config as cfg_mod
+        from nerve.gateway.routes import _deps
+        from nerve.gateway.routes.diagnostics import diagnostics
+
+        previous = (_deps._deps, cfg_mod._config)
+
+        async def run(engine):
+            _deps.init_deps(engine, db)
+            cfg_mod._config = engine.config
+            return await diagnostics()
+
+        yield run
+        _deps._deps, cfg_mod._config = previous
+
+    @pytest.mark.asyncio
+    async def test_reports_the_catalog_read(
+        self, tmp_path, db, gateway, external, diagnostics_of,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        await engine._mcp_gateway.start()
+        try:
+            report = await diagnostics_of(engine)
+            first = gateway.catalog
+            gateway.catalog = catalog_payload(
+                8, {"docs": ["search"], "jira": ["create"]}, inventory={"jira": None},
+            )
+            await engine._mcp_gateway.refresh()
+            later = await diagnostics_of(engine)
+        finally:
+            await engine._mcp_gateway.close()
+        block = report["mcp_gateway"]
+        assert block["url"] == gateway.url
+        assert block["generation"] == 7
+        assert block["digest"] == catalog_payload(7, {})["digest"]
+        assert block["desired_revision"] == first["desiredRevision"]
+        assert [server["id"] for server in block["servers"]] == ["docs", "github"]
+        assert block["error"] is None
+        assert block["fetched_at"] is not None
+        # A catalog read is not a running client's state.
+        assert not any("applied" in key for key in block if key != "not_applied")
+
+        block = later["mcp_gateway"]
+        assert block["generation"] == 8
+        assert block["desired_revision"] == gateway.catalog["desiredRevision"]
+        docs, jira = block["servers"]
+        assert (docs["id"], docs["inventory"]["tool_count"]) == ("docs", 1)
+        assert docs["health"]["inventory_state"] == "current"
+        assert jira["id"] == "jira"
+        assert jira["desired_revision"] == gateway.catalog["servers"][1]["desiredRevision"]
+        assert jira["inventory"] is None
+        assert jira["health"] == {
+            "inventory_state": "unknown", "checked_at": None, "failure": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_reports_the_tool_policy_without_a_tool_limit(
+        self, tmp_path, db, gateway, external, diagnostics_of,
+    ):
+        gateway.catalog_body = (FIXTURES / "catalog-all-tools.json").read_bytes()
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        await engine._mcp_gateway.start()
+        try:
+            every = (await diagnostics_of(engine))["mcp_gateway"]
+            gateway.catalog_body = (FIXTURES / "catalog-review-changes.json").read_bytes()
+            await engine._mcp_gateway.refresh()
+            review = (await diagnostics_of(engine))["mcp_gateway"]
+        finally:
+            await engine._mcp_gateway.close()
+        wiki = every["servers"][1]
+        assert (wiki["id"], wiki["tool_mode"], wiki["tool_changes"]) == ("wiki", "all", "accept")
+        # The only count is the size of the last list that the gateway served.
+        assert set(wiki) == {
+            "id", "desired_revision", "tool_mode", "tool_changes", "inventory", "health",
+        }
+        assert wiki["inventory"]["tool_count"] == 2
+        assert [server["tool_changes"] for server in review["servers"]] == ["review", "accept"]
+
+    @pytest.mark.asyncio
+    async def test_reports_an_unreachable_gateway(
+        self, tmp_path, db, gateway, external, diagnostics_of,
+    ):
+        gateway.stop()
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        await engine._mcp_gateway.start()
+        try:
+            block = (await diagnostics_of(engine))["mcp_gateway"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert block["generation"] is None
+        assert block["retrying"] is True
+        assert "cannot reach the MCP gateway" in block["error"]
+
+    @pytest.mark.asyncio
+    async def test_local_mode_has_no_gateway_block(self, tmp_path, db, diagnostics_of):
+        engine = AgentEngine(_config(tmp_path), db)
+        assert "mcp_gateway" not in await diagnostics_of(engine)
+
+
+class TestDoctor:
+    def _report(self, tmp_path, **extra):
+        from nerve.cli import doctor_report
+
+        return doctor_report(_config(tmp_path, **extra))
+
+    def test_external_mode_names_the_gateway(self, tmp_path, external):
+        report = self._report(tmp_path, mcp_gateway_url="http://192.0.2.1:8080")
+        assert "[OK] MCP gateway: http://192.0.2.1:8080" in report
+        assert "mcp_servers: 2 server(s) in the configuration, not used" in report
+
+    def test_external_mode_without_a_gateway_warns(self, tmp_path, external):
+        report = self._report(tmp_path)
+        assert "[WARN] MCP gateway: mcp_gateway_url is not set" in report
+
+    def test_external_mode_warns_about_ultracode(self, tmp_path, external):
+        report = self._report(tmp_path, codex={
+            "home_dir": str(tmp_path / "codex-home"), "ultracode": {"enabled": True},
+        })
+        assert "[WARN] codex.ultracode has no effect in external mode" in report
+
+    def test_local_mode_warns_about_an_unused_gateway(self, tmp_path):
+        report = self._report(tmp_path, mcp_gateway_url="http://192.0.2.1:8080")
+        assert "[WARN] mcp_gateway_url has no effect in local mode" in report
+        assert "[OK] MCP gateway" not in report
+
+    def test_local_mode_without_a_gateway_says_nothing(self, tmp_path):
+        assert "MCP gateway" not in self._report(tmp_path)

@@ -1355,6 +1355,51 @@ and workflow runs that were cancelled while still queued, are not counted,
 so `cost_usd / runs` is the average cost per run. Jobs without usage are
 omitted.
 
+In external mode the response also has `mcp_gateway`: the catalog of the MCP
+gateway that Nerve read last, which new sessions get, and the result of the
+last catalog request. It does not tell what a running session loaded.
+`desired_revision` is the agent's aggregate desired revision; `generation` and
+`digest` identify the tenant's policy. These and `fetched_at` (the time of the
+last successful read) are `null` before the first catalog. Each entry of
+`servers` has the server's `desired_revision`, `tool_mode` (`selected`, or
+`all`: the agent can call every tool of the server, also one that the server
+adds later) and `tool_changes` (`accept`, or `review`: the gateway serves the
+tool definitions that a person approved), and apart from them what the gateway
+observed: `inventory` (the last tool list that it served to the agent, `null`
+when it observed none; `tool_count` is the size of that list, also with
+`all`) and `health` (`inventory_state`
+`unknown`, `current` or `stale`, the time of its last read, and the reason of
+a failed last read). `checked_at` is the time of the last catalog request and
+`error` its problem, or `null` after a success. `retrying` is true while the
+background retry runs. The block is absent in local mode.
+
+```json
+"mcp_gateway": {
+  "url": "http://192.0.2.1:8080",
+  "generation": 7,
+  "digest": "sha256:3f9a…",
+  "desired_revision": "sha256:0dc5…",
+  "servers": [{
+    "id": "docs",
+    "desired_revision": "sha256:c3c1…",
+    "tool_mode": "selected",
+    "tool_changes": "accept",
+    "inventory": {
+      "revision": "sha256:a7d6…", "tool_count": 2,
+      "observed_at": "2026-10-17T12:00:00Z", "desired_revision": "sha256:c3c1…"
+    },
+    "health": {
+      "inventory_state": "current", "checked_at": "2026-10-17T12:00:00Z",
+      "failure": null
+    }
+  }],
+  "fetched_at": "2026-10-17T12:05:00+00:00",
+  "checked_at": "2026-10-17T12:05:00+00:00",
+  "error": null,
+  "retrying": false
+}
+```
+
 #### `GET /api/cron/logs?job_id=&limit=50&offset=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
