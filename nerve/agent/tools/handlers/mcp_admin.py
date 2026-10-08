@@ -98,6 +98,14 @@ async def mcp_reload_handler(ctx: ToolContext, args: dict) -> ToolResult:
     """Reload MCP server configs from YAML files."""
     if not ctx.engine:
         return ToolResult.text("Engine not available.")
+    if getattr(ctx.engine, "managed_mcp", False) is True:
+        from nerve.mcp_gateway import MANAGED_RELOAD_DETAIL
+
+        return ToolResult.text(
+            f"mcp_reload is not available. {MANAGED_RELOAD_DETAIL} To ask for "
+            "a new MCP server or tool, ask an administrator of the organization.",
+            is_error=True,
+        )
     try:
         servers = await ctx.engine.reload_mcp_config()
         names = ["nerve (built-in)"] + [s.name for s in servers]

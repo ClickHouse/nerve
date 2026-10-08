@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
 
 from nerve.agent.backends import SessionSpec
 from nerve.agent.engine import AgentEngine
@@ -605,3 +606,112 @@ class TestLocalModeUnchanged:
              patch("nerve.config.load_claude_code_plugins", return_value=[]):
             await engine.reload_mcp_config()
         yaml_servers.assert_called_once()
+
+
+class TestReadOnlyInExternalMode:
+    """Catalog servers are read-only and managed by the organization."""
+
+    @pytest_asyncio.fixture
+    async def routes(self, tmp_path, db, gateway, external):
+        from nerve.gateway.routes import _deps
+
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        await engine._mcp_gateway.start()
+        await engine._sync_mcp_servers_to_db()
+        # A server from an earlier local mode stays in the database.
+        await db.upsert_mcp_server(name="local-files", server_type="stdio")
+        previous = _deps._deps
+        _deps.init_deps(engine, db)
+        yield engine
+        _deps._deps = previous
+        await engine._mcp_gateway.close()
+
+    @pytest.mark.asyncio
+    async def test_list_marks_the_catalog_servers(self, routes):
+        from nerve.gateway.routes.mcp_servers import list_mcp_servers
+
+        listed = await list_mcp_servers()
+        assert listed["managed_by"] == "organization"
+        servers = {row["name"]: row for row in listed["servers"]}
+        assert set(servers) == {"nerve", "docs", "github"}
+        assert servers["docs"]["managed_by"] == "organization"
+        assert servers["docs"]["display_name"] == "Docs"
+        assert servers["docs"]["description"] == "The docs server."
+        assert servers["nerve"]["managed_by"] is None
+
+    @pytest.mark.asyncio
+    async def test_detail_of_a_catalog_server(self, routes):
+        from fastapi import HTTPException
+
+        from nerve.gateway.routes.mcp_servers import get_mcp_server_detail
+
+        detail = await get_mcp_server_detail("docs")
+        assert detail["managed_by"] == "organization"
+        assert detail["tools"] == []
+        with pytest.raises(HTTPException) as refused:
+            await get_mcp_server_detail("local-files")
+        assert refused.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_reload_is_refused(self, routes):
+        from fastapi import HTTPException
+
+        from nerve.gateway.routes.mcp_servers import reload_mcp_servers
+
+        with patch("nerve.config.load_mcp_servers") as yaml_servers:
+            with pytest.raises(HTTPException) as refused:
+                await reload_mcp_servers()
+        assert refused.value.status_code == 409
+        assert "organization manages the MCP servers" in refused.value.detail
+        yaml_servers.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mcp_reload_tool_refuses(self, routes):
+        from nerve.agent.tools.handlers.mcp_admin import mcp_reload_handler
+
+        with patch("nerve.config.load_mcp_servers") as yaml_servers:
+            result = await mcp_reload_handler(SimpleNamespace(engine=routes), {})
+        yaml_servers.assert_not_called()
+        assert result.is_error is True
+        assert "mcp_reload is not available" in result.content[0]["text"]
+
+    def test_mcp_reload_is_not_offered(self, tmp_path, db, external):
+        from nerve.agent.backends.base import config_excluded_tools
+
+        engine = AgentEngine(_config(tmp_path), db)
+        assert "mcp_reload" in config_excluded_tools(engine.config)
+        assert "mcp_reload" in engine._backends["claude"].excluded_tools()
+        assert "mcp_reload" in engine._backends["codex"].excluded_tools()
+
+
+class TestApiInLocalMode:
+    @pytest.mark.asyncio
+    async def test_routes_answer_as_before(self, tmp_path, db):
+        from nerve.agent.backends.base import config_excluded_tools
+        from nerve.agent.tools.handlers.mcp_admin import mcp_reload_handler
+        from nerve.gateway.routes import _deps
+        from nerve.gateway.routes.mcp_servers import (
+            get_mcp_server_detail,
+            list_mcp_servers,
+            reload_mcp_servers,
+        )
+
+        engine = AgentEngine(_config(tmp_path), db)
+        await engine._sync_mcp_servers_to_db()
+        previous = _deps._deps
+        _deps.init_deps(engine, db)
+        try:
+            listed = await list_mcp_servers()
+            assert set(listed) == {"servers"}
+            assert all("managed_by" not in row for row in listed["servers"])
+            assert "managed_by" not in await get_mcp_server_detail("local-files")
+            with patch("nerve.config.load_mcp_servers", return_value=[]) as yaml_servers, \
+                 patch("nerve.config.load_claude_code_plugins", return_value=[]):
+                reloaded = await reload_mcp_servers()
+                result = await mcp_reload_handler(SimpleNamespace(engine=engine), {})
+            assert yaml_servers.call_count == 2
+            assert reloaded["reloaded"] == 0
+            assert result.is_error is False
+        finally:
+            _deps._deps = previous
+        assert "mcp_reload" not in config_excluded_tools(engine.config)

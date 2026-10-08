@@ -639,6 +639,35 @@ Re-read MCP server config from YAML files and refresh the in-memory cache. New s
 Response: { "reloaded": 2, "servers": [...] }
 ```
 
+#### MCP servers in external mode
+
+In external mode the organization manages the MCP servers through the MCP
+gateway (see [MCP servers in external mode](config.md#mcp-servers-in-external-mode)).
+The routes above then change as follows:
+
+- `GET /api/mcp-servers` lists the built-in `nerve` server and the servers of
+  the applied catalog only, and adds `"managed_by": "organization"` to the
+  response.
+- Each listed server has `managed_by`: `"organization"` for a catalog server,
+  `null` for `nerve`. A catalog server also has `display_name` and
+  `description` from the catalog. These servers are read-only.
+- `GET /api/mcp-servers/{name}` returns `404` for a server that is not
+  listed, for example one from an earlier local mode.
+- `POST /api/mcp-servers/reload` returns `409` and reads no file.
+
+```json
+Response: {
+  "managed_by": "organization",
+  "servers": [{
+    "name": "docs", "type": "http", "enabled": true, "tool_count": 2,
+    "managed_by": "organization", "display_name": "Docs",
+    "description": "Search the product documentation.", ...
+  }]
+}
+```
+
+In local mode the responses have no `managed_by` field.
+
 ### Memory Files
 
 #### `GET /api/memory/files`

@@ -1794,7 +1794,12 @@ The clients get this configuration:
   `codex.ultracode` has no effect.
 
 In external mode Nerve does not read `mcp_servers` from any configuration file
-and does not load Claude Code plugins.
+and does not load Claude Code plugins. The catalog servers are read-only and
+show as managed by the organization on the MCP Servers page and in the API
+(see [MCP servers in external mode](api.md#mcp-servers-in-external-mode)).
+There is no MCP configuration to reload: the agent does not get the
+`mcp_reload` tool, and `POST /api/mcp-servers/reload` returns `409`. An
+administrator of the organization adds a server or a tool at the gateway.
 
 When the gateway refuses a server or a tool, it answers with the JSON-RPC
 error `-32001` and a fixed message. The clients connect to the gateway
