@@ -7,6 +7,7 @@ import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgen
 import { StatusBadge } from '../components/Cron/controls';
 import { totalInputTokens, type UsageTokens } from '../utils/usageTokens';
 import { langfuseProjectUrl } from '../utils/langfuseLinks';
+import { McpGatewayStatus } from '../components/Mcp/McpGatewayStatus';
 
 const INPUT_HEADER_TITLE = 'Uncached input + cache reads + cache writes';
 
@@ -151,6 +152,9 @@ export function DiagnosticsPage() {
             )}
           </div>
         )}
+
+        {/* MCP gateway catalog — external mode only */}
+        {data.mcp_gateway && <McpGatewayStatus status={data.mcp_gateway} />}
 
         {/* Usage & Cost */}
         {usage?.last_7d && (
