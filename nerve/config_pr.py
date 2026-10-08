@@ -142,6 +142,12 @@ _SECURITY_SETTINGS_KEYS: dict[tuple[str, ...], str] = {
 
 _SETTINGS_FILE = "config/settings.yaml"
 
+# Settings keys of the MCP servers. In external mode the organization manages
+# the MCP servers through the MCP gateway, and a proposal may not change them.
+# Judged by change against the base branch, like the security keys: a file
+# that restates an earlier value unchanged changes nothing.
+_MANAGED_MCP_KEYS = (("mcp_servers",), ("mcp_gateway_url",))
+
 # Under ``portable_only`` a bundle with no portable config file at all is an
 # error: a CI gate that validated nothing must not report success. A proposal is
 # not that gate. The staged worktree is validated with the change already
@@ -489,6 +495,30 @@ def _security_settings_change(content: str, dst: Path) -> str | None:
     return "changes " + "; ".join(moved) if moved else None
 
 
+def _managed_mcp_changes(content: str, dst: Path) -> list[str]:
+    """The MCP keys that a proposed ``config/settings.yaml`` changes.
+
+    Change against the base branch, as :func:`_security_settings_change`
+    judges it. When the base revision cannot be read, a key that the proposal
+    states counts as changed. Unreadable proposed content yields nothing:
+    validation rejects it.
+    """
+    parsed = _settings_mapping(content)
+    if parsed is None:
+        return []
+    current = _current_settings(dst)
+    changed = []
+    for key in _MANAGED_MCP_KEYS:
+        after = _lookup(parsed, key)
+        if current is _UNKNOWN:
+            moved = after is not _ABSENT
+        else:
+            moved = _lookup(current, key) != after
+        if moved:
+            changed.append(".".join(key))
+    return changed
+
+
 def _executable_effect(staged: str, dst: Path, content: str) -> str | None:
     """Why the reviewer should look hard at this change, or ``None``.
 
@@ -568,6 +598,7 @@ def propose_config_change(
     now: int,
     branch: str | None = None,
     base: str = "",
+    managed_mcp: bool = False,
 ) -> ProposeResult:
     """Open a PR against the workspace repo with the given file changes.
 
@@ -581,6 +612,10 @@ def propose_config_change(
     ``base`` is the branch to propose against: the one workspace sync pulls from
     (``workspace_sync.branch``). Empty falls back to origin's default branch —
     never the local ``HEAD``, see :func:`_remote_default_branch`.
+
+    ``managed_mcp`` is true in external mode, where the organization manages
+    the MCP servers through the MCP gateway. A proposal that changes the MCP
+    keys of ``config/settings.yaml`` is then refused as a whole.
 
     Never raises.
     """
@@ -703,6 +738,20 @@ def propose_config_change(
                 )
             staged = dst.relative_to(wt.resolve()).as_posix()
             content = str(ch["content"])
+            if managed_mcp and staged == _SETTINGS_FILE:
+                changed = _managed_mcp_changes(content, dst)
+                if changed:
+                    return ProposeResult(
+                        ok=False, branch=branch,
+                        message=(
+                            "in external mode the organization manages the MCP "
+                            "servers through the MCP gateway, so a proposal cannot "
+                            f"change {', '.join(changed)} in {_SETTINGS_FILE} — no "
+                            "PR opened. Keep these keys as they are in the base "
+                            "branch. To ask for a new MCP server or tool, ask an "
+                            "administrator of the organization."
+                        ),
+                    )
             effect = _executable_effect(staged, dst, content)
             if effect:
                 effects[staged] = effect
