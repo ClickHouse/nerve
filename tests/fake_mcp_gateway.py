@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -49,6 +50,8 @@ class FakeMcpGateway:
         self.denied_tools: set[str] = set()
         self.catalog_requests = 0
         self.catalog_gate: threading.Event | None = None
+        # Seconds between single bytes of the catalog body; None sends it at once.
+        self.trickle: float | None = None
         self.mcp_requests: list[tuple[str, dict]] = []
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -81,7 +84,25 @@ class FakeMcpGateway:
                 body = gateway.catalog_body
                 if body is None:
                     body = json.dumps(gateway.catalog).encode()
+                if gateway.trickle is not None:
+                    self._trickle(body, gateway.trickle)
+                    return
                 self._send(200, body, gateway.content_type)
+
+            def _trickle(self, body: bytes, interval: float) -> None:
+                # Each byte arrives well within a read timeout, but the whole
+                # body takes len(body) * interval seconds.
+                self.send_response(200)
+                self.send_header("Content-Type", gateway.content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for index in range(len(body)):
+                        self.wfile.write(body[index:index + 1])
+                        self.wfile.flush()
+                        time.sleep(interval)
+                except OSError:
+                    pass  # the client gave up
 
             def do_POST(self) -> None:  # noqa: N802 - http.server API
                 parts = self.path.split("/")

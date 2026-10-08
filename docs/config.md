@@ -1766,12 +1766,15 @@ from the connection. It does not use the proxy environment variables, and for
   `<mcp_gateway_url>/s/<id>/mcp`.
 - When the catalog changes, new sessions get the new servers. A session that
   is running keeps the servers that it started with.
+- One catalog request takes at most 5 seconds, from the connection to the
+  checked catalog.
 - When the gateway gives no catalog (it is not reachable, it answers with an
-  error, or the catalog breaks the contract), Nerve keeps the catalog that it
-  applied last. After startup there is none, and sessions start with the
-  `nerve` server only. Nerve then tries again in the background: after 1
-  second, and after each failure with double the interval, up to 60 seconds.
-  It stops at the first success. A new session also tries once.
+  error or too slowly, or the catalog breaks the contract), Nerve keeps the
+  catalog that it applied last. After startup there is none, and sessions
+  start with the `nerve` server only. Nerve then tries again in the
+  background: after 1 second, and after each failure with double the
+  interval, up to 60 seconds. It stops at the first success. A new session
+  also tries once.
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
 
