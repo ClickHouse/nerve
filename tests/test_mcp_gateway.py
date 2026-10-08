@@ -72,6 +72,9 @@ class TestGatewayUrlSetting:
         ("http://192.0.2.1:8080", "http://192.0.2.1:8080"),
         ("http://192.0.2.1:8080/", "http://192.0.2.1:8080"),
         (" https://mcp.example.com/agent/ ", "https://mcp.example.com/agent"),
+        ("http://[::1]:8080", "http://[::1]:8080"),
+        ("http://gateway.example.:8080", "http://gateway.example.:8080"),
+        ("http://bücher.example", "http://bücher.example"),
     ])
     def test_accepted_values(self, value, expected):
         from nerve.config import NerveConfig
@@ -93,6 +96,19 @@ class TestGatewayUrlSetting:
         "http://192.0.2.1:8080?",
         "http://192.0.2.1:99999",
         "http://192.0.2.1:0",
+        # Values that the HTTP client cannot use, or that would corrupt a log
+        # line or the doctor report.
+        "http://192.0.2.1:8080/a\nb",
+        "http://192.0.2.1:8080/a b",
+        "http://192.0.2.1:8080/a\x00b",
+        "http://exa mple.example",
+        "http://ex\tample.example",
+        "http://\x7fexample.example",
+        "http://[::1",
+        "http://-bad-.example",
+        "http://a..example",
+        "http://.example",
+        "http://%zz.example",
     ])
     def test_refused_values(self, value):
         from nerve.config import ConfigError, NerveConfig
