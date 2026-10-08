@@ -1800,8 +1800,9 @@ The clients get this configuration:
   the same name, and Nerve cannot remove a key with an override. So before a
   Codex session starts, Nerve removes such a server from `config.toml` in
   `codex.home_dir`, with Codex's own configuration writer, and keeps a copy of
-  the file as `config.toml.nerve-mcp-backup-<UTC time>`. If that fails, the
-  session does not start and the error names the file.
+  the file as `config.toml.nerve-mcp-backup-<UTC time>-<random>` (a new file
+  each time; a copy never replaces another). If that fails, the session does
+  not start and the error names the file.
 
   Nerve does not change `/etc/codex/config.toml`. A gateway server whose name
   is also in that file is not given to Codex, the file's server is turned off,

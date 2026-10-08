@@ -432,6 +432,75 @@ class TestCodexConfiguration:
             assert "mcp_servers.docs.enabled=false" in overrides
             assert f'mcp_servers.github.url="{gateway.url}/s/github/mcp"' in overrides
 
+    @pytest.mark.asyncio
+    async def test_backups_never_replace_each_other(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """Two removals in the same second keep two copies of the file."""
+        import nerve.agent.backends.codex.backend as codex_module
+
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        first = (
+            '[mcp_servers.docs]\ncommand = "/usr/bin/true"\n'
+            '[mcp_servers.jira]\ncommand = "/usr/bin/true"\n'
+        )
+        (home / "config.toml").write_text(first, encoding="utf-8")
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        backend = engine._backends["codex"]
+
+        async def write(path, edits):
+            # Codex's writer: drop the named tables.
+            names = {edit["keyPath"].split(".", 1)[1] for edit in edits}
+            kept = [
+                block for block in path.read_text().split("[mcp_servers.")[1:]
+                if block.split("]", 1)[0] not in names
+            ]
+            path.write_text("".join("[mcp_servers." + block for block in kept))
+
+        monkeypatch.setattr(backend, "_write_codex_config", write)
+        monkeypatch.setattr(codex_module.time, "strftime", lambda *a: "20261008T120000Z")
+        await engine._mcp_gateway.start()
+        try:
+            await backend._remove_colliding_user_mcp_servers(engine.managed_mcp_servers())
+            second = (home / "config.toml").read_text()
+            gateway.catalog = catalog_payload(8, {"jira": ["create"]})
+            await engine._mcp_gateway.refresh()
+            await backend._remove_colliding_user_mcp_servers(engine.managed_mcp_servers())
+        finally:
+            await engine._mcp_gateway.close()
+
+        backups = sorted(home.glob("config.toml.nerve-mcp-backup-20261008T120000Z-*"))
+        assert len(backups) == 2
+        assert sorted(b.read_text() for b in backups) == sorted([first, second])
+        assert "[mcp_servers.jira]" in second
+        assert (home / "config.toml").read_text() == ""
+
+    def test_a_backup_does_not_replace_an_existing_file(self, tmp_path, monkeypatch):
+        import uuid
+
+        import nerve.agent.backends.codex.backend as codex_module
+        from nerve.agent.backends.codex import CodexBackend
+
+        config = tmp_path / "config.toml"
+        config.write_text("[mcp_servers.docs]\n", encoding="utf-8")
+        monkeypatch.setattr(codex_module.time, "strftime", lambda *a: "20261008T120000Z")
+        same = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        other = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        # The second copy draws the first name again, then a new one.
+        values = iter([same, same, other])
+        monkeypatch.setattr(codex_module.uuid, "uuid4", lambda: next(values))
+        taken = tmp_path / "config.toml.nerve-mcp-backup-20261008T120000Z-aaaaaaaaaaaa"
+
+        assert CodexBackend._write_backup(config) == taken
+        assert taken.read_text() == "[mcp_servers.docs]\n"
+        assert taken.stat().st_mode & 0o777 == 0o600
+        config.write_text("[mcp_servers.jira]\n", encoding="utf-8")
+        second = CodexBackend._write_backup(config)
+        assert second.name == "config.toml.nerve-mcp-backup-20261008T120000Z-bbbbbbbbbbbb"
+        assert taken.read_text() == "[mcp_servers.docs]\n"
+        assert second.read_text() == "[mcp_servers.jira]\n"
+
     def test_ultracode_is_off_in_external_mode(self, tmp_path, db, external):
         cfg = _config(tmp_path, codex={
             "home_dir": str(tmp_path / "codex-home"),
