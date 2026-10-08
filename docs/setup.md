@@ -374,6 +374,14 @@ nerve restart
 
 Subsequent `nerve upgrade` runs install from the lock automatically.
 
+### Going back to an older Nerve
+
+Going back to an older Nerve after an upgrade is refused by default: the
+database schema is then newer than the code, and older code on a newer schema
+fails quietly later rather than loudly at start. Restore the backup taken
+before the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start
+anyway and accept that risk.
+
 ### Changing a dependency
 
 Edit `pyproject.toml`, then relock and commit `uv.lock` alongside it:
