@@ -220,6 +220,54 @@ class TestWriteSerialization:
 
 
 @pytest.mark.asyncio
+class TestAtomicBeginsBeforeReading:
+    """A read inside _atomic() and the write that depends on it are one
+    transaction, even against another connection."""
+
+    async def test_transaction_is_open_before_the_first_statement(
+        self, db: Database,
+    ):
+        async with db._atomic():
+            assert db.db.in_transaction
+        assert not db.db.in_transaction
+
+    async def test_other_connection_cannot_commit_between_read_and_write(
+        self, db: Database,
+    ):
+        await db.set_sync_cursor("counter", "1")
+        async with db._atomic():
+            async with db.db.execute(
+                "SELECT cursor FROM sync_cursors WHERE source = 'counter'",
+            ) as cur:
+                value = int((await cur.fetchone())[0])
+            ext = sqlite3.connect(str(db.db_path), timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    ext.execute(
+                        "UPDATE sync_cursors SET cursor = '100' "
+                        "WHERE source = 'counter'"
+                    )
+            finally:
+                ext.close()
+            await db.db.execute(
+                "UPDATE sync_cursors SET cursor = ? WHERE source = 'counter'",
+                (str(value + 1),),
+            )
+        assert await db.get_sync_cursor("counter") == "2"
+        # The lock ends with the transaction.
+        _external_commit(db.db_path)
+
+    async def test_read_only_body_error_leaves_connection_clean(
+        self, db: Database,
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            async with db._atomic():
+                raise RuntimeError("boom")
+        assert not db.db.in_transaction
+        _external_commit(db.db_path)
+
+
+@pytest.mark.asyncio
 class TestWriteResultPlumbing:
     """lastrowid/rowcount survive the migration to _write()."""
 
