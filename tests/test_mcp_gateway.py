@@ -358,6 +358,69 @@ class TestCatalogReader:
             await reader.close()
 
     @pytest.mark.asyncio
+    async def test_a_slow_catalog_counts_as_unavailable(self, gateway):
+        """A body that arrives byte by byte stays under each read timeout.
+
+        The whole request has a deadline, so startup and a new session do not
+        wait for it without limit. The applied catalog stays and the retry
+        runs.
+        """
+        gateway.trickle = 0.05
+        reader = McpGatewayCatalog(gateway.url, retry_initial=30, deadline=0.5)
+        loop = asyncio.get_running_loop()
+        try:
+            started = loop.time()
+            await asyncio.wait_for(reader.start(), 5)
+            assert loop.time() - started < 2
+            assert reader.applied is None
+            assert reader.status()["error"] == (
+                "MCP gateway catalog not received within 0.5 seconds"
+            )
+            assert reader.retrying is True
+
+            gateway.trickle = None
+            await reader.refresh()
+            assert reader.applied.generation == 7
+
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            gateway.trickle = 0.05
+            started = loop.time()
+            await asyncio.wait_for(reader.refresh(), 5)
+            assert loop.time() - started < 2
+            assert reader.applied.generation == 7
+            assert reader.retrying is True
+        finally:
+            await reader.close()
+
+    def test_the_default_deadline_is_bounded(self):
+        from nerve.mcp_gateway import FETCH_DEADLINE_SECONDS
+
+        assert 0 < FETCH_DEADLINE_SECONDS <= 10
+        assert McpGatewayCatalog("http://192.0.2.1:8080")._deadline == FETCH_DEADLINE_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_a_failed_handler_runs_again_on_the_next_request(self, gateway):
+        calls: list[int] = []
+
+        async def on_applied(catalog):
+            calls.append(catalog.generation)
+            if len(calls) == 1:
+                raise RuntimeError("database is locked")
+
+        reader = McpGatewayCatalog(gateway.url, on_applied=on_applied)
+        try:
+            await reader.start()
+            assert calls == [7]
+            # The same catalog: the handler did not complete, so it runs again.
+            await reader.refresh()
+            assert calls == [7, 7]
+            # Now it completed; the same catalog does not call it again.
+            await reader.refresh()
+            assert calls == [7, 7]
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
     async def test_concurrent_refreshes_share_one_request(self, gateway):
         reader = McpGatewayCatalog(gateway.url)
         try:

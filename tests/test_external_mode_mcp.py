@@ -840,6 +840,31 @@ class TestReadOnlyInExternalMode:
         assert result.is_error is True
         assert "mcp_reload is not available" in result.content[0]["text"]
 
+    @pytest.mark.asyncio
+    async def test_failed_row_writes_are_repaired_on_the_next_request(
+        self, tmp_path, db, gateway, external,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        upsert = db.upsert_mcp_server
+        failures = []
+
+        async def flaky_upsert(name, *args, **kwargs):
+            if name == "github" and not failures:
+                failures.append(name)
+                raise RuntimeError("database is locked")
+            return await upsert(name, *args, **kwargs)
+
+        with patch.object(db, "upsert_mcp_server", flaky_upsert):
+            await engine._mcp_gateway.start()
+            rows = {row["name"] for row in await db.get_mcp_server_stats()}
+            assert "github" not in rows
+            # The next catalog request, the same generation: the rows follow.
+            await engine._mcp_gateway.refresh()
+        await engine._mcp_gateway.close()
+        rows = {row["name"] for row in await db.get_mcp_server_stats()}
+        assert {"docs", "github", "nerve"} <= rows
+        assert failures == ["github"]
+
     def test_mcp_reload_is_not_offered(self, tmp_path, db, external):
         from nerve.agent.backends.base import config_excluded_tools
 

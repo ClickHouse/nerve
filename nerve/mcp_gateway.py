@@ -67,7 +67,11 @@ MANAGED_RELOAD_DETAIL = (
 MAX_CATALOG_BYTES = 8 * 1024 * 1024
 
 # One catalog request. A new session waits for it, so it is short.
+# FETCH_TIMEOUT bounds each network operation; FETCH_DEADLINE_SECONDS bounds
+# the whole request, from the connection to the parsed catalog. A gateway that
+# sends its answer too slowly is unavailable for that request.
 FETCH_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+FETCH_DEADLINE_SECONDS = 5.0
 
 # Interval before the first retry after a failure, and its upper limit.
 RETRY_INITIAL_SECONDS = 1.0
@@ -200,10 +204,12 @@ class McpGatewayCatalog:
     """Read the agent's catalog from the MCP gateway and keep the last one.
 
     :meth:`start` reads the catalog once. :meth:`refresh` reads it again
-    before a new session. Concurrent calls share one request. A changed
-    catalog replaces the applied one and goes to ``on_applied``. A failure
-    keeps the applied catalog and starts the background retry, which stops at
-    the first success.
+    before a new session. Concurrent calls share one request, which takes at
+    most ``deadline`` seconds. A changed catalog replaces the applied one and
+    goes to ``on_applied``; when ``on_applied`` fails, the next successful
+    request calls it again with the applied catalog. A failure keeps the
+    applied catalog and starts the background retry, which stops at the first
+    success.
     """
 
     def __init__(
@@ -215,6 +221,7 @@ class McpGatewayCatalog:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         retry_initial: float = RETRY_INITIAL_SECONDS,
         retry_max: float = RETRY_MAX_SECONDS,
+        deadline: float = FETCH_DEADLINE_SECONDS,
     ):
         self._base_url = base_url.rstrip("/")
         self._on_applied = on_applied
@@ -222,8 +229,11 @@ class McpGatewayCatalog:
         self._sleep = sleep
         self._retry_initial = retry_initial
         self._retry_max = retry_max
+        self._deadline = deadline
         self._client: httpx.AsyncClient | None = None
         self._applied: GatewayCatalog | None = None
+        # Whether on_applied completed for the applied catalog.
+        self._handled = True
         self._applied_at: str | None = None
         self._checked_at: str | None = None
         self._error: str | None = None
@@ -311,11 +321,18 @@ class McpGatewayCatalog:
     async def _fetch_and_apply(self) -> bool:
         self._checked_at = _now()
         try:
-            catalog = await self._fetch()
+            async with asyncio.timeout(self._deadline):
+                catalog = await self._fetch()
         except Exception as e:  # noqa: BLE001 - a failure keeps the applied catalog
-            error = str(e) if isinstance(e, CatalogError) else (
-                f"MCP gateway catalog request failed ({type(e).__name__})"
-            )
+            if isinstance(e, CatalogError):
+                error = str(e)
+            elif isinstance(e, TimeoutError):
+                error = (
+                    "MCP gateway catalog not received within "
+                    f"{self._deadline:g} seconds"
+                )
+            else:
+                error = f"MCP gateway catalog request failed ({type(e).__name__})"
             # One warning for each new problem; a retry that fails in the
             # same way is logged at debug level.
             log = logger.debug if error == self._error else logger.warning
@@ -328,17 +345,22 @@ class McpGatewayCatalog:
         if catalog != self._applied:
             self._applied = catalog
             self._applied_at = _now()
+            self._handled = False
             logger.info(
                 "MCP gateway catalog generation %d applied for new sessions: "
                 "%d server(s) (%s)",
                 catalog.generation, len(catalog.servers),
                 ", ".join(server.id for server in catalog.servers) or "none",
             )
-            if self._on_applied is not None:
-                try:
-                    await self._on_applied(catalog)
-                except Exception:  # noqa: BLE001 - the catalog is applied
-                    logger.exception("MCP gateway catalog handler failed")
+        if not self._handled and self._on_applied is not None:
+            try:
+                await self._on_applied(catalog)
+                self._handled = True
+            except Exception:  # noqa: BLE001 - the catalog is applied
+                logger.exception(
+                    "MCP gateway catalog handler failed; the next catalog "
+                    "request calls it again",
+                )
         return True
 
     def _http(self) -> httpx.AsyncClient:
