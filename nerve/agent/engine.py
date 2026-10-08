@@ -1962,6 +1962,7 @@ class AgentEngine:
                 "duration_api_ms": event.duration_api_ms,
                 "num_turns": event.num_turns,
                 "context_window": event.context_window,
+                "context_tokens": event.context_tokens,
                 "status": event.status,
             }
             if event.status == "failed" and event.error:
@@ -2344,12 +2345,15 @@ class AgentEngine:
                 else 200_000
             )
         num_turns = (st.result_meta or {}).get("num_turns") or 1
+        context_tokens = (st.result_meta or {}).get("context_tokens")
         if st.last_usage:
             usage_data = {
                 **st.last_usage,
                 "max_context_tokens": max_context,
                 "num_turns": num_turns,
             }
+            if context_tokens is not None:
+                usage_data["context_tokens"] = context_tokens
             session_record = await self.db.get_session(session_id)
             meta = json.loads(session_record.get("metadata") or "{}") if session_record else {}
             meta["last_usage"] = usage_data
@@ -2457,6 +2461,7 @@ class AgentEngine:
             usage=st.last_usage,
             max_context_tokens=max_context,
             num_turns=num_turns,
+            context_tokens=context_tokens,
         )
         self.sessions.touch(session_id)
 
