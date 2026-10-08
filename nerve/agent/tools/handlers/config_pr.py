@@ -21,6 +21,7 @@ async def propose_config_change_handler(ctx: ToolContext, args: dict) -> ToolRes
     from pathlib import Path
 
     from nerve.config_pr import propose_config_change
+    from nerve.gateway.auth import is_external_mode
 
     config = ctx.config
     if config is None:
@@ -40,6 +41,8 @@ async def propose_config_change_handler(ctx: ToolContext, args: dict) -> ToolRes
             # this instance. Empty is a real setting — the tool falls back to
             # origin's default rather than to whatever this checkout is on.
             base=config.workspace_sync.branch,
+            # External mode: the MCP gateway decides the MCP servers.
+            managed_mcp=is_external_mode(),
         )
     except Exception as e:  # noqa: BLE001
         logger.error("propose_config_change failed: %s", e)
