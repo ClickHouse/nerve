@@ -174,6 +174,9 @@ class TestProxyServiceInit:
         assert data["api-keys"] == ["sk-test-key"]
         assert data["auth-dir"] == str(tmp_path / "auth")
         assert (tmp_path / "auth").is_dir()  # auth dir was created
+        # Credential cooldowns are off: with one credential a cooldown is a
+        # self-inflicted outage, not a failover.
+        assert data["disable-cooling"] is True
 
     def test_detect_asset_suffix(self) -> None:
         from nerve.proxy.service import _detect_asset_suffix

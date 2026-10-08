@@ -237,6 +237,17 @@ class ProxyService:
             "api-keys": [self.config.proxy.api_key],
             "debug": False,
             "request-retry": 3,
+            # Nerve drives the proxy with a single Claude credential, so its
+            # cooldown scheduler has nothing to fail over to: benching that
+            # credential just takes the whole daemon offline. The scheduler
+            # also trusts the reset advertised in Anthropic's rate-limit
+            # headers, and on a usage-based account the representative claim is
+            # the monthly overage window -- so one transient 429 parked every
+            # model until the first of the next month, and because the cooldown
+            # is enforced locally no further request ever reached Anthropic to
+            # discover the limit had passed. Pass the 429 and its Retry-After
+            # through to the caller, which already backs off, instead.
+            "disable-cooling": True,
         }
 
         # Register a local Ollama server as an OpenAI-compatible upstream so
