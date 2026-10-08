@@ -375,6 +375,12 @@ memory:
 #   path: /mcp/v1
 #   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
+# MCP gateway (external mode only, NERVE_AUTH_MODE=external). Nerve then takes
+# its MCP servers only from the gateway's catalog, and mcp_servers has no
+# effect. A change needs a restart. See docs/config.md "MCP servers in
+# external mode".
+# mcp_gateway_url: "http://192.0.2.1:8080"
+
 # Observability (optional) — Langfuse tracing for the agent loop and memU.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.
 # See docs/observability.md for setup details.

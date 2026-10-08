@@ -64,6 +64,10 @@ class BackendDeps:
     # Codex tool-bridge collaborators (None until the gateway wires them):
     gateway_port: Callable[[], int | None] = field(default=lambda: None)
     mint_session_token: Callable[[str], str] | None = None
+    # External mode: the MCP gateway servers (``GatewayServer``) for a new
+    # session, possibly none. ``None`` in local mode. In external mode the
+    # backends use these servers only, together with Nerve's own server.
+    managed_mcp_servers: Callable[[], tuple | None] = field(default=lambda: None)
 
 
 def build_backends(deps: BackendDeps) -> dict[str, AgentBackend]:

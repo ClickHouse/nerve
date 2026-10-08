@@ -27,11 +27,13 @@ import os
 import re
 import stat
 import time
+import warnings
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from claude_agent_sdk import (
     AssistantMessage,
+    CanUseToolShadowedWarning,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
@@ -75,6 +77,17 @@ try:
     from claude_agent_sdk import ThinkingBlock
 except ImportError:  # pragma: no cover - depends on SDK version
     ThinkingBlock = None
+
+# In external mode the gateway servers are in allowed_tools, so the CLI runs
+# their tools without asking can_use_tool. That is the intent: the
+# organization approved the tools at the gateway, and can_use_tool allows
+# every MCP tool anyway. The SDK warns about each such list once; only the
+# warning that names gateway servers alone is ignored.
+warnings.filterwarnings(
+    "ignore",
+    message=r"can_use_tool will not be invoked for: mcp__[a-z0-9-]+(, mcp__[a-z0-9-]+)*\.",
+    category=CanUseToolShadowedWarning,
+)
 
 # The system prompt is confidential, so it never travels in argv.
 #
@@ -556,6 +569,17 @@ class ClaudeBackend:
         if spec.interactive is not None:
             can_use_tool = ClaudeToolPermissions(spec.interactive).can_use_tool
 
+        # External mode: the MCP gateway's servers only. The CLI reads no
+        # other MCP configuration, loads no plugin, and runs the gateway's
+        # tools without a prompt: the organization approved them there.
+        managed = self._managed_mcp_servers()
+        managed_options: dict[str, Any] = {}
+        if managed is not None:
+            managed_options = {
+                "strict_mcp_config": True,
+                "allowed_tools": [f"mcp__{server.id}" for server in managed],
+            }
+
         return ClaudeAgentOptions(
             model=selected_model,
             system_prompt=system_prompt,
@@ -584,9 +608,10 @@ class ClaudeBackend:
             # fatal to the turn the moment a Read returns a screenshot — see
             # AgentConfig.cli_max_message_bytes.
             max_buffer_size=config.agent.cli_max_message_bytes,
-            # No allowed_tools — can_use_tool handles permissions.
-            # External MCP server tools are discovered at connection time,
-            # so we can't enumerate them upfront.
+            # No allowed_tools in local mode — can_use_tool handles
+            # permissions. External MCP server tools are discovered at
+            # connection time, so we can't enumerate them upfront. External
+            # mode allows the gateway servers (``managed_options``).
             #
             # Remove the CLI's cron tools — Nerve has its own cron system.
             # ``ScheduleWakeup`` stays available and is handled by Nerve's
@@ -609,11 +634,17 @@ class ClaudeBackend:
             # "project" sources. Native skills/plugins are unaffected — they
             # load via ``plugins`` (--plugin-dir), independent of this setting.
             setting_sources=[],
-            mcp_servers=self._build_mcp_servers(spec.session_id),
+            mcp_servers=self._build_mcp_servers(spec.session_id, managed),
             # Claude Code plugins — loaded via --plugin-dir so the CLI
             # handles OAuth, credentials, and plugin lifecycle natively.
-            plugins=self._deps.claude_plugins(),
+            plugins=[] if managed is not None else self._deps.claude_plugins(),
+            **managed_options,
         )
+
+    def _managed_mcp_servers(self) -> tuple | None:
+        """The MCP gateway servers in external mode, ``None`` in local mode."""
+        source = getattr(self._deps, "managed_mcp_servers", None)
+        return source() if source is not None else None
 
     def _system_prompt_dir(self) -> Path:
         """Owner-only directory holding the per-session system prompts.
@@ -747,12 +778,18 @@ class ClaudeBackend:
                 env[env_name] = str(target)
         return env
 
-    def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
+    def _build_mcp_servers(
+        self, session_id: str, managed: tuple | None = None,
+    ) -> dict[str, Any]:
         """Build the mcp_servers dict: in-process nerve + external servers.
 
         Claude Code plugin MCPs are handled separately via the SDK
         ``plugins`` field which lets the CLI manage OAuth and plugin
         lifecycle natively.
+
+        ``managed`` holds the MCP gateway servers in external mode. They
+        take the place of the configured servers, each as an HTTP server at
+        its gateway URL, without headers.
         """
         from nerve.agent.tools import build_session_mcp_server
 
@@ -765,12 +802,17 @@ class ClaudeBackend:
                 exclude=self.excluded_tools(),
             ),
         }
-        for srv in self._deps.external_mcp_servers():
-            if srv.enabled and srv.name != "nerve":
-                try:
-                    servers[srv.name] = srv.to_sdk_config()
-                except ValueError as e:
-                    logger.warning("Skipping MCP server %r: %s", srv.name, e)
+        if managed is not None:
+            for server in managed:
+                if server.id != "nerve":
+                    servers[server.id] = {"type": "http", "url": server.url}
+        else:
+            for srv in self._deps.external_mcp_servers():
+                if srv.enabled and srv.name != "nerve":
+                    try:
+                        servers[srv.name] = srv.to_sdk_config()
+                    except ValueError as e:
+                        logger.warning("Skipping MCP server %r: %s", srv.name, e)
         if len(servers) > 1:
             logger.debug(
                 "Session %s: %d MCP servers (%s)",

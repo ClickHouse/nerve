@@ -66,9 +66,15 @@ from nerve.agent.tools import (
 # keep working. The new runtime path uses ``self.registry`` + a
 # per-session ``ToolContext`` and ignores those globals.
 from nerve.agent.tools import init_tools
-from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
+from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import Actor
+from nerve.mcp_gateway import (
+    BUILTIN_SERVER_NAME,
+    GatewayCatalog,
+    GatewayServer,
+    McpGatewayCatalog,
+)
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.skills.manager import SkillManager
 
@@ -262,7 +268,21 @@ class AgentEngine:
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
         self._mcp_loopback_port: int | None = None
-        self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
+        # External mode: the MCP gateway's catalog is the only source of MCP
+        # servers besides Nerve's own. Nerve does not read mcp_servers or
+        # Claude Code plugins then. The mode and the gateway URL change only
+        # with a restart.
+        from nerve.gateway.auth import is_external_mode
+
+        self._managed_mcp = is_external_mode()
+        self._mcp_gateway: McpGatewayCatalog | None = None
+        if self._managed_mcp and config.mcp_gateway_url:
+            self._mcp_gateway = McpGatewayCatalog(
+                config.mcp_gateway_url, on_applied=self._on_mcp_catalog_applied,
+            )
+        self._mcp_servers_cache = (  # hot-reloadable
+            [] if self._managed_mcp else list(config.mcp_servers)
+        )
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
         # Tool registry — built once at construction. Per-session MCP
@@ -294,6 +314,7 @@ class AgentEngine:
                 claude_plugins=lambda: self._claude_code_plugins,
                 gateway_port=self._gateway_port,
                 mint_session_token=self._mint_mcp_session_token,
+                managed_mcp_servers=self.managed_mcp_servers,
             )
         )
         self._session_backends: dict[str, str] = {}
@@ -382,6 +403,53 @@ class AgentEngine:
     def set_mcp_loopback_port(self, port: int | None) -> None:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
+
+    # ------------------------------------------------------------------ #
+    #  MCP servers from the MCP gateway (external mode)                   #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def managed_mcp(self) -> bool:
+        """Whether the organization manages the MCP servers (external mode)."""
+        return self._managed_mcp
+
+    def managed_mcp_servers(self) -> tuple[GatewayServer, ...] | None:
+        """The MCP gateway servers for a new session.
+
+        ``None`` in local mode. In external mode, the servers of the applied
+        catalog, which is empty without a gateway URL or before the first
+        catalog. A server that has the name of Nerve's own server is left out.
+        """
+        if not self._managed_mcp:
+            return None
+        if self._mcp_gateway is None:
+            return ()
+        return tuple(
+            server for server in self._mcp_gateway.servers
+            if server.id != BUILTIN_SERVER_NAME
+        )
+
+    def mcp_gateway_status(self) -> dict | None:
+        """The applied catalog for diagnostics. ``None`` in local mode."""
+        if not self._managed_mcp:
+            return None
+        if self._mcp_gateway is None:
+            return {
+                "url": None, "generation": None, "digest": None, "servers": [],
+                "applied_at": None, "checked_at": None,
+                "error": "mcp_gateway_url is not set", "retrying": False,
+            }
+        return self._mcp_gateway.status()
+
+    async def _on_mcp_catalog_applied(self, catalog: GatewayCatalog) -> None:
+        if any(server.id == BUILTIN_SERVER_NAME for server in catalog.servers):
+            logger.warning(
+                "MCP gateway catalog names a server %r; Nerve's own server has "
+                "that name, so the catalog server is not used",
+                BUILTIN_SERVER_NAME,
+            )
+        if self.db is not None:
+            await self._sync_mcp_servers_to_db()
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -504,9 +572,21 @@ class AgentEngine:
             engine=self,
         )
 
-        # Load Claude Code plugin directories for SDK plugins field
-        from nerve.config import load_claude_code_plugins
-        self._claude_code_plugins = load_claude_code_plugins()
+        if self._managed_mcp:
+            # The first catalog. When the gateway gives none, sessions start
+            # without gateway servers and the catalog reader tries again in
+            # the background.
+            if self._mcp_gateway is not None:
+                await self._mcp_gateway.start()
+            else:
+                logger.warning(
+                    "External mode without mcp_gateway_url: sessions start "
+                    "without MCP servers other than Nerve's own",
+                )
+        else:
+            # Load Claude Code plugin directories for SDK plugins field
+            from nerve.config import load_claude_code_plugins
+            self._claude_code_plugins = load_claude_code_plugins()
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
@@ -545,13 +625,29 @@ class AgentEngine:
             await self.db.upsert_mcp_server(
                 name=srv.name, server_type=srv.type, enabled=srv.enabled,
             )
+        for server in self.managed_mcp_servers() or ():
+            await self.db.upsert_mcp_server(
+                name=server.id, server_type="http", enabled=True,
+                tool_count=len(server.tools),
+            )
 
     async def reload_mcp_config(self) -> list:
         """Re-read MCP server config from YAML files and update cache + DB.
 
         New sessions will automatically use the updated config.
         Returns the list of McpServerConfig.
+
+        In external mode the YAML files are not read. The catalog is read
+        from the MCP gateway again, and the list holds its servers.
         """
+        if self._managed_mcp:
+            if self._mcp_gateway is not None:
+                await self._mcp_gateway.refresh()
+            await self._sync_mcp_servers_to_db()
+            return [
+                McpServerConfig(name=server.id, type="http", url=server.url)
+                for server in self.managed_mcp_servers() or ()
+            ]
         from nerve.config import load_claude_code_plugins, load_mcp_servers
         # Read from the daemon's actual config dir (not the process cwd) so a
         # reload sees the same config.yaml + workspace/config/settings.yaml that
@@ -672,6 +768,9 @@ class AgentEngine:
         """
         for sid in list(self._idle_watchers):
             self._stop_idle_watcher(sid)
+
+        if self._mcp_gateway is not None:
+            await self._mcp_gateway.close()
 
         for sid, client in list(self.sessions._clients.items()):
             try:
@@ -1315,6 +1414,12 @@ class AgentEngine:
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
                 return await self._record_wakeup(self.db, sid, tool_input)
 
+            # External mode: read the catalog again, so the new client gets
+            # the servers of the current generation. A failure keeps the
+            # applied catalog.
+            if self._mcp_gateway is not None:
+                await self._mcp_gateway.refresh()
+
             spec = SessionSpec(
                 session_id=session_id,
                 source=source,
@@ -1761,6 +1866,8 @@ class AgentEngine:
                             # overwriting their type (nerve=sdk, grafana=stdio).
                             known = {"nerve"} | {
                                 s.name for s in self._mcp_servers_cache
+                            } | {
+                                s.id for s in self.managed_mcp_servers() or ()
                             }
                             if srv_name not in known:
                                 await self.db.upsert_mcp_server(

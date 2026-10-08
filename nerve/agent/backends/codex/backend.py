@@ -115,6 +115,19 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# External mode: Codex features that add MCP servers or tools outside the MCP
+# gateway. ``apps`` are the ChatGPT apps (connectors) and their ``codex_apps``
+# MCP server, ``plugins`` are plugins and their MCP servers, and
+# ``skill_mcp_dependency_install`` lets a skill install an MCP server. These
+# are feature flags of the Codex versions that Nerve supports (see
+# ``codex features list``).
+_MANAGED_MCP_DISABLED_FEATURES = ("apps", "plugins", "skill_mcp_dependency_install")
+
+# Codex's system configuration file. It and the user file in CODEX_HOME can
+# name MCP servers that are not in the overrides that Nerve passes.
+_CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
+
+
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
 # app-server catalog, weakest first. Used only to clamp a requested effort
 # down to what the serving model advertises.
@@ -279,7 +292,7 @@ class CodexBackend:
 
     async def create_client(self, spec: SessionSpec) -> "CodexClient":
         await self._check_cli_version()
-        if self.codex.ultracode.enabled:
+        if self._ultracode_enabled:
             await ensure_ultracode_installed(self.config)
         client = CodexClient(self, spec)
         try:
@@ -387,7 +400,7 @@ class CodexBackend:
                 )
                 effective_auth = self._normalize_auth_mode(account_type)
                 plugin = None
-                if self.codex.ultracode.enabled:
+                if self._ultracode_enabled:
                     # Diagnostics must be observational. Installation/repair
                     # occurs only when a real Codex client is created.
                     plugin = ultracode_installation_status(self.config)
@@ -440,8 +453,13 @@ class CodexBackend:
                 )
         # Keep external MCP credentials out of process argv. Stdio values are
         # inherited by name through ``env_vars``; HTTP headers use synthetic
-        # environment names referenced by ``env_http_headers``.
-        for srv in self._deps.external_mcp_servers():
+        # environment names referenced by ``env_http_headers``. External mode
+        # uses no configured server, and the gateway servers take no secret.
+        configured = (
+            self._deps.external_mcp_servers()
+            if self._managed_mcp_servers() is None else []
+        )
+        for srv in configured:
             if not srv.enabled or srv.name == "nerve":
                 continue
             if getattr(srv, "command", None):
@@ -458,7 +476,7 @@ class CodexBackend:
                         str(srv.name), str(header), "HTTP",
                     )
                     env[secret_name] = str(value)
-        if self.codex.ultracode.enabled:
+        if self._ultracode_enabled:
             wrapper = materialize_worker_wrapper(self._home_dir())
             env["CODEX_CLI_PATH"] = str(wrapper)
             env["NERVE_CODEX_REAL_BIN"] = self.codex.bin_path
@@ -531,30 +549,107 @@ class CodexBackend:
                 "or token minter unavailable", spec.session_id,
             )
 
-        # External MCP servers (grafana, langfuse, ...) — translate the
-        # nerve config into codex's mcp_servers shape. Claude-plugin MCPs
-        # have no codex equivalent and are skipped (docs plan §14).
-        for srv in self._deps.external_mcp_servers():
-            if not srv.enabled or srv.name == "nerve":
-                continue
-            try:
-                overrides += self._translate_mcp_server(srv)
-            except Exception as e:
-                logger.warning(
-                    "Skipping MCP server %r for codex: %s", srv.name, e,
-                )
+        managed = self._managed_mcp_servers()
+        if managed is None:
+            # External MCP servers (grafana, langfuse, ...) — translate the
+            # nerve config into codex's mcp_servers shape. Claude-plugin MCPs
+            # have no codex equivalent and are skipped (docs plan §14).
+            for srv in self._deps.external_mcp_servers():
+                if not srv.enabled or srv.name == "nerve":
+                    continue
+                try:
+                    overrides += self._translate_mcp_server(srv)
+                except Exception as e:
+                    logger.warning(
+                        "Skipping MCP server %r for codex: %s", srv.name, e,
+                    )
 
         if not self.codex.web_search:
             overrides.append("tools.web_search=false")
 
         for key, value in (self.codex.extra_config or {}).items():
+            if managed is not None and self._names_mcp_servers(str(key)):
+                logger.warning(
+                    "codex.extra_config key %r is not used in external mode: "
+                    "MCP servers come only from the MCP gateway", key,
+                )
+                continue
             if isinstance(value, str):
                 overrides.append(f"{key}={_toml_str(value)}")
             elif isinstance(value, bool):
                 overrides.append(f"{key}={'true' if value else 'false'}")
             else:
                 overrides.append(f"{key}={value}")
+
+        # Last, so that no earlier override can change them.
+        if managed is not None:
+            overrides += self._managed_mcp_overrides(managed)
         return overrides
+
+    def _managed_mcp_servers(self) -> tuple | None:
+        """The MCP gateway servers in external mode, ``None`` in local mode."""
+        source = getattr(self._deps, "managed_mcp_servers", None)
+        return source() if source is not None else None
+
+    @property
+    def _ultracode_enabled(self) -> bool:
+        """Ultracode is a Codex plugin, and external mode turns plugins off."""
+        return bool(self.codex.ultracode.enabled) and self._managed_mcp_servers() is None
+
+    @staticmethod
+    def _names_mcp_servers(key: str) -> bool:
+        """Whether a ``-c`` key sets the ``mcp_servers`` table or a part of it."""
+        return key.split(".", 1)[0].strip().strip("\"'") == "mcp_servers"
+
+    def _managed_mcp_overrides(self, managed: tuple) -> list[str]:
+        """``-c`` overrides for external mode.
+
+        One HTTP server for each gateway server. Codex runs with approval
+        policy ``never`` and refuses an MCP tool that it would have to ask
+        about, so the gateway servers approve their tools: the organization
+        approved them at the gateway. The servers that Codex's own
+        configuration files name are turned off, and so are the features that
+        add MCP servers.
+        """
+        out: list[str] = []
+        names = set()
+        for server in managed:
+            if server.id == "nerve":
+                continue
+            names.add(server.id)
+            base = f"mcp_servers.{server.id}"
+            out.append(f"{base}.url={_toml_str(server.url)}")
+            out.append(f'{base}.default_tools_approval_mode="approve"')
+        for name in sorted(self._file_mcp_server_names() - names - {"nerve"}):
+            if not self._TOML_KEY_RE.fullmatch(name):
+                logger.warning(
+                    "Codex configuration names MCP server %r, which Nerve cannot "
+                    "turn off with an override; the session may start with it",
+                    name,
+                )
+                continue
+            out.append(f"mcp_servers.{name}.enabled=false")
+        out += [f"features.{name}=false" for name in _MANAGED_MCP_DISABLED_FEATURES]
+        return out
+
+    def _file_mcp_server_names(self) -> set[str]:
+        """Names in the ``mcp_servers`` tables of Codex's configuration files."""
+        import tomllib
+
+        names: set[str] = set()
+        for path in (Path(self._home_dir()) / "config.toml", _CODEX_SYSTEM_CONFIG):
+            try:
+                with open(path, "rb") as f:
+                    data = tomllib.load(f)
+            except FileNotFoundError:
+                continue
+            except (OSError, tomllib.TOMLDecodeError) as e:
+                logger.warning("Cannot read MCP servers from %s: %s", path, e)
+                continue
+            table = data.get("mcp_servers")
+            if isinstance(table, dict):
+                names.update(str(name) for name in table)
+        return names
 
     _TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -664,7 +759,7 @@ class CodexClient(AgentClient):
         self._spec = spec
         config_overrides = backend.build_config_overrides(spec)
         env = backend.build_env(spec)
-        if backend.codex.ultracode.enabled:
+        if backend._ultracode_enabled:
             # Child workers inherit the parent session's FULL MCP surface —
             # the Nerve bridge and external servers alike — with the same
             # permissions as the session itself (no worker-side tool

@@ -2985,6 +2985,42 @@ def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
             if isinstance(cfg, dict)]
 
 
+def _normalize_mcp_gateway_url(value: Any) -> str:
+    """Return ``mcp_gateway_url`` without a trailing ``/``.
+
+    Empty means "no MCP gateway". Raises :class:`ConfigError` for a value that
+    is not an http or https URL with a host. The URL cannot hold credentials,
+    a query or a fragment: the gateway identifies the agent from the
+    connection, and the URL goes into logs and diagnostics.
+    """
+    from urllib.parse import urlsplit
+
+    url = "" if value is None else str(value).strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        port_ok = parts.port is None or parts.port > 0
+    except ValueError:
+        parts, port_ok = None, False
+    if (
+        parts is None
+        or not port_ok
+        or parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or url.endswith(("?", "#"))
+    ):
+        raise ConfigError(
+            "mcp_gateway_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    return url.rstrip("/")
+
+
 def _get_enabled_claude_code_plugins(
     claude_dir: Path | None = None,
 ) -> list[tuple[str, Path]]:
@@ -3213,6 +3249,10 @@ class NerveConfig:
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
+    # Base URL of the MCP gateway. In external mode Nerve takes its MCP
+    # servers only from the gateway's catalog, and mcp_servers has no effect.
+    # In local mode this key has no effect. Stored without a trailing "/".
+    mcp_gateway_url: str = ""
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
@@ -3465,6 +3505,7 @@ class NerveConfig:
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
+            mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
