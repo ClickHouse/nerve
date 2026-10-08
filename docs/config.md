@@ -1755,7 +1755,7 @@ not change.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query or fragment. A trailing `/` is removed. It has an effect only in external mode. A change needs a restart. |
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment, whitespace or control characters. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
 
 Nerve reads `GET <mcp_gateway_url>/catalog` when it starts and before each new
 session. The request has no credential, because the gateway knows the agent

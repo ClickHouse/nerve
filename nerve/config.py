@@ -2985,27 +2985,47 @@ def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
             if isinstance(cfg, dict)]
 
 
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+
+
+def _valid_url_host(host: str) -> bool:
+    """Whether ``host`` (IDNA-encoded) is an IPv6 literal or a DNS name."""
+    if ":" in host:
+        return True  # an IPv6 literal, already checked by the URL parser
+    name = host.removesuffix(".")  # a fully qualified name may end in a dot
+    return bool(name) and all(_HOST_LABEL_RE.fullmatch(label) for label in name.split("."))
+
+
 def _normalize_mcp_gateway_url(value: Any) -> str:
     """Return ``mcp_gateway_url`` without a trailing ``/``.
 
     Empty means "no MCP gateway". Raises :class:`ConfigError` for a value that
     is not an http or https URL with a host. The URL cannot hold credentials,
     a query or a fragment: the gateway identifies the agent from the
-    connection, and the URL goes into logs and diagnostics.
+    connection, and the URL goes into logs and diagnostics. It cannot hold
+    whitespace or control characters, and the HTTP client must accept it.
     """
     from urllib.parse import urlsplit
+
+    import httpx
 
     url = "" if value is None else str(value).strip()
     if not url:
         return ""
     try:
         parts = urlsplit(url)
-        port_ok = parts.port is None or parts.port > 0
-    except ValueError:
-        parts, port_ok = None, False
+        # The URL of the catalog request must parse in the HTTP client too.
+        catalog = httpx.URL(url.rstrip("/") + "/catalog")
+        parsed = (
+            (parts.port is None or parts.port > 0)
+            and _valid_url_host(catalog.raw_host.decode("ascii"))
+        )
+    except (ValueError, httpx.InvalidURL):
+        parts, parsed = None, False
     if (
         parts is None
-        or not port_ok
+        or not parsed
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url)
         or parts.scheme not in ("http", "https")
         or not parts.hostname
         or parts.username is not None
