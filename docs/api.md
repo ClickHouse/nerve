@@ -735,10 +735,14 @@ Response: {
   "recent_cron_logs": [...],
   "usage": {
     "last_7d": { ... }, "daily": [...], "by_model": [...], "by_source": [...],
-    "by_cron_job": [ { "job_id": "daily-digest", "runs": 7, "sessions": 7, "turns": 9, "input_tokens": 1200, "output_tokens": 5400, "cost_usd": 1.84, "estimated_cost_usd": 0.0, ... } ]
+    "by_cron_job": [ { "job_id": "daily-digest", "runs": 7, "sessions": 7, "turns": 9, "input_tokens": 120, "cache_read": 410000, "cache_creation": 95000, "output_tokens": 5400, "cost_usd": 1.84, "estimated_cost_usd": 0.0, ... } ]
   }
 }
 ```
+
+In every usage row, `input_tokens` counts only uncached input. Cache reads
+(`cache_read`) and cache writes (`cache_creation`) are separate fields, so
+the total input is the sum of the three.
 
 `usage.by_cron_job` attributes each turn to the cron job that caused it:
 turns in the job's own sessions (`cron:<job>`, `cron:<job>:<run>`), and
