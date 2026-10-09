@@ -167,6 +167,7 @@ lookup from repopulating the map after logout or overwriting a newer refresh.
 ### Diagnostics Panel
 System status dashboard (`/diagnostics`) with:
 - **System** — Hostname, platform, memory (RSS), disk usage
+- **Usage & Cost** — 7-day totals, daily cost, and cost breakdowns by model, by source, and by cron job (with runs and average cost per run)
 - **Sources** — Per-source sync status: cursor, last run, records fetched/processed, errors
 - **Tasks / FTS Index** — Active/done counts, FTS indexed vs total, in-sync status indicator (green ✓ / red ✗)
 - **Recent Cron Logs** — Job ID, status, timestamps, errors
