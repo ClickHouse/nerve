@@ -254,13 +254,16 @@ class UsageStore:
 
         * a session of the job — ``cron:<job>`` or
           ``cron:<job>:<YYYYmmdd-HHMMSS>``; the job id is read from the
-          session id;
+          session id. (A legacy stable ``cron:<job>`` session of a job whose
+          id itself ends in ``:<YYYYmmdd-HHMMSS>`` cannot be told apart from
+          a run session of the shorter id and is attributed to the latter.)
         * the ``workflow:<run>`` session of a workflow run that the job
           started, either as a workflow-run job (``created_by`` is
-          ``cron:<job>``) or through a tool call in one of its sessions
-          (``created_by`` is ``session:cron:<job>[:<run>]``). Only this
-          one hop is followed: review-loop legs and runs started from
-          another workflow run are not attributed.
+          ``cron:<job>``, which holds the exact job id) or through a tool
+          call in one of its sessions (``created_by`` is
+          ``session:<cron session id>``). Only this one hop is followed:
+          review-loop legs and runs started from another workflow run are
+          not attributed.
 
         These links are permanent, so attribution does not depend on
         ``cron_logs`` retention. Every turn in a job's session counts,
@@ -269,25 +272,23 @@ class UsageStore:
         can exceed the ``cron`` row of :meth:`get_usage_by_source`.
 
         ``runs`` counts the job's ``cron_logs`` rows in the same window
-        that are linked to a session or workflow run — runs that did agent
-        work. Rows for runs that did none (missed, lock-skipped, workflow
-        runs disabled, failed before a session was chosen, source runners)
-        have no session, and gate-skipped runs are not logged, so
-        ``cost_usd / runs`` is the average spend per run. Jobs without
-        usage are omitted.
+        that did agent work: rows linked to a cron session, and rows linked
+        to a workflow run that began execution (``started_at`` is set at
+        dispatch, so a run still queued or cancelled in the queue does not
+        count). Rows for runs that did no work (missed, lock-skipped,
+        workflow runs disabled or refused by ``start_run``, failed before a
+        session was chosen, source runners) have no session link, and
+        gate-skipped runs are not logged, so ``cost_usd / runs`` is the
+        average spend per run. Jobs without usage are omitted.
         """
         window = f"-{days} days"
         async with self.db.execute(
             """
             WITH workflow_origins AS (
-                -- The cron session (or bare 'cron:<job>') that started each
-                -- workflow run. workflow_runs.session_id is not UNIQUE, so
-                -- collapse to one row per session to rule out join fan-out.
-                SELECT
-                    session_id,
-                    MIN(CASE WHEN created_by GLOB 'session:cron:?*'
-                             THEN substr(created_by, 9)
-                             ELSE created_by END) AS origin
+                -- The cron job or cron session that started each workflow
+                -- run. workflow_runs.session_id is not UNIQUE, so collapse
+                -- to one row per session to rule out join fan-out.
+                SELECT session_id, MIN(created_by) AS created_by
                 FROM workflow_runs
                 WHERE session_id IS NOT NULL
                   AND (created_by GLOB 'cron:?*'
@@ -295,9 +296,15 @@ class UsageStore:
                 GROUP BY session_id
             ),
             usage_origin AS (
+                -- origin_job: an exact job id. origin_session: a cron
+                -- session id, which still carries any run suffix.
                 SELECT
+                    CASE WHEN u.session_id NOT GLOB 'cron:?*'
+                              AND w.created_by GLOB 'cron:?*'
+                         THEN substr(w.created_by, 6) END AS origin_job,
                     CASE WHEN u.session_id GLOB 'cron:?*' THEN u.session_id
-                         ELSE w.origin END AS origin,
+                         WHEN w.created_by GLOB 'session:cron:?*'
+                         THEN substr(w.created_by, 9) END AS origin_session,
                     u.*
                 FROM session_usage u
                 LEFT JOIN workflow_origins w ON w.session_id = u.session_id
@@ -305,18 +312,29 @@ class UsageStore:
             ),
             attributed AS (
                 SELECT
-                    CASE WHEN origin GLOB ?
-                         THEN substr(origin, 6, length(origin) - ?)
-                         ELSE substr(origin, 6) END AS job_id,
+                    CASE WHEN origin_job IS NOT NULL THEN origin_job
+                         WHEN origin_session GLOB ? THEN substr(
+                             origin_session, 6, length(origin_session) - ?)
+                         ELSE substr(origin_session, 6) END AS job_id,
                     *
                 FROM usage_origin
-                WHERE origin GLOB 'cron:?*'
+                WHERE origin_job IS NOT NULL
+                   OR origin_session GLOB 'cron:?*'
             ),
             runs AS (
-                SELECT job_id, COUNT(*) AS runs
-                FROM cron_logs
-                WHERE started_at >= DATE('now', ?) AND session_id IS NOT NULL
-                GROUP BY job_id
+                -- Cron links a workflow-run job's log row to
+                -- 'workflow:<run-id>' right after start_run, while the run
+                -- can still be queued; count it only once it was dispatched.
+                SELECT c.job_id, COUNT(*) AS runs
+                FROM cron_logs c
+                LEFT JOIN workflow_runs wr
+                       ON c.session_id GLOB 'workflow:?*'
+                      AND wr.id = substr(c.session_id, 10)
+                WHERE c.started_at >= DATE('now', ?)
+                  AND c.session_id IS NOT NULL
+                  AND (c.session_id NOT GLOB 'workflow:?*'
+                       OR wr.started_at IS NOT NULL)
+                GROUP BY c.job_id
             )
             SELECT
                 a.job_id,

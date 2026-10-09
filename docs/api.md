@@ -751,9 +751,11 @@ or through a `workflow_run_start` call in one of its sessions (review-loop
 legs and runs started from another workflow run are not attributed).
 Workflow-run turns have source `workflow` in `by_source`, so the per-job
 totals can be larger than the `cron` row there. `runs` counts the job's
-runs in the same 7-day window that were linked to a session or a workflow
-run (missed and skipped runs are not counted), so `cost_usd / runs` is the
-average cost per run. Jobs without usage are omitted.
+runs in the same 7-day window that did agent work: runs linked to a cron
+session, and workflow runs that began execution. Missed and skipped runs,
+and workflow runs that were cancelled while still queued, are not counted,
+so `cost_usd / runs` is the average cost per run. Jobs without usage are
+omitted.
 
 #### `GET /api/cron/logs?job_id=&limit=50&offset=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;

@@ -68,12 +68,13 @@ async def _runs(
 
 
 async def _workflow_run(db: Database, run_id: str, created_by: str) -> str:
-    """A workflow run linked to its ``workflow:<run>`` session."""
+    """A dispatched workflow run linked to its ``workflow:<run>`` session."""
     session_id = f"workflow:{run_id}"
     await db.create_session(session_id, source="workflow", actor=None)
     await db.create_workflow_run(
         run_id, "claude-workflow", {"prompt": "x"}, 5.0, created_by=created_by,
     )
+    assert await db.transition_workflow_run(run_id, "running", expect=("pending",))
     await db.update_workflow_run(run_id, {"session_id": session_id})
     return session_id
 
@@ -149,6 +150,48 @@ class TestUsageByCronJob:
         assert rows["gamma"]["sessions"] == 2
         assert rows["gamma"]["runs"] == 1
         assert rows["gamma"]["cost_usd"] == pytest.approx(5.0)
+
+    async def test_workflow_job_id_shaped_like_a_run_suffix(self, db: Database):
+        # created_by 'cron:<job>' holds the exact job id: a trailing
+        # timestamp in it is part of the id, not a run suffix.
+        for i, job in enumerate(("digest", "digest:20261009-120000")):
+            run = await _workflow_run(db, f"wfr-{i}", f"cron:{job}")
+            await _turn(db, run, 4.0)
+            await _runs(db, job, 1, session_id=run)
+
+        rows = _by_job(await db.get_usage_by_cron_job())
+        assert set(rows) == {"digest", "digest:20261009-120000"}
+        for row in rows.values():
+            assert row["runs"] == 1
+            assert row["cost_usd"] == pytest.approx(4.0)
+
+    async def test_runs_count_only_workflow_runs_that_started(self, db: Database):
+        ran = await _workflow_run(db, "wfr-ran", "cron:digest")
+        await _turn(db, ran, 4.0)
+        await _runs(db, "digest", 1, session_id=ran)
+        # It ran and then failed: it still did work, so it still counts.
+        assert await db.transition_workflow_run(
+            "wfr-ran", "failed", expect=("running",),
+        )
+        # Launches that never began execution. Cron links each log row to
+        # the run's future session id right after start_run, while the run
+        # can still be queued: nine were cancelled in the queue, one is
+        # still waiting for a slot.
+        for i in range(10):
+            run_id = f"wfr-queued-{i}"
+            await db.create_workflow_run(
+                run_id, "claude-workflow", {"prompt": "x"}, 5.0,
+                created_by="cron:digest",
+            )
+            if i < 9:
+                assert await db.transition_workflow_run(
+                    run_id, "killed", expect=("pending",),
+                )
+            await _runs(db, "digest", 1, session_id=f"workflow:{run_id}")
+
+        row = _by_job(await db.get_usage_by_cron_job())["digest"]
+        assert row["runs"] == 1
+        assert row["cost_usd"] == pytest.approx(4.0)
 
     async def test_workflow_run_started_from_a_cron_session(self, db: Database):
         # The agent of a cron run called workflow_run_start: the run's
