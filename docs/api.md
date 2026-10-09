@@ -732,9 +732,24 @@ Response: {
   "system": { "hostname": "...", "memory_mb": 65.2, "disk_free_gb": 180.5 },
   "tasks": { "total": 92, "active": 16, "done": 76, "fts_indexed": 92, "fts_ok": true },
   "sync": { "github": { "cursor": "...", "last_run": "...", "records_fetched": 3, "records_processed": 3, "error": null } },
-  "recent_cron_logs": [...]
+  "recent_cron_logs": [...],
+  "usage": {
+    "last_7d": { ... }, "daily": [...], "by_model": [...], "by_source": [...],
+    "by_cron_job": [ { "job_id": "daily-digest", "runs": 7, "sessions": 7, "turns": 9, "input_tokens": 1200, "output_tokens": 5400, "cost_usd": 1.84, "estimated_cost_usd": 0.0, ... } ]
+  }
 }
 ```
+
+`usage.by_cron_job` attributes each turn to the cron job that caused it:
+turns in the job's own sessions (`cron:<job>`, `cron:<job>:<run>`), and
+turns of workflow runs that the job started, either as a workflow-run job
+or through a `workflow_run_start` call in one of its sessions (review-loop
+legs and runs started from another workflow run are not attributed).
+Workflow-run turns have source `workflow` in `by_source`, so the per-job
+totals can be larger than the `cron` row there. `runs` counts the job's
+runs in the same 7-day window that were linked to a session or a workflow
+run (missed and skipped runs are not counted), so `cost_usd / runs` is the
+average cost per run. Jobs without usage are omitted.
 
 #### `GET /api/cron/logs?job_id=&limit=50&offset=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;

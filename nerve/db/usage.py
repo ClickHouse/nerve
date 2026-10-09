@@ -32,6 +32,16 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
 # Default fallback when model is unknown or None
 DEFAULT_PRICING = (5, 25, 0.50, 6.25, 10.00, 0.01)  # Opus 4.6 standard
 
+# Cron session ids (see ``SessionManager.create_cron_session`` and
+# ``CronService._start_new_generation``):
+#   cron:<job>                   — legacy stable persistent session
+#   cron:<job>:<YYYYmmdd-HHMMSS> — isolated run / persistent generation
+# The run glob matches the second form, so the job id can be cut out of it
+# even when the job id itself contains ``:``.
+_CRON_RUN_SESSION_GLOB = "cron:?*:" + "[0-9]" * 8 + "-" + "[0-9]" * 6
+# len("cron:") + len(":YYYYmmdd-HHMMSS")
+_CRON_RUN_SESSION_OVERHEAD = 5 + 16
+
 
 def _get_pricing(
     model: str | None,
@@ -234,6 +244,104 @@ class UsageStore:
             ORDER BY COALESCE(SUM(cost_usd), 0) DESC
             """,
             (f"-{days} days",),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_usage_by_cron_job(self, days: int = 7) -> list[dict]:
+        """Usage aggregated by the cron job that caused it, past N days.
+
+        A turn belongs to a job when its session is one of:
+
+        * a session of the job — ``cron:<job>`` or
+          ``cron:<job>:<YYYYmmdd-HHMMSS>``; the job id is read from the
+          session id;
+        * the ``workflow:<run>`` session of a workflow run that the job
+          started, either as a workflow-run job (``created_by`` is
+          ``cron:<job>``) or through a tool call in one of its sessions
+          (``created_by`` is ``session:cron:<job>[:<run>]``). Only this
+          one hop is followed: review-loop legs and runs started from
+          another workflow run are not attributed.
+
+        These links are permanent, so attribution does not depend on
+        ``cron_logs`` retention. Every turn in a job's session counts,
+        including wakeups and messages a user sends in the cron chat.
+        Workflow-run turns have source ``workflow``, so the per-job totals
+        can exceed the ``cron`` row of :meth:`get_usage_by_source`.
+
+        ``runs`` counts the job's ``cron_logs`` rows in the same window
+        that are linked to a session or workflow run — runs that did agent
+        work. Rows for runs that did none (missed, lock-skipped, workflow
+        runs disabled, failed before a session was chosen, source runners)
+        have no session, and gate-skipped runs are not logged, so
+        ``cost_usd / runs`` is the average spend per run. Jobs without
+        usage are omitted.
+        """
+        window = f"-{days} days"
+        async with self.db.execute(
+            """
+            WITH workflow_origins AS (
+                -- The cron session (or bare 'cron:<job>') that started each
+                -- workflow run. workflow_runs.session_id is not UNIQUE, so
+                -- collapse to one row per session to rule out join fan-out.
+                SELECT
+                    session_id,
+                    MIN(CASE WHEN created_by GLOB 'session:cron:?*'
+                             THEN substr(created_by, 9)
+                             ELSE created_by END) AS origin
+                FROM workflow_runs
+                WHERE session_id IS NOT NULL
+                  AND (created_by GLOB 'cron:?*'
+                       OR created_by GLOB 'session:cron:?*')
+                GROUP BY session_id
+            ),
+            usage_origin AS (
+                SELECT
+                    CASE WHEN u.session_id GLOB 'cron:?*' THEN u.session_id
+                         ELSE w.origin END AS origin,
+                    u.*
+                FROM session_usage u
+                LEFT JOIN workflow_origins w ON w.session_id = u.session_id
+                WHERE u.created_at >= DATE('now', ?)
+            ),
+            attributed AS (
+                SELECT
+                    CASE WHEN origin GLOB ?
+                         THEN substr(origin, 6, length(origin) - ?)
+                         ELSE substr(origin, 6) END AS job_id,
+                    *
+                FROM usage_origin
+                WHERE origin GLOB 'cron:?*'
+            ),
+            runs AS (
+                SELECT job_id, COUNT(*) AS runs
+                FROM cron_logs
+                WHERE started_at >= DATE('now', ?) AND session_id IS NOT NULL
+                GROUP BY job_id
+            )
+            SELECT
+                a.job_id,
+                COALESCE(MAX(r.runs), 0) as runs,
+                COUNT(DISTINCT a.session_id) as sessions,
+                COUNT(*) as turns,
+                SUM(a.input_tokens) as input_tokens,
+                SUM(a.output_tokens) as output_tokens,
+                SUM(a.cache_creation_input_tokens) as cache_creation,
+                SUM(a.cache_creation_5m_input_tokens) as cache_creation_5m,
+                SUM(a.cache_creation_1h_input_tokens) as cache_creation_1h,
+                SUM(a.cache_read_input_tokens) as cache_read,
+                COALESCE(SUM(a.cost_usd), 0) as cost_usd,
+                COALESCE(SUM(a.estimated_cost_usd), 0) as estimated_cost_usd,
+                COALESCE(SUM(a.web_search_requests), 0) as web_searches
+            FROM attributed a
+            LEFT JOIN runs r ON r.job_id = a.job_id
+            GROUP BY a.job_id
+            ORDER BY COALESCE(SUM(a.cost_usd), 0) DESC, a.job_id
+            """,
+            (
+                window,
+                _CRON_RUN_SESSION_GLOB, _CRON_RUN_SESSION_OVERHEAD,
+                window,
+            ),
         ) as cursor:
             return [dict(row) async for row in cursor]
 

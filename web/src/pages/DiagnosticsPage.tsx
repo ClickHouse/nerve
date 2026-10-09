@@ -252,6 +252,43 @@ export function DiagnosticsPage() {
                 </table>
               </div>
             )}
+
+            {/* By cron job breakdown */}
+            {usage.by_cron_job?.length > 0 && (
+              <div className="border border-border-subtle rounded-lg overflow-x-auto mt-3">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-surface text-text-muted">
+                      <th className="text-left px-4 py-2 font-medium">Cron job</th>
+                      <th className="text-right px-4 py-2 font-medium">Runs</th>
+                      <th className="text-right px-4 py-2 font-medium">Turns</th>
+                      <th className="text-right px-4 py-2 font-medium">Input</th>
+                      <th className="text-right px-4 py-2 font-medium">Output</th>
+                      <th className="text-right px-4 py-2 font-medium">Cost</th>
+                      <th className="text-right px-4 py-2 font-medium" title="Average cost per run that started agent work">Per run</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {usage.by_cron_job.map((job: any) => {
+                      const cost = job.cost_usd || 0;
+                      return (
+                        <tr key={job.job_id} className="border-t border-border-subtle hover:bg-surface">
+                          <td className="px-4 py-2 font-mono text-text-secondary text-xs break-all">{job.job_id}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">{job.runs}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">{job.turns}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(job.input_tokens || 0)}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(job.output_tokens || 0)}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums">${cost.toFixed(2)}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">
+                            {job.runs > 0 ? `$${(cost / job.runs).toFixed(2)}` : '-'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </section>
         )}
 
