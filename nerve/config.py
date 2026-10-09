@@ -2985,6 +2985,62 @@ def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
             if isinstance(cfg, dict)]
 
 
+_HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
+
+
+def _valid_url_host(host: str) -> bool:
+    """Whether ``host`` (IDNA-encoded) is an IPv6 literal or a DNS name."""
+    if ":" in host:
+        return True  # an IPv6 literal, already checked by the URL parser
+    name = host.removesuffix(".")  # a fully qualified name may end in a dot
+    return bool(name) and all(_HOST_LABEL_RE.fullmatch(label) for label in name.split("."))
+
+
+def _normalize_mcp_gateway_url(value: Any) -> str:
+    """Return ``mcp_gateway_url`` without a trailing ``/``.
+
+    Empty means "no MCP gateway". Raises :class:`ConfigError` for a value that
+    is not an http or https URL with a host. The URL cannot hold credentials,
+    a query or a fragment: the gateway identifies the agent from the
+    connection, and the URL goes into logs and diagnostics. It cannot hold
+    whitespace or control characters, and the HTTP client must accept it.
+    """
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    url = "" if value is None else str(value).strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        # The URL of the catalog request must parse in the HTTP client too.
+        catalog = httpx.URL(url.rstrip("/") + "/catalog")
+        parsed = (
+            (parts.port is None or parts.port > 0)
+            and _valid_url_host(catalog.raw_host.decode("ascii"))
+        )
+    except (ValueError, httpx.InvalidURL):
+        parts, parsed = None, False
+    if (
+        parts is None
+        or not parsed
+        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url)
+        or parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or url.endswith(("?", "#"))
+    ):
+        raise ConfigError(
+            "mcp_gateway_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    return url.rstrip("/")
+
+
 def _get_enabled_claude_code_plugins(
     claude_dir: Path | None = None,
 ) -> list[tuple[str, Path]]:
@@ -3213,6 +3269,10 @@ class NerveConfig:
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
+    # Base URL of the MCP gateway. In external mode Nerve takes its MCP
+    # servers only from the gateway's catalog, and mcp_servers has no effect.
+    # In local mode this key has no effect. Stored without a trailing "/".
+    mcp_gateway_url: str = ""
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
@@ -3465,6 +3525,7 @@ class NerveConfig:
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
+            mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),

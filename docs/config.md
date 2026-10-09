@@ -282,6 +282,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1745,6 +1746,96 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 - **Auto-registered in UI** — plugin MCP servers appear in the MCP Servers page on first tool invocation (type: `plugin`).
 - **No conflicts** — Nerve-configured MCPs (from `config.yaml`) and Claude Code plugin MCPs coexist; they use separate mechanisms (`--mcp-config` vs `--plugin-dir`).
 
+### MCP servers in external mode
+
+In [external mode](#authentication-mode), an MCP gateway decides which MCP
+servers and tools the agent can use. Nerve takes its MCP servers only from the
+catalog of the gateway, together with its own `nerve` server. Local mode does
+not change.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment, whitespace or control characters. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts and before each new
+session. The request has no credential, because the gateway knows the agent
+from the connection. It does not use the proxy environment variables, and for
+`https` it uses the system trust store.
+
+- Each server of the catalog is one HTTP MCP server at
+  `<mcp_gateway_url>/s/<id>/mcp`.
+- When the catalog changes, new sessions get the new servers. A session that
+  is running keeps the servers that it started with.
+- One catalog request takes at most 5 seconds, from the connection to the
+  checked catalog.
+- When the gateway gives no catalog (it is not reachable, it answers with an
+  error or too slowly, or the catalog breaks the contract), Nerve keeps the
+  catalog that it applied last. After startup there is none, and sessions
+  start with the `nerve` server only. Nerve then tries again in the
+  background: after 1 second, and after each failure with double the
+  interval, up to 60 seconds. It stops at the first success. A new session
+  also tries once.
+- A catalog server with the ID `nerve` is not used, because Nerve's own server
+  has that name.
+
+The clients get this configuration:
+
+- **Claude.** The gateway servers and the `nerve` server, with
+  `--strict-mcp-config`, so the CLI reads no other MCP configuration. No
+  Claude Code plugin is loaded. Each gateway server is allowed as
+  `mcp__<id>`, so its tools run without a permission prompt: the organization
+  approved them at the gateway.
+- **Codex.** `mcp_servers.<id>.url` and
+  `mcp_servers.<id>.default_tools_approval_mode = "approve"` for each gateway
+  server. Nerve runs Codex with approval policy `never`, and Codex then refuses
+  an MCP tool that it would have to ask about. Nerve also turns off the Codex
+  features `apps` (ChatGPT apps, also called connectors), `plugins` and
+  `skill_mcp_dependency_install`, and sets `enabled = false` for each MCP
+  server that `config.toml` in `codex.home_dir` or `/etc/codex/config.toml`
+  names and that is not a gateway server. `codex.extra_config` keys under
+  `mcp_servers` are not used. Ultracode is a Codex plugin, so
+  `codex.ultracode` has no effect.
+
+  Codex merges a server of its configuration files with a gateway server of
+  the same name, and Nerve cannot remove a key with an override. So before a
+  Codex session starts, Nerve removes such a server from `config.toml` in
+  `codex.home_dir`, with Codex's own configuration writer, and keeps a copy of
+  the file as `config.toml.nerve-mcp-backup-<UTC time>-<random>` (a new file
+  each time; a copy never replaces another). If that fails, the session does
+  not start and the error names the file.
+
+  Nerve does not change `/etc/codex/config.toml`. A gateway server whose name
+  is also in that file is not given to Codex, the file's server is turned off,
+  and the Codex session starts with the other servers, so that one server
+  does not stop all work. Nerve logs an error once for each catalog
+  generation, and `GET /api/diagnostics` (`mcp_gateway.not_applied`), the MCP
+  server API (`not_applied`) and the MCP Servers page show "Not applied to
+  Codex: name used by the system configuration". Claude sessions are not
+  affected.
+
+In external mode Nerve does not read `mcp_servers` from any configuration file
+and does not load Claude Code plugins. The catalog servers are read-only and
+show as managed by the organization on the MCP Servers page and in the API
+(see [MCP servers in external mode](api.md#mcp-servers-in-external-mode)).
+There is no MCP configuration to reload: the agent does not get the
+`mcp_reload` tool, and `POST /api/mcp-servers/reload` returns `409`. A
+`propose_config_change` proposal that changes `mcp_servers` or
+`mcp_gateway_url` in `config/settings.yaml` (compared with the base branch) is
+refused, and no pull request is opened. An administrator of the organization
+adds a server or a tool at the gateway.
+
+When the gateway refuses a server or a tool, it answers with the JSON-RPC
+error `-32001` and a fixed message. The clients connect to the gateway
+directly and give the message to the model unchanged.
+
+The Claude CLI and Codex use the proxy environment variables of the Nerve
+service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
+
+`GET /api/diagnostics` and the Diagnostics page show the applied catalog
+generation, its servers, and the result of the last catalog request (see
+[`GET /api/diagnostics`](api.md#get-apidiagnostics)). `nerve doctor` shows
+the configured `mcp_gateway_url`; it does not ask the running server.
+
 ## Auth
 
 | Key | Type | Default | Description |
@@ -1761,7 +1852,7 @@ server starts. A configuration reload does not change it; a restart does.
 | Value | Behavior |
 |---|---|
 | `local` | Default, also when the variable is unset or empty. Local accounts, login and session tokens. |
-| `external` | A gateway in front of Nerve names the person behind each request in the `X-Nerve-Actor-Context` header. Local login, account management and the setup page are not available. See [External mode](accounts.md#external-mode). |
+| `external` | A gateway in front of Nerve names the person behind each request in the `X-Nerve-Actor-Context` header. Local login, account management and the setup page are not available. See [External mode](accounts.md#external-mode). MCP servers come only from an MCP gateway; see [MCP servers in external mode](#mcp-servers-in-external-mode). |
 
 Any other value stops `nerve start`, `nerve restart` and the server with an
 error. `nerve restart` checks the value before it stops the running daemon.

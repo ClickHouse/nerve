@@ -639,6 +639,39 @@ Re-read MCP server config from YAML files and refresh the in-memory cache. New s
 Response: { "reloaded": 2, "servers": [...] }
 ```
 
+#### MCP servers in external mode
+
+In external mode the organization manages the MCP servers through the MCP
+gateway (see [MCP servers in external mode](config.md#mcp-servers-in-external-mode)).
+The routes above then change as follows:
+
+- `GET /api/mcp-servers` lists the built-in `nerve` server and the servers of
+  the applied catalog only, and adds `"managed_by": "organization"` to the
+  response.
+- Each listed server has `managed_by`: `"organization"` for a catalog server,
+  `null` for `nerve`. A catalog server also has `display_name` and
+  `description` from the catalog, and `not_applied`: the agent backends whose
+  sessions do not get the server, each with the reason, for example
+  `{"codex": "name used by the system configuration (/etc/codex/config.toml)"}`;
+  `{}` when all do. These servers are read-only.
+- `GET /api/mcp-servers/{name}` and `GET /api/mcp-servers/{name}/usage`
+  return `404` for a server that is not listed, for example one from an
+  earlier local mode.
+- `POST /api/mcp-servers/reload` returns `409` and reads no file.
+
+```json
+Response: {
+  "managed_by": "organization",
+  "servers": [{
+    "name": "docs", "type": "http", "enabled": true, "tool_count": 2,
+    "managed_by": "organization", "display_name": "Docs",
+    "description": "Search the product documentation.", "not_applied": {}, ...
+  }]
+}
+```
+
+In local mode the responses have no `managed_by` field.
+
 ### Memory Files
 
 #### `GET /api/memory/files`
@@ -733,6 +766,28 @@ Response: {
   "tasks": { "total": 92, "active": 16, "done": 76, "fts_indexed": 92, "fts_ok": true },
   "sync": { "github": { "cursor": "...", "last_run": "...", "records_fetched": 3, "records_processed": 3, "error": null } },
   "recent_cron_logs": [...]
+}
+```
+
+In external mode the response also has `mcp_gateway`: the catalog of the MCP
+gateway that new sessions use, and the result of the last catalog request.
+`generation`, `digest` and `applied_at` are `null` before the first catalog.
+`error` is the problem of the last request, or `null` after a success.
+`retrying` is true while the background retry runs. `not_applied` maps a
+catalog server ID to the backends that leave it out, each with the reason (see
+the MCP server routes above). The block is absent in local mode.
+
+```json
+"mcp_gateway": {
+  "url": "http://192.0.2.1:8080",
+  "generation": 7,
+  "digest": "sha256:3f9a…",
+  "servers": ["docs", "github"],
+  "applied_at": "2026-10-08T10:00:00+00:00",
+  "checked_at": "2026-10-08T10:05:00+00:00",
+  "error": null,
+  "retrying": false,
+  "not_applied": {}
 }
 ```
 

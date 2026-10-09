@@ -832,7 +832,10 @@ export const api = {
   syncSkills: () => request<any>('/skills/sync', { method: 'POST' }),
 
   // MCP Servers
-  listMcpServers: () => request<{ servers: any[] }>('/mcp-servers'),
+  // `managed_by` is `organization` in external mode, where the MCP gateway's
+  // catalog decides the servers.
+  listMcpServers: () =>
+    request<{ servers: any[]; managed_by?: string | null }>('/mcp-servers'),
   getMcpServer: (name: string) =>
     request<any>(`/mcp-servers/${encodeURIComponent(name)}`),
   getMcpServerUsage: (name: string, limit = 50) =>

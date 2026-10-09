@@ -5,6 +5,7 @@ import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, A
 import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 import { StatusBadge } from '../components/Cron/controls';
+import { McpGatewayStatus } from '../components/Mcp/McpGatewayStatus';
 
 function formatUptime(isoDate: string): string {
   const diff = Date.now() - new Date(isoDate).getTime();
@@ -140,6 +141,9 @@ export function DiagnosticsPage() {
             )}
           </div>
         )}
+
+        {/* MCP gateway catalog — external mode only */}
+        {data.mcp_gateway && <McpGatewayStatus status={data.mcp_gateway} />}
 
         {/* Usage & Cost */}
         {usage?.last_7d && (

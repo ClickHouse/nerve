@@ -1413,3 +1413,137 @@ class TestHandler:
         assert "locked" in text
         assert "will not work either" in text
         assert "operator" in text
+
+
+class TestManagedMcpKeys:
+    """External mode: a proposal cannot change the MCP keys of the settings.
+
+    The organization manages the MCP servers through the MCP gateway. Like the
+    security keys, the keys are judged by change against the base branch.
+    """
+
+    def _dst(self, tmp_path, current=None, *, raw=None):
+        p = tmp_path / "settings.yaml"
+        if raw is not None:
+            p.write_bytes(raw)
+        elif current is not None:
+            p.write_text(current)
+        return p
+
+    @pytest.mark.parametrize("current,proposed,expected", [
+        ("timezone: UTC\n", "timezone: Europe/Berlin\n", []),
+        (None, "timezone: UTC\n", []),
+        # A server block from local mode, restated unchanged.
+        ("mcp_servers:\n  files: {command: /bin/true}\n",
+         "mcp_servers:\n  files: {command: /bin/true}\ntimezone: UTC\n", []),
+        ("timezone: UTC\n", "mcp_servers:\n  files: {command: /bin/true}\n",
+         ["mcp_servers"]),
+        ("mcp_servers:\n  files: {command: /bin/true}\n", "timezone: UTC\n",
+         ["mcp_servers"]),
+        ("mcp_servers:\n  files: {command: /bin/true}\n",
+         "mcp_servers:\n  files: {command: /bin/false}\n", ["mcp_servers"]),
+        (None, "mcp_gateway_url: http://192.0.2.9:8080\n", ["mcp_gateway_url"]),
+        ("mcp_gateway_url: http://192.0.2.1:8080\n",
+         "mcp_gateway_url: http://192.0.2.9:8080\n", ["mcp_gateway_url"]),
+    ])
+    def test_changes_against_the_base(self, tmp_path, current, proposed, expected):
+        dst = self._dst(tmp_path, current)
+        assert cpr._managed_mcp_changes(proposed, dst) == expected
+
+    def test_an_unreadable_base_counts_a_stated_key(self, tmp_path):
+        dst = self._dst(tmp_path, "mcp_servers: [unclosed\n")
+        assert cpr._managed_mcp_changes("mcp_servers: {}\n", dst) == ["mcp_servers"]
+        assert cpr._managed_mcp_changes("timezone: UTC\n", dst) == []
+
+    def test_an_unreadable_proposal_yields_nothing(self, tmp_path):
+        dst = self._dst(tmp_path, "timezone: UTC\n")
+        assert cpr._managed_mcp_changes("mcp_servers: [unclosed\n", dst) == []
+
+    def _git(self, *args, cwd):
+        import os
+        subprocess.run(
+            ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+            env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                 "HOME": str(cwd), "PATH": os.environ["PATH"]},
+        )
+
+    def _workspace(self, tmp_path):
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        self._git("init", "-b", "main", cwd=origin)
+        (origin / "config").mkdir()
+        (origin / "config" / "settings.yaml").write_text("timezone: UTC\n")
+        self._git("add", "-A", cwd=origin)
+        self._git("commit", "-m", "init", cwd=origin)
+        ws = tmp_path / "ws"
+        self._git("clone", str(origin), str(ws), cwd=tmp_path)
+        return ws
+
+    _ADD_SERVER = [{
+        "path": "config/settings.yaml",
+        "content": "timezone: UTC\nmcp_servers:\n  files:\n    command: /bin/true\n",
+    }]
+
+    @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+    def test_external_mode_refuses_and_pushes_nothing(self, tmp_path, monkeypatch):
+        ws = self._workspace(tmp_path)
+        gh_calls = []
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: gh_calls.append(a) or _cp(stdout="x"))
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Add a server", "", self._ADD_SERVER, now=7,
+            managed_mcp=True,
+        )
+        assert not r.ok
+        assert "organization manages the MCP servers" in r.message
+        assert "mcp_servers" in r.message
+        assert gh_calls == []
+        remote = subprocess.run(
+            ["git", "branch", "-r"], cwd=str(ws), capture_output=True, text=True,
+        ).stdout
+        assert "nerve-config/" not in remote
+
+    @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+    def test_external_mode_allows_other_settings(self, tmp_path, monkeypatch):
+        ws = self._workspace(tmp_path)
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: _cp(stdout="https://gh/pr/2"))
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Change tz", "",
+            [{"path": "config/settings.yaml", "content": "timezone: Europe/Berlin\n"}],
+            now=8, managed_mcp=True,
+        )
+        assert r.ok, r.message
+
+    @pytest.mark.skipif(not shutil.which("git"), reason="git not available")
+    def test_local_mode_opens_the_pr(self, tmp_path, monkeypatch):
+        ws = self._workspace(tmp_path)
+        monkeypatch.setattr(cpr, "_gh", lambda a, c: _cp(stdout="https://gh/pr/3"))
+        r = propose_config_change(
+            ws, tmp_path / "cfg", "Add a server", "", self._ADD_SERVER, now=9,
+        )
+        assert r.ok, r.message
+        assert r.code_paths == ["config/settings.yaml"]
+
+    @pytest.mark.parametrize("mode, expected", [("external", True), ("local", False)])
+    @pytest.mark.asyncio
+    async def test_the_tool_passes_the_mode(self, monkeypatch, mode, expected):
+        from nerve.agent.tools.handlers.config_pr import propose_config_change_handler
+        from nerve.agent.tools.registry import ToolContext
+        from nerve.config import NerveConfig
+        from nerve.gateway.auth import AUTH_MODE_ENV
+
+        monkeypatch.setenv(AUTH_MODE_ENV, mode)
+        seen = {}
+
+        def fake(*args, **kwargs):
+            seen.update(kwargs)
+            return ProposeResult(ok=False, message="refused")
+
+        monkeypatch.setattr(cpr, "propose_config_change", fake)
+        config = NerveConfig()
+        config.workspace = Path("/tmp/ws")
+        await propose_config_change_handler(
+            ToolContext(session_id="s", config=config),
+            {"title": "t", "changes": _changes()},
+        )
+        assert seen["managed_mcp"] is expected

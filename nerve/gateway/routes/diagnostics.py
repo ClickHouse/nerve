@@ -150,6 +150,15 @@ async def diagnostics():
         except Exception:
             logger.exception("Failed to collect per-source diagnostics")
 
+    # The applied MCP gateway catalog, in external mode only.
+    mcp_gateway_status: dict | None = None
+    try:
+        status_of = getattr(deps.engine, "mcp_gateway_status", None)
+        if getattr(deps.engine, "managed_mcp", False) is True and status_of:
+            mcp_gateway_status = status_of()
+    except Exception:
+        logger.exception("Failed to collect MCP gateway diagnostics")
+
     # Codex thread sync (optional)
     codex_sync_status: dict | None = None
     try:
@@ -160,7 +169,7 @@ async def diagnostics():
     except Exception:
         logger.exception("Failed to collect Codex thread sync diagnostics")
 
-    return {
+    response = {
         "system": {
             "platform": platform.platform(),
             "python": platform.python_version(),
@@ -182,6 +191,9 @@ async def diagnostics():
         "usage": usage_data,
         "langfuse": langfuse_status(),
     }
+    if mcp_gateway_status is not None:
+        response["mcp_gateway"] = mcp_gateway_status
+    return response
 
 
 @router.get("/api/observability/status")
