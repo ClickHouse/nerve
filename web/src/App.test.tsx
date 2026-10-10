@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Outlet } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthStatus } from './api/client';
@@ -12,6 +12,8 @@ vi.mock('./api/client', async () => {
     api: {
       authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(),
       listActors: vi.fn().mockResolvedValue({ actors: [] }),
+      setupState: vi.fn(),
+      setupHostLogin: vi.fn(async () => ({ available: false, kind: null, source: null })),
     },
     setToken: vi.fn(),
     clearToken: vi.fn(),
@@ -57,10 +59,13 @@ import { ws } from './api/websocket';
 import App from './App';
 import { useAuthStore } from './stores/authStore';
 import { useChatStore } from './stores/chatStore';
+import { useSetupStore } from './stores/setupStore';
+import { makeExternalState, makeState } from './test/setupFixtures';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
+const setupState = api.setupState as unknown as ReturnType<typeof vi.fn>;
 const tokenInStorage = getToken as unknown as ReturnType<typeof vi.fn>;
 
 function me() {
@@ -89,6 +94,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   tokenInStorage.mockReturnValue(null);
   getViewer.mockResolvedValue(me());
+  // A finished checklist by default, so the banner stays out of the way of
+  // the routing cases; the setup cases below override it.
+  setupState.mockResolvedValue(makeState({ finished: true, steps_left: 0 }));
+  useSetupStore.getState().reset();
   useAuthStore.setState({
     authenticated: false,
     loading: false,
@@ -112,7 +121,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -155,7 +164,7 @@ describe('startup with a token already in storage', () => {
     expect(ws.connect).not.toHaveBeenCalled();
 
     answer(status({ login: 'setup' }));
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
   });
 
   it('reaches setup on a real reload, not just with a reset store', async () => {
@@ -167,7 +176,7 @@ describe('startup with a token already in storage', () => {
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -235,7 +244,7 @@ describe('startup with no token', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
     expect(apiLogin).not.toHaveBeenCalled();
   });
 
@@ -296,7 +305,30 @@ describe('hosted startup', () => {
     renderApp();
 
     expect(await screen.findByText('the chat page')).toBeInTheDocument();
-    expect(screen.queryByRole('form', { name: 'Claim this instance' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+  });
+
+  it('mounts the setup wizard at /setup and /setup/:stepId, without a claim', async () => {
+    setupState.mockResolvedValue(makeExternalState());
+
+    renderAt('/setup');
+
+    expect(await screen.findByRole('navigation', { name: 'Setup steps' })).toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument();
+    cleanup();
+
+    renderAt('/setup/provider');
+    expect(await screen.findByRole('heading', { level: 1, name: 'Connect a model' })).toBeInTheDocument();
+  });
+
+  it('shows the finish-setup banner inside the hosted adapter', async () => {
+    setupState.mockResolvedValue(makeExternalState());
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent(/Finish setting up Nerve — 7 steps left/);
   });
 
   it('has no accounts page', async () => {
@@ -394,6 +426,41 @@ describe('hosted startup', () => {
     act(() => useAuthStore.setState({ sessionExpired: true }));
 
     expect(screen.queryByRole('dialog', { name: 'Session expired' })).not.toBeInTheDocument();
+  });
+});
+
+describe('setup checklist in local mode', () => {
+  beforeEach(() => {
+    tokenInStorage.mockReturnValue('a-stored-token');
+    authStatus.mockResolvedValue(status());
+  });
+
+  it('reads the checklist once when the app goes live and mounts the banner', async () => {
+    setupState.mockResolvedValue(makeState());
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent(/7 steps left/);
+    expect(setupState).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the banner away while the checklist is unknown', async () => {
+    setupState.mockRejectedValue(new ApiError(404, 'Not Found'));
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    await waitFor(() => expect(setupState).toHaveBeenCalled());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('serves the wizard on /setup/:stepId for a claimed instance', async () => {
+    setupState.mockResolvedValue(makeState());
+
+    render(<MemoryRouter initialEntries={['/setup/memory']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Memory' })).toBeInTheDocument();
   });
 });
 

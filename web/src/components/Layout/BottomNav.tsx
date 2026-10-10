@@ -7,8 +7,9 @@ import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { Drawer, IconButton } from '../ui';
 import { MoreHorizontal, LogOut, X } from '../ui/icons';
+import { useSetupStore } from '../../stores/setupStore';
 import { ThemeToggle } from './ThemeToggle';
-import { NAV_ITEMS, PRIMARY_PATHS, type NavItem } from './navItems';
+import { NAV_ITEMS, PRIMARY_PATHS, visibleNavItems, type NavItem } from './navItems';
 
 /**
  * Phone navigation: four primary destinations plus More, pinned to the bottom.
@@ -30,6 +31,9 @@ export function BottomNav() {
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
   const hosted = useHostedStore(s => s.mode === 'external');
+  // Subscribed, like NavRail: the Setup entry has to appear when the
+  // checklist read answers, without waiting for another re-render.
+  const setupKnown = useSetupStore(s => s.state !== null);
   const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
@@ -38,8 +42,7 @@ export function BottomNav() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const available = NAV_ITEMS.filter(i =>
-    !(i.feature === 'ultracode' && !ultracodeEnabled) && !(i.feature === 'accounts' && hosted));
+  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));
