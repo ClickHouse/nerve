@@ -300,6 +300,8 @@ See [docs/config.md](docs/config.md) for all options.
 | [Config](docs/config.md) | All config options with descriptions and defaults |
 | [Accounts](docs/accounts.md) | Local accounts, actor identity, the first-start bootstrap and the signing secret |
 | [Worker Guide](docs/worker-guide.md) | Worker mode setup, onboarding, plan-approve loop |
+| [Personal Best Practices](docs/personal-best-practices.md) | Running a personal assistant well: brain files, memory tiers, approval classes, turn shape, safety hygiene |
+| [Worker Best Practices](docs/worker-best-practices.md) | Running an autonomous worker well: `TASK.md` anatomy, plan-approve-execute, task state machine, CI results comments, escalation |
 | [API Reference](docs/api.md) | REST API and WebSocket protocol |
 | [SDK Sessions](docs/sdk-sessions.md) | Session lifecycle, resume, forking |
 | [Sources](docs/sources.md) | Sync engine, cursors, consumer model |

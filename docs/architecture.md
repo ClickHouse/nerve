@@ -35,6 +35,8 @@ Nerve supports two modes, chosen once — on the Mode step of the browser setup,
 
 Mode affects which workspace templates are generated, which cron jobs are enabled, and which memory categories are seeded — but the underlying engine is identical. Both modes run the same agent, tools, and infrastructure.
 
+How to operate each mode well is covered in [Personal Best Practices](personal-best-practices.md) (brain files, memory tiers, approval classes) and [Worker Best Practices](worker-best-practices.md) (`TASK.md` anatomy, plan-approve-execute, the task state machine).
+
 ## Deployment
 
 Two deployment options:

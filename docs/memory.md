@@ -19,12 +19,15 @@ workspace/
 ├── USER.md          # User profile and preferences
 ├── AGENTS.md        # Agent behavior guidelines
 ├── TOOLS.md         # Tool usage notes
-└── MEMORY.md        # HOT memory — L1 cache (loaded into system prompt every session)
+├── MEMORY.md        # HOT memory — L1 cache (loaded into system prompt every session)
+└── memory/contexts/<slug>.md  # warm workstream files, read on demand (not injected)
 ```
 
 ### MEMORY.md
 
-HOT memory — the agent's L1 cache. Loaded into the system prompt every main session, so size directly impacts token cost. Contains only frequently accessed, currently relevant context: active projects, upcoming deadlines, operational lessons. Each entry is tagged with `[added YYYY-MM-DD]` or `[stable]` for lifecycle management. Stale entries (>2 weeks, not accessed) get moved to memU via `memorize` and removed.
+HOT memory — the agent's L1 cache. Loaded into the system prompt of every session, so size directly impacts token cost. Contains only frequently accessed, currently relevant context: active projects, upcoming deadlines, operational lessons. Each entry carries a lifecycle tag (`[added YYYY-MM-DD]`, `[updated YYYY-MM-DD]`, `[stable]`, `[dormant YYYY-MM-DD]`) or a provenance tag such as `[operator directive YYYY-MM-DD]` for human rulings. Stale entries (>2 weeks, not accessed) get moved to memU via `memorize` and removed.
+
+Day-to-day conventions for the tiers — keeping the hot file lean with annotation stubs, warm `memory/contexts/<slug>.md` workstream files read on demand, recall before work and memorize as you go — are in [Personal Best Practices](personal-best-practices.md) and [Worker Best Practices](worker-best-practices.md).
 
 ## memU Integration
 
@@ -125,12 +128,17 @@ This uses the `anthropic` Python SDK directly (not the OpenAI-compatible endpoin
 
 ### Agent Tools
 
-Eight tools for interacting with memory:
+Nine tools for interacting with memory:
 
 ```
 memory_recall(query="user's work preferences", limit=10)
 ```
-Semantic search across all indexed content (files + conversations). Best for topic-based queries.
+Semantic search across all indexed content (files + conversations). Best for topic-based queries. Results also carry related-topic breadcrumbs (`cat:<id>`).
+
+```
+memory_expand_category(category_id="abc123", query="", limit=20)
+```
+Expand a `cat:<id>` breadcrumb from a recall result into its constituent memory items, most recent first; `query` keyword-filters them.
 
 ```
 conversation_history(date="2026-02-25", end_date="2026-02-26", limit=30)
@@ -161,6 +169,11 @@ Delete a memory item. Use for wrong, duplicate, or stale memories.
 category_update(category_id="abc123", summary="Updated summary", description="New description")
 ```
 Update a category's summary and/or description. Re-embeds the category after update to keep vector search in sync (when an embedding provider is configured).
+
+```
+session_context(topic="what I am about to work on", memory_limit=15, include_skills=true)
+```
+Dynamic startup context: recalled memU priors biased by `topic`, a summary of the active skills, and session metadata (id, source, time, workspace). External MCP clients (Codex, Claude Code) call it first in a fresh thread; Nerve-owned sessions get the same priors automatically at session start.
 
 All recall and history results include memory IDs (`id:abc123...`), enabling the agent to target specific items for update or deletion.
 
