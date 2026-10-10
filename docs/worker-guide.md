@@ -2,6 +2,8 @@
 
 Worker mode deploys Nerve as a task-focused autonomous agent. Give it a job description, and it researches the domain, creates its own skills and cron jobs, then operates in a plan-approve-execute loop — all with human oversight.
 
+> How to run a worker *well* — `TASK.md` anatomy and hard rules, plan-approve-execute discipline, the task state machine, memory tiers and running several workers — is covered in [Worker Best Practices](worker-best-practices.md).
+
 ## Setup
 
 ```bash
@@ -38,7 +40,9 @@ worker is configured on that page:
 
 The same choice from a terminal is `nerve init --terminal`, which asks for the
 mode and the task description itself and does not start the daemon (`nerve
-start` afterwards). Unattended installs set `NERVE_MODE=worker` and
+start` afterwards). Its worker path has no cron step, so it writes `task-planner`,
+`skill-extractor` and `skill-reviser` with `enabled: false`: set `enabled: true` in
+`config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK="…"` for `nerve init --non-interactive` — see
 [Unattended installation](setup.md#unattended-installation).
 
@@ -123,7 +127,7 @@ Cron detects issue → Agent proposes plan → Notification sent
 4. **Notification** — A notification is sent so you know there's a plan to review
 5. **Review** — You review the plan in the web UI:
    - **Approve** → An implementation session spawns automatically with the plan as instructions
-   - **Decline** → Task stays open, agent won't re-propose unless conditions change
+   - **Decline** → The related task is closed (moved to `done`) with your feedback recorded as the note; reopen or recreate the task if you want a fresh plan
    - **Revise** → Your feedback is sent back to the planner session (context preserved), which proposes a revised plan
 6. **Implementation** — The approved plan executes in a dedicated session with full tool access
 7. **Verification** — Implementation session runs checks, tests, reports results
@@ -206,7 +210,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. Configure quiet hours in `<workspace>/config/settings.yaml` to avoid late-night pings.
+Priority levels: `urgent`, `high`, `normal`, `low`. `quiet_start`/`quiet_end` in `<workspace>/config/settings.yaml` suppress only task-deadline escalation reminders; `notify` is not gated by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 
