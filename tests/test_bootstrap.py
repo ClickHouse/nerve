@@ -302,9 +302,13 @@ class TestCliInit:
         lose and lives in a git-tracked directory. So a flat "all three are
         backed up" is a promise the code does not keep, exactly where being
         misled costs the most.
+
+        The regenerate-with-backup prompt belongs to the full terminal wizard
+        (``--terminal``); the default ``nerve init`` on a configured install
+        prints the status and exits without touching anything.
         """
         result = CliRunner().invoke(
-            main, ["-c", str(configured_dir), "init"], input="n\n"
+            main, ["-c", str(configured_dir), "init", "--terminal"], input="n\n"
         )
         assert result.exit_code == 0
         assert "*.bak" in result.output
