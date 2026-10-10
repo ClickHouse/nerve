@@ -42,6 +42,7 @@ from nerve.agent.backends.base import (
     TurnInput,
     config_excluded_tools,
 )
+from nerve.agent.backends.codex import lifecycle
 from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
     CodexRpcError,
@@ -656,6 +657,30 @@ class CodexBackend:
         return None
 
 
+_WORKFLOW_SESSION_PREFIX = "workflow:"
+
+
+def _workflow_containment(
+    backend: "CodexBackend", spec: SessionSpec,
+) -> lifecycle.WorkflowContainment | None:
+    """Containment for a ``workflow:`` session in strict mode. None for other
+    sessions, disabled mode, or a run id that isn't a run dir under
+    ``runs_dir``."""
+    sid = spec.session_id or ""
+    if not sid.startswith(_WORKFLOW_SESSION_PREFIX):
+        return None
+    if backend.codex.lifecycle.mode != lifecycle.MODE_STRICT:
+        return None
+    run_id = sid[len(_WORKFLOW_SESSION_PREFIX):]
+    if not lifecycle._RUN_ID_RE.match(run_id):
+        return None
+    runs_dir = Path(backend.config.workflows.runs_dir).expanduser().resolve()
+    run_dir = (runs_dir / run_id).resolve()
+    if run_dir.parent != runs_dir:
+        return None
+    return lifecycle.WorkflowContainment(run_dir=run_dir, run_id=run_id)
+
+
 class CodexClient(AgentClient):
     """One live ``codex app-server`` subprocess for one nerve session."""
 
@@ -699,6 +724,7 @@ class CodexClient(AgentClient):
             env=env,
             server_request_handler=self._handle_server_request,
             config_overrides=config_overrides,
+            containment=_workflow_containment(backend, spec),
         )
         self._thread_id: str | None = None
         self._turn_id: str | None = None
