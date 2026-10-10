@@ -719,6 +719,10 @@ class ClaudeBackend:
             api_key = config.effective_api_key
             if api_key:
                 env["ANTHROPIC_API_KEY"] = api_key
+            elif getattr(config, "claude_oauth_token", ""):
+                # A subscription token from `claude setup-token`: the CLI
+                # reads it from this variable. An API key wins when both exist.
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = config.claude_oauth_token
             if config.proxy.enabled:
                 env["ANTHROPIC_BASE_URL"] = (
                     f"http://{config.proxy.host}:{config.proxy.port}"

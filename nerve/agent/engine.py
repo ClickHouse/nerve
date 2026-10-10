@@ -307,6 +307,16 @@ class AgentEngine:
         self._pending_preambles: dict[str, str] = {}
 
     @property
+    def memory_bridge(self) -> Any | None:
+        """The memU bridge once :meth:`initialize` built it, else ``None``.
+
+        The setup page's Mode step applies the chosen memory categories to
+        the running service through it (``apply_categories``), so a browser
+        setup does not end in a restart for that alone.
+        """
+        return self._memory_bridge
+
+    @property
     def config(self) -> NerveConfig:
         return self._config
 
@@ -576,6 +586,24 @@ class AgentEngine:
         # Structured TASK.md (post-onboarding) has "## Mission"
         return content.startswith("# Task\n") and "## Mission" not in content
 
+    def ensure_worker_onboarding(self) -> bool:
+        """Start the first-boot onboarding session if it is due and not running.
+
+        The public, idempotent-per-process entry the setup wizard's finish
+        step uses when the mode was chosen in the browser after boot (the
+        start-up check in :meth:`initialize` has already run by then). Returns
+        whether a session was scheduled now. The session it creates is the one
+        :meth:`run_cron` names ``Cron: worker-onboarding`` with
+        ``source="cron"``, which is how the checklist recognises it.
+        """
+        task = getattr(self, "_onboarding_task", None)
+        if task is not None and not task.done():
+            return False
+        if not self._needs_worker_onboarding():
+            return False
+        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
+        return True
+
     async def _run_worker_onboarding(self) -> None:
         """Run the worker onboarding agent session on first boot."""
         logger.info("Worker onboarding: starting first-boot setup session")
@@ -728,6 +756,12 @@ class AgentEngine:
     def register_channel(self, channel: Any) -> None:
         """Register a channel with the router."""
         self.router.register(channel)
+
+    def channel(self, name: str) -> Any | None:
+        """The registered channel called ``name`` (``"telegram"``), or ``None``."""
+        if self._router is None:
+            return None
+        return self._router.get_channel(name)
 
     def register_channel_runtime(self, name: str, runtime: Any) -> None:
         """Publish the lifecycle owner for a dynamically managed channel."""
@@ -3613,8 +3647,11 @@ class AgentEngine:
     ) -> None:
         """Generate a meaningful short title for a session using a fast model."""
         try:
-            # Skip if no credentials are configured (neither API key nor Bedrock)
-            if not self.config.provider.is_bedrock and not self.config.effective_api_key:
+            # Skip if no credentials are configured. An OAuth-only credential
+            # cannot drive the API directly either (it is not an API key).
+            if not self.config.provider.is_bedrock and not (
+                self.config.resolve_anthropic_api_key()
+            ):
                 return
 
             client = self.config.create_anthropic_client(timeout=10.0)

@@ -74,7 +74,7 @@ def reset_cache() -> None:
 
 def _fingerprint(config: NerveConfig) -> tuple[str, str, str]:
     """Identity of the credentials/endpoint a cached catalog belongs to."""
-    key = config.effective_api_key or ""
+    key = config.resolve_anthropic_api_key() or ""
     return (
         "bedrock" if config.provider.is_bedrock else "anthropic",
         config.anthropic_api_base_url,
@@ -98,7 +98,7 @@ def fetch_models(
         # The Bedrock client has no `.models` resource, and Bedrock IDs are
         # region-prefixed — configured models are the only sane source there.
         return []
-    if not config.effective_api_key:
+    if not config.resolve_anthropic_api_key():
         logger.debug("Claude model discovery skipped: no API key configured")
         return []
 

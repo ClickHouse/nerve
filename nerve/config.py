@@ -648,12 +648,20 @@ def read_machine_layers(config_dir: Path) -> dict[str, Any]:
     )
 
 
-def _read_config_sources(config_dir: Path) -> dict[str, Any]:
+def _read_config_sources(config_dir: Path, *, workspace: Path | None = None) -> dict[str, Any]:
     """Merge all config layers for ``config_dir`` and resolve ${ENV_VAR} refs.
 
     Returns the fully-merged, env-interpolated config dict (untyped). Shared by
     :func:`load_config` and :func:`load_mcp_servers` so both see the same view.
+
+    ``workspace`` overrides where the workspace is: the tracked settings file
+    is read from there and the ``workspace`` key resolves to it. The host side
+    of a Docker deployment needs this — ``config.yaml`` names the *container*
+    path while the same directory is bind-mounted somewhere on the host — so
+    ``nerve status``/``doctor`` can derive the setup checklist from the real
+    files. A lockdown anchor still wins (the environment decides there).
     """
+    override = Path(workspace).expanduser() if workspace is not None else None
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
     # Check each layer's ``auth`` before the merge. After it, a valid machine
@@ -671,6 +679,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     anchored = lockdown_anchor()
     if anchored:
         workspace = _anchored_workspace()
+    elif override is not None:
+        workspace = override
     else:
         # The workspace path comes from the machine-local config (or the
         # default), never from the tracked settings file — resolve it first.
@@ -712,6 +722,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     else:
         # Precedence, lowest first: settings < config.yaml < config.local.yaml
         merged = _deep_merge(_deep_merge(ws_settings, base), local)
+        if override is not None:
+            merged["workspace"] = str(workspace)  # the caller's view, not config.yaml's
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
 
@@ -3219,6 +3231,11 @@ class NerveConfig:
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     brave_search_api_key: str = ""
+    # A Claude subscription token (`claude setup-token`), exported to the
+    # Claude CLI as CLAUDE_CODE_OAUTH_TOKEN when no API key is set. Not an
+    # API key: background jobs that call the API directly (memory, titles)
+    # still need one.
+    claude_oauth_token: str = ""
 
     # Where this config was loaded from (set by load_config, not a YAML key).
     # Used by anything that needs to write back (e.g. Telegram pairing
@@ -3242,6 +3259,36 @@ class NerveConfig:
         if self.proxy.enabled:
             return self.proxy.api_key
         return self.anthropic_api_key
+
+    def credential_available(self) -> bool:
+        """Whether the agent can talk to a model at all.
+
+        One answer for the setup page, memU, title generation and the model
+        catalogue, so an environment-provisioned instance (``ANTHROPIC_API_KEY``
+        or ``CLAUDE_CODE_OAUTH_TOKEN`` in the gateway's environment, which the
+        Claude CLI subprocess inherits) is not "done" in Setup and "no
+        credential" in memory at the same time.
+        """
+        return bool(
+            self.effective_api_key
+            or self.provider.is_bedrock
+            or self.proxy.enabled
+            or self.claude_oauth_token
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+
+    def resolve_anthropic_api_key(self) -> str:
+        """The API key background jobs should use: config, else the environment.
+
+        Empty for Bedrock and the proxy (they do not take one) and when only
+        an OAuth token exists (it is not an API key).
+        """
+        if self.effective_api_key:
+            return self.effective_api_key
+        if self.provider.is_bedrock or self.proxy.enabled:
+            return ""
+        return os.environ.get("ANTHROPIC_API_KEY", "") or ""
 
     @property
     def ollama_routable(self) -> bool:
@@ -3469,6 +3516,7 @@ class NerveConfig:
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
+            claude_oauth_token=str(d.get("claude_oauth_token", "") or ""),
         )
 
 
@@ -3563,7 +3611,7 @@ def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
     return cwd, "default"
 
 
-def load_config(config_dir: Path | None = None) -> NerveConfig:
+def load_config(config_dir: Path | None = None, *, workspace: Path | None = None) -> NerveConfig:
     """Load and type the effective configuration.
 
     Merges (lowest→highest precedence) ``workspace/config/settings.yaml``
@@ -3571,7 +3619,8 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
     ``config.local.yaml`` (machine secrets/overrides), then resolves
     ``${ENV_VAR}`` references. The workspace location is taken from the
     machine-local config (or the default) before the tracked settings file is
-    read.
+    read — unless ``workspace`` names it explicitly (the host side of a Docker
+    deployment, where ``config.yaml`` carries the container path).
 
     If config_dir is None, the directory is resolved via the waterfall in
     :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
@@ -3582,7 +3631,7 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
 
     # Assemble config from workspace/config/settings.yaml + config.yaml +
     # config.local.yaml (lowest→highest precedence) and resolve ${ENV_VAR} refs.
-    merged = _read_config_sources(config_dir)
+    merged = _read_config_sources(config_dir, workspace=workspace)
 
     # Surface typos and stale keys instead of silently ignoring them.
     for warning in validate_config_keys(merged):
@@ -3834,8 +3883,9 @@ def lockdown_machine_local_notes(
 # --- Unknown-key validation ---
 
 # YAML keys that are intentionally not dataclass fields — keyed by dotted
-# prefix ("" is the top level). claude_oauth_token / github_token are read
-# from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+# prefix ("" is the top level). github_token is read from config.local.yaml by
+# the Docker entrypoint, not by NerveConfig (claude_oauth_token became a field:
+# the Claude backend exports it to the CLI).
 #
 # The `<channel>.source` entries are the transport's own spelling of
 # ChannelSourceConfig's `allow_conversations` / `deny_conversations`:
@@ -3847,7 +3897,7 @@ def lockdown_machine_local_notes(
 # teaching the walk about the remap keeps a real typo (`allow_channel`)
 # reported, which making the subtree opaque would not.
 _EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
-    "": {"claude_oauth_token", "github_token"},
+    "": {"github_token"},
     "slack.source": {"allow_channels", "deny_channels"},
     "telegram.source": {"allow_chats", "deny_chats"},
 }

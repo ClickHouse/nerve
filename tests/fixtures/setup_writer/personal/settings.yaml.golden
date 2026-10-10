@@ -1,0 +1,71 @@
+# Nerve — Shared configuration
+# Git-tracked and portable: this is the layer that syncs between machines and
+# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
+# which overrides this file. Secrets belong in config.local.yaml or behind an
+# ${ENV_VAR} reference — never here.
+#
+# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
+# does not generate are left alone.
+
+timezone: Europe/Berlin
+gateway:
+  host: 0.0.0.0
+  port: 8900
+agent:
+  model: claude-opus-5
+  cron_model: claude-sonnet-4-6
+  max_turns: 50
+  max_concurrent: 32
+  thinking: max
+  effort: max
+  context_1m: true
+quiet_start: 02:00
+quiet_end: 08:00
+memory:
+  recall_model: claude-sonnet-4-6
+  memorize_model: claude-sonnet-4-6
+  fast_model: claude-haiku-4-5-20251001
+  embed_model: text-embedding-3-small
+  categories:
+  - name: personal_info
+    description: Identity, contact details, timezone, background
+  - name: preferences
+    description: Communication style, tool preferences, how things should be done
+  - name: relationships
+    description: People, dynamics, contact context
+  - name: work
+    description: Job, projects, PRs, code reviews, meetings
+  - name: infrastructure
+    description: Servers, deployments, CI/CD, system ops
+  - name: finances
+    description: Accounts, payments, subscriptions, budgets
+  - name: tasks_deadlines
+    description: Active tasks, deadlines, pending follow-ups
+  - name: conversations
+    description: Key things said, promises, follow-ups
+  - name: agent_ops
+    description: Operational lessons, memory design, prompt tuning
+  - name: people
+    description: Information and facts about people
+sessions:
+  sticky_period_minutes: 120
+  archive_after_days: 30
+  max_sessions: 500
+  memorize_interval_minutes: 30
+telegram:
+  dm_policy: pairing
+  stream_mode: partial
+sync:
+  telegram:
+    enabled: true
+  gmail:
+    enabled: true
+  github:
+    enabled: true
+  github_events:
+    enabled: true
+  github_repos:
+    enabled: false
+    repos: []
+provider:
+  type: anthropic

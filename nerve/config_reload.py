@@ -134,6 +134,79 @@ def restart_required(old_config, new_config) -> list[str]:
     return changed
 
 
+# The configuration this process *started* with. "Is a restart pending" is
+# answered by comparing it with what is on disk now, so a value written and
+# then reverted disappears from the answer, and the answer is empty after a
+# restart by construction — nothing has to remember to clear it.
+_startup_config = None
+
+
+def remember_startup_config(config) -> None:
+    """Capture the configuration the running process was built from.
+
+    Called by the gateway lifespan right after the config is pinned. A deep
+    copy, so later in-place edits to the live object (the external-agents
+    routes mutate it) cannot make the snapshot agree with them.
+    """
+    global _startup_config
+    import copy
+
+    try:
+        _startup_config = copy.deepcopy(config)
+    except Exception:  # noqa: BLE001 — an uncopyable stand-in (tests): keep the reference
+        _startup_config = config
+
+
+def startup_config():
+    """The snapshot, or ``None`` outside a started gateway."""
+    return _startup_config
+
+
+def restart_pending() -> list[str]:
+    """Restart-only paths whose on-disk value differs from the running one.
+
+    ``[]`` when there is no snapshot (CLI processes, tests): nothing can be
+    said, and saying "a restart is pending" with nothing to compare would be
+    a guess.
+    """
+    if _startup_config is None:
+        return []
+    try:
+        from nerve.config import get_config
+
+        live = get_config()
+    except Exception:  # noqa: BLE001 — no config loaded
+        return []
+    return restart_required(_startup_config, live)
+
+
+def note_applied(path: str, value) -> None:
+    """Record that the running process now honours ``value`` at ``path``.
+
+    For the one restart-only path a live handler applies itself:
+    ``telegram.allowed_users`` after a successful ``/pair``. Rebuilds the
+    startup snapshot with that single leaf replaced, so the next reload does
+    not report a change the channel already honours. No-op without a
+    snapshot; a path that names nothing is ignored.
+    """
+    global _startup_config
+    if _startup_config is None:
+        return
+    parts = path.split(".")
+    nodes = [_startup_config]
+    for part in parts[:-1]:
+        node = getattr(nodes[-1], part, _UNSET)
+        if node is _UNSET or not dataclasses.is_dataclass(node):
+            return
+        nodes.append(node)
+    if not hasattr(nodes[-1], parts[-1]):
+        return
+    rebuilt = dataclasses.replace(nodes[-1], **{parts[-1]: value})
+    for parent, part in zip(reversed(nodes[:-1]), reversed(parts[:-1])):
+        rebuilt = dataclasses.replace(parent, **{part: rebuilt})
+    _startup_config = rebuilt
+
+
 def reload_failures(summary: dict) -> dict[str, str]:
     """The subsystems in a :func:`reload_all` summary that failed, mapped to why.
 
