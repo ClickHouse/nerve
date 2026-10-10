@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -1424,6 +1425,40 @@ class AgentEngine:
                 "Failed to reset cost baseline for %s: %s", session_id, e,
             )
 
+    async def _reconcile_bg_tasks_on_teardown(self, session_id: str) -> None:
+        """Terminalize a torn-down session's still-"running" bg-task entries.
+
+        Once the delivering client (and its idle-stream watcher) is gone, a
+        completion event for these tasks can never arrive — so mark any still
+        "running" entry done, prune, and broadcast so the sidebar's "parked"
+        dot clears at once instead of lingering until the next daemon restart
+        (the registry is in-memory). "done" matches the registry's terminal
+        vocabulary and the frontend's background_tasks_update contract.
+        """
+        registry = self._bg_task_registry.get(session_id)
+        if not registry:
+            return
+        changed = False
+        for entry in registry.values():
+            if entry.get("status") == "running":
+                entry["status"] = "done"
+                entry["last_event_at"] = time.monotonic()
+                changed = True
+        if not changed:
+            return
+        await broadcaster.broadcast(session_id, {
+            "type": "background_tasks_update",
+            "session_id": session_id,
+            "tasks": list(registry.values()),
+        })
+        self._prune_bg_tasks(session_id)
+        # background_tasks_update only refreshes the active session's task
+        # panel; the sidebar dot is driven by has_background_tasks on the
+        # global session_running event, so emit that too to clear it live.
+        await self._broadcast_session_running(
+            session_id, self.sessions.is_running(session_id),
+        )
+
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
         background_memorize: bool = False,
@@ -1440,6 +1475,10 @@ class AgentEngine:
                 that kept the run log "running" (and APScheduler skipping
                 subsequent fires) long after the agent turn had finished.
         """
+        # The client that delivers these tasks' completion is going away —
+        # terminalize any still-"running" entries so the session doesn't keep
+        # a phantom "parked" dot forever.
+        await self._reconcile_bg_tasks_on_teardown(session_id)
         self._stop_idle_watcher(session_id)
         if background_memorize:
             await self.schedule_memorize(session_id)
@@ -1989,6 +2028,13 @@ class AgentEngine:
 
     # CLI task statuses that mean "no longer running".
     _BG_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+    # A "running" bg-task entry silent this long is treated as orphaned (its
+    # terminal event was missed) so the idle sweep can reap the session instead
+    # of showing a permanent "parked" dot. Well above the longest legitimately-
+    # silent background task — a from-scratch build or a long test/fuzzer run
+    # can emit nothing for hours — so a real run_in_background task is never
+    # reaped early (which would kill its idle-stream watcher).
+    _BG_TASK_STALE_SECONDS = 24 * 3600
 
     async def _handle_system_event(
         self, session_id: str, event: SystemEvent,
@@ -2037,9 +2083,12 @@ class AgentEngine:
         if entry is None:
             entry = {
                 "task_id": task_id, "label": "", "tool": "Bash",
-                "status": "running",
+                "status": "running", "last_event_at": time.monotonic(),
             }
             registry[task_id] = entry
+        # Any event for this task is proof of life — refresh unconditionally so
+        # a task that keeps emitting (even no-op progress) never looks stale.
+        entry["last_event_at"] = time.monotonic()
 
         changed = True
         if subtype == "task_started":
@@ -3559,11 +3608,26 @@ class AgentEngine:
         discarding tears down the idle-stream watcher (``_idle_stream_watcher``)
         that delivers the task's completion turn, so the session would never
         wake when the task settles.
+
+        A "running" entry that has produced no event for longer than
+        ``_BG_TASK_STALE_SECONDS`` is treated as orphaned — its terminal event
+        was missed (a detached ``&`` child the CLI stopped observing, a dropped
+        event, a client torn down early) — so it no longer counts as live. That
+        breaks the self-perpetuating trap where a stuck entry makes the sweep
+        skip the session forever, leaving a permanent "parked" dot. Pure: never
+        mutates the registry (a missing stamp counts as just-seen, so a task is
+        never reaped for lacking one).
         """
         registry = self._bg_task_registry.get(session_id)
-        return bool(registry) and any(
-            entry.get("status") == "running" for entry in registry.values()
-        )
+        if not registry:
+            return False
+        now = time.monotonic()
+        for entry in registry.values():
+            if entry.get("status") != "running":
+                continue
+            if now - entry.get("last_event_at", now) < self._BG_TASK_STALE_SECONDS:
+                return True
+        return False
 
     async def run_idle_client_sweep(self) -> int:
         """Disconnect clients that have been idle beyond the configured timeout.
