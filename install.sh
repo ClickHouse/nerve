@@ -608,8 +608,13 @@ offer_start() {
     local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
     # The interactive `nerve init` starts the daemon itself and prints the
     # setup page and token. Starting it a second time here would only print
-    # "already running" and read as a failure.
-    if "$nerve_bin" -c "$CONFIG_DIR" status 2>/dev/null | head -1 | grep -q 'is running'; then
+    # "already running" and read as a failure. Capture the whole report before
+    # searching it: while setup is incomplete it opens with the setup-page
+    # block, and piping it straight into `grep -q` under `pipefail` fails
+    # whenever grep stops reading before `nerve status` has finished writing.
+    local status_report
+    status_report=$("$nerve_bin" -c "$CONFIG_DIR" status 2>/dev/null || true)
+    if printf '%s\n' "$status_report" | grep -q 'Nerve is running'; then
         NERVE_STARTED=1
         return
     fi
