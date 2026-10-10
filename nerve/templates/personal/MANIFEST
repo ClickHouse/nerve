@@ -2,5 +2,5 @@ SOUL.md	Agent personality, values, and identity foundation
 IDENTITY.md	Name, vibe, communication style
 USER.md	Information about the human you're assisting
 AGENTS.md	Operational guidelines, memory conventions, safety rules
-TOOLS.md	Environment-specific tool notes
+TOOLS.md	Nerve platform tool and feature reference + environment-specific local notes
 MEMORY.md	Hot memory (L1 cache) for frequently accessed context

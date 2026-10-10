@@ -1,4 +1,4 @@
 SOUL.md	Worker identity and operating principles
 AGENTS.md	Plan-driven workflow, memory, notifications, safety, audit trail
-TOOLS.md	Environment-specific tool notes
+TOOLS.md	Nerve platform tool and feature reference + environment-specific local notes
 MEMORY.md	HOT memory — frequently accessed context (L1 cache)
