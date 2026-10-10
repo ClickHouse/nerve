@@ -76,12 +76,14 @@ A password cannot be removed.
 
 An installation becomes passwordless only by an explicit choice:
 
-- `nerve init` asks for a password. An empty answer asks you to confirm
-  "Keep this installation passwordless".
+- The default `nerve init` asks nothing about accounts: it prints the setup
+  token and leaves the choice to the browser setup page, whose first step
+  has a "Keep this installation passwordless" option.
+- `nerve init --terminal` asks for a password. An empty answer asks you to
+  confirm "Keep this installation passwordless".
 - `nerve init --non-interactive` reads `NERVE_PASSWORDLESS=1`. It refuses
   `NERVE_PASSWORD` and `NERVE_PASSWORDLESS=1` together. With neither, setup
   stays incomplete, and you complete it in the browser.
-- The browser setup page has a "Keep this installation passwordless" option.
 
 The installer reads these values once. Setup completion is persistent, so
 changing the environment later has no effect.
@@ -89,10 +91,12 @@ changing the environment later has no effect.
 ### Claiming the first account
 
 While setup is not complete, login is refused. Open `/setup`, enter the setup
-token that `nerve status` shows, and set a username and password or keep the
-installation passwordless. The claim updates the existing account, records
-setup as complete and deletes the token, in one transaction. See
-[Setup](setup.md#claiming-an-instance-from-a-browser).
+token that `nerve init` printed (`nerve status` shows it again), and set a
+username and password or keep the installation passwordless. The claim
+updates the existing account, records setup as complete and deletes the
+token, in one transaction. It is the first step of the setup wizard: on
+success you are signed in and the wizard continues with the Mode step. See
+[Setup](setup.md#the-setup-token).
 
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the
@@ -149,7 +153,10 @@ does.
 In external mode:
 
 - `POST /api/auth/login` returns `404`. The account routes (`/api/accounts`)
-  and the setup claim (`/api/setup/claim`) are not available.
+  and the setup claim (`/api/setup/claim`) are not available. The setup
+  checklist (`/api/setup`, the `/setup` page) is: any person the gateway
+  names may run it, and it never reads local-account state. See
+  [Instances with external authentication](setup.md#instances-with-external-authentication).
 - Startup creates no account and deletes a setup token from an earlier local
   mode. It still makes the signing secret, because system and MCP tokens need
   it.

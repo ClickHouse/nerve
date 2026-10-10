@@ -11,24 +11,40 @@ cd nerve
 uv sync
 source .venv/bin/activate
 
-# Initialize in worker mode
-nerve init --mode worker
+# Decide how Nerve runs here, start it, get the setup page and token
+nerve init
 ```
 
-The wizard walks through:
-1. **Deployment** — `server` (bare metal) or `docker`
-2. **Task description** — plain English description of what this worker should do
-3. **API configuration** — Anthropic API key or CLIProxyAPI proxy
-4. **Workspace setup** — creates workspace with worker-specific templates
-5. **Cron configuration** — enables `task-planner`, `skill-extractor`, `skill-reviser`, `memory-maintenance`
+`nerve init` asks only about this machine (server or Docker, paths, port and
+bind address), starts Nerve and prints the setup page with a setup token. The
+worker is configured on that page:
 
-```bash
-nerve start -f    # Start in foreground (first boot triggers onboarding)
-```
+1. **Claim** — your username and password (or keep it passwordless), plus the token
+2. **Mode** — choose **Worker** and describe the task in plain English (three
+   starter templates: monitor a build, review pull requests, watch logs). This
+   writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
+   `MEMORY.md`), the raw `TASK.md`, and `config/cron/system.yaml` with
+   `task-planner`, `skill-extractor` and `skill-reviser` on
+   (`memory-maintenance` is always on)
+3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
+   Code login found on the server, or AWS Bedrock; test it, pick a model
+4. **Operator** — who runs this worker and in which time zone it should plan
+   its day; **Memory**, **Channels** and **Automation** are optional and can be
+   skipped. Sources and external agents are not offered to a worker
+5. **Review and finish** — the server check-up, then **Restart Nerve** (the
+   mode's memory settings are read at startup) or **Finish**. The ending reads
+   "Your worker is ready" with **Onboarding session starting** and a link to
+   that session
+
+The same choice from a terminal is `nerve init --terminal`, which asks for the
+mode and the task description itself and does not start the daemon (`nerve
+start` afterwards). Unattended installs set `NERVE_MODE=worker` and
+`NERVE_TASK="…"` for `nerve init --non-interactive` — see
+[Unattended installation](setup.md#unattended-installation).
 
 ## How Onboarding Works
 
-On first boot, Nerve detects that `TASK.md` contains a raw description (no `## Mission` section yet) and runs a **setup agent session** with full tool access:
+When Nerve starts — or when the setup page's Finish runs on an instance that needs no restart — and `TASK.md` still contains the raw description (no `## Mission` section yet), it runs a **setup agent session** with full tool access. The setup page shows it as "Onboarding session starting" and then links to the running session:
 
 1. **Research** — fetches URLs, searches the web, clones repos, explores CI systems mentioned in the task
 2. **Rewrite TASK.md** — restructures the raw description into a structured format:
@@ -49,7 +65,7 @@ After onboarding, the worker operates autonomously on its configured schedule.
 
 The task file lives at `workspace/TASK.md` and is injected into every session's system prompt. It's the worker's mission brief.
 
-**Before onboarding** (raw, written by `nerve init`):
+**Before onboarding** (raw, written by the Mode step or `nerve init --terminal`):
 ```markdown
 # Task
 
@@ -132,26 +148,26 @@ When a skill-related plan is approved, the plan approval handler creates/updates
 
 ## Running Multiple Workers
 
-Each worker needs its own workspace and config. Deploy multiple workers by cloning Nerve into separate directories:
+Each worker needs its own config directory (`-c`), state directory
+(`NERVE_HOME`), workspace and port. `nerve init` asks for the workspace and the
+port; the other two come from the command line and the environment:
 
 ```bash
 # Worker 1: CI monitor
-cd ~/nerve-ci-monitor
-nerve init --mode worker
-nerve start
+NERVE_HOME=~/.nerve-ci-monitor nerve -c ~/nerve-ci-monitor init --port 8901
+# → open the setup page it prints, choose Worker, describe the task
 
 # Worker 2: PR reviewer
-cd ~/nerve-pr-reviewer
-nerve init --mode worker
-nerve start
+NERVE_HOME=~/.nerve-pr-reviewer nerve -c ~/nerve-pr-reviewer init --port 8902
 ```
 
-Each worker has:
+Keep `NERVE_HOME` set (and pass `-c`) for every later `nerve` command that
+addresses that worker. Each worker has:
 - Separate config files (`config.yaml`, `config.local.yaml`)
-- Separate databases (`~/.nerve-ci-monitor/`, `~/.nerve-pr-reviewer/` — or use different `--config-dir`)
+- Separate databases and logs (its `NERVE_HOME`)
 - Separate workspace (its own skills, tasks, memory)
 - Separate cron jobs and schedules
-- Separate web UI port (configure `gateway.port` in each)
+- Separate web UI port (`gateway.port`, chosen at `nerve init`)
 
 Workers don't share state. They're fully independent processes.
 
@@ -167,7 +183,13 @@ nerve doctor
 #   [OK] Database schema: v14
 #   [OK] Cron jobs: 3/4 enabled, 1 overridden in jobs.yaml
 #   [OK] Proxy: running on port 8317
+#   [OK] Setup checklist complete
 ```
+
+While setup is unfinished the last line reads `[WARN] Setup checklist
+incomplete (steps: provider, profile) — finish at /setup`; `nerve status`
+prints the same count with the page's address. Neither prints the setup token
+after the claim.
 
 ### Web UI
 
