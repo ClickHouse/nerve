@@ -1,18 +1,23 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  api, type SetupAutomationDetail, type SetupSourcesDetail, type SetupState, type SetupStep,
+  api, type SecretOut, type SetupAutomationDetail, type SetupSourcesDetail, type SetupState, type SetupStep,
 } from '../../../api/client';
 import { useSetupStore } from '../../../stores/setupStore';
 import { Button, Checkbox, TextField } from '../../ui';
 import { Github, Mail, MessageCircle, RefreshCw, X } from '../../ui/icons';
-import { INBOX_JOB_OFF, SOURCES_IDLE_HINT, STEP_HEADINGS } from '../copy';
-import { Field } from '../Field';
+import {
+  INBOX_JOB_OFF, MANAGED_SOURCE_TEXT, SOURCES_IDLE_HINT, STEP_HEADINGS, TELEGRAM_SIGNIN, TELEGRAM_SYNC_INTRO,
+  TELEGRAM_SYNC_TITLE, managedLine,
+} from '../copy';
+import { managedSource, secretManaged, type ManagedSource } from '../credentialSource';
+import { CodeText, Field } from '../Field';
 import { stepOf, stopPath } from '../navigation';
 import { Notice } from '../Notice';
 import { secretPayload } from '../payload';
 import { SecretField } from '../SecretField';
 import { StepFrame } from '../StepFrame';
+import { TelegramSyncSignIn } from '../TelegramSyncSignIn';
 
 const EMAIL_RE = /^[^\s@-][^\s@]*@[^\s@]+\.[^\s@]+$/;
 /** The optional job that reads the sources; off by default on a first run with none connected. */
@@ -20,17 +25,43 @@ const INBOX_JOB = 'inbox-processor';
 /** Secondary controls reach the 44 px phone target without changing the desktop density. */
 const TOUCH = 'min-h-[44px] md:min-h-0';
 
+/** A value the operator provided, in the place its field would be. */
+function ManagedValue({ label, secret, source }: { label: string; secret?: SecretOut; source: ManagedSource }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-sm font-medium text-text">{label}</span>
+      <p className="text-sm text-text-muted">
+        {MANAGED_SOURCE_TEXT[source]}
+        {secret?.last4 ? <> · <span className="font-mono">…{secret.last4}</span></> : null}
+      </p>
+    </div>
+  );
+}
+
 /**
  * GitHub, Gmail and Telegram message sync as toggle cards with the server's
  * preflight beside each. Always sends all three booleans — "none of these"
  * is a decision too.
+ *
+ * The Telegram sync needs more than the API id and hash: a one-time sign-in
+ * of the person's own account, which creates the session file on the
+ * server. Once the credentials are saved the card shows the sign-in panel;
+ * a Continue that saves new credentials therefore **stays** on the step
+ * (with a notice) rather than moving on with a sync that cannot read
+ * anything yet. The Ready screen points back here when it is still unsigned.
+ *
+ * A credential the operator provided (environment, configuration
+ * repository) renders as managed: the line says so, there is no field.
  */
 export function SourcesStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupSourcesDetail;
   const save = useSetupStore((s) => s.save);
+  const load = useSetupStore((s) => s.load);
   const fieldError = useSetupStore((s) => s.fieldError);
   const preflight = useSetupStore((s) => s.preflight);
   const loadPreflight = useSetupStore((s) => s.loadPreflight);
+  const savedNotice = useSetupStore((s) => s.savedNotice);
+  const noteSaved = useSetupStore((s) => s.noteSaved);
   const locked = step.read_only || step.status === 'blocked';
 
   const [github, setGithub] = useState(detail.github.enabled);
@@ -44,6 +75,18 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const [rechecking, setRechecking] = useState(false);
 
   useEffect(() => { void loadPreflight(); }, [loadPreflight]);
+
+  // After credentials are saved the server's answer remounts this form and
+  // the sign-in panel is what comes next, so its heading takes focus.
+  useEffect(() => {
+    if (savedNotice === 'sources') document.getElementById('setup-telegram-signin-heading')?.focus();
+  }, [savedNotice]);
+
+  const githubManaged = managedSource(detail.github.source);
+  const gmailManaged = managedSource(detail.gmail.source);
+  const apiIdManaged = secretManaged(detail.telegram.api_id);
+  const apiHashManaged = secretManaged(detail.telegram.api_hash);
+  const credentialsSaved = detail.telegram.api_id.configured && detail.telegram.api_hash.configured;
 
   const errFor = (field: string) =>
     clientError?.field === field ? clientError.detail
@@ -61,7 +104,7 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const submit = async () => {
     setClientError(null);
     const body: Record<string, unknown> = { github, gmail, telegram };
-    if (gmail) {
+    if (gmail && !gmailManaged) {
       const list = newAccount.trim() && EMAIL_RE.test(newAccount.trim()) && !accounts.includes(newAccount.trim())
         ? [...accounts, newAccount.trim()] : accounts;
       if (list.length === 0) { setClientError({ field: 'gmail_accounts', detail: 'Add at least one Gmail address.' }); return false; }
@@ -82,9 +125,24 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
         setClientError({ field: 'telegram_api_hash', detail: 'Telegram sync needs the API hash from my.telegram.org.' }); return false;
       }
     }
+    const credentialsSent = body.telegram_api_id !== undefined || body.telegram_api_hash !== undefined;
     const ok = await save('sources', () => api.setupStep('sources', body));
-    if (ok) { setApiId(''); setApiHash(''); }
-    return ok;
+    if (!ok) return false;
+    setApiId('');
+    setApiHash('');
+    if (telegram && credentialsSent) {
+      // Stay: the sync still needs the sign-in, and the panel for it has
+      // appeared below. (The server's answer usually remounts this form;
+      // the notice lives in the store, so it survives that.)
+      const latest = useSetupStore.getState().state;
+      const after = latest ? stepOf(latest, 'sources')?.detail as SetupSourcesDetail | undefined : undefined;
+      const saved = !!after?.telegram.api_id.configured && !!after?.telegram.api_hash.configured;
+      if (saved && after?.telegram.session?.authorized !== true) {
+        noteSaved('sources');
+        return false;
+      }
+    }
+    return true;
   };
 
   const recheck = async () => {
@@ -125,6 +183,8 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
         </Button>
       </div>
 
+      {savedNotice === 'sources' && <Notice tone="info">{TELEGRAM_SIGNIN.savedSignInNext}</Notice>}
+
       {inboxWarning && (
         <Notice tone="warning">
           {INBOX_JOB_OFF}{' '}
@@ -140,10 +200,11 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
           label={<span className="flex items-center gap-2 text-text"><Github size={16} />GitHub — notifications, PRs, issues</span>}
         />
         <p className="text-xs text-text-dim" role="status">
-          {githubOk === null ? 'Preflight pending'
+          {githubOk === null ? 'Checking…'
             : githubOk ? `gh is installed and signed in${preflight?.github.login ? ` as ${preflight.github.login}` : ''}`
               : preflight?.github.hint ?? 'gh is not signed in on the server'}
         </p>
+        {githubManaged && <p className="text-xs text-text-muted">{managedLine('Token', githubManaged)}</p>}
         {github && githubOk === false && <Notice tone="warning">{SOURCES_IDLE_HINT}</Notice>}
       </section>
 
@@ -155,40 +216,47 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
           label={<span className="flex items-center gap-2 text-text"><Mail size={16} />Gmail — your inbox, via gog</span>}
         />
         <p className="text-xs text-text-dim" role="status">
-          {gmailOk === null ? 'Preflight pending' : gmailOk ? 'gog is installed on the server' : preflight?.gmail.hint ?? 'gog is not installed on the server'}
+          {gmailOk === null ? 'Checking…' : gmailOk ? 'gog is installed on the server' : preflight?.gmail.hint ?? 'gog is not installed on the server'}
         </p>
+        {gmailManaged && <p className="text-xs text-text-muted">{managedLine('Accounts', gmailManaged)}</p>}
         {gmail && (
           <>
             {gmailOk === false && <Notice tone="warning">{SOURCES_IDLE_HINT}</Notice>}
-            <Field label="Gmail addresses" help="Each needs `gog gmail setup <address>` on the server." error={errFor('gmail_accounts')}>
-              <TextField
-                value={newAccount}
-                onChange={(e) => { setNewAccount(e.target.value); setClientError(null); }}
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addAccount(); } }}
-                placeholder="alice@example.com"
-                autoComplete="off"
-                type="email"
-                disabled={locked}
-              />
-            </Field>
-            <div>
-              <Button variant="secondary" size="xs" onClick={addAccount} disabled={locked || !newAccount.trim()} className={TOUCH}>Add address</Button>
-            </div>
+            {!gmailManaged && (
+              <>
+                <Field label="Gmail addresses" help={<CodeText text="Run `gog gmail setup <address>` on the server for each address." />} error={errFor('gmail_accounts')}>
+                  <TextField
+                    value={newAccount}
+                    onChange={(e) => { setNewAccount(e.target.value); setClientError(null); }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addAccount(); } }}
+                    placeholder="alice@example.com"
+                    autoComplete="off"
+                    type="email"
+                    disabled={locked}
+                  />
+                </Field>
+                <div>
+                  <Button variant="secondary" size="xs" onClick={addAccount} disabled={locked || !newAccount.trim()} className={TOUCH}>Add address</Button>
+                </div>
+              </>
+            )}
             {accounts.length > 0 && (
               <ul className="flex flex-wrap gap-1.5" aria-label="Gmail addresses to sync">
                 {accounts.map((a) => (
                   <li key={a} className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-text">
                     {a}
-                    <button
-                      type="button"
-                      aria-label={`Remove ${a}`}
-                      // A larger hit area on phones without growing the chip.
-                      className="text-text-dim hover:text-text inline-flex items-center justify-center p-3 -m-3 md:p-0 md:m-0"
-                      onClick={() => setAccounts(accounts.filter((x) => x !== a))}
-                      disabled={locked}
-                    >
-                      <X size={12} />
-                    </button>
+                    {!gmailManaged && (
+                      <button
+                        type="button"
+                        aria-label={`Remove ${a}`}
+                        // A larger hit area on phones without growing the chip.
+                        className="text-text-dim hover:text-text inline-flex items-center justify-center p-3 -m-3 md:p-0 md:m-0"
+                        onClick={() => setAccounts(accounts.filter((x) => x !== a))}
+                        disabled={locked}
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -202,34 +270,47 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
           checked={telegram}
           onChange={(e) => setTelegram(e.target.checked)}
           disabled={locked}
-          label={<span className="flex items-center gap-2 text-text"><MessageCircle size={16} />Telegram — your own messages</span>}
+          label={<span className="flex items-center gap-2 text-text"><MessageCircle size={16} />{TELEGRAM_SYNC_TITLE}</span>}
         />
-        <p className="text-xs text-text-dim">
-          Reads your messages with API credentials from my.telegram.org — not the bot token.
-          {detail.telegram.api_id.configured && detail.telegram.api_hash.configured && ' Credentials are configured.'}
-        </p>
+        <p className="text-xs text-text-dim">{TELEGRAM_SYNC_INTRO}</p>
         {telegram && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="API id" error={errFor('telegram_api_id')} help={detail.telegram.api_id.configured ? 'Configured — leave blank to keep' : undefined}>
-              <TextField value={apiId} onChange={(e) => { setApiId(e.target.value); setClientError(null); }} inputMode="numeric" autoComplete="off" disabled={locked} />
-            </Field>
-            <SecretField
-              label="API hash"
-              secret={detail.telegram.api_hash}
-              value={apiHash}
-              onChange={(v) => { setApiHash(v); setClientError(null); }}
-              error={errFor('telegram_api_hash')}
-              removable={false}
-              disabled={locked}
-            />
-          </div>
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {apiIdManaged ? (
+                <ManagedValue label="API id" secret={detail.telegram.api_id} source={apiIdManaged} />
+              ) : (
+                <Field label="API id" error={errFor('telegram_api_id')} help={detail.telegram.api_id.configured ? 'Configured — leave blank to keep' : undefined}>
+                  <TextField value={apiId} onChange={(e) => { setApiId(e.target.value); setClientError(null); }} inputMode="numeric" autoComplete="off" disabled={locked} />
+                </Field>
+              )}
+              <SecretField
+                label="API hash"
+                secret={detail.telegram.api_hash}
+                value={apiHash}
+                onChange={(v) => { setApiHash(v); setClientError(null); }}
+                error={errFor('telegram_api_hash')}
+                removable={false}
+                disabled={locked || apiHashManaged !== null}
+              />
+            </div>
+            {credentialsSaved ? (
+              <TelegramSyncSignIn known={detail.telegram.session} disabled={locked} onChanged={() => void load()} />
+            ) : (
+              <div className="flex flex-col gap-1">
+                <p className="text-sm text-text-muted" role="status">{TELEGRAM_SIGNIN.saveFirst}</p>
+                <p className="text-xs text-text-dim">
+                  {TELEGRAM_SIGNIN.fallbackPrefix} <code className="font-mono">{TELEGRAM_SIGNIN.fallbackCommand}</code>.
+                </p>
+              </div>
+            )}
+          </>
         )}
       </section>
 
       {!locked && (
         <div>
           <Button variant="ghost" size="sm" onClick={() => { setGithub(false); setGmail(false); setTelegram(false); }} className={TOUCH}>
-            None of these
+            Turn all off
           </Button>
         </div>
       )}

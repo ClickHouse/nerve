@@ -3,16 +3,22 @@ import type { SecretOut } from '../../api/client';
 import { Button, IconButton, TextField } from '../ui';
 import { Eye, EyeOff } from '../ui/icons';
 import { CONTROL_CLASS } from './controlStyle';
+import { MANAGED_SOURCE_HINT, MANAGED_SOURCE_TEXT } from './copy';
+import { secretManaged } from './credentialSource';
 
 /** Secondary controls reach the 44 px phone target without changing the desktop density. */
 const TOUCH = 'min-h-[44px] md:min-h-0';
 
 /**
- * A secret the server reports as `{configured, last4}` and never reads back.
+ * A secret the server reports as `{configured, last4, source}` and never
+ * reads back.
  *
- * Three states. Configured and untouched: "Configured · …ab12 — leave blank
+ * Four states. Configured and untouched: "Configured · …ab12 — leave blank
  * to keep", with *Replace* and *Remove*. Replacing (or not configured): a
- * password input with an eye toggle. Removed: a note, with *Undo*.
+ * password input with an eye toggle. Removed: a note, with *Undo*. Managed
+ * (`source` is the environment, a configuration repository or the channel
+ * gateway): the line says who provides it and where it is changed, with no
+ * Replace, no Remove and no input — the server would refuse the write.
  *
  * The value model: `''` means "untouched/blank" (omitted from the payload),
  * a string is a new value, and `null` means "remove" (sent as `null`).
@@ -44,10 +50,24 @@ export function SecretField({
   const [replacing, setReplacing] = useState(startReplacing);
   const [shown, setShown] = useState(false);
   const configured = !!secret?.configured;
+  const managed = secretManaged(secret);
   const describedBy = [help ? helpId : null, error ? errorId : null].filter(Boolean).join(' ') || undefined;
 
   const showInput = !configured || replacing || (value !== null && value !== '');
   const removed = value === null;
+
+  if (managed) {
+    return (
+      <div className="flex flex-col gap-1">
+        <label htmlFor={id} className="text-sm font-medium text-text">{label}</label>
+        <p id={id} className="text-sm text-text-muted" tabIndex={-1}>
+          {MANAGED_SOURCE_TEXT[managed]}
+          {secret?.last4 ? <> · <span className="font-mono">…{secret.last4}</span></> : null}
+        </p>
+        <p id={helpId} className="text-xs text-text-dim">{MANAGED_SOURCE_HINT[managed]}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-1">

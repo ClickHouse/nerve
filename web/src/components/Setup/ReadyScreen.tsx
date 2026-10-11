@@ -1,18 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   api, type PairingStatus, type SetupChannelsDetail, type SetupModeDetail,
-  type SetupOnboarding, type SetupProfileDetail, type SetupProviderDetail, type SetupState,
+  type SetupOnboarding, type SetupProfileDetail, type SetupProviderDetail, type SetupSourcesDetail,
+  type SetupState,
 } from '../../api/client';
 import { useAuthStore } from '../../stores/authStore';
 import { useSetupStore } from '../../stores/setupStore';
 import { Button } from '../ui';
 import { Check, Loader2, PartyPopper } from '../ui/icons';
 import {
-  ONBOARDING_OPEN, ONBOARDING_SENTENCES, ONBOARDING_TRY_AGAIN, PROVIDER_LAST_TEST_FAILED, READY_STEPS_LEFT,
-  SAY_HELLO,
+  MANAGED_SOURCE_SHORT, ONBOARDING_OPEN, ONBOARDING_SENTENCES, ONBOARDING_TRY_AGAIN, PROVIDER_LAST_TEST_FAILED,
+  READY_STEPS_LEFT, READY_TELEGRAM_SYNC_LINK, READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
 } from './copy';
-import { stepOf } from './navigation';
+import { providerManaged, secretManaged } from './credentialSource';
+import { stepOf, stopPath } from './navigation';
 import { PairingWidget } from './PairingWidget';
 import { personNameFor } from './personName';
 
@@ -108,20 +110,42 @@ export function ReadyScreen({ state, onboarding }: {
     if (result) setRetry({ ...result.onboarding, supersedes });
   };
 
-  const summary: string[] = [];
+  // What was set up, one line each. A credential the operator provided
+  // says so (the server's own summary already does for the model); the
+  // Telegram sync that nobody has signed in to gets its line and the way
+  // back, since the sync reads nothing until then.
+  const summary: { key: string; text: ReactNode }[] = [];
   if (provider?.summary) {
-    const failed = (provider.detail as SetupProviderDetail).last_test?.ok === false;
-    summary.push(`Model: ${provider.summary}${failed ? ` · ${PROVIDER_LAST_TEST_FAILED}` : ''}`);
+    const providerDetail = provider.detail as SetupProviderDetail;
+    const failed = providerDetail.last_test?.ok === false;
+    const source = providerManaged(providerDetail);
+    const sourceNote = source && !provider.summary.includes(MANAGED_SOURCE_SHORT[source]) ? ` · ${MANAGED_SOURCE_SHORT[source]}` : '';
+    summary.push({ key: 'model', text: `Model: ${provider.summary}${sourceNote}${failed ? ` · ${PROVIDER_LAST_TEST_FAILED}` : ''}` });
   }
   if (telegramReady) {
-    summary.push(pairing?.bot_username || channels?.telegram.bot_username
-      ? `Telegram: @${pairing?.bot_username ?? channels?.telegram.bot_username}`
-      : 'Telegram bot ready to pair');
+    const botName = pairing?.bot_username ?? channels?.telegram.bot_username ?? null;
+    const source = secretManaged(channels?.telegram.bot_token);
+    summary.push({
+      key: 'telegram',
+      text: `${botName ? `Telegram: @${botName}` : 'Telegram bot ready to pair'}${source ? ` · ${MANAGED_SOURCE_SHORT[source]}` : ''}`,
+    });
+  }
+  const sources = stepOf(state, 'sources')?.detail as SetupSourcesDetail | undefined;
+  if (sources?.telegram.enabled && sources.telegram.session?.authorized === false) {
+    summary.push({
+      key: 'telegram-sync',
+      text: (
+        <>
+          {READY_TELEGRAM_SYNC_UNSIGNED} ·{' '}
+          <Link to={stopPath('sources')} className="underline underline-offset-2 hover:text-text">{READY_TELEGRAM_SYNC_LINK}</Link>
+        </>
+      ),
+    });
   }
   const memory = stepOf(state, 'memory');
-  if (memory?.summary) summary.push(`Memory: ${memory.summary}`);
+  if (memory?.summary) summary.push({ key: 'memory', text: `Memory: ${memory.summary}` });
   const automation = stepOf(state, 'automation');
-  if (automation?.summary) summary.push(`Automation: ${automation.summary}`);
+  if (automation?.summary) summary.push({ key: 'automation', text: `Automation: ${automation.summary}` });
 
   const sayHello = () => {
     navigate('/chat', { state: { suggestedMessage: SAY_HELLO(personName) } });
@@ -139,10 +163,14 @@ export function ReadyScreen({ state, onboarding }: {
           <PartyPopper size={22} className="text-hue-amber" />
           {worker ? 'Your worker is ready' : 'Nerve is ready'}
         </h1>
+        {/* No claim that everything is in effect: the summary below can
+            list a Telegram sync nobody has signed in to or a provider whose
+            last test failed, and a source can be on while its tool is
+            missing on the server. */}
         <p className="text-sm text-text-muted mt-2 max-w-md">
           {worker
             ? 'Setup is complete. The worker reads its task description on first boot and plans its work in an onboarding session.'
-            : 'Setup is complete and everything you chose is in effect.'}
+            : 'Setup is complete.'}
         </p>
         {/* Optional steps can still be open here (another tab, a reload):
             say so rather than let the banner contradict this page. */}
@@ -153,7 +181,7 @@ export function ReadyScreen({ state, onboarding }: {
 
       {summary.length > 0 && (
         <ul className="text-sm text-text-muted flex flex-col gap-1" aria-label="Summary">
-          {summary.slice(0, 3).map((line) => <li key={line}>{line}</li>)}
+          {summary.map((line) => <li key={line.key}>{line.text}</li>)}
         </ul>
       )}
 
@@ -204,7 +232,7 @@ export function ReadyScreen({ state, onboarding }: {
       )}
 
       <Link to="/setup" className="text-sm text-text-muted hover:text-text underline-offset-2 hover:underline">
-        Open Setup later
+        Open the setup page
       </Link>
     </div>
   );

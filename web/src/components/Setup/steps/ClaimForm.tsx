@@ -37,7 +37,7 @@ function statusOf(cause: unknown): number | null {
  * refusal, so a wrong token is never resubmitted by habit. Success signs
  * the tab in and lands on the Mode step — not on chat.
  *
- * The route and the API say "claim"; the person is creating a sign-in, so
+ * The route and the API say "claim"; the person is creating an account, so
  * the words on the screen say that. The button is never disabled: pressing
  * it early names the first missing field (under the field, focused) rather
  * than leaving a keyboard user to guess why Tab skipped the button.
@@ -95,7 +95,7 @@ export function ClaimForm() {
       void useSetupStore.getState().load();
       navigate('/setup/mode', { replace: true });
     } catch (cause) {
-      setError(errorDetail(cause, 'Could not create the sign-in'));
+      setError(errorDetail(cause, 'Could not create the account'));
       if (statusOf(cause) === TOKEN_REFUSED) {
         // The token was wrong: clear it and put the cursor back there.
         setSetupToken('');
@@ -173,13 +173,13 @@ export function ClaimForm() {
         />
         {passwordless && (
           <p role="note" className="text-sm text-hue-amber">
-            Without a password, anyone who can reach this address is the owner:
-            they can use the agent, its tools and its credentials. Keep the
-            gateway on localhost or behind a protected network. You can set a
-            password later.
+            Without a password, anyone who can reach this address is the owner
+            and can use Nerve, its tools and its stored credentials. Keep Nerve
+            on localhost or on a protected network. You can set a password later
+            in Accounts.
           </p>
         )}
-        <Field label="Display name" help="Optional. How Nerve and other people see you; you can change it later.">
+        <Field label="Display name" help="Optional. The name Nerve and other people see. You can change it later.">
           <TextField
             value={displayName}
             onChange={(event) => setDisplayName(event.target.value)}
@@ -190,9 +190,9 @@ export function ClaimForm() {
           label="Setup token"
           help={(
             <>
-              Read the token with <code>nerve status</code> on the server. For
-              remote setup, open this page only over HTTPS or a protected tunnel;
-              the setup token is a bearer credential.
+              Run <code>nerve status</code> on the server to see it. Anyone with
+              this token can create the owner account, so for remote setup open
+              this page only over HTTPS or a protected tunnel.
             </>
           )}
           error={missing === 'setup_token' ? MISSING_TEXT.setup_token : undefined}

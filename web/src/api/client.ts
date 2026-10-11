@@ -39,10 +39,21 @@ export interface SetupClaim {
 // computes one. Secrets travel only as `{configured, last4}`.
 // ---------------------------------------------------------------------------
 
-/** A secret as the server reports it: whether it is set, and its last four. */
+/**
+ * Where a configured value lives. `file` is `config.local.yaml`, written by
+ * this wizard or `nerve init`; the other three were provided outside the
+ * wizard — an environment variable (directly or as a `${VAR}` reference),
+ * the tracked `settings.yaml` of a configuration repository, or the shared
+ * channel gateway — and the page shows them as managed, with nothing to
+ * replace or remove. Absent from an older backend, which means `file`.
+ */
+export type CredentialSource = 'file' | 'environment' | 'config-repo' | 'gateway';
+
+/** A secret as the server reports it: whether it is set, its last four, and where it lives. */
 export interface SecretOut {
   configured: boolean;
   last4: string | null;
+  source?: CredentialSource | null;
 }
 
 export type SetupAuthMode = 'local' | 'external';
@@ -80,6 +91,12 @@ export type SetupCredential =
 export interface SetupProviderDetail {
   type: SetupProviderType | string;
   credential: SetupCredential;
+  /**
+   * Where the effective credential came from, when the server states it
+   * for the provider as a whole; otherwise it is read off the saved
+   * secret's own `source` (and `credential: 'environment'`).
+   */
+  credential_source?: CredentialSource | null;
   anthropic_api_key: SecretOut;
   claude_oauth_token: SecretOut;
   proxy_enabled: boolean;
@@ -137,6 +154,13 @@ export interface SetupTelegramDetail {
   pairing_unavailable_reason: string | null;
 }
 
+/** The shared channel gateway's view of this instance's Slack streams (`slack.mode: hosted`). */
+export interface SlackGatewayStatus {
+  streams: number;
+  connected: boolean;
+  last_event_at: string | null;
+}
+
 export interface SetupSlackDetail {
   enabled: boolean;
   mode: 'socket' | 'hosted' | string;
@@ -145,6 +169,8 @@ export interface SetupSlackDetail {
   allow_users: string[];
   allow_direct_messages: boolean;
   allow_channels: string[];
+  /** Present when the channel gateway holds the connection; `null` or absent otherwise. */
+  gateway?: SlackGatewayStatus | null;
 }
 
 export interface SetupChannelsDetail {
@@ -152,10 +178,34 @@ export interface SetupChannelsDetail {
   slack: SetupSlackDetail;
 }
 
+/** The Telegram account a message-sync session is signed in as. */
+export interface TelegramSyncUser {
+  id: number;
+  username: string | null;
+  first_name: string;
+}
+
+/**
+ * What the checklist knows about the sync's user session file: whether it
+ * exists, whether it is authorised (`null` when it could not be checked —
+ * the sync was using it), and whose it is.
+ */
+export interface TelegramSyncSessionSummary {
+  present: boolean;
+  authorized: boolean | null;
+  user: TelegramSyncUser | null;
+}
+
 export interface SetupSourcesDetail {
-  github: { enabled: boolean };
-  gmail: { enabled: boolean; accounts: string[] };
-  telegram: { enabled: boolean; api_id: SecretOut; api_hash: SecretOut };
+  github: { enabled: boolean; source?: CredentialSource | null };
+  gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
+  telegram: {
+    enabled: boolean;
+    api_id: SecretOut;
+    api_hash: SecretOut;
+    /** Absent from an older backend, which knows nothing about the session. */
+    session?: TelegramSyncSessionSummary | null;
+  };
 }
 
 export interface SetupCronJob {
@@ -268,15 +318,22 @@ export interface HostLogin {
 export interface SetupModel {
   id: string;
   label: string;
-  family: 'opus' | 'sonnet' | 'haiku' | 'other' | string;
+  family: 'opus' | 'fable' | 'sonnet' | 'haiku' | 'other' | string;
+  /** The instance's configured model (Nerve's default on a fresh install). */
   recommended: boolean;
 }
 
 export interface SetupModelsResponse {
+  /** The configured model first, then the catalogue as the API orders it (newest first). */
   models: SetupModel[];
   current: { model: string; effort: string };
   efforts: string[];
   discovered: boolean;
+  /**
+   * Nerve's own default, so the picker can say so when the instance was
+   * changed to something else. Absent from an older backend.
+   */
+  default_model?: string;
 }
 
 export interface SimpleTestResult {
@@ -318,6 +375,38 @@ export interface SourcesPreflight {
   gmail: { cli: boolean; hint: string | null };
   telegram: { credentials_configured: boolean };
   checked_at: string;
+}
+
+/**
+ * The Telegram message sync's user session, as `GET
+ * /api/setup/sources/telegram/session` reports it — and as every login
+ * step except `start` answers. `configured` is the API id and hash being
+ * saved; `authorized: null` means the session could not be checked —
+ * `reason: "busy"` (the running sync holds the file) or `"unreachable"`
+ * (Telegram did not answer the probe); other reasons: `not_configured`,
+ * `no_session`, `telethon_missing`. `pending` names the login step the
+ * server is waiting on: `code`, or `password` when the account has two-step
+ * verification. The phone comes back masked only; the code, the password
+ * and the hash never come back. The login POSTs answer `400 {detail,
+ * field}` for a refused value, `429 {detail, retry_after}` for a flood
+ * wait, `409 {detail}` when nothing is pending or the code expired, and
+ * `502 {detail}` when Telegram could not be reached.
+ */
+export interface TelegramSyncSession {
+  configured: boolean;
+  session_present: boolean;
+  authorized: boolean | null;
+  user: TelegramSyncUser | null;
+  pending: 'code' | 'password' | null;
+  phone_masked: string | null;
+  reason: 'busy' | 'unreachable' | 'not_configured' | 'no_session' | 'telethon_missing' | string | null;
+}
+
+/** `POST …/session/start`: Telegram sent a login code. */
+export interface TelegramSyncLoginStarted {
+  pending: 'code';
+  phone_masked: string;
+  expires_in: number;
 }
 
 export interface DetectedAgent {
@@ -925,6 +1014,27 @@ export const api = {
     }),
 
   setupSourcesPreflight: () => request<SourcesPreflight>('/setup/sources/preflight'),
+
+  // Telegram message sync: the one-time sign-in of the person's own account,
+  // done on the server (the session file never leaves it). The phone, the
+  // code and the password travel in the JSON body only.
+  setupTelegramSession: () => request<TelegramSyncSession>('/setup/sources/telegram/session'),
+  setupTelegramSessionStart: (body: { phone: string }) =>
+    request<TelegramSyncLoginStarted>('/setup/sources/telegram/session/start', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionCode: (body: { code: string }) =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/code', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionPassword: (body: { password: string }) =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/password', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionCancel: () =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/cancel', { method: 'POST', body: '{}' }),
+  setupTelegramSessionLogout: () =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/logout', { method: 'POST', body: '{}' }),
 
   setupAgentsDetect: () => request<AgentsDetect>('/setup/agents/detect'),
 

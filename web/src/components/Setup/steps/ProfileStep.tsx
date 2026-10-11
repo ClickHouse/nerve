@@ -103,7 +103,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
       setClientError({ field: 'quiet_start', detail: 'Use 24-hour times such as 22:00.' }); return false;
     }
     if (codePoints(form.agent_emoji.trim()) > 8) {
-      setClientError({ field: 'agent_emoji', detail: 'One emoji is plenty.' }); return false;
+      setClientError({ field: 'agent_emoji', detail: 'Enter one emoji.' }); return false;
     }
     const body: Record<string, unknown> = {};
     const optional = ['language', 'agent_name', 'agent_emoji'] as const;
@@ -147,7 +147,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
     : PROFILE_NAME_HELP_EXTERNAL.actor_header;
   const nameHelp = external
     ? `${externalHelp}${actorNameLine ? ` ${PROFILE_NAME_HELP_EXTERNAL.signedInAs(actorNameLine)}` : ''}`
-    : worker ? 'Who operates this worker; written to its notes.' : 'How Nerve addresses you. Also your display name in the app.';
+    : worker ? 'The person who operates this worker. It goes into the worker\'s notes.' : 'What Nerve calls you. It is also your display name in this app.';
 
   return (
     <StepFrame
@@ -181,7 +181,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
 
       <Field
         label="Time zone"
-        help="Scheduled work and quiet hours follow this zone."
+        help="Scheduled jobs and quiet hours use this time zone."
         error={errFor('timezone')}
       >
         <TextField
@@ -205,7 +205,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
       )}
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Quiet hours start" help="Nerve does not ping you between these times unless it is urgent." error={errFor('quiet_start')}>
+        <Field label="Quiet hours start" help="Nerve does not message you between these times unless it is urgent." error={errFor('quiet_start')}>
           <TextField
             type="time"
             value={form.quiet_start}
@@ -262,7 +262,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
           </div>
           <Field
             label="A sentence about you or your work (optional)"
-            help="Goes into USER.md so Nerve starts with some context."
+            help="Saved to USER.md, so Nerve knows it from the first conversation."
             error={errFor('about')}
           >
             <TextArea
@@ -303,7 +303,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
             </Button>
           ))}
         </div>
-        <p className="text-xs text-text-dim">A preference of this browser; applied at once, not saved on the server.</p>
+        <p className="text-xs text-text-dim">Applies to this browser only. It changes right away and is not saved on the server.</p>
       </div>
     </StepFrame>
   );

@@ -1,6 +1,22 @@
-import { cloneElement, isValidElement, useId, type ReactElement, type ReactNode } from 'react';
+import { Fragment, cloneElement, isValidElement, useId, type ReactElement, type ReactNode } from 'react';
 import { cx } from '../ui/styles';
 import { CONTROL_CLASS } from './controlStyle';
+
+/**
+ * A sentence from copy.ts that names a command: each `backticked` part
+ * renders as <code>, the way the hand-written JSX shows `nerve status`.
+ * copy.ts stays plain strings; this is where the backticks are read, so
+ * they never reach the screen as literal characters.
+ */
+export function CodeText({ text }: { text: string }) {
+  return (
+    <>
+      {text.split('`').map((part, i) => (i % 2 === 1
+        ? <code key={i} className="font-mono">{part}</code>
+        : <Fragment key={i}>{part}</Fragment>))}
+    </>
+  );
+}
 
 /**
  * A labelled form field: `<label htmlFor>`, optional help text, and an error

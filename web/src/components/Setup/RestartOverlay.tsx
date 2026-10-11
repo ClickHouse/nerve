@@ -20,7 +20,7 @@ export const DISMISSIBLE_AFTER_MS = 10_000;
  *   command with Copy when the server knows one (systemd), otherwise the
  *   sentence names the supervisor's operator and promises no command; and
  *   **Not now**. The wait still runs.
- * - `timed out`: **Retry waiting** and **Close**.
+ * - `timed out`: **Keep waiting** and **Close**.
  *
  * Closing hides the overlay and returns to the review step; the generation
  * wait keeps running in the store, so the banner and the review update on
@@ -74,9 +74,10 @@ export function RestartOverlay() {
               </h1>
             </div>
             <p id="restart-overlay-text" className="text-sm text-text-muted" role="status">
-              {outcome?.message ?? 'This page reconnects on its own; you stay signed in.'}
-              {!canDismiss && ' This usually takes a few seconds; the dialog can be put away after ten.'}
-              {canDismiss && ' You can keep using the app; the banner updates when Nerve is back.'}
+              {outcome?.message ?? 'This page reconnects by itself. You stay signed in.'}
+              {!canDismiss && ' You can close this dialog after 10 seconds.'}
+              {/* Closing returns to the Review step, which the wait keeps up to date. */}
+              {canDismiss && ' You can close this dialog. The Review step updates when Nerve is back.'}
             </p>
             {canDismiss && (
               <div className="flex justify-end">
@@ -123,13 +124,13 @@ export function RestartOverlay() {
               Nerve did not come back
             </h1>
             <p id="restart-overlay-text" className="text-sm text-text-muted">
-              Nerve did not come back within {timeoutMinutes} {timeoutMinutes === 1 ? 'minute' : 'minutes'}.
+              No answer from Nerve after {timeoutMinutes} {timeoutMinutes === 1 ? 'minute' : 'minutes'}.
               On the server, check <code className="font-mono">nerve logs</code> or run{' '}
               <code className="font-mono">nerve start</code>.
             </p>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="md" onClick={close}>Close</Button>
-              <Button variant="primary" size="md" onClick={() => void retryWait()}>Retry waiting</Button>
+              <Button variant="primary" size="md" onClick={() => void retryWait()}>Keep waiting</Button>
             </div>
           </>
         )}

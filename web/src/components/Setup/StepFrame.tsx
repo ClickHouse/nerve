@@ -11,7 +11,7 @@ import { useWizardNav } from './wizardContext';
 /**
  * The frame every step renders in: a `<form aria-label>` with the heading,
  * the one-sentence intro, the step's own fields, the error line and the
- * footer (Back · Skip/Put back · Continue|Save|Next · Finish now).
+ * footer (Back · Skip/Undo skip · Continue|Save|Next · Finish now).
  *
  * Continue is the form's submit, so Enter in a single-line field submits.
  * On a `blocked` or read-only step it reads **Next** and sends nothing. A
@@ -153,7 +153,7 @@ export function StepFrame({
             className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-surface-raised p-3"
           >
             <p id="setup-leave-text" className="text-sm text-text flex-1 min-w-[12rem]">
-              Leave without saving? Your edits on this step will be lost.
+              Leave without saving? Your changes on this step will be lost.
             </p>
             <Button ref={keepEditing} variant="ghost" size="sm" onClick={stay} className="min-h-[44px] md:min-h-0">
               Keep editing
@@ -195,7 +195,7 @@ export function StepFrame({
         )}
         {!locked && step.can_skip && step.status === 'skipped' && (
           <Button variant="ghost" size="md" onClick={putBack} className="min-h-[44px]">
-            Put back
+            Undo skip
           </Button>
         )}
         <Button

@@ -64,14 +64,14 @@ beforeEach(() => {
 
 describe('composer seed', () => {
   it('fills the composer once for a session with no draft and keeps it as the draft', async () => {
-    await renderComposer("Hi! I'm Alice. Tell me what you can do.");
-    expect(screen.getByRole('textbox')).toHaveValue("Hi! I'm Alice. Tell me what you can do.");
-    expect(useChatStore.getState().drafts.s1).toBe("Hi! I'm Alice. Tell me what you can do.");
+    await renderComposer("Hi, I'm Alice. Tell me what you can do.");
+    expect(screen.getByRole('textbox')).toHaveValue("Hi, I'm Alice. Tell me what you can do.");
+    expect(useChatStore.getState().drafts.s1).toBe("Hi, I'm Alice. Tell me what you can do.");
   });
 
   it('never overwrites a draft somebody typed', async () => {
     useChatStore.setState({ drafts: { s1: 'what I was writing' } });
-    await renderComposer('Hi!');
+    await renderComposer('Hi.');
     expect(screen.getByRole('textbox')).toHaveValue('what I was writing');
     expect(useChatStore.getState().drafts.s1).toBe('what I was writing');
   });

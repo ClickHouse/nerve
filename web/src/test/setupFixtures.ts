@@ -1,5 +1,5 @@
 import type {
-  SecretOut, SetupAgentsDetail, SetupAutomationDetail, SetupChannelsDetail, SetupClaimDetail,
+  CredentialSource, SecretOut, SetupAgentsDetail, SetupAutomationDetail, SetupChannelsDetail, SetupClaimDetail,
   SetupMemoryDetail, SetupModeDetail, SetupProfileDetail, SetupProviderDetail,
   SetupSourcesDetail, SetupState, SetupStep, SetupStepDetail, SetupStepId,
 } from '../api/client';
@@ -7,7 +7,10 @@ import type {
 /** Fixtures for the setup wizard: a personal, local, mid-way instance. */
 
 export const OFF: SecretOut = { configured: false, last4: null };
-export const on = (last4: string): SecretOut => ({ configured: true, last4 });
+/** A configured secret; `source` names who provided it when it was not this wizard. */
+export const on = (last4: string, source?: CredentialSource): SecretOut => (
+  source ? { configured: true, last4, source } : { configured: true, last4 }
+);
 
 export const DETAILS: Record<SetupStepId, SetupStepDetail> = {
   claim: { username: 'alice', passwordless: false } satisfies SetupClaimDetail,
@@ -18,7 +21,7 @@ export const DETAILS: Record<SetupStepId, SetupStepDetail> = {
   } satisfies SetupModeDetail,
   provider: {
     type: 'anthropic', credential: 'none', anthropic_api_key: OFF, claude_oauth_token: OFF,
-    proxy_enabled: false, aws_region: '', aws_profile: '', model: 'claude-sonnet-4-6', effort: 'high',
+    proxy_enabled: false, aws_region: '', aws_profile: '', model: 'claude-opus-5-5', effort: 'high',
     cron_model: 'claude-sonnet-4-6', warning: null, last_test: null,
   } satisfies SetupProviderDetail,
   profile: {
@@ -42,7 +45,7 @@ export const DETAILS: Record<SetupStepId, SetupStepDetail> = {
   } satisfies SetupChannelsDetail,
   sources: {
     github: { enabled: false }, gmail: { enabled: false, accounts: [] },
-    telegram: { enabled: false, api_id: OFF, api_hash: OFF },
+    telegram: { enabled: false, api_id: OFF, api_hash: OFF, session: { present: false, authorized: false, user: null } },
   } satisfies SetupSourcesDetail,
   automation: {
     file_present: true, timezone: 'America/New_York',

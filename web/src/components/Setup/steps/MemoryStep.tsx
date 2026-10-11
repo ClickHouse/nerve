@@ -3,6 +3,7 @@ import { api, type SetupMemoryDetail, type SetupState, type SetupStep } from '..
 import { useSetupStore } from '../../../stores/setupStore';
 import { ChoiceCards } from '../ChoiceCards';
 import { MEMORY_WITHOUT_EMBEDDINGS, MEMORY_WITH_EMBEDDINGS, STEP_HEADINGS } from '../copy';
+import { secretManaged } from '../credentialSource';
 import { Notice } from '../Notice';
 import { decides, secretPayload } from '../payload';
 import { SecretField } from '../SecretField';
@@ -14,6 +15,10 @@ type Choice = 'embeddings' | 'without';
 /**
  * Optional OpenAI key for embeddings, with the trade-off spelled out.
  * Sends `{openai_api_key}` or `{openai_api_key: null, embeddings: false}`.
+ *
+ * A key the operator provided (environment, configuration repository) is
+ * shown as managed: the choice is fixed on embeddings, the field says who
+ * provides the key, and Continue sends nothing.
  */
 export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupMemoryDetail;
@@ -21,6 +26,7 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
   const fieldError = useSetupStore((s) => s.fieldError);
   const locked = step.read_only || step.status === 'blocked';
   const configured = detail.openai_api_key.configured;
+  const managed = secretManaged(detail.openai_api_key) !== null;
 
   const [choice, setChoice] = useState<Choice>(() => (configured ? 'embeddings' : 'without'));
   const [key, setKey] = useState<string | null>('');
@@ -31,11 +37,12 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
 
   const submit = async () => {
     setClientError(null);
+    if (managed) return true;   // the operator's key; nothing to send
     if (choice === 'embeddings') {
       const typed = secretPayload(key);
       if (typed === undefined || typed === null) {
         if (configured && key !== null) return true;  // keep what is there
-        setClientError('Paste an OpenAI key, or continue without embeddings.');
+        setClientError('Paste an OpenAI key, or choose No embeddings.');
         return false;
       }
       if (!typed.startsWith('sk-') && !weakKeyWarning) { setWeakKeyWarning(true); return false; }
@@ -69,11 +76,11 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
         label="Memory recall"
         options={[
           { value: 'embeddings', title: 'Use embeddings', description: MEMORY_WITH_EMBEDDINGS },
-          { value: 'without', title: 'Continue without', description: MEMORY_WITHOUT_EMBEDDINGS },
+          { value: 'without', title: 'No embeddings', description: MEMORY_WITHOUT_EMBEDDINGS },
         ]}
         value={choice}
         onChange={(v) => { setChoice(v); setClientError(null); setWeakKeyWarning(false); }}
-        disabled={locked}
+        disabled={locked || managed}
       />
 
       {choice === 'embeddings' && (
@@ -89,16 +96,16 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
             disabled={locked}
           />
           {weakKeyWarning && (
-            <Notice tone="warning">That does not look like an OpenAI key (they start with sk-). Continue to save it anyway.</Notice>
+            <Notice tone="warning">That does not look like an OpenAI key (they start with sk-). Select Save anyway to keep it.</Notice>
           )}
-          {!locked && <TestButton label="Test key" run={runTest} disabled={!(key ?? '').trim()} />}
+          {!locked && !managed && <TestButton label="Test key" run={runTest} disabled={!(key ?? '').trim()} />}
         </>
       )}
 
       {providerWarning === 'oauth_background_jobs' && (
         <Notice tone="warning">
-          Memory itself needs an Anthropic API key to run in the background; the model step currently has only a
-          subscription token. Embeddings alone will not switch memory on.
+          Memory runs in the background and needs an Anthropic API key. The Model step has only a subscription
+          token, so an OpenAI key alone will not turn memory on.
         </Notice>
       )}
     </StepFrame>

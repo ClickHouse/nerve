@@ -244,12 +244,12 @@ export function ReviewStep({ state }: { state: SetupState }) {
       </section>
 
       {files.length > 0 && (
-        <section aria-label="What was written where" className="flex flex-col gap-2">
-          <h2 className="text-sm font-medium text-text">What was written where</h2>
+        <section aria-label="Files written" className="flex flex-col gap-2">
+          <h2 className="text-sm font-medium text-text">Files written</h2>
           <ul className="flex flex-wrap gap-1.5">
             {files.map((f) => <li key={f} className="font-mono text-xs rounded border border-border bg-code-bg px-1.5 py-0.5">{f}</li>)}
           </ul>
-          <p className="text-xs text-text-dim">Secrets are in config.local.yaml, readable only by the server's owner.</p>
+          <p className="text-xs text-text-dim">Keys and tokens are in config.local.yaml, readable only by the account Nerve runs as.</p>
         </section>
       )}
     </div>

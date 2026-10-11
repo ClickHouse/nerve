@@ -50,7 +50,7 @@ describe('empty transcript', () => {
     useSetupStore.setState({ state: makeState() });
     renderEmpty();
     const status = screen.getByRole('status');
-    expect(status).toHaveTextContent('Add a model provider to start chatting');
+    expect(status).toHaveTextContent('Connect a model to start a conversation');
     expect(screen.getByRole('link', { name: 'Finish setup' })).toHaveAttribute('href', '/setup/provider');
     expect(screen.queryByText('Start a conversation')).not.toBeInTheDocument();
   });

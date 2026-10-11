@@ -4,9 +4,10 @@ import { useSetupStore, type SetupFieldError } from '../../../stores/setupStore'
 import { Button, Checkbox, TextField } from '../../ui';
 import { ChevronDown, ChevronRight, MessageCircle, Slack } from '../../ui/icons';
 import {
-  NO_CHANNELS_LABEL, PAIRING_AFTER_RESTART, SLACK_DISCLOSURE, SLACK_HOSTED, SLACK_INTRO,
+  NO_CHANNELS_LABEL, PAIRING_AFTER_RESTART, SLACK_DISCLOSURE, SLACK_GATEWAY_LINE, SLACK_GATEWAY_SWITCH, SLACK_INTRO,
   STEP_HEADINGS, TELEGRAM_STEPS,
 } from '../copy';
+import { secretManaged } from '../credentialSource';
 import { Field } from '../Field';
 import { Notice } from '../Notice';
 import { PairingWidget } from '../PairingWidget';
@@ -32,7 +33,12 @@ interface Sent { telegram: boolean; slack: boolean }
  * A `400 field: bot_token` from the PUT lands under the token field.
  *
  * Slack is behind a disclosure unless it is already configured, hosted, or
- * the server just complained about one of its fields.
+ * the server has refused one of its fields.
+ *
+ * A token the operator provided (environment, configuration repository)
+ * renders as managed, with no Replace, Remove or Test. Slack held by the
+ * shared channel gateway shows the gateway's status line and only the
+ * switch; there are no tokens to enter.
  */
 export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupChannelsDetail;
@@ -44,6 +50,8 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
   const tg = detail.telegram;
   const slack = detail.slack;
   const slackHosted = slack.mode === 'hosted';
+  const tgManaged = secretManaged(tg.bot_token) !== null;
+  const slackManaged = secretManaged(slack.bot_token) !== null && secretManaged(slack.app_token) !== null;
 
   const [botToken, setBotToken] = useState<string | null>('');
   const [botName, setBotName] = useState<string | null>(null);
@@ -218,7 +226,7 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
           error={errFor('bot_token')}
           disabled={locked}
         />
-        {!locked && (
+        {!locked && !tgManaged && (
           <TestButton label="Test token" run={testTelegram} disabled={!(botToken ?? '').trim()} />
         )}
         {botName && <p className="text-xs text-text-dim">Saving connects @{botName}.</p>}
@@ -230,8 +238,8 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
               <div className="flex flex-col gap-2">
                 <Notice tone="info">{tg.pairing_unavailable_reason ?? PAIRING_AFTER_RESTART}</Notice>
                 <Field
-                  label="Pair manually: your numeric Telegram user id (optional)"
-                  help="Send /start to @userinfobot in Telegram to see it."
+                  label="Your numeric Telegram user id (optional)"
+                  help="Pairs your account without a code. Send /start to @userinfobot in Telegram to see your id."
                   error={errFor('allowed_users_add')}
                 >
                   <TextField
@@ -273,7 +281,11 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
           </h2>
           {slackHosted ? (
             <>
-              <Notice tone="locked">{SLACK_HOSTED}</Notice>
+              {/* The gateway's stream count stays out of the copy: it is the
+                  gateway's internal detail, not something a person acts on. */}
+              <Notice tone="locked">
+                {SLACK_GATEWAY_LINE(slack.gateway?.connected === true)}. {SLACK_GATEWAY_SWITCH}
+              </Notice>
               <Checkbox
                 checked={slackEnabled}
                 onChange={(e) => setSlackEnabled(e.target.checked)}
@@ -322,7 +334,7 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
                   disabled={locked}
                 />
               )}
-              {!locked && (
+              {!locked && !slackManaged && (
                 <TestButton
                   label="Test Slack"
                   run={testSlack}
@@ -334,7 +346,7 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
         </section>
       )}
       {state.lockdown && !locked && (
-        <p className="text-xs text-text-dim">Channel tokens are machine secrets; this instance accepts them here.</p>
+        <p className="text-xs text-text-dim">Channel tokens are stored on this server, not in the repository, so you can enter them here.</p>
       )}
     </StepFrame>
   );

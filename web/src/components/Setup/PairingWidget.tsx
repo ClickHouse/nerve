@@ -66,7 +66,7 @@ export function PairingWidget({ onPaired }: { onPaired?: () => void }) {
       setCode(issued);
       setPaired(false);
     } catch (e) {
-      setError(errorDetail(e, 'Could not issue a pairing code'));
+      setError(errorDetail(e, 'Could not get a pairing code'));
     } finally {
       setIssuing(false);
     }

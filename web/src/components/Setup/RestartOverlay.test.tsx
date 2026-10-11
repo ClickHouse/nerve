@@ -79,7 +79,7 @@ describe('unsupported (a supervisor owns the process)', () => {
     });
     renderAt('/setup/review');
     const dialog = screen.getByRole('dialog', { name: /must be done on the server/ });
-    expect(dialog).toHaveAccessibleDescription(/Someone who runs this instance's supervisor must restart Nerve/);
+    expect(dialog).toHaveAccessibleDescription(/Whoever manages the supervisor must restart Nerve/);
     expect(dialog).not.toHaveAccessibleDescription(/command below/);
     expect(dialog).toHaveAccessibleDescription(/cannot name/);   // the server's own sentence still shows
     expect(screen.queryByRole('button', { name: 'Copy' })).not.toBeInTheDocument();
@@ -92,13 +92,14 @@ describe('timed out', () => {
     useSetupStore.setState({ reconnectFailed: true, restartOutcome: outcome('restart', { timeout_hint_seconds: 120 }) });
   });
 
-  it('offers Retry waiting and Close', async () => {
+  it('offers Keep waiting and Close', async () => {
     const retryWait = vi.fn(async () => true);
     useSetupStore.setState({ retryWait });
     renderAt('/setup/review');
-    expect(screen.getByRole('dialog', { name: 'Nerve did not come back' })).toHaveAccessibleDescription(/2 minutes/);
+    const dialog = screen.getByRole('dialog', { name: 'Nerve did not come back' });
+    expect(dialog).toHaveAccessibleDescription(/No answer from Nerve after 2 minutes/);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Retry waiting' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Keep waiting' }));
     expect(retryWait).toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: 'Close' }));
@@ -114,7 +115,7 @@ describe('restarting', () => {
   it('has no secondary action before ten seconds, and Escape does nothing then', async () => {
     renderAt('/setup/review');
     const dialog = screen.getByRole('dialog', { name: /Restarting Nerve/ });
-    expect(dialog).toHaveAccessibleDescription(/can be put away after ten/);
+    expect(dialog).toHaveAccessibleDescription(/You can close this dialog after 10 seconds/);
     expect(screen.queryByRole('button', { name: 'Not now' })).not.toBeInTheDocument();
 
     fireEvent.keyDown(dialog, { key: 'Escape' });
@@ -125,7 +126,9 @@ describe('restarting', () => {
   it('offers Not now after ten seconds of waiting', async () => {
     renderAt('/setup/review');
     act(() => useSetupStore.setState({ reconnectElapsedMs: DISMISSIBLE_AFTER_MS }));
-    expect(screen.getByRole('dialog', { name: /Restarting Nerve… \(10 s\)/ })).toBeInTheDocument();
+    // Closing returns to the Review step, so that is where the line points, not at a hidden banner.
+    expect(screen.getByRole('dialog', { name: /Restarting Nerve… \(10 s\)/ }))
+      .toHaveAccessibleDescription(/The Review step updates when Nerve is back/);
 
     await userEvent.click(screen.getByRole('button', { name: 'Not now' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();

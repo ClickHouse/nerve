@@ -103,7 +103,7 @@ describe('first-account claim', () => {
     expect(screen.getByRole('button', { name: 'Create and continue' })).toBeEnabled();
     expect(screen.getByText(/HTTPS or a protected tunnel/)).toBeInTheDocument();
     expect(screen.queryByText(/provider credential/i)).not.toBeInTheDocument();
-    expect(screen.getByRole('heading', { level: 1, name: 'Create your sign-in' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Create your account' })).toBeInTheDocument();
     expect(screen.queryByText(/^Claim/)).not.toBeInTheDocument();
   });
 
@@ -265,7 +265,7 @@ describe('first-account claim', () => {
       useAuthStore.setState({ loginMode });
       renderPage();
       expect(await screen.findByRole('navigation', { name: 'Setup steps' })).toBeInTheDocument();
-      expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
       expect(screen.queryByText('chat destination')).not.toBeInTheDocument();
     });
 
@@ -273,6 +273,6 @@ describe('first-account claim', () => {
     useHostedStore.setState({ mode: 'external' });
     renderPage();
     expect(await screen.findByRole('navigation', { name: 'Setup steps' })).toBeInTheDocument();
-    expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
   });
 });

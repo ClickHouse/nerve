@@ -1,7 +1,7 @@
 import type { SetupProfileDetail, SetupState } from '../../api/client';
 
 /**
- * Whose name goes into the Ready screen's "Hi! I'm …".
+ * Whose name goes into the Ready screen's "Hi, I'm …".
  *
  * It must be the *viewer's* own name: USER.md (`detail.name`) is shared
  * instance state, so on an instance behind a front gateway Alice would

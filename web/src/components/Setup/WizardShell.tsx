@@ -121,7 +121,7 @@ export function WizardShell() {
         <div className="flex flex-col gap-3">
           <h1 id="setup-step-heading" tabIndex={-1} className="text-xl font-semibold text-text outline-none">Setup</h1>
           <p role={error ? 'alert' : 'status'} className={`text-sm ${error ? 'text-error' : 'text-text-muted'}`}>
-            {error ?? 'This server does not offer the setup checklist.'}
+            {error ?? 'Setup is not available on this server.'}
           </p>
           {error && <div><Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button></div>}
         </div>

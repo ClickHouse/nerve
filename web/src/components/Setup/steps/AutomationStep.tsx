@@ -44,7 +44,7 @@ export function AutomationStep({ step, state }: { step: SetupStep; state: SetupS
       dirty={dirty}
     >
       {!detail.file_present && (
-        <p className="text-sm text-text-muted" role="status">The job catalogue is created when a mode is chosen.</p>
+        <p className="text-sm text-text-muted" role="status">Nerve creates the job list when you choose a mode.</p>
       )}
 
       <section aria-label="Core jobs" className="flex flex-col gap-2">

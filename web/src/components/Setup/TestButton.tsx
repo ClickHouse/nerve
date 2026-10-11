@@ -34,7 +34,7 @@ export function TestButton({ label = 'Test connection', run, disabled, onResult,
     try {
       result = await run();
     } catch (e) {
-      result = { ok: false, detail: errorDetail(e, 'The check could not run.') };
+      result = { ok: false, detail: errorDetail(e, 'The test could not run.') };
     }
     setOutcome(result);
     setBusy(false);
@@ -55,7 +55,7 @@ export function TestButton({ label = 'Test connection', run, disabled, onResult,
             ${outcome.ok ? 'border-success-border bg-success-bg text-success' : 'border-error-border bg-error-bg text-error'}`}>
             {outcome.ok ? <Check size={14} className="mt-0.5 shrink-0" /> : <CircleX size={14} className="mt-0.5 shrink-0" />}
             <div className="min-w-0">
-              <p>{outcome.detail ?? (outcome.ok ? 'Works.' : 'Failed.')}</p>
+              <p>{outcome.detail ?? (outcome.ok ? 'The test passed.' : 'The test failed.')}</p>
               {outcome.hint && <p className="text-xs opacity-80 mt-0.5">{outcome.hint}</p>}
             </div>
           </div>

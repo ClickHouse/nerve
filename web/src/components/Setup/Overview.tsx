@@ -1,10 +1,11 @@
 import { Link, useNavigate } from 'react-router-dom';
-import type { SetupProviderDetail, SetupState, SetupStep } from '../../api/client';
+import type { SetupState, SetupStep } from '../../api/client';
 import { Button } from '../ui';
 import { ArrowRight, RefreshCw } from '../ui/icons';
 import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED } from './copy';
+import { stepManaged } from './credentialSource';
 import { firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
 import { Notice } from './Notice';
 import { StatusBadge } from './StatusBadge';
@@ -12,14 +13,15 @@ import { useWizardNav } from './wizardContext';
 
 /**
  * A done step whose configuration provably did not come from this wizard:
- * a credential from the server's environment, or any config-writing step
- * on a lockdown instance (its files arrive from the repository). Anything
- * else may well be the person's own work from a minute ago — or another
- * person's — and is not called "already configured".
+ * a credential the operator provided (the environment, a configuration
+ * repository, the channel gateway), or any config-writing step on a
+ * lockdown instance (its files arrive from the repository). Anything else
+ * may well be the person's own work from a minute ago, or another
+ * person's, and is not called "already configured".
  */
 function preconfigured(step: SetupStep, state: SetupState): boolean {
   if (step.status !== 'done') return false;
-  if (step.id === 'provider') return (step.detail as SetupProviderDetail).credential === 'environment';
+  if (stepManaged(step) !== null) return true;
   return state.lockdown && step.id !== 'claim' && step.id !== 'mode';
 }
 
@@ -68,13 +70,11 @@ export function Overview({ state }: { state: SetupState }) {
 
       <div className="rounded-lg border border-border bg-surface-raised p-4 flex flex-col gap-2 text-sm text-text-muted">
         <p>
-          This wizard configures this Nerve instance: which model it uses, how it reaches you,
-          what it reads and when it works on its own.
-          {external && ' It configures the instance for everyone who uses it; nothing here is personal to your account.'}
+          Each step saves when you continue.
+          {external && ' These settings apply to everyone who uses this instance, not only to you.'}
         </p>
         <p>
-          Each step saves on its own, and you can come back to any of them later from the Setup entry.
-          {' '}<strong className="text-text">{count}</strong>.
+          <strong className="text-text">{count}</strong>.
           {preset.length > 0 && !state.finished && (
             <> Already configured: {preset.join(', ')}.</>
           )}
@@ -84,13 +84,13 @@ export function Overview({ state }: { state: SetupState }) {
       {state.lockdown && (
         <Notice tone="locked">
           {state.read_only_reason ?? 'Configuration is managed from the config repository on this instance.'}
-          {' '}Steps that write configuration are locked here; the rest still work.
+          {' '}Steps that write configuration are locked. The other steps still work.
         </Notice>
       )}
 
       {state.restart_pending && (
         <Notice tone="warning" icon={<RefreshCw size={14} />}>
-          Some changes wait for a restart. <Link to="/setup/review" className="underline">Review and restart</Link>.
+          Some changes take effect after a restart. <Link to="/setup/review" className="underline">Review and restart</Link>.
         </Notice>
       )}
 

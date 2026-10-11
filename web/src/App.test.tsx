@@ -121,7 +121,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -164,7 +164,7 @@ describe('startup with a token already in storage', () => {
     expect(ws.connect).not.toHaveBeenCalled();
 
     answer(status({ login: 'setup' }));
-    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
   });
 
   it('reaches setup on a real reload, not just with a reset store', async () => {
@@ -176,7 +176,7 @@ describe('startup with a token already in storage', () => {
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
 
-    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -244,7 +244,7 @@ describe('startup with no token', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Create your sign-in' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(apiLogin).not.toHaveBeenCalled();
   });
 
@@ -305,7 +305,7 @@ describe('hosted startup', () => {
     renderApp();
 
     expect(await screen.findByText('the chat page')).toBeInTheDocument();
-    expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
   });
 
   it('mounts the setup wizard at /setup and /setup/:stepId, without a claim', async () => {
@@ -314,7 +314,7 @@ describe('hosted startup', () => {
     renderAt('/setup');
 
     expect(await screen.findByRole('navigation', { name: 'Setup steps' })).toBeInTheDocument();
-    expect(screen.queryByRole('form', { name: 'Create your sign-in' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument();
     cleanup();
 

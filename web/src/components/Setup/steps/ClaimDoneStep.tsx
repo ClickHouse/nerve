@@ -22,9 +22,7 @@ export function ClaimDoneStep({ step }: { step: SetupStep }) {
     >
       <Notice tone="info">
         {detail.username ? <>Signed in as <strong>{detail.username}</strong>. </> : null}
-        {detail.passwordless
-          ? 'The installation is passwordless by choice; set a password in Accounts whenever you like. '
-          : 'The password is set. '}
+        {detail.passwordless ? 'This instance has no password. ' : 'A password is set. '}
         Manage people and passwords in <Link to="/accounts" className="underline">Accounts</Link>.
       </Notice>
     </StepFrame>

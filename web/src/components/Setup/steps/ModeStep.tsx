@@ -84,13 +84,13 @@ export function ModeStep({ step, state }: { step: SetupStep; state: SetupState }
       />
 
       {chosen && !readOnly && taskOnly && (
-        <Notice tone="info">The templates are in place; this worker still needs its task description.</Notice>
+        <Notice tone="info">The workspace templates are in place. This worker still needs a task description.</Notice>
       )}
 
       {mode === 'worker' && (!chosen || taskOnly) && (
         <>
           <Field
-            label="What should this worker do?"
+            label="Task description"
             help={`${TASK_MIN}–${TASK_MAX} characters. Say what to watch, what to produce, and what it must never do on its own.`}
             error={taskError}
           >
@@ -114,16 +114,18 @@ export function ModeStep({ step, state }: { step: SetupStep; state: SetupState }
       )}
 
       {/* The onboarding in sentences, never the enum or the session id: the
-          link carries the id. */}
+          link carries the id. Without a link the sentence simply ends. */}
       {chosen && detail.mode === 'worker' && detail.onboarding !== 'not_applicable' && (
         <p className="text-xs text-text-dim" role="status">
           {detail.onboarding === 'ended' || detail.onboarding === 'running' ? (
             <>
-              {detail.onboarding === 'ended' ? ONBOARDING_ENDED : ONBOARDING_SENTENCES.running}
+              {detail.onboarding === 'ended' ? ONBOARDING_ENDED : ONBOARDING_SENTENCES.running}.
               {state.mode === 'worker' && detail.onboarding_session_id ? (
-                <> — <Link to={`/chat/${detail.onboarding_session_id}`} className="underline underline-offset-2 hover:text-text">open it</Link></>
+                <>
+                  {' '}<Link to={`/chat/${detail.onboarding_session_id}`} className="underline underline-offset-2 hover:text-text">Open it</Link>
+                  {detail.onboarding === 'ended' ? ' to see why.' : '.'}
+                </>
               ) : null}
-              {detail.onboarding === 'ended' ? ' to see why.' : ''}
             </>
           ) : ONBOARDING_SENTENCES[detail.onboarding]}
         </p>

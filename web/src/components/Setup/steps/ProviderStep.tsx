@@ -7,12 +7,14 @@ import { Button, Select, TextField } from '../../ui';
 import { Cloud, KeyRound, Monitor, Sparkles } from '../../ui/icons';
 import { ChoiceCards } from '../ChoiceCards';
 import {
-  COMMON_AWS_REGIONS, EFFORT_GUIDANCE, EFFORT_SERVER_DEFAULT, ENVIRONMENT_CREDENTIAL, HOST_LOGIN_FOUND,
-  HOST_LOGIN_NONE, HOST_LOGIN_UNREADABLE, HOST_LOGIN_UNREADABLE_HINT, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT,
+  COMMON_AWS_REGIONS, EFFORT_GUIDANCE, EFFORT_SERVER_DEFAULT, HOST_LOGIN_FOUND,
+  HOST_LOGIN_NONE, HOST_LOGIN_UNREADABLE, HOST_LOGIN_UNREADABLE_HINT, MANAGED_SOURCE_HINT, MANAGED_SOURCE_TEXT,
+  MODEL_DEFAULT_LINE, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT,
   OAUTH_BACKGROUND_WARNING, PROVIDER_CARDS, PROVIDER_SAVED_PICK_MODEL, PROVIDER_TEST_FAILED_WARNING,
   STEP_HEADINGS, SUBSCRIPTION_NOTICE,
 } from '../copy';
-import { Field } from '../Field';
+import { providerManaged } from '../credentialSource';
+import { CodeText, Field } from '../Field';
 import { Notice } from '../Notice';
 import { changedFields, decides, same, secretPayload } from '../payload';
 import { focusRadio, radioTabIndex, radioTarget } from '../rovingRadio';
@@ -36,9 +38,10 @@ const SECRET_LABELS: Record<SecretKey, string> = {
   anthropic_api_key: 'Anthropic API key',
   claude_oauth_token: 'Claude subscription token',
 };
+/** Rendered through `CodeText`: a backticked part shows as a command. */
 const SECRET_HELP: Record<SecretKey, string> = {
-  anthropic_api_key: 'From console.anthropic.com. Stored in config.local.yaml on the server, readable only by its owner.',
-  claude_oauth_token: 'Run `claude setup-token` on any machine with your Claude login and paste the result.',
+  anthropic_api_key: 'Get one at console.anthropic.com. It is stored in config.local.yaml on the server, readable only by the account Nerve runs as.',
+  claude_oauth_token: 'Run `claude setup-token` on any computer where you are signed in to Claude, then paste the token it prints.',
 };
 const SECRET_PLACEHOLDER: Record<SecretKey, string> = {
   anthropic_api_key: 'sk-ant-…',
@@ -74,7 +77,12 @@ interface Form {
  *
  * Two things make Continue ask twice, both with a warning and a **Save
  * anyway** label: a key that does not look like an Anthropic key, and a
- * key whose live test just failed (it would be saved unverified).
+ * key whose live test failed a moment ago (it would be saved unverified).
+ *
+ * A credential provided outside the wizard (the environment, a
+ * configuration repository) is shown as managed: no cards, no key field,
+ * no Replace, Remove or Test. The model and effort stay this instance's to
+ * choose, so the picker still renders and a PUT can only carry those two.
  */
 export function ProviderStep({ step }: { step: SetupStep }) {
   const detail = step.detail as SetupProviderDetail;
@@ -87,7 +95,8 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   const savedNotice = useSetupStore((s) => s.savedNotice);
   const noteSaved = useSetupStore((s) => s.noteSaved);
 
-  const envCredential = detail.credential === 'environment';
+  const managed = providerManaged(detail);
+  const managedCredential = managed !== null;
   const proxy = detail.credential === 'proxy';
   const locked = step.read_only || step.status === 'blocked';
   const done = step.status === 'done';
@@ -114,7 +123,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   // The secret the saved credential lives in, when it is one of the two.
   const savedSecret: SecretKey | null = detail.credential === 'api_key' ? 'anthropic_api_key'
     : detail.credential === 'oauth_token' ? 'claude_oauth_token' : null;
-  const compact = done && !locked && !envCredential && !proxy && !changing
+  const compact = done && !locked && !managedCredential && !proxy && !changing
     && (savedSecret !== null || detail.credential === 'bedrock');
 
   // Host-login detection is lazy and rate-limited on the server; it is
@@ -181,14 +190,14 @@ export function ProviderStep({ step }: { step: SetupStep }) {
 
   const validate = (): boolean => {
     const typedKey = (form.anthropic_api_key ?? '').trim();
-    if (form.type === 'anthropic' && !typedKey && !detail.anthropic_api_key.configured && !envCredential) {
+    if (form.type === 'anthropic' && !typedKey && !detail.anthropic_api_key.configured && !managedCredential) {
       setClientError({ field: 'anthropic_api_key', detail: 'Paste an API key to continue.' });
       return false;
     }
     if (form.type === 'oauth') {
       const token = (form.claude_oauth_token ?? '').trim();
-      if (!token && !detail.claude_oauth_token.configured && !envCredential) {
-        setClientError({ field: 'claude_oauth_token', detail: 'Paste the token from `claude setup-token` to continue.' });
+      if (!token && !detail.claude_oauth_token.configured && !managedCredential) {
+        setClientError({ field: 'claude_oauth_token', detail: 'Paste a subscription token to continue.' });
         return false;
       }
     }
@@ -216,7 +225,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   const submit = async () => {
     if (!validate()) return false;
     let body: Record<string, unknown>;
-    if (decides(step) && !envCredential) {
+    if (decides(step) && !managedCredential) {
       body = candidate();
       if (form.model && form.model !== detail.model) body.model = form.model;
       if (form.effort && form.effort !== detail.effort) body.effort = form.effort;
@@ -246,10 +255,10 @@ export function ProviderStep({ step }: { step: SetupStep }) {
       ) as Record<string, unknown>;
       const key = secretPayload(form.anthropic_api_key);
       const token = secretPayload(form.claude_oauth_token);
-      const credentialChanged = !envCredential
+      const credentialChanged = !managedCredential
         && (diff.type !== undefined || key !== undefined || token !== undefined
           || diff.aws_region !== undefined || diff.aws_profile !== undefined);
-      if (envCredential) {
+      if (managedCredential) {
         delete diff.type; delete diff.aws_region; delete diff.aws_profile;
       } else if (credentialChanged) {
         // The server resolves a credential change against the type, so the
@@ -288,10 +297,18 @@ export function ProviderStep({ step }: { step: SetupStep }) {
     }));
 
   const showPicker = done || testedOk || justSaved;
+  // Every model the API returned, the configured one marked. When the
+  // instance was changed away from Nerve's own default, the help says which
+  // is which, so "recommended" is never mistaken for "Nerve's default".
   const modelOptions = (models?.models ?? []).map((m) => ({
     value: m.id, label: `${m.label}${m.recommended ? ' · recommended' : ''}`,
   }));
   const selectedFamily = models?.models.find((m) => m.id === form.model)?.family ?? 'other';
+  const labelOf = (id: string) => models?.models.find((m) => m.id === id)?.label ?? id;
+  const defaultLine = models?.default_model && models.default_model !== models.current.model
+    ? MODEL_DEFAULT_LINE(labelOf(models.default_model), labelOf(models.current.model))
+    : null;
+  const modelHelp = `${MODEL_FAMILY_GUIDANCE[selectedFamily] ?? MODEL_FAMILY_GUIDANCE.other}${defaultLine ? ` ${defaultLine}` : ''}`;
   const efforts = models?.efforts ?? ['max', 'xhigh', 'high', 'medium', 'low'];
   const dirty = !same(form, initial);
   const effortOff = () => !!locked;
@@ -299,7 +316,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   const secretField = (key: SecretKey, extra: { removable?: boolean; onReplace?: () => void; startReplacing?: boolean } = {}) => (
     <SecretField
       label={SECRET_LABELS[key]}
-      help={SECRET_HELP[key]}
+      help={<CodeText text={SECRET_HELP[key]} />}
       secret={detail[key]}
       value={form[key]}
       onChange={(v) => set(key, v)}
@@ -322,9 +339,9 @@ export function ProviderStep({ step }: { step: SetupStep }) {
       dirty={dirty}
       continueLabel={weakKeyWarning || testFailedWarning ? 'Save anyway' : undefined}
     >
-      {envCredential && <Notice tone="locked">{ENVIRONMENT_CREDENTIAL}</Notice>}
-      {proxy && <Notice tone="info">Claude is reached through the local proxy set up with <code>nerve init --terminal</code>. Only the model choice is changed here.</Notice>}
-      {detail.warning === 'oauth_background_jobs' && <Notice tone="warning">{OAUTH_BACKGROUND_WARNING}</Notice>}
+      {managed && <Notice tone="locked">{MANAGED_SOURCE_TEXT[managed]}. {MANAGED_SOURCE_HINT[managed]}</Notice>}
+      {proxy && <Notice tone="info">Nerve reaches Claude through the local proxy that <code>nerve init --terminal</code> set up. You can change the model and effort here.</Notice>}
+      {detail.warning === 'oauth_background_jobs' && <Notice tone="warning"><CodeText text={OAUTH_BACKGROUND_WARNING} /></Notice>}
       {savedNotice === 'provider' && <Notice tone="info">{PROVIDER_SAVED_PICK_MODEL}</Notice>}
 
       {compact && (
@@ -355,7 +372,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
         </div>
       )}
 
-      {!compact && !envCredential && !proxy && (
+      {!compact && !managedCredential && !proxy && (
         <>
           <ChoiceCards
             label="Model provider"
@@ -374,7 +391,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
                   likely cause and the ways around it. */}
               {hostLogin.reason
                 ? <span>{hostLogin.reason}</span>
-                : hostLogin.lookup === 'unreadable' ? <span>{HOST_LOGIN_UNREADABLE_HINT}</span> : null}
+                : hostLogin.lookup === 'unreadable' ? <span><CodeText text={HOST_LOGIN_UNREADABLE_HINT} /></span> : null}
               <Button variant="link" size="sm" onClick={() => void lookAgain()} disabled={locked} className={TOUCH}>
                 Look again
               </Button>
@@ -388,20 +405,20 @@ export function ProviderStep({ step }: { step: SetupStep }) {
             startReplacing: changing && savedSecret === 'anthropic_api_key',
           })}
           {weakKeyWarning && (
-            <Notice tone="warning">That does not look like an Anthropic API key (they start with sk-ant-). Continue to save it anyway.</Notice>
+            <Notice tone="warning">That does not look like an Anthropic API key (they start with sk-ant-). Select Save anyway to keep it.</Notice>
           )}
 
           {form.type === 'oauth' && (
             <>
               {secretField('claude_oauth_token', { startReplacing: changing && savedSecret === 'claude_oauth_token' })}
-              <Notice tone="info">{SUBSCRIPTION_NOTICE}</Notice>
+              <Notice tone="info"><CodeText text={SUBSCRIPTION_NOTICE} /></Notice>
             </>
           )}
 
           {form.type === 'host_login' && (
             <Notice tone="info">
-              The login found on this server ({hostLogin?.source ?? 'detected'}) is copied into Nerve's own
-              configuration. The value is never shown here.
+              When you continue, Nerve copies the login found on this server ({hostLogin?.source ?? 'detected'})
+              into its own configuration. The login itself is never shown here.
             </Notice>
           )}
 
@@ -440,7 +457,7 @@ export function ProviderStep({ step }: { step: SetupStep }) {
           <h2 id="setup-model-picker-heading" tabIndex={-1} className="text-sm font-medium text-text outline-none">Default model</h2>
           <Field
             label="Model"
-            help={MODEL_FAMILY_GUIDANCE[selectedFamily] ?? MODEL_FAMILY_GUIDANCE.other}
+            help={modelHelp}
             error={errFor('model')}
           >
             {modelOptions.length > 0 ? (

@@ -2,7 +2,9 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SetupAutomationDetail, SetupState } from '../../api/client';
+import type {
+  SetupAutomationDetail, SetupState, TelegramSyncSession, TelegramSyncSessionSummary,
+} from '../../api/client';
 
 vi.mock('../../api/client', async () => {
   const actual = await vi.importActual<typeof import('../../api/client')>('../../api/client');
@@ -26,6 +28,12 @@ vi.mock('../../api/client', async () => {
       setupPairing: vi.fn(),
       setupPairingStart: vi.fn(),
       setupSourcesPreflight: vi.fn(),
+      setupTelegramSession: vi.fn(),
+      setupTelegramSessionStart: vi.fn(),
+      setupTelegramSessionCode: vi.fn(),
+      setupTelegramSessionPassword: vi.fn(),
+      setupTelegramSessionCancel: vi.fn(),
+      setupTelegramSessionLogout: vi.fn(),
       setupAgentsDetect: vi.fn(),
       setupEnvironment: vi.fn(),
       restartSystem: vi.fn(),
@@ -92,6 +100,27 @@ const ENVIRONMENT = {
   checked_at: '2026-10-10T09:12:03Z',
 };
 
+/** What the Models API advertises for a normal key, the configured one first. */
+const MODELS = {
+  models: [
+    { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', family: 'opus', recommended: true },
+    { id: 'claude-fable-5-1', label: 'Claude Fable 5.1', family: 'fable', recommended: false },
+    { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', family: 'sonnet', recommended: false },
+    { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', family: 'haiku', recommended: false },
+  ],
+  current: { model: 'claude-opus-5-5', effort: 'high' },
+  efforts: ['max', 'xhigh', 'high', 'medium', 'low'],
+  discovered: true,
+  default_model: 'claude-opus-5-5',
+};
+
+/** The Telegram sync's user session: nobody signed in / signed in as alice. */
+const SESSION_OUT: TelegramSyncSession = {
+  configured: true, session_present: false, authorized: false, user: null, pending: null, phone_masked: null, reason: null,
+};
+const ALICE = { id: 1, username: 'alice_example', first_name: 'Alice' };
+const SESSION_IN: TelegramSyncSession = { ...SESSION_OUT, session_present: true, authorized: true, user: ALICE };
+
 const realMatchMedia = window.matchMedia;
 
 beforeEach(() => {
@@ -110,15 +139,8 @@ beforeEach(() => {
   m(api.setupStep).mockImplementation(async () => current);
   m(api.setupSkip).mockImplementation(async () => current);
   m(api.setupHostLogin).mockResolvedValue({ available: false, kind: null, source: null });
-  m(api.setupModels).mockResolvedValue({
-    models: [
-      { id: 'claude-opus-5', label: 'Claude Opus 5', family: 'opus', recommended: true },
-      { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', family: 'sonnet', recommended: false },
-    ],
-    current: { model: 'claude-sonnet-4-6', effort: 'high' },
-    efforts: ['max', 'xhigh', 'high', 'medium', 'low'],
-    discovered: true,
-  });
+  m(api.setupModels).mockResolvedValue(MODELS);
+  m(api.setupTelegramSession).mockResolvedValue(SESSION_OUT);
   m(api.setupProviderTest).mockResolvedValue({ ok: true, checked: 'api', code: 'ok', detail: 'claude-haiku answered', hint: null, latency_ms: 800 });
   m(api.setupSourcesPreflight).mockResolvedValue({
     github: { cli: true, authenticated: false, login: null, hint: 'Run gh auth login on the server.' },
@@ -190,7 +212,7 @@ describe('rail and overview', () => {
     // Locally the heading has said who; the line under it moves on instead
     // of repeating the name.
     expect(screen.queryByText(/Signed in as/)).not.toBeInTheDocument();
-    expect(screen.getByText('Three decisions and Nerve is ready: a mode, a model, a few facts about you.')).toBeInTheDocument();
+    expect(screen.getByText('The Mode and Model steps are required. You can skip the others and come back to them later.')).toBeInTheDocument();
     expect(screen.getByText(/2 of 9/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
     expect(await heading('Connect a model')).toBeInTheDocument();
@@ -206,7 +228,7 @@ describe('rail and overview', () => {
     renderAt('/setup');
     await heading(/^Welcome, /);
     expect(screen.getByText(/Signed in as/)).toHaveTextContent("Alice Example through your organisation's sign-in");
-    expect(screen.getByText(/configures the instance for everyone/)).toBeInTheDocument();
+    expect(screen.getByText(/apply to everyone who uses this instance/)).toBeInTheDocument();
     const nav = screen.getByRole('navigation', { name: 'Setup steps' });
     expect(within(nav).queryByRole('link', { name: /Claim/ })).not.toBeInTheDocument();
     expect(within(nav).getByRole('link', { name: /^Mode(?!l)/ })).toBeInTheDocument();
@@ -259,7 +281,7 @@ describe('rail and overview', () => {
       optional: automation.optional.map((job) => (job.id === 'inbox-processor' ? { ...job, enabled: false } : job)),
     }));
     renderAt('/setup/sources');
-    await heading('What should Nerve read?');
+    await heading('Choose what Nerve reads');
     expect(screen.queryByText(/Inbox processor job is off/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
     const notice = screen.getByText(/Inbox processor job is off/).closest('[role="status"]') as HTMLElement;
@@ -389,7 +411,7 @@ describe('editing a step from the Overview or the Review', () => {
 
   it('Back from Mode lands on the Overview, not on the read-only Account card', async () => {
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     expect(await heading(/^Welcome, /)).toBeInTheDocument();
     expect(screen.queryByRole('heading', { level: 1, name: 'Account' })).not.toBeInTheDocument();
@@ -402,28 +424,28 @@ describe('navigation semantics', () => {
       status: 'blocked', blocked_reason: 'Choose a mode first — the files this step fills in depend on it', read_only: true,
     }));
     renderAt('/setup/sources');
-    await heading('What should Nerve read?');
+    await heading('Choose what Nerve reads');
     expect(screen.getAllByRole('status').some((el) => /Choose a mode first/.test(el.textContent ?? ''))).toBe(true);
     const next = screen.getByRole('button', { name: /Next/ });
     await userEvent.click(next);
     expect(api.setupStep).not.toHaveBeenCalled();
-    expect(await heading('Scheduled work')).toBeInTheDocument();
+    expect(await heading('Scheduled jobs')).toBeInTheDocument();
   });
 
-  it('Skip for now records the skip and moves on; Put back undoes it', async () => {
+  it('Skip for now records the skip and moves on; Undo skip undoes it', async () => {
     const skipped = withStep(makeState(), step('memory', { status: 'skipped' }));
     m(api.setupSkip).mockImplementation(async (_id: string, on: boolean) => (on ? skipped : makeState()));
     renderAt('/setup/memory');
     await heading('Memory');
     await userEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
     expect(api.setupSkip).toHaveBeenCalledWith('memory', true);
-    expect(await heading('Talk to Nerve where you already are')).toBeInTheDocument();
+    expect(await heading('Connect Telegram or Slack')).toBeInTheDocument();
 
     current = skipped;
     const nav = screen.getByRole('navigation', { name: 'Setup steps' });
     await userEvent.click(within(nav).getByRole('link', { name: /Memory/ }));
     await heading('Memory');
-    await userEvent.click(await screen.findByRole('button', { name: 'Put back' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Undo skip' }));
     expect(api.setupSkip).toHaveBeenCalledWith('memory', false);
   });
 
@@ -466,14 +488,14 @@ describe('navigation semantics', () => {
     renderAt('/setup/memory');
     await heading('Memory');
     await userEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
-    const next = await heading('Talk to Nerve where you already are');
+    const next = await heading('Connect Telegram or Slack');
     await waitFor(() => expect(next).toHaveFocus());
   });
 
   it('focuses the heading on the first mount too, once the state has loaded', async () => {
     // The claim lands here: the heading only exists after load() answers.
     renderAt('/setup/mode');
-    const h1 = await heading('What should Nerve be for you?');
+    const h1 = await heading('Choose a mode');
     await waitFor(() => expect(h1).toHaveFocus());
   });
 
@@ -551,7 +573,7 @@ describe('forms open on server values and send the right payload', () => {
 
   it('automation: a pending step opens on what the file enables, flags an idle job, and always sends the full set', async () => {
     renderAt('/setup/automation');
-    await heading('Scheduled work');
+    await heading('Scheduled jobs');
     // The file enables the inbox processor; no source is connected yet, so it
     // stays on (Continue must not silently switch it off) and wears "idle".
     expect(screen.getByRole('checkbox', { name: /Inbox processor/ })).toBeChecked();
@@ -584,7 +606,7 @@ describe('forms open on server values and send the right payload', () => {
   it('choice cards are one tab stop, and the arrow keys move the choice and the focus', async () => {
     current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     const personal = screen.getByRole('radio', { name: /Personal assistant/ });
     const worker = screen.getByRole('radio', { name: /Worker/ });
     expect(personal).toHaveAttribute('tabindex', '0');
@@ -615,39 +637,40 @@ describe('forms open on server values and send the right payload', () => {
     });
     current = worker('ended', 'sess-1');
     const view = renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     const line = screen.getByText(/ended without writing a plan/);
     expect(line).not.toHaveTextContent('sess-1');
     expect(line).not.toHaveTextContent(/Onboarding:/);
-    expect(within(line).getByRole('link', { name: 'open it' })).toHaveAttribute('href', '/chat/sess-1');
+    expect(line).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
+    expect(within(line).getByRole('link', { name: 'Open it' })).toHaveAttribute('href', '/chat/sess-1');
     view.unmount();
 
     useSetupStore.getState().reset();
     current = worker('pending', null);
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     expect(await screen.findByText('The onboarding session starts after setup finishes.')).toBeInTheDocument();
   });
 
   it('automation: a done step opens on the file exactly', async () => {
     current = withStep(makeState(), step('automation', { status: 'done' }));
     renderAt('/setup/automation');
-    await heading('Scheduled work');
+    await heading('Scheduled jobs');
     expect(screen.getByRole('checkbox', { name: /Inbox processor/ })).toBeChecked();
   });
 
-  it('sources: "None of these" is a decision with all three booleans', async () => {
+  it('sources: "Turn all off" is a decision with all three booleans', async () => {
     renderAt('/setup/sources');
-    await heading('What should Nerve read?');
+    await heading('Choose what Nerve reads');
     expect(await screen.findByText(/Run gh auth login/)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'None of these' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Turn all off' }));
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: false, gmail: false, telegram: false }));
   });
 
   it('sources: enabling a card whose tool failed preflight warns that it stays idle', async () => {
     renderAt('/setup/sources');
-    await heading('What should Nerve read?');
+    await heading('Choose what Nerve reads');
     await screen.findByText(/Run gh auth login/);
     await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
     expect(screen.getByText(/stays idle until the tool is set up/)).toBeInTheDocument();
@@ -655,7 +678,7 @@ describe('forms open on server values and send the right payload', () => {
 
   it('agents: nothing is pre-checked, the footer line says what Continue writes, and [] is a decision', async () => {
     renderAt('/setup/agents');
-    await heading('Other coding agents');
+    await heading('Connect coding agents');
     expect(await screen.findByText(/codex-cli 0\.40\.0/)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: /Codex/ })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: /Claude Code/ })).not.toBeChecked();
@@ -671,7 +694,7 @@ describe('forms open on server values and send the right payload', () => {
       { id: 'claude-code', label: 'Claude Code', installed: true, version: '2.1.0', config_paths: ['~/.claude/settings.json'], config_exists: false, enabled: false },
     ] });
     renderAt('/setup/agents');
-    await heading('Other coding agents');
+    await heading('Connect coding agents');
     await screen.findByText(/codex-cli 0\.40\.0/);
     expect(screen.queryByRole('radiogroup', { name: 'Conflict policy' })).not.toBeInTheDocument();
 
@@ -692,7 +715,7 @@ describe('forms open on server values and send the right payload', () => {
   it('memory: continuing without embeddings is a decision; a key is sent when chosen', async () => {
     renderAt('/setup/memory');
     await heading('Memory');
-    expect(screen.getByRole('radio', { name: /Continue without/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /No embeddings/ })).toBeChecked();
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('memory', { openai_api_key: null, embeddings: false }));
 
@@ -708,7 +731,7 @@ describe('forms open on server values and send the right payload', () => {
 
   it('mode is read-only once chosen, with the reason', async () => {
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     expect(screen.getByRole('radio', { name: /Personal assistant/ })).toBeDisabled();
     expect(screen.getByRole('radio', { name: /Personal assistant/ })).toBeChecked();
     expect(screen.queryByText('Recommended')).not.toBeInTheDocument();
@@ -720,8 +743,8 @@ describe('forms open on server values and send the right payload', () => {
   it('mode: Personal assistant is preselected and tagged, so Continue is live on arrival', async () => {
     current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
-    expect(screen.getByText(/Chosen once\./)).toBeInTheDocument();
+    await heading('Choose a mode');
+    expect(screen.getByText(/You choose this once\./)).toBeInTheDocument();
     const personal = screen.getByRole('radio', { name: /Personal assistant/ });
     expect(personal).toBeChecked();
     expect(within(personal).getByText('Recommended')).toBeInTheDocument();
@@ -729,17 +752,17 @@ describe('forms open on server values and send the right payload', () => {
     // The preselection is the opening value, not an edit: Back does not ask.
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole('heading', { level: 1, name: 'What should Nerve be for you?' })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('heading', { level: 1, name: 'Choose a mode' })).not.toBeInTheDocument());
   });
 
   it('a worker needs a task description; a starter template fills one in', async () => {
     current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
     renderAt('/setup/mode');
-    await heading('What should Nerve be for you?');
+    await heading('Choose a mode');
     await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
-    await userEvent.type(screen.getByLabelText(/What should this worker do/), 'x');
+    await userEvent.type(screen.getByLabelText('Task description'), 'x');
     await userEvent.click(continueButton());
-    expect(screen.getByLabelText(/What should this worker do/)).toHaveAccessibleDescription(/at least one full sentence/);
+    expect(screen.getByLabelText('Task description')).toHaveAccessibleDescription(/at least one full sentence/);
     expect(api.setupStep).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: 'Monitor a build' }));
@@ -769,8 +792,8 @@ describe('provider', () => {
   });
 
   it('a pending step stays after the first save and shows the picker with what the server applied', async () => {
-    const saved = withStep(makeState(), step('provider', { status: 'done', etag: 'provider-etag-2', summary: 'Anthropic API key (…ab12) · claude-opus-5 · effort max' }, {
-      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5', effort: 'max',
+    const saved = withStep(makeState(), step('provider', { status: 'done', etag: 'provider-etag-2', summary: 'Anthropic API key (…ab12) · claude-opus-5-5 · effort max' }, {
+      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'max',
     }));
     m(api.setupStep).mockImplementation(async () => { current = saved; return saved; });
     renderAt('/setup/provider');
@@ -783,7 +806,7 @@ describe('provider', () => {
     // Still here, saved, and the defaults are on screen rather than silent.
     expect(screen.getByRole('heading', { level: 1, name: 'Connect a model' })).toBeInTheDocument();
     expect(await screen.findByText(/Saved\. Pick the default model and effort/)).toBeInTheDocument();
-    expect(await screen.findByLabelText('Model')).toHaveValue('claude-opus-5');
+    expect(await screen.findByLabelText('Model')).toHaveValue('claude-opus-5-5');
     expect(screen.getByRole('radio', { name: 'max' })).toBeChecked();
     expect(screen.getByText(/leave blank to keep/)).toHaveTextContent('…ab12');
 
@@ -805,12 +828,46 @@ describe('provider', () => {
     expect(await screen.findByText('claude-haiku answered')).toBeInTheDocument();
     await waitFor(() => expect(api.setupModels).toHaveBeenCalled());
     const model = await screen.findByLabelText('Model');
-    await userEvent.selectOptions(model, 'claude-opus-5');
-    expect(screen.getByText(/Most capable/)).toBeInTheDocument();
+    await userEvent.selectOptions(model, 'claude-fable-5-1');
+    expect(screen.getByText(/The newest generation/)).toBeInTheDocument();
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', {
-      type: 'anthropic', anthropic_api_key: 'sk-ant-REPLACE', model: 'claude-opus-5',
+      type: 'anthropic', anthropic_api_key: 'sk-ant-REPLACE', model: 'claude-fable-5-1',
     }));
+  });
+
+  it('lists every model the API returns, marks the configured one recommended, and explains Fable', async () => {
+    current = withStep(makeState(), step('provider', { status: 'done' }, {
+      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'high',
+    }));
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    const model = await screen.findByLabelText('Model');
+    const names = within(model).getAllByRole('option').map((o) => o.textContent ?? '')
+      .filter((name) => !name.startsWith('Server default'));
+    expect(names).toEqual(['Claude Opus 5.5 · recommended', 'Claude Fable 5.1', 'Claude Sonnet 5.5', 'Claude Haiku 5.5']);
+    expect(model).toHaveAccessibleDescription(/Most capable of the classic line/);
+    // Nerve's default and the instance's model agree, so nothing is said about it.
+    expect(model).not.toHaveAccessibleDescription(/Nerve's default/);
+    await userEvent.selectOptions(model, 'claude-fable-5-1');
+    expect(model).toHaveAccessibleDescription('The newest generation; strongest on long, open-ended work.');
+  });
+
+  it('says which model is Nerve\'s default when the instance was set to another', async () => {
+    m(api.setupModels).mockResolvedValue({
+      ...MODELS,
+      models: MODELS.models.map((x) => ({ ...x, recommended: x.id === 'claude-sonnet-5-5' })),
+      current: { model: 'claude-sonnet-5-5', effort: 'high' },
+    });
+    current = withStep(makeState(), step('provider', { status: 'done' }, {
+      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-sonnet-5-5', effort: 'high',
+    }));
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    const model = await screen.findByLabelText('Model');
+    expect(model).toHaveAccessibleDescription(/Nerve's default is Claude Opus 5\.5; this instance is set to Claude Sonnet 5\.5\./);
+    expect(screen.getByRole('option', { name: 'Claude Sonnet 5.5 · recommended' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Claude Opus 5.5' })).toBeInTheDocument();
   });
 
   it('reports a precise failure from the server-side test', async () => {
@@ -859,7 +916,7 @@ describe('provider', () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, { credential: 'environment' }));
     renderAt('/setup/provider');
     await heading('Connect a model');
-    expect(screen.getByText(/Configured from the environment/)).toBeInTheDocument();
+    expect(screen.getByText(/Configured by your operator \(environment\)\./)).toHaveTextContent(/Change it where the server process gets its environment/);
     // No way to type or replace a key: the cards, the key field, Replace,
     // Remove and Test are all absent, so a PUT can never carry a credential.
     expect(screen.queryByRole('radiogroup', { name: 'Model provider' })).not.toBeInTheDocument();
@@ -957,13 +1014,30 @@ describe('provider', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { type: 'anthropic', anthropic_api_key: null }));
   });
 
-  it('warns when the only credential is a subscription token', async () => {
+  it('warns when the only credential is a subscription token, and names where background jobs get a key', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       type: 'oauth', credential: 'oauth_token', claude_oauth_token: on('9z8y'), warning: 'oauth_background_jobs',
     }));
     renderAt('/setup/provider');
     await heading('Connect a model');
-    expect(screen.getByText(/Chat works; memory, titles and scheduled jobs need an API key/)).toBeInTheDocument();
+    const warning = screen.getByText(/Chat works, but memory, titles and scheduled jobs cannot use it/);
+    expect(warning).toHaveTextContent('Replace the token with an Anthropic API key on this step');
+    expect(warning).toHaveTextContent("set ANTHROPIC_API_KEY in the server's environment");
+    // The Memory step only takes an OpenAI key, so it is never named as the way.
+    expect(warning).not.toHaveTextContent(/Memory step/);
+    expect(within(warning).getByText('ANTHROPIC_API_KEY').tagName).toBe('CODE');
+  });
+
+  it('the subscription card says where background jobs get a key, never the Memory step', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.click(screen.getByRole('radio', { name: /Claude subscription/ }));
+    const notice = screen.getByText(/Memory, titles and scheduled jobs cannot use a subscription token/);
+    expect(notice).toHaveTextContent('choose Anthropic API key above instead');
+    expect(notice).toHaveTextContent("set ANTHROPIC_API_KEY in the server's environment");
+    expect(notice).toHaveTextContent('set up the proxy with nerve init --terminal');
+    expect(notice).not.toHaveTextContent(/Memory step/);
+    expect(notice.textContent).not.toContain('`');
   });
 });
 
@@ -983,7 +1057,7 @@ describe('channels', () => {
   it('shows the unavailable notice and takes a manual user id', async () => {
     current = configured();
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     expect(screen.getByText(/after the restart at the end of setup/)).toBeInTheDocument();
     expect(screen.getByText(/@example_assistant_bot/)).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText(/numeric Telegram user id/), '123456789');
@@ -994,7 +1068,7 @@ describe('channels', () => {
   it('offers in-wizard pairing when the bot is live', async () => {
     current = configured({ live: true, pairing_available: true, pairing_unavailable_reason: null });
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     await userEvent.click(await screen.findByRole('button', { name: 'Get pairing code' }));
     expect(await screen.findByLabelText('Pairing code')).toHaveTextContent('483920');
     expect(screen.getByRole('link', { name: /Open @example_assistant_bot in Telegram/ }))
@@ -1005,25 +1079,25 @@ describe('channels', () => {
   it('shows a start error from the last boot above the token', async () => {
     current = configured({ start_error: 'InvalidToken: The token <token> was rejected by the server.' });
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     expect(screen.getByText(/could not start with the saved token/)).toHaveTextContent('Replace the token and restart.');
   });
 
   it('lands a 400 with field bot_token under the token field', async () => {
     m(api.setupStep).mockRejectedValue(new ApiError(400, '{"detail": "Telegram rejected this token: unauthorized", "field": "bot_token"}'));
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     const token = telegramCard().getByLabelText('Bot token');
     await userEvent.type(token, `123456:${'A'.repeat(35)}`);
     await userEvent.click(continueButton());
     await waitFor(() => expect(token).toHaveAttribute('aria-invalid', 'true'));
     expect(token).toHaveAccessibleDescription(/Telegram rejected this token/);
-    expect(screen.getByRole('heading', { level: 1, name: 'Talk to Nerve where you already are' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Connect Telegram or Slack' })).toBeInTheDocument();
   });
 
   it('refuses a malformed token before asking the server', async () => {
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     await userEvent.type(telegramCard().getByLabelText('Bot token'), 'nope');
     await userEvent.click(continueButton());
     expect(telegramCard().getByLabelText('Bot token')).toHaveAccessibleDescription(/does not look like a bot token/);
@@ -1033,7 +1107,7 @@ describe('channels', () => {
   it('tests a token and names the bot', async () => {
     m(api.setupTelegramTest).mockResolvedValue({ ok: true, bot_username: 'example_assistant_bot', detail: null });
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     await userEvent.type(telegramCard().getByLabelText('Bot token'), `123456:${'A'.repeat(35)}`);
     await userEvent.click(screen.getByRole('button', { name: 'Test token' }));
     expect(await screen.findByText(/Token works: @example_assistant_bot/)).toBeInTheDocument();
@@ -1043,25 +1117,26 @@ describe('channels', () => {
     const skipped = withStep(makeState(), step('channels', { status: 'skipped' }));
     m(api.setupSkip).mockImplementation(async () => { current = skipped; return skipped; });
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     expect(screen.queryByRole('button', { name: 'Skip for now' })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /No channels for now/ }));
+    await userEvent.click(screen.getByRole('button', { name: /Continue without channels/ }));
     expect(api.setupSkip).toHaveBeenCalledWith('channels', true);
     expect(api.setupStep).not.toHaveBeenCalled();
-    expect(await heading('What should Nerve read?')).toBeInTheDocument();
+    expect(await heading('Choose what Nerve reads')).toBeInTheDocument();
   });
 
   it('typing a token turns the primary back into Continue and brings Skip back', async () => {
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
+    expect(screen.getByRole('button', { name: 'Continue without channels' })).toBeInTheDocument();
     await userEvent.type(telegramCard().getByLabelText('Bot token'), '123');
-    expect(screen.getByRole('button', { name: /^Continue/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Skip for now' })).toBeInTheDocument();
   });
 
   it('keeps Slack behind a disclosure and lands a Slack rejection under the Slack token, not Telegram', async () => {
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     expect(screen.queryByRole('region', { name: 'Slack' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /Also connect Slack \(advanced\)/ }));
     const slackCard = within(screen.getByRole('region', { name: 'Slack' }));
@@ -1085,20 +1160,325 @@ describe('channels', () => {
       slack: { ...CHANNELS.slack, enabled: true, bot_token: on('abcd'), app_token: on('efgh') },
     }));
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
+    await heading('Connect Telegram or Slack');
     expect(screen.getByRole('region', { name: 'Slack' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Also connect Slack/ })).not.toBeInTheDocument();
   });
 
-  it('shows Slack as managed by the gateway in hosted channel mode', async () => {
-    current = withStep(makeState(), step('channels', {}, {
+  it('shows Slack as managed by the gateway in hosted channel mode, with its status and only the switch', async () => {
+    const hosted = (gateway: { streams: number; connected: boolean; last_event_at: string | null } | null) => withStep(makeState(), step('channels', { status: 'done' }, {
       telegram: CHANNELS.telegram,
-      slack: { enabled: true, mode: 'hosted', bot_token: on('abcd'), app_token: on('efgh'), allow_users: [], allow_direct_messages: true, allow_channels: [] },
+      slack: {
+        enabled: true, mode: 'hosted', bot_token: on('abcd', 'gateway'), app_token: on('efgh', 'gateway'),
+        allow_users: [], allow_direct_messages: true, allow_channels: [], gateway,
+      },
     }));
+    current = hosted({ streams: 2, connected: true, last_event_at: '2026-10-10T09:12:03Z' });
+    const view = renderAt('/setup/channels');
+    await heading('Connect Telegram or Slack');
+    let slackCard = within(screen.getByRole('region', { name: 'Slack' }));
+    // The gateway's stream count is its internal detail; the line names the state and what can be changed.
+    const gatewayLine = slackCard.getByText(/Managed by your organisation's channel gateway · connected/);
+    expect(gatewayLine).toHaveTextContent('You can only turn Slack on or off here.');
+    expect(gatewayLine).not.toHaveTextContent('stream');
+    expect(slackCard.queryByLabelText('Bot token')).not.toBeInTheDocument();
+    expect(slackCard.queryByLabelText('App-level token')).not.toBeInTheDocument();
+    expect(slackCard.queryByRole('button', { name: /Test Slack/ })).not.toBeInTheDocument();
+    expect(slackCard.getByRole('checkbox', { name: 'Slack enabled' })).toBeChecked();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    current = hosted({ streams: 0, connected: false, last_event_at: null });
     renderAt('/setup/channels');
-    await heading('Talk to Nerve where you already are');
-    expect(screen.getByText(/managed by the channel gateway/)).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: 'Slack' })).queryByLabelText('Bot token')).not.toBeInTheDocument();
+    await heading('Connect Telegram or Slack');
+    slackCard = within(screen.getByRole('region', { name: 'Slack' }));
+    expect(slackCard.getByText(/channel gateway · waiting for the gateway/)).toBeInTheDocument();
+  });
+});
+
+describe('pre-configured connections', () => {
+  it('a provider credential from a configuration repository is managed: no Replace, Remove or Test; the picker still is', async () => {
+    current = withStep(makeState(), step('provider', { status: 'done' }, {
+      credential: 'api_key', credential_source: 'config-repo', anthropic_api_key: on('ab12', 'config-repo'),
+      model: 'claude-opus-5-5', effort: 'high',
+    }));
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    expect(screen.getByText(/Managed from the configuration repository\./)).toHaveTextContent(/Change it in the repository/);
+    expect(screen.queryByRole('radiogroup', { name: 'Model provider' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/API key|subscription token/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^(Replace|Remove|Test connection)$/ })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain('leave blank to keep');
+    expect(await screen.findByLabelText('Model')).toBeEnabled();
+    await userEvent.click(screen.getByRole('radio', { name: 'low' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'low' }));
+  });
+
+  it('a Telegram bot token from the environment is managed; the Ready screen says where it came from', async () => {
+    const channels = withStep(makeState({ finished: true, steps_left: 0 }), step('channels', { status: 'done' }, {
+      telegram: {
+        ...CHANNELS.telegram, enabled: true, bot_token: on('Xw9z', 'environment'), bot_username: 'example_assistant_bot',
+        live: true, allowed_users_count: 1,
+      },
+      slack: CHANNELS.slack,
+    }));
+    current = channels;
+    const view = renderAt('/setup/channels');
+    await heading('Connect Telegram or Slack');
+    const card = within(screen.getByRole('region', { name: 'Telegram' }));
+    expect(card.getByText(/Configured by your operator \(environment\)/)).toHaveTextContent('…Xw9z');
+    expect(card.getByText(/Change it where the server process gets its environment/)).toBeInTheDocument();
+    expect(card.queryByRole('button', { name: /^(Replace|Remove|Test token)$/ })).not.toBeInTheDocument();
+    expect(card.queryByText(/BotFather/)).not.toBeInTheDocument();
+    expect(card.queryByLabelText('Bot token', { selector: 'input' })).not.toBeInTheDocument();
+    view.unmount();
+
+    render(<MemoryRouter><ReadyScreen state={channels} /></MemoryRouter>);
+    expect(screen.getByRole('list', { name: 'Summary' })).toHaveTextContent('Telegram: @example_assistant_bot · from the environment');
+  });
+
+  it('an OpenAI key from the environment fixes the memory choice and Continue sends nothing', async () => {
+    current = withStep(makeState(), step('memory', { status: 'done' }, { openai_api_key: on('ab12', 'environment'), embeddings_chosen: true }));
+    renderAt('/setup/memory');
+    await heading('Memory');
+    expect(screen.getByRole('radio', { name: /Use embeddings/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /No embeddings/ })).toBeDisabled();
+    expect(screen.getByText(/Configured by your operator \(environment\)/)).toHaveTextContent('…ab12');
+    expect(screen.queryByRole('button', { name: /^(Replace|Remove|Test key)$/ })).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    expect(await heading('Connect Telegram or Slack')).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+
+  it('sources the operator provided render as managed lines, not fields', async () => {
+    current = withStep(makeState(), step('sources', { status: 'done' }, {
+      github: { enabled: true, source: 'environment' },
+      gmail: { enabled: true, accounts: ['alice@example.com'], source: 'config-repo' },
+      telegram: {
+        enabled: true, api_id: on('4567', 'environment'), api_hash: on('ab12', 'environment'),
+        session: { present: true, authorized: true, user: ALICE },
+      },
+    }));
+    m(api.setupTelegramSession).mockResolvedValue(SESSION_IN);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getByText('Token: configured by your operator (environment)')).toBeInTheDocument();
+    expect(screen.getByText('Accounts: managed from the configuration repository')).toBeInTheDocument();
+    expect(screen.getByText('alice@example.com')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Remove alice@example.com/ })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Gmail addresses')).not.toBeInTheDocument();
+    const tg = within(screen.getByRole('region', { name: 'Telegram sync' }));
+    expect(tg.getAllByText(/Configured by your operator \(environment\)/)).toHaveLength(2);
+    expect(tg.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(tg.getByText('Signed in as @alice_example')).toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: true, telegram: true }));
+  });
+
+  it('"Already configured" names the steps whose credentials the operator provided', async () => {
+    current = makeState({
+      steps: makeState().steps.map((s) => (
+        s.id === 'memory' ? step('memory', { status: 'done' }, { openai_api_key: on('ab12', 'environment') })
+          : s.id === 'channels' ? step('channels', { status: 'done' }, { telegram: CHANNELS.telegram, slack: { ...CHANNELS.slack, mode: 'hosted', enabled: true } })
+            : s
+      )),
+    });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Memory, Channels.');
+  });
+});
+
+describe('telegram message sync sign-in', () => {
+  const NOBODY: TelegramSyncSessionSummary = { present: false, authorized: false, user: null };
+  const withCredentials = (session: TelegramSyncSessionSummary = NOBODY) =>
+    withStep(makeState(), step('sources', { status: 'done' }, {
+      telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session },
+    }));
+  const telegramCard = () => within(screen.getByRole('region', { name: 'Telegram sync' }));
+
+  it('asks for the credentials to be saved first, and names the terminal fallback', async () => {
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Telegram — your own messages/ }));
+    expect(screen.getByText(/Reads the chats of your own Telegram account/)).toBeInTheDocument();
+    expect(screen.getByText('Save the API credentials first (Continue), then sign in.')).toBeInTheDocument();
+    expect(screen.getByText('nerve setup-telegram')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Phone number')).not.toBeInTheDocument();
+    expect(api.setupTelegramSession).not.toHaveBeenCalled();
+  });
+
+  it('signs in: phone, code, the two-step password, then "Signed in as @name" with Sign out', async () => {
+    current = withCredentials();
+    m(api.setupTelegramSessionStart).mockResolvedValue({ pending: 'code', phone_masked: '+1••••••89', expires_in: 600 });
+    m(api.setupTelegramSessionCode).mockResolvedValue({ ...SESSION_OUT, pending: 'password' });
+    m(api.setupTelegramSessionPassword).mockResolvedValue(SESSION_IN);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const reads = m(api.setupState).mock.calls.length;
+    const phone = await screen.findByLabelText('Phone number');
+    await userEvent.type(phone, '+15550100');
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    expect(api.setupTelegramSessionStart).toHaveBeenCalledWith({ phone: '+15550100' });
+    expect(await screen.findByText(/Telegram sent a code to \+1••••••89/)).toHaveTextContent('valid for 10 minutes');
+
+    // Enter in the code field acts on the panel, not on the step's form.
+    await userEvent.type(screen.getByLabelText('Code'), '12345{Enter}');
+    expect(api.setupTelegramSessionCode).toHaveBeenCalledWith({ code: '12345' });
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    const password = await screen.findByLabelText('Two-step verification password');
+    expect(password).toHaveAttribute('type', 'password');
+    expect(screen.getByText(/This account has two-step verification/)).toBeInTheDocument();
+    await userEvent.type(password, 'correct horse');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(api.setupTelegramSessionPassword).toHaveBeenCalledWith({ password: 'correct horse' });
+    expect(await screen.findByText('Signed in as @alice_example')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Phone number')).not.toBeInTheDocument();
+    // The checklist is re-read so its summary and the Ready screen agree.
+    await waitFor(() => expect(m(api.setupState).mock.calls.length).toBeGreaterThan(reads));
+    expect(document.body.textContent).not.toContain('correct horse');
+  });
+
+  it('lands a refused phone or code under its field, and says how long Telegram asks to wait', async () => {
+    current = withCredentials();
+    m(api.setupTelegramSessionStart)
+      .mockRejectedValueOnce(new ApiError(400, '{"detail": "That is not a phone number Telegram knows.", "field": "phone"}'))
+      .mockRejectedValueOnce(new ApiError(429, '{"detail": "Too many attempts.", "retry_after": 42}'))
+      .mockResolvedValue({ pending: 'code', phone_masked: '+1••••••89', expires_in: 600 });
+    m(api.setupTelegramSessionCode).mockRejectedValue(new ApiError(400, '{"detail": "The code is wrong or has expired.", "field": "code"}'));
+    m(api.setupTelegramSessionCancel).mockResolvedValue(SESSION_OUT);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const phone = await screen.findByLabelText('Phone number');
+    // Empty: named under the field, no request.
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    expect(phone).toHaveAccessibleDescription(/Enter the phone number of your Telegram account/);
+    expect(api.setupTelegramSessionStart).not.toHaveBeenCalled();
+
+    await userEvent.type(phone, '12');
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    await waitFor(() => expect(phone).toHaveAttribute('aria-invalid', 'true'));
+    expect(phone).toHaveAccessibleDescription(/not a phone number Telegram knows/);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Telegram asks you to wait 42 seconds.');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    const code = await screen.findByLabelText('Code');
+    await userEvent.type(code, '00000');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await waitFor(() => expect(code).toHaveAttribute('aria-invalid', 'true'));
+    expect(code).toHaveAccessibleDescription(/wrong or has expired/);
+
+    // Start over drops the pending login on the server and returns to the phone.
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    expect(api.setupTelegramSessionCancel).toHaveBeenCalled();
+    expect(await screen.findByLabelText('Phone number')).toBeInTheDocument();
+  });
+
+  it('shows who is signed in from the checklist before the check answers; Sign out returns to the phone', async () => {
+    current = withCredentials({ present: true, authorized: true, user: ALICE });
+    m(api.setupTelegramSession).mockResolvedValue(SESSION_IN);
+    m(api.setupTelegramSessionLogout).mockResolvedValue(SESSION_OUT);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(telegramCard().getByText('Signed in as @alice_example')).toBeInTheDocument();
+    await waitFor(() => expect(api.setupTelegramSession).toHaveBeenCalled());
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    expect(api.setupTelegramSessionLogout).toHaveBeenCalled();
+    expect(await screen.findByLabelText('Phone number')).toBeInTheDocument();
+    expect(screen.queryByText(/Signed in as/)).not.toBeInTheDocument();
+  });
+
+  it('says when the running sync holds the session, and Check again re-reads it', async () => {
+    current = withCredentials();
+    m(api.setupTelegramSession)
+      .mockResolvedValueOnce({ ...SESSION_OUT, session_present: true, authorized: null, reason: 'busy' })
+      .mockResolvedValue(SESSION_IN);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(await screen.findByText(/The sync is using the session right now/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Check again' }));
+    expect(await screen.findByText('Signed in as @alice_example')).toBeInTheDocument();
+  });
+
+  it('says when Telegram could not be reached, by the probe and by a sign-in step, without losing the way forward', async () => {
+    current = withCredentials();
+    m(api.setupTelegramSession)
+      .mockResolvedValueOnce({ ...SESSION_OUT, authorized: null, reason: 'unreachable' })
+      .mockResolvedValue(SESSION_OUT);
+    m(api.setupTelegramSessionStart)
+      .mockRejectedValueOnce(new ApiError(502, '{"detail": "The server could not reach Telegram; nothing was changed. Try again."}'))
+      .mockResolvedValue({ pending: 'code', phone_masked: '+1••••••89', expires_in: 600 });
+    m(api.setupTelegramSessionCode).mockRejectedValue(new ApiError(409, '{"detail": "The code has expired. Start over to get a new one."}'));
+    m(api.setupTelegramSessionCancel).mockResolvedValue(SESSION_OUT);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(await screen.findByText(/The server could not reach Telegram, so the session could not be checked/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Check again' }));
+    await waitFor(() => expect(screen.queryByText(/could not be checked/)).not.toBeInTheDocument());
+
+    // A 502 from a sign-in step is a plain sentence, not a field error; the phone stays as typed.
+    const phone = await screen.findByLabelText('Phone number');
+    await userEvent.type(phone, '+15550100');
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('The server could not reach Telegram; nothing was changed. Try again.');
+    expect(phone).not.toHaveAttribute('aria-invalid');
+    expect(phone).toHaveValue('+15550100');
+
+    // A 409 (expired code) is a plain sentence too, and Start over is right there.
+    await userEvent.click(screen.getByRole('button', { name: 'Send code' }));
+    await userEvent.type(await screen.findByLabelText('Code'), '12345');
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('The code has expired. Start over to get a new one.');
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    expect(await screen.findByLabelText('Phone number')).toBeInTheDocument();
+  });
+
+  it('saving new credentials stays on the step, announces the sign-in panel and focuses it; the next Continue moves on', async () => {
+    const saved = withStep(makeState(), step('sources', { status: 'done', etag: 'sources-etag-2' }, {
+      telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session: { present: false, authorized: false, user: null } },
+    }));
+    m(api.setupStep).mockImplementation(async () => { current = saved; return saved; });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Telegram — your own messages/ }));
+    await userEvent.type(screen.getByLabelText('API id'), '1234567');
+    await userEvent.type(screen.getByLabelText('API hash'), 'abcdef0123456789abcdef0123456789');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', {
+      github: false, gmail: false, telegram: true, telegram_api_id: 1234567, telegram_api_hash: 'abcdef0123456789abcdef0123456789',
+    }));
+    expect(screen.getByRole('heading', { level: 1, name: 'Choose what Nerve reads' })).toBeInTheDocument();
+    expect(await screen.findByText('Saved. Sign in to your Telegram account below, then Continue.')).toBeInTheDocument();
+    const panelHeading = await screen.findByRole('heading', { level: 3, name: 'Sign in to your Telegram account' });
+    await waitFor(() => expect(panelHeading).toHaveFocus());
+    expect(await screen.findByLabelText('Phone number')).toBeInTheDocument();
+
+    m(api.setupStep).mockClear();
+    await userEvent.click(continueButton());
+    expect(await heading('Scheduled jobs')).toBeInTheDocument();
+  });
+
+  it('the ready screen lists an unsigned Telegram sync with a way back to the step', () => {
+    const sync = (session: TelegramSyncSessionSummary) =>
+      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done' }, {
+        telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session },
+      }));
+    const view = render(<MemoryRouter><ReadyScreen state={sync({ present: false, authorized: false, user: null })} /></MemoryRouter>);
+    const summary = screen.getByRole('list', { name: 'Summary' });
+    expect(summary).toHaveTextContent('Telegram message sync: not signed in');
+    expect(within(summary).getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/setup/sources');
+    // The line above the summary does not claim that everything is in effect.
+    expect(screen.getByText('Setup is complete.')).toBeInTheDocument();
+    expect(screen.queryByText(/in effect/)).not.toBeInTheDocument();
+    view.unmount();
+
+    render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
+    expect(screen.queryByText(/not signed in/)).not.toBeInTheDocument();
   });
 });
 
@@ -1118,7 +1498,7 @@ describe('remount only when persisted values change', () => {
     expect(screen.getByLabelText('Anthropic API key')).toHaveValue('sk-ant-REPLACE-TYPED');
 
     // A changed etag (somebody else saved) remounts with fresh hydration.
-    current = withStep(makeState(), step('provider', { etag: 'provider-etag-2' }, { model: 'claude-opus-5' }));
+    current = withStep(makeState(), step('provider', { etag: 'provider-etag-2' }, { model: 'claude-fable-5-1' }));
     act(() => { document.dispatchEvent(new Event('visibilitychange')); });
     await waitFor(() => expect(screen.getByLabelText('Anthropic API key')).toHaveValue(''));
   });
@@ -1184,7 +1564,7 @@ describe('review and the ending', () => {
     expect(reasons).toHaveTextContent('Time zone: America/New_York → Europe/Berlin');
     expect(reasons).toHaveTextContent('Telegram bot settings');
     expect(reasons).toHaveTextContent('telegram.bot_token: changed');
-    expect(screen.getByText('Some of what you changed is read at startup.')).toBeInTheDocument();
+    expect(screen.getByText('Some changes take effect after a restart.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Restart Nerve' })).toBeInTheDocument();
     expect(await screen.findByText(/Install gh and run gh auth login/)).toBeInTheDocument();
     expect(screen.getByText(/served over plain HTTP/)).toBeInTheDocument();
@@ -1201,14 +1581,14 @@ describe('review and the ending', () => {
     current = makeState({ restart_pending: true, restart_reasons: ['memory: changed'] });
     renderAt('/setup/review');
     await heading('Review and finish');
-    expect(screen.getByText('One restart finishes a fresh setup; this page reconnects on its own.')).toBeInTheDocument();
+    expect(screen.getByText('First-time setup needs one restart to finish.')).toBeInTheDocument();
     const reasons = screen.getByRole('list', { name: 'Restart reasons' });
-    expect(reasons).toHaveTextContent('The mode you chose (its memory layout is read at startup)');
+    expect(within(reasons).getByText('The mode you chose')).toBeInTheDocument();
     expect(reasons).not.toHaveTextContent(/Memory settings/);
     expect(reasons).toHaveTextContent('memory: changed');
     // Before the click the card speaks in the future tense; "Restarting." is
     // the overlay's sentence.
-    expect(screen.getByText('Restarting stops this process and starts a new one; this page reconnects on its own.')).toBeInTheDocument();
+    expect(screen.getByText('Restarting stops Nerve and starts it again. This page reconnects by itself.')).toBeInTheDocument();
     expect(screen.queryByText(/^Restarting\./)).not.toBeInTheDocument();
   });
 
@@ -1216,7 +1596,7 @@ describe('review and the ending', () => {
     current = makeState({ restart_pending: true, restart_reasons: ['memory: changed', 'timezone: changed'] });
     renderAt('/setup/review');
     await heading('Review and finish');
-    expect(screen.getByText('Some of what you changed is read at startup.')).toBeInTheDocument();
+    expect(screen.getByText('Some changes take effect after a restart.')).toBeInTheDocument();
   });
 
   it('lists what is still to do above the Finish button, with a one-click Skip', async () => {
@@ -1280,7 +1660,7 @@ describe('review and the ending', () => {
     })));
     expect(await heading('Nerve is ready')).toHaveFocus();
     await userEvent.click(screen.getByRole('button', { name: /Say hello to Nerve/ }));
-    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi! I'm Alice Example. Tell me");
+    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi, I'm Alice Example. Tell me");
     view.unmount();
 
     // Local, no display name anywhere: the clause is dropped rather than "I'm alice".
@@ -1292,14 +1672,14 @@ describe('review and the ending', () => {
     view = readyAt(withStep(makeState({ finished: true, steps_left: 0 }), step('profile', { status: 'done' }, { name: null, actor_name: null })));
     await userEvent.click(screen.getByRole('button', { name: /Say hello to Nerve/ }));
     const probe = await screen.findByText(/chat page/);
-    expect(probe).toHaveTextContent('Hi! Tell me what you can do');
+    expect(probe).toHaveTextContent('Hi. Tell me what you can do');
     expect(probe).not.toHaveTextContent(/I'm/);
     view.unmount();
 
     // Local with a USER.md name but no account display name: the USER.md name is the person's own.
     readyAt(withStep(makeState({ finished: true, steps_left: 0 }), step('profile', { status: 'done' }, { name: 'Alice', actor_name: null })));
     await userEvent.click(screen.getByRole('button', { name: /Say hello to Nerve/ }));
-    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi! I'm Alice. Tell me");
+    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi, I'm Alice. Tell me");
   });
 
   it('Finish waits until every step is decided, and says so', async () => {
@@ -1337,7 +1717,7 @@ describe('review and the ending', () => {
     expect(await heading('Nerve is ready')).toBeInTheDocument();
     expect(api.restartSystem).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: /Say hello to Nerve/ }));
-    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi! I'm Alice. Tell me what you can do");
+    expect(await screen.findByText(/chat page/)).toHaveTextContent("Hi, I'm Alice. Tell me what you can do");
   });
 
   it('Finish with a pending restart restarts, waits for the new generation, and ends ready', async () => {
@@ -1369,7 +1749,7 @@ describe('review and the ending', () => {
     await screen.findByRole('dialog', { name: /Restarting Nerve/ });
     await act(async () => { await vi.advanceTimersByTimeAsync(121_000); });
     expect(await screen.findByRole('dialog', { name: 'Nerve did not come back' })).toHaveAccessibleDescription(/nerve logs/);
-    expect(screen.getByRole('button', { name: 'Retry waiting' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Keep waiting' })).toBeInTheDocument();
   });
 
   it('a worker ends with the onboarding session', async () => {
@@ -1432,7 +1812,7 @@ describe('review and the ending', () => {
         </Routes>
       </MemoryRouter>,
     );
-    expect(screen.getByRole('status')).toHaveTextContent('The onboarding session ended without writing a plan — open it to see why.');
+    expect(screen.getByRole('status')).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
     expect(screen.queryByText(/Onboarding session starting/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open the onboarding session' })).toBeInTheDocument();
 
