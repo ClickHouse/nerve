@@ -124,13 +124,13 @@ Append the worker's jobs to `<workspace>/config/cron/jobs.yaml` — Nerve's \
 scheduler (`nerve cron <id>` runs one by hand), not the system crontab. One job \
 per line of `TASK.md` § Triggers. Gate a job with `run_if` where the guide says, \
 so it stays idle until there is work: a `tasks` gate on the status and tag a \
-lane owns for the jobs that work the queue, a `messages` gate for inbox-driven \
+work job owns, a `messages` gate for inbox-driven \
 work, a `github_pr_activity` gate (with the bot's login as `author`) for a PR \
 monitor. Scan jobs that create the work run on their schedule, ungated. \
 `lock: true` and `catchup: false` on anything that may outrun its interval. \
-Lane procedure goes in `config/cron/prompts/<lane>.md`, loaded with \
+Procedure for one job goes in `config/cron/prompts/<job>.md`, loaded with \
 `prompt_file` and opening with "`TASK.md` is the kernel; this file is your \
-charter for the <lane> phase." Format:
+charter for the <job> phase." Format:
 
 ```yaml
 jobs:

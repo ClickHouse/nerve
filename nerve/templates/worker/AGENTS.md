@@ -13,7 +13,7 @@ Do this silently; the first visible action is work. Do not re-read the injected 
 ## Memory
 - Hot: `MEMORY.md`, first 300 lines injected everywhere: rules, one-line facts, stubs. Edited only by the maintenance job, humans, and you when recording a human directive.
 - Warm: `memory/contexts/<slug>.md`, one per workstream or incident family, never injected. Per-task detail goes in the task file.
-- Deep: memU. Before ending every session, `memorize` root causes, repro steps, what worked and what did not, decisions and why. Nothing new: one event line of what you checked.
+- Long-term: semantic memory. Before ending every session, `memorize` root causes, repro steps, what worked and what did not, decisions and why. Nothing new: one event line of what you checked.
 - Stub rule: an Active Context entry is at most 5 lines. Longer: move the body verbatim to a context file headed `Moved from MEMORY.md: YYYY-MM-DD`.
 - `memorize` failed twice: append one bullet to `memory/contexts/lessons-inbox.md`. Never fall back to `MEMORY.md`.
 
@@ -40,7 +40,7 @@ The left column is autonomous once `TASK.md` § Approval Required grants it. Unt
 - A waiting status needs a real external block: a PR, a question you posted, an event you cannot act before. Never leave a blocked task in `pending`.
 - A human directive or reviewer comment moves a task from any status to actionable with `needs-response`.
 - Prefer `task_update(note=...)`. `task_write` replaces the file and re-derives tags from its `**Tags:**` line.
-- One real-work item per run, plus all status hygiene. A task ends a run `in_progress` only with ownership intact and a resume note.
+- One real-work item per run, plus all status hygiene. Work left when the run ends: return the task to `pending` with a resume note.
 
 ## Run shape
 Hygiene transitions first, then the work. Before the final text: the status transition, `memorize`, `notify`. The final text says what changed and where.
@@ -51,7 +51,7 @@ Hygiene transitions first, then the work. Before the final text: the status tran
 - Chat apps: no markdown tables, full URLs, never a bare `#123`.
 
 ## Defects you find: say it, then register it
-Noticing is not a mandate. Disclose it in one sentence in the parent PR or task note. Create a task only with an `## Impact` section that passes all four tests: reachable, consequence, observed, wanted.
+Noticing is not a mandate. Disclose it in one sentence in the parent PR or task note. Create a task only when it clears the bar `TASK.md` sets, e.g. an `## Impact` section (reachable, consequence, observed, wanted).
 
 ## Boundaries
 - Never comment on, review or push to PRs or issues you did not open, unless addressed. If someone else's fix exists, track it and move on.
@@ -60,8 +60,8 @@ Noticing is not a mandate. Disclose it in one sentence in the parent PR or task 
 
 ## Execution hygiene and safety
 - Builds and tests run in the foreground as one call: `timeout` above the expected duration, `cmd > build.log 2>&1; rc=$?; tail -50 build.log; echo RC=$rc`. Never `$?` after a pipe, never background-and-exit, never sleep-poll across turns. Too long for one call: end the run with a resume note.
-- Before a write outside your own tree, run the ownership gate. Only the permit code proceeds; no `rm -rf`, no `--force`.
-- Launch servers, engines and benchmarks memory-capped with a runtime limit. A capped run that dies is a result.
+- Before a write outside your own tree, confirm the target is yours (your fork, branch or task files); no `rm -rf`, no `--force`.
+- Run servers, engines and benchmarks under a runtime limit; a run that hits it is a result.
 - Kill by PID, never by pattern. Prove the PID is yours: `ps -p <pid> -o pid=,ppid=,lstart=,command=`.
 - Redact before output. Credentials travel via stdin, 0600 files or headers, never argv; record where they live, never their value.
 - Before a push to a public remote, scan the whole range, commit messages included, for names, emails, hosts and secrets.
@@ -71,7 +71,7 @@ Noticing is not a mandate. Disclose it in one sentence in the parent PR or task 
 - A human correction or "remember this": edit `TASK.md` (procedure, policy) or `MEMORY.md` (facts, lessons) with a provenance tag such as `[operator directive YYYY-MM-DD]`, editing the existing entry; `memorize` as backup.
 - Non-negotiables are `⛔ HARD RULE:` headings in `TASK.md`: one sentence of rule before any why, failing closed on anything not explicitly permitted.
 - One authoritative home per rule; elsewhere, point to it. Volatile facts (pins, schedules, caps) are pointers: "lives in `<file>`, read it".
-- Lane procedure goes in that lane's cron prompt file, not in `TASK.md`.
+- Procedure for one job goes in that job's cron prompt file, not in `TASK.md`.
 - Under lockdown the reviewed files are read-only: use `propose_config_change`. `TASK.md`, `MEMORY.md` and `memory/` stay writable.
 
 ## Further reading

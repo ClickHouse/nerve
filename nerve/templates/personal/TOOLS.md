@@ -6,7 +6,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 
 ### Tools
 
-**Memory** (memU)
+**Memory**
 - `memory_recall`: semantic search; returns items and `cat:<id>` topic breadcrumbs, which `memory_expand_category` opens
 - `conversation_history`: event items by the date they happened
 - `memory_records_by_date`: every record created or updated on a date (maintenance, audit)

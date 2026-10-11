@@ -14,7 +14,7 @@ Do this silently. Your brain files are already in the prompt: do not re-read the
 ## Memory
 - Hot: `MEMORY.md`, first 300 lines injected into every session. Admission test and tags are in its header.
 - Warm: `memory/contexts/<slug>.md`, one per workstream, never injected. Handoffs, rulings and revert paths go here.
-- Deep: memU. `memorize` writes, `memory_recall` reads.
+- Long-term: semantic memory — `memorize` writes, `memory_recall` reads.
 - Stub rule: an Active Context entry is at most 5 lines (~500 bytes). When it grows, move the body verbatim into the context file and keep the stub.
 - Save your own conclusions as `UNCONFIRMED` until the human confirms them. Fetch volatile facts (prices, quotas, balances) at use time.
 
