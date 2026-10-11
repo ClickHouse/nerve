@@ -183,7 +183,7 @@ keep", never read back.
 | Step | Asks | Writes | Takes effect |
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
-| **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …; worker: `TASK.md`), mode defaults in `settings.yaml` only where absent, `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
+| **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours (prefilled 22:00–07:00), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml`; the matching lines of `USER.md` and `IDENTITY.md` (personal) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
@@ -270,8 +270,8 @@ reasons are listed before you click. Then:
   answer (see [Restarts from the browser](#restarts-from-the-browser)). The
   page stays where it is, reconnects on its own and ends the same way.
 - A **worker** ends with "Onboarding session starting" and a link to that
-  session: the agent reads your task description, researches it and writes
-  `TASK.md` — see the [Worker Guide](worker-guide.md).
+  session: the agent reads your task description, researches it and fills in
+  `TASK.md` — see the [Worker Guide](worker-guide.md#how-onboarding-works).
 
 ### Coming back later
 

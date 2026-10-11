@@ -646,9 +646,10 @@ reports as `restart_mode`, `restart_message` and `restart_command`.
 #### `POST /api/setup/finish`
 
 Body `{}`. Reloads the configuration, recomputes the checklist and, for a
-worker whose `TASK.md` is still the raw description, a provider is configured
-and nothing waits on a restart, starts the onboarding session. Idempotent;
-allowed under lockdown (it writes nothing).
+worker whose `TASK.md` still carries the onboarding marker (the comment on its
+second line, deleted by the onboarding session when the file is complete), a
+provider is configured and nothing waits on a restart, starts the onboarding
+session. Idempotent; allowed under lockdown (it writes nothing).
 
 ```json
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "cron:worker-onboarding:…" } }
@@ -658,9 +659,9 @@ Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_re
 `onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
 `not_applicable`, `pending`, `running`, `ended` or `done`. `ended` means the
 onboarding session exists but the engine is no longer driving it while
-`TASK.md` still has no `## Mission` — it stopped without writing a plan (a
-placeholder key, a crash); the session id is carried so the page can link to
-it instead of waiting. Calling `finish` again schedules the session anew; the
+`TASK.md` still carries the onboarding marker — it stopped before completing
+the file (a placeholder key, a crash); the session id is carried so the page
+can link to it instead of waiting. Calling `finish` again schedules the session anew; the
 ended row stays in the table, and a session the engine is driving always wins
 over an ended one (among several ended ones the newest is named), so every
 tab reads `running` with the new id.

@@ -40,6 +40,8 @@ from nerve import setup_writer
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
 from nerve.setup_writer import (
+    TASK_DESCRIPTION_TOKEN,
+    TASK_ONBOARDING_MARKER,
     apply_mode,
     apply_profile_templates,
     choices_from_config,
@@ -47,12 +49,16 @@ from nerve.setup_writer import (
     merge_machine_paths,
     merge_private_paths,
     merge_settings_defaults,
+    render_task_md,
+    task_description_from,
+    task_onboarding_pending,
     workspace_mode,
     write_config_yaml,
     write_cron_jobs,
     write_slim_install,
     write_workspace_settings,
 )
+from nerve.workspace import initialize_workspace, read_manifest, template_file
 
 FIXTURES = Path(__file__).parent / "fixtures" / "setup_writer"
 
@@ -281,7 +287,13 @@ class TestInstallerOutputIsUnchanged:
     def test_unattended_worker_install(self, tmp_path: Path) -> None:
         produced = run_unattended(tmp_path, "worker", {"TASK.md": "workspace/TASK.md"})
         _assert_matches_golden(produced, "unattended-worker")
+        # The worker template with the description in place — the same file
+        # the web Mode step and ``nerve init --terminal`` write — still
+        # carrying the marker the onboarding session deletes.
         assert produced["TASK.md"].startswith("# Task\n")
+        assert produced["TASK.md"] == render_task_md("Keep the build green.")
+        assert produced["TASK.md"].splitlines()[1].startswith(TASK_ONBOARDING_MARKER)
+        assert TASK_DESCRIPTION_TOKEN not in produced["TASK.md"]
 
     def test_slim_install(self, tmp_path: Path) -> None:
         produced = run_slim(tmp_path, SetupChoices(
@@ -651,17 +663,87 @@ class TestApplyMode:
         first = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
         assert first.task_written
         task = ws / "TASK.md"
-        assert task.read_text(encoding="utf-8").startswith("# Task\n\nWatch the nightly")
-        # Still a placeholder: a second description replaces it.
+        text = task.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        assert lines[0] == "# Task" and lines[1].startswith(TASK_ONBOARDING_MARKER)
+        assert (
+            "## Task description (as given)\n"
+            "Watch the nightly build for example/repo and propose fixes.\n"
+        ) in text
+        assert TASK_DESCRIPTION_TOKEN not in text
+        # Still pending (the marker stands): a second description replaces it.
         apply_mode(ws, "worker", "Something else entirely, twenty characters.")
         assert "Something else" in task.read_text(encoding="utf-8")
-        # Once the onboarding session rewrote it, it is theirs.
-        task.write_text("# Task\n\n## Mission\nKeep the build green.\n", encoding="utf-8")
+        # Once the onboarding session deleted the marker, the file is theirs.
+        task.write_text(text.replace(lines[1] + "\n", "", 1), encoding="utf-8")
         again = apply_mode(ws, "worker", "A third description that must not land.")
         assert not again.task_written
         assert "third" not in task.read_text(encoding="utf-8")
+        # So is a file an older version's onboarding structured (no marker ever).
+        task.write_text("# Task\n\n## Mission\nKeep the build green.\n", encoding="utf-8")
+        assert not apply_mode(ws, "worker", "A fourth description that must not land.").task_written
+        assert "fourth" not in task.read_text(encoding="utf-8")
         assert workspace_mode(ws) == "worker"
         assert not (ws / "USER.md").exists()
+
+    def test_worker_task_md_is_the_template_with_the_description(self, tmp_path: Path) -> None:
+        """One ``TASK.md``: the template the MANIFEST lists, token replaced."""
+        ws = tmp_path / "ws"
+        description = (
+            "Watch the nightly build for example/repo.\n\n"
+            "Propose fixes before changing anything."
+        )
+        outcome = apply_mode(ws, "worker", description)
+        assert outcome.task_written
+        template = template_file("worker", "TASK.md").read_text(encoding="utf-8")
+        produced = (ws / "TASK.md").read_text(encoding="utf-8")
+        assert produced == template.replace(TASK_DESCRIPTION_TOKEN, description)
+        assert produced == render_task_md(description)
+        assert task_onboarding_pending(produced)
+        assert task_description_from(produced) == description
+        assert produced.rstrip().endswith(
+            "Read the full guide: https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md"
+        )
+        # The writer owns the file: the MANIFEST lists it (``nerve doctor``
+        # expects it of a worker), the copier leaves it out, and without a
+        # description there is no TASK.md rather than one with a bare token.
+        assert "TASK.md" in [name for name, _ in read_manifest("worker")]
+        assert "TASK.md" not in outcome.created
+        bare = tmp_path / "bare"
+        assert apply_mode(bare, "worker").task_written is False
+        assert not (bare / "TASK.md").exists()
+        assert "TASK.md" in initialize_workspace(tmp_path / "copied", "worker")
+        assert TASK_DESCRIPTION_TOKEN in (tmp_path / "copied" / "TASK.md").read_text(encoding="utf-8")
+
+    def test_task_pending_is_the_marker_or_the_legacy_rule(self) -> None:
+        filled = render_task_md("Keep the build green.")
+        marker_line = filled.splitlines()[1]
+        assert marker_line.startswith(TASK_ONBOARDING_MARKER)
+        assert task_onboarding_pending(filled)
+        # Sections filled but the marker left standing: the marker decides.
+        half_done = filled.replace(
+            "_(onboarding fills this in: one paragraph ending in the quality bar)_",
+            "Keep CI green on org/repo-a.",
+        )
+        assert task_onboarding_pending(half_done)
+        assert not task_onboarding_pending(filled.replace(marker_line + "\n", "", 1))
+        # Files written by older versions: raw until onboarding added ``## Mission``.
+        assert task_onboarding_pending("# Task\n\nKeep the build green.\n")
+        assert not task_onboarding_pending("# Task\n\n## Mission\nKeep the build green.\n")
+        assert not task_onboarding_pending("# Task: CI monitor — ci-bot\n\n## Identity\n…\n## Mission\n…\n")
+        assert not task_onboarding_pending("")
+
+    def test_task_description_from_reads_the_section(self) -> None:
+        description = "Watch the nightly build.\n\nPropose fixes first."
+        filled = render_task_md(description)
+        assert task_description_from(filled) == description
+        # Legacy raw form: everything after the heading.
+        assert task_description_from("# Task\n\nKeep the build green.\n") == "Keep the build green."
+        # Pending without a description yet (a bare template copy): empty, not None.
+        assert task_description_from(template_file("worker", "TASK.md").read_text(encoding="utf-8")) == ""
+        # Onboarded, either way: None — the file is the worker's.
+        assert task_description_from(filled.replace(filled.splitlines()[1] + "\n", "", 1)) is None
+        assert task_description_from("# Task\n\n## Mission\nKeep the build green.\n") is None
 
     def test_apply_mode_is_idempotent_and_keeps_edited_settings(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
@@ -693,6 +775,10 @@ class TestApplyMode:
         assert not (ws / "TASK.md").exists()
         outcome = apply_mode(ws, "worker", "Watch the nightly build and propose fixes.", locked=True)
         assert outcome.task_written and outcome.created == () and not outcome.cron_written
+        # The same template-sourced file as the unlocked path writes.
+        assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md(
+            "Watch the nightly build and propose fixes.",
+        )
 
 
 class TestProfileTemplates:

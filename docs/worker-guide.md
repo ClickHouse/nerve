@@ -25,7 +25,8 @@ worker is configured on that page:
 2. **Mode** — choose **Worker** and describe the task in plain English (three
    starter templates: monitor a build, review pull requests, watch logs). This
    writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
-   `MEMORY.md`), the raw `TASK.md`, and `config/cron/system.yaml` with
+   `MEMORY.md`), `TASK.md` from its template with your description in place
+   (the onboarding session fills the rest), and `config/cron/system.yaml` with
    `task-planner`, `skill-extractor` and `skill-reviser` on
    (`memory-maintenance` is always on)
 3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
@@ -48,68 +49,141 @@ start` afterwards). Its worker path has no cron step, so it writes `task-planner
 
 ## How Onboarding Works
 
-When Nerve starts — or when the setup page's Finish runs on an instance that needs no restart — and `TASK.md` still contains the raw description (no `## Mission` section yet), it runs a **setup agent session** with full tool access. The setup page shows it as "Onboarding session starting" and then links to the running session:
+When Nerve starts — or when the setup page's Finish runs on an instance that needs no restart — and `TASK.md` still carries the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line), it runs a **setup agent session** with full tool access. The session's prompt is your task description, the full [Worker Best Practices](worker-best-practices.md) guide, and the steps below. The setup page shows it as "Onboarding session starting" and then links to the running session:
 
 1. **Research** — fetches URLs, searches the web, clones repos, explores CI systems mentioned in the task
-2. **Rewrite TASK.md** — restructures the raw description into a structured format:
-   - `## Mission` — what the worker does (1–2 sentences)
-   - `## Scope` — repos, services, systems to monitor
-   - `## Triggers` — events to watch for
-   - `## Actions` — step-by-step procedures when triggered
-   - `## Approval` — what needs human approval vs autonomous action
-   - `## References` — links to docs, APIs, tools
+2. **Fill TASK.md in place** — replaces every `_(onboarding fills this in: …)_` placeholder and example line of the template with this worker's content, keeping the headings and the description as given, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link
 3. **Create skills** — writes domain-specific procedures as reusable skills (`skill_create`)
-4. **Configure cron jobs** — adds monitoring and task-specific crons to `<workspace>/config/cron/jobs.yaml`
+4. **Configure cron jobs** — adds the worker's jobs to `<workspace>/config/cron/jobs.yaml`, with `run_if` gates where the guide calls for them so a job stays idle until there is work
 5. **Create initial tasks** — files setup tasks that need manual work (credentials, access tokens, etc.)
-6. **Notify** — sends a notification that onboarding is complete with a summary of what was configured
+6. **Memorize and notify** — saves what it learned to memory and sends a notification that onboarding is complete with a summary of what was configured
+7. **Delete the marker** — last, once every section is filled. The marker is how Nerve knows onboarding is still due: the setup page and `nerve doctor` report it as pending while the line stands, and a start before it is gone runs the session again
+
+A `TASK.md` from an older install (the raw `# Task` form, no marker) is rewritten into the template's shape with its text under "Task description (as given)" when the session starts; such a file counts as onboarded once it has a `## Mission` heading.
 
 After onboarding, the worker operates autonomously on its configured schedule.
 
 ## TASK.md
 
-The task file lives at `workspace/TASK.md` and is injected into every session's system prompt. It's the worker's mission brief.
+The task file lives at `workspace/TASK.md` and is injected into every session's system prompt. It is the worker's mission brief. What each section holds, and how to write rules that hold up, is in [Worker Best Practices → TASK.md Anatomy](worker-best-practices.md#taskmd-anatomy).
 
-**Before onboarding** (raw, written by the Mode step or `nerve init --terminal`):
+**Before onboarding.** The Mode step, `nerve init --terminal` and `nerve init --non-interactive` write the worker template with your description in place. The comment on the second line marks the file as not onboarded yet. The example lines the template carries under each heading are left out here:
+
 ```markdown
 # Task
+<!-- nerve:onboarding pending — the first-boot onboarding session fills this file in and deletes this line. -->
 
+## Task description (as given)
 Monitor the CI pipeline for flaky tests. When a test fails intermittently,
 investigate the root cause and propose a fix.
+
+## Identity
+_(onboarding fills this in: which account acts, exact git author, fork/remote names)_
+
+## Mission
+_(onboarding fills this in: one paragraph ending in the quality bar)_
+
+## Capabilities
+_(onboarding fills this in: what this worker is expected to be able to do, and what it may never dismiss; at most 10 lines)_
+
+## Scope
+_(onboarding fills this in: repos, CI, data sources, and the one exhaustive reference doc or skill; pointers, no credentials)_
+
+## Hard rules
+_(onboarding fills this in: the non-negotiables, each its own heading with a marker and provenance; as few as you can defend)_
+
+## Triggers
+_(onboarding fills this in: what creates work, one line each: scan crons, inbox and mentions, human directives)_
+
+## Actions
+_(onboarding fills this in: the status state machine as a transition table, then an anti-patterns list)_
+
+| From | Event | To | Who holds the ball |
+|---|---|---|---|
+
+## Approval Required
+_(onboarding fills this in: what needs a human, what is autonomous, where decisions are recorded)_
+
+## References
+_(onboarding fills this in: endpoints with auth mode (never passwords), schema columns, canonical filters, label vocabulary; the long form lives in `TOOLS.md`)_
+
+---
+Read the full guide: https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md
 ```
 
-**After onboarding** (structured by the setup agent):
+**After onboarding.** The onboarding session has filled every section in place, kept the headings and the description, and deleted the marker line:
+
 ```markdown
 # Task
 
+## Task description (as given)
+Monitor the CI pipeline for flaky tests. When a test fails intermittently,
+investigate the root cause and propose a fix.
+
+## Identity
+You are `ci-bot`. Git author `CI Bot <ci-bot@example.com>`; fork `ci-bot/repo-a`
+(remote `fork`); upstream `org/repo-a` (remote `origin`). Every public action
+(commit, push, comment) uses this account and no other.
+
 ## Mission
-Monitor CI pipelines for flaky test failures and propose targeted fixes.
+Watch CI on `org/repo-a`, find flaky tests and regressions, fix them at the
+source, and tell maintainers what they need to know. Fewer, better PRs beat
+many quick ones.
+
+## Capabilities
+You are a developer on `repo-a` with the full source, a warm debug build
+(`skill_get build-and-test`) and read access to the failure database. Do not
+dismiss a failure as too deep, "infra noise" or someone else's code. If a tool
+is missing, name it, then install it or flag the gap.
 
 ## Scope
-- Repository: github.com/org/repo
-- CI system: GitHub Actions
-- Test framework: pytest
+- Repository: `org/repo-a` on GitHub · CI: GitHub Actions · tests: pytest
+- Failure DB: endpoint and auth mode in `TOOLS.md` § Failure DB (read-only user)
+- CI internals: `docs/ci-internals.md` in the repo, or the `ci-db-query` skill
+
+## Hard rules
+### ⛔ HARD RULE: builds and tests run in the FOREGROUND as ONE call [operator directive 2026-03-02]
+One synchronous Bash call with a `timeout` above the expected duration that
+captures the producer's exit code: `make test > build.log 2>&1; rc=$?;
+tail -50 build.log; echo RC=$rc`. Never `$?` after a pipe; never
+background-and-exit.
+### ⛔ HARD RULE: never touch PRs or issues you did not open unless addressed [operator directive 2026-03-02]
+Being right does not make it welcome. Track external fixes; do not comment.
 
 ## Triggers
-- CI run fails with a test that passed on the previous commit
-- Same test fails >2 times in the last 7 days with different commits
+- `ci-scan` cron (every 30 min): new main-branch failures → tasks tagged `source:ci-main`
+- `pr-ci` cron (`github_pr_activity` gate): CI finished on an own PR → CI results comment
+- Human directives (chat, task notes tagged `human-directive`) → outrank everything
 
 ## Actions
-1. Identify the flaky test from CI logs
-2. Check git blame and recent changes to the test and tested code
-3. Reproduce locally if possible
-4. Propose a fix via plan-approve workflow
+| From | Event | To | Who holds the ball |
+|---|---|---|---|
+| `pending` | a run claims it | `in_progress` | this worker |
+| `in_progress` | PR pushed, CI running | `waiting_ci` | CI |
+| `waiting_ci` | CI green, review requested | `on_review` | reviewer |
+| `in_progress` | someone else's fix PR exists | `monitoring_external` | the other author |
+| any waiting | human comment or directive | `pending` + `needs-response` | this worker |
+| `on_review` | merged | `verifying` → `done` | post-merge window |
 
-## Approval
-- Bug fixes: propose plan, wait for approval
-- Test-only changes: propose plan, wait for approval
-- Infra changes: always escalate via notification
+Anti-patterns: pushing a cleanly waiting task back to `pending` (burns a run);
+a waiting status with no PR and no posted question (a phantom block).
+
+## Approval Required
+- Opening a public issue · anything irreversible or external → human approval
+- Classifying a test as flaky · the CI results comment on an own PR · notifying
+  → autonomous, recorded in the task note
+- Self-raised work → only with a passing `## Impact` section
 
 ## References
-- CI dashboard: https://github.com/org/repo/actions
-- Test conventions: docs/testing.md
+- Failure DB columns: `job, test, status, log_url`; failures `status IN ('failed','errored')`
+- Labels: `bugfix`, `flaky-test`
+- Toolchain pin lives in `ci/toolchain.lock`: read it, never quote it
+
+---
+Read the full guide: https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md
 ```
 
-You can edit `TASK.md` at any time. Changes take effect on the next session.
+Statuses in the Actions table other than the built-in `pending`, `in_progress`, `done` and `deferred` are created once with `task_status_create`. You can edit `TASK.md` at any time. Changes take effect on the next session.
 
 ## The Plan-Approve Loop
 

@@ -110,6 +110,7 @@ from nerve.setup_writer import (
     plan_optional_crons,
     replace_choices,
     settings_problem,
+    task_description_from,
     workspace_mode,
 )
 
@@ -1022,16 +1023,14 @@ TASK_LOCK_REASON = (
 
 
 def _task_description_on_disk(task_path: Path) -> str | None:
-    """The description a still-raw ``TASK.md`` carries, or ``None`` once the
-    worker's onboarding has structured it (or the file is unreadable)."""
+    """The description a not-yet-onboarded ``TASK.md`` carries — its "Task
+    description (as given)" section — or ``None`` once the worker's onboarding
+    has completed the file (or it is unreadable)."""
     try:
         text = task_path.read_text(encoding="utf-8")
     except OSError:
         return None
-    stripped = text.strip()
-    if not stripped.startswith("# Task") or "## Mission" in stripped:
-        return None
-    return stripped[len("# Task"):].strip()
+    return task_description_from(text)
 
 
 @router.put("/api/setup/mode")
@@ -1053,8 +1052,10 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
             # description is refused rather than silently replacing what a
             # stale tab or a second person did not see. Only a worker whose
             # TASK.md is still absent (templates arrived from a config
-            # repository) gets it written here.
-            if _task_description_on_disk(ws / "TASK.md") != task:
+            # repository) — or still the bare template, with no description
+            # in it — gets it written here.
+            on_disk = _task_description_on_disk(ws / "TASK.md")
+            if on_disk is None or (on_disk and on_disk != task):
                 raise HTTPException(status_code=409, detail=TASK_LOCK_REASON)
         if mode == "worker" and current is None:
             if len(task) < _TASK_MIN:

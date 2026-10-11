@@ -68,6 +68,7 @@ from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
     install_config_scaffold,
+    template_file,
 )
 
 # --- Cron definitions for the wizard ---
@@ -1561,15 +1562,98 @@ class ModeOutcome:
     cron_written: bool
 
 
+# --- A worker's TASK.md -------------------------------------------------------
+#
+# The contract with ``nerve/templates/worker/TASK.md`` (and with the first-boot
+# onboarding session, whose prompt restates it): line 1 is the ``# Task``
+# heading, line 2 the marker comment, and the operator's description sits under
+# ``## Task description (as given)`` where the template has the token. The
+# onboarding session fills the other sections in place and deletes the marker
+# line last — so "marker present" is "onboarding still pending", for the
+# installers, the setup checklist and the engine's start-up check alike.
 _TASK_HEADER = "# Task\n"
+TASK_ONBOARDING_MARKER = "<!-- nerve:onboarding pending"
+TASK_DESCRIPTION_TOKEN = "{{TASK_DESCRIPTION}}"
+TASK_DESCRIPTION_HEADING = "## Task description (as given)"
+
+# MANIFEST entries the installers write themselves instead of copying: see
+# :func:`apply_task_md`. Passed to :func:`initialize_workspace` as ``skip``.
+WRITER_OWNED_TEMPLATES = ("TASK.md",)
+
+
+def task_onboarding_pending(text: str) -> bool:
+    """Whether a ``TASK.md`` body is still waiting for the onboarding session.
+
+    The marker comment decides. Files written by older versions carry no
+    marker: those are the raw ``# Task`` form until onboarding gave them a
+    ``## Mission`` heading, and that rule is kept for them.
+    """
+    if TASK_ONBOARDING_MARKER in text:
+        return True
+    stripped = text.strip()
+    return stripped.startswith(_TASK_HEADER.strip()) and "## Mission" not in stripped
+
+
+def task_description_from(text: str) -> str | None:
+    """The operator's description a not-yet-onboarded ``TASK.md`` carries.
+
+    The section under ``## Task description (as given)`` up to the next ``##``
+    heading; for the legacy raw form, everything after the ``# Task`` line.
+    ``""`` when the file is pending but holds no description yet (the template
+    token still in place). ``None`` once the onboarding session owns the file.
+    """
+    if not task_onboarding_pending(text):
+        return None
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != TASK_DESCRIPTION_HEADING:
+            continue
+        body: list[str] = []
+        for rest in lines[index + 1:]:
+            if rest.startswith("## "):
+                break
+            body.append(rest)
+        description = "\n".join(body).strip()
+        return "" if description == TASK_DESCRIPTION_TOKEN else description
+    stripped = text.strip()
+    return stripped[len(_TASK_HEADER.strip()):].strip()
+
+
+def render_task_md(task_description: str) -> str:
+    """The worker ``TASK.md`` a fresh install gets: the template, description in place."""
+    template = template_file("worker", "TASK.md").read_text(encoding="utf-8")
+    if TASK_DESCRIPTION_TOKEN not in template or TASK_ONBOARDING_MARKER not in template:
+        raise RuntimeError(
+            "the worker TASK.md template lost its {{TASK_DESCRIPTION}} token or its "
+            "onboarding marker; the installers and the onboarding check key on both"
+        )
+    return template.replace(TASK_DESCRIPTION_TOKEN, task_description.strip(), 1)
 
 
 def _task_is_placeholder(path: Path) -> bool:
-    """A ``TASK.md`` the onboarding session has not rewritten yet."""
+    """A ``TASK.md`` the onboarding session has not completed (or none at all)."""
     if not path.exists():
         return True
-    text = path.read_text(encoding="utf-8").strip()
-    return text.startswith(_TASK_HEADER.strip()) and "## Mission" not in text
+    return task_onboarding_pending(path.read_text(encoding="utf-8"))
+
+
+def apply_task_md(workspace: Path, task_description: str) -> bool:
+    """Write a worker's ``TASK.md`` from the template while it is still pending.
+
+    The one writer behind the web Mode step, ``nerve init --terminal`` and
+    ``--non-interactive``, so the three paths produce the same file. Nothing is
+    written without a description, and never over a file the onboarding
+    session has completed (marker gone, or a legacy file with ``## Mission``).
+    Returns whether it wrote.
+    """
+    description = (task_description or "").strip()
+    if not description:
+        return False
+    path = Path(workspace) / "TASK.md"
+    if not _task_is_placeholder(path):
+        return False
+    publish_text(path, render_task_md(description))
+    return True
 
 
 def apply_mode(
@@ -1583,9 +1667,10 @@ def apply_mode(
     """Choose the mode: templates, ``TASK.md``, settings defaults, ``system.yaml``.
 
     Never overwrites: :func:`initialize_workspace` copies only missing
-    templates, ``TASK.md`` is written only while it is still the installer's
-    placeholder, settings leaves are filled only where absent, and
-    ``system.yaml`` is written only when missing.
+    templates, ``TASK.md`` is written (from its template, description in
+    place — :func:`apply_task_md`) only while onboarding is still pending,
+    settings leaves are filled only where absent, and ``system.yaml`` is
+    written only when missing.
 
     Under ``locked`` the reviewed files (templates, settings, cron) are
     refused with :class:`ModeRefused` before anything is written; when the
@@ -1596,7 +1681,6 @@ def apply_mode(
     if mode not in ("personal", "worker"):
         raise ValueError(f"mode must be personal or worker, got {mode!r}")
     ws = Path(workspace)
-    task_path = ws / "TASK.md"
 
     if locked:
         if workspace_mode(ws) is None:
@@ -1606,24 +1690,18 @@ def apply_mode(
                 "the workspace templates (SOUL.md and friends), which are reviewed "
                 "root files here — add them from the config repository."
             )
-        task_written = False
-        if mode == "worker" and task_description and _task_is_placeholder(task_path):
-            publish_text(task_path, f"{_TASK_HEADER}\n{task_description.strip()}\n")
-            task_written = True
+        task_written = mode == "worker" and apply_task_md(ws, task_description)
         return ModeOutcome(
             created=(), task_written=task_written,
             settings_defaults_added=(), cron_written=False,
         )
 
     ws.mkdir(parents=True, exist_ok=True)
-    created = tuple(initialize_workspace(ws, mode))
+    created = tuple(initialize_workspace(ws, mode, skip=WRITER_OWNED_TEMPLATES))
     install_bundled_skills(ws)
     install_config_scaffold(ws)
 
-    task_written = False
-    if mode == "worker" and task_description and _task_is_placeholder(task_path):
-        publish_text(task_path, f"{_TASK_HEADER}\n{task_description.strip()}\n")
-        task_written = True
+    task_written = mode == "worker" and apply_task_md(ws, task_description)
 
     if in_container:
         tools_md = ws / "TOOLS.md"

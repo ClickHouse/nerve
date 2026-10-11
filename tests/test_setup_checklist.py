@@ -273,6 +273,24 @@ class TestDoneRules:
         assert checklist.onboarding_from_task(worker, "worker") == "done"
         assert checklist.onboarding_from_task(worker, "personal") == "not_applicable"
 
+    def test_onboarding_is_done_once_the_marker_is_gone(self, worker):
+        """The template's marker comment decides, not the headings: a filled
+        file with the marker still standing is pending; without it, done."""
+        task = worker / "TASK.md"
+        text = task.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        assert lines[1].startswith("<!-- nerve:onboarding pending")
+        assert "## Mission" in text, "the template already carries the heading"
+        task.write_text(text.replace(
+            "_(onboarding fills this in: one paragraph ending in the quality bar)_",
+            "Keep CI green on org/repo-a.",
+        ), encoding="utf-8")
+        assert checklist.onboarding_from_task(worker, "worker") == "pending"
+        task.write_text("\n".join(lines[:1] + lines[2:]) + "\n", encoding="utf-8")
+        assert checklist.onboarding_from_task(worker, "worker") == "done"
+        task.unlink()
+        assert checklist.onboarding_from_task(worker, "worker") == "pending"
+
 
 class TestFinishedAndStepsLeft:
     def test_steps_left_counts_pending_only(self, personal):

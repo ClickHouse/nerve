@@ -425,7 +425,14 @@ class TestModeLock:
         assert "sources" not in ids and "agents" not in ids
         assert step(state, "mode")["detail"]["onboarding"] == "pending"
         assert step(state, "mode")["detail"]["task_present"] is True
-        assert (claimed.workspace / "TASK.md").read_text().startswith("# Task\n\nWatch the nightly")
+        # The worker template with the description in place, marker on line 2.
+        task_md = (claimed.workspace / "TASK.md").read_text()
+        assert task_md.startswith("# Task\n<!-- nerve:onboarding pending")
+        assert (
+            "## Task description (as given)\n"
+            "Watch the nightly build for example/repo and propose fixes before changing anything.\n"
+        ) in task_md
+        assert "{{TASK_DESCRIPTION}}" not in task_md
         assert step(state, "profile")["title"] == "Operator"
 
     async def test_bad_mode_is_a_field_error(self, claimed):

@@ -41,6 +41,7 @@ from nerve.setup_writer import (
     list_optional_crons,
     optional_cron_ids_for,
     system_cron_file,
+    task_onboarding_pending,
     user_md_pristine,
     workspace_mode,
 )
@@ -386,12 +387,13 @@ def onboarding_from_task(workspace: Path, mode: str | None) -> str:
     if not task.exists():
         return "pending"
     try:
-        text = task.read_text(encoding="utf-8").strip()
+        text = task.read_text(encoding="utf-8")
     except OSError:
         return "pending"
-    if text.startswith("# Task") and "## Mission" not in text:
-        return "pending"
-    return "done"
+    # Pending while the template's marker comment stands (the onboarding
+    # session deletes it last); done once it is gone. Legacy files from older
+    # installs follow the old rule — see ``task_onboarding_pending``.
+    return "pending" if task_onboarding_pending(text) else "done"
 
 
 def _system_yaml_jobs(workspace: Path) -> list[dict[str, Any]] | None:

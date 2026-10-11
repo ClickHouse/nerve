@@ -40,12 +40,14 @@ from nerve.setup_writer import (
     PRODUCTIVITY_CRONS,
     SetupChoices,
     SlimOutcome,
+    WRITER_OWNED_TEMPLATES,
     _DOCKER_NERVE_HOME,
     _DOCKER_TOOLS_SECTION,
     _DOCKER_WORKSPACE,
     _PERSONAL_MEMORY_CATEGORIES,
     _WORKER_MEMORY_CATEGORIES,
     apply_profile_templates,
+    apply_task_md,
     bedrock_geo_prefix,
     build_config_layers,
     # Re-exported under its old private name: this module has been its import
@@ -1568,10 +1570,12 @@ class SetupWizard:
     def _apply(self) -> None:
         click.echo()
 
-        # 1. Create workspace from templates
+        # 1. Create workspace from templates (TASK.md is written in step 5)
         click.echo("  Creating workspace...", nl=False)
         ws_path = self._workspace_dir()
-        created = initialize_workspace(ws_path, self.choices.mode)
+        created = initialize_workspace(
+            ws_path, self.choices.mode, skip=WRITER_OWNED_TEMPLATES,
+        )
         click.secho(" ✓", fg="green")
 
         # 2. Install bundled skills
@@ -1601,13 +1605,11 @@ class SetupWizard:
                 content += _DOCKER_TOOLS_SECTION
                 tools_md.write_text(content, encoding="utf-8")
 
-        # 5. Write TASK.md for worker mode
-        if self.choices.mode == "worker" and self.choices.task_description:
-            task_md = ws_path / "TASK.md"
-            task_md.write_text(
-                f"# Task\n\n{self.choices.task_description}\n",
-                encoding="utf-8",
-            )
+        # 5. Worker: TASK.md from the template with the description in place —
+        #    the same writer the web Mode step uses, so every install path
+        #    produces one file for the onboarding session to fill in.
+        if self.choices.mode == "worker":
+            apply_task_md(ws_path, self.choices.task_description)
 
         # 6. Back up existing configs before regenerating — re-running init
         # must never silently destroy hand edits (model tweaks, paired
