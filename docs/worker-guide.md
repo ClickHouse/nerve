@@ -206,7 +206,7 @@ Cron detects issue → Agent proposes plan → Notification sent
 6. **Implementation** — The approved plan executes in a dedicated session with full tool access
 7. **Verification** — Implementation session runs checks, tests, reports results
 
-Plans and their revisions happen in the same persistent planner session — full conversation context is preserved across revision rounds.
+A revision goes back to the session that proposed the plan — for the planner's plans, the same persistent planner session — so the planning context is preserved across revision rounds.
 
 ## Skills
 
@@ -222,7 +222,7 @@ Workers create their own skills during onboarding and refine them over time.
 - `skill-extractor` (every 12h) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
 - `skill-reviser` (weekly) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
 
-When a skill-related plan is approved, the plan approval handler creates/updates the skill directly from the plan content (no implementation session needed — the plan IS the skill).
+When a skill-related plan is approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md) with `skill_create` or `skill_update` and close the task with `task_done`.
 
 ## Running Multiple Workers
 
@@ -284,7 +284,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. `quiet_start`/`quiet_end` in `<workspace>/config/settings.yaml` suppress only task-deadline escalation reminders; `notify` is not gated by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
+Priority levels: `urgent`, `high`, `normal`, `low`. `quiet_start`/`quiet_end` in `<workspace>/config/settings.yaml` record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 

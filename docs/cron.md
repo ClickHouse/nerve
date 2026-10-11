@@ -140,7 +140,7 @@ prompt definition.
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a catch-up or web-triggered run waits for the previous one to finish. An overlapping scheduled fire is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -451,7 +451,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 - **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
 - **Worker** — `memory-maintenance` (always on) + `task-planner` + `skill-extractor` + `skill-reviser` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `nerve init --terminal` has no cron step for workers and writes the three with `enabled: false` — set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
-Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, the plan approval handler creates/updates the skill directly from the plan content (which is a full SKILL.md file) instead of spawning an implementation session.
+Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
 
 ## Persistent Timers
 
