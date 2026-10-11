@@ -1,4 +1,4 @@
-import type { SetupStep } from '../../api/client';
+import type { SetupProfileDetail, SetupStep } from '../../api/client';
 
 /** Structural equality good enough for wire-shaped values. */
 export function same(a: unknown, b: unknown): boolean {
@@ -38,4 +38,14 @@ export function secretPayload(value: string | null): string | null | undefined {
 
 export function codePoints(s: string): number {
   return [...s].length;
+}
+
+/**
+ * Whether the server's quiet hours are on. Off is both times empty; an
+ * older backend sends no `quiet_enabled` and always has both times.
+ */
+export function quietEnabled(
+  detail: Pick<SetupProfileDetail, 'quiet_enabled' | 'quiet_start' | 'quiet_end'>,
+): boolean {
+  return detail.quiet_enabled ?? Boolean(detail.quiet_start && detail.quiet_end);
 }

@@ -125,8 +125,15 @@ export interface SetupProfileDetail {
   writable_fields: string[] | null;
   timezone: string;
   timezone_is_default: boolean;
+  /** `HH:MM`, or `''` for both while quiet hours are off. */
   quiet_start: string;
   quiet_end: string;
+  /**
+   * Whether quiet hours are on (both times set). Off by default for a
+   * worker. Absent from an older backend, which always has both times.
+   */
+  quiet_enabled?: boolean;
+  /** The quiet hours are still the mode's default: personal 02:00–08:00, worker off. */
   quiet_is_default: boolean;
   language: string | null;
   agent_name: string | null;
@@ -217,7 +224,14 @@ export interface SetupCronJob {
   requires?: string | null;
   requirement_met?: boolean;
   enabled?: boolean;
+  /** Same value as `default_enabled`; the older name. */
   default?: boolean;
+  /**
+   * Whether the mode's first-run default turns this optional job on. A
+   * worker's `task-planner` is off until its onboarding session decides.
+   * Absent from an older backend.
+   */
+  default_enabled?: boolean;
 }
 
 export interface SetupAutomationDetail {

@@ -51,7 +51,8 @@ const { useAuthStore } = await import('../../stores/authStore');
 const { useSetupStore } = await import('../../stores/setupStore');
 const { browserTimeZone } = await import('../../utils/timeZones');
 const {
-  CHANNELS, MODE_LOCK_REASON, makeExternalState, makeState, on, step, withStep,
+  CHANNELS, MODE_LOCK_REASON, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState, makeWorkerState, on,
+  step, withStep,
 } = await import('../../test/setupFixtures');
 const { SetupPage } = await import('../../pages/SetupPage');
 const { ReadyScreen } = await import('./ReadyScreen');
@@ -513,11 +514,12 @@ describe('forms open on server values and send the right payload', () => {
     await heading('About you');
     const zone = browserTimeZone() || 'America/New_York';
     expect(screen.getByLabelText('Time zone')).toHaveValue(zone);
+    expect(screen.getByRole('checkbox', { name: 'Quiet hours' })).toBeChecked();
     expect(screen.getByLabelText('Quiet hours start')).toHaveValue('22:00');
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
     expect(api.setupStep).toHaveBeenCalledWith('profile', expect.objectContaining({
-      timezone: zone, quiet_start: '22:00', quiet_end: '07:00',
+      timezone: zone, quiet_enabled: true, quiet_start: '22:00', quiet_end: '07:00',
     }));
   });
 
@@ -571,6 +573,105 @@ describe('forms open on server values and send the right payload', () => {
     expect(api.setupStep).not.toHaveBeenCalled();
   });
 
+  it('quiet hours: turning them off hides the times and sends quiet_enabled: false without them', async () => {
+    renderAt('/setup/profile');
+    await heading('About you');
+    const quiet = screen.getByRole('checkbox', { name: 'Quiet hours' });
+    expect(quiet).toBeChecked();
+    expect(quiet).toHaveAccessibleDescription('Nerve records these for the agent, which keeps non-urgent messages outside them.');
+    expect(screen.getByLabelText('Quiet hours end')).toHaveValue('07:00');
+    await userEvent.click(quiet);
+    expect(screen.queryByLabelText('Quiet hours start')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Quiet hours end')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    const body = m(api.setupStep).mock.calls[0][1];
+    expect(body).toMatchObject({ quiet_enabled: false });
+    expect(body).not.toHaveProperty('quiet_start');
+    expect(body).not.toHaveProperty('quiet_end');
+  });
+
+  it('quiet hours: a worker opens with them off and Continue records that; an older backend opens them on', async () => {
+    current = makeWorkerState();
+    const view = renderAt('/setup/profile');
+    await heading('Operator');
+    expect(screen.getByRole('checkbox', { name: 'Quiet hours' })).not.toBeChecked();
+    expect(screen.queryByLabelText('Quiet hours start')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    const body = m(api.setupStep).mock.calls[0][1];
+    expect(body).toMatchObject({ timezone: browserTimeZone() || 'America/New_York', quiet_enabled: false });
+    expect(body).not.toHaveProperty('quiet_start');
+    view.unmount();
+
+    // No `quiet_enabled` and both times set: on, with the pending prefill, as before.
+    useSetupStore.getState().reset();
+    current = withStep(makeWorkerState(), step('profile', { title: 'Operator' }, {
+      ...WORKER_PROFILE, quiet_enabled: undefined, quiet_start: '02:00', quiet_end: '08:00',
+    }));
+    renderAt('/setup/profile');
+    await heading('Operator');
+    expect(screen.getByRole('checkbox', { name: 'Quiet hours' })).toBeChecked();
+    expect(screen.getByLabelText('Quiet hours start')).toHaveValue('22:00');
+  });
+
+  it('quiet hours: turning them on shows 22:00–07:00, checks the times, and sends the switch with both', async () => {
+    current = makeWorkerState();
+    renderAt('/setup/profile');
+    await heading('Operator');
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Quiet hours' }));
+    const start = screen.getByLabelText('Quiet hours start');
+    expect(start).toHaveValue('22:00');
+    expect(screen.getByLabelText('Quiet hours end')).toHaveValue('07:00');
+
+    fireEvent.change(start, { target: { value: '' } });
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(start).toHaveAccessibleDescription('Use 24-hour times such as 22:00.'));
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    fireEvent.change(start, { target: { value: '23:30' } });
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('profile', expect.objectContaining({
+      quiet_enabled: true, quiet_start: '23:30', quiet_end: '07:00',
+    })));
+  });
+
+  it('quiet hours on a done profile: left as they are, nothing is sent; turned off, the switch goes alone', async () => {
+    const done = (quiet: Record<string, unknown>) => withStep(makeState(), step('profile', { status: 'done' }, {
+      timezone: 'Europe/Berlin', timezone_is_default: false, quiet_is_default: false, ...quiet,
+    }));
+    current = done({ quiet_start: '', quiet_end: '', quiet_enabled: false });
+    const view = renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByRole('checkbox', { name: 'Quiet hours' })).not.toBeChecked();
+    await userEvent.click(continueButton());
+    expect(await heading('Memory')).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    current = done({ quiet_start: '23:00', quiet_end: '06:30', quiet_enabled: true });
+    renderAt('/setup/profile');
+    await heading('About you');
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Quiet hours' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('profile', { quiet_enabled: false }));
+  });
+
+  it('quiet hours on a done profile: one changed time sends the switch with both times', async () => {
+    current = withStep(makeState(), step('profile', { status: 'done' }, {
+      timezone: 'Europe/Berlin', timezone_is_default: false,
+      quiet_start: '23:00', quiet_end: '06:30', quiet_enabled: true, quiet_is_default: false,
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    fireEvent.change(screen.getByLabelText('Quiet hours end'), { target: { value: '07:30' } });
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('profile', {
+      quiet_enabled: true, quiet_start: '23:00', quiet_end: '07:30',
+    }));
+  });
+
   it('automation: a pending step opens on what the file enables, flags an idle job, and always sends the full set', async () => {
     renderAt('/setup/automation');
     await heading('Scheduled jobs');
@@ -580,6 +681,8 @@ describe('forms open on server values and send the right payload', () => {
     expect(screen.getByText('idle')).toBeInTheDocument();
     expect(screen.getByText(/stays idle until a source is connected \(Sources step\)/)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: /Task planner/ })).not.toBeChecked();
+    // Off in this file by choice, not by the mode's default: no worker hint.
+    expect(screen.queryByText(/Off for workers/)).not.toBeInTheDocument();
     expect(screen.getByText(/every 30 minutes \(America\/New_York\)/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('checkbox', { name: /Task planner/ }));
     await userEvent.click(continueButton());
@@ -657,6 +760,34 @@ describe('forms open on server values and send the right payload', () => {
     renderAt('/setup/automation');
     await heading('Scheduled jobs');
     expect(screen.getByRole('checkbox', { name: /Inbox processor/ })).toBeChecked();
+  });
+
+  it('automation: a worker\'s task planner opens off and says onboarding decides; an older backend shows no hint', async () => {
+    current = makeWorkerState();
+    const view = renderAt('/setup/automation');
+    await heading('Scheduled jobs');
+    const planner = screen.getByRole('checkbox', { name: /Task planner/ });
+    expect(planner).not.toBeChecked();
+    expect(planner).toHaveAccessibleDescription(
+      'Off for workers until onboarding decides. The onboarding session enables it when this worker should plan through the approval loop.',
+    );
+    expect(screen.getByRole('checkbox', { name: /Skill reviser/ })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: /Skill extractor/ })).toBeChecked();
+    expect(screen.getAllByText(/Off for workers/)).toHaveLength(1);
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('automation', { crons: ['skill-reviser', 'skill-extractor'] }));
+    view.unmount();
+
+    // Without `default_enabled`, and `default` still true: the row renders as before.
+    useSetupStore.getState().reset();
+    const [reviser, extractor, planned] = WORKER_AUTOMATION.optional!;
+    current = withStep(makeWorkerState(), step('automation', {}, {
+      optional: [reviser, extractor, { ...planned, default: true, default_enabled: undefined }],
+    }));
+    renderAt('/setup/automation');
+    await heading('Scheduled jobs');
+    expect(screen.getByRole('checkbox', { name: /Task planner/ })).not.toBeChecked();
+    expect(screen.queryByText(/Off for workers/)).not.toBeInTheDocument();
   });
 
   it('sources: "Turn all off" is a decision with all three booleans', async () => {
@@ -1699,6 +1830,23 @@ describe('review and the ending', () => {
     await heading('Review and finish');
     const checklist = screen.getByRole('region', { name: 'Checklist' });
     expect(within(checklist).getByText(/last connection test failed/)).toBeInTheDocument();
+  });
+
+  it('the Review says whether quiet hours are on, with their window', async () => {
+    const row = (title: string) => within(screen.getByRole('region', { name: 'Checklist' })).getByText(title).closest('li')!;
+    current = withStep(decided(), step('profile', { status: 'done', summary: 'Alice · Europe/Berlin' }, {
+      quiet_start: '22:00', quiet_end: '07:00', quiet_enabled: true, quiet_is_default: false,
+    }));
+    const view = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(row('About you')).toHaveTextContent('Quiet hours: 22:00–07:00');
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    current = withStep(makeWorkerState(), step('profile', { status: 'done', title: 'Operator' }, WORKER_PROFILE));
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(row('Operator')).toHaveTextContent('Quiet hours: off');
   });
 
   it('the ready screen says when optional steps are still open instead of contradicting the banner', () => {

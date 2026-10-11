@@ -1,17 +1,20 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { SetupFinishResponse, SetupProviderDetail, SetupState, SetupStep } from '../../../api/client';
+import type {
+  SetupFinishResponse, SetupProfileDetail, SetupProviderDetail, SetupState, SetupStep,
+} from '../../../api/client';
 import { useSetupStore } from '../../../stores/setupStore';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { Badge, Button } from '../../ui';
 import { Check, Copy, Loader2, RefreshCw } from '../../ui/icons';
 import {
   ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, HTTPS_HINT, PASSWORDLESS_LAN_HINT, PROVIDER_LAST_TEST_FAILED,
-  RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN, REVIEW_DECIDE_FIRST, REVIEW_HEADING,
-  describeRestartReason, isFirstRunRestart,
+  QUIET_HOURS_LINE, RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN, REVIEW_DECIDE_FIRST,
+  REVIEW_HEADING, describeRestartReason, isFirstRunRestart,
 } from '../copy';
 import { stepTitle, stopPath } from '../navigation';
 import { Notice } from '../Notice';
+import { quietEnabled } from '../payload';
 import { ReadyScreen } from '../ReadyScreen';
 import { StatusBadge } from '../StatusBadge';
 import { useWizardNav } from '../wizardContext';
@@ -22,6 +25,12 @@ const RETURN_HERE = { returnTo: '/setup/review' };
 /** The server's last live test of the provider failed: say so beside its summary. */
 function lastTestFailed(step: SetupStep): boolean {
   return step.id === 'provider' && (step.detail as SetupProviderDetail).last_test?.ok === false;
+}
+
+/** The profile row's second line: "Quiet hours: off" or "Quiet hours: 22:00–07:00". */
+function quietHoursLine(step: SetupStep): string {
+  const detail = step.detail as SetupProfileDetail;
+  return QUIET_HOURS_LINE(quietEnabled(detail) ? { start: detail.quiet_start, end: detail.quiet_end } : null);
 }
 
 /**
@@ -193,6 +202,11 @@ export function ReviewStep({ state }: { state: SetupState }) {
                     {step.summary}
                     {lastTestFailed(step) && <span className="text-hue-amber"> · {PROVIDER_LAST_TEST_FAILED}</span>}
                   </p>
+                )}
+                {/* Before a mode is chosen the times are the config's
+                    fallback, which the mode is about to replace. */}
+                {step.id === 'profile' && state.mode !== null && (
+                  <p className="text-xs text-text-dim">{quietHoursLine(step)}</p>
                 )}
                 {step.id === 'claim' && (
                   <p className="text-xs text-text-dim">

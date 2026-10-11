@@ -224,6 +224,18 @@ export const COMMON_LANGUAGES = [
 
 export const QUIET_HOURS_PREFILL = { start: '22:00', end: '07:00' };
 
+/**
+ * The profile step's quiet-hours switch and the sentence under it. Nerve
+ * stores the times; the agent is the one that applies them, so the help
+ * says that and promises nothing about the server holding messages back.
+ */
+export const QUIET_HOURS_LABEL = 'Quiet hours';
+export const QUIET_HOURS_HELP =
+  'Nerve records these for the agent, which keeps non-urgent messages outside them.';
+/** The Review's line under the profile row: "Quiet hours: off" or "Quiet hours: 22:00–07:00". */
+export const QUIET_HOURS_LINE = (window: { start: string; end: string } | null) =>
+  `Quiet hours: ${window ? `${window.start}–${window.end}` : 'off'}`;
+
 export const MEMORY_WITH_EMBEDDINGS =
   'Fast vector search over Nerve\'s memory. Needs an OpenAI API key; OpenAI charges per note.';
 export const MEMORY_WITHOUT_EMBEDDINGS =
@@ -243,6 +255,11 @@ export const NO_CHANNELS_LABEL = 'Continue without channels';
 
 export const AUTOMATION_IDLE_UNTIL_SOURCE =
   'stays idle until a source is connected (Sources step)';
+
+/** Under a worker's task planner while the mode's default leaves it off. */
+export const AUTOMATION_TASK_PLANNER_WORKER =
+  'Off for workers until onboarding decides. The onboarding session enables it when this worker '
+  + 'should plan through the approval loop.';
 
 /** The Slack card when the shared channel gateway holds the connection: a status line, and only the switch. */
 export const SLACK_GATEWAY_LINE = (connected: boolean) =>

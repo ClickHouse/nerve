@@ -5,13 +5,14 @@ import { useAuthStore } from '../../../stores/authStore';
 import { useSetupStore } from '../../../stores/setupStore';
 import { useThemeStore } from '../../../stores/themeStore';
 import { browserLanguageName, browserTimeZone, supportedTimeZones } from '../../../utils/timeZones';
-import { Button, TextArea, TextField } from '../../ui';
+import { Button, Checkbox, TextArea, TextField } from '../../ui';
 import {
-  COMMON_LANGUAGES, PROFILE_HEADING_WORKER, PROFILE_NAME_HELP_EXTERNAL, QUIET_HOURS_PREFILL, STEP_HEADINGS,
+  COMMON_LANGUAGES, PROFILE_HEADING_WORKER, PROFILE_NAME_HELP_EXTERNAL, QUIET_HOURS_HELP, QUIET_HOURS_LABEL,
+  QUIET_HOURS_PREFILL, STEP_HEADINGS,
 } from '../copy';
 import { Field } from '../Field';
 import { Notice } from '../Notice';
-import { codePoints, decides, same } from '../payload';
+import { codePoints, decides, quietEnabled, same } from '../payload';
 import { focusRadio, radioTabIndex, radioTarget } from '../rovingRadio';
 import { StepFrame } from '../StepFrame';
 
@@ -25,6 +26,8 @@ const never = () => false;
 interface Form {
   name: string;
   timezone: string;
+  /** Off hides the times and sends `quiet_enabled: false`; the times wait behind it. */
+  quiet_enabled: boolean;
   quiet_start: string;
   quiet_end: string;
   language: string;
@@ -37,9 +40,15 @@ interface Form {
  * About you (worker: Operator). Opens on what the server has, with three
  * client prefills — the browser's time zone when the server's is still the
  * default, 22:00–07:00 quiet hours while the step is pending and the file
- * still has the template's, and the browser language — and always sends
- * the time zone and both quiet times on a pending step, so accepting a
- * prefill is saved and recorded as answered.
+ * still has the mode's default, and the browser language — and always sends
+ * the time zone and the quiet-hours decision on a pending step, so accepting
+ * a prefill is saved and recorded as answered.
+ *
+ * Quiet hours are optional: a switch above the two times, off by default
+ * for a worker. They travel as a whole — `quiet_enabled: false` alone, or
+ * `true` with both times — and a done step sends them only when the switch
+ * or a time differs from the server's. While they are off the times hold
+ * 22:00–07:00, so turning them on never shows two empty fields.
  *
  * In external mode the name comes from the actor header and only ever goes
  * to USER.md; no account controls render and no account endpoint is called.
@@ -69,11 +78,14 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
     // external mode the header's name is already `detail.name` when there
     // is one, and a short-id label must never land in USER.md.
     const fallbackName = !external && pending && viewer ? actorName(viewer) : '';
+    const prefill = detail.quiet_is_default && pending;
+    const quietTime = (value: string, fallback: string) => ((prefill || !value) ? fallback : value);
     return {
       name: detail.name ?? fallbackName,
       timezone: detail.timezone_is_default && zone ? zone : detail.timezone,
-      quiet_start: detail.quiet_is_default && pending ? QUIET_HOURS_PREFILL.start : detail.quiet_start,
-      quiet_end: detail.quiet_is_default && pending ? QUIET_HOURS_PREFILL.end : detail.quiet_end,
+      quiet_enabled: quietEnabled(detail),
+      quiet_start: quietTime(detail.quiet_start, QUIET_HOURS_PREFILL.start),
+      quiet_end: quietTime(detail.quiet_end, QUIET_HOURS_PREFILL.end),
       language: detail.language ?? (pending ? browserLanguageName() : ''),
       agent_name: detail.agent_name ?? '',
       agent_emoji: detail.agent_emoji ?? '',
@@ -99,7 +111,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
     if (!form.timezone.trim()) {
       setClientError({ field: 'timezone', detail: 'Pick a time zone.' }); return false;
     }
-    if (!TIME_RE.test(form.quiet_start) || !TIME_RE.test(form.quiet_end)) {
+    if (form.quiet_enabled && (!TIME_RE.test(form.quiet_start) || !TIME_RE.test(form.quiet_end))) {
       setClientError({ field: 'quiet_start', detail: 'Use 24-hour times such as 22:00.' }); return false;
     }
     if (codePoints(form.agent_emoji.trim()) > 8) {
@@ -107,11 +119,15 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
     }
     const body: Record<string, unknown> = {};
     const optional = ['language', 'agent_name', 'agent_emoji'] as const;
+    const quiet = form.quiet_enabled
+      ? { quiet_enabled: true, quiet_start: form.quiet_start, quiet_end: form.quiet_end }
+      : { quiet_enabled: false };
+    const quietChanged = form.quiet_enabled !== quietEnabled(detail) || (form.quiet_enabled
+      && (!same(form.quiet_start, detail.quiet_start) || !same(form.quiet_end, detail.quiet_end)));
     if (pending) {
-      // The decision payload: the time zone and both quiet times, always.
+      // The decision payload: the time zone and the quiet hours, always.
       body.timezone = form.timezone.trim();
-      body.quiet_start = form.quiet_start;
-      body.quiet_end = form.quiet_end;
+      Object.assign(body, quiet);
       if (name && (name !== (detail.name ?? '') || detail.user_md_pristine?.name)) body.name = name;
       for (const key of optional) {
         const value = form[key].trim();
@@ -119,8 +135,7 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
       }
     } else {
       if (!same(form.timezone.trim(), detail.timezone)) body.timezone = form.timezone.trim();
-      if (!same(form.quiet_start, detail.quiet_start)) body.quiet_start = form.quiet_start;
-      if (!same(form.quiet_end, detail.quiet_end)) body.quiet_end = form.quiet_end;
+      if (quietChanged) Object.assign(body, quiet);
       if (name !== (detail.name ?? '')) body.name = name;
       for (const key of optional) {
         const value = form[key].trim();
@@ -134,8 +149,11 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
 
   const heading = worker ? PROFILE_HEADING_WORKER : STEP_HEADINGS.profile;
   const zone = browserTimeZone();
-  const dirty = !same(form, initial);
+  // Times behind a switch that is off are not an edit.
+  const shown = (f: Form) => (f.quiet_enabled ? f : { ...f, quiet_start: '', quiet_end: '' });
+  const dirty = !same(shown(form), shown(initial));
   const fieldOff = (field: keyof Form) => locked || (onlyName && field !== 'name');
+  const quietError = errFor('quiet_enabled');
 
   // Behind a front gateway the field shows what the *instance* holds: the
   // person's own header name until USER.md is filled, the saved USER.md name
@@ -204,24 +222,40 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
         </div>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Quiet hours start" help="Nerve does not message you between these times unless it is urgent." error={errFor('quiet_start')}>
-          <TextField
-            type="time"
-            value={form.quiet_start}
-            onChange={(e) => set('quiet_start', e.target.value)}
-            disabled={fieldOff('quiet_start')}
-          />
-        </Field>
-        <Field label="Quiet hours end" error={errFor('quiet_end')}>
-          <TextField
-            type="time"
-            value={form.quiet_end}
-            onChange={(e) => set('quiet_end', e.target.value)}
-            disabled={fieldOff('quiet_end')}
-          />
-        </Field>
+      <div className="flex flex-col gap-1">
+        <Checkbox
+          checked={form.quiet_enabled}
+          onChange={(e) => set('quiet_enabled', e.target.checked)}
+          disabled={fieldOff('quiet_enabled')}
+          label={<span className="font-medium text-text">{QUIET_HOURS_LABEL}</span>}
+          aria-describedby={quietError ? 'setup-quiet-help setup-quiet-error' : 'setup-quiet-help'}
+          aria-invalid={quietError ? true : undefined}
+        />
+        <p id="setup-quiet-help" className="text-xs text-text-dim">{QUIET_HOURS_HELP}</p>
+        {quietError && (
+          <p id="setup-quiet-error" role="alert" tabIndex={-1} className="text-xs text-error outline-none">{quietError}</p>
+        )}
       </div>
+      {form.quiet_enabled && (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Quiet hours start" error={errFor('quiet_start')}>
+            <TextField
+              type="time"
+              value={form.quiet_start}
+              onChange={(e) => set('quiet_start', e.target.value)}
+              disabled={fieldOff('quiet_start')}
+            />
+          </Field>
+          <Field label="Quiet hours end" error={errFor('quiet_end')}>
+            <TextField
+              type="time"
+              value={form.quiet_end}
+              onChange={(e) => set('quiet_end', e.target.value)}
+              disabled={fieldOff('quiet_end')}
+            />
+          </Field>
+        </div>
+      )}
 
       <Field label="Response language" help="The language Nerve answers in." error={errFor('language')}>
         <TextField
