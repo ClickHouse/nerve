@@ -434,6 +434,16 @@ class TestModeLock:
         ) in task_md
         assert "{{TASK_DESCRIPTION}}" not in task_md
         assert step(state, "profile")["title"] == "Operator"
+        # A worker's defaults: no quiet hours, stated in the tracked settings,
+        # and task-planner offered but off until the onboarding session decides.
+        assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("", "")
+        profile = step(state, "profile")["detail"]
+        assert (profile["quiet_enabled"], profile["quiet_start"], profile["quiet_end"]) == (False, "", "")
+        assert profile["quiet_is_default"] is True
+        optional = {o["id"]: o for o in step(state, "automation")["detail"]["optional"]}
+        assert (optional["task-planner"]["enabled"], optional["task-planner"]["default_enabled"]) == (False, False)
+        assert all(optional[i]["enabled"] and optional[i]["default_enabled"] for i in ("skill-extractor", "skill-reviser"))
+        assert statuses(state)["automation"] == "pending"
 
     async def test_bad_mode_is_a_field_error(self, claimed):
         async with claimed.client() as http:
@@ -837,11 +847,104 @@ class TestProfile:
         choose(claimed, "personal")
         settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
         async with claimed.client() as http:
-            for body in ({"timezone": None}, {"quiet_start": None}, {"quiet_start": None, "quiet_end": None}):
+            for body in (
+                {"timezone": None}, {"quiet_start": None}, {"quiet_start": None, "quiet_end": None},
+                {"quiet_enabled": None}, {"quiet_enabled": None, "quiet_start": None},
+            ):
                 state = (await http.put("/api/setup/profile", json=body)).json()
                 assert step(state, "profile")["status"] == "pending", body
         assert "profile" not in setup_state.load_state().answered
         assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+
+    async def test_quiet_hours_off_writes_empty_values_and_user_md_says_none(self, claimed):
+        """``quiet_enabled: false`` is an answer: both values empty in the
+        tracked settings, the personal USER.md line reads "none". Whatever
+        times the form still holds are ignored, not validated."""
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            response = await http.put("/api/setup/profile", json={
+                "quiet_enabled": False, "quiet_start": "25:99", "quiet_end": None,
+            })
+        assert response.status_code == 200, response.text
+        state = response.json()
+        settings = claimed.settings_yaml()
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+        assert "- **Quiet hours:** none" in (claimed.workspace / "USER.md").read_text()
+        profile = step(state, "profile")
+        assert profile["status"] == "done"
+        assert "profile" in setup_state.load_state().answered
+        assert (profile["detail"]["quiet_enabled"], profile["detail"]["quiet_start"]) == (False, "")
+        assert profile["detail"]["quiet_is_default"] is False, "a personal install's default is 02:00–08:00"
+        assert state["restart_pending"] is False, "quiet hours are live"
+
+    async def test_quiet_hours_on_needs_both_valid_times(self, claimed):
+        choose(claimed, "personal")
+        settings_path = claimed.workspace / "config" / "settings.yaml"
+        before = settings_path.read_bytes()
+        async with claimed.client() as http:
+            for body, field_name in (
+                ({"quiet_enabled": True, "quiet_start": "22:00"}, "quiet_end"),
+                ({"quiet_enabled": True, "quiet_end": "07:00"}, "quiet_start"),
+                ({"quiet_enabled": True, "quiet_start": "22:00", "quiet_end": None}, "quiet_end"),
+                ({"quiet_enabled": True, "quiet_start": "22:00", "quiet_end": "7pm"}, "quiet_end"),
+                ({"quiet_enabled": True, "quiet_start": "", "quiet_end": "07:00"}, "quiet_start"),
+                ({"quiet_enabled": True, "quiet_start": "24:00", "quiet_end": "07:00"}, "quiet_start"),
+            ):
+                response = await http.put("/api/setup/profile", json=body)
+                assert response.status_code == 400, (body, response.text)
+                assert response.json()["field"] == field_name, body
+            assert settings_path.read_bytes() == before, "a refused body writes nothing"
+            state = (await http.put("/api/setup/profile", json={
+                "quiet_enabled": True, "quiet_start": "22:00", "quiet_end": "07:00", "timezone": "Europe/Berlin",
+            })).json()
+        settings = claimed.settings_yaml()
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("22:00", "07:00")
+        assert "- **Quiet hours:** 22:00–07:00 (Europe/Berlin)" in (claimed.workspace / "USER.md").read_text()
+        assert step(state, "profile")["detail"]["quiet_enabled"] is True
+
+    async def test_a_worker_switches_quiet_hours_on_and_off(self, claimed):
+        """On without times: the configured window, else 02:00–08:00. Off
+        again: empty values. A worker has no USER.md to touch."""
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "profile")["detail"]
+            assert (before["quiet_enabled"], before["quiet_is_default"]) == (False, True)
+            state = (await http.put("/api/setup/profile", json={"quiet_enabled": True})).json()
+            assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("02:00", "08:00")
+            detail = step(state, "profile")["detail"]
+            assert (detail["quiet_enabled"], detail["quiet_is_default"]) == (True, False)
+            assert step(state, "profile")["status"] == "done"
+            await http.put("/api/setup/profile", json={"quiet_enabled": True, "quiet_start": "23:00", "quiet_end": "06:30"})
+            # On again without times keeps the window it has.
+            await http.put("/api/setup/profile", json={"quiet_enabled": True})
+            assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("23:00", "06:30")
+            state = (await http.put("/api/setup/profile", json={"quiet_enabled": False})).json()
+        assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("", "")
+        detail = step(state, "profile")["detail"]
+        assert (detail["quiet_enabled"], detail["quiet_is_default"]) == (False, True)
+        assert not (claimed.workspace / "USER.md").exists()
+
+    async def test_a_times_only_body_still_enables_with_those_times(self, claimed):
+        """The body the page sent before the switch existed: unchanged on an
+        install that has quiet hours (only the named key is written), and on
+        one that has none the other time is filled so the pair is never half set."""
+        choose(claimed, "personal")
+        before = claimed.settings_yaml()
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/profile", json={"quiet_start": "23:00"})).json()
+        after = claimed.settings_yaml()
+        assert (after["quiet_start"], after["quiet_end"]) == ("23:00", "08:00")
+        assert {k: v for k, v in after.items() if k != "quiet_start"} == {
+            k: v for k, v in before.items() if k != "quiet_start"
+        }
+        assert step(state, "profile")["status"] == "done"
+        assert "- **Quiet hours:** 23:00–08:00" in (claimed.workspace / "USER.md").read_text()
+
+    async def test_a_times_only_body_on_a_worker_without_quiet_hours(self, claimed):
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        async with claimed.client() as http:
+            await http.put("/api/setup/profile", json={"quiet_start": "22:00"})
+        assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("22:00", "08:00")
 
     async def test_put_equal_to_defaults_records_answered(self, claimed):
         choose(claimed, "personal")
@@ -1008,6 +1111,25 @@ class TestAutomation:
         async with claimed.client() as http:
             state = (await http.put("/api/setup/automation", json={"crons": ["inbox-processor", "task-planner"]})).json()
         assert step(state, "automation")["status"] == "done"
+
+    async def test_a_worker_can_switch_task_planner_on(self, claimed):
+        """Off by default for a worker, still one toggle away on this step."""
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "automation")
+            assert {o["id"]: o["default_enabled"] for o in before["detail"]["optional"]} == {
+                "task-planner": False, "skill-extractor": True, "skill-reviser": True,
+            }
+            assert before["summary"] == "2 of 3 optional jobs on"
+            state = (await http.put("/api/setup/automation", json={
+                "crons": ["task-planner", "skill-extractor", "skill-reviser"],
+            })).json()
+        auto = step(state, "automation")
+        assert auto["status"] == "done"
+        planner = next(o for o in auto["detail"]["optional"] if o["id"] == "task-planner")
+        assert (planner["enabled"], planner["default_enabled"]) == (True, False)
+        jobs = yaml.safe_load((claimed.workspace / "config" / "cron" / "system.yaml").read_text())["jobs"]
+        assert next(j for j in jobs if j["id"] == "task-planner")["enabled"] is True
 
     async def test_without_a_mode_the_catalogue_is_missing(self, claimed):
         async with claimed.client() as http:
@@ -1557,6 +1679,34 @@ class TestLockdown:
             assert (await http.post("/api/setup/finish")).status_code == 200
         assert "anthropic_api_key" not in claimed.local_yaml()
 
+    async def test_locked_profile_refuses_the_quiet_switch(self, claimed, monkeypatch):
+        """The switch is a portable setting like the time zone: under lockdown
+        (local) it is a 409 naming it — before the times it travels with."""
+        choose(claimed, "personal")
+        _lock(claimed, monkeypatch)
+        settings_path = claimed.workspace / "config" / "settings.yaml"
+        before = settings_path.read_bytes()
+        async with claimed.client() as http:
+            for body in (
+                {"name": "Alice", "quiet_enabled": False},
+                {"quiet_enabled": True, "quiet_start": "22:00", "quiet_end": "07:00"},
+                {"quiet_enabled": None},
+            ):
+                response = await http.put("/api/setup/profile", json=body)
+                assert response.status_code == 409, (body, response.text)
+                assert response.json()["field"] == "quiet_enabled", body
+                assert response.json()["detail"].startswith("Configuration is managed")
+        assert settings_path.read_bytes() == before
+        assert "- **Quiet hours:** none" not in (claimed.workspace / "USER.md").read_text()
+
+    async def test_external_locked_profile_refuses_the_quiet_switch(self, external_install, monkeypatch):
+        choose(external_install, "personal")
+        _lock(external_install, monkeypatch, external=True)
+        async with external_install.client() as http:
+            refused = await http.put("/api/setup/profile", json={"quiet_enabled": False})
+        assert refused.status_code == 409
+        assert refused.json()["detail"].startswith("Configuration is managed")
+
     async def test_mode_blocked_without_templates_and_task_md_allowed(self, claimed, monkeypatch):
         _lock(claimed, monkeypatch)
         async with claimed.client() as http:
@@ -1956,6 +2106,15 @@ class TestExternalMode:
         assert [a["display_name"] for a in actors] == ["Alice Example"], "the header owns the name"
         assert "- **Name:** Alice" in (external_install.workspace / "USER.md").read_text()
         assert external_install.settings_yaml()["timezone"] == "UTC"
+
+    async def test_any_person_may_switch_quiet_hours_off(self, external_install):
+        choose(external_install, "personal")
+        async with external_install.client() as http:
+            state = (await http.put("/api/setup/profile", json={"quiet_enabled": False})).json()
+        assert step(state, "profile")["status"] == "done"
+        settings = external_install.settings_yaml()
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+        assert "- **Quiet hours:** none" in (external_install.workspace / "USER.md").read_text()
 
     async def test_header_name_is_the_prefill_only_while_user_md_is_pristine(self, external_install):
         choose(external_install, "personal")

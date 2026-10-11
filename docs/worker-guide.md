@@ -27,12 +27,14 @@ worker is configured on that page:
    writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
    `MEMORY.md`), `TASK.md` from its template with your description in place
    (the onboarding session fills the rest), and `config/cron/system.yaml` with
-   `task-planner`, `skill-extractor` and `skill-reviser` on
-   (`memory-maintenance` is always on)
+   `skill-extractor` and `skill-reviser` on and `task-planner` off
+   (`memory-maintenance` is always on; the onboarding session enables
+   `task-planner` when the worker should plan through the approval loop)
 3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
    Code login found on the server, or AWS Bedrock; test it, pick a model
-4. **Operator** — who runs this worker and in which time zone it should plan
-   its day; **Memory**, **Channels** and **Automation** are optional and can be
+4. **Operator** — who runs this worker, in which time zone it should plan its
+   day, and quiet hours if it should keep any (off for a worker by default);
+   **Memory**, **Channels** and **Automation** are optional and can be
    skipped. Sources and external agents are not offered to a worker
 5. **Review and finish** — the server check-up, then **Restart Nerve** (the
    mode's memory settings are read at startup) or **Finish**. The ending reads
@@ -41,8 +43,9 @@ worker is configured on that page:
 
 The same choice from a terminal is `nerve init --terminal`, which asks for the
 mode and the task description itself and does not start the daemon (`nerve
-start` afterwards). Its worker path has no cron step, so it writes `task-planner`,
-`skill-extractor` and `skill-reviser` with `enabled: false`: set `enabled: true` in
+start` afterwards). Its worker path has no cron step, so it writes
+`skill-extractor` and `skill-reviser` with `enabled: false` too (`task-planner` is
+off on every path until onboarding enables it): set `enabled: true` in
 `config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK="…"` for `nerve init --non-interactive` — see
 [Unattended installation](setup.md#unattended-installation).
@@ -54,14 +57,14 @@ When Nerve starts — or when the setup page's Finish runs on an instance that n
 1. **Research** — fetches URLs, searches the web, clones repos, explores CI systems mentioned in the task
 2. **Fill TASK.md in place** — replaces every `_(onboarding fills this in: …)_` placeholder and example line of the template with this worker's content, keeping the headings and the description as given, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link
 3. **Create skills** — writes domain-specific procedures as reusable skills (`skill_create`)
-4. **Configure cron jobs** — adds the worker's jobs to `<workspace>/config/cron/jobs.yaml`, with `run_if` gates where the guide calls for them so a job stays idle until there is work
+4. **Configure cron jobs** — adds the worker's jobs to `<workspace>/config/cron/jobs.yaml`, with `run_if` gates where the guide calls for them so a job stays idle until there is work. It also decides on `task-planner`, which ships disabled for workers: when the worker should plan through the approval loop, the session enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag; when a work job with a standing grant covers the routine items, it stays off. `TASK.md` § Approval Required says which
 5. **Create initial tasks** — files setup tasks that need manual work (credentials, access tokens, etc.)
-6. **Memorize and notify** — saves what it learned to memory and sends a notification that onboarding is complete with a summary of what was configured
+6. **Walk through everything it did, then give next steps** — saves what it learned to memory, then sends a `high` notification and ends with a final message, both listing every change: the `TASK.md` sections filled, statuses and skills created, cron jobs added or enabled (id, schedule, gate, session mode, whether enabled), the tasks it created for you and what each needs, and what it memorized. Both close with numbered **Next steps for the operator**: access to grant (with the task ids), plans to approve, jobs to review or enable, how to run one by hand (`nerve cron <id>`), and what to watch during the first runs
 7. **Delete the marker** — last, once every section is filled. The marker is how Nerve knows onboarding is still due: the setup page and `nerve doctor` report it as pending while the line stands, and a start before it is gone runs the session again
 
 A `TASK.md` from an older install (the raw `# Task` form, no marker) is rewritten into the template's shape with its text under "Task description (as given)" when the session starts; such a file counts as onboarded once it has a `## Mission` heading.
 
-After onboarding, the worker operates autonomously on its configured schedule.
+After onboarding, the worker operates autonomously on its configured schedule. Start with the session's walkthrough (the notification, or the session's last message): its next steps list what only you can do before the first runs.
 
 ## TASK.md
 
@@ -195,7 +198,7 @@ Cron detects issue → Agent proposes plan → Notification sent
 ```
 
 **In detail:**
-1. **Detection** — A cron job (built-in `task-planner` or custom monitoring cron) identifies something actionable
+1. **Detection** — A cron job (the built-in `task-planner`, when onboarding enabled it, or a custom monitoring cron) identifies something actionable
 2. **Task creation** — The agent creates a task describing the issue (`task_create`)
 3. **Plan proposal** — The agent researches the issue, explores the codebase, and writes a plan (`plan_propose`)
 4. **Notification** — A notification is sent so you know there's a plan to review
@@ -284,7 +287,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. `quiet_start`/`quiet_end` in `<workspace>/config/settings.yaml` record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
+Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, they record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 
@@ -302,7 +305,8 @@ Cron run history is stored in the `cron_logs` SQLite table and visible in the we
 | **Purpose** | Full-featured assistant for one human | Task-focused autonomous agent |
 | **Workspace files** | SOUL.md, IDENTITY.md, USER.md, MEMORY.md, AGENTS.md, TOOLS.md | SOUL.md, TASK.md, MEMORY.md, AGENTS.md, TOOLS.md |
 | **Memory categories** | Life-oriented (relationships, finances, health, travel) | Operational (patterns, procedures, decisions, approvals) |
-| **Default crons** | inbox-processor, task-planner, memory-maintenance | task-planner, skill-extractor, skill-reviser, memory-maintenance |
+| **Default crons** | inbox-processor, task-planner, memory-maintenance | skill-extractor, skill-reviser, memory-maintenance (task-planner off until onboarding enables it) |
+| **Quiet hours** | 02:00–08:00 | none |
 | **Sync sources** | Telegram, Gmail, GitHub | None by default (can add custom sources) |
 | **Channels** | Web UI + Telegram bot | Web UI (+ Telegram if configured) |
 | **Onboarding** | Interactive — user configures identity and preferences | Autonomous — agent researches task and self-configures |

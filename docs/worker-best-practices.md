@@ -29,11 +29,11 @@ Each job plays one role, and each role moves tasks in one direction:
 | Scan | Finds new work outside (failures, issues, alerts) and creates `pending` tasks tagged for the job that will work them | None; runs on its schedule | `isolated` |
 | Work | Claims one actionable task, moves it to `in_progress`, and ends the run with it in a truthful status | `tasks` on `pending` and the tag it owns | `isolated` |
 | Monitor | Watches a waiting status and returns the task when the external event happens | `tasks` on that status, plus `github_pr_activity` for PRs | `persistent` or `isolated` |
-| Planner (`task-planner`) | Proposes a plan for an open task that has none | `tasks` on `pending` | `persistent` |
+| Planner (`task-planner`) | Proposes a plan for an open task that has none. Ships disabled for workers; onboarding enables it when the worker plans through the approval loop | `tasks` on `pending`, and the worker's tag once overridden | `persistent` |
 | Skills (`skill-extractor`, `skill-reviser`) | Propose new or revised skills, each as a task with a plan | None | `persistent` |
 | Maintenance (`memory-maintenance`) | Tidies long-term memory; moves no tasks | None | `isolated` |
 
-The last three ship in `system.yaml` ([cron.md](cron.md#built-in-system-crons)); scan, work and monitor jobs are yours, in `config/cron/jobs.yaml`. A default worker is plan-driven: `task-planner` proposes, the operator approves, and an implementation session does the work. Add a work job when `TASK.md` § Approval Required grants autonomy for routine items. When both run, give each its own tasks by tag, and override `task-planner` by id in `jobs.yaml` so its prompt and gate name the tag it plans for; a job in `jobs.yaml` replaces the `system.yaml` job with the same id.
+The last three ship in `system.yaml` ([cron.md](cron.md#built-in-system-crons)); scan, work and monitor jobs are yours, in `config/cron/jobs.yaml`. `task-planner` ships disabled for workers. When the worker should plan through the approval loop (`task-planner` proposes, the operator approves, and an implementation session does the work), onboarding enables it by overriding the job by id in `jobs.yaml`, with a prompt and a `tasks` gate that name the worker's tag; a job in `jobs.yaml` replaces the `system.yaml` job with the same id. Add a work job when `TASK.md` § Approval Required grants autonomy for routine items. When both run, give each its own tasks by tag.
 
 ### How the pieces connect
 

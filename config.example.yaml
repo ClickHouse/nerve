@@ -240,7 +240,8 @@ notifications:
   # in slack.allow_channels is used; names and globs are not resolved.
   # slack_channel_id: "C0456DEF"
 
-# Quiet hours (local timezone)
+# Quiet hours (local timezone). Optional: set both to "" for none, which is
+# what a worker gets by default.
 quiet_start: "02:00"
 quiet_end: "12:00"
 

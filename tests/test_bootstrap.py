@@ -203,6 +203,39 @@ class TestNonInteractiveSetup:
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
 
+    def test_worker_mode_defaults(self, tmp_path: Path) -> None:
+        """Worker non-interactive: the two skill jobs on, task-planner
+        written but off (the onboarding session decides), quiet hours none."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Watch the nightly build for example/repo and propose fixes.",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.enabled_crons == ["skill-reviser", "skill-extractor"]
+        ws = tmp_path / "ws"
+        system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
+        assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
+            "memory-maintenance": True, "task-planner": False,
+            "skill-extractor": True, "skill-reviser": True,
+        }
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+
+    def test_personal_mode_keeps_its_quiet_hours(self, tmp_path: Path) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load((tmp_path / "ws" / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
+
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
         from nerve.bootstrap import PRODUCTIVITY_CRONS

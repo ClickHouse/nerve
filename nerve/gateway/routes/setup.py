@@ -93,6 +93,7 @@ from nerve.setup_token import (
 )
 from nerve.setup_writer import (
     CONFIG_YAML_HEADER,
+    DEFAULT_QUIET_WINDOW,
     ModeRefused,
     apply_mode,
     apply_profile_templates,
@@ -928,6 +929,9 @@ class ProviderRequest(BaseModel):
 class ProfileRequest(BaseModel):
     name: str | None = Field(default=None, max_length=_SHORT)
     timezone: str | None = Field(default=None, max_length=64)
+    # Declared before the times: a lockdown refusal names the first refused
+    # key, and with the switch in the body that should be the switch.
+    quiet_enabled: bool | None = None
     quiet_start: str | None = Field(default=None, max_length=16)
     quiet_end: str | None = Field(default=None, max_length=16)
     language: str | None = Field(default=None, max_length=_SHORT)
@@ -1382,9 +1386,47 @@ def _valid_time(value: str) -> bool:
     return 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59
 
 
+_QUIET_PATHS = ("quiet_start", "quiet_end")
+
+
+def _quiet_change(
+    enabled: bool | None, given: dict[str, Any], config: NerveConfig,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """``(start, end, paths to write)`` for a profile body, or ``None`` (unchanged).
+
+    ``("", "")`` is "no quiet hours". ``enabled`` false writes that; true
+    writes the two times given (the caller has validated both), or — both
+    omitted — the window configured now, else the default one. Omitted or
+    null leaves quiet hours alone unless a time is given: a body with times
+    only enables with them, as it always has, writing the times it names and
+    filling the other only where it is empty now, so the pair never ends up
+    half set.
+    """
+    current = (str(config.quiet_start or ""), str(config.quiet_end or ""))
+    asked = {key: str(given.get(key) or "").strip() for key in _QUIET_PATHS}
+    if enabled is False:
+        return "", "", _QUIET_PATHS
+    if enabled is True:
+        if not any(asked.values()):
+            start, end = current if all(current) else DEFAULT_QUIET_WINDOW
+            return start, end, _QUIET_PATHS
+        return asked["quiet_start"], asked["quiet_end"], _QUIET_PATHS
+    if not any(asked.values()):
+        return None
+    start = asked["quiet_start"] or current[0] or DEFAULT_QUIET_WINDOW[0]
+    end = asked["quiet_end"] or current[1] or DEFAULT_QUIET_WINDOW[1]
+    paths = tuple(key for key, now in zip(_QUIET_PATHS, current) if asked[key] or not now)
+    return start, end, paths
+
+
 @router.put("/api/setup/profile")
 async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person)):
     given = {k: v for k, v in req.model_dump().items() if k in req.model_fields_set}
+    if req.quiet_enabled is False:
+        # Quiet hours off: whatever times the form still holds are not used,
+        # so they are neither validated nor written.
+        for key in _QUIET_PATHS:
+            given.pop(key, None)
     name = (req.name or "").strip() if req.name is not None else None
     tz = (req.timezone or "").strip() if req.timezone is not None else None
     if tz is not None:
@@ -1394,10 +1436,17 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
             ZoneInfo(tz)
         except (ZoneInfoNotFoundError, ValueError, OSError):
             raise SetupFieldError("timezone", "Not a time zone name. Use an IANA name such as Europe/Berlin.")
-    for field_name in ("quiet_start", "quiet_end"):
+    for field_name in _QUIET_PATHS:
         value = given.get(field_name)
         if value is not None and not _valid_time(str(value).strip()):
             raise SetupFieldError(field_name, "Use a 24-hour time such as 22:00.")
+    if req.quiet_enabled is True:
+        # Switching quiet hours on with one time names the other one; with
+        # neither, the configured (or default) window is used.
+        stated = [key for key in _QUIET_PATHS if given.get(key) is not None]
+        if len(stated) == 1:
+            missing = "quiet_end" if stated[0] == "quiet_start" else "quiet_start"
+            raise SetupFieldError(missing, "Quiet hours need both a start and an end time.")
     # Every one of these becomes one line of USER.md or IDENTITY.md — files
     # loaded into the agent's system prompt. A line break inside a "display
     # name" would plant arbitrary prompt lines there, so single-line fields
@@ -1439,27 +1488,27 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
                 detail="Choose a mode first — the files this step fills in depend on it",
             )
         # An explicit null on a settings value is not a removal (the time
-        # zone and quiet hours always have a value); it is treated as
-        # omitted, so it neither writes nor counts as an answer.
-        config_writes = {
-            k: v for k, v in given.items()
-            if k in ("timezone", "quiet_start", "quiet_end") and v is not None and str(v).strip()
-        }
-        quiet_start = str(given["quiet_start"]).strip() if given.get("quiet_start") else None
-        quiet_end = str(given["quiet_end"]).strip() if given.get("quiet_end") else None
+        # zone always has a value; quiet hours are switched off with
+        # ``quiet_enabled: false``); it is treated as omitted, so it neither
+        # writes nor counts as an answer.
+        quiet = _quiet_change(req.quiet_enabled, given, config)
+        overrides: dict[str, Any] = {}
+        portable_paths: list[str] = []
+        if tz:
+            overrides["timezone"] = tz
+            portable_paths.append("timezone")
+        if quiet is not None:
+            quiet_start, quiet_end, quiet_paths = quiet
+            overrides.update(
+                quiet_enabled=bool(quiet_start and quiet_end),
+                quiet_start=quiet_start, quiet_end=quiet_end,
+            )
+            portable_paths.extend(quiet_paths)
+        config_writes = bool(portable_paths)
 
         if config_writes:
-            choices = choices_from_config(config)
-            overrides: dict[str, Any] = {}
-            if tz:
-                overrides["timezone"] = tz
-            if quiet_start:
-                overrides["quiet_start"] = quiet_start
-            if quiet_end:
-                overrides["quiet_end"] = quiet_end
-            choices = replace_choices(choices, **overrides)
-            portable_paths = tuple(k for k in ("timezone", "quiet_start", "quiet_end") if k in overrides)
-            _m, portable, _s = _select(choices, portable_paths=portable_paths)
+            choices = replace_choices(choices_from_config(config), **overrides)
+            _m, portable, _s = _select(choices, portable_paths=tuple(portable_paths))
             _write(ctx, portable=portable)
 
         if mode == "personal" and not ctx.facts.lockdown:
@@ -1469,10 +1518,8 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
                     name=name or None,
                     timezone=tz or None,
                     language=(req.language or "").strip() or None if req.language is not None else None,
-                    quiet=(
-                        (quiet_start or config.quiet_start, quiet_end or config.quiet_end)
-                        if (quiet_start or quiet_end) else None
-                    ),
+                    # ("", "") writes "Quiet hours: none" while the line is pristine.
+                    quiet=(quiet[0], quiet[1]) if quiet is not None else None,
                     agent_name=(req.agent_name or "").strip() or None if req.agent_name is not None else None,
                     agent_emoji=emoji or None,
                     about=about or None,
@@ -1498,7 +1545,7 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
                 logger.exception("Setup: the display name could not be written")
                 raise HTTPException(
                     status_code=500,
-                    detail=f"{'The time zone was saved. ' if config_writes else 'Nothing was written. '}"
+                    detail=f"{'The settings were saved. ' if config_writes else 'Nothing was written. '}"
                            f"The display name could not be saved: {_public_error(e, config)}",
                 ) from e
 

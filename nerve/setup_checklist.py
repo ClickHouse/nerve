@@ -35,6 +35,7 @@ from nerve.setup_state import SetupState
 from nerve.setup_writer import (
     CORE_CRONS,
     DEFAULT_CRONS,
+    DEFAULT_QUIET_HOURS,
     PRODUCTIVITY_CRONS,
     describe_cron,
     identity_md_pristine,
@@ -122,7 +123,6 @@ PAIRING_AFTER_RESTART = (
 # What `nerve init` writes when nobody chose one (nerve/config.py's own
 # default). A timezone that differs from it is an answer somebody gave.
 DEFAULT_TIMEZONE = NerveConfig().timezone
-DEFAULT_QUIET = (NerveConfig().quiet_start, NerveConfig().quiet_end)
 
 # The persisted-config subset of each step's detail. Volatile fields (a test
 # result, whether the bot is live, pairing counts, onboarding progress) are
@@ -137,7 +137,7 @@ ETAG_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     STEP_PROFILE: (
         "name", "name_source", "display_name_editable", "writable_fields", "timezone",
-        "timezone_is_default", "quiet_start", "quiet_end", "quiet_is_default",
+        "timezone_is_default", "quiet_enabled", "quiet_start", "quiet_end", "quiet_is_default",
         "language", "agent_name", "agent_emoji", "about_set", "user_md_pristine",
         "identity_md_pristine",
     ),
@@ -519,6 +519,10 @@ def _profile_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str
         saved = _line_value(user_lines, "- **Name:**")
         if saved:
             name, name_source = saved, "user_md"
+    # Quiet hours are optional: both empty is "none" (a worker's default), and
+    # "default" means the mode's own — personal 02:00–08:00, a worker none.
+    quiet = (str(config.quiet_start or ""), str(config.quiet_end or ""))
+    quiet_default = DEFAULT_QUIET_HOURS.get(mode or "personal", DEFAULT_QUIET_HOURS["personal"])
     detail = {
         "name": name,
         "name_source": name_source,
@@ -527,9 +531,10 @@ def _profile_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str
         "writable_fields": writable_fields,
         "timezone": config.timezone,
         "timezone_is_default": config.timezone == DEFAULT_TIMEZONE,
-        "quiet_start": config.quiet_start,
-        "quiet_end": config.quiet_end,
-        "quiet_is_default": (config.quiet_start, config.quiet_end) == DEFAULT_QUIET,
+        "quiet_enabled": bool(quiet[0] and quiet[1]),
+        "quiet_start": quiet[0],
+        "quiet_end": quiet[1],
+        "quiet_is_default": quiet == quiet_default,
         "language": _line_value(user_lines, "- **Language:**"),
         "agent_name": _line_value(identity_lines, "- **Name:**"),
         "agent_emoji": _line_value(identity_lines, "- **Emoji:**"),
@@ -703,6 +708,10 @@ def _automation_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], 
             "schedule": toggle.schedule,
             "schedule_text": describe_cron(toggle.schedule),
             "enabled": toggle.enabled,
+            # Whether this mode's default set switches the job on (a worker's
+            # task-planner: no — onboarding decides). ``default`` is the
+            # older name for the same value.
+            "default_enabled": default,
             "default": default,
         })
     core = [{

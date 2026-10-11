@@ -19,8 +19,8 @@ agent:
   thinking: max
   effort: max
   context_1m: true
-quiet_start: 02:00
-quiet_end: 08:00
+quiet_start: ''
+quiet_end: ''
 memory:
   recall_model: claude-sonnet-4-6
   memorize_model: claude-sonnet-4-6

@@ -250,10 +250,56 @@ class TestDoneRules:
         assert statuses(facts(personal))["automation"] == "done"
 
     def test_automation_worker_defaults(self, worker):
+        """task-planner is offered but off by default for a worker — the
+        detail says so per job, which is what the page's hint keys on."""
         s = step(facts(worker), "automation")
-        assert [o["id"] for o in s["detail"]["optional"]] == ["task-planner", "skill-extractor", "skill-reviser"]
-        assert all(o["enabled"] and o["default"] for o in s["detail"]["optional"])
-        assert s["status"] == "pending"
+        optional = {o["id"]: o for o in s["detail"]["optional"]}
+        assert list(optional) == ["task-planner", "skill-extractor", "skill-reviser"]
+        assert {i: (o["enabled"], o["default_enabled"]) for i, o in optional.items()} == {
+            "task-planner": (False, False),
+            "skill-extractor": (True, True),
+            "skill-reviser": (True, True),
+        }
+        assert all(o["default"] == o["default_enabled"] for o in optional.values()), "the older name stays"
+        assert s["status"] == "pending", "the file matches the worker defaults"
+        assert s["summary"] == "2 of 3 optional jobs on"
+        # Turning the planner on is a decision, as any other change is.
+        set_optional_crons(worker, {"task-planner", "skill-extractor", "skill-reviser"})
+        assert statuses(facts(worker))["automation"] == "done"
+
+    def test_automation_personal_defaults_are_unchanged(self, personal):
+        optional = {o["id"]: o["default_enabled"] for o in step(facts(personal), "automation")["detail"]["optional"]}
+        assert optional == {
+            "inbox-processor": True, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
+        }
+
+    def test_quiet_hours_detail_follows_the_mode_default(self, tmp_path):
+        """``quiet_enabled`` is "both times set"; ``quiet_is_default`` compares
+        against the mode's own default — personal 02:00–08:00, a worker none."""
+        personal, worker = tmp_path / "personal", tmp_path / "worker"
+        apply_mode(personal, "personal")
+        apply_mode(worker, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        cases = [
+            (personal, {}, (True, "02:00", "08:00", True)),
+            (personal, {"quiet_start": "22:00", "quiet_end": "07:00"}, (True, "22:00", "07:00", False)),
+            (personal, {"quiet_start": "", "quiet_end": ""}, (False, "", "", False)),
+            (worker, {"quiet_start": "", "quiet_end": ""}, (False, "", "", True)),
+            (worker, {"quiet_start": "22:00", "quiet_end": "07:00"}, (True, "22:00", "07:00", False)),
+            # A key no layer states is the loader's window: on, and not a worker's default.
+            (worker, {}, (True, "02:00", "08:00", False)),
+            # Half a pair is no quiet hours at all (the representation is both or neither).
+            (worker, {"quiet_start": "22:00", "quiet_end": ""}, (False, "22:00", "", False)),
+        ]
+        for ws, quiet, expected in cases:
+            detail = step(facts(ws, cfg(ws, **quiet)), "profile")["detail"]
+            got = (detail["quiet_enabled"], detail["quiet_start"], detail["quiet_end"], detail["quiet_is_default"])
+            assert got == expected, (ws.name, quiet)
+
+    def test_switching_quiet_hours_off_changes_the_profile_etag(self, worker):
+        on = step(facts(worker, cfg(worker, quiet_start="22:00", quiet_end="07:00")), "profile")
+        off = step(facts(worker, cfg(worker, quiet_start="", quiet_end="")), "profile")
+        assert on["etag"] != off["etag"]
+        assert "quiet_enabled" in checklist.ETAG_FIELDS["profile"]
 
     def test_agents(self, personal):
         assert statuses(facts(personal))["agents"] == "pending"

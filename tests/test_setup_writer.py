@@ -765,6 +765,26 @@ class TestApplyMode:
         apply_mode(ws, "personal", in_container=True)
         assert (ws / "TOOLS.md").read_text(encoding="utf-8").count("## Docker Environment") == 1
 
+    def test_worker_mode_writes_no_quiet_hours_and_leaves_task_planner_off(self, tmp_path: Path) -> None:
+        """A worker's defaults: quiet hours off — stated as empty strings, so
+        the loader's own 02:00–08:00 cannot come back — and task-planner in
+        the catalogue but disabled until the onboarding session decides."""
+        ws = tmp_path / "ws"
+        outcome = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        assert {"quiet_start", "quiet_end"} <= set(outcome.settings_defaults_added)
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text(encoding="utf-8"))
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+        config = NerveConfig.from_dict({"workspace": str(ws), **settings})
+        assert (config.quiet_start, config.quiet_end) == ("", "")
+        crons = {c.id: c.enabled for c in setup_writer.list_optional_crons(ws)}
+        assert crons == {"task-planner": False, "skill-extractor": True, "skill-reviser": True}
+
+    def test_personal_mode_keeps_the_installer_window(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        apply_mode(ws, "personal")
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text(encoding="utf-8"))
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
+
     def test_apply_mode_under_lockdown(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
         with pytest.raises(setup_writer.ModeRefused):
@@ -934,3 +954,67 @@ class TestFixRoundTwoWriterRules:
             "skill-reviser": "Skill reviser",
         }
         assert "name" not in yaml.safe_load(setup_writer.system_cron_file(ws).read_text(encoding="utf-8"))["jobs"][0]
+
+
+class TestModeDefaults:
+    """Quiet hours are optional (a worker's are off) and a worker's
+    task-planner is off until its onboarding session enables it."""
+
+    @staticmethod
+    def _quiet(**fields) -> tuple[str, str]:
+        _machine, portable, _ = setup_writer.build_config_layers(SetupChoices(**fields))
+        return portable["quiet_start"], portable["quiet_end"]
+
+    def test_each_mode_writes_its_own_quiet_hours(self) -> None:
+        assert self._quiet(mode="personal") == ("02:00", "08:00")
+        assert self._quiet(mode="worker") == ("", "")
+        assert setup_writer.DEFAULT_QUIET_HOURS == {"personal": ("02:00", "08:00"), "worker": ("", "")}
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_the_switch_beats_the_mode_default(self, mode: str) -> None:
+        # Off: none, whatever times the choices still carry.
+        assert self._quiet(mode=mode, quiet_enabled=False) == ("", "")
+        assert self._quiet(mode=mode, quiet_enabled=False, quiet_start="22:00", quiet_end="07:00") == ("", "")
+        # On: the times given; a missing one from the default window.
+        assert self._quiet(mode=mode, quiet_enabled=True) == ("02:00", "08:00")
+        assert self._quiet(mode=mode, quiet_enabled=True, quiet_start="22:00", quiet_end="07:00") == ("22:00", "07:00")
+        assert self._quiet(mode=mode, quiet_enabled=True, quiet_start="22:00") == ("22:00", "08:00")
+        # Not stated but times given: on with them, as a times-only answer always was.
+        assert self._quiet(mode=mode, quiet_start="22:00", quiet_end="07:00") == ("22:00", "07:00")
+
+    def test_choices_from_config_state_the_switch(self, tmp_path: Path) -> None:
+        """An install that switched quiet hours off stays off when its choices
+        are written again — the mode's default does not reapply."""
+        off = choices_from_config(NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"), "quiet_start": "", "quiet_end": "",
+        }))
+        assert off.quiet_enabled is False
+        assert setup_writer.quiet_hours(off) == ("", "")
+        on = choices_from_config(NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"), "quiet_start": "22:00", "quiet_end": "07:00",
+        }))
+        assert on.quiet_enabled is True
+        assert setup_writer.quiet_hours(on) == ("22:00", "07:00")
+        # A key missing from every layer is the loader's default window.
+        assert choices_from_config(NerveConfig.from_dict({"workspace": str(tmp_path / "ws")})).quiet_enabled is True
+
+    def test_user_md_records_no_quiet_hours(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        apply_mode(ws, "personal")
+        assert apply_profile_templates(ws, quiet=("22:00", "")) == [], "half a pair is skipped"
+        assert apply_profile_templates(ws, quiet=("", "")) == ["- **Quiet hours:** none"]
+        assert "- **Quiet hours:** none" in (ws / "USER.md").read_text(encoding="utf-8")
+        # Pristine-guarded like every other line: a later window does not replace it.
+        assert apply_profile_templates(ws, quiet=("22:00", "07:00")) == []
+
+    def test_worker_default_crons_leave_task_planner_available_but_off(self) -> None:
+        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor"]
+        assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner"]
+        assert setup_writer.optional_cron_ids_for("worker") == ("task-planner", "skill-extractor", "skill-reviser")
+        jobs = setup_writer.build_cron_jobs(SetupChoices(
+            mode="worker", enabled_crons=list(setup_writer.DEFAULT_CRONS["worker"]),
+        ))
+        assert {job["id"]: job["enabled"] for job in jobs} == {
+            "memory-maintenance": True, "task-planner": False,
+            "skill-extractor": True, "skill-reviser": True,
+        }

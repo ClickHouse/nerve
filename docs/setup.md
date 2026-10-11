@@ -185,11 +185,11 @@ keep", never read back.
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
 | **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
-| **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours (prefilled 22:00–07:00), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml`; the matching lines of `USER.md` and `IDENTITY.md` (personal) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
+| **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
 | **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
 | **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash, then a one-time sign-in to your own Telegram account: phone, the code Telegram sends, your two-step password if you have one) as toggle cards, each with a server-side check of its tool (`gh`, `gog`) | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml`; the Telegram session → `NERVE_HOME/telegram_sync.session` (owner-only, written by Telethon) | live |
-| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
+| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. For a worker `task-planner` starts off: the onboarding session enables it when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
 | **Agents** (personal) | which coding agents on this server (Codex, Claude Code) get a connection to Nerve; what to do with an existing config | the agents' own config files; `external_agents.*` and `mcp_endpoint.enabled` → `config.yaml` | restart |
 | **Review and finish** | a server check-up (Claude CLI, Node, `gh`, `gog`, disk, time zone, web build), what was written where, and the apply button | nothing new | hot reload, or a restart when something above needs one |
 
@@ -213,9 +213,12 @@ A few things worth knowing per step:
   step may show a Keychain prompt **on the server's screen** once — Deny keeps
   the option hidden. Choosing it copies that credential into
   `config.local.yaml`, exactly as the terminal wizard does.
-- **About you** prefills the time zone from your browser and quiet hours of
-  22:00–07:00 when the instance still has the defaults. Continuing accepts
-  them; the step counts as decided.
+- **About you** prefills the time zone from your browser. Quiet hours are
+  optional: on a personal install the switch starts on with 22:00–07:00 while
+  the instance still has the defaults; a worker's starts off. Continuing
+  accepts what the form shows; the step counts as decided. Nerve records quiet
+  hours for the agent and does not hold messages back itself (see
+  [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the
@@ -238,7 +241,10 @@ A few things worth knowing per step:
   the sync is on but nobody is signed in, the Sources summary, the Ready
   screen and `nerve doctor` say so.
 - **Automation** lists the core jobs as always-on and the optional ones as
-  checkboxes with their schedule rendered in the chosen time zone.
+  checkboxes with their schedule rendered in the chosen time zone. A worker's
+  `task-planner` is unchecked by default; leave it for the onboarding session,
+  which turns it on (scoped to the worker's tasks) when the worker should plan
+  through the approval loop.
 - **Review and finish** shows an HTTPS warning when the page is served over
   plain HTTP from an address other than loopback, and a warning when the
   instance is passwordless and listening beyond localhost.
@@ -410,10 +416,12 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
 
-This path is byte-for-byte what it was: the same files, no daemon started. The
-browser checklist afterwards shows what the environment decided as done — the
-mode, the provider, the time zone, a Telegram token — and leaves the rest to
-skip or fill in.
+This path writes the same files it always has and starts no daemon; only a
+worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
+empty) and `task-planner` disabled until the onboarding session enables it.
+The browser checklist afterwards shows what the environment decided as done —
+the mode, the provider, the time zone, a Telegram token — and leaves the rest
+to skip or fill in.
 
 A re-run over an existing install keeps the configuration and only upgrades the code.
 

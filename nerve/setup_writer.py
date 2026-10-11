@@ -203,14 +203,31 @@ PRODUCTIVITY_CRONS = [
 
 # The optional crons each mode switches on when nobody chose otherwise: what
 # ``nerve init --non-interactive`` writes, and what the web Mode step writes
-# into a fresh ``system.yaml``.
+# into a fresh ``system.yaml``. A worker's ``task-planner`` is not among them:
+# whether the worker plans through the approval loop is the onboarding
+# session's decision, and it enables the job (overridden by id in
+# ``jobs.yaml``, scoped to the worker's tag) when the answer is yes.
 DEFAULT_CRONS: dict[str, list[str]] = {
     "personal": ["inbox-processor", "task-planner"],
-    "worker": ["skill-reviser", "skill-extractor", "task-planner"],
+    "worker": ["skill-reviser", "skill-extractor"],
 }
 
-# The optional crons a worker install carries at all.
+# The optional crons a worker install carries at all — task-planner included,
+# written disabled, so it stays one toggle away.
 _WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner")
+
+# Quiet hours: ``quiet_start`` and ``quiet_end`` both empty means there are
+# none; otherwise both are ``HH:MM``. The window an enabled-but-unspecified
+# quiet period falls back to, and the one a personal install starts with.
+DEFAULT_QUIET_WINDOW: tuple[str, str] = ("02:00", "08:00")
+
+# What each mode writes when nobody chose: a personal install keeps the
+# installer's window, a worker has none. Written explicitly (empty strings in
+# ``settings.yaml``), so NerveConfig's own default cannot bring a window back.
+DEFAULT_QUIET_HOURS: dict[str, tuple[str, str]] = {
+    "personal": DEFAULT_QUIET_WINDOW,
+    "worker": ("", ""),
+}
 
 # Default memory categories for a fresh install.
 # Generic enough for any user — they can customize in config.yaml later.
@@ -332,7 +349,11 @@ class SetupChoices:
     # Model picker (web Provider step). Empty keeps the installer's defaults.
     agent_model: str = ""
     agent_effort: str = ""
-    # Quiet hours (web Profile step). Empty keeps the installer's defaults.
+    # Quiet hours (web Profile step) — see :func:`quiet_hours`. ``None``
+    # leaves the switch to the times (given → on) or else to the mode's
+    # default; ``False`` writes none; ``True`` fills a missing time from the
+    # default window.
+    quiet_enabled: bool | None = None
     quiet_start: str = ""
     quiet_end: str = ""
     # Slack (web Channels step). ``None`` leaves the key out entirely.
@@ -468,6 +489,23 @@ def del_leaf(d: dict[str, Any], path: str) -> bool:
     return True
 
 
+def quiet_hours(choices: SetupChoices) -> tuple[str, str]:
+    """The ``(quiet_start, quiet_end)`` these answers write; ``("", "")`` is none.
+
+    ``quiet_enabled`` decides. ``False``: no quiet hours. ``True``: on, a
+    missing time taken from :data:`DEFAULT_QUIET_WINDOW`. ``None`` — nobody
+    stated the switch — is on when a time was given (what a request carrying
+    only times has always meant) and otherwise the mode's default: personal
+    02:00–08:00, a worker none.
+    """
+    start, end = choices.quiet_start, choices.quiet_end
+    if choices.quiet_enabled is False:
+        return "", ""
+    if choices.quiet_enabled is None and not (start or end):
+        return DEFAULT_QUIET_HOURS.get(choices.mode, DEFAULT_QUIET_WINDOW)
+    return start or DEFAULT_QUIET_WINDOW[0], end or DEFAULT_QUIET_WINDOW[1]
+
+
 # Keys that describe *this box* and must never travel with the workspace
 # repo. Everything else the wizard decides is shared behaviour and belongs
 # in the tracked settings layer, so `nerve config sync` and lockdown mean
@@ -495,6 +533,7 @@ def build_config_layers(
         "deployment": choices.deployment,
     }
     shadowed: list[str] = []
+    quiet_start, quiet_end = quiet_hours(choices)
     portable: dict[str, Any] = {
         "timezone": choices.timezone,
         # Shared, not machine-local: these describe the deployment, and a
@@ -518,8 +557,10 @@ def build_config_layers(
             "effort": "max",
             "context_1m": True,
         },
-        "quiet_start": choices.quiet_start or "02:00",
-        "quiet_end": choices.quiet_end or "08:00",
+        # Personal 02:00–08:00 and worker none unless stated otherwise; an
+        # empty pair is written as such, never left out (see quiet_hours).
+        "quiet_start": quiet_start,
+        "quiet_end": quiet_end,
         "memory": {
             "recall_model": DEFAULT_RECALL_MODEL,
             "memorize_model": DEFAULT_MEMORIZE_MODEL,
@@ -1173,8 +1214,9 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             jobs.append(job)
     elif choices.mode == "worker":
         # Workers get skill crons — they create skills during onboarding
-        # and those skills should be maintained automatically.
-        # Other crons (task-planner, etc.) can be added during onboarding.
+        # and those skills should be maintained automatically. task-planner
+        # is catalogued too but on only when chosen (DEFAULT_CRONS leaves it
+        # to the onboarding session); other jobs are added during onboarding.
         for cron in PRODUCTIVITY_CRONS:
             if cron["id"] not in _WORKER_CRONS:
                 continue
@@ -1711,7 +1753,8 @@ def apply_mode(
                 publish_text(tools_md, content + _DOCKER_TOOLS_SECTION)
 
     # Settings: the mode decides the memory categories (set, where absent) and
-    # the rest of the installer's defaults are filled only where absent.
+    # the quiet hours (a worker's are empty: none), and the rest of the
+    # installer's defaults are filled only where absent.
     categories = (
         _PERSONAL_MEMORY_CATEGORIES if mode == "personal" else _WORKER_MEMORY_CATEGORIES
     )
@@ -1822,7 +1865,9 @@ def apply_profile_templates(
     Exact-line substitution: a line is replaced only while it still reads as
     the template wrote it, so a second person — or the agent, which maintains
     these files — never has an edit clobbered. ``None`` arguments are skipped.
-    Returns the lines it changed.
+    ``quiet`` is ``(start, end)``; ``("", "")`` records that there are no
+    quiet hours, and a pair with only one time is skipped. Returns the lines
+    it changed.
     """
     ws = Path(workspace)
     # Defence in depth for every caller (the API validates first; the
@@ -1849,6 +1894,8 @@ def apply_profile_templates(
         user[_USER_PRISTINE["quiet_hours"]] = (
             f"- **Quiet hours:** {quiet[0]}–{quiet[1]}{tz}"
         )
+    elif quiet is not None and tuple(quiet) == ("", ""):
+        user[_USER_PRISTINE["quiet_hours"]] = "- **Quiet hours:** none"
     if about:
         user[_USER_PRISTINE["work"]] = f"**Work:** {about}"
     if user:
@@ -1936,6 +1983,9 @@ def choices_from_config(config) -> SetupChoices:
         external_agents_conflict_policy=str(config.external_agents.conflict_policy),
         agent_model=str(config.agent.model or ""),
         agent_effort=str(config.agent.effort or ""),
+        # Stated, not left to the mode's default: an install that switched
+        # its quiet hours off must stay off when these choices are written.
+        quiet_enabled=bool(config.quiet_start and config.quiet_end),
         quiet_start=str(config.quiet_start or ""),
         quiet_end=str(config.quiet_end or ""),
         slack_enabled=bool(config.slack.enabled),

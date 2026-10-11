@@ -2594,11 +2594,11 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
             except ValueError:
                 pass
 
-    # In non-interactive personal mode, enable all productivity crons by default
-    if choices.mode == "personal":
-        choices.enabled_crons = ["inbox-processor", "task-planner"]
-    elif choices.mode == "worker":
-        choices.enabled_crons = ["skill-reviser", "skill-extractor", "task-planner"]
+    # The mode's default optional crons — the set the web Mode step writes too.
+    # Personal: inbox-processor and task-planner. Worker: the two skill jobs;
+    # its task-planner stays off until the onboarding session enables it.
+    if choices.mode in DEFAULT_CRONS:
+        choices.enabled_crons = list(DEFAULT_CRONS[choices.mode])
 
     # External agents — comma-separated list ("codex,claude-code") and
     # optional conflict policy. Validated against AGENT_REGISTRY so an

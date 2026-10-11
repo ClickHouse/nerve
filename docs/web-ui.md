@@ -170,14 +170,18 @@ Per-step behaviour worth knowing: Mode is read-only once chosen; the Model
 step shows the "Claude Code login on this server" card only when
 `GET /api/setup/provider/host-login` finds one, offers "Test connection", and
 shows the model and effort picker (with one line of guidance each) once a
-credential works; About you prefills the browser's time zone and 22:00–07:00
-quiet hours when the instance still has the defaults, and offers theme pills
-(client-side only); Channels verifies a Telegram token with the test button,
+credential works; About you prefills the browser's time zone, shows quiet
+hours as a switch above the two times (on with 22:00–07:00 when a personal
+instance still has the defaults, off for a worker; off sends
+`quiet_enabled: false`), and offers theme pills (client-side only); Channels
+verifies a Telegram token with the test button,
 shows the saved token's start error when the bot failed to boot, and embeds
 the `PairingWidget` (t.me link, code, 2 s poll) when the bot is live, with a
 manual user id fallback; Sources load `GET /api/setup/sources/preflight` and
 warn when a toggle is on but its tool is missing; Automation renders
-schedules in the chosen time zone; Agents default-checks what is installed.
+schedules in the chosen time zone and, for a worker, shows `task-planner` off
+by default with a note that the onboarding session enables it when the worker
+should plan through the approval loop; Agents default-checks what is installed.
 
 **Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
 runs the server check-up (`GET /api/setup/environment`) with its hints — an

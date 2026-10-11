@@ -148,18 +148,41 @@ jobs:
     prompt_file: prompts/work-queue.md   # or an inline `prompt: |`
 ```
 
+Then decide on the planner. The built-in jobs are in \
+`<workspace>/config/cron/system.yaml`: for a worker `task-planner` ships \
+disabled (after `nerve init --terminal` the skill jobs are disabled too). When \
+this worker should plan through the approval loop, enable `task-planner` by \
+overriding it by id in `jobs.yaml` (a job there replaces the `system.yaml` job \
+with the same id): `enabled: true`, with a prompt and a `tasks` gate \
+(`status: pending` and this worker's `tag`) scoped to the tasks it plans. Leave \
+it off when a work job with a standing grant covers the routine items. Say \
+which in `TASK.md` § Approval Required.
+
 ### 5. Create initial tasks
 
 `task_create` one task per thing only the operator can do: credentials to \
 grant, accounts to create, access to request, decisions the description leaves \
 open.
 
-### 6. Memorize and notify
+### 6. Walk through everything you did, then give next steps
 
-`memorize` what you learned about the domain (`knowledge`) and what you decided \
-(`event`); the next session starts from zero. Then `notify` (priority `high`) a \
-summary: the `TASK.md` sections filled, the skills created, the cron jobs added \
-with their schedules and gates, and the tasks that need the operator.
+First `memorize` what you learned about the domain (`knowledge`) and what you \
+decided (`event`); the next session starts from zero. Then `notify` (priority \
+`high`) a walkthrough, and after step 7 end the session with the same \
+walkthrough as your final message. Both enumerate every change:
+
+- the `TASK.md` sections you filled;
+- the statuses you created;
+- the skills you created, by name;
+- the cron jobs you added or enabled: id, schedule, gate, session mode, and \
+whether it is enabled;
+- the tasks you created: their ids and what the operator must do for each;
+- what you memorized.
+
+Close both with a numbered **Next steps for the operator**: credentials and \
+access to grant (with the task ids), plans to approve, jobs to review or \
+enable, how to run a job by hand (`nerve cron <id>`), and what to watch during \
+the first runs.
 
 ### 7. Delete the marker — last
 

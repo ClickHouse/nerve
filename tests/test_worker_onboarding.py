@@ -100,7 +100,52 @@ class TestPrompt:
             "<!-- nerve:onboarding pending",
         ):
             assert needle in prompt, needle
-        assert prompt.index("### 7. Delete the marker — last") > prompt.index("### 6. Memorize and notify")
+        assert prompt.index("### 7. Delete the marker — last") > prompt.index(
+            "### 6. Walk through everything you did, then give next steps"
+        )
+
+    def test_step_four_decides_on_the_planner(self) -> None:
+        """task-planner ships disabled for a worker: the session enables it —
+        overridden by id, scoped to the worker's tag — or says why not."""
+        steps = worker_onboarding_prompt(DESCRIPTION, "guide text").split("### 4. Configure cron jobs", 1)[1]
+        step_four = steps.split("### 5.", 1)[0]
+        for needle in (
+            "`task-planner` ships disabled",
+            "overriding it by id in `jobs.yaml`",
+            "`enabled: true`",
+            "a `tasks` gate",
+            "this worker's `tag`",
+            "Leave it off when a work job with a standing grant covers the routine items",
+            "`TASK.md` § Approval Required",
+        ):
+            assert needle in step_four, needle
+
+    def test_step_six_walks_through_every_change_and_ends_with_next_steps(self) -> None:
+        prompt = worker_onboarding_prompt(DESCRIPTION, "guide text")
+        step_six = prompt.split("### 6. Walk through everything you did, then give next steps", 1)[1]
+        step_six = step_six.split("### 7.", 1)[0]
+        assert "Next steps" in prompt
+        for needle in (
+            "`memorize`",
+            "`notify` (priority `high`)",
+            "final message",
+            "the `TASK.md` sections you filled",
+            "the statuses you created",
+            "the skills you created, by name",
+            "id, schedule, gate, session mode",
+            "whether it is enabled",
+            "their ids and what the operator must do",
+            "what you memorized",
+            "**Next steps for the operator**",
+            "credentials and access to grant",
+            "plans to approve",
+            "jobs to review or enable",
+            "`nerve cron <id>`",
+            "what to watch during the first runs",
+        ):
+            assert needle in step_six, needle
+        # The final message comes after the marker is gone; the marker stays last among the changes.
+        assert "after step 7" in step_six
 
     def test_multi_line_descriptions_are_quoted_line_by_line(self) -> None:
         prompt = worker_onboarding_prompt("First line.\n\nSecond paragraph.", "guide text")

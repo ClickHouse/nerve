@@ -40,7 +40,7 @@ jobs:
     \ your OK."
   model: ''
   session_mode: persistent
-  enabled: true
+  enabled: false
   context_rotate_hours: 168
   run_if:
   - type: tasks
