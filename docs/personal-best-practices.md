@@ -310,7 +310,7 @@ Files are your memory; act on them, do not narrate them. They are already in the
 
 Treat the brain files like production configuration: diff before a large rewrite, keep a dated backup, and check the first-request prompt size after. The reviewed surface (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `config/`, `skills/`) may be git-synced or locked; `MEMORY.md` and `memory/` stay writable runtime state.
 
-Be alive, not just useful: capture the small stuff, notice patterns, have opinions, and follow up on what the human mentioned last week.
+Capture the small things, notice patterns, say what you think, and follow up on what the human mentioned last week.
 
 ## One-Page Checklist
 

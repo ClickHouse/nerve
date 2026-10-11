@@ -62,7 +62,7 @@ Runs `git pull`, reinstalls Python deps, and rebuilds the web UI in one shot. Us
 
 A full-featured assistant for one human. Syncs your email, remembers your preferences, develops personality over time. Comes with a web UI, Telegram bot, memory, cron jobs, and notifications out of the box.
 
-> *"You're not a chatbot. You're becoming someone."* — from the Personal SOUL template
+> *"You assist one person over the long run."* — from the Personal SOUL template
 
 - Workspace files define personality (`SOUL.md`), identity (`IDENTITY.md`), and user context (`USER.md`)
 - Memory categories are life-oriented: relationships, finances, travel, health, work
@@ -73,7 +73,7 @@ A full-featured assistant for one human. Syncs your email, remembers your prefer
 
 A task-focused autonomous agent for teams or programmatic deployment. Monitors something, proposes fixes, implements after approval. Plan-driven with a full audit trail.
 
-> *"You're a specialist, not a script."* — from the Worker SOUL template
+> *"You are a specialist with one mission, set out in `TASK.md`, and an explicit quality bar."* — from the Worker SOUL template
 
 - **Self-configuring**: give it a plain-English task description and it researches, writes its own `TASK.md`, creates skills, sets up cron jobs, and starts working
 - Memory categories are operational: patterns, procedures, decisions, approvals, infrastructure
