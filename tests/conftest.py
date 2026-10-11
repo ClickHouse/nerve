@@ -105,13 +105,22 @@ def _reset_setup_process_state(monkeypatch):
 
     setup_checks.reset_caches()
     monkeypatch.setattr(config_reload, "_startup_config", None)
+    catalog = sys.modules.get("nerve.models_catalog")
+    if catalog is not None:
+        catalog.reset_cache()  # the fingerprint-keyed catalog and any warm-up
     routes = sys.modules.get("nerve.gateway.routes.setup")
     if routes is not None:
         routes._bot_usernames.clear()
         monkeypatch.setattr(routes, "_restart_requested", False)
         monkeypatch.setattr(routes, "_last_provider_test", None)
+        # One pending Telegram sign-in per process: never one left by another test.
+        from nerve import setup_telegram_login
+
+        monkeypatch.setattr(routes, "_telegram_login", setup_telegram_login.TelegramLogin())
     yield
     setup_checks.reset_caches()
+    if catalog is not None:
+        catalog.reset_cache()
     routes = sys.modules.get("nerve.gateway.routes.setup")
     if routes is not None:
         routes._bot_usernames.clear()

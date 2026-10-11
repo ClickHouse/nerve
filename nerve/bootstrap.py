@@ -32,7 +32,7 @@ import click
 import yaml
 
 from nerve import paths
-from nerve.config import workspace_settings_file
+from nerve.config import DEFAULT_MODEL, workspace_settings_file
 from nerve.setup_writer import (
     CONFIG_YAML_HEADER,
     CORE_CRONS,
@@ -923,7 +923,7 @@ class SetupWizard:
         click.echo()
         click.secho(
             f"  → Model IDs will use the '{prefix}.' inference-profile prefix\n"
-            f"    (e.g. {prefix}.anthropic.claude-opus-5) based on region {region}.",
+            f"    (e.g. {prefix}.anthropic.{DEFAULT_MODEL}) based on region {region}.",
             fg="green",
         )
         click.echo()

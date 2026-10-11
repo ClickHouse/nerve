@@ -512,7 +512,7 @@ class ClaudeBackend:
             else self._effective_effort(spec.effort, selected_model)
         )
         # Some subscriptions reject the context-1m beta for specific models
-        # (e.g. claude-sonnet-4-6) — skip the beta header for those.
+        # (some Sonnet models, for instance) — skip the beta header for those.
         betas = (
             ["context-1m-2025-08-07"]
             if not is_ollama_model
@@ -730,13 +730,16 @@ class ClaudeBackend:
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
         # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-        # env vars. Nerve defaults "opus" → claude-opus-5 (skipped on Bedrock,
-        # where model IDs need a geo prefix — set agent.model_aliases with
-        # explicit prefixed IDs there). User-configured aliases merge over
-        # the default; an empty value unsets it (CLI built-in mapping wins).
+        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL (skipped
+        # on Bedrock, where model IDs need a geo prefix — set
+        # agent.model_aliases with explicit prefixed IDs there).
+        # User-configured aliases merge over the default; an empty value
+        # unsets it (CLI built-in mapping wins).
+        from nerve.config import DEFAULT_MODEL
+
         aliases: dict[str, str] = {}
         if not config.provider.is_bedrock:
-            aliases["opus"] = "claude-opus-5"
+            aliases["opus"] = DEFAULT_MODEL
         aliases.update(config.agent.model_aliases)
         for alias, target in aliases.items():
             env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
@@ -972,7 +975,7 @@ class ClaudeBackend:
             return {"type": "adaptive"}
 
     # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
+    # full model name so dated aliases (a model id with a date suffix) resolve.
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {

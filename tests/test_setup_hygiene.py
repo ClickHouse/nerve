@@ -114,11 +114,12 @@ _HYGIENE_FILES = sorted(
     + [ROOT / "tests" / name for name in (
         "test_setup_api.py", "test_setup_checklist.py", "test_setup_writer.py",
         "test_cli_init_slim.py", "test_setup_state.py", "test_daemon_restart.py",
-        "test_memu_gating.py", "test_setup_extensions.py",
+        "test_memu_gating.py", "test_setup_extensions.py", "test_setup_provenance.py",
+        "test_setup_telegram_login.py", "test_default_models.py",
     )]
     + [ROOT / "nerve" / name for name in (
         "setup_writer.py", "setup_checklist.py", "setup_checks.py", "setup_state.py",
-        "daemon.py", "boot.py",
+        "daemon.py", "boot.py", "setup_provenance.py", "setup_telegram_login.py",
     )]
     + [ROOT / "nerve" / "gateway" / "routes" / "setup.py"],
 )

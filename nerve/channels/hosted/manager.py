@@ -18,7 +18,8 @@ import asyncio
 import itertools
 import logging
 import uuid
-from typing import Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 
 from starlette.responses import Response as HTTPResponse
 from starlette.websockets import WebSocket
@@ -92,6 +93,26 @@ class StreamManager:
     def streams(self) -> list[ChannelStream]:
         """Open streams, oldest first."""
         return [self._streams[key] for key in sorted(self._streams)]
+
+    def status(self) -> dict[str, Any]:
+        """``{"streams": n, "connected": bool, "last_event_at": iso | None}``.
+
+        For the setup page and ``nerve doctor``: how many streams the gateway
+        holds open, whether one of them has negotiated (``ready``), and when
+        the gateway last sent anything on any of them — heartbeats included,
+        so it reads as liveness; ``None`` while no stream is open.
+        """
+        streams = self.streams
+        last_event_at = None
+        if streams:
+            age = min(stream.seconds_since_last_received() for stream in streams)
+            when = datetime.now(timezone.utc) - timedelta(seconds=age)
+            last_event_at = when.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return {
+            "streams": len(streams),
+            "connected": any(stream.ready for stream in streams),
+            "last_event_at": last_event_at,
+        }
 
     # ------------------------------------------------------------------ #
     #  Endpoint                                                            #

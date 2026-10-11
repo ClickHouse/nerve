@@ -141,7 +141,7 @@ drawer opened from the header and a line under the header reads "Step 3 of 9 ·
 Model". Every step is a `<form aria-label>` with an `<h1 tabIndex={-1}>` that
 receives focus on navigation, so Enter in a field submits and screen readers
 land on the heading. The footer is sticky inside the scroller (never fixed, so
-it cannot collide with the bottom nav): Back · Skip for now (or Put back on a
+it cannot collide with the bottom nav): Back · Skip for now (or Undo skip on a
 skipped step) · Continue — which reads **Next** on a blocked or read-only
 step and sends nothing — and, once a provider is configured, **Finish now**.
 Back on a dirty form asks "Leave without saving?" inline (`role="alertdialog"`).
@@ -191,13 +191,13 @@ supervisor) the operator's command is shown before the click — it arrives as
 never parsed out of the message. Then `ReadyScreen`: "Nerve is ready", three summary
 lines, **Say hello** (opens a new chat with a suggested first message),
 a pairing card when a live Telegram bot has nobody paired yet, and "Open
-Setup later". A worker's ending is "Your worker is ready" with the onboarding
+the setup page". A worker's ending is "Your worker is ready" with the onboarding
 session's status and a link to it, polled every 5 s while it runs.
 
 **RestartOverlay** covers the page while the daemon restarts and is never a
 trap: "Restarting Nerve… (12 s)" with **Not now** after ten seconds; for an
 `unsupported` restart, who must act and the command with Copy; after the time
-box, "Nerve did not come back" with **Retry waiting** and Close. Escape maps to
+box, "Nerve did not come back" with **Keep waiting** and Close. Escape maps to
 the secondary action. The wait itself is owned by `setupStore`
 (`waitForGeneration`): it polls `/health` once a second until `generation`
 differs from the one the restart answered with, then clears the hosted
@@ -217,7 +217,7 @@ when setup is finished, while the state is unknown, during a restart, and
 after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
 The **Setup** entry in the navigation appears as soon as the checklist has
 been read, in both auth modes, and stays visible when setup is finished. The
-chat page's empty state reads "Add a model provider to start chatting" with a
+chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
 
 **External authentication.** `/setup` and `/setup/:stepId` are registered in

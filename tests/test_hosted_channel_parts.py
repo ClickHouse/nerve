@@ -118,6 +118,40 @@ def manager(*streams: _Stream) -> StreamManager:
     return subject
 
 
+class _LiveStream(_Stream):
+    """A stream with a last-received age, for the status report."""
+
+    def __init__(self, stream_id: int, *, age: float, ready: bool = True):
+        super().__init__(stream_id, ready=ready)
+        self._age = age
+
+    def seconds_since_last_received(self) -> float:
+        return self._age
+
+
+class TestStatus:
+    """``status()`` is what the setup page's Channels step and ``nerve doctor``
+    show for a Slack held by the channel gateway."""
+
+    def test_no_stream_reads_as_not_connected(self):
+        assert manager().status() == {"streams": 0, "connected": False, "last_event_at": None}
+
+    def test_a_negotiating_stream_is_counted_but_not_connected(self):
+        status = manager(_LiveStream(1, age=3.0, ready=False)).status()
+        assert status["streams"] == 1 and status["connected"] is False
+        assert status["last_event_at"] is not None
+
+    def test_the_most_recent_frame_across_streams_is_reported(self):
+        from datetime import datetime, timedelta, timezone
+
+        before = datetime.now(timezone.utc)
+        status = manager(_LiveStream(1, age=120.0), _LiveStream(2, age=2.0, ready=False)).status()
+        assert status == {"streams": 2, "connected": True, "last_event_at": status["last_event_at"]}
+        when = datetime.fromisoformat(status["last_event_at"].replace("Z", "+00:00"))
+        assert before - timedelta(seconds=4) <= when <= datetime.now(timezone.utc)
+        assert status["last_event_at"].endswith("Z") and "." not in status["last_event_at"]
+
+
 class TestPreferredStream:
     def test_the_oldest_ready_stream_is_preferred(self):
         assert manager(_Stream(2), _Stream(1)).preferred().id == 1

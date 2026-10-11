@@ -229,11 +229,14 @@ def test_build_env_agent_teams_independent_of_provider():
 # Model-alias env emission (agent.model_aliases → ANTHROPIC_DEFAULT_*_MODEL)
 # ---------------------------------------------------------------------------
 
-def test_build_env_default_opus_alias_maps_to_opus_5():
+def test_build_env_default_opus_alias_maps_to_the_default_model():
     # No config → Nerve's built-in default: the "opus" alias resolves to
-    # claude-opus-5 in every spawned CLI (Agent/Workflow model options etc.).
+    # nerve.config.DEFAULT_MODEL in every spawned CLI (Agent/Workflow model
+    # options etc.), so one constant update moves the alias too.
+    from nerve.config import DEFAULT_MODEL
+
     env = _make_env_backend()._build_env()
-    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL == "claude-opus-5-5"
 
 
 def test_build_env_alias_config_overrides_default():
@@ -251,7 +254,9 @@ def test_build_env_extra_alias_merges_over_default():
     env = _make_env_backend(aliases={"sonnet": "claude-sonnet-5"})._build_env()
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "claude-sonnet-5"
     # The built-in opus default survives a partial user mapping.
-    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
+    from nerve.config import DEFAULT_MODEL
+
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL
 
 
 def test_build_env_bedrock_skips_default_alias():
@@ -272,7 +277,9 @@ def test_build_env_unknown_alias_ignored():
     env = _make_env_backend(aliases={"turbo": "claude-x"})._build_env()
     assert not any("TURBO" in k for k in env)
     # Known defaults unaffected by the bad entry.
-    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5"
+    from nerve.config import DEFAULT_MODEL
+
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL
 
 
 # ---------------------------------------------------------------------------

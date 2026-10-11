@@ -36,8 +36,18 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from nerve import boot, config_reload, daemon, pairing, paths, setup_checks, setup_state
-from nerve.config import NerveConfig, get_config
+from nerve import (
+    boot,
+    config_reload,
+    daemon,
+    pairing,
+    paths,
+    setup_checks,
+    setup_provenance,
+    setup_state,
+    setup_telegram_login,
+)
+from nerve.config import DEFAULT_MODEL, NerveConfig, get_config
 from nerve.config_reload import reload_all, reload_failures
 from nerve.db.accounts import AccountError, NotClaimableError, UsernameTakenError
 from nerve.gateway.auth import (
@@ -58,6 +68,7 @@ from nerve.setup_checklist import (
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
     SKIPPABLE_STEPS,
+    STATUS_BLOCKED,
     STEP_AGENTS,
     STEP_AUTOMATION,
     STEP_CHANNELS,
@@ -203,15 +214,25 @@ class SetupFieldError(HTTPException):
 
     400 for a validation problem; 409 (``status_code=409``) when the field is
     refused because of a read-only state — lockdown accepting only ``name``
-    on the profile step — which is not something a different value could
-    fix. Rendered as ``{"detail": ..., "field": ...}`` by
-    :func:`install_handlers`; without that handler FastAPI's default still
-    answers with ``detail``.
+    on the profile step, a value the operator provisioned — which is not
+    something a different value could fix; 429 with ``retry_after`` (seconds)
+    when a remote service asks for a pause. Rendered as
+    ``{"detail": ..., "field": ...[, "retry_after": n]}`` by
+    :func:`install_handlers` (``field`` only when there is one); without that
+    handler FastAPI's default still answers with ``detail``.
     """
 
-    def __init__(self, field: str, detail: str, *, status_code: int = 400):
+    def __init__(
+        self,
+        field: str | None,
+        detail: str,
+        *,
+        status_code: int = 400,
+        retry_after: int | None = None,
+    ):
         super().__init__(status_code=status_code, detail=detail)
         self.field = field
+        self.retry_after = retry_after
 
 
 def install_handlers(app) -> None:
@@ -220,9 +241,12 @@ def install_handlers(app) -> None:
 
     @app.exception_handler(SetupFieldError)
     async def _setup_field_error(request, exc: SetupFieldError):  # noqa: ANN001
-        return JSONResponse(
-            status_code=exc.status_code, content={"detail": exc.detail, "field": exc.field},
-        )
+        content: dict[str, Any] = {"detail": exc.detail}
+        if exc.field is not None:
+            content["field"] = exc.field
+        if exc.retry_after is not None:
+            content["retry_after"] = exc.retry_after
+        return JSONResponse(status_code=exc.status_code, content=content)
 
 
 # Every single-line field the wizard writes into the agent's instruction files
@@ -519,6 +543,9 @@ async def _context(actor: Actor) -> _Context:
     except Exception:  # noqa: BLE001
         available = ()
     facts = Facts(
+        credential_sources=setup_provenance.credential_sources(config),
+        hosted_gateway=_hosted_gateway_status(config),
+        telegram_session_present=setup_telegram_login.session_present(),
         config=config,
         workspace=Path(config.workspace),
         state=state,
@@ -541,6 +568,47 @@ async def _context(actor: Actor) -> _Context:
         available_agents=available,
     )
     return _Context(facts=facts, actor=actor)
+
+
+def _hosted_gateway_status(config: NerveConfig) -> dict[str, Any] | None:
+    """What the hosted channel runtime reports about the gateway's streams
+    (``slack.mode: hosted`` only); a quiet default when it has not started."""
+    if config.slack.mode != "hosted":
+        return None
+    try:
+        from nerve.gateway import server
+
+        runtime = getattr(server, "_hosted_channels", None)
+        if runtime is not None:
+            return runtime.streams.status()
+    except Exception:  # noqa: BLE001 — a stand-in, or a runtime that failed to start
+        pass
+    return {"streams": 0, "connected": False, "last_event_at": None}
+
+
+_MANAGED_DETAIL = {
+    setup_provenance.SOURCE_ENVIRONMENT: (
+        "This value is configured by your operator from the environment and cannot be changed here."
+    ),
+    setup_provenance.SOURCE_CONFIG_REPO: (
+        "This value is managed from the configuration repository and cannot be changed here."
+    ),
+    setup_provenance.SOURCE_GATEWAY: (
+        "This connection is held by the channel gateway; there is no token to change here."
+    ),
+}
+
+
+def _refuse_managed(ctx: _Context, path: str, field: str) -> None:
+    """409 ``{detail, field}`` when the value at ``path`` came from somewhere
+    the page may not overwrite: the environment (a variable Nerve reads, or a
+    ``${VAR}`` reference in a layer), the configuration repository, or the
+    channel gateway. A value from a file on this machine is replaceable."""
+    source = ctx.facts.credential_sources.get(path)
+    if source in (None, setup_provenance.SOURCE_FILE):
+        return
+    detail = _MANAGED_DETAIL.get(source, _MANAGED_DETAIL[setup_provenance.SOURCE_ENVIRONMENT])
+    raise SetupFieldError(field, detail, status_code=409)
 
 
 def _require_claimed(ctx: _Context) -> None:
@@ -1181,6 +1249,12 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
     pre = await _context(actor)
     _require_claimed(pre)
     _require_writable(pre)
+    # A credential the operator provisioned (environment, config repository)
+    # is not replaced or removed from here; the step already reads done.
+    if key or remove_key or kind == "host_login":
+        _refuse_managed(pre, "anthropic_api_key", "anthropic_api_key")
+    if token or remove_token or kind == "host_login":
+        _refuse_managed(pre, "claude_oauth_token", "claude_oauth_token")
     discovered: list[str] = []
     if model is not None:
         try:
@@ -1285,12 +1359,10 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
             # Bedrock region/profile), so it would now describe the wrong
             # thing. A model/effort-only change keeps it.
             _last_provider_test = None
-        try:
-            from nerve import models_catalog
-
-            models_catalog.reset_cache()
-        except Exception:  # noqa: BLE001
-            pass
+        # No cache reset here: the catalog cache is keyed by the credentials'
+        # fingerprint (provider, base URL, key tail), so the saved key simply
+        # misses an entry fetched without one — and finds the catalog the
+        # provider test warmed for it (models_catalog.warm).
         logger.info("Setup: provider step written (type=%s)", kind or "unchanged")
         return await _finish_mutation(ctx, step=STEP_PROVIDER, answered=answered)
 
@@ -1454,6 +1526,8 @@ async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person))
         before = ctx.config.openai_api_key
         debts: dict[str, str] = {}
         if key_given:
+            _require_writable(ctx)
+            _refuse_managed(ctx, "openai_api_key", "openai_api_key")
             _write(ctx, secret={"openai_api_key": key})
             if (key or "") != (before or ""):
                 debts["openai_api_key"] = "embeddings start after a restart"
@@ -1616,6 +1690,15 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_pers
     pre = await _context(actor)
     _require_claimed(pre)
     _require_writable(pre)
+    # Tokens the operator provisioned are not replaced or removed from here
+    # (the gateway's Slack tokens never were — see _slack_plan).
+    if tg_token_given:
+        _refuse_managed(pre, "telegram.bot_token", "bot_token")
+    if slack is not None and pre.config.slack.mode != "hosted":
+        if "bot_token" in slack.model_fields_set and slack.bot_token != "":
+            _refuse_managed(pre, "slack.bot_token", "bot_token")
+        if "app_token" in slack.model_fields_set and slack.app_token != "":
+            _refuse_managed(pre, "slack.app_token", "app_token")
     verified_tg: dict[str, str] = {}
     if tg is not None:
         plan = _telegram_plan(pre.config, tg, tg_token, tg_token_given)
@@ -1742,6 +1825,13 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         api_hash = "" if remove_hash else (
             new_hash if new_hash is not None else (live.telegram.api_hash or "")
         )
+        # Credentials and addresses the operator provisioned stay as they are.
+        if id_given:
+            _refuse_managed(ctx, "sync.telegram.api_id", "telegram_api_id")
+        if hash_given or remove_hash:
+            _refuse_managed(ctx, "sync.telegram.api_hash", "telegram_api_hash")
+        if req.gmail_accounts is not None:
+            _refuse_managed(ctx, "sync.gmail.accounts", "gmail_accounts")
         if req.telegram_api_id is not None and req.telegram_api_id <= 0:
             raise SetupFieldError("telegram_api_id", "The API id is a positive number from my.telegram.org.")
         if api_hash and not api_id:
@@ -2006,6 +2096,17 @@ async def provider_test(req: ProviderRequest, actor: Actor = Depends(require_per
         result = await setup_checks.provider_test(candidate)
     except setup_checks.Busy:
         raise HTTPException(status_code=429, detail=_BUSY)
+    if result.get("ok") and result.get("checked") == "api" and not candidate.provider.is_bedrock \
+            and candidate.resolve_anthropic_api_key():
+        # The key works: fetch the catalog for it now (in the background,
+        # keyed by this candidate's fingerprint) so the picker is complete the
+        # moment the key is saved instead of waiting on a cold fetch then.
+        try:
+            from nerve import models_catalog
+
+            models_catalog.schedule_warm(candidate)
+        except Exception:  # noqa: BLE001
+            pass
     # Remembered either way — a failure too, so the Review and Ready screens
     # can say "the last connection test failed" for a key the server could
     # not use. Data only (`last_test` is outside the etag; it never remounts a
@@ -2042,17 +2143,19 @@ async def provider_host_login(refresh: int = 0, actor: Actor = Depends(require_p
 
 
 def _family(model_id: str) -> str:
+    """``fable`` | ``opus`` | ``sonnet`` | ``haiku`` | ``other`` — fable first,
+    so a Fable id is never filed under another family it happens to mention."""
     low = model_id.lower()
-    for family in ("opus", "sonnet", "haiku"):
+    for family in ("fable", "opus", "sonnet", "haiku"):
         if family in low:
             return family
     return "other"
 
 
 def _label(model_id: str) -> str:
-    """``claude-opus-5-5`` → ``Claude Opus 5.5``; ``claude-haiku-4-5-20251001``
-    → ``Claude Haiku 4.5`` (a date suffix is dropped, a Bedrock geo prefix and
-    ``-v1:0`` too). Consecutive numeric segments form one dotted version."""
+    """A picker label from a model id: ``Claude <Family> <version>``. A date
+    suffix is dropped, a Bedrock geo prefix and ``-v1:0`` too, and consecutive
+    numeric segments form one dotted version (``…-5-5`` → ``5.5``)."""
     base = model_id.split("anthropic.")[-1]
     parts = base.replace("-v1:0", "").split("-")
     words: list[str] = []
@@ -2083,6 +2186,8 @@ async def setup_models(actor: Actor = Depends(require_person)):
         discovered = list(await models_catalog.get_models(config))
     except Exception:  # noqa: BLE001
         discovered = []
+    # The configured model first, then the catalog as the API orders it
+    # (newest first), or the built-in list when nothing was discovered.
     models = config.selectable_claude_models(discovered)
     return {
         "models": [
@@ -2092,6 +2197,9 @@ async def setup_models(actor: Actor = Depends(require_person)):
         "current": {"model": config.agent.model, "effort": config.agent.effort},
         "efforts": ["max", "xhigh", "high", "medium", "low"],
         "discovered": bool(discovered) and not config.provider.is_bedrock,
+        # Nerve's own default, so the page can say which entry it is even
+        # when this instance was changed to another model.
+        "default_model": DEFAULT_MODEL,
     }
 
 
@@ -2231,6 +2339,118 @@ async def pairing_issue(actor: Actor = Depends(require_person)):
 # --------------------------------------------------------------------------- #
 #  Sources preflight · agents detect · environment                             #
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+#  Telegram message sync: the signed-in session                                #
+# --------------------------------------------------------------------------- #
+#
+# The Telethon source reads the person's own account and needs an authorised
+# user session on disk; API credentials alone do nothing. These routes run the
+# sign-in (phone → code → optional password) the terminal command
+# `nerve setup-telegram` runs interactively. One pending login per process,
+# in memory only (nerve/setup_telegram_login.py). The phone leaves only
+# masked; the code, the password and Telegram's hash never leave at all.
+
+_telegram_login = setup_telegram_login.TelegramLogin()
+
+
+class TelegramPhoneRequest(BaseModel):
+    phone: str = Field(min_length=1, max_length=40)
+
+
+class TelegramCodeRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=16)
+
+
+class TelegramPasswordRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=_SECRET)
+
+
+def _telegram_session_scope(ctx: _Context, *, write: bool) -> None:
+    """The sources step must exist on this instance and, to change the
+    session, be actionable: not locked, not waiting for the Mode step."""
+    step = next((s for s in derive(ctx.facts) if s.id == STEP_SOURCES), None)
+    if step is None:
+        raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
+    if not write:
+        return
+    if ctx.facts.lockdown:
+        raise HTTPException(status_code=409, detail=LOCKDOWN_TEXT)
+    if step.status == STATUS_BLOCKED:
+        raise HTTPException(status_code=409, detail=step.blocked_reason or "Choose a mode first")
+
+
+def _login_failure(exc: setup_telegram_login.LoginError) -> HTTPException:
+    if exc.field is not None or exc.retry_after is not None:
+        return SetupFieldError(exc.field, exc.detail, status_code=exc.status_code, retry_after=exc.retry_after)
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+async def _note_telegram_session(result: dict[str, Any]) -> None:
+    """Remember (or forget) who the sync is signed in as, in the state file,
+    so the pure checklist and ``nerve doctor`` can say "signed in as @name"
+    without opening the session. ``authorized: null`` (busy, unreachable,
+    not configured) leaves what was known alone."""
+    authorized = result.get("authorized")
+    if authorized is None:
+        return
+    user = result.get("user") if authorized else None
+    async with _loop_lock("state"):
+        state = setup_state.load_state()
+        setup_state.retire_on_boot(state)
+        if state.telegram_sync_user != user or state.retired:
+            state.telegram_sync_user = user
+            setup_state.save_state(state)
+
+
+async def _telegram_session_call(actor: Actor, *, write: bool, call: Any) -> dict[str, Any]:
+    ctx = await _claimed_context(actor)
+    _telegram_session_scope(ctx, write=write)
+    try:
+        result = await call(ctx.config)
+    except setup_telegram_login.LoginError as exc:
+        raise _login_failure(exc) from None
+    await _note_telegram_session(result)
+    return result
+
+
+@router.get("/api/setup/sources/telegram/session")
+async def telegram_session_status(actor: Actor = Depends(require_person)):
+    """Whether the sync is signed in: a short-lived client on the session file
+    (five seconds at most), never while a sign-in is pending."""
+    return await _telegram_session_call(actor, write=False, call=lambda config: _telegram_login.status(config))
+
+
+@router.post("/api/setup/sources/telegram/session/start")
+async def telegram_session_start(req: TelegramPhoneRequest, actor: Actor = Depends(require_person)):
+    return await _telegram_session_call(
+        actor, write=True, call=lambda config: _telegram_login.start(config, req.phone),
+    )
+
+
+@router.post("/api/setup/sources/telegram/session/code")
+async def telegram_session_code(req: TelegramCodeRequest, actor: Actor = Depends(require_person)):
+    return await _telegram_session_call(
+        actor, write=True, call=lambda config: _telegram_login.code(config, req.code),
+    )
+
+
+@router.post("/api/setup/sources/telegram/session/password")
+async def telegram_session_password(req: TelegramPasswordRequest, actor: Actor = Depends(require_person)):
+    return await _telegram_session_call(
+        actor, write=True, call=lambda config: _telegram_login.password(config, req.password),
+    )
+
+
+@router.post("/api/setup/sources/telegram/session/cancel")
+async def telegram_session_cancel(actor: Actor = Depends(require_person)):
+    return await _telegram_session_call(actor, write=True, call=lambda config: _telegram_login.cancel(config))
+
+
+@router.post("/api/setup/sources/telegram/session/logout")
+async def telegram_session_logout(actor: Actor = Depends(require_person)):
+    return await _telegram_session_call(actor, write=True, call=lambda config: _telegram_login.logout(config))
 
 
 @router.get("/api/setup/sources/preflight")

@@ -185,8 +185,8 @@ _FULL_ENV_REF_RE = re.compile(r"^\$\{[^}]*\}$")
 
 # Left-behind values that still look like a credential: one opaque run of at
 # least 24 alphanumerics (hashes, base64 blobs, random keys). Deliberately does
-# not match hyphenated words, which is what separates a real key from
-# ``claude-haiku-4-5-20251001`` or ``inbox-processor-daily-digest``.
+# not match hyphenated words, which is what separates a real key from a dated
+# model id (``claude-<family>-<version>-<date>``) or ``inbox-processor-daily-digest``.
 _OPAQUE_VALUE_RE = re.compile(r"^[A-Za-z0-9]{24,}={0,2}$")
 
 # Whole mappings whose *every* scalar value is treated as sensitive, regardless

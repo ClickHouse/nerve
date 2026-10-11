@@ -263,13 +263,13 @@ Response: {
                   "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
-      "summary": "Anthropic API key (…ab12) · claude-opus-5 · effort max",
+      "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort max",
       "files": ["config.local.yaml", "workspace/config/settings.yaml", "config.yaml"],
-      "detail": { "type": "anthropic", "credential": "api_key",
-                  "anthropic_api_key": { "configured": true, "last4": "ab12" },
-                  "claude_oauth_token": { "configured": false, "last4": null },
+      "detail": { "type": "anthropic", "credential": "api_key", "credential_source": "file",
+                  "anthropic_api_key": { "configured": true, "last4": "ab12", "source": "file" },
+                  "claude_oauth_token": { "configured": false, "last4": null, "source": null },
                   "proxy_enabled": false, "aws_region": "", "aws_profile": "",
-                  "model": "claude-opus-5", "effort": "max", "cron_model": "claude-sonnet-4-6",
+                  "model": "claude-opus-5-5", "effort": "max", "cron_model": "claude-sonnet-4-6",
                   "warning": null, "last_test": { "ok": true, "code": "ok", "detail": "claude-haiku-4-5-20251001 answered", "checked_at": "2026-10-10T09:12:03Z" } } },
     { "id": "profile", "title": "About you", "status": "pending", "required": false, "can_skip": true,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
@@ -335,6 +335,41 @@ reason when the bot failed to start at this boot. In external mode
 `detail.profile.name_source` is `actor_header` and `display_name_editable` is
 `false`.
 
+**Where a value came from.** Every masked secret is
+`{"configured": bool, "last4": str | null, "source": str | null}`. `source`
+says where a configured value came from — `file` (`config.local.yaml` or
+`config.yaml` on this machine; the page may replace or remove it),
+`environment` (a variable Nerve reads directly — `ANTHROPIC_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` — or a `${VAR}` reference in any
+configuration layer, judged on the raw files before interpolation),
+`config-repo` (the tracked `settings.yaml` under lockdown) or `gateway`
+(held by the shared channel gateway, `slack.mode: hosted`); `null` when
+nothing is configured. A value with a `source` other than `file` is
+configured and managed: the page renders it read-only, and a `PUT` that would
+replace or remove it answers `409 {"detail", "field"}`. The same enum
+appears as `detail.provider.credential_source` (the active credential's
+origin; `null` for Bedrock, the proxy or none), `detail.sources.github.source`
+(a GitHub token Nerve forwards to the CLI; `null` when only the CLI's own
+login exists) and `detail.sources.gmail.source` (the address list). A
+credential that exists only in the gateway's environment reads
+`{"configured": true, "last4": null, "source": "environment"}` with
+`credential: "environment"`.
+
+`detail.channels.slack.gateway` is `{"streams": n, "connected": bool,
+"last_event_at": iso | null}` when `slack.mode` is `hosted` — what the stream
+manager reports about the gateway's streams (`connected` once a stream has
+negotiated; `last_event_at` the last frame received, heartbeats included) —
+and `null` in socket mode. A hosted Slack makes the channels step `done`; its
+tokens read `source: "gateway"` and `enabled` is the only accepted field.
+`detail.sources.telegram.session` is `{"present": bool, "authorized": true |
+false | null, "user": {"id", "username", "first_name"} | null}` for the
+Telegram message sync: `present` is the session file, `authorized` what the
+last sign-in or session check established (`null` when a file exists but
+nothing has verified it in this install — the session endpoint below answers
+live), and the summary reads `Telegram sync · signed in as @name` or
+`Telegram sync · not signed in`. Both `gateway` and `session` are volatile
+and outside the step's `etag`.
+
 #### `PUT /api/setup/{step}`
 
 One per step: `mode`, `provider`, `profile`, `memory`, `channels`, `sources`,
@@ -349,7 +384,7 @@ mutation runs at a time.
 
 ```json
 PUT /api/setup/mode        { "mode": "worker", "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything." }
-PUT /api/setup/provider    { "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE", "model": "claude-opus-5", "effort": "high" }
+PUT /api/setup/provider    { "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE", "model": "claude-opus-5-5", "effort": "high" }
 PUT /api/setup/provider    { "type": "oauth", "claude_oauth_token": "sk-ant-oat01-REPLACE" }
 PUT /api/setup/provider    { "type": "host_login" }
 PUT /api/setup/provider    { "type": "bedrock", "aws_region": "eu-central-1", "aws_profile": "nerve" }
@@ -371,11 +406,11 @@ PUT /api/setup/agents      { "agents": ["codex"], "conflict_policy": "backup" }
 | Step | Rules |
 |---|---|
 | `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker needs `task_description` (20–4000 characters → `400`, `field: task_description`). Once `TASK.md` exists, the same mode with a **different** description is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); only a worker whose templates exist but whose `TASK.md` is still absent gets it written by a later PUT. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
-| `provider` | `type` is `anthropic`, `oauth`, `host_login` or `bedrock`, optional when only `model`/`effort` change. `anthropic_api_key` must start with `sk-ant-`; `aws_region` must look like a region; `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` must be in the catalogue for these credentials or be a Claude id. `host_login` is accepted only when `GET /api/setup/provider/host-login` finds one (`409` otherwise; `429` while other checks are running) and copies that credential into `config.local.yaml`; the value is never returned. In external authentication mode `host_login` is `409` unless the operator set `NERVE_SETUP_HOST_LOGIN=1` (see the host-login endpoint). Switching the credential type deletes the other secret; leaving Bedrock drops the region-scoped model ids. The model catalogue and the host-login detection run before the write lock is taken, so other people's reads and saves never wait on them |
+| `provider` | `type` is `anthropic`, `oauth`, `host_login` or `bedrock`, optional when only `model`/`effort` change. `anthropic_api_key` must start with `sk-ant-`; `aws_region` must look like a region; `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` must be in the catalogue for these credentials or be a Claude id. `host_login` is accepted only when `GET /api/setup/provider/host-login` finds one (`409` otherwise; `429` while other checks are running) and copies that credential into `config.local.yaml`; the value is never returned. In external authentication mode `host_login` is `409` unless the operator set `NERVE_SETUP_HOST_LOGIN=1` (see the host-login endpoint). Switching the credential type deletes the other secret; leaving Bedrock drops the region-scoped model ids. A credential whose `source` is not `file` (provisioned from the environment or the configuration repository) is neither replaced nor removed from here: `409` with `field: anthropic_api_key` / `claude_oauth_token` (`host_login` too); a `model`/`effort`-only save still works. The model catalogue and the host-login detection run before the write lock is taken, so other people's reads and saves never wait on them. No catalogue reset after a save: the cache is keyed by the credentials' fingerprint, so a new key finds the catalogue the provider test warmed for it |
 | `profile` | `timezone` must be an IANA name; `quiet_start`/`quiet_end` are `HH:MM`; `name` ≤ 80, `agent_name` ≤ 40, `language` ≤ 40, `about` ≤ 600 characters. Every field becomes one line of a file the agent reads: `name`, `language`, `agent_name`, `agent_emoji` refuse control characters and line breaks (`400` with the `field`), and `about` is folded to a single line. A `null` time zone or quiet time is treated as omitted (nothing written, no decision recorded). Writes `timezone`/`quiet_*` to `settings.yaml`, the still-pristine template lines of `USER.md`/`IDENTITY.md` (personal), and — local mode only — the display name on your account. In external mode the name goes to `USER.md` alone; no account is touched. Under lockdown (local) only `name` is accepted; any other key is `409` with that `field` and the lockdown reason (a read-only state, not a validation error) |
-| `memory` | `openai_api_key` must start with `sk-`. Adding, changing or removing it records that embeddings start after a restart. `{"openai_api_key": null}` alone removes the key; `"embeddings": false` records "continue without" as a decision |
-| `channels` | A Telegram `bot_token` must look like one from BotFather, and when the channel would be enabled it is **verified against Telegram before anything is written**: rejected → `400` `field: bot_token` `Telegram rejected this token: …`; unreachable → `400` `The server could not reach api.telegram.org to verify the token; nothing was saved. Try again.` The verification runs *before* the write lock is taken (a probe can take 10–20 s and must not stall other people's reads and saves); inside the lock the decision is recomputed against the configuration as it is then, and a token that was not the one verified — the stored token changed meanwhile — is verified again. `enabled` defaults to true when a token is given; `"bot_token": null` removes the token and disables the channel; `enabled: true` without a token is `409`. `allowed_users` replaces the allow-list, `allowed_users_add` appends; not both. Slack tokens need the `xoxb-`/`xapp-` prefixes, `enabled` needs both, and they are verified the same way (`auth_test` and a Socket Mode connection). With `slack.mode: hosted` only `enabled` is accepted (`409` for tokens) |
-| `sources` | personal mode only (`409` for a worker). `gmail: true` needs at least one address in `gmail_accounts`; `telegram: true` needs `telegram_api_id` (positive) and `telegram_api_hash`. The two Telegram credentials follow the secret rules independently — omitted keeps, blank is omitted, `null` removes — and a hash without an id (new or stored) is `400` `field: telegram_api_id` rather than being dropped. Sending all three booleans records the decision, so "none of these" counts as answered |
+| `memory` | `openai_api_key` must start with `sk-`. Adding, changing or removing it records that embeddings start after a restart. `{"openai_api_key": null}` alone removes the key; `"embeddings": false` records "continue without" as a decision. A key whose `source` is not `file` is `409` `field: openai_api_key` |
+| `channels` | A Telegram `bot_token` must look like one from BotFather, and when the channel would be enabled it is **verified against Telegram before anything is written**: rejected → `400` `field: bot_token` `Telegram rejected this token: …`; unreachable → `400` `The server could not reach api.telegram.org to verify the token; nothing was saved. Try again.` The verification runs *before* the write lock is taken (a probe can take 10–20 s and must not stall other people's reads and saves); inside the lock the decision is recomputed against the configuration as it is then, and a token that was not the one verified — the stored token changed meanwhile — is verified again. `enabled` defaults to true when a token is given; `"bot_token": null` removes the token and disables the channel; `enabled: true` without a token is `409`. `allowed_users` replaces the allow-list, `allowed_users_add` appends; not both. Slack tokens need the `xoxb-`/`xapp-` prefixes, `enabled` needs both, and they are verified the same way (`auth_test` and a Socket Mode connection). With `slack.mode: hosted` only `enabled` is accepted (`409` for tokens). A token whose `source` is not `file` (environment, configuration repository) is `409` with `field: bot_token` / `app_token`, before any verification runs |
+| `sources` | personal mode only (`409` for a worker). `gmail: true` needs at least one address in `gmail_accounts`; `telegram: true` needs `telegram_api_id` (positive) and `telegram_api_hash`. The two Telegram credentials follow the secret rules independently — omitted keeps, blank is omitted, `null` removes — and a hash without an id (new or stored) is `400` `field: telegram_api_id` rather than being dropped. A credential or address list whose `source` is not `file` is `409` with `field: telegram_api_id` / `telegram_api_hash` / `gmail_accounts`. Sending all three booleans records the decision, so "none of these" counts as answered. The credentials alone do not make the Telegram sync work — see the sign-in endpoints below |
 | `automation` | `crons` is the full set of enabled optional job ids; an unknown id is `400` `field: crons`. Always records the decision; the scheduler reloads |
 | `agents` | personal mode only. `agents` names from the registry (`codex`, `claude-code`); `conflict_policy` is `backup`, `skip` or `merge`. Writes each agent's config file (per-agent failures are reported in `warning`, the others still apply) and `external_agents.*`/`mcp_endpoint.enabled` in `config.yaml`. `[]` is a decision too |
 
@@ -445,17 +480,82 @@ the `reason` names the variable.
 
 ```json
 Response: {
-  "models": [{ "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": true },
-             { "id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "family": "sonnet", "recommended": false }],
-  "current": { "model": "claude-opus-5", "effort": "max" },
+  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+             { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
+             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": false }],
+  "current": { "model": "claude-opus-5-5", "effort": "max" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
-  "discovered": true
+  "discovered": true,
+  "default_model": "claude-opus-5-5"
 }
 ```
 
-`family` is `opus`, `sonnet`, `haiku` or `other`; `recommended` marks the
-configured model. On Bedrock the ids carry the geo prefix and `discovered`
-is `false`.
+The configured model comes first, then the catalogue as the Anthropic Models
+API orders it (newest first), nothing else; without discovery the built-in
+list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
+(`fable` is checked first); `recommended` marks the configured model;
+`default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
+page can say which entry it is even when this instance was changed to another
+model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
+
+The catalogue is cached per credential fingerprint (provider, base URL, key
+tail). A successful `POST /api/setup/provider/test` with an API key fetches
+the catalogue for that candidate key in the background, keyed by its
+fingerprint, so the picker is complete the moment the key is saved; a failure
+recorded while no key was configured is never served for a configuration
+that now carries one.
+
+#### Telegram message sync: `GET /api/setup/sources/telegram/session` and the sign-in
+
+The Telethon source reads the person's own Telegram account and needs an
+authorised user session on disk (`NERVE_HOME/telegram_sync.session`); the
+API id and hash alone do nothing. These routes run the same sign-in the
+terminal command `nerve setup-telegram` runs interactively. All of them need
+a signed-in person and a claimed instance (local mode); the `POST`s also need
+the sources step to be actionable — `409` for a worker instance, under
+lockdown, or before the Mode step. One sign-in is pending per process, in
+memory only, for ten minutes; a new start cancels the previous one.
+
+```json
+GET  /api/setup/sources/telegram/session
+Response: { "configured": true, "session_present": true, "authorized": true,
+            "user": { "id": 424242, "username": "alice_example", "first_name": "Alice" },
+            "pending": null, "phone_masked": null, "reason": null }
+Response: { "configured": true, "session_present": false, "authorized": false, "user": null,
+            "pending": null, "phone_masked": null, "reason": "no_session" }
+Response: { "configured": true, "session_present": true, "authorized": null, "user": null,
+            "pending": null, "phone_masked": null, "reason": "busy" }
+Response: { "configured": true, "session_present": true, "authorized": false, "user": null,
+            "pending": "code", "phone_masked": "+1••••••••23", "reason": null }
+
+POST /api/setup/sources/telegram/session/start     { "phone": "+1 555 010 0123" }
+Response: { "pending": "code", "phone_masked": "+1••••••••23", "expires_in": 600 }
+POST /api/setup/sources/telegram/session/code      { "code": "73146" }
+POST /api/setup/sources/telegram/session/password  { "password": "…" }
+POST /api/setup/sources/telegram/session/cancel    {}
+POST /api/setup/sources/telegram/session/logout    {}
+```
+
+`configured` is whether the API id and hash are saved. The `GET` opens a
+short-lived client on the session file (five seconds at most), never while
+a sign-in is pending; `reason` is a short machine string — `busy` (the file
+is locked by a running sync; `authorized` is then `null` rather than an
+error), `not_configured`, `no_session`, `unreachable`, `telethon_missing` —
+or `null`. `code`, `password`, `cancel` and `logout` answer the `GET` shape:
+when Telegram asks for the two-step password, `code` answers with
+`pending: "password"` and `authorized: false`; on success `authorized: true`
+with `user`. `logout` calls `log_out()` on the saved session and removes the
+file. Errors: `400 {"detail", "field"}` with `field` `phone`, `code` or
+`password`; `429 {"detail", "retry_after"}` (seconds) for a Telegram flood
+wait; `409 {"detail"}` when nothing is configured, no sign-in is in progress,
+the code expired, or the session file is in use; `502 {"detail"}` when
+Telegram cannot be reached. The phone appears only masked; the code, the
+password and Telegram's hash never appear in a response, a log line or the
+state file. A successful sign-in makes the session file owner-only and notes
+who is signed in (`id`, `username`, `first_name`) in the state file, which
+is what `detail.sources.telegram.session` and `nerve doctor` report.
 
 #### `POST /api/setup/memory/test` · `POST /api/setup/channels/telegram/test` · `POST /api/setup/channels/slack/test`
 

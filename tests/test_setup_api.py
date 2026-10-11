@@ -25,8 +25,8 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
-from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_token
-from nerve.config import NerveConfig, load_config, set_config
+from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
+from nerve.config import DEFAULT_MODEL, NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -166,6 +166,13 @@ def _fresh_module_state(monkeypatch):
     monkeypatch.setattr(setup_routes, "_last_provider_test", None)
     setup_routes._bot_usernames.clear()
     setup_checks.reset_caches()
+    from nerve import models_catalog
+
+    models_catalog.reset_cache()
+    # The Telegram sign-in keeps one pending login per process; never Telethon here.
+    monkeypatch.setattr(setup_routes, "_telegram_login", setup_telegram_login.TelegramLogin(
+        client_factory=lambda api_id, api_hash: pytest.fail("a test touched Telethon without the fake"),
+    ))
     monkeypatch.setattr(config_reload, "_startup_config", None)
     # This module builds its own instance without a cron service; a service
     # another test module left on the gateway global must not be reloaded
@@ -501,8 +508,9 @@ class TestProviderKinds:
             })).json()
         provider = step(state, "provider")
         assert provider["status"] == "done"
-        assert provider["detail"]["anthropic_api_key"] == {"configured": True, "last4": "0000"}
+        assert provider["detail"]["anthropic_api_key"] == {"configured": True, "last4": "0000", "source": "file"}
         assert provider["detail"]["credential"] == "api_key"
+        assert provider["detail"]["credential_source"] == "file"
         assert provider["detail"]["model"] == "claude-sonnet-4-6" and provider["detail"]["effort"] == "high"
         assert claimed.local_yaml()["anthropic_api_key"] == _API_KEY
         assert stat.S_IMODE((claimed.config_dir / "config.local.yaml").stat().st_mode) == 0o600
@@ -556,7 +564,7 @@ class TestProviderKinds:
             assert detail["aws_profile"] == "nerve"
             settings = claimed.settings_yaml()
             assert settings["provider"] == {"type": "bedrock", "aws_region": "eu-central-1"}
-            assert settings["agent"]["model"] == "eu.anthropic.claude-opus-5"
+            assert settings["agent"]["model"] == f"eu.anthropic.{DEFAULT_MODEL}"
             assert settings["memory"]["recall_model"].startswith("eu.anthropic.")
             assert claimed.machine_yaml()["provider"] == {"aws_profile": "nerve"}
             bad = await http.put("/api/setup/provider", json={"type": "bedrock", "aws_region": "mars"})
@@ -564,7 +572,7 @@ class TestProviderKinds:
             state = (await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})).json()
         settings = claimed.settings_yaml()
         assert settings["provider"] == {"type": "anthropic"}
-        assert settings["agent"]["model"] == "claude-opus-5"
+        assert settings["agent"]["model"] == DEFAULT_MODEL
         assert "title_model" not in settings["agent"]
         assert "provider" not in claimed.machine_yaml()
         assert step(state, "provider")["detail"]["credential"] == "api_key"
@@ -639,19 +647,104 @@ class TestProviderKinds:
         assert claimed.settings_yaml()["agent"] == {"model": "claude-haiku-4-5-20251001", "effort": "low"}
 
     async def test_models_endpoint(self, claimed, monkeypatch):
+        """The configured (default) model first, then the catalog as the API
+        orders it; Fable is its own family; ``default_model`` names Nerve's
+        default even when the instance is changed to another model."""
         from nerve import models_catalog
 
+        catalog = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"]
+
         async def _models(_config):
-            return ["claude-opus-5", "claude-sonnet-4-6"]
+            return list(catalog)
 
         monkeypatch.setattr(models_catalog, "get_models", _models)
         async with claimed.client() as http:
             body = (await http.get("/api/setup/models")).json()
-        assert [m["id"] for m in body["models"]][:2] == ["claude-opus-5", "claude-sonnet-4-6"]
-        assert body["models"][0]["family"] == "opus" and body["models"][0]["recommended"] is True
-        assert body["current"] == {"model": "claude-opus-5", "effort": "max"}
-        assert body["efforts"] == ["max", "xhigh", "high", "medium", "low"]
+            assert [m["id"] for m in body["models"]] == [
+                "claude-opus-5-5", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-5",
+            ]
+            by_id = {m["id"]: m for m in body["models"]}
+            assert by_id["claude-opus-5-5"] == {
+                "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": True,
+            }
+            assert by_id["claude-fable-5-1"] == {
+                "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": False,
+            }
+            assert [m["family"] for m in body["models"]] == ["opus", "haiku", "sonnet", "fable", "opus"]
+            assert body["current"] == {"model": DEFAULT_MODEL, "effort": "max"}
+            assert body["default_model"] == DEFAULT_MODEL == "claude-opus-5-5"
+            assert body["efforts"] == ["max", "xhigh", "high", "medium", "low"]
+            assert body["discovered"] is True
+            # The instance moves to another model: it is recommended now, and
+            # the default is still named so the page can say which one it is.
+            await http.put("/api/setup/provider", json={"model": "claude-fable-5-1"})
+            body = (await http.get("/api/setup/models")).json()
+        assert [m["id"] for m in body["models"]][:2] == ["claude-fable-5-1", "claude-haiku-5-5"]
+        assert [m["id"] for m in body["models"] if m["recommended"]] == ["claude-fable-5-1"]
+        assert body["current"]["model"] == "claude-fable-5-1"
+        assert body["default_model"] == "claude-opus-5-5"
+
+    async def test_provider_test_warms_the_catalog_for_the_candidate_key(self, claimed, monkeypatch):
+        """A successful test fetches the catalog for the tested key, keyed by
+        that key's fingerprint; the save finds it, so the picker is complete
+        without a second fetch — and never serves the no-key failure entry."""
+        from nerve import models_catalog
+
+        fetched: list[str] = []
+
+        def _fetch(config, timeout=0.0):
+            key = config.resolve_anthropic_api_key()
+            fetched.append(key[-4:])
+            return ["claude-opus-5-5", "claude-fable-5-1"] if key else []
+
+        async def _probe(candidate):
+            return {"ok": True, "checked": "api", "code": "ok", "detail": "answered", "hint": None, "latency_ms": 5}
+
+        monkeypatch.setattr(models_catalog, "fetch_models", _fetch)
+        monkeypatch.setattr(setup_checks, "provider_test", _probe)
+        async with claimed.client() as http:
+            # No key yet: the picker falls back to the built-in list and the
+            # catalog remembers a no-key failure for *this* fingerprint.
+            before = (await http.get("/api/setup/models")).json()
+            assert before["discovered"] is False and fetched == [""]
+            assert (await http.post("/api/setup/provider/test", json={
+                "type": "anthropic", "anthropic_api_key": _API_KEY,
+            })).json()["ok"] is True
+            task = models_catalog._warm_tasks.get(models_catalog._fingerprint(
+                setup_checks.candidate_config(claimed.config, type="anthropic", anthropic_api_key=_API_KEY),
+            ))
+            if task is not None:
+                await task
+            assert fetched == ["", _API_KEY[-4:]], "the test fetched for the candidate key"
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            after = (await http.get("/api/setup/models")).json()
+        assert after["discovered"] is True
+        assert [m["id"] for m in after["models"]] == ["claude-opus-5-5", "claude-fable-5-1"]
+        assert fetched == ["", _API_KEY[-4:]], "served from the warmed entry; the stale no-key entry was never used"
+
+    async def test_models_after_a_new_key_never_serve_the_stale_no_key_entry(self, claimed, monkeypatch):
+        """Without a warm-up (the person saved without testing): the entry
+        recorded while no key was configured misses the new fingerprint, so
+        the catalog is fetched for the key instead of answering `[]`."""
+        from nerve import models_catalog
+
+        fetched: list[str] = []
+
+        def _fetch(config, timeout=0.0):
+            key = config.resolve_anthropic_api_key()
+            fetched.append(key[-4:])
+            return ["claude-opus-5-5", "claude-sonnet-5-5"] if key else []
+
+        monkeypatch.setattr(models_catalog, "fetch_models", _fetch)
+        async with claimed.client() as http:
+            assert (await http.get("/api/setup/models")).json()["discovered"] is False
+            assert (await http.get("/api/setup/models")).json()["discovered"] is False
+            assert fetched == [""], "the no-key failure is backed off, not retried"
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            body = (await http.get("/api/setup/models")).json()
         assert body["discovered"] is True
+        assert [m["id"] for m in body["models"]] == ["claude-opus-5-5", "claude-sonnet-5-5"]
+        assert fetched == ["", _API_KEY[-4:]]
 
 
 # --------------------------------------------------------------------------- #
@@ -844,7 +937,9 @@ class TestSources:
         local = claimed.local_yaml()["sync"]["telegram"]
         assert local == {"api_id": 1234567, "api_hash": "REPLACE_HASH_VALUE"}
         detail = step(state, "sources")["detail"]["telegram"]
-        assert detail["api_id"] == {"configured": True, "last4": None}
+        assert detail["api_id"] == {"configured": True, "last4": None, "source": "file"}
+        assert detail["session"] == {"present": False, "authorized": False, "user": None}
+        assert step(state, "sources")["summary"] == "Telegram sync · not signed in"
         assert "REPLACE_HASH_VALUE" not in json.dumps(state)
 
     async def test_api_hash_needs_an_id_and_null_removes_it(self, claimed):
@@ -1953,11 +2048,24 @@ class TestExternalMode:
 
 
 def test_model_labels_are_formatted_consistently():
-    """The picker labels the four built-in ids the same way: one dotted version."""
+    """The picker labels every id the same way: one dotted version, no date."""
     assert [setup_routes._label(m) for m in (
-        "claude-opus-5", "claude-opus-5-5", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
-    )] == ["Claude Opus 5", "Claude Opus 5.5", "Claude Sonnet 4.6", "Claude Haiku 4.5"]
+        "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+    )] == ["Claude Opus 5", "Claude Opus 5.5", "Claude Fable 5.1", "Claude Sonnet 4.6", "Claude Haiku 4.5"]
     assert setup_routes._label("eu.anthropic.claude-sonnet-4-6-v1:0") == "Claude Sonnet 4.6"
+    from nerve.config import DEFAULT_CLAUDE_MODELS
+
+    assert [setup_routes._label(m) for m in DEFAULT_CLAUDE_MODELS] == [
+        "Claude Opus 5.5", "Claude Fable 5.1", "Claude Sonnet 5.5", "Claude Haiku 5.5",
+    ]
+
+
+def test_model_families_know_fable():
+    """Fable is checked before the other families, so it is never 'other'."""
+    assert [setup_routes._family(m) for m in (
+        "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+        "eu.anthropic.claude-fable-5-v1:0", "claude-3-7-something",
+    )] == ["fable", "opus", "sonnet", "haiku", "fable", "other"]
 
 
 # --------------------------------------------------------------------------- #
@@ -2584,3 +2692,371 @@ class TestNoServerPathInResponses:
                 mp.setattr(daemon, "restart_daemon", _boom)
                 body = self._clean(claimed, await http.post("/api/system/restart"), 500)
             assert body["detail"].startswith("The restart could not be started: Permission denied.")
+
+
+# --------------------------------------------------------------------------- #
+#  Telegram message sync: the signed-in session over HTTP                      #
+# --------------------------------------------------------------------------- #
+
+_TG_PHONE = "+1 555 010 0123"
+_TG_CODE = "73146"
+_TG_PASSWORD = "two-step-REPLACE"
+_TG_HASH = "phone-code-hash-REPLACE"
+_TG_ME = SimpleNamespace(id=424242, username="alice_example", first_name="Alice")
+_TG_USER = {"id": 424242, "username": "alice_example", "first_name": "Alice"}
+_SESSION = "/api/setup/sources/telegram/session"
+
+
+class _FakeTelethon:
+    """Scripted stand-in for ``telethon.TelegramClient`` (see the unit tests)."""
+
+    def __init__(self, script: dict):
+        self.script = script
+        self.calls: list = []
+
+    async def connect(self):
+        self.calls.append("connect")
+        if "connect" in self.script:
+            raise self.script["connect"]
+        setup_telegram_login.session_file().parent.mkdir(parents=True, exist_ok=True)
+        setup_telegram_login.session_file().touch()
+
+    async def is_user_authorized(self):
+        return bool(self.script.get("authorized"))
+
+    async def get_me(self):
+        return _TG_ME
+
+    async def send_code_request(self, phone):
+        self.calls.append(("send_code", phone))
+        if "send_code" in self.script:
+            raise self.script["send_code"]
+        return SimpleNamespace(phone_code_hash=_TG_HASH)
+
+    async def sign_in(self, phone=None, code=None, *, password=None, phone_code_hash=None):
+        from telethon import errors as tg_errors
+
+        self.calls.append(("sign_in", phone, code, password, phone_code_hash))
+        if password is not None:
+            if password != _TG_PASSWORD:
+                raise tg_errors.PasswordHashInvalidError(request=None)
+        else:
+            if code != _TG_CODE:
+                raise tg_errors.PhoneCodeInvalidError(request=None)
+            if self.script.get("two_step"):
+                raise tg_errors.SessionPasswordNeededError(request=None)
+        self.script["authorized"] = True
+        return _TG_ME
+
+    async def log_out(self):
+        self.calls.append("log_out")
+        self.script["authorized"] = False
+        setup_telegram_login.session_file().unlink(missing_ok=True)
+        return True
+
+    async def disconnect(self):
+        self.calls.append("disconnect")
+
+
+@pytest.fixture
+def telegram_login(monkeypatch):
+    script: dict = {}
+    clock = {"now": 1000.0}
+    clients: list[_FakeTelethon] = []
+
+    def _factory(api_id, api_hash):
+        client = _FakeTelethon(script)
+        clients.append(client)
+        return client
+
+    login = setup_telegram_login.TelegramLogin(client_factory=_factory, clock=lambda: clock["now"])
+    monkeypatch.setattr(setup_routes, "_telegram_login", login)
+    return SimpleNamespace(script=script, clock=clock, login=login, clients=clients)
+
+
+async def _configure_sync(http) -> dict:
+    response = await http.put("/api/setup/sources", json={
+        "telegram": True, "telegram_api_id": 1234567, "telegram_api_hash": "REPLACE_HASH_VALUE",
+    })
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.asyncio
+class TestTelegramSession:
+    async def test_the_shape_before_credentials_and_before_a_session(self, claimed, telegram_login):
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            body = (await http.get(_SESSION)).json()
+            assert body == {
+                "configured": False, "session_present": False, "authorized": False, "user": None,
+                "pending": None, "phone_masked": None, "reason": "not_configured",
+            }
+            refused = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert refused.status_code == 409 and "API id and API hash first" in refused.json()["detail"]
+            await _configure_sync(http)
+            body = (await http.get(_SESSION)).json()
+            assert body["configured"] is True and body["session_present"] is False
+            assert body["authorized"] is False and body["reason"] == "no_session"
+        assert telegram_login.clients == [], "no client is opened without a session file"
+
+    async def test_start_code_password_signed_in_and_the_checklist_follows(self, claimed, telegram_login, caplog):
+        caplog.set_level(logging.DEBUG)
+        telegram_login.script["two_step"] = True
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            await _configure_sync(http)
+            started = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert started.status_code == 200, started.text
+            assert started.json() == {"pending": "code", "phone_masked": "+1••••••••23", "expires_in": 600}
+            pending = (await http.get(_SESSION)).json()
+            assert pending["pending"] == "code" and pending["authorized"] is False
+            assert pending["phone_masked"] == "+1••••••••23" and pending["session_present"] is True
+            assert len(telegram_login.clients) == 1, "no probe while a sign-in is pending"
+            bad = await http.post(f"{_SESSION}/code", json={"code": "00000"})
+            assert bad.status_code == 400 and bad.json() == {"detail": bad.json()["detail"], "field": "code"}
+            asked = await http.post(f"{_SESSION}/code", json={"code": _TG_CODE})
+            assert asked.status_code == 200 and asked.json()["pending"] == "password"
+            assert asked.json()["authorized"] is False and asked.json()["configured"] is True
+            wrong = await http.post(f"{_SESSION}/password", json={"password": "nope"})
+            assert wrong.status_code == 400 and wrong.json()["field"] == "password"
+            done = await http.post(f"{_SESSION}/password", json={"password": _TG_PASSWORD})
+            assert done.status_code == 200, done.text
+            assert done.json()["authorized"] is True and done.json()["pending"] is None
+            assert done.json()["user"] == _TG_USER and done.json()["session_present"] is True
+            state = (await http.get("/api/setup")).json()
+            sources = step(state, "sources")
+            assert sources["detail"]["telegram"]["session"] == {"present": True, "authorized": True, "user": _TG_USER}
+            assert sources["summary"] == "Telegram sync · signed in as @alice_example"
+            again = (await http.get(_SESSION)).json()
+            assert again["authorized"] is True and again["user"] == _TG_USER
+        assert setup_state.load_state().telegram_sync_user == _TG_USER
+        assert stat.S_IMODE(setup_telegram_login.session_file().stat().st_mode) == 0o600
+        blob = "\n".join([
+            caplog.text, json.dumps(state), started.text, pending and json.dumps(pending), asked.text, done.text,
+            setup_state.state_file().read_text(encoding="utf-8"),
+        ])
+        for secret in ("5550100123", _TG_CODE, _TG_PASSWORD, _TG_HASH, "REPLACE_HASH_VALUE"):
+            assert secret not in blob, secret
+        assert "+1••••••••23" in started.text
+
+    async def test_cancel_expiry_flood_wait_and_a_busy_session_file(self, claimed, telegram_login):
+        from telethon import errors as tg_errors
+
+        import sqlite3
+
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            await _configure_sync(http)
+            assert (await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})).status_code == 200
+            cancelled = await http.post(f"{_SESSION}/cancel", json={})
+            assert cancelled.status_code == 200 and cancelled.json()["pending"] is None
+            assert telegram_login.clients[0].calls[-1] == "disconnect"
+            nothing = await http.post(f"{_SESSION}/code", json={"code": _TG_CODE})
+            assert nothing.status_code == 409 and "No sign-in is in progress" in nothing.json()["detail"]
+            # Expiry: the code is good for ten minutes.
+            assert (await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})).status_code == 200
+            telegram_login.clock["now"] += 601
+            expired = await http.post(f"{_SESSION}/code", json={"code": _TG_CODE})
+            assert expired.status_code == 409 and "expired" in expired.json()["detail"]
+            assert (await http.get(_SESSION)).json()["pending"] is None
+            # A flood wait is a 429 carrying the seconds.
+            telegram_login.script["send_code"] = tg_errors.FloodWaitError(request=None, capture=30)
+            flood = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert flood.status_code == 429
+            assert flood.json() == {"detail": "Telegram asks you to wait 30 seconds before another attempt.", "retry_after": 30}
+            del telegram_login.script["send_code"]
+            # A session file a running sync holds: busy, not an error.
+            telegram_login.script["connect"] = sqlite3.OperationalError("database is locked")
+            busy = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert busy.status_code == 409 and "running sync" in busy.json()["detail"]
+            status = (await http.get(_SESSION)).json()
+            assert status["authorized"] is None and status["reason"] == "busy" and status["session_present"] is True
+            # A phone that is not a number never reaches Telegram.
+            bad = await http.post(f"{_SESSION}/start", json={"phone": "alice"})
+            assert bad.status_code == 400 and bad.json()["field"] == "phone"
+
+    async def test_logout_removes_the_session_and_forgets_the_user(self, claimed, telegram_login):
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            await _configure_sync(http)
+            assert (await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})).status_code == 200
+            done = await http.post(f"{_SESSION}/code", json={"code": _TG_CODE})
+            assert done.status_code == 200 and done.json()["authorized"] is True
+            assert setup_state.load_state().telegram_sync_user == _TG_USER
+            out = await http.post(f"{_SESSION}/logout", json={})
+            assert out.status_code == 200, out.text
+            assert out.json()["session_present"] is False and out.json()["authorized"] is False
+            assert out.json()["reason"] == "no_session" and out.json()["user"] is None
+            assert telegram_login.clients[-1].calls == ["connect", "log_out", "disconnect"]
+            state = (await http.get("/api/setup")).json()
+        assert not setup_telegram_login.session_present()
+        assert setup_state.load_state().telegram_sync_user is None
+        assert step(state, "sources")["summary"] == "Telegram sync · not signed in"
+        assert step(state, "sources")["detail"]["telegram"]["session"] == {"present": False, "authorized": False, "user": None}
+
+    async def test_refusals_worker_before_mode_lockdown_and_system_token(self, claimed, telegram_login, monkeypatch):
+        async with claimed.client() as http:
+            # Before the Mode step the sources step is blocked: reads work, changes do not.
+            assert (await http.get(_SESSION)).status_code == 200
+            blocked = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert blocked.status_code == 409 and "mode" in blocked.json()["detail"].lower()
+        async with claimed.client(headers=claimed.system_headers()) as http:
+            assert (await http.get(_SESSION)).status_code == 403
+        choose(claimed, "personal")
+        _lock(claimed, monkeypatch)
+        async with claimed.client() as http:
+            assert (await http.get(_SESSION)).status_code == 200
+            locked = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert locked.status_code == 409 and locked.json()["detail"].startswith("Configuration is managed")
+            for route in ("code", "password", "cancel", "logout"):
+                body = {"code": "1", "password": "x"}.get(route) and {route: {"code": "12345", "password": "x"}[route]}
+                response = await http.post(f"{_SESSION}/{route}", json=body or {})
+                assert response.status_code == 409, route
+        assert telegram_login.clients == []
+
+    async def test_refused_for_a_worker(self, claimed, telegram_login):
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        async with claimed.client() as http:
+            response = await http.get(_SESSION)
+            assert response.status_code == 409 and "worker" in response.json()["detail"]
+            assert (await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})).status_code == 409
+        assert telegram_login.clients == []
+
+    async def test_external_mode_reads_but_refuses_changes_before_the_mode(self, external_install, telegram_login):
+        async with external_install.client() as http:
+            status = await http.get(_SESSION)
+            assert status.status_code == 200 and status.json()["reason"] == "not_configured"
+            blocked = await http.post(f"{_SESSION}/start", json={"phone": _TG_PHONE})
+            assert blocked.status_code == 409
+        assert telegram_login.clients == []
+
+
+# --------------------------------------------------------------------------- #
+#  Pre-configured connections: `source`, 409 on overwrite, the hosted gateway   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestManagedValues:
+    async def test_an_environment_credential_is_done_managed_and_not_overwritable(self, claimed, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            provider = step(state, "provider")
+            assert provider["status"] == "done"
+            assert provider["detail"]["credential"] == "environment"
+            assert provider["detail"]["credential_source"] == "environment"
+            assert provider["detail"]["anthropic_api_key"] == {"configured": True, "last4": None, "source": "environment"}
+            assert provider["detail"]["claude_oauth_token"] == {"configured": False, "last4": None, "source": None}
+            refused = await http.put("/api/setup/provider", json={
+                "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE1111111111",
+            })
+            assert refused.status_code == 409 and refused.json()["field"] == "anthropic_api_key"
+            assert "environment" in refused.json()["detail"]
+            removed = await http.put("/api/setup/provider", json={"anthropic_api_key": None})
+            assert removed.status_code == 409 and removed.json()["field"] == "anthropic_api_key"
+            # Copying the server's own login would overwrite the managed key:
+            # refused before the detection even runs (nothing on this host is read).
+            copied = await http.put("/api/setup/provider", json={"type": "host_login"})
+            assert copied.status_code == 409 and copied.json()["field"] == "anthropic_api_key"
+            ok = await http.put("/api/setup/provider", json={"model": "claude-fable-5-1", "effort": "high"})
+            assert ok.status_code == 200, ok.text
+            assert step(ok.json(), "provider")["detail"]["model"] == "claude-fable-5-1"
+        assert "anthropic_api_key" not in claimed.local_yaml()
+        assert _API_KEY not in json.dumps(state)
+
+    async def test_a_reference_in_a_layer_reads_as_environment_and_is_refused(self, claimed, monkeypatch):
+        from nerve.setup_writer import CONFIG_YAML_HEADER, merge_machine_paths, merge_private_paths
+
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", _TG_TOKEN)
+        monkeypatch.setenv("OPENAI_KEY_FOR_NERVE", _OPENAI)
+        monkeypatch.setenv("TG_API_HASH", "REPLACE_HASH_VALUE")
+        monkeypatch.setenv("GMAIL_ACCOUNT", "alice@example.com")
+
+        async def _no_probe(*a, **k):
+            pytest.fail("a managed token must be refused before any verification runs")
+
+        monkeypatch.setattr(setup_checks, "telegram_get_me", _no_probe)
+        choose(claimed, "personal")
+        merge_private_paths(claimed.config_dir / "config.local.yaml", {
+            "telegram.bot_token": "${TELEGRAM_BOT_TOKEN}",
+            "openai_api_key": "${OPENAI_KEY_FOR_NERVE}",
+            "sync.telegram.api_id": 1234567,
+            "sync.telegram.api_hash": "${TG_API_HASH}",
+        })
+        merge_machine_paths(claimed.config_dir / "config.yaml", {
+            "telegram.enabled": True, "sync.gmail.accounts": "${GMAIL_ACCOUNT}",
+        }, header=CONFIG_YAML_HEADER)
+        config_reload.remember_startup_config(claimed.reload())
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            channels = step(state, "channels")
+            assert channels["status"] == "done"
+            assert channels["detail"]["telegram"]["bot_token"] == {
+                "configured": True, "last4": _TG_TOKEN[-4:], "source": "environment",
+            }
+            memory = step(state, "memory")
+            assert memory["status"] == "done" and memory["detail"]["openai_api_key"]["source"] == "environment"
+            sources = step(state, "sources")["detail"]
+            assert sources["telegram"]["api_hash"]["source"] == "environment"
+            assert sources["telegram"]["api_id"]["source"] == "file"
+            assert sources["gmail"] == {"enabled": False, "accounts": ["alice@example.com"], "source": "environment"}
+            # Overwrites of the managed values are refused with the field; the
+            # rest of each step still works.
+            for path, body, field in (
+                ("/api/setup/channels", {"telegram": {"bot_token": "654321:REPLACEzyxwvutsrqponmlkjihgfedcba9876"}}, "bot_token"),
+                ("/api/setup/channels", {"telegram": {"bot_token": None}}, "bot_token"),
+                ("/api/setup/memory", {"openai_api_key": "sk-REPLACE11111111"}, "openai_api_key"),
+                ("/api/setup/memory", {"openai_api_key": None}, "openai_api_key"),
+                ("/api/setup/sources", {"telegram_api_hash": "OTHER_HASH_REPLACE"}, "telegram_api_hash"),
+                ("/api/setup/sources", {"telegram_api_hash": None}, "telegram_api_hash"),
+                ("/api/setup/sources", {"gmail_accounts": ["bob@example.com"]}, "gmail_accounts"),
+            ):
+                response = await http.put(path, json=body)
+                assert response.status_code == 409, (path, body, response.text)
+                assert response.json()["field"] == field
+                assert "environment" in response.json()["detail"]
+            assert (await http.put("/api/setup/channels", json={"telegram": {"allowed_users_add": [123456789]}})).status_code == 200
+            assert (await http.put("/api/setup/memory", json={"embeddings": False})).status_code == 200
+            assert (await http.put("/api/setup/sources", json={"github": True, "telegram_api_id": 7654321})).status_code == 200
+        local = claimed.local_yaml()
+        assert local["telegram"]["bot_token"] == "${TELEGRAM_BOT_TOKEN}"
+        assert local["openai_api_key"] == "${OPENAI_KEY_FOR_NERVE}"
+        assert local["sync"]["telegram"] == {"api_id": 7654321, "api_hash": "${TG_API_HASH}"}
+        assert claimed.machine_yaml()["sync"]["gmail"]["accounts"] == "${GMAIL_ACCOUNT}"
+        for secret in (_TG_TOKEN, _OPENAI, "REPLACE_HASH_VALUE"):
+            assert secret not in json.dumps(state)
+
+    async def test_hosted_slack_reports_the_gateway_and_counts_as_done(self, claimed, monkeypatch):
+        from nerve.setup_writer import merge_settings_paths
+
+        choose(claimed, "personal")
+        merge_settings_paths(claimed.workspace, {"slack.mode": "hosted"})
+        config_reload.remember_startup_config(claimed.reload())
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            channels = step(state, "channels")
+            assert channels["status"] == "done"
+            slack = channels["detail"]["slack"]
+            assert slack["mode"] == "hosted" and slack["enabled"] is True
+            assert slack["bot_token"] == {"configured": True, "last4": None, "source": "gateway"}
+            assert slack["app_token"]["source"] == "gateway"
+            assert slack["gateway"] == {"streams": 0, "connected": False, "last_event_at": None}
+            assert channels["summary"] == "Slack managed by the channel gateway · waiting for the gateway"
+            # The runtime is up and a gateway stream has negotiated.
+            runtime = SimpleNamespace(streams=SimpleNamespace(status=lambda: {
+                "streams": 2, "connected": True, "last_event_at": "2026-10-11T09:00:00Z",
+            }))
+            monkeypatch.setattr(server, "_hosted_channels", runtime, raising=False)
+            live = step((await http.get("/api/setup")).json(), "channels")
+            assert live["detail"]["slack"]["gateway"] == {"streams": 2, "connected": True, "last_event_at": "2026-10-11T09:00:00Z"}
+            assert live["summary"] == "Slack managed by the channel gateway · connected"
+            assert live["etag"] == channels["etag"], "the gateway's state never remounts the form"
+            # `enabled` is the only control; tokens are refused.
+            switched = await http.put("/api/setup/channels", json={"slack": {"enabled": False}})
+            assert switched.status_code == 200 and step(switched.json(), "channels")["detail"]["slack"]["enabled"] is False
+            refused = await http.put("/api/setup/channels", json={"slack": {"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"}})
+            assert refused.status_code == 409 and "channel gateway" in refused.json()["detail"]
+        assert claimed.machine_yaml()["slack"] == {"enabled": False}
+        assert "slack" not in claimed.local_yaml()

@@ -133,7 +133,8 @@ class TestDoneRules:
         config = cfg(personal, **{field: value})
         s = step(facts(personal, config), "provider")
         assert s["status"] == "done"
-        assert s["detail"][field] == {"configured": True, "last4": value[-4:]}
+        assert s["detail"][field] == {"configured": True, "last4": value[-4:], "source": "file"}
+        assert s["detail"]["credential_source"] == "file"
         assert value not in str(s)
 
     def test_provider_done_from_bedrock_proxy_env_or_host_login_answer(self, personal):
@@ -149,6 +150,17 @@ class TestDoneRules:
         answered = facts(personal, state=SetupState(answered={"provider"}))
         assert statuses(answered)["provider"] == "done"
         assert statuses(facts(personal))["provider"] == "pending"
+
+    def test_subscription_token_warns_only_without_an_api_key(self, personal):
+        token = cfg(personal, claude_oauth_token="sk-ant-oat01-REPLACE")
+        alone = step(facts(personal, token), "provider")["detail"]
+        assert alone["credential"] == "oauth_token" and alone["warning"] == "oauth_background_jobs"
+        # ANTHROPIC_API_KEY in the environment serves the background jobs: no warning.
+        with_env_key = step(facts(personal, token, env_credential=True), "provider")["detail"]
+        assert with_env_key["credential"] == "oauth_token" and with_env_key["warning"] is None
+        # An environment that holds only an OAuth token still warns.
+        env_oauth = step(facts(personal, token, env_credential=True, env_oauth_only=True), "provider")["detail"]
+        assert env_oauth["warning"] == "oauth_background_jobs"
 
     def test_provider_detection_alone_is_not_done(self, personal):
         """Detection is an offer, not a decision (C6)."""
@@ -217,8 +229,11 @@ class TestDoneRules:
         assert statuses(facts(personal, state=SetupState(answered={"sources"})))["sources"] == "done"
         api = cfg(personal, sync={"telegram": {"api_id": 1234567, "api_hash": "REPLACE_HASH_VALUE"}})
         d = step(facts(personal, api), "sources")["detail"]
-        assert d["telegram"]["api_id"] == {"configured": True, "last4": None}, "ints never expose digits"
+        assert d["telegram"]["api_id"] == {"configured": True, "last4": None, "source": "file"}, "ints never expose digits"
         assert d["telegram"]["api_hash"]["configured"] is True
+        assert d["telegram"]["session"] == {"present": False, "authorized": False, "user": None}
+        assert d["github"] == {"enabled": False, "source": None}
+        assert d["gmail"] == {"enabled": False, "accounts": [], "source": None}
 
     def test_automation(self, personal):
         s = step(facts(personal), "automation")
@@ -389,13 +404,101 @@ class TestLockdown:
 
 
 class TestMaskingAndEtag:
+    def test_a_credential_from_the_environment_reads_as_managed(self, personal):
+        env = step(facts(personal, env_credential=True), "provider")["detail"]
+        assert env["anthropic_api_key"] == {"configured": True, "last4": None, "source": "environment"}
+        assert env["claude_oauth_token"] == {"configured": False, "last4": None, "source": None}
+        assert env["credential_source"] == "environment"
+        oauth = step(facts(personal, env_credential=True, env_oauth_only=True), "provider")["detail"]
+        assert oauth["claude_oauth_token"]["source"] == "environment" and oauth["anthropic_api_key"]["configured"] is False
+        none = step(facts(personal), "provider")["detail"]
+        assert none["credential_source"] is None
+        bedrock = cfg(personal, provider={"type": "bedrock", "aws_region": "eu-central-1"})
+        assert step(facts(personal, bedrock), "provider")["detail"]["credential_source"] is None
+
+    def test_resolved_sources_flow_into_every_masked_value(self, personal):
+        config = cfg(
+            personal, anthropic_api_key="sk-ant-REPLACE0000000000", openai_api_key="sk-REPLACE00000000",
+            telegram={"bot_token": "123456:REPLACEabcdefghijklmnopqrstuvwxyz0123"},
+            slack={"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"},
+            sync={"telegram": {"api_id": 1234567, "api_hash": "REPLACE_HASH_VALUE"}, "gmail": {"accounts": ["alice@example.com"]}},
+        )
+        sources = {
+            "anthropic_api_key": "environment", "openai_api_key": "config-repo", "telegram.bot_token": "environment",
+            "slack.bot_token": "file", "slack.app_token": "environment", "sync.telegram.api_id": "file",
+            "sync.telegram.api_hash": "environment", "github_token": "environment", "sync.gmail.accounts": "config-repo",
+        }
+        f = facts(personal, config, credential_sources=sources)
+        provider = step(f, "provider")["detail"]
+        assert provider["anthropic_api_key"]["source"] == "environment" and provider["credential_source"] == "environment"
+        assert step(f, "memory")["detail"]["openai_api_key"]["source"] == "config-repo"
+        channels = step(f, "channels")["detail"]
+        assert channels["telegram"]["bot_token"]["source"] == "environment"
+        assert channels["slack"]["bot_token"]["source"] == "file" and channels["slack"]["app_token"]["source"] == "environment"
+        assert channels["slack"]["gateway"] is None
+        sources_detail = step(f, "sources")["detail"]
+        assert sources_detail["telegram"]["api_id"]["source"] == "file"
+        assert sources_detail["telegram"]["api_hash"]["source"] == "environment"
+        assert sources_detail["github"]["source"] == "environment"
+        assert sources_detail["gmail"]["source"] == "config-repo"
+        # Nothing resolved: a configured value is a file, an absent one has no source.
+        plain = step(facts(personal, config), "sources")["detail"]
+        assert plain["gmail"]["source"] == "file" and plain["github"]["source"] is None
+
+    def test_hosted_slack_is_done_and_reports_the_gateway(self, personal):
+        hosted = cfg(personal, slack={"mode": "hosted"})
+        quiet = step(facts(personal, hosted), "channels")
+        assert quiet["status"] == "done"
+        assert quiet["detail"]["slack"]["bot_token"] == {"configured": True, "last4": None, "source": "gateway"}
+        assert quiet["detail"]["slack"]["app_token"]["source"] == "gateway"
+        assert quiet["detail"]["slack"]["gateway"] == {"streams": 0, "connected": False, "last_event_at": None}
+        assert quiet["summary"] == "Slack managed by the channel gateway · waiting for the gateway"
+        live = step(facts(personal, hosted, hosted_gateway={
+            "streams": 2, "connected": True, "last_event_at": "2026-10-11T09:00:00Z",
+        }), "channels")
+        assert live["detail"]["slack"]["gateway"]["connected"] is True
+        assert live["summary"] == "Slack managed by the channel gateway · connected"
+        assert live["etag"] == quiet["etag"], "the gateway's state is volatile: never remounts the form"
+        socket = step(facts(personal, cfg(personal, slack={"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"})), "channels")
+        assert socket["detail"]["slack"]["gateway"] is None and socket["summary"] == "Slack"
+
+    def test_the_sources_summary_says_whether_telegram_is_signed_in(self, personal):
+        on = cfg(personal, sync={"telegram": {"enabled": True, "api_id": 1234567, "api_hash": "REPLACE_HASH_VALUE"}})
+        absent = step(facts(personal, on), "sources")
+        assert absent["detail"]["telegram"]["session"] == {"present": False, "authorized": False, "user": None}
+        assert absent["summary"] == "Telegram sync · not signed in"
+        unverified = step(facts(personal, on, telegram_session_present=True), "sources")
+        assert unverified["detail"]["telegram"]["session"]["authorized"] is None
+        assert unverified["summary"] == "Telegram sync · sign-in not verified"
+        user = {"id": 424242, "username": "alice_example", "first_name": "Alice"}
+        signed = step(facts(
+            personal, on, telegram_session_present=True, state=SetupState(telegram_sync_user=user),
+        ), "sources")
+        assert signed["detail"]["telegram"]["session"] == {"present": True, "authorized": True, "user": user}
+        assert signed["summary"] == "Telegram sync · signed in as @alice_example"
+        assert signed["etag"] == absent["etag"], "the session is volatile: never remounts the form"
+        no_handle = step(facts(
+            personal, on, telegram_session_present=True,
+            state=SetupState(telegram_sync_user={"id": 7, "username": None, "first_name": "Alice"}),
+        ), "sources")
+        assert no_handle["summary"] == "Telegram sync · signed in as Alice"
+        # A stale note without the file means nothing: the file is the session.
+        stale = step(facts(personal, on, state=SetupState(telegram_sync_user=user)), "sources")
+        assert stale["detail"]["telegram"]["session"]["authorized"] is False
+        with_github = cfg(personal, sync={"github": {"enabled": True}, "telegram": {"enabled": True, "api_id": 1, "api_hash": "x"}})
+        assert step(facts(personal, with_github), "sources")["summary"] == "GitHub, Telegram sync · not signed in"
+
     def test_mask_rules(self):
-        assert checklist.mask("") == {"configured": False, "last4": None}
-        assert checklist.mask(None) == {"configured": False, "last4": None}
-        assert checklist.mask("short") == {"configured": True, "last4": None}
-        assert checklist.mask("sk-ant-REPLACE0000ab12") == {"configured": True, "last4": "ab12"}
-        assert checklist.mask(1234567) == {"configured": True, "last4": None}
-        assert checklist.mask(0) == {"configured": False, "last4": None}
+        assert checklist.mask("") == {"configured": False, "last4": None, "source": None}
+        assert checklist.mask(None) == {"configured": False, "last4": None, "source": None}
+        assert checklist.mask("short") == {"configured": True, "last4": None, "source": "file"}
+        assert checklist.mask("sk-ant-REPLACE0000ab12") == {"configured": True, "last4": "ab12", "source": "file"}
+        assert checklist.mask(1234567) == {"configured": True, "last4": None, "source": "file"}
+        assert checklist.mask(0) == {"configured": False, "last4": None, "source": None}
+        # Where the value came from rides along; nothing for an absent value.
+        assert checklist.mask("sk-ant-REPLACE0000ab12", "environment")["source"] == "environment"
+        assert checklist.mask("", "environment")["source"] is None
+        assert checklist.managed("gateway") == {"configured": True, "last4": None, "source": "gateway"}
 
     def test_etag_stable_across_test_pairing_onboarding_changes(self, personal):
         config = cfg(personal, anthropic_api_key="sk-ant-REPLACE0000000000")

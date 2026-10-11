@@ -25,6 +25,12 @@ Only what cannot be derived is stored, and **no configuration value ever is**:
 * **telegram_bot_username** — the non-secret bot name from the last
   successful server-side ``getMe``, so the page after a restart can offer the
   ``t.me`` link before the new process has looked it up.
+* **telegram_sync_user** — who the Telegram *message sync* is signed in as
+  (``{"id", "username", "first_name"}``), from the last sign-in or session
+  check, so the pure checklist and ``nerve doctor`` can say "signed in as
+  @name" without opening the session file. Cleared on sign-out or when a
+  check finds the session unauthorised. Not a secret, not a configuration
+  value.
 
 Whether a *restart* is pending is not stored at all: it is derived by
 comparing the configuration the process started with against the one on disk
@@ -70,6 +76,8 @@ class SetupState:
     boot_errors: dict[str, str] = field(default_factory=dict)
     #: The bot's username from the last successful getMe, or ``None``.
     telegram_bot_username: str | None = None
+    #: Who the Telegram message sync is signed in as, or ``None``.
+    telegram_sync_user: dict[str, Any] | None = None
     #: The generation that wrote the boot-scoped entries above, or ``""``.
     boot: str = ""
     #: Whether :func:`retire_on_boot` dropped anything since the load, so the
@@ -84,9 +92,27 @@ class SetupState:
             "debts": {k: str(v) for k, v in sorted(self.debts.items())},
             "boot_errors": {k: str(v) for k, v in sorted(self.boot_errors.items())},
             "telegram_bot_username": self.telegram_bot_username or None,
+            "telegram_sync_user": _sync_user(self.telegram_sync_user),
             "boot": boot.boot_id(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+
+def _sync_user(value: Any) -> dict[str, Any] | None:
+    """``{"id": int, "username": str | None, "first_name": str}`` or ``None``
+    for anything that is not that shape (an older or hand-edited file)."""
+    if not isinstance(value, dict):
+        return None
+    raw_id = value.get("id")
+    if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
+        return None
+    username = value.get("username")
+    first_name = value.get("first_name")
+    return {
+        "id": raw_id,
+        "username": username if isinstance(username, str) and username else None,
+        "first_name": first_name if isinstance(first_name, str) else "",
+    }
 
 
 def _string_set(value: Any) -> set[str]:
@@ -156,6 +182,7 @@ def load_state() -> SetupState:
         debts=_string_map(raw.get("debts"), legacy_list=True),
         boot_errors=_string_map(raw.get("boot_errors")),
         telegram_bot_username=username if isinstance(username, str) and username else None,
+        telegram_sync_user=_sync_user(raw.get("telegram_sync_user")),
         boot=written_by if isinstance(written_by, str) else "",
     )
 

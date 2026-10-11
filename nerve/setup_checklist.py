@@ -30,6 +30,7 @@ from typing import Any
 import yaml
 
 from nerve.config import NerveConfig
+from nerve.setup_provenance import SOURCE_ENVIRONMENT, SOURCE_FILE, SOURCE_GATEWAY
 from nerve.setup_state import SetupState
 from nerve.setup_writer import (
     CORE_CRONS,
@@ -196,6 +197,17 @@ class Facts:
     provider_last_test: dict[str, Any] | None = None
     #: Agent ids the registry knows (``codex``, ``claude-code``).
     available_agents: tuple[str, ...] = ()
+    #: Where each configured connection value came from, by dotted config
+    #: path — ``file`` / ``environment`` / ``config-repo`` / ``gateway`` or
+    #: ``None`` (:func:`nerve.setup_provenance.credential_sources`). A path
+    #: missing here reads as ``file`` when the value is configured.
+    credential_sources: dict[str, str | None] = field(default_factory=dict)
+    #: ``slack.mode: hosted`` only: the stream manager's ``status()`` —
+    #: ``{"streams", "connected", "last_event_at"}``; ``None`` otherwise or
+    #: when no process can ask (``nerve doctor``).
+    hosted_gateway: dict[str, Any] | None = None
+    #: The Telethon session file for the Telegram message sync exists.
+    telegram_session_present: bool = False
 
 
 @dataclass
@@ -245,21 +257,32 @@ class Step:
 # --------------------------------------------------------------------------- #
 
 
-def mask(value: Any) -> dict[str, Any]:
-    """``{"configured": bool, "last4": str | None}`` for a secret.
+def mask(value: Any, source: str | None = None) -> dict[str, Any]:
+    """``{"configured": bool, "last4": str | None, "source": str | None}`` for a secret.
 
     ``last4`` only for *string* secrets of twelve characters or more — never
     for an integer such as ``sync.telegram.api_id`` (an int's last digits say
     too much about too short a value) and never for a short string.
+
+    ``source`` is where a configured value came from (``file``,
+    ``environment``, ``config-repo``, ``gateway`` — see
+    :mod:`nerve.setup_provenance`); ``file`` when the caller resolved nothing
+    else, ``None`` for a value that is not configured.
     """
     if value is None or value == "" or value == 0:
-        return {"configured": False, "last4": None}
+        return {"configured": False, "last4": None, "source": None}
     if isinstance(value, bool):
-        return {"configured": bool(value), "last4": None}
+        return {"configured": bool(value), "last4": None, "source": (source or SOURCE_FILE) if value else None}
     if not isinstance(value, str):
-        return {"configured": True, "last4": None}
+        return {"configured": True, "last4": None, "source": source or SOURCE_FILE}
     text = str(value)
-    return {"configured": True, "last4": text[-4:] if len(text) >= 12 else None}
+    return {"configured": True, "last4": text[-4:] if len(text) >= 12 else None, "source": source or SOURCE_FILE}
+
+
+def managed(source: str) -> dict[str, Any]:
+    """A configured value this machine does not hold the text of — the
+    gateway's token, a credential from the environment: no ``last4``."""
+    return {"configured": True, "last4": None, "source": source}
 
 
 def _pick(detail: Any, path: str) -> Any:
@@ -414,13 +437,37 @@ def _provider_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     else:
         kind = "anthropic"
     warning = None
-    if credential == "oauth_token" or (credential == "environment" and facts.env_oauth_only):
+    # Background jobs (memory, titles, crons) need an API key. A subscription
+    # token alone cannot serve them, unless the environment carries a key.
+    env_api_key = facts.env_credential and not facts.env_oauth_only
+    if (credential == "oauth_token" and not env_api_key) or (
+        credential == "environment" and facts.env_oauth_only
+    ):
         warning = "oauth_background_jobs"
+    sources = facts.credential_sources
+    api_key = mask(config.anthropic_api_key, sources.get("anthropic_api_key"))
+    oauth_token = mask(config.claude_oauth_token, sources.get("claude_oauth_token"))
+    if credential == "environment":
+        # Nothing in the files: the gateway's environment carries the value
+        # (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN). Configured, managed,
+        # and not a configuration value this page could show the tail of.
+        if facts.env_oauth_only:
+            oauth_token = managed(SOURCE_ENVIRONMENT)
+        else:
+            api_key = managed(SOURCE_ENVIRONMENT)
+    credential_source = {
+        "api_key": api_key["source"],
+        "oauth_token": oauth_token["source"],
+        "environment": SOURCE_ENVIRONMENT,
+    }.get(credential)
     detail = {
         "type": kind,
         "credential": credential,
-        "anthropic_api_key": mask(config.anthropic_api_key),
-        "claude_oauth_token": mask(config.claude_oauth_token),
+        # Where the active credential came from (``file`` / ``environment`` /
+        # ``config-repo``); ``None`` for Bedrock, the proxy, or none at all.
+        "credential_source": credential_source,
+        "anthropic_api_key": api_key,
+        "claude_oauth_token": oauth_token,
         "proxy_enabled": bool(config.proxy.enabled),
         "aws_region": config.provider.aws_region or "",
         "aws_profile": config.provider.aws_profile or "",
@@ -510,10 +557,21 @@ def _channels_detail(facts: Facts) -> tuple[dict[str, Any], str]:
         pairing_available, reason = False, PAIRING_AFTER_RESTART
     else:
         pairing_available, reason = True, None
+    sources = facts.credential_sources
+    hosted = slack.mode == "hosted"
+    if hosted:
+        # The shared channel gateway holds the tokens; this machine has none.
+        slack_bot = managed(SOURCE_GATEWAY)
+        slack_app = managed(SOURCE_GATEWAY)
+        gateway = facts.hosted_gateway or {"streams": 0, "connected": False, "last_event_at": None}
+    else:
+        slack_bot = mask(slack.bot_token, sources.get("slack.bot_token"))
+        slack_app = mask(slack.app_token, sources.get("slack.app_token"))
+        gateway = None
     detail = {
         "telegram": {
             "enabled": bool(tg.enabled),
-            "bot_token": mask(tg.bot_token),
+            "bot_token": mask(tg.bot_token, sources.get("telegram.bot_token")),
             "bot_username": facts.bot_username,
             "live": bool(facts.telegram_live),
             "start_error": facts.telegram_start_error,
@@ -525,8 +583,12 @@ def _channels_detail(facts: Facts) -> tuple[dict[str, Any], str]:
         "slack": {
             "enabled": bool(slack.enabled),
             "mode": slack.mode,
-            "bot_token": mask(slack.bot_token),
-            "app_token": mask(slack.app_token),
+            "bot_token": slack_bot,
+            "app_token": slack_app,
+            # ``slack.mode: hosted`` only — what the stream manager reports
+            # about the gateway's streams; ``None`` in socket mode. Volatile:
+            # outside the step's etag.
+            "gateway": gateway,
             "allow_users": list(slack.allow_users or []),
             "allow_direct_messages": bool(slack.allow_direct_messages),
             "allow_channels": list(slack.allow_channels or []),
@@ -541,28 +603,75 @@ def _channels_detail(facts: Facts) -> tuple[dict[str, Any], str]:
         if not facts.telegram_live and facts.restart_pending:
             paired += " (restart pending)"
         parts.append(f"Telegram {name} · {paired}")
-    if slack.bot_token and slack.app_token:
-        parts.append("Slack" + (" (hosted)" if slack.mode == "hosted" else ""))
-    elif slack.mode == "hosted":
-        parts.append("Slack managed by the gateway")
+    if hosted:
+        parts.append(
+            "Slack managed by the channel gateway · "
+            + ("connected" if gateway and gateway.get("connected") else "waiting for the gateway")
+        )
+    elif slack.bot_token and slack.app_token:
+        parts.append("Slack")
     return detail, " · ".join(parts)
+
+
+def telegram_session(facts: Facts) -> dict[str, Any]:
+    """``{"present", "authorized", "user"}`` for the Telegram message sync,
+    from facts a pure read can know: the session file exists, and who the
+    last sign-in or session check said it belongs to (state file). ``None``
+    for ``authorized`` means the file exists but nothing has verified it in
+    this install yet — the page's session check answers that live."""
+    present = bool(facts.telegram_session_present)
+    user = facts.state.telegram_sync_user if present else None
+    if not present:
+        authorized: bool | None = False
+    elif user:
+        authorized = True
+    else:
+        authorized = None
+    return {"present": present, "authorized": authorized, "user": dict(user) if user else None}
+
+
+def _telegram_handle(user: dict[str, Any] | None) -> str:
+    if not user:
+        return "someone"
+    if user.get("username"):
+        return f"@{user['username']}"
+    return str(user.get("first_name") or f"id {user.get('id')}")
 
 
 def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     sync = facts.config.sync
+    sources = facts.credential_sources
+    session = telegram_session(facts)
+    accounts = list(sync.gmail.accounts or [])
     detail = {
-        "github": {"enabled": bool(sync.github.enabled)},
-        "gmail": {"enabled": bool(sync.gmail.enabled), "accounts": list(sync.gmail.accounts or [])},
+        # ``source`` for GitHub is where a token Nerve forwards to the GitHub
+        # CLI comes from (``github_token`` / GH_TOKEN); ``None`` when the CLI's
+        # own login is all there is (the preflight reports that one).
+        "github": {"enabled": bool(sync.github.enabled), "source": sources.get("github_token")},
+        "gmail": {
+            "enabled": bool(sync.gmail.enabled),
+            "accounts": accounts,
+            "source": (sources.get("sync.gmail.accounts") or SOURCE_FILE) if accounts else None,
+        },
         "telegram": {
             "enabled": bool(sync.telegram.enabled),
-            "api_id": mask(sync.telegram.api_id),
-            "api_hash": mask(sync.telegram.api_hash),
+            "api_id": mask(sync.telegram.api_id, sources.get("sync.telegram.api_id")),
+            "api_hash": mask(sync.telegram.api_hash, sources.get("sync.telegram.api_hash")),
+            "session": session,
         },
     }
-    on = [name for name, flag in (
-        ("GitHub", sync.github.enabled), ("Gmail", sync.gmail.enabled),
-        ("Telegram", sync.telegram.enabled),
-    ) if flag]
+    on = []
+    if sync.github.enabled:
+        on.append("GitHub")
+    if sync.gmail.enabled:
+        on.append("Gmail")
+    if sync.telegram.enabled:
+        if session["authorized"]:
+            on.append(f"Telegram sync · signed in as {_telegram_handle(session['user'])}")
+        elif session["authorized"] is None:
+            on.append("Telegram sync · sign-in not verified")
+        else:
+            on.append("Telegram sync · not signed in")
     if not on and STEP_SOURCES in facts.state.answered:
         return detail, "None"  # a deliberate "none of these" beside the Done badge
     return detail, ", ".join(on)
@@ -734,7 +843,7 @@ def derive(facts: Facts) -> list[Step]:
                 status = _skipped_or_pending(step_id, facts)
 
         elif step_id == STEP_MEMORY:
-            key = mask(config.openai_api_key)
+            key = mask(config.openai_api_key, facts.credential_sources.get("openai_api_key"))
             detail = {
                 "openai_api_key": key,
                 "embeddings_chosen": bool(config.openai_api_key),
@@ -756,8 +865,12 @@ def derive(facts: Facts) -> list[Step]:
 
         elif step_id == STEP_CHANNELS:
             detail, summary = _channels_detail(facts)
+            # A Slack held by the shared channel gateway is a connection the
+            # operator provisioned: the step is decided, `enabled` stays the
+            # one control.
             done = bool(
                 config.telegram.bot_token or (config.slack.bot_token and config.slack.app_token)
+                or config.slack.mode == "hosted"
             )
             if done:
                 status = STATUS_DONE

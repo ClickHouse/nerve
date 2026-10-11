@@ -26,6 +26,7 @@ from nerve.bootstrap import (
     _DOCKERIGNORE_TEMPLATE,
 )
 from nerve.cli import main
+from nerve.config import DEFAULT_MODEL
 
 
 @pytest.fixture
@@ -1397,7 +1398,7 @@ class TestPortableSettingsSplit:
         assert after["provider"]["type"] == "anthropic"
         assert "aws_region" not in after.get("provider", {})
         # The non-prefixed names overwrite rather than needing deletion.
-        assert after["agent"]["model"] == "claude-opus-5"
+        assert after["agent"]["model"] == DEFAULT_MODEL
 
     def test_gateway_host_and_port_are_shared(self, tmp_path: Path) -> None:
         """The tracked layer has to be able to state the bind address.
@@ -1452,9 +1453,7 @@ class TestPortableSettingsSplit:
         """
         self._wizard(tmp_path)._apply()
         settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
-        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == (
-            "claude-opus-5"
-        )
+        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == DEFAULT_MODEL
 
         self._wizard(
             tmp_path, provider_type="bedrock", aws_region="eu-west-1"

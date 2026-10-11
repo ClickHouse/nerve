@@ -25,6 +25,33 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Default Claude models — update HERE when Anthropic ships a new generation.
+#
+# This block is the only place a default model id is spelled. Every other
+# site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
+# ``opus`` alias, the terminal wizard's example line) references these names,
+# and ``tests/test_default_models.py`` fails on a model-id literal anywhere
+# else under ``nerve/`` — so the next update is one edit here plus the
+# regenerated goldens, examples and docs.
+DEFAULT_MODEL = "claude-opus-5-5"               # agent.model (conversations)
+DEFAULT_CRON_MODEL = "claude-sonnet-4-6"        # agent.cron_model
+DEFAULT_TITLE_MODEL = "claude-haiku-4-5-20251001"  # agent.title_model
+DEFAULT_RECALL_MODEL = "claude-sonnet-4-6"      # memory.recall_model
+DEFAULT_MEMORIZE_MODEL = "claude-sonnet-4-6"    # memory.memorize_model
+DEFAULT_FAST_MODEL = "claude-haiku-4-5-20251001"   # memory.fast_model
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+
+# Fallback for the composer's Claude model picker when ``agent.models`` is
+# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
+# — the current generation, the configured default first. Bare Anthropic API
+# IDs: they do not apply on Bedrock, where model IDs are region-prefixed.
+DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
+    DEFAULT_MODEL,
+    DEFAULT_FALLBACK_MODEL,
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+)
+
 # Runtime queue of session ids to auto-resume after ``nerve restart --resume``.
 # The CLI appends ids here (synchronously, before triggering the restart) and
 # the fresh daemon drains it on startup. Kept next to the other machine-local
@@ -848,17 +875,8 @@ class PromptRewriteConfig:
         )
 
 
-# Fallback for the composer's Claude model picker when ``agent.models`` is
-# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
-# — the current-generation models Nerve itself defaults to elsewhere in this
-# file. Bare Anthropic API IDs: they do not apply on Bedrock, where model IDs
-# are region-prefixed.
-DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
-    "claude-opus-5",
-    "claude-opus-5-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-)
+# The default model ids live in the constants block at the top of this file
+# (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
 
 
 @dataclass
@@ -872,14 +890,14 @@ class AgentConfig:
     # Wakeup turns fire on existing sessions and inherit their stored
     # backend — this only affects freshly minted cron/hook sessions.
     cron_backend: str = ""
-    model: str = "claude-opus-5"
-    cron_model: str = "claude-sonnet-4-6"
-    title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
+    model: str = DEFAULT_MODEL
+    cron_model: str = DEFAULT_CRON_MODEL
+    title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → claude-opus-5 on
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL on
     # non-Bedrock providers; entries here merge over that default, and an
     # empty value ("") unsets it (falls back to the CLI's built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
@@ -1001,9 +1019,9 @@ class AgentConfig:
         return cls(
             backend=str(d.get("backend", "claude")).strip().lower(),
             cron_backend=str(d.get("cron_backend") or "").strip().lower(),
-            model=d.get("model", "claude-opus-5"),
-            cron_model=d.get("cron_model", "claude-sonnet-4-6"),
-            title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
+            model=d.get("model", DEFAULT_MODEL),
+            cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
+            title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
@@ -1951,9 +1969,9 @@ class MemoryCategoryConfig:
 
 @dataclass
 class MemoryConfig:
-    recall_model: str = "claude-sonnet-4-6"  # Recall routing
-    memorize_model: str = "claude-sonnet-4-6"  # Extraction & preprocessing
-    fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
+    recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
+    memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
+    fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
     embed_model: str = ""
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
@@ -1967,9 +1985,9 @@ class MemoryConfig:
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
         return cls(
-            recall_model=d.get("recall_model", "claude-sonnet-4-6"),
-            memorize_model=d.get("memorize_model", "claude-sonnet-4-6"),
-            fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
+            recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
+            memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
+            fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
             embed_model=d.get("embed_model", ""),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),

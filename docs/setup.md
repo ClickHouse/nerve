@@ -186,9 +186,9 @@ keep", never read back.
 | **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …; worker: `TASK.md`), mode defaults in `settings.yaml` only where absent, `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours (prefilled 22:00–07:00), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml`; the matching lines of `USER.md` and `IDENTITY.md` (personal) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
-| **Memory** | an OpenAI key for vector search, or "Continue without" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
+| **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
 | **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
-| **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash) as toggle cards, each with a server-side check of its tool (`gh`, `gog`) | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml` | live |
+| **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash, then a one-time sign-in to your own Telegram account: phone, the code Telegram sends, your two-step password if you have one) as toggle cards, each with a server-side check of its tool (`gh`, `gog`) | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml`; the Telegram session → `NERVE_HOME/telegram_sync.session` (owner-only, written by Telethon) | live |
 | **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
 | **Agents** (personal) | which coding agents on this server (Codex, Claude Code) get a connection to Nerve; what to do with an existing config | the agents' own config files; `external_agents.*` and `mcp_endpoint.enabled` → `config.yaml` | restart |
 | **Review and finish** | a server check-up (Claude CLI, Node, `gh`, `gog`, disk, time zone, web build), what was written where, and the apply button | nothing new | hot reload, or a restart when something above needs one |
@@ -203,10 +203,12 @@ A few things worth knowing per step:
 - **Model.** "Test connection" runs on the server (not in your browser) and
   reports precisely: a rejected key, a region where Claude is not enabled, no
   network, a timeout. Subscription tokens cannot be tested against the API and
-  say so. A subscription token drives chat only — memory, titles and scheduled
-  jobs call the API directly and need an API key, which the Memory step or an
-  `ANTHROPIC_API_KEY` in the server's environment can supply; the page tells
-  you when that is the case. "Use the Claude Code login on this server" is
+  say so. A subscription token drives chat only: memory, titles and scheduled
+  jobs call the API directly and need an Anthropic API key. Paste one on the
+  Model step instead (it replaces the token), set `ANTHROPIC_API_KEY` in the
+  server's environment, or use the proxy from `nerve init --terminal`, the one
+  route that runs those jobs on the subscription; the page says so when it
+  applies. "Claude Code login on this server" is
   offered only when the server actually has one; on a Mac, opening the Model
   step may show a Keychain prompt **on the server's screen** once — Deny keeps
   the option hidden. Choosing it copies that credential into
@@ -224,6 +226,17 @@ A few things worth knowing per step:
   (`slack.mode: hosted`) shows only the on/off switch.
 - **Sources** that are turned on while their tool is missing on the server
   are saved and stay idle until the tool is set up; the card says so.
+- **Telegram message sync** reads the chats of your *own* Telegram account,
+  so API credentials alone do nothing: after the API id and hash are saved,
+  the card offers a sign-in — your phone number, the code Telegram sends,
+  and your two-step password if you have one. The sign-in stays on this
+  server: Telethon writes the session file under `NERVE_HOME`, owner-only;
+  the page shows the phone masked and never stores the code or the
+  password. One sign-in is pending at a time, for ten minutes; a new one
+  replaces it. **Sign out** revokes the session and removes the file. On the
+  server, `nerve setup-telegram` runs the same sign-in in the terminal. While
+  the sync is on but nobody is signed in, the Sources summary, the Ready
+  screen and `nerve doctor` say so.
 - **Automation** lists the core jobs as always-on and the optional ones as
   checkboxes with their schedule rendered in the chosen time zone.
 - **Review and finish** shows an HTTPS warning when the page is served over
@@ -269,7 +282,7 @@ count includes the steps that are waiting for the Mode step, so it only ever
 goes down; steps a lockdown makes read-only are never counted. The
 chat page's empty state points at the Model step until a provider is
 configured. On the Overview every done step has a **Change** link; a skipped
-step offers **Put back**. The CLI reports the same checklist: `nerve status`
+step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
 prints `Setup checklist: N steps left — http://…/setup`, and `nerve doctor`
 prints `[OK] Setup checklist complete` or
 `[WARN] Setup checklist incomplete (steps: provider, profile) — finish at /setup`.
@@ -328,7 +341,7 @@ the daemon:
 `NERVE_SUPERVISOR=exit` or `NERVE_SUPERVISOR=refuse` in the daemon's
 environment overrides the detection for other supervisors. The wait is never
 unbounded: the overlay offers **Not now** after ten seconds, and "did not
-come back" with **Retry waiting** and a `nerve logs` / `nerve start` hint at
+come back" with **Keep waiting** and a `nerve logs` / `nerve start` hint at
 the end. Your session survives the restart — the signing secret is pinned and
 persisted, and nothing in the wizard rotates it.
 
@@ -507,11 +520,57 @@ environment variable and writes it inside the container. Either way the
 `~/.claude` directory is NOT mounted into the container — this avoids file
 permission issues and macOS Keychain access from within Docker.
 
-The browser's "Use the Claude Code login on this server" option looks in a
+The browser's "Claude Code login on this server" option looks in a
 different order — the environment variables and the credentials file first,
 the Keychain last — because it runs on the gateway host at the click of a
 button and a Keychain lookup can raise a prompt there (see the Model step
 notes above).
+
+## Pre-configuring connections
+
+An operator can provide a connection before anyone opens the setup page —
+from the service environment, from `config.local.yaml` written by
+provisioning, from a `settings.yaml` that arrives from a configuration
+repository, or by running Slack behind a shared channel gateway. The setup
+page then shows that connection as **done and read-only**: the card reads
+"Configured by your operator (environment)", "Managed from the configuration
+repository" or "Managed by your organisation's channel gateway", with no
+Replace or Remove. The page never asks for a value the operator already
+provided, and a save that would overwrite one is refused (`409`, naming the
+field).
+
+| Connection | Setting(s) and layer | Environment-reference example | How the setup page reports it |
+|---|---|---|---|
+| Model provider | `anthropic_api_key` or `claude_oauth_token` in `config.local.yaml`; or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the service environment; Bedrock: `provider.type`, `provider.aws_region` in `settings.yaml` | `anthropic_api_key: "${ANTHROPIC_API_KEY}"` in `settings.yaml` from a configuration repository, or `Environment=ANTHROPIC_API_KEY=…` in the service unit | Model: done · "Configured by your operator (environment)"; the model and effort picker stays open |
+| Memory (vector search) | `openai_api_key` in `config.local.yaml` | `openai_api_key: "${OPENAI_API_KEY}"` | Memory: done, read-only |
+| Telegram bot | `telegram.bot_token` in `config.local.yaml`; `telegram.enabled` in `config.yaml` | `telegram: {bot_token: "${TELEGRAM_BOT_TOKEN}"}` in `settings.yaml`, or `config.local.yaml` written by provisioning | Channels: done; the Telegram card is read-only, pairing still works |
+| Slack with your own app | `slack.bot_token`, `slack.app_token` in `config.local.yaml`; `slack.enabled` in `config.yaml`; allow-lists in `settings.yaml` | `slack: {bot_token: "${SLACK_BOT_TOKEN}", app_token: "${SLACK_APP_TOKEN}"}` | Channels: done; token fields read-only |
+| Slack behind a shared channel gateway | `slack.mode: hosted` and `channels.hosted.*` in `settings.yaml` ([config.md](config.md#hosted-mode)) — no tokens on this machine | — | Channels: done · "Managed by your organisation's channel gateway · connected" or "· waiting for the gateway"; the on/off switch is the only control |
+| Telegram message sync | `sync.telegram.api_id`, `sync.telegram.api_hash` in `config.local.yaml`; `sync.telegram.enabled` in `settings.yaml`. The signed-in session is runtime state (`NERVE_HOME/telegram_sync.session`), created on the setup page or with `nerve setup-telegram` | `sync: {telegram: {api_id: "${TG_API_ID}", api_hash: "${TG_API_HASH}"}}` | Sources: the credentials read as managed; the sign-in is still offered until a session exists |
+| GitHub | `gh auth login` on the server; or `github_token` in `config.local.yaml` (forwarded to a container as `GH_TOKEN`); or `GH_TOKEN` / `GITHUB_TOKEN` in the environment | `GH_TOKEN` in the service environment | Sources: the card shows the login the server-side check found; a token from the environment reads "(environment)" |
+| Gmail | `sync.gmail.accounts` in `config.yaml`; `sync.gmail.enabled` in `settings.yaml`; `gog gmail setup <account>` on the server | `sync: {gmail: {accounts: "${GMAIL_ACCOUNTS}"}}` | Sources: done; the addresses are read-only |
+
+How the origin is detected: Nerve reads the configuration files as written,
+before `${VAR}` references are resolved, and judges the layer the loader
+takes the value from (`config.local.yaml` over `config.yaml` over
+`settings.yaml`; under lockdown `settings.yaml` alone). Every masked value in
+`GET /api/setup` carries a `source`: `file` (a file on this machine — the
+page may replace or remove it), `environment` (a variable Nerve reads
+directly, or a `${VAR}` reference in any layer), `config-repo` (the tracked
+`settings.yaml` under [lockdown](#lockdown)) or `gateway` (held by the
+channel gateway). Secrets stay masked whatever their source.
+
+`nerve doctor` prints the source of every configured connection:
+
+```
+[OK] Anthropic API key: configured (environment)
+[OK] Telegram bot token: ...ab12 (environment)
+[OK] Slack hosted by the channel gateway: agent …, 2 gateway key(s) from …
+[OK] Telegram sync: API credentials configured (config-repo)
+[WARN] Telegram sync: no signed-in session at ~/.nerve/telegram_sync.session — sign in on the setup page (Sources → Telegram) or run 'nerve setup-telegram' on the server
+```
+
+Nothing is appended for a value that came from a file on this machine.
 
 ## Instances with external authentication
 
@@ -547,8 +606,12 @@ the setup page works the same way with these differences:
   file alone — the same facts as in local mode. An instance provisioned from
   the environment (`nerve init --non-interactive`, a credential in the
   process environment) or from a config repository reads as done where those
-  decided; a credential from the environment shows as "configured from the
-  environment", read-only.
+  decided; a connection the operator provided shows as configured and
+  managed, read-only, and the page never asks for it again — see
+  [Pre-configuring connections](#pre-configuring-connections) for the
+  settings per connection and how each is reported. Slack behind your
+  organisation's channel gateway shows the gateway's connection state and an
+  on/off switch only.
 - **Finish** prefers a hot reload. When a restart is unavoidable, the page
   says what will happen for the supervisor it detects — the process exits and
   the supervisor starts it again, or an operator must run the command shown —
@@ -624,7 +687,7 @@ nerve logs               # Tail the daemon log
 
 The gateway boots with nothing configured — no provider, no mode — and stays
 idle rather than failing: memory warm-up and sync sources wait for their
-configuration, the chat page shows "Add a model provider to start chatting",
+configuration, the chat page shows "Connect a model to start a conversation",
 and a Telegram bot whose token is rejected at startup is logged (token
 scrubbed), reported on the Channels step and by `nerve doctor`, and never
 stops the gateway from starting.
@@ -873,7 +936,7 @@ saved) or in `config.local.yaml`, then restart.
 
 **The page says "Nerve did not come back".** The restart was requested but no
 new process answered within the time box. On the server, check `nerve logs`
-and run `nerve start` if nothing is running, then **Retry waiting** or reload
+and run `nerve start` if nothing is running, then **Keep waiting** or reload
 the page.
 
 **A Keychain prompt appeared on the server's screen (macOS).** Opening the

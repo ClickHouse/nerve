@@ -219,6 +219,11 @@ class ChannelStream:
     def ready(self) -> bool:
         return self.state == "ready"
 
+    def seconds_since_last_received(self) -> float:
+        """How long ago the gateway last sent anything on this stream, on the
+        stream's own clock (heartbeats included)."""
+        return max(0.0, self._clock() - self.last_received)
+
     def has_capacity(self) -> bool:
         """Whether one more request fits the gateway's in-flight limit."""
         return (

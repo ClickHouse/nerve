@@ -38,7 +38,7 @@ import yaml
 
 from nerve import setup_writer
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
-from nerve.config import NerveConfig
+from nerve.config import DEFAULT_MODEL, NerveConfig
 from nerve.setup_writer import (
     apply_mode,
     apply_profile_templates,
@@ -400,7 +400,7 @@ class TestSecretsLandInExactlyOneLayer:
         """Every field added for the web steps defaults to "not stated"."""
         machine, portable, _ = setup_writer.build_config_layers(SetupChoices())
         assert "slack" not in machine and "slack" not in portable
-        assert portable["agent"]["model"] == "claude-opus-5"
+        assert portable["agent"]["model"] == DEFAULT_MODEL
         assert portable["quiet_start"] == "02:00"
         assert "slack" not in setup_writer.build_config_local(SetupChoices())
 
@@ -545,7 +545,7 @@ class TestMergeWriters:
         ws = tmp_path / "ws"
         setup_writer.merge_settings_paths(ws, {"agent.model": "claude-sonnet-4-6", "timezone": "UTC"})
         outcome = merge_settings_defaults(ws, {
-            "agent.model": "claude-opus-5", "agent.effort": "max", "quiet_start": "02:00",
+            "agent.model": DEFAULT_MODEL, "agent.effort": "max", "quiet_start": "02:00",
         })
         assert outcome.wrote
         assert set(outcome.added) == {"agent.effort", "quiet_start"}

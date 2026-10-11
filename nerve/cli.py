@@ -385,7 +385,7 @@ def _setup_summary(config) -> dict | None:
     if config is None:
         return None
     try:
-        from nerve import setup_checklist, setup_state
+        from nerve import setup_checklist, setup_provenance, setup_state, setup_telegram_login
         from nerve.db.accounts import read_setup_required
         from nerve.setup_writer import workspace_mode
 
@@ -405,6 +405,8 @@ def _setup_summary(config) -> dict | None:
             writable_problem=setup_checklist.LOCKDOWN_TEXT if config.lockdown else None,
             restart_pending=[],
             telegram_live=False,
+            credential_sources=setup_provenance.credential_sources(config),
+            telegram_session_present=setup_telegram_login.session_present(),
             env_credential=bool(
                 os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
             ),
@@ -1497,6 +1499,58 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
+def _source_suffix(config, path: str) -> str:
+    """`` (environment)`` / `` (config-repo)`` after a configured connection
+    line when the value did not come from a file on this machine; ``""`` for
+    the normal case. Never raises — doctor must not die on a report detail."""
+    try:
+        from nerve import setup_provenance
+
+        return setup_provenance.describe(setup_provenance.credential_sources(config).get(path))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
+    """Doctor lines for the Telegram *message sync*: credentials, and whether
+    the session is signed in. Reads the session file's presence and the state
+    file's note of the last sign-in — no network from a CLI process."""
+    lines: list[str] = []
+    sync = config.sync.telegram
+    if not sync.enabled:
+        lines.append("[--] Telegram sync disabled")
+        return lines
+    if not (sync.api_id and sync.api_hash):
+        warnings.append(
+            "[WARN] Telegram sync: enabled but sync.telegram.api_id/api_hash are not set — "
+            "add them on the setup page (Sources → Telegram) or in config.local.yaml"
+        )
+        return lines
+    lines.append(
+        f"[OK] Telegram sync: API credentials configured{_source_suffix(config, 'sync.telegram.api_hash')}"
+    )
+    try:
+        from nerve import setup_state, setup_telegram_login
+
+        present = setup_telegram_login.session_present()
+        user = setup_state.load_state().telegram_sync_user
+        where = f"{paths.home_label()}/{setup_telegram_login.SESSION_NAME}.session"
+    except Exception:  # noqa: BLE001
+        return lines
+    both_routes = "sign in on the setup page (Sources → Telegram) or run 'nerve setup-telegram' on the server"
+    if not present:
+        warnings.append(f"[WARN] Telegram sync: no signed-in session at {where} — {both_routes}")
+    elif user:
+        handle = f"@{user['username']}" if user.get("username") else (user.get("first_name") or f"id {user.get('id')}")
+        lines.append(f"[OK] Telegram sync: signed in as {handle}")
+    else:
+        warnings.append(
+            f"[WARN] Telegram sync: a session file exists at {where} but no sign-in has been "
+            f"verified — {both_routes}"
+        )
+    return lines
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1684,7 +1738,21 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             lines.append("[--] Anthropic API key not set (using proxy)")
     elif config.anthropic_api_key:
-        lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
+        lines.append(
+            f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}"
+            f"{_source_suffix(config, 'anthropic_api_key')}"
+        )
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        # Provisioned by the operator: the gateway's environment carries it
+        # (Docker entrypoint, systemd Environment=), nothing in the files.
+        lines.append("[OK] Anthropic API key: configured (environment)")
+    elif config.claude_oauth_token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        where = _source_suffix(config, "claude_oauth_token") if config.claude_oauth_token else " (environment)"
+        lines.append(f"[OK] Claude subscription token: configured{where}")
+        warnings.append(
+            "[WARN] Only a subscription token is configured — background jobs "
+            "(memory, titles, cron) need an API key"
+        )
     elif config.lockdown:
         # The generic message names config.local.yaml, which a locked instance
         # never reads. The cause is also often upstream of the key: if the
@@ -1710,14 +1778,20 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             errors.append(f"[ERR] Claude API: {detail}")
 
     if config.openai_api_key:
-        lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]} (vector embeddings enabled)")
+        lines.append(
+            f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
+            f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"
+        )
     else:
         lines.append("[--] OpenAI API key not set (using LLM-based memory recall)")
 
     # Check Telegram
     if config.telegram.enabled:
         if config.telegram.bot_token:
-            lines.append(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
+            lines.append(
+                f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}"
+                f"{_source_suffix(config, 'telegram.bot_token')}"
+            )
             if config.telegram.dm_policy == "open":
                 warnings.append(
                     "[WARN] telegram.dm_policy is 'open' — any Telegram user "
@@ -1733,6 +1807,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
         lines.append("[--] Telegram disabled")
+
+    # Telegram message sync (the Telethon source): API credentials alone do
+    # nothing — it needs a signed-in session of the person's own account.
+    lines.extend(_telegram_sync_lines(config, warnings))
 
     # Check Slack
     if config.slack.mode == "hosted":
@@ -1777,7 +1855,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "(Socket Mode needs both)"
             )
         else:
-            lines.append(f"[OK] Slack bot token: ...{config.slack.bot_token[-4:]}")
+            lines.append(
+                f"[OK] Slack bot token: ...{config.slack.bot_token[-4:]}"
+                f"{_source_suffix(config, 'slack.bot_token')}"
+            )
             slack = config.slack
             if not (
                 slack.allow_users
@@ -2659,17 +2740,25 @@ def setup_telegram(ctx: click.Context) -> None:
     api_id = config.sync.telegram.api_id
     api_hash = config.sync.telegram.api_hash
     if not api_id or not api_hash:
-        click.echo("Error: sync.telegram.api_id and api_hash must be set in config.")
+        click.echo(
+            "Error: sync.telegram.api_id and api_hash are not set. Add them on the setup "
+            "page (Sources → Telegram) or in config.local.yaml, then run this again."
+        )
         ctx.exit(1)
         return
 
-    session_path = str(paths.nerve_path("telegram_sync"))
+    from nerve import setup_telegram_login
+
+    session_path = str(setup_telegram_login.session_base())
     click.echo(f"Telethon session: {session_path}.session")
     click.echo(f"API ID: {api_id}")
+    click.echo("(The setup page's Sources step offers the same sign-in in the browser.)")
     click.echo()
 
     async def _run():
         from telethon import TelegramClient, functions
+
+        from nerve import setup_state
 
         client = TelegramClient(session_path, api_id, api_hash)
         await client.start()
@@ -2682,6 +2771,15 @@ def setup_telegram(ctx: click.Context) -> None:
         click.echo(f"Current state: pts={state.pts}, qts={state.qts}, date={state.date}, seq={state.seq}")
 
         await client.disconnect()
+        # Owner-only like every credential file, and noted in the state file
+        # so the setup page and `nerve doctor` can say who is signed in.
+        setup_telegram_login._make_private(setup_telegram_login.session_file())
+        notes = setup_state.load_state()
+        setup_state.retire_on_boot(notes)
+        notes.telegram_sync_user = {
+            "id": int(me.id), "username": me.username or None, "first_name": me.first_name or "",
+        }
+        setup_state.save_state(notes)
         click.echo()
         click.echo(f"Session saved to {session_path}.session")
         click.echo("Telegram source is now ready to use.")

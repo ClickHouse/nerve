@@ -53,7 +53,17 @@ from typing import Any
 import yaml
 
 from nerve import paths
-from nerve.config import _expand_path, _interpolate_str, workspace_settings_file
+from nerve.config import (
+    DEFAULT_CRON_MODEL,
+    DEFAULT_FAST_MODEL,
+    DEFAULT_MEMORIZE_MODEL,
+    DEFAULT_MODEL,
+    DEFAULT_RECALL_MODEL,
+    DEFAULT_TITLE_MODEL,
+    _expand_path,
+    _interpolate_str,
+    workspace_settings_file,
+)
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
@@ -499,8 +509,8 @@ def build_config_layers(
             "port": int(choices.gateway_port),
         },
         "agent": {
-            "model": "claude-opus-5",
-            "cron_model": "claude-sonnet-4-6",
+            "model": DEFAULT_MODEL,
+            "cron_model": DEFAULT_CRON_MODEL,
             "max_turns": 50,
             "max_concurrent": 32,
             "thinking": "max",
@@ -510,9 +520,9 @@ def build_config_layers(
         "quiet_start": choices.quiet_start or "02:00",
         "quiet_end": choices.quiet_end or "08:00",
         "memory": {
-            "recall_model": "claude-sonnet-4-6",
-            "memorize_model": "claude-sonnet-4-6",
-            "fast_model": "claude-haiku-4-5-20251001",
+            "recall_model": DEFAULT_RECALL_MODEL,
+            "memorize_model": DEFAULT_MEMORIZE_MODEL,
+            "fast_model": DEFAULT_FAST_MODEL,
             "embed_model": "text-embedding-3-small",
             "categories": (
                 _PERSONAL_MEMORY_CATEGORIES if choices.mode == "personal"
@@ -572,12 +582,12 @@ def build_config_layers(
         # the tracked layer, these belong there too.
         geo = bedrock_geo_prefix(choices.aws_region)
         for section, key, value in (
-            ("agent", "model", f"{geo}.anthropic.claude-opus-5"),
-            ("agent", "cron_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-            ("agent", "title_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
-            ("memory", "recall_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-            ("memory", "memorize_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-            ("memory", "fast_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            ("agent", "model", f"{geo}.anthropic.{DEFAULT_MODEL}"),
+            ("agent", "cron_model", f"{geo}.anthropic.{DEFAULT_CRON_MODEL}"),
+            ("agent", "title_model", f"{geo}.anthropic.{DEFAULT_TITLE_MODEL}-v1:0"),
+            ("memory", "recall_model", f"{geo}.anthropic.{DEFAULT_RECALL_MODEL}"),
+            ("memory", "memorize_model", f"{geo}.anthropic.{DEFAULT_MEMORIZE_MODEL}"),
+            ("memory", "fast_model", f"{geo}.anthropic.{DEFAULT_FAST_MODEL}-v1:0"),
         ):
             portable[section][key] = value
     else:

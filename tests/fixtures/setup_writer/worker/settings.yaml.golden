@@ -12,7 +12,7 @@ gateway:
   host: 0.0.0.0
   port: 8900
 agent:
-  model: eu.anthropic.claude-opus-5
+  model: eu.anthropic.claude-opus-5-5
   cron_model: eu.anthropic.claude-sonnet-4-6
   max_turns: 50
   max_concurrent: 32

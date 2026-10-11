@@ -24,6 +24,40 @@ def state_path(tmp_path, monkeypatch):
     return path
 
 
+class TestTelegramSyncUser:
+    """Who the message sync is signed in as: a decision-like note, validated on load."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        ({"id": 7, "username": "alice_example", "first_name": "Alice"}, {"id": 7, "username": "alice_example", "first_name": "Alice"}),
+        ({"id": 7}, {"id": 7, "username": None, "first_name": ""}),
+        ({"id": 7, "username": "", "first_name": None}, {"id": 7, "username": None, "first_name": ""}),
+        ({"id": "7"}, None),
+        ({"id": 0}, None),
+        ({"id": True}, None),
+        ({"username": "alice_example"}, None),
+        ("alice_example", None),
+        (["alice_example"], None),
+        (None, None),
+    ])
+    def test_only_the_right_shape_is_kept(self, state_path, raw, expected):
+        state_path.write_text(json.dumps({"version": 3, "telegram_sync_user": raw}), encoding="utf-8")
+        assert setup_state.load_state().telegram_sync_user == expected
+
+    def test_absent_in_an_older_file_reads_as_none(self, state_path):
+        state_path.write_text(json.dumps({"version": 3, "skipped": ["memory"]}), encoding="utf-8")
+        state = setup_state.load_state()
+        assert state.telegram_sync_user is None and state.skipped == {"memory"}
+
+    def test_clearing_survives_a_round_trip(self, state_path):
+        state = setup_state.SetupState(telegram_sync_user={"id": 7, "username": None, "first_name": "A"})
+        assert setup_state.save_state(state)
+        state = setup_state.load_state()
+        state.telegram_sync_user = None
+        assert setup_state.save_state(state)
+        assert json.loads(state_path.read_text(encoding="utf-8"))["telegram_sync_user"] is None
+        assert setup_state.load_state().telegram_sync_user is None
+
+
 class TestLoadNeverRaises:
     @pytest.mark.parametrize("body", [
         "",
@@ -91,6 +125,7 @@ class TestRoundTrip:
         state.debts["openai_api_key"] = "embeddings start after a restart"
         state.boot_errors["telegram"] = "InvalidToken: The token <token> was rejected by the server."
         state.telegram_bot_username = "example_assistant_bot"
+        state.telegram_sync_user = {"id": 424242, "username": "alice_example", "first_name": "Alice"}
         assert setup_state.save_state(state) is True
 
         text = state_path.read_text(encoding="utf-8")
@@ -99,8 +134,10 @@ class TestRoundTrip:
         raw = json.loads(text)
         assert set(raw) == {
             "version", "skipped", "answered", "debts", "boot_errors",
-            "telegram_bot_username", "boot", "updated_at",
+            "telegram_bot_username", "telegram_sync_user", "boot", "updated_at",
         }
+        assert raw["telegram_sync_user"] == {"id": 424242, "username": "alice_example", "first_name": "Alice"}
+        assert setup_state.load_state().telegram_sync_user == state.telegram_sync_user
         assert raw["version"] == 3
         reloaded = setup_state.load_state()
         assert reloaded.skipped == {"channels"}
