@@ -1,24 +1,32 @@
 # Observability — Langfuse
 
-Nerve has an optional Langfuse integration for tracing the agent loop and
-the memU memory pipeline. When configured, every Claude Agent SDK turn,
-tool call, and direct Anthropic SDK call (memU embeddings/condensation)
-becomes a span in your Langfuse project, tagged with `session_id`,
-`source` (`web` / `cron` / `telegram` / `hook`), `model`, and `channel`.
+Nerve has an optional Langfuse integration for tracing the agent loop.
+When configured, every Claude Agent SDK turn and tool call, and every
+direct Anthropic SDK call, becomes a span in your Langfuse project. Agent
+turns are tagged with `session_id`, `source` (`web` / `cron` /
+`telegram` / `hook`), `model`, and `channel`.
 
 When the keys aren't set, the integration is a complete no-op — Nerve
 runs identically with zero observability overhead.
 
 ## What gets captured
 
-| Surface                       | Source                                               | Tags                                              |
-|-------------------------------|------------------------------------------------------|---------------------------------------------------|
-| Agent turns + tool calls      | `claude_agent_sdk` via LangSmith integration         | `source:*`, `model:*`, `channel:*` (when present) |
-| memU chat / summarize / embed | `anthropic` SDK via `AnthropicInstrumentor`          | `component:memu`, `purpose:summarize`             |
+| Surface                                  | Source                                       | Tags                                              |
+|------------------------------------------|----------------------------------------------|---------------------------------------------------|
+| Agent turns + tool calls (Claude backend) | `claude_agent_sdk` via LangSmith integration | `source:*`, `model:*`, `channel:*` (when present) |
+| memU chat / summarize on Bedrock         | `anthropic` SDK via `AnthropicInstrumentor`  | `component:memu`, `purpose:summarize`             |
+| Other direct Anthropic calls (session titles, prompt rewrite, source condensing, image analysis, memU date resolution) | `anthropic` SDK via `AnthropicInstrumentor` | none (no session id) |
+
+Not captured:
+
+- **Codex turns.** Langfuse tracing covers the Claude backend only.
+- **memU on providers other than Bedrock.** memU's own client uses the
+  OpenAI SDK, which Nerve does not instrument, so memU extraction and
+  recall calls do not appear.
 
 Trace-level attributes (`session_id`, `metadata.parent_session_id`,
 `metadata.fork_from`) are propagated to every span emitted inside a turn
-via OpenTelemetry Baggage.
+through the in-process OpenTelemetry context.
 
 ## Setup
 
@@ -50,13 +58,22 @@ langfuse:
   host: https://cloud.langfuse.com
 ```
 
-Restart Nerve. On startup you should see one of:
+Restart Nerve. On startup Nerve checks the keys with
+`GET <host>/api/public/projects` and logs one of:
 
-- `Langfuse: enabled (host=...)` — keys valid, tracing active.
+- `Langfuse: enabled (host=..., project=...)` — keys valid, tracing active.
 - `Langfuse: disabled (no public_key/secret_key in config)` — keys absent.
-- `Langfuse: auth_check failed against ...` — keys present but rejected.
+- `Langfuse: ... rejected the key pair (HTTP 401)` — keys present but
+  rejected. Tracing is off until you fix the keys and restart.
+- `Langfuse: could not verify the keys against ...` — the host did not
+  answer. Tracing stays on, and spans are sent when the host answers.
 
 Visit the diagnostics page (`/diagnostics`) to confirm the live status.
+
+The keys go only to the Langfuse client inside the Nerve process. Nerve
+does not export them to the environment, so the Claude CLI, the agent's
+shell tools and Codex do not inherit them. An agent that can read
+`config.local.yaml` can still read them there.
 
 ## Configuration reference
 
@@ -67,9 +84,18 @@ Visit the diagnostics page (`/diagnostics`) to confirm the live status.
 | `host`            | `https://cloud.langfuse.com`     | Region endpoint or self-hosted URL.                             |
 | `redact_patterns` | (built-in secret regexes)        | List of regexes — matched substrings are replaced with `[REDACTED]`. |
 
+All four fields are read once at startup; change them and restart.
+
 The default `redact_patterns` strip common secret formats: Anthropic API
 keys, Langfuse keys, and bcrypt hashes. Add more for any project-specific
-secret formats you don't want to leave the host.
+secret formats you don't want to leave the host. An explicit empty list
+(`redact_patterns: []`) turns redaction off.
+
+Nerve applies the patterns to the string attributes of every span before
+it leaves the process: prompts, completions, tool inputs and outputs,
+tags and metadata. It uses the Langfuse SDK's `mask_otel_spans` export
+hook, so spans from every instrumentation are covered. Span names and
+span events (for example exception messages) are not redacted.
 
 ## Privacy note
 
@@ -79,12 +105,21 @@ the boundary — make sure it points where you want the data to go. For
 strict data residency, self-host Langfuse on infrastructure you control.
 
 `redact_patterns` is a defensive layer — useful even with trusted
-endpoints in case a secret leaks into a prompt accidentally.
+endpoints in case a secret leaks into a prompt accidentally. It only
+removes text that matches a pattern; everything else is sent as is.
 
 ## Disabling
 
-Remove or empty the `public_key` / `secret_key` fields. No restart-time
-flags, no feature gates — the lack of keys is the off switch.
+Remove or empty the `public_key` / `secret_key` fields and restart. No
+feature gates — the lack of keys is the off switch.
+
+## Session links
+
+When the startup key check succeeds, the chat header shows a **Langfuse**
+link to `<host>/project/<projectId>/sessions/<sessionId>`. Nerve gets the
+project id from the key check. If the host did not answer at startup,
+there is no link until the next successful check, which happens at the
+next restart.
 
 ## Cost cross-check
 
@@ -122,13 +157,15 @@ key).
 
 ## Troubleshooting
 
-- **Spans aren't appearing.** Check `/api/observability/status` —
-  if `auth_ok: false`, the keys are wrong. If `enabled: false` despite
-  keys being set, look at startup logs for an `ImportError` on the
-  `langfuse` package itself (run `uv sync` to refresh).
-- **Spans are tagged but session_id is missing.** That can happen if the
-  installed Langfuse SDK doesn't accept `session_id=` kwarg in
-  `propagate_attributes`. Upgrade to a newer Langfuse Python SDK.
+- **Spans aren't appearing.** Check `/api/observability/status`:
+  - `enabled: false` with keys set: the host rejected the keys, or the
+    `langfuse` package failed to import. The startup log says which; for
+    an import error, run `uv sync` to refresh.
+  - `enabled: true` with `auth_ok: false`: the host did not answer the
+    startup check. Spans are sent when it answers; check the network path
+    to `host`.
+- **No Langfuse link in the chat header.** The link needs `project_id`
+  from a successful startup check. Restart Nerve once the host answers.
 - **The host runs out of memory under heavy load.** The Langfuse SDK
   buffers spans and ships them async. If memory is tight you can drop
   the Anthropic instrumentation by editing `init_langfuse`, or deploy

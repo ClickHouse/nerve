@@ -375,7 +375,7 @@ memory:
 #   path: /mcp/v1
 #   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
-# Observability (optional) — Langfuse tracing for the agent loop and memU.
+# Observability (optional) — Langfuse tracing for the agent loop.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.
 # See docs/observability.md for setup details.
 # langfuse:
