@@ -23,9 +23,9 @@ Implementation notes
   ``metadata``) are propagated to every span inside a wrapped block via
   :func:`langfuse.propagate_attributes`, through the in-process
   OpenTelemetry context.
-- ``langfuse.redact_patterns`` are applied to the string attributes of
-  every span this client exports, through the SDK's ``mask_otel_spans``
-  export hook. Span names and span events are not redacted.
+- ``langfuse.redact_patterns`` are applied to text in span attributes,
+  including bytes, nested values and serialized JSON, before the SDK
+  extracts media. Span names and span events are not redacted.
 
 Failure mode
 ------------
@@ -38,9 +38,11 @@ Nothing here raises.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -120,6 +122,7 @@ def init_langfuse(config: Any) -> bool:
 
     try:
         from langfuse import Langfuse
+        from langfuse._client.span_filter import is_default_export_span
     except ImportError as e:
         logger.warning(
             "Langfuse: package not importable (%s) — observability disabled. "
@@ -127,22 +130,34 @@ def init_langfuse(config: Any) -> bool:
         )
         return False
 
-    # The export hook reads the compiled patterns, so compile them before
-    # the client can export anything.
     _redact_patterns = _compile_patterns(getattr(lf, "redact_patterns", []))
+    export_ready = False
+
+    def should_export_span(span: Any) -> bool:
+        return export_ready and is_default_export_span(span)
 
     try:
         client = Langfuse(
             public_key=public_key,
             secret_key=secret_key,
             base_url=host,
-            mask_otel_spans=_mask_otel_spans,
+            should_export_span=should_export_span,
         )
     except Exception as e:
         logger.warning(
             "Langfuse: client setup failed (%s) — observability disabled",
             type(e).__name__,
         )
+        return False
+
+    try:
+        _install_redaction(client)
+    except Exception as e:
+        logger.warning(
+            "Langfuse: redaction setup failed (%s) — observability disabled",
+            type(e).__name__,
+        )
+        _shutdown_quietly(client)
         return False
 
     # Key check: the same request as ``Langfuse.auth_check()``, which also
@@ -197,6 +212,8 @@ def init_langfuse(config: Any) -> bool:
             "agent-loop costs in Langfuse will overcount cached input "
             "tokens", e,
         )
+
+    export_ready = True
 
     # Wrap Claude Agent SDK. Failure here disables agent tracing but doesn't
     # disable the rest — direct Anthropic instrumentation still covers
@@ -264,17 +281,38 @@ def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
     """Return a redacted copy of an OTEL attribute value.
 
     Returns ``value`` itself when nothing matched, so callers can detect a
-    change with ``is``. Attribute values are scalars or homogeneous
-    sequences of scalars; only strings can hold a secret.
+    change with ``is``. Text in bytes, mappings, sequences and serialized
+    JSON is included. Non-UTF-8 bytes are replaced with the redaction marker.
     """
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return REDACTED.encode("utf-8")
+        redacted = _redact_value(text, patterns)
+        return value if redacted is text else redacted.encode("utf-8")
     if isinstance(value, str):
+        if value.lstrip().startswith(("{", "[", '"')):
+            try:
+                decoded = json.loads(value)
+            except ValueError:
+                pass
+            else:
+                redacted = _redact_value(decoded, patterns)
+                if redacted is not decoded:
+                    return json.dumps(redacted, ensure_ascii=False)
+                return value
         redacted = _redact_text(value, patterns)
         return value if redacted == value else redacted
-    if isinstance(value, (list, tuple)) and any(isinstance(v, str) for v in value):
-        items = [
-            _redact_text(v, patterns) if isinstance(v, str) else v for v in value
-        ]
-        return value if list(value) == items else tuple(items)
+    if isinstance(value, Mapping):
+        items = {
+            _redact_text(key, patterns): _redact_value(item, patterns)
+            for key, item in value.items()
+        }
+        return value if items == value else items
+    if isinstance(value, (list, tuple)):
+        items = tuple(_redact_value(item, patterns) for item in value)
+        return value if all(a is b for a, b in zip(value, items)) else items
     return value
 
 
@@ -293,7 +331,7 @@ def redact_attributes(
 
 
 def _mask_otel_spans(*, params: Any) -> Any:
-    """Langfuse ``mask_otel_spans`` hook: redact span attributes on export.
+    """Redact span attributes before media extraction and export.
 
     Runs on the span processor's export thread for every batch this client
     sends. If it raises, Langfuse drops the whole batch, so a bug here
@@ -313,6 +351,32 @@ def _mask_otel_spans(*, params: Any) -> Any:
     if not patches:
         return None
     return MaskOtelSpansResult(span_patches=patches)
+
+
+def _install_redaction(client: Any) -> None:
+    """Install masking ahead of the client's media-processing exporter.
+
+    Requires the Langfuse 4.17 / OpenTelemetry 1.45 exporter layout. The
+    client's span filter stays closed until this setup succeeds.
+    """
+    from langfuse._client.span_exporter import LangfuseTransformingSpanExporter
+    from langfuse._client.span_processor import LangfuseSpanProcessor
+
+    resources = client._resources
+    processors = resources.tracer_provider._active_span_processor._span_processors
+    matching = [
+        processor for processor in processors
+        if isinstance(processor, LangfuseSpanProcessor)
+        and processor.public_key == resources.public_key
+    ]
+    if len(matching) != 1:
+        raise RuntimeError("Expected one Langfuse span processor")
+    batch = matching[0]._batch_processor
+    batch._exporter = LangfuseTransformingSpanExporter(
+        exporter=batch._exporter,
+        media_manager=None,
+        mask_otel_spans=_mask_otel_spans,
+    )
 
 
 @contextmanager

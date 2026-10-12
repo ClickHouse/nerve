@@ -91,11 +91,19 @@ keys, Langfuse keys, and bcrypt hashes. Add more for any project-specific
 secret formats you don't want to leave the host. An explicit empty list
 (`redact_patterns: []`) turns redaction off.
 
-Nerve applies the patterns to the string attributes of every span before
-it leaves the process: prompts, completions, tool inputs and outputs,
-tags and metadata. It uses the Langfuse SDK's `mask_otel_spans` export
-hook, so spans from every instrumentation are covered. Span names and
-span events (for example exception messages) are not redacted.
+Nerve applies the patterns to text in the attributes of every exported
+span: prompts, completions, tool inputs and outputs, tags and metadata.
+This includes UTF-8 bytes and nested mappings and sequences. JSON is
+decoded before matching patterns against its text. Bytes that are not
+valid UTF-8 are replaced with `[REDACTED]`.
+
+Masking runs before the Langfuse SDK extracts media for upload. A matching
+data URI is redacted before it can enter the upload queue. This uses the
+exporter layout of Langfuse 4.17 and OpenTelemetry 1.45; if masking cannot
+be installed, tracing stays off. If masking raises, the batch is dropped
+before media processing or export. Span names and span events (for
+example exception messages) are not redacted. Patterns do not inspect the
+contents of encoded images or other media.
 
 ## Privacy note
 

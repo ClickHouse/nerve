@@ -10,9 +10,12 @@ belongs to the SDK.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import re
 import sys
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -113,6 +116,10 @@ def _install_fake_langfuse(monkeypatch, *, auth_ok: bool = True):
 
     fake_lf = MagicMock()
     fake_lf.Langfuse = MagicMock(return_value=fake_client)
+    fake_filter = MagicMock()
+    fake_filter.is_default_export_span.return_value = True
+    fake_install = MagicMock()
+    monkeypatch.setattr(lf, "_install_redaction", fake_install)
     # propagate_attributes returns a context manager — use MagicMock's
     # __enter__/__exit__ defaults.
     fake_lf.propagate_attributes = MagicMock(return_value=MagicMock(
@@ -130,6 +137,7 @@ def _install_fake_langfuse(monkeypatch, *, auth_ok: bool = True):
     fake_anthropic_instr.AnthropicInstrumentor = fake_instrumentor_cls
 
     monkeypatch.setitem(sys.modules, "langfuse", fake_lf)
+    monkeypatch.setitem(sys.modules, "langfuse._client.span_filter", fake_filter)
     monkeypatch.setitem(sys.modules, "langsmith", MagicMock())
     monkeypatch.setitem(sys.modules, "langsmith.integrations", MagicMock())
     monkeypatch.setitem(
@@ -145,6 +153,8 @@ def _install_fake_langfuse(monkeypatch, *, auth_ok: bool = True):
     return SimpleNamespace(
         client=fake_client,
         constructor=fake_lf.Langfuse,
+        install=fake_install,
+        span_filter=fake_filter.is_default_export_span,
         configure=fake_configure,
         instrumentor_inst=fake_instrumentor_inst,
         instrumentor_cls=fake_instrumentor_cls,
@@ -162,13 +172,16 @@ def test_init_with_keys_passes_keys_to_client_and_calls_instrumentors(monkeypatc
     assert lf.init_langfuse(cfg) is True
     assert lf.is_enabled() is True
 
-    # The keys go to the client constructor, with the redaction hook.
+    # The keys go to the client constructor.
     fakes.constructor.assert_called_once()
     kwargs = fakes.constructor.call_args.kwargs
     assert kwargs["public_key"] == "pk-lf-test"
     assert kwargs["secret_key"] == "sk-lf-test"
     assert kwargs["base_url"] == "https://cloud.langfuse.com"
-    assert kwargs["mask_otel_spans"] is lf._mask_otel_spans
+    fakes.install.assert_called_once_with(fakes.client)
+    assert kwargs["should_export_span"](object()) is True
+    fakes.span_filter.return_value = False
+    assert kwargs["should_export_span"](object()) is False
 
     # LangSmith flags are set; they hold no credentials.
     assert os.environ["LANGSMITH_OTEL_ENABLED"] == "true"
@@ -259,6 +272,21 @@ def test_init_disabled_when_client_constructor_raises(monkeypatch):
     assert lf.init_langfuse(cfg) is False
     assert lf.is_enabled() is False
     fakes.configure.assert_not_called()
+
+
+def test_init_keeps_export_closed_when_redaction_setup_fails(monkeypatch):
+    fakes = _install_fake_langfuse(monkeypatch)
+
+    def fail_install(client):
+        assert fakes.constructor.call_args.kwargs["should_export_span"](object()) is False
+        raise AttributeError("unsupported exporter layout")
+
+    fakes.install.side_effect = fail_install
+    assert lf.init_langfuse(_config_with(public_key="pk-test", secret_key="sk-test")) is False
+    assert fakes.constructor.call_args.kwargs["should_export_span"](object()) is False
+    fakes.client.shutdown.assert_called_once()
+    fakes.configure.assert_not_called()
+    fakes.instrumentor_cls.assert_not_called()
 
 
 def test_init_continues_when_anthropic_instrumentor_fails(monkeypatch):
@@ -441,6 +469,41 @@ def test_redact_attributes_without_patterns_changes_nothing():
     assert lf.redact_attributes({"a": _FAKE_ANTHROPIC_KEY}, []) == {}
 
 
+def test_redact_attributes_handles_nested_values_and_bytes():
+    value = {
+        "nested": [{"token": _FAKE_ANTHROPIC_KEY.encode(), "count": 12}],
+        "binary": b"\xff" + _FAKE_ANTHROPIC_KEY.encode(),
+        "flags": (True, False),
+    }
+    changed = lf.redact_attributes({"input": value}, _default_patterns())
+    assert changed == {"input": {
+        "nested": ({"token": b"[REDACTED]", "count": 12},),
+        "binary": b"[REDACTED]",
+        "flags": (True, False),
+    }}
+    assert value["nested"][0]["token"] == _FAKE_ANTHROPIC_KEY.encode()
+
+
+@pytest.mark.parametrize("as_bytes", [False, True])
+def test_redact_attributes_decodes_json_text(as_bytes):
+    value = json.dumps({"input": "private-π-token line1\nline2"})
+    if as_bytes:
+        value = value.encode()
+    patterns = lf._compile_patterns(["private-π-token", "line1\nline2"])
+    changed = lf.redact_attributes({"input": value}, patterns)
+    assert json.loads(changed["input"]) == {"input": "[REDACTED] [REDACTED]"}
+    assert isinstance(changed["input"], type(value))
+
+
+def test_redact_attributes_preserves_unmatched_values():
+    attributes = {
+        "json": b'{"input": "plain text"}',
+        "nested": {"items": ("plain text", 1, None)},
+        "invalid_json": '{"input":',
+    }
+    assert lf.redact_attributes(attributes, _default_patterns()) == {}
+
+
 def test_mask_hook_patches_only_spans_with_secrets():
     types = pytest.importorskip("langfuse.types", reason="langfuse not installed")
     lf._redact_patterns = _default_patterns()
@@ -527,13 +590,15 @@ def test_real_pipeline_redacts_spans_and_keeps_usage_rewrite():
         secret_key="sk-test",
         base_url="http://localhost:9",
         span_exporter=delegate,
-        mask_otel_spans=lf._mask_otel_spans,
     )
     provider = TracerProvider()
     provider.add_span_processor(processor)
-    client = SimpleNamespace(_resources=SimpleNamespace(tracer_provider=provider))
+    client = SimpleNamespace(_resources=SimpleNamespace(
+        tracer_provider=provider, public_key="pk-test",
+    ))
 
     try:
+        lf._install_redaction(client)
         assert install_usage_rewriter(client) is True
         tracer = provider.get_tracer("langsmith")
         with tracer.start_as_current_span("claude.assistant.turn") as span:
@@ -560,6 +625,114 @@ def test_real_pipeline_redacts_spans_and_keeps_usage_rewrite():
         )
     finally:
         provider.shutdown()
+
+
+@pytest.fixture
+def real_export_pipeline():
+    from langfuse._client.span_processor import LangfuseSpanProcessor
+    from langfuse._task_manager.media_manager import MediaManager
+    from opentelemetry.sdk.trace import TracerProvider
+
+    uploads = Queue()
+    media = MediaManager(
+        api_client=MagicMock(), httpx_client=MagicMock(), media_upload_queue=uploads,
+    )
+    delegate = _RecordingExporter()
+    processor = LangfuseSpanProcessor(
+        public_key="pk-test", secret_key="sk-test", base_url="http://localhost:9",
+        span_exporter=delegate, media_manager=media,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    client = SimpleNamespace(_resources=SimpleNamespace(
+        tracer_provider=provider, public_key="pk-test",
+    ))
+    lf._install_redaction(client)
+    try:
+        yield provider, delegate, uploads
+    finally:
+        provider.shutdown()
+
+
+def test_langsmith_byte_payloads_are_redacted_on_export(real_export_pipeline):
+    from langsmith import Client, traceable, tracing_context
+    from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+
+    provider, delegate, _ = real_export_pipeline
+    lf._redact_patterns = _default_patterns()
+    client = Client(tracing_mode="otel", otel_tracer_provider=provider)
+
+    @traceable(run_type="tool", client=client)
+    def sample_tool(text):
+        return text
+
+    try:
+        with tracing_context(enabled=True):
+            sample_tool(_FAKE_ANTHROPIC_KEY)
+        client.flush()
+        provider.force_flush()
+        exported = [span for batch in delegate.batches for span in batch]
+        assert len(exported) == 1
+        assert json.loads(exported[0].attributes["gen_ai.prompt"]) == {"text": "[REDACTED]"}
+        assert json.loads(exported[0].attributes["gen_ai.completion"]) == {"output": "[REDACTED]"}
+        assert _FAKE_ANTHROPIC_KEY.encode() not in encode_spans(exported).SerializeToString()
+    finally:
+        client.close()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_json_text_is_redacted_on_export(real_export_pipeline):
+    from opentelemetry.instrumentation.anthropic.span_utils import aset_input_attributes
+
+    provider, delegate, _ = real_export_pipeline
+    lf._redact_patterns = lf._compile_patterns(["private-π-token", "line1\nline2"])
+    tracer = provider.get_tracer("opentelemetry.instrumentation.anthropic")
+    with tracer.start_as_current_span("anthropic.chat") as span:
+        await aset_input_attributes(span, {
+            "messages": [{"role": "user", "content": "private-π-token line1\nline2"}],
+        })
+    provider.force_flush()
+    exported = [span for batch in delegate.batches for span in batch]
+    assert len(exported) == 1
+    messages = json.loads(exported[0].attributes["gen_ai.input.messages"])
+    assert messages[0]["parts"][0]["content"] == "[REDACTED] [REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("patterns", [[], [r"(?s).+"]])
+async def test_media_queue_obeys_redaction(real_export_pipeline, patterns):
+    from opentelemetry.instrumentation.anthropic.span_utils import aset_input_attributes
+
+    provider, delegate, uploads = real_export_pipeline
+    lf._redact_patterns = lf._compile_patterns(patterns)
+    content = "data:text/plain;base64," + base64.b64encode(b"private content").decode()
+    tracer = provider.get_tracer("opentelemetry.instrumentation.anthropic")
+    with tracer.start_as_current_span("anthropic.chat") as span:
+        await aset_input_attributes(span, {
+            "messages": [{"role": "user", "content": content}],
+        })
+    provider.force_flush()
+    exported = [span for batch in delegate.batches for span in batch]
+    assert len(exported) == 1
+    if patterns:
+        assert uploads.empty()
+        assert "[REDACTED]" in exported[0].attributes["gen_ai.input.messages"]
+        assert content not in exported[0].attributes["gen_ai.input.messages"]
+    else:
+        assert uploads.get_nowait()["content_bytes"] == b"private content"
+        assert "@@@langfuseMedia:" in exported[0].attributes["gen_ai.input.messages"]
+
+
+def test_masking_failure_drops_batch_before_media_extraction(real_export_pipeline, monkeypatch):
+    provider, delegate, uploads = real_export_pipeline
+    lf._redact_patterns = _default_patterns()
+    monkeypatch.setattr(lf, "redact_attributes", MagicMock(side_effect=RuntimeError("test")))
+    tracer = provider.get_tracer("langsmith")
+    with tracer.start_as_current_span("media") as span:
+        span.set_attribute("input", "data:text/plain;base64,cHJpdmF0ZQ==")
+    provider.force_flush()
+    assert delegate.batches == []
+    assert uploads.empty()
 
 
 # ---------------------------------------------------------------------------
