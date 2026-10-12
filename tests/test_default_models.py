@@ -19,6 +19,7 @@ from nerve import config as config_module
 from nerve.config import (
     DEFAULT_CLAUDE_MODELS,
     DEFAULT_CRON_MODEL,
+    DEFAULT_EFFORT,
     DEFAULT_FALLBACK_MODEL,
     DEFAULT_FAST_MODEL,
     DEFAULT_MEMORIZE_MODEL,
@@ -67,6 +68,9 @@ def test_the_constants_agree_with_each_other():
     assert AgentConfig().model == AgentConfig.from_dict({}).model == DEFAULT_MODEL
     assert AgentConfig().cron_model == AgentConfig.from_dict({}).cron_model == DEFAULT_CRON_MODEL
     assert AgentConfig().title_model == AgentConfig.from_dict({}).title_model == DEFAULT_TITLE_MODEL
+    # The reasoning effort travels with the models: one constant, declared and parsed alike.
+    assert DEFAULT_EFFORT == "xhigh"
+    assert AgentConfig().effort == AgentConfig.from_dict({}).effort == DEFAULT_EFFORT
     memory = MemoryConfig.from_dict({})
     assert (memory.recall_model, memory.memorize_model, memory.fast_model) == (
         DEFAULT_RECALL_MODEL, DEFAULT_MEMORIZE_MODEL, DEFAULT_FAST_MODEL,
@@ -82,7 +86,8 @@ def test_the_constants_block_sits_at_the_top_of_config_py():
     first_def = text.index("\ndef ")
     for name in (
         "DEFAULT_MODEL", "DEFAULT_CRON_MODEL", "DEFAULT_TITLE_MODEL", "DEFAULT_RECALL_MODEL",
-        "DEFAULT_MEMORIZE_MODEL", "DEFAULT_FAST_MODEL", "DEFAULT_FALLBACK_MODEL", "DEFAULT_CLAUDE_MODELS",
+        "DEFAULT_MEMORIZE_MODEL", "DEFAULT_FAST_MODEL", "DEFAULT_FALLBACK_MODEL", "DEFAULT_EFFORT",
+        "DEFAULT_CLAUDE_MODELS",
     ):
         assignments = re.findall(rf"^{name}\b[^=\n]*=", text, flags=re.MULTILINE)
         assert len(assignments) == 1, (name, assignments)
@@ -96,7 +101,7 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     _machine, portable, _shadowed = build_config_layers(SetupChoices())
     assert portable["agent"] == {
         "model": DEFAULT_MODEL, "cron_model": DEFAULT_CRON_MODEL,
-        "max_turns": 50, "max_concurrent": 32, "thinking": "max", "effort": "max", "context_1m": True,
+        "max_turns": 50, "max_concurrent": 32, "thinking": "max", "effort": DEFAULT_EFFORT, "context_1m": True,
     }
     assert (portable["memory"]["recall_model"], portable["memory"]["memorize_model"],
             portable["memory"]["fast_model"]) == (DEFAULT_RECALL_MODEL, DEFAULT_MEMORIZE_MODEL, DEFAULT_FAST_MODEL)
@@ -140,6 +145,7 @@ def test_the_examples_and_templates_carry_the_default():
             (ROOT / "tests" / "fixtures" / "setup_writer" / golden / "settings.yaml.golden").read_text(encoding="utf-8"),
         )
         assert data["agent"]["model"] == DEFAULT_MODEL, golden
+        assert data["agent"]["effort"] == DEFAULT_EFFORT, golden
     worker = yaml.safe_load(
         (ROOT / "tests" / "fixtures" / "setup_writer" / "worker" / "settings.yaml.golden").read_text(encoding="utf-8"),
     )

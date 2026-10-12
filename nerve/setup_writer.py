@@ -55,6 +55,7 @@ import yaml
 from nerve import paths
 from nerve.config import (
     DEFAULT_CRON_MODEL,
+    DEFAULT_EFFORT,
     DEFAULT_FAST_MODEL,
     DEFAULT_MEMORIZE_MODEL,
     DEFAULT_MODEL,
@@ -554,7 +555,7 @@ def build_config_layers(
             "max_turns": 50,
             "max_concurrent": 32,
             "thinking": "max",
-            "effort": "max",
+            "effort": DEFAULT_EFFORT,
             "context_1m": True,
         },
         # Personal 02:00–08:00 and worker none unless stated otherwise; an

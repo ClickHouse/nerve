@@ -17,7 +17,7 @@ agent:
   max_turns: 50
   max_concurrent: 32
   thinking: max
-  effort: max
+  effort: xhigh
   context_1m: true
 quiet_start: 02:00
 quiet_end: 08:00

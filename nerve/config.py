@@ -40,6 +40,7 @@ DEFAULT_RECALL_MODEL = "claude-sonnet-4-6"      # memory.recall_model
 DEFAULT_MEMORIZE_MODEL = "claude-sonnet-4-6"    # memory.memorize_model
 DEFAULT_FAST_MODEL = "claude-haiku-4-5-20251001"   # memory.fast_model
 DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
 
 # Fallback for the composer's Claude model picker when ``agent.models`` is
 # unset and live discovery is off or unavailable (see nerve/models_catalog.py)
@@ -949,7 +950,7 @@ class AgentConfig:
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
-    effort: str = "max"         # max, xhigh, high, medium, low
+    effort: str = DEFAULT_EFFORT  # max, xhigh, high, medium, low
     # Effort for cron- and hook-sourced turns (sensing / triage work). These
     # fire far more often than interactive sessions and rarely need Opus-tier
     # deliberation, so they default lower than `effort` above to cut token
@@ -1052,7 +1053,7 @@ class AgentConfig:
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
-            effort=str(d.get("effort", "max")),
+            effort=str(d.get("effort", DEFAULT_EFFORT)),
             cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=_str_list(
@@ -3418,8 +3419,12 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        # The key the checks accept (config, else the environment). An explicit
+        # ``api_key`` — ``""`` included — stops the SDK from reading the
+        # environment itself, so the environment-only install the checks call
+        # "configured" would otherwise send an empty key and get a 401.
         return anthropic.Anthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),
             base_url=base_url,
             timeout=timeout,
         )
@@ -3448,7 +3453,7 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         return anthropic.AsyncAnthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
             timeout=timeout,
         )

@@ -26,7 +26,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -688,7 +688,7 @@ class TestProviderKinds:
                 "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": False,
             }
             assert [m["family"] for m in body["models"]] == ["opus", "haiku", "sonnet", "fable", "opus"]
-            assert body["current"] == {"model": DEFAULT_MODEL, "effort": "max"}
+            assert body["current"] == {"model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT}
             assert body["default_model"] == DEFAULT_MODEL == "claude-opus-5-5"
             assert body["efforts"] == ["max", "xhigh", "high", "medium", "low"]
             assert body["discovered"] is True
