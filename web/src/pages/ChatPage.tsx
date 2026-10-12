@@ -22,6 +22,7 @@ import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
+import { langfuseSessionUrl, type LangfuseLinkStatus } from '../utils/langfuseLinks';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
@@ -218,14 +219,19 @@ export function ChatPage() {
   }, [activeSession, activeSessionRow]);
 
   // Langfuse deep-link status — fetched once. Shows a small "external link"
-  // icon when observability is enabled so we can jump from a session to
-  // its trace in Langfuse.
-  const [langfuse, setLangfuse] = useState<{ host: string | null; enabled: boolean } | null>(null);
+  // icon when observability is enabled and the project is known, so we can
+  // jump from a session to its traces in Langfuse.
+  const [langfuse, setLangfuse] = useState<LangfuseLinkStatus | null>(null);
   useEffect(() => {
     api.getObservabilityStatus()
-      .then(s => setLangfuse({ host: s.langfuse.host, enabled: s.langfuse.enabled }))
-      .catch(() => setLangfuse({ host: null, enabled: false }));
+      .then(s => setLangfuse({
+        host: s.langfuse.host,
+        enabled: s.langfuse.enabled,
+        project_id: s.langfuse.project_id ?? null,
+      }))
+      .catch(() => setLangfuse(null));
   }, []);
+  const langfuseUrl = langfuseSessionUrl(langfuse, activeSession);
 
   useEffect(() => {
     loadSessions().then(() => {
@@ -415,9 +421,9 @@ export function ChatPage() {
                   <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
                 </div>
               )}
-              {langfuse?.enabled && langfuse.host && activeSession && (
+              {langfuseUrl && (
                 <a
-                  href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
+                  href={langfuseUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-xs text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"

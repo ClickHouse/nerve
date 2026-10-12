@@ -6,6 +6,7 @@ import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 import { StatusBadge } from '../components/Cron/controls';
 import { totalInputTokens, type UsageTokens } from '../utils/usageTokens';
+import { langfuseProjectUrl } from '../utils/langfuseLinks';
 
 const INPUT_HEADER_TITLE = 'Uncached input + cache reads + cache writes';
 
@@ -135,7 +136,7 @@ export function DiagnosticsPage() {
             </span>
             {data.langfuse.host && (
               <a
-                href={data.langfuse.host}
+                href={langfuseProjectUrl(data.langfuse) ?? data.langfuse.host}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-text-faint hover:text-text-secondary underline-offset-2 hover:underline"
