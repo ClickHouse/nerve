@@ -28,9 +28,9 @@ const { useAuthStore } = await import('./authStore');
 const { selectViewerStorage } = await import('./helpers/viewerStorage');
 const {
   RECONNECT_INTERVAL_MS, RECONNECT_TIMEOUT_MS, fieldErrorOf, providerConfigured,
-  setupIsUnfinished, stepById, stepsLeft, useSetupStore,
+  setupIsUnfinished, setupNotStarted, stepById, stepsLeft, useSetupStore,
 } = await import('./setupStore');
-const { makeState, step, withStep } = await import('../test/setupFixtures');
+const { makeFreshState, makeState, step, withStep } = await import('../test/setupFixtures');
 
 type Mock = ReturnType<typeof vi.fn>;
 const setupState = api.setupState as unknown as Mock;
@@ -351,6 +351,25 @@ describe('selectors and helpers', () => {
     expect(providerConfigured(useSetupStore.getState())).toBe(false);
     useSetupStore.setState({ state: withStep(makeState(), step('provider', { status: 'done' })) });
     expect(providerConfigured(useSetupStore.getState())).toBe(true);
+  });
+
+  it('reads "not started" only while Mode is pending on an unfinished checklist', () => {
+    expect(setupNotStarted(useSetupStore.getState())).toBe(false);   // unknown
+    useSetupStore.setState({ state: makeFreshState() });
+    expect(setupNotStarted(useSetupStore.getState())).toBe(true);
+    // Mode chosen with steps left is the banner's case; finished is nobody's.
+    useSetupStore.setState({ state: makeState() });
+    expect(setupNotStarted(useSetupStore.getState())).toBe(false);
+    useSetupStore.setState({ state: makeState({ finished: true, steps_left: 0 }) });
+    expect(setupNotStarted(useSetupStore.getState())).toBe(false);
+    // Under lockdown nothing on the page can answer Mode, so it is not "never set up".
+    useSetupStore.setState({
+      state: withStep(makeFreshState({ lockdown: true }), step('mode', {
+        status: 'blocked', blocked_kind: 'lockdown',
+        blocked_reason: 'Configuration is managed from the config repository on this instance.',
+      })),
+    });
+    expect(setupNotStarted(useSetupStore.getState())).toBe(false);
   });
 
   it('parses a field error and nothing else', () => {

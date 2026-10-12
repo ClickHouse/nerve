@@ -103,14 +103,40 @@ export function makeState(overrides: Partial<SetupState> = {}): SetupState {
   };
 }
 
+/** The sentence the server puts on a step that waits for the Mode step. */
+export const WAITS_FOR_MODE = 'Choose a mode first — the files this step fills in depend on it';
+
+/**
+ * Personal, local, straight after the claim — an instance that has never
+ * chosen a mode. The steps whose files depend on the mode wait for it
+ * (blocked by sequencing), and the server counts them as left to do.
+ */
+export function makeFreshState(overrides: Partial<SetupState> = {}): SetupState {
+  const waiting = (id: SetupStepId) => step(id, {
+    status: 'blocked', read_only: true, blocked_reason: WAITS_FOR_MODE, blocked_kind: 'sequencing',
+  });
+  const steps: SetupStep[] = [
+    step('claim', { status: 'done', summary: 'alice · password set' }),
+    step('mode', {}, { mode: null, templates_present: [] }),
+    step('provider'),
+    waiting('profile'),
+    step('memory'),
+    step('channels'),
+    waiting('sources'),
+    waiting('automation'),
+    waiting('agents'),
+  ];
+  return makeState({ mode: null, steps, steps_left: 8, ...overrides });
+}
+
 /** The same instance behind a front gateway: no claim step, external actor. */
-export function makeExternalState(overrides: Partial<SetupState> = {}): SetupState {
-  const base = makeState();
+export function makeExternalState(overrides: Partial<SetupState> = {}, base: SetupState = makeState()): SetupState {
   return makeState({
+    ...base,
     auth_mode: 'external',
     steps: base.steps.filter((s) => s.id !== 'claim').map((s) => (
       s.id === 'profile'
-        ? step('profile', {}, { name: 'Alice Example', name_source: 'actor_header', display_name_editable: false })
+        ? step('profile', s, { name: 'Alice Example', name_source: 'actor_header', display_name_editable: false })
         : s
     )),
     ...overrides,

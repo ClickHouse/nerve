@@ -281,11 +281,15 @@ reasons are listed before you click. Then:
 
 ### Coming back later
 
-The wizard is re-enterable. **Setup** sits in the navigation; while steps are
-left, a dismissible banner reads "Finish setting up Nerve — N steps left"
-(or "Restart Nerve to apply your setup" when only the restart is left). The
-count includes the steps that are waiting for the Mode step, so it only ever
-goes down; steps a lockdown makes read-only are never counted. The
+The wizard is re-enterable. **Setup** sits in the navigation. An instance
+that has never chosen a mode opens on the setup page: whoever signs in lands
+on `/setup` once per visit (a link straight into the wizard is left where it
+points) and is free to go anywhere else from there. A partially set-up
+instance — Mode chosen, steps left — opens as usual, with a dismissible
+banner that reads "Finish setting up Nerve — N steps left" (or "Restart
+Nerve to apply your setup" when only the restart is left). The count
+includes the steps that are waiting for the Mode step, so it only ever goes
+down; steps a lockdown makes read-only are never counted. The
 chat page's empty state points at the Model step until a provider is
 configured. On the Overview every done step has a **Change** link; a skipped
 step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
@@ -626,7 +630,9 @@ the setup page works the same way with these differences:
   and reconnects through the gateway's own sign-in; no login form can appear.
   The wait is time-boxed with a clear message and a retry.
 - The **Setup** entry and the "Finish setting up" banner render in this mode
-  too.
+  too, and so does the landing: an instance that has never chosen a mode
+  opens on the setup page once the gateway has signed the person in; a
+  partially set-up one shows the banner.
 
 ## Lockdown
 

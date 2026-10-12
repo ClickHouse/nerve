@@ -136,6 +136,17 @@ export function setupIsUnfinished(s: SetupStoreState): boolean {
   return s.state !== null && !s.state.finished;
 }
 
+/**
+ * Whether the instance has never been set up: the checklist is unfinished
+ * and the Mode step, where the wizard starts, is still pending. Unknown is
+ * not "never set up", nor is a Mode step a lockdown has blocked — nothing on
+ * the page can answer that one. A partly set-up instance (Mode chosen,
+ * steps left) is the banner's case, not this one.
+ */
+export function setupNotStarted(s: SetupStoreState): boolean {
+  return setupIsUnfinished(s) && stepById(s, 'mode')?.status === 'pending';
+}
+
 export function stepsLeft(s: SetupStoreState): number {
   return s.state?.steps_left ?? 0;
 }

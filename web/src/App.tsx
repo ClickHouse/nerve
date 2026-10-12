@@ -34,6 +34,7 @@ import { AccountsPage } from './pages/AccountsPage';
 import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { SetupBanner } from './components/Setup/SetupBanner';
+import { SetupLanding } from './components/Setup/SetupLanding';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { useSetupStore } from './stores/setupStore';
 
@@ -60,9 +61,9 @@ function App() {
     ws.connect();
     const unsub = ws.onMessage(handleWSMessage);
     loadSessions();
-    // The setup checklist drives the nav entry and the finish-setup banner;
-    // one read per app session, in both auth modes. Silent on an older
-    // backend without it.
+    // The setup checklist drives the nav entry, the finish-setup banner and
+    // the landing on an instance that has never been set up; one read per
+    // app session, in both auth modes. Silent on an older backend without it.
     void useSetupStore.getState().load();
     return () => { unsub(); ws.disconnect(); };
   }, [live]);
@@ -145,6 +146,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <SetupLanding />
       <SetupBanner />
       <ShortcutsModal />
     </>
