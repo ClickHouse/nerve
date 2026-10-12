@@ -59,12 +59,11 @@ class TestTheSetting:
             NerveConfig.from_dict({"setup": {"local_secrets": value}})
         assert "setup.local_secrets must be true or false" in str(ei.value)
 
-    def test_a_bare_key_is_refused_not_read_as_allowed(self):
-        """``local_secrets:`` with no value: unlike ``lockdown:``, where a bare
-        key is the restrictive default, here it would be the permissive one."""
-        with pytest.raises(ConfigError) as ei:
-            NerveConfig.from_dict({"setup": {"local_secrets": None}})
-        assert "setup.local_secrets must be true or false" in str(ei.value)
+    def test_a_bare_key_reads_as_off_not_as_allowed(self):
+        """``local_secrets:`` with no value is "off", as a bare key is for every
+        boolean here — never "use the default", which would be the permissive
+        position for this one."""
+        assert NerveConfig.from_dict({"setup": {"local_secrets": None}}).setup.local_secrets is False
 
     def test_a_bare_section_is_the_default(self):
         assert NerveConfig.from_dict({"setup": None}).setup.local_secrets is True
@@ -76,12 +75,18 @@ class TestTheTrackedFileValue:
     a typo in the one key that decides whether the page stores credentials
     stops the load rather than quietly reading as "allowed"."""
 
-    @pytest.mark.parametrize("text", ["flase", "ture", "maybe", '"maybe"', "off,", "null", "~", "", '""'])
+    @pytest.mark.parametrize("text", ["flase", "ture", "maybe", '"maybe"', "off,", '""', "' '"])
     def test_an_unreadable_value_is_refused(self, tmp_path, text):
         config_dir = _install(tmp_path, settings=f"setup:\n  local_secrets: {text}\n")
         with pytest.raises(ConfigError) as ei:
             load_config(config_dir)
         assert "setup.local_secrets must be true or false" in str(ei.value)
+
+    @pytest.mark.parametrize("text", ["", "null", "~"])
+    def test_a_bare_key_or_null_reads_as_off(self, tmp_path, text):
+        """Fails closed without stopping the load: the page stores nothing."""
+        config_dir = _install(tmp_path, settings=f"setup:\n  local_secrets: {text}\n")
+        assert load_config(config_dir).setup.local_secrets is False
 
     @pytest.mark.parametrize(
         "text, expected",

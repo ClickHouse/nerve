@@ -656,9 +656,12 @@ setup:
 
 or `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment. The variable
 works like `NERVE_LOCKDOWN`, one way only: it can turn the storage off over a
-file that allows it, never back on over a file that forbids it. The setting is
-read on every request, so a reload applies it. The wizard then says so instead
-of offering the fields:
+file that allows it, never back on over a file that forbids it. The value must
+be `true` or `false`: anything else (a typo, a `${VAR}` that resolves to
+something else) stops the configuration from loading, as it does for
+`lockdown`, and a bare `local_secrets:` reads as `false`. The setting is read
+on every request, so a reload applies it. The wizard then says so instead of
+offering the fields:
 
 - **Memory**, **Sources** and **Agents** read "Not available on this
   instance", with the reason: *This instance does not store credentials

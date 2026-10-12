@@ -676,10 +676,17 @@ def _as_local_secrets(value: Any) -> bool:
     signal, and the first person through the page would store the keys the
     setting exists to keep away. So the key is read the way ``lockdown`` is:
     real booleans and the documented spellings pass, anything else is a hard
-    :class:`ConfigError`. Unlike ``lockdown``, a bare key (``local_secrets:``)
-    is refused too: there the bare key is the restrictive default, here it
-    would be the permissive one, and a value that says nothing must not
-    grant it.
+    :class:`ConfigError`.
+
+    A bare key (``local_secrets:``, YAML ``null``) is ``False`` — the rule
+    every boolean in this module follows (see :func:`nerve.coerce.as_bool`):
+    a key written with no value is "off", never "use the default", because
+    here the default is the permissive position and a value that says
+    nothing must not grant it. That is also what ``lockdown`` does with its
+    bare key — read it as the restrictive position — which for that flag
+    happens to be its default. An *empty string* is not a bare key: it comes
+    from a ``${VAR}`` that is set to nothing, and is refused like ``lockdown``
+    refuses it.
 
     By the time this runs the ``${VAR}`` pass is over, so a reference that
     did not resolve has already been refused by name; what reaches here is
@@ -687,6 +694,8 @@ def _as_local_secrets(value: Any) -> bool:
     """
     if isinstance(value, bool):
         return value
+    if value is None:
+        return False
     if isinstance(value, str):
         text = value.strip().lower()
         if text in TRUTHY:
@@ -695,11 +704,10 @@ def _as_local_secrets(value: Any) -> bool:
             return False
     raise ConfigError(
         f"setup.local_secrets must be true or false, got {value!r}. Accepted "
-        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); a "
-        f"bare key or an empty value is not one of them. Refused rather than "
-        f"assumed, because assuming would mean assuming 'true' — letting the "
-        f"setup page store on this instance the credentials the setting exists "
-        f"to keep off it."
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); an "
+        f"empty value is not one of them. Refused rather than assumed, because "
+        f"assuming would mean assuming 'true' — letting the setup page store on "
+        f"this instance the credentials the setting exists to keep off it."
     )
 
 
