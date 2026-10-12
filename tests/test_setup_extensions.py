@@ -107,6 +107,7 @@ def _backend(*, api_key: str = "", oauth: str = ""):
             aws_access_key_id="", aws_secret_access_key="",
         ),
         proxy=SimpleNamespace(enabled=False, host="", port=0),
+        anthropic_base_url="",
         effective_api_key=api_key,
         claude_oauth_token=oauth,
         agent=SimpleNamespace(model_aliases={}, agent_teams=False),

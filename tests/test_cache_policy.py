@@ -176,6 +176,7 @@ def _make_env_backend(
             aws_access_key_id="", aws_secret_access_key="",
         ),
         proxy=SimpleNamespace(enabled=False, host="", port=0),
+        anthropic_base_url="",
         effective_api_key="",
         agent=SimpleNamespace(
             model_aliases=aliases or {}, agent_teams=agent_teams,

@@ -723,9 +723,10 @@ class ClaudeBackend:
                 # A subscription token from `claude setup-token`: the CLI
                 # reads it from this variable. An API key wins when both exist.
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = config.claude_oauth_token
-            if config.proxy.enabled:
+            if config.proxy.enabled or config.anthropic_base_url:
+                # The endpoint of Nerve's own SDK clients. The CLI adds /v1.
                 env["ANTHROPIC_BASE_URL"] = (
-                    f"http://{config.proxy.host}:{config.proxy.port}"
+                    config.anthropic_api_base_url.removesuffix("/v1/")
                 )
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
