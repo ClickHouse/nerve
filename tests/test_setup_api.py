@@ -3226,3 +3226,159 @@ class TestManagedValues:
             assert refused.status_code == 409 and "channel gateway" in refused.json()["detail"]
         assert claimed.machine_yaml()["slack"] == {"enabled": False}
         assert "slack" not in claimed.local_yaml()
+
+
+# --------------------------------------------------------------------------- #
+#  Instances that keep no credentials on disk                                  #
+# --------------------------------------------------------------------------- #
+
+
+_NO_SECRETS = "This instance does not keep credentials on disk. Connections are provided by the operator of this deployment."
+
+
+def _keep_no_secrets(install: Install, **settings) -> None:
+    """``setup.local_secrets: false`` in the tracked settings, as an operator writes it."""
+    from nerve.setup_writer import merge_settings_paths
+
+    merge_settings_paths(install.workspace, {"setup.local_secrets": False, **settings})
+    config_reload.remember_startup_config(install.reload())
+
+
+@pytest.mark.asyncio
+class TestNoLocalSecrets:
+    async def test_the_state_names_the_policy_and_closes_the_steps(self, claimed):
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["local_secrets"] is False
+        assert state["lockdown"] is False and state["writable"] is True
+        s = statuses(state)
+        for step_id in ("memory", "channels", "sources", "agents"):
+            closed = step(state, step_id)
+            assert s[step_id] == "blocked", step_id
+            assert closed["blocked_kind"] == "policy" and closed["blocked_reason"] == _NO_SECRETS
+            assert closed["read_only"] is True
+        assert s["provider"] == "pending" and s["profile"] == "pending" and s["automation"] == "pending"
+        assert state["steps_left"] == 3
+
+    async def test_every_write_that_would_store_a_credential_is_refused(self, claimed, monkeypatch):
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+
+        async def _no_probe(*a, **k):
+            pytest.fail("a refused write must never reach a verification probe")
+
+        for name in ("telegram_get_me", "slack_test", "openai_test"):
+            monkeypatch.setattr(setup_checks, name, _no_probe)
+        async with claimed.client() as http:
+            for method, path, body in (
+                ("PUT", "/api/setup/memory", {"openai_api_key": _OPENAI}),
+                ("PUT", "/api/setup/memory", {"openai_api_key": None, "embeddings": False}),
+                ("PUT", "/api/setup/channels", {"telegram": {"bot_token": _TG_TOKEN}}),
+                ("PUT", "/api/setup/channels", {"telegram": {"allowed_users_add": [123456789]}}),
+                ("PUT", "/api/setup/channels", {"slack": {"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"}}),
+                ("PUT", "/api/setup/channels", {"slack": {"enabled": True}}),
+                ("PUT", "/api/setup/sources", {"github": True, "gmail": False, "telegram": False}),
+                ("PUT", "/api/setup/sources", {"telegram": True, "telegram_api_id": 1234567, "telegram_api_hash": "REPLACE_HASH_VALUE"}),
+                ("PUT", "/api/setup/agents", {"agents": []}),
+                ("PUT", "/api/setup/agents", {"agents": ["codex"]}),
+                ("POST", "/api/setup/memory/test", {"openai_api_key": _OPENAI}),
+                ("POST", "/api/setup/channels/telegram/test", {"bot_token": _TG_TOKEN}),
+                ("POST", "/api/setup/channels/slack/test", {"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"}),
+                ("POST", "/api/setup/channels/telegram/pairing", None),
+                ("POST", "/api/setup/sources/telegram/session/start", {"phone": "+15550100"}),
+                ("POST", "/api/setup/sources/telegram/session/logout", None),
+            ):
+                response = await http.request(method, path, json=body)
+                assert response.status_code == 409, (method, path, body, response.text)
+                assert response.json()["detail"] == _NO_SECRETS, (method, path, body)
+            pairing = (await http.get("/api/setup/channels/telegram/pairing")).json()
+            assert pairing["available"] is False and pairing["reason"] == _NO_SECRETS
+            # Runtime state and the steps the policy does not cover still work.
+            assert (await http.post("/api/setup/steps/memory/skip")).status_code == 200
+            assert (await http.put("/api/setup/automation", json={"crons": []})).status_code == 200
+            assert (await http.put("/api/setup/profile", json={"name": "Alice"})).status_code == 200
+            assert (await http.post("/api/setup/finish")).status_code == 200
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        assert "external_agents" not in claimed.machine_yaml()
+
+    async def test_the_model_step_refuses_a_pasted_credential_but_not_bedrock_or_the_picker(self, claimed, monkeypatch):
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        monkeypatch.setattr(
+            setup_checks, "host_login",
+            lambda *a, **k: pytest.fail("the server's own login must not be looked up"),
+        )
+        async with claimed.client() as http:
+            key = await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            assert key.status_code == 409 and key.json() == {"detail": _NO_SECRETS, "field": "anthropic_api_key"}
+            token = await http.put("/api/setup/provider", json={"type": "oauth", "claude_oauth_token": _OAUTH})
+            assert token.status_code == 409 and token.json() == {"detail": _NO_SECRETS, "field": "claude_oauth_token"}
+            copied = await http.put("/api/setup/provider", json={"type": "host_login"})
+            assert copied.status_code == 409 and copied.json()["detail"] == _NO_SECRETS
+            tested = await http.post("/api/setup/provider/test", json={"type": "host_login"})
+            assert tested.status_code == 409 and tested.json()["detail"] == _NO_SECRETS
+            found = (await http.get("/api/setup/provider/host-login")).json()
+            assert found["available"] is False and found["reason"] == _NO_SECRETS and found["lookup"] == "none"
+            # Bedrock stores no secret: it goes through, and the step is done.
+            bedrock = await http.put("/api/setup/provider", json={"type": "bedrock", "aws_region": "eu-central-1"})
+            assert bedrock.status_code == 200, bedrock.text
+            provider = step(bedrock.json(), "provider")
+            assert provider["status"] == "done" and provider["detail"]["credential"] == "bedrock"
+            picked = await http.put("/api/setup/provider", json={"effort": "low"})
+            assert picked.status_code == 200 and step(picked.json(), "provider")["detail"]["effort"] == "low"
+        local = claimed.local_yaml()
+        assert "anthropic_api_key" not in local and "claude_oauth_token" not in local
+
+    async def test_a_credential_from_the_environment_is_done_and_the_picker_stays_open(self, claimed, monkeypatch):
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            provider = step(state, "provider")
+            assert provider["status"] == "done" and provider["read_only"] is False
+            assert provider["detail"]["credential_source"] == "environment"
+            refused = await http.put("/api/setup/provider", json={"anthropic_api_key": "sk-ant-REPLACE1111111111"})
+            assert refused.status_code == 409 and refused.json()["field"] == "anthropic_api_key"
+            ok = await http.put("/api/setup/provider", json={"model": "claude-fable-5-1"})
+            assert ok.status_code == 200 and step(ok.json(), "provider")["detail"]["model"] == "claude-fable-5-1"
+        assert "anthropic_api_key" not in claimed.local_yaml()
+
+    async def test_hosted_slack_keeps_its_switch_and_nothing_else(self, claimed):
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{"slack.mode": "hosted"})
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            channels = step(state, "channels")
+            assert channels["status"] == "done" and channels["read_only"] is False
+            assert channels["detail"]["slack"]["bot_token"]["source"] == "gateway"
+            switched = await http.put("/api/setup/channels", json={"slack": {"enabled": False}})
+            assert switched.status_code == 200, switched.text
+            assert step(switched.json(), "channels")["detail"]["slack"]["enabled"] is False
+            for body in (
+                {"slack": {"enabled": True, "allow_direct_messages": True}},
+                {"slack": {"bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE"}},
+                {"telegram": {"bot_token": _TG_TOKEN}},
+                {"telegram": {"enabled": False}, "slack": {"enabled": True}},
+            ):
+                refused = await http.put("/api/setup/channels", json=body)
+                assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS, body
+        assert claimed.machine_yaml()["slack"] == {"enabled": False}
+        assert "slack" not in claimed.local_yaml() and "telegram" not in claimed.local_yaml()
+
+    async def test_an_instance_the_operator_provisioned_finishes(self, claimed, monkeypatch):
+        """Credential from the environment, Slack through the channel gateway,
+        nothing stored here: profile and automation answered, nothing left."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{"slack.mode": "hosted"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
+        async with claimed.client() as http:
+            assert (await http.put("/api/setup/profile", json={"name": "Alice"})).status_code == 200
+            assert (await http.put("/api/setup/automation", json={"crons": []})).status_code == 200
+            state = (await http.get("/api/setup")).json()
+        assert state["steps_left"] == 0
+        assert state["finished"] is True
+        assert {s["id"] for s in state["steps"] if s["blocked_kind"] == "policy"} == {"memory", "sources", "agents"}

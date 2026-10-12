@@ -459,6 +459,10 @@ _UNRESOLVED_REF = "${"
 # one place neither the agent nor a config edit reaches.
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
+# Turns ``setup.local_secrets`` off from the service definition, so the setup
+# page of an instance whose connections the operator provides cannot be talked
+# into storing a credential by a file on the box. One-way, like the anchor.
+LOCAL_SECRETS_ENV = "NERVE_SETUP_LOCAL_SECRETS"
 
 def _require_auth_mapping(value: Any, where: str) -> None:
     """Refuse an ``auth`` section that is present but not a mapping.
@@ -568,6 +572,40 @@ def _anchored_workspace() -> Path:
             f"reads it."
         )
     return workspace
+
+
+def local_secrets_denied_by_environment() -> bool:
+    """Whether the environment forbids the setup page to store credentials.
+
+    ``NERVE_SETUP_LOCAL_SECRETS`` is read the way the lockdown anchor is, and
+    with the same one-way rule: a falsy value (``0``, ``false``, ``no``,
+    ``off``) turns ``setup.local_secrets`` off whatever the files say; a
+    truthy, empty or unset one is "no opinion" and leaves the files to decide.
+    The environment can take the page's permission to store a credential
+    away, never grant it over a tracked ``false`` — so an operator who
+    provisions an instance to keep nothing on disk keeps that guarantee
+    whatever a file on the box says later.
+
+    An unreadable value is refused rather than read as "no opinion", because
+    that reading would discard an operator's instruction to keep credentials
+    off this machine.
+    """
+    raw = os.environ.get(LOCAL_SECRETS_ENV)
+    if raw is None:
+        return False
+    text = raw.strip().lower()
+    if not text or text in TRUTHY:
+        return False
+    if text in FALSY:
+        return True
+    raise ConfigError(
+        f"{LOCAL_SECRETS_ENV}={raw!r} is neither true nor false. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); "
+        f"unset or empty means the environment has no opinion and "
+        f"setup.local_secrets in the settings decides. Refused rather than "
+        f"assumed, because assuming would mean discarding an instruction to "
+        f"keep credentials off this instance."
+    )
 
 
 def _as_lockdown(value: Any) -> bool:
@@ -772,6 +810,11 @@ def _read_config_sources(config_dir: Path, *, workspace: Path | None = None) -> 
             merged["workspace"] = str(workspace)  # the caller's view, not config.yaml's
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
+    # The same one-way rule for the setup page's permission to store a
+    # credential: the environment can only take it away.
+    if local_secrets_denied_by_environment():
+        section = merged.get("setup")
+        merged["setup"] = {**(section if isinstance(section, dict) else {}), "local_secrets": False}
 
     return _resolve_env_refs(merged)
 
@@ -2459,6 +2502,29 @@ class AuthConfig:
 
 
 @dataclass
+class SetupConfig:
+    """What the browser setup page may do on this instance.
+
+    ``local_secrets``: whether the page may store a credential it is given —
+    an API key, a bot token, a Telegram sign-in — in the files on this
+    machine. ``False`` on an instance whose connections the operator provides
+    (a model credential in the service environment, Slack through a channel
+    gateway): the steps whose only purpose is to store one read "not
+    available", their writes are refused, and the Model step accepts Bedrock
+    or the credential from the environment. Read on every request, so a
+    reload applies it. ``NERVE_SETUP_LOCAL_SECRETS=0`` in the service
+    environment forces it off (one-way, like the lockdown anchor).
+    """
+
+    local_secrets: bool = True
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> SetupConfig:
+        return cls(local_secrets=d.get("local_secrets", True))
+
+
+@dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
@@ -3250,6 +3316,7 @@ class NerveConfig:
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    setup: SetupConfig = field(default_factory=SetupConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
@@ -3541,6 +3608,7 @@ class NerveConfig:
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),
+            setup=SetupConfig.from_dict(d.get("setup") or {}),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),
