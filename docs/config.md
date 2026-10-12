@@ -1842,7 +1842,9 @@ daemon that started with a different environment can be different.
 When set, every model request goes to this endpoint: the Claude CLI (as
 `ANTHROPIC_BASE_URL`), the direct SDK calls (session titles, prompt rewrite,
 source condensing, image description, `nerve doctor`), memU and model discovery.
-Nerve sends `anthropic_api_key` as the key.
+Nerve sends `anthropic_api_key` as the key, or `ANTHROPIC_API_KEY` from the
+daemon's environment when it is unset; the Claude CLI alone also takes
+`claude_oauth_token`.
 
 Setting `ANTHROPIC_BASE_URL` in Nerve's environment is not the same. The CLI
 inherits it, but the direct calls and memU still go to `api.anthropic.com`.

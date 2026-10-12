@@ -185,7 +185,7 @@ class TestRequestPaths:
         # The same base URL and key the memU bridge gives its chat profiles.
         client = OpenAISDKClient(
             base_url=cfg.anthropic_api_base_url,
-            api_key=cfg.effective_api_key,
+            api_key=cfg.resolve_anthropic_api_key(),
             chat_model="m",
             embed_model="e",
         )
