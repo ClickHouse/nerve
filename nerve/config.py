@@ -229,6 +229,24 @@ def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
 # letting shared settings live in the workspace.
 
 
+def _path_exists(path: Path) -> bool:
+    """``path.exists()`` that answers ``False`` for a path this account cannot
+    even stat.
+
+    ``Path.exists()`` raises ``PermissionError`` when a parent directory may not
+    be traversed. The host side of a Docker deployment hits that on Linux:
+    ``config.yaml`` names the container's workspace under ``/root``, which the
+    host's user cannot look into, and there is nothing of ours to read there.
+    For the config loader an unreachable path is an absent one; a file we can
+    see but not open is still reported by the caller (``open()`` fails).
+    """
+    try:
+        return path.exists()
+    except OSError as e:
+        logger.debug("config: %s is not reachable from this account (%s); treating it as absent", path, e)
+        return False
+
+
 def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Read a YAML file into a dict; ``{}`` if absent or empty.
 
@@ -262,7 +280,7 @@ def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     to debug. YAML is UTF-8 by spec, so pinning it is also the correct reading
     of the file.
     """
-    if not path.exists():
+    if not _path_exists(path):
         return {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -1998,7 +2016,7 @@ class MemoryConfig:
 
 def _cron_dir_has_jobs(d: Path) -> bool:
     """True if a cron dir actually holds job definitions (jobs.yaml or system.yaml)."""
-    return (d / "jobs.yaml").exists() or (d / "system.yaml").exists()
+    return _path_exists(d / "jobs.yaml") or _path_exists(d / "system.yaml")
 
 
 def _resolve_cron_dir(workspace: Path | None, locked: bool = False) -> Path:

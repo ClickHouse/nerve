@@ -637,10 +637,14 @@ class TestHelpers:
         """A listener that just closed its connections leaves the port in
         TIME_WAIT for up to a minute: a plain bind says EADDRINUSE although
         nothing listens — exactly a re-run of `nerve init` after `nerve stop`.
-        The probe must answer as the server's own SO_REUSEADDR bind would."""
+        The probe must answer as the server's own SO_REUSEADDR bind would. The
+        listener carries SO_REUSEADDR like the gateway's does: on Linux a reusing
+        bind steps over TIME_WAIT only when the earlier socket had the option as
+        well, which is the re-run case exactly (BSD kernels ask only the new one)."""
         import errno
 
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # what uvicorn sets
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]

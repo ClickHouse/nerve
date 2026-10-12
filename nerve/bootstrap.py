@@ -2119,7 +2119,9 @@ def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
     ``TIME_WAIT``, and a plain bind answers ``EADDRINUSE`` although nothing
     listens — exactly the moment someone re-runs ``nerve init`` after stopping
     the previous daemon. The server itself binds with ``SO_REUSEADDR`` (what
-    uvicorn sets), which steps over ``TIME_WAIT`` but not over a listener.
+    uvicorn sets), which steps over ``TIME_WAIT`` but not over a listener. (On
+    Linux that step also needs the earlier socket to have had ``SO_REUSEADDR``,
+    which the gateway's always does; BSD kernels ask only the new socket.)
 
     So on ``EADDRINUSE`` the probe asks the two questions that tell the cases
     apart: does anything *accept* a connection on the port (a listener — on
