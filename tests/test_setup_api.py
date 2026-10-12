@@ -3236,12 +3236,17 @@ class TestManagedValues:
 _NO_SECRETS = "This instance does not keep credentials on disk. Connections are provided by the operator of this deployment."
 
 
-def _keep_no_secrets(install: Install, **settings) -> None:
-    """``setup.local_secrets: false`` in the tracked settings, as an operator writes it."""
+def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
+    """``setup.local_secrets`` in the tracked settings, as an operator writes it, then reloaded."""
     from nerve.setup_writer import merge_settings_paths
 
-    merge_settings_paths(install.workspace, {"setup.local_secrets": False, **settings})
+    merge_settings_paths(install.workspace, {"setup.local_secrets": allowed, **settings})
     config_reload.remember_startup_config(install.reload())
+
+
+def _keep_no_secrets(install: Install, **settings) -> None:
+    """``setup.local_secrets: false`` in the tracked settings."""
+    _set_local_secrets(install, False, **settings)
 
 
 @pytest.mark.asyncio
@@ -3296,13 +3301,66 @@ class TestNoLocalSecrets:
                 assert response.json()["detail"] == _NO_SECRETS, (method, path, body)
             pairing = (await http.get("/api/setup/channels/telegram/pairing")).json()
             assert pairing["available"] is False and pairing["reason"] == _NO_SECRETS
-            # Runtime state and the steps the policy does not cover still work.
-            assert (await http.post("/api/setup/steps/memory/skip")).status_code == 200
+            # Skipping a closed step is answered the same way, and records nothing:
+            # the step is not waiting on a decision, the instance has closed it.
+            for step_id in ("memory", "channels", "sources", "agents"):
+                skipped = await http.post(f"/api/setup/steps/{step_id}/skip")
+                assert skipped.status_code == 409 and skipped.json()["detail"] == _NO_SECRETS, step_id
+            assert setup_state.load_state().skipped == set()
+            # The steps the policy does not cover still work, skipping included.
+            assert (await http.post("/api/setup/steps/profile/skip")).status_code == 200
             assert (await http.put("/api/setup/automation", json={"crons": []})).status_code == 200
             assert (await http.put("/api/setup/profile", json={"name": "Alice"})).status_code == 200
             assert (await http.post("/api/setup/finish")).status_code == 200
         assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
         assert "external_agents" not in claimed.machine_yaml()
+
+    async def test_the_policy_is_read_again_inside_the_state_lock(self, claimed, monkeypatch):
+        """The lock-free pre-check passes; a reload turns the setting off while
+        the probe or the catalogue runs outside the lock; the write is still
+        refused, because the decision is taken again on the config as it is
+        when the lock is held."""
+        from nerve import models_catalog
+
+        choose(claimed, "personal")
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+
+        async def _get_me_then_flip(token):
+            assert token == _TG_TOKEN
+            _keep_no_secrets(claimed)  # the reload lands while getMe is in flight
+            return True, "example_assistant_bot"
+
+        async def _catalogue_then_flip(_config):
+            _keep_no_secrets(claimed)
+            return ["claude-fable-5-1"]
+
+        monkeypatch.setattr(setup_checks, "telegram_get_me", _get_me_then_flip)
+        monkeypatch.setattr(models_catalog, "get_models", _catalogue_then_flip)
+        async with claimed.client() as http:
+            refused = await http.put("/api/setup/channels", json={"telegram": {"bot_token": _TG_TOKEN}})
+            assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
+            # Back on for the provider's turn, so its pre-check passes too.
+            _set_local_secrets(claimed, True)
+            refused = await http.put(
+                "/api/setup/provider",
+                json={"type": "anthropic", "anthropic_api_key": _API_KEY, "model": "claude-fable-5-1"},
+            )
+            assert refused.status_code == 409
+            assert refused.json() == {"detail": _NO_SECRETS, "field": "anthropic_api_key"}
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        local = claimed.local_yaml()
+        assert "telegram" not in local and "anthropic_api_key" not in local
+
+    async def test_the_policy_is_the_answer_before_a_mode_is_chosen(self, claimed):
+        """The checklist ranks the policy above the wait for a mode (choosing
+        one would not open the step); the sources write answers the same."""
+        _keep_no_secrets(claimed)
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert statuses(state)["mode"] == "pending"
+            assert step(state, "sources")["blocked_kind"] == "policy"
+            refused = await http.put("/api/setup/sources", json={"github": True, "gmail": False, "telegram": False})
+            assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
 
     async def test_the_model_step_refuses_a_pasted_credential_but_not_bedrock_or_the_picker(self, claimed, monkeypatch):
         choose(claimed, "personal")

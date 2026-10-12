@@ -65,6 +65,7 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.accounts import instance_is_passwordless, setup_required
 from nerve.identity import Actor
 from nerve.setup_checklist import (
+    BLOCKED_POLICY,
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
     NO_LOCAL_SECRETS_TEXT,
@@ -80,6 +81,7 @@ from nerve.setup_checklist import (
     STEP_PROVIDER,
     STEP_SOURCES,
     Facts,
+    Step,
     derive,
     onboarding_from_task,
     steps_for_mode,
@@ -1314,6 +1316,17 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
         _require_claimed(ctx)
         config = ctx.config
         _require_writable(ctx)
+        # The policy is read again on the config as it is *now*: a reload may
+        # have turned it off while the catalogue or the host login was being
+        # looked up outside the lock, and the write below must not outrun it.
+        if key:
+            _refuse_without_local_secrets(ctx, "anthropic_api_key")
+        if token:
+            _refuse_without_local_secrets(ctx, "claude_oauth_token")
+        if kind == "host_login" and found is not None:
+            refusal = _host_login_refusal(config)
+            if refusal:
+                raise HTTPException(status_code=409, detail=refusal)
         if model is not None and not _model_allowed(model, config, discovered):
             raise SetupFieldError("model", "That model is not in the catalogue for these credentials.")
 
@@ -1808,6 +1821,11 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_pers
         _require_claimed(ctx)
         config = ctx.config
         _require_writable(ctx)
+        # Read again on the config as it is now: a reload during the probe
+        # above may have turned the policy on, and the token must not be
+        # written on the strength of a check that predates it.
+        if not _hosted_switch_only(config, tg, slack):
+            _refuse_without_local_secrets(ctx)
         secret: dict[str, Any] = {}
         machine: dict[str, Any] = {}
         portable: dict[str, Any] = {}
@@ -1885,12 +1903,14 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         config = ctx.config
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
-        if workspace_mode(config.workspace) is None:
-            raise HTTPException(status_code=409, detail="Choose a mode first")
         _require_writable(ctx)
         # GitHub login or token, the Gmail keyring, the Telegram API
-        # credentials: every source keeps a credential on this machine.
+        # credentials: every source keeps a credential on this machine. Ranked
+        # above the wait for a mode, as the checklist ranks it: choosing a
+        # mode would not open this step, so that is not the answer to give.
         _refuse_without_local_secrets(ctx)
+        if workspace_mode(config.workspace) is None:
+            raise HTTPException(status_code=409, detail="Choose a mode first")
         live = config.sync
         accounts = (
             [a.strip() for a in req.gmail_accounts if a.strip()]
@@ -2097,9 +2117,9 @@ def _check_skippable(step_id: str) -> None:
         )
 
 
-def _step_status_here(ctx: _Context, step_id: str) -> str:
-    """The step's current status on *this* instance; 400 when the step is not
-    in this instance's list (a worker has no Sources or Agents step), so the
+def _step_here(ctx: _Context, step_id: str) -> Step:
+    """The step as it stands on *this* instance; 400 when the step is not in
+    this instance's list (a worker has no Sources or Agents step), so the
     state file only ever records decisions about steps that exist."""
     offered = {
         item[0] for item in steps_for_mode(
@@ -2108,7 +2128,7 @@ def _step_status_here(ctx: _Context, step_id: str) -> str:
     }
     if step_id not in offered:
         raise HTTPException(status_code=400, detail=f"The {step_id} step does not apply to this instance.")
-    return next(s.status for s in derive(ctx.facts) if s.id == step_id)
+    return next(s for s in derive(ctx.facts) if s.id == step_id)
 
 
 @router.post("/api/setup/steps/{step_id}/skip")
@@ -2117,10 +2137,16 @@ async def skip_step(step_id: str, actor: Actor = Depends(require_person)):
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
-        if _step_status_here(ctx, step_id) == "done":
+        here = _step_here(ctx, step_id)
+        if here.status == "done":
             # A fact already made the step done; "skip" means nothing here and
             # is not recorded (`done` beats `skipped` anyway). Idempotent 200.
             return _render(ctx)
+        if here.blocked_kind == BLOCKED_POLICY:
+            # Closed by the instance, not waiting on anyone's decision: answered
+            # like every other write the policy refuses, and nothing is recorded
+            # about a step the page says is not available.
+            raise HTTPException(status_code=409, detail=here.blocked_reason or NO_LOCAL_SECRETS_TEXT)
         ctx.state.skipped.add(step_id)
         _save_or_refuse(ctx.state)
         return _render(await _context(actor))
@@ -2132,7 +2158,7 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_person)):
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
-        _step_status_here(ctx, step_id)
+        _step_here(ctx, step_id)
         ctx.state.skipped.discard(step_id)
         _save_or_refuse(ctx.state)
         return _render(await _context(actor))
@@ -2305,6 +2331,9 @@ async def setup_models(actor: Actor = Depends(require_person)):
 @router.post("/api/setup/memory/test")
 async def memory_test(req: MemoryTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    # Refused with the step it belongs to, unlike the provider test: a Bedrock
+    # or environment credential is still worth testing there, whereas the only
+    # thing to do with a working OpenAI key here is to save it, which is refused.
     _refuse_without_local_secrets(ctx)
     key = (req.openai_api_key or "").strip() or ctx.config.openai_api_key
     if not key:

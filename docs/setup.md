@@ -680,13 +680,14 @@ of offering the fields:
   reads read-only.
 - The writes behind those steps answer `409` with the same two sentences:
   the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
-  mode excepted), the key and token tests, Telegram pairing and the Telegram
-  sign-in.
+  mode excepted), the key and token tests, Telegram pairing, the Telegram
+  sign-in, and skipping one of the closed steps (there is nothing to decide).
 
 What stays available: the model provider from the environment, Slack through
 a channel gateway, the model and effort choice, About you, Automation, the
-account (local mode), skipping, finishing and restarting. `GET /api/setup`
-carries `local_secrets: false`, and `nerve doctor` prints one line about it.
+account (local mode), skipping the steps that are offered, finishing and
+restarting. `GET /api/setup` carries `local_secrets: false`, and
+`nerve doctor` prints one line about it.
 
 Unlike [lockdown](#lockdown), this does not change which configuration files
 are read or what the agent may edit; it only governs what the setup page
