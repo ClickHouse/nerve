@@ -488,6 +488,10 @@ _UNRESOLVED_REF = "${"
 # one place neither the agent nor a config edit reaches.
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
+# Turns ``setup.local_secrets`` off from the service definition, so the setup
+# page of an instance whose connections the operator provides cannot be talked
+# into storing a credential by a file on the box. One-way, like the anchor.
+LOCAL_SECRETS_ENV = "NERVE_SETUP_LOCAL_SECRETS"
 
 def _require_auth_mapping(value: Any, where: str) -> None:
     """Refuse an ``auth`` section that is present but not a mapping.
@@ -599,6 +603,40 @@ def _anchored_workspace() -> Path:
     return workspace
 
 
+def local_secrets_denied_by_environment() -> bool:
+    """Whether the environment forbids the setup page to store credentials.
+
+    ``NERVE_SETUP_LOCAL_SECRETS`` is read the way the lockdown anchor is, and
+    with the same one-way rule: a falsy value (``0``, ``false``, ``no``,
+    ``off``) turns ``setup.local_secrets`` off whatever the files say; a
+    truthy, empty or unset one is "no opinion" and leaves the files to decide.
+    The environment can take the page's permission to store a credential
+    away, never grant it over a tracked ``false`` — so an operator who
+    provisions an instance to keep nothing on disk keeps that guarantee
+    whatever a file on the box says later.
+
+    An unreadable value is refused rather than read as "no opinion", because
+    that reading would discard an operator's instruction to keep credentials
+    off this machine.
+    """
+    raw = os.environ.get(LOCAL_SECRETS_ENV)
+    if raw is None:
+        return False
+    text = raw.strip().lower()
+    if not text or text in TRUTHY:
+        return False
+    if text in FALSY:
+        return True
+    raise ConfigError(
+        f"{LOCAL_SECRETS_ENV}={raw!r} is neither true nor false. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); "
+        f"unset or empty means the environment has no opinion and "
+        f"setup.local_secrets in the settings decides. Refused rather than "
+        f"assumed, because assuming would mean discarding an instruction to "
+        f"keep credentials off this instance."
+    )
+
+
 def _as_lockdown(value: Any) -> bool:
     """Parse the ``lockdown`` flag, refusing anything that isn't a plain yes/no.
 
@@ -652,6 +690,53 @@ def _as_lockdown(value: Any) -> bool:
         f"not one of them. Refused rather than assumed, because assuming would "
         f"mean assuming 'unlocked' — the setting that drops every restriction "
         f"lockdown exists to impose."
+    )
+
+
+def _as_local_secrets(value: Any) -> bool:
+    """Parse ``setup.local_secrets``, refusing anything that isn't a plain yes/no.
+
+    The lenient coercion every other boolean gets falls back to the field's
+    default for a value it cannot read — and this field's default is ``True``,
+    the position in which the setup page stores every credential it is
+    handed. An operator who wrote ``local_secrets: flase`` into the tracked
+    settings meant to keep credentials off this instance; reading that as
+    "allowed" would undo the instruction with one log line as the only
+    signal, and the first person through the page would store the keys the
+    setting exists to keep away. So the key is read the way ``lockdown`` is:
+    real booleans and the documented spellings pass, anything else is a hard
+    :class:`ConfigError`.
+
+    A bare key (``local_secrets:``, YAML ``null``) is ``False`` — the rule
+    every boolean in this module follows (see :func:`nerve.coerce.as_bool`):
+    a key written with no value is "off", never "use the default", because
+    here the default is the permissive position and a value that says
+    nothing must not grant it. That is also what ``lockdown`` does with its
+    bare key — read it as the restrictive position — which for that flag
+    happens to be its default. An *empty string* is not a bare key: it comes
+    from a ``${VAR}`` that is set to nothing, and is refused like ``lockdown``
+    refuses it.
+
+    By the time this runs the ``${VAR}`` pass is over, so a reference that
+    did not resolve has already been refused by name; what reaches here is
+    the resolved text, judged as the setting's value.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in TRUTHY:
+            return True
+        if text in FALSY:
+            return False
+    raise ConfigError(
+        f"setup.local_secrets must be true or false, got {value!r}. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); an "
+        f"empty value is not one of them. Refused rather than assumed, because "
+        f"assuming would mean assuming 'true' — letting the setup page store on "
+        f"this instance the credentials the setting exists to keep off it."
     )
 
 
@@ -801,6 +886,11 @@ def _read_config_sources(config_dir: Path, *, workspace: Path | None = None) -> 
             merged["workspace"] = str(workspace)  # the caller's view, not config.yaml's
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
+    # The same one-way rule for the setup page's permission to store a
+    # credential: the environment can only take it away.
+    if local_secrets_denied_by_environment():
+        section = merged.get("setup")
+        merged["setup"] = {**(section if isinstance(section, dict) else {}), "local_secrets": False}
 
     return _resolve_env_refs(merged)
 
@@ -2488,6 +2578,34 @@ class AuthConfig:
 
 
 @dataclass
+class SetupConfig:
+    """What the browser setup page may do on this instance.
+
+    ``local_secrets``: whether the page may store a credential it is given —
+    an API key, a bot token, a Telegram sign-in — in the files on this
+    machine. ``False`` on an instance whose connections the operator provides
+    (a model credential in the service environment, Slack through a channel
+    gateway): the steps whose only purpose is to store one read "not
+    available", their writes are refused, and the Model step accepts Bedrock
+    or the credential from the environment. Read on every request, so a
+    reload applies it. ``NERVE_SETUP_LOCAL_SECRETS=0`` in the service
+    environment forces it off (one-way, like the lockdown anchor).
+    """
+
+    local_secrets: bool = True
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> SetupConfig:
+        # Parsed strictly rather than left to @_coerced, which would read a
+        # value it cannot parse as the default — "store credentials here".
+        # See :func:`_as_local_secrets`. An absent key is the default.
+        if "local_secrets" not in d:
+            return cls()
+        return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
+
+
+@dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
@@ -3279,6 +3397,7 @@ class NerveConfig:
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    setup: SetupConfig = field(default_factory=SetupConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
@@ -3599,6 +3718,7 @@ class NerveConfig:
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),
+            setup=SetupConfig.from_dict(d.get("setup") or {}),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),

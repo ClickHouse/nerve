@@ -65,8 +65,10 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.accounts import instance_is_passwordless, setup_required
 from nerve.identity import Actor
 from nerve.setup_checklist import (
+    BLOCKED_POLICY,
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
+    NO_LOCAL_SECRETS_TEXT,
     SKIPPABLE_STEPS,
     STATUS_BLOCKED,
     STEP_AGENTS,
@@ -79,6 +81,7 @@ from nerve.setup_checklist import (
     STEP_PROVIDER,
     STEP_SOURCES,
     Facts,
+    Step,
     derive,
     onboarding_from_task,
     steps_for_mode,
@@ -331,8 +334,17 @@ _HOST_LOGIN_NOT_OFFERED = (
 )
 
 
-def _host_login_offered() -> bool:
-    return not is_external_mode() or os.environ.get(HOST_LOGIN_OPT_IN_ENV) == "1"
+def _host_login_refusal(config: NerveConfig) -> str | None:
+    """Why the server's own Claude Code login is not offered here, or ``None``.
+
+    Copying it writes a credential into config.local.yaml, so an instance
+    that keeps none on disk refuses it first; then the external-mode rule.
+    """
+    if not config.setup.local_secrets:
+        return NO_LOCAL_SECRETS_TEXT
+    if is_external_mode() and os.environ.get(HOST_LOGIN_OPT_IN_ENV) != "1":
+        return _HOST_LOGIN_NOT_OFFERED
+    return None
 
 
 def _hide_paths(text: str, config: NerveConfig | None = None) -> str:
@@ -611,6 +623,18 @@ def _refuse_managed(ctx: _Context, path: str, field: str) -> None:
         return
     detail = _MANAGED_DETAIL.get(source, _MANAGED_DETAIL[setup_provenance.SOURCE_ENVIRONMENT])
     raise SetupFieldError(field, detail, status_code=409)
+
+
+def _refuse_without_local_secrets(ctx: _Context, field: str | None = None) -> None:
+    """409 when this instance keeps no credentials on disk
+    (``setup.local_secrets: false``) and the request would store one. With
+    ``field`` the body names it — the shape of the managed-value refusal —
+    for a request that is otherwise fine (the provider's model picker)."""
+    if ctx.config.setup.local_secrets:
+        return
+    if field is not None:
+        raise SetupFieldError(field, NO_LOCAL_SECRETS_TEXT, status_code=409)
+    raise HTTPException(status_code=409, detail=NO_LOCAL_SECRETS_TEXT)
 
 
 def _require_claimed(ctx: _Context) -> None:
@@ -1254,6 +1278,13 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
     pre = await _context(actor)
     _require_claimed(pre)
     _require_writable(pre)
+    # An instance that keeps no credentials on disk stores neither a pasted
+    # key nor a token; Bedrock (an IAM role, no secret), the model picker and
+    # a removal store nothing and go through.
+    if key:
+        _refuse_without_local_secrets(pre, "anthropic_api_key")
+    if token:
+        _refuse_without_local_secrets(pre, "claude_oauth_token")
     # A credential the operator provisioned (environment, config repository)
     # is not replaced or removed from here; the step already reads done.
     if key or remove_key or kind == "host_login":
@@ -1270,8 +1301,9 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
             discovered = []
     found = None
     if kind == "host_login":
-        if not _host_login_offered():
-            raise HTTPException(status_code=409, detail=_HOST_LOGIN_NOT_OFFERED)
+        refusal = _host_login_refusal(pre.config)
+        if refusal:
+            raise HTTPException(status_code=409, detail=refusal)
         try:
             found = await setup_checks.host_login()
         except setup_checks.Busy:
@@ -1284,6 +1316,17 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
         _require_claimed(ctx)
         config = ctx.config
         _require_writable(ctx)
+        # The policy is read again on the config as it is *now*: a reload may
+        # have turned it off while the catalogue or the host login was being
+        # looked up outside the lock, and the write below must not outrun it.
+        if key:
+            _refuse_without_local_secrets(ctx, "anthropic_api_key")
+        if token:
+            _refuse_without_local_secrets(ctx, "claude_oauth_token")
+        if kind == "host_login" and found is not None:
+            refusal = _host_login_refusal(config)
+            if refusal:
+                raise HTTPException(status_code=409, detail=refusal)
         if model is not None and not _model_allowed(model, config, discovered):
             raise SetupFieldError("model", "That model is not in the catalogue for these credentials.")
 
@@ -1571,16 +1614,17 @@ async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person))
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
+        _require_writable(ctx)
+        # The step exists to store an OpenAI key. Without local secrets it is
+        # closed outright — "no embeddings" is what the instance does anyway.
+        _refuse_without_local_secrets(ctx)
         before = ctx.config.openai_api_key
         debts: dict[str, str] = {}
         if key_given:
-            _require_writable(ctx)
             _refuse_managed(ctx, "openai_api_key", "openai_api_key")
             _write(ctx, secret={"openai_api_key": key})
             if (key or "") != (before or ""):
                 debts["openai_api_key"] = "embeddings start after a restart"
-        else:
-            _require_writable(ctx)
         answered = bool(key) or req.embeddings is False
         return await _finish_mutation(ctx, step=STEP_MEMORY, answered=answered, debts=debts)
 
@@ -1701,6 +1745,15 @@ async def _verify_slack(bot_token: str, app_token: str) -> None:
         raise SetupFieldError(result.get("field") or "bot_token", result.get("detail") or "Slack rejected the tokens.")
 
 
+def _hosted_switch_only(config: NerveConfig, tg: TelegramPatch | None, slack: SlackPatch | None) -> bool:
+    """The one channels write an instance without local secrets accepts: the
+    on/off switch of a Slack the channel gateway holds (no token involved)."""
+    return (
+        tg is None and slack is not None and config.slack.mode == "hosted"
+        and slack.model_fields_set <= {"enabled"}
+    )
+
+
 @router.put("/api/setup/channels")
 async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_person)):
     tg = req.telegram
@@ -1738,6 +1791,10 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_pers
     pre = await _context(actor)
     _require_claimed(pre)
     _require_writable(pre)
+    # Without local secrets the step stores nothing — except the switch of a
+    # Slack the channel gateway holds, which involves no token.
+    if not _hosted_switch_only(pre.config, tg, slack):
+        _refuse_without_local_secrets(pre)
     # Tokens the operator provisioned are not replaced or removed from here
     # (the gateway's Slack tokens never were — see _slack_plan).
     if tg_token_given:
@@ -1764,6 +1821,11 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_pers
         _require_claimed(ctx)
         config = ctx.config
         _require_writable(ctx)
+        # Read again on the config as it is now: a reload during the probe
+        # above may have turned the policy on, and the token must not be
+        # written on the strength of a check that predates it.
+        if not _hosted_switch_only(config, tg, slack):
+            _refuse_without_local_secrets(ctx)
         secret: dict[str, Any] = {}
         machine: dict[str, Any] = {}
         portable: dict[str, Any] = {}
@@ -1841,9 +1903,14 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         config = ctx.config
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
+        _require_writable(ctx)
+        # GitHub login or token, the Gmail keyring, the Telegram API
+        # credentials: every source keeps a credential on this machine. Ranked
+        # above the wait for a mode, as the checklist ranks it: choosing a
+        # mode would not open this step, so that is not the answer to give.
+        _refuse_without_local_secrets(ctx)
         if workspace_mode(config.workspace) is None:
             raise HTTPException(status_code=409, detail="Choose a mode first")
-        _require_writable(ctx)
         live = config.sync
         accounts = (
             [a.strip() for a in req.gmail_accounts if a.strip()]
@@ -1990,6 +2057,8 @@ async def set_agents(req: AgentsRequest, actor: Actor = Depends(require_person))
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="External agents do not apply to a worker instance.")
         config_dir = _require_writable(ctx)
+        # Connecting an agent writes an MCP token into its config file.
+        _refuse_without_local_secrets(ctx)
         failures: list[str] = []
         written: list[str] = []
         if names:
@@ -2048,9 +2117,9 @@ def _check_skippable(step_id: str) -> None:
         )
 
 
-def _step_status_here(ctx: _Context, step_id: str) -> str:
-    """The step's current status on *this* instance; 400 when the step is not
-    in this instance's list (a worker has no Sources or Agents step), so the
+def _step_here(ctx: _Context, step_id: str) -> Step:
+    """The step as it stands on *this* instance; 400 when the step is not in
+    this instance's list (a worker has no Sources or Agents step), so the
     state file only ever records decisions about steps that exist."""
     offered = {
         item[0] for item in steps_for_mode(
@@ -2059,7 +2128,7 @@ def _step_status_here(ctx: _Context, step_id: str) -> str:
     }
     if step_id not in offered:
         raise HTTPException(status_code=400, detail=f"The {step_id} step does not apply to this instance.")
-    return next(s.status for s in derive(ctx.facts) if s.id == step_id)
+    return next(s for s in derive(ctx.facts) if s.id == step_id)
 
 
 @router.post("/api/setup/steps/{step_id}/skip")
@@ -2068,10 +2137,16 @@ async def skip_step(step_id: str, actor: Actor = Depends(require_person)):
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
-        if _step_status_here(ctx, step_id) == "done":
+        here = _step_here(ctx, step_id)
+        if here.status == "done":
             # A fact already made the step done; "skip" means nothing here and
             # is not recorded (`done` beats `skipped` anyway). Idempotent 200.
             return _render(ctx)
+        if here.blocked_kind == BLOCKED_POLICY:
+            # Closed by the instance, not waiting on anyone's decision: answered
+            # like every other write the policy refuses, and nothing is recorded
+            # about a step the page says is not available.
+            raise HTTPException(status_code=409, detail=here.blocked_reason or NO_LOCAL_SECRETS_TEXT)
         ctx.state.skipped.add(step_id)
         _save_or_refuse(ctx.state)
         return _render(await _context(actor))
@@ -2083,7 +2158,7 @@ async def unskip_step(step_id: str, actor: Actor = Depends(require_person)):
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
-        _step_status_here(ctx, step_id)
+        _step_here(ctx, step_id)
         ctx.state.skipped.discard(step_id)
         _save_or_refuse(ctx.state)
         return _render(await _context(actor))
@@ -2126,8 +2201,9 @@ async def provider_test(req: ProviderRequest, actor: Actor = Depends(require_per
     if kind == "oauth":
         overrides["anthropic_api_key"] = ""
     if kind == "host_login":
-        if not _host_login_offered():
-            raise HTTPException(status_code=409, detail=_HOST_LOGIN_NOT_OFFERED)
+        refusal = _host_login_refusal(config)
+        if refusal:
+            raise HTTPException(status_code=409, detail=refusal)
         try:
             found = await setup_checks.host_login()
         except setup_checks.Busy:
@@ -2175,13 +2251,14 @@ async def provider_test(req: ProviderRequest, actor: Actor = Depends(require_per
 
 @router.get("/api/setup/provider/host-login")
 async def provider_host_login(refresh: int = 0, actor: Actor = Depends(require_person)):
-    await _claimed_context(actor)
-    if not _host_login_offered():
+    ctx = await _claimed_context(actor)
+    refusal = _host_login_refusal(ctx.config)
+    if refusal:
         # Not looked up at all: the answer would reveal that the operator's
         # personal login exists and where, to anyone the gateway signs in.
         return {
             "available": False, "kind": None, "source": None,
-            "reason": _HOST_LOGIN_NOT_OFFERED, "lookup": setup_checks.LOOKUP_NONE,
+            "reason": refusal, "lookup": setup_checks.LOOKUP_NONE,
         }
     try:
         found = await setup_checks.host_login(refresh=bool(refresh))
@@ -2254,6 +2331,10 @@ async def setup_models(actor: Actor = Depends(require_person)):
 @router.post("/api/setup/memory/test")
 async def memory_test(req: MemoryTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    # Refused with the step it belongs to, unlike the provider test: a Bedrock
+    # or environment credential is still worth testing there, whereas the only
+    # thing to do with a working OpenAI key here is to save it, which is refused.
+    _refuse_without_local_secrets(ctx)
     key = (req.openai_api_key or "").strip() or ctx.config.openai_api_key
     if not key:
         return {"ok": False, "detail": "No OpenAI key to test.", "hint": "Enter a key first."}
@@ -2266,6 +2347,7 @@ async def memory_test(req: MemoryTestRequest, actor: Actor = Depends(require_per
 @router.post("/api/setup/channels/telegram/test")
 async def telegram_test(req: TelegramTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    _refuse_without_local_secrets(ctx)
     token = (req.bot_token or "").strip() or ctx.config.telegram.bot_token
     if not token:
         return {"ok": False, "bot_username": None, "detail": "No bot token to test."}
@@ -2297,6 +2379,7 @@ async def telegram_test(req: TelegramTestRequest, actor: Actor = Depends(require
 @router.post("/api/setup/channels/slack/test")
 async def slack_test(req: SlackTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    _refuse_without_local_secrets(ctx)
     bot = (req.bot_token or "").strip() or ctx.config.slack.bot_token
     app = (req.app_token or "").strip() or ctx.config.slack.app_token
     if not bot or not app:
@@ -2367,6 +2450,7 @@ async def pairing_issue(actor: Actor = Depends(require_person)):
         ctx = await _claimed_context(actor)
         if ctx.facts.lockdown:
             raise HTTPException(status_code=409, detail=LOCKDOWN_TEXT)
+        _refuse_without_local_secrets(ctx)
         if not ctx.config.telegram.bot_token:
             raise HTTPException(status_code=409, detail="Add a bot token first.")
         if ctx.config.telegram.dm_policy != "pairing":
@@ -2425,6 +2509,8 @@ def _telegram_session_scope(ctx: _Context, *, write: bool) -> None:
         return
     if ctx.facts.lockdown:
         raise HTTPException(status_code=409, detail=LOCKDOWN_TEXT)
+    # The sign-in leaves a user session on this machine.
+    _refuse_without_local_secrets(ctx)
     if step.status == STATUS_BLOCKED:
         raise HTTPException(status_code=409, detail=step.blocked_reason or "Choose a mode first")
 

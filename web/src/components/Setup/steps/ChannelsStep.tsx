@@ -4,11 +4,12 @@ import { useSetupStore, type SetupFieldError } from '../../../stores/setupStore'
 import { Button, Checkbox, TextField } from '../../ui';
 import { ChevronDown, ChevronRight, MessageCircle, Slack } from '../../ui/icons';
 import {
-  NO_CHANNELS_LABEL, PAIRING_AFTER_RESTART, SLACK_DISCLOSURE, SLACK_GATEWAY_LINE, SLACK_GATEWAY_SWITCH, SLACK_INTRO,
-  STEP_HEADINGS, TELEGRAM_STEPS,
+  NO_CHANNELS_LABEL, NO_LOCAL_SECRETS_TEXT, PAIRING_AFTER_RESTART, SLACK_DISCLOSURE, SLACK_GATEWAY_LINE,
+  SLACK_GATEWAY_SWITCH, SLACK_INTRO, STEP_HEADINGS, TELEGRAM_STEPS,
 } from '../copy';
 import { secretManaged } from '../credentialSource';
 import { Field } from '../Field';
+import { keepsLocalSecrets } from '../navigation';
 import { Notice } from '../Notice';
 import { PairingWidget } from '../PairingWidget';
 import { decides, same, secretPayload } from '../payload';
@@ -39,6 +40,15 @@ interface Sent { telegram: boolean; slack: boolean }
  * renders as managed, with no Replace, Remove or Test. Slack held by the
  * shared channel gateway shows the gateway's status line and only the
  * switch; there are no tokens to enter.
+ *
+ * On an instance whose setup page stores no credential (`local_secrets:
+ * false`) this step is reached only when something made it done without a
+ * token entered here — a Slack the channel gateway holds, whose switch
+ * stays the one control, or a token the operator provided. The sentence
+ * replaces the token fields and is said once: by the frame when it is the
+ * step's read-only reason, by this step otherwise. A Telegram card appears
+ * only for a token already configured, read-only and without the pairing
+ * controls (pairing would store the paired account here).
  */
 export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupChannelsDetail;
@@ -47,11 +57,15 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
   const fieldError = useSetupStore((s) => s.fieldError);
   const load = useSetupStore((s) => s.load);
   const locked = step.read_only || step.status === 'blocked';
+  const keyless = !keepsLocalSecrets(state);
   const tg = detail.telegram;
   const slack = detail.slack;
   const slackHosted = slack.mode === 'hosted';
   const tgManaged = secretManaged(tg.bot_token) !== null;
   const slackManaged = secretManaged(slack.bot_token) !== null && secretManaged(slack.app_token) !== null;
+  // A bot token would land in config.local.yaml: nothing about Telegram is
+  // editable without local secrets, whatever the step's own status says.
+  const tgLocked = locked || keyless;
 
   const [botToken, setBotToken] = useState<string | null>('');
   const [botName, setBotName] = useState<string | null>(null);
@@ -198,77 +212,91 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
       continueLabel={primaryIsSkip ? NO_CHANNELS_LABEL : undefined}
       hideSkip={primaryIsSkip}
     >
-      <section aria-label="Telegram" className="flex flex-col gap-3 rounded-lg border border-border bg-surface-raised p-4">
-        <h2 className="text-sm font-medium text-text flex items-center gap-2"><MessageCircle size={16} />Telegram</h2>
-        {tg.start_error && (
-          <Notice tone="error">
-            The bot could not start with the saved token: {tg.start_error} Replace the token and restart.
-          </Notice>
-        )}
-        {!tg.bot_token.configured && (
-          <ol className="list-decimal pl-5 text-sm text-text-muted flex flex-col gap-0.5">
-            {TELEGRAM_STEPS.map((line) => <li key={line}>{line}</li>)}
-          </ol>
-        )}
-        {tg.bot_token.configured && (
-          <p className="text-sm text-text-muted">
-            {tg.bot_username ? <>Bot <strong className="text-text">@{tg.bot_username}</strong></> : 'A bot token is saved'}
-            {tg.live ? ' · running' : ' · starts after the restart'}
-            {tg.allowed_users_count > 0 ? ` · ${tg.allowed_users_count} paired` : ' · not paired yet'}
-          </p>
-        )}
-        <SecretField
-          label="Bot token"
-          secret={tg.bot_token}
-          value={botToken}
-          onChange={(v) => { setBotToken(v); setBotName(null); setClientError(null); }}
-          placeholder="123456789:AA…"
-          error={errFor('bot_token')}
-          disabled={locked}
-        />
-        {!locked && !tgManaged && (
-          <TestButton label="Test token" run={testTelegram} disabled={!(botToken ?? '').trim()} />
-        )}
-        {botName && <p className="text-xs text-text-dim">Saving connects @{botName}.</p>}
+      {/* The frame already shows the step's read-only reason, which under
+          the policy is this very sentence: it is not repeated beneath it. */}
+      {keyless && step.read_only_reason !== NO_LOCAL_SECRETS_TEXT && (
+        <Notice tone="locked">{NO_LOCAL_SECRETS_TEXT}</Notice>
+      )}
 
-        {tg.bot_token.configured && (
-          tg.pairing_available
-            ? <PairingWidget onPaired={() => void load()} />
-            : (
-              <div className="flex flex-col gap-2">
-                <Notice tone="info">{tg.pairing_unavailable_reason ?? PAIRING_AFTER_RESTART}</Notice>
-                <Field
-                  label="Your numeric Telegram user id (optional)"
-                  help="Pairs your account without a code. Send /start to @userinfobot in Telegram to see your id."
-                  error={errFor('allowed_users_add')}
-                >
-                  <TextField
-                    value={manualUserId}
-                    onChange={(e) => { setManualUserId(e.target.value); setClientError(null); }}
-                    inputMode="numeric"
-                    autoComplete="off"
-                    placeholder="123456789"
-                    disabled={locked}
-                  />
-                </Field>
-              </div>
-            )
-        )}
-      </section>
+      {(!keyless || tg.bot_token.configured) && (
+        <section aria-label="Telegram" className="flex flex-col gap-3 rounded-lg border border-border bg-surface-raised p-4">
+          <h2 className="text-sm font-medium text-text flex items-center gap-2"><MessageCircle size={16} />Telegram</h2>
+          {tg.start_error && (
+            <Notice tone="error">
+              The bot could not start with the saved token: {tg.start_error} Replace the token and restart.
+            </Notice>
+          )}
+          {!tg.bot_token.configured && (
+            <ol className="list-decimal pl-5 text-sm text-text-muted flex flex-col gap-0.5">
+              {TELEGRAM_STEPS.map((line) => <li key={line}>{line}</li>)}
+            </ol>
+          )}
+          {tg.bot_token.configured && (
+            <p className="text-sm text-text-muted">
+              {tg.bot_username ? <>Bot <strong className="text-text">@{tg.bot_username}</strong></> : 'A bot token is saved'}
+              {tg.live ? ' · running' : ' · starts after the restart'}
+              {tg.allowed_users_count > 0 ? ` · ${tg.allowed_users_count} paired` : ' · not paired yet'}
+            </p>
+          )}
+          <SecretField
+            label="Bot token"
+            secret={tg.bot_token}
+            value={botToken}
+            onChange={(v) => { setBotToken(v); setBotName(null); setClientError(null); }}
+            placeholder="123456789:AA…"
+            error={errFor('bot_token')}
+            disabled={tgLocked}
+          />
+          {!tgLocked && !tgManaged && (
+            <TestButton label="Test token" run={testTelegram} disabled={!(botToken ?? '').trim()} />
+          )}
+          {botName && <p className="text-xs text-text-dim">Saving connects @{botName}.</p>}
+
+          {/* Pairing stores the paired account on this machine, so without
+              local secrets neither the widget nor the manual id has anything
+              to offer — and the server's reason would be the sentence again. */}
+          {tg.bot_token.configured && !keyless && (
+            tg.pairing_available
+              ? <PairingWidget onPaired={() => void load()} />
+              : (
+                <div className="flex flex-col gap-2">
+                  <Notice tone="info">{tg.pairing_unavailable_reason ?? PAIRING_AFTER_RESTART}</Notice>
+                  <Field
+                    label="Your numeric Telegram user id (optional)"
+                    help="Pairs your account without a code. Send /start to @userinfobot in Telegram to see your id."
+                    error={errFor('allowed_users_add')}
+                  >
+                    <TextField
+                      value={manualUserId}
+                      onChange={(e) => { setManualUserId(e.target.value); setClientError(null); }}
+                      inputMode="numeric"
+                      autoComplete="off"
+                      placeholder="123456789"
+                      disabled={tgLocked}
+                    />
+                  </Field>
+                </div>
+              )
+          )}
+        </section>
+      )}
 
       {!slackShown ? (
-        <div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSlackOpen(true)}
-            aria-expanded={false}
-            aria-controls="setup-slack-section"
-            className="min-h-[44px]"
-          >
-            <ChevronRight size={14} /><Slack size={14} />{SLACK_DISCLOSURE}
-          </Button>
-        </div>
+        // No tokens to enter without local secrets: nothing to disclose.
+        !keyless && (
+          <div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSlackOpen(true)}
+              aria-expanded={false}
+              aria-controls="setup-slack-section"
+              className="min-h-[44px]"
+            >
+              <ChevronRight size={14} /><Slack size={14} />{SLACK_DISCLOSURE}
+            </Button>
+          </div>
+        )
       ) : (
         <section id="setup-slack-section" aria-label="Slack" className="flex flex-col gap-3 rounded-lg border border-border bg-surface-raised p-4">
           <h2 className="text-sm font-medium text-text flex items-center justify-between gap-2">
@@ -334,7 +362,7 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
                   disabled={locked}
                 />
               )}
-              {!locked && !slackManaged && (
+              {!locked && !slackManaged && !keyless && (
                 <TestButton
                   label="Test Slack"
                   run={testSlack}

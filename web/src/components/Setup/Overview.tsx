@@ -4,9 +4,9 @@ import { Button } from '../ui';
 import { ArrowRight, RefreshCw } from '../ui/icons';
 import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
-import { ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED } from './copy';
+import { ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, NOT_AVAILABLE_HERE, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED } from './copy';
 import { stepManaged } from './credentialSource';
-import { firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
+import { closedByPolicy, firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
 import { Notice } from './Notice';
 import { StatusBadge } from './StatusBadge';
 import { useWizardNav } from './wizardContext';
@@ -116,7 +116,12 @@ export function Overview({ state }: { state: SetupState }) {
               )}
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <StatusBadge step={step} />
+              {/* A step the instance has closed (it keeps no credentials on
+                  disk) is not a "blocked" chore: the row says so in words,
+                  and the reason above it says why. */}
+              {closedByPolicy(step)
+                ? <span className="text-xs text-text-muted">{NOT_AVAILABLE_HERE}</span>
+                : <StatusBadge step={step} />}
               {step.status === 'done' && !step.read_only && step.id !== 'claim' && (
                 <Link
                   to={stopPath(step.id)}

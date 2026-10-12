@@ -467,6 +467,98 @@ class TestLockdown:
         assert local["steps_left"] == 1  # profile (name) is the only pending step
 
 
+def keyless(ws: Path, **top) -> NerveConfig:
+    """A config whose setup page may not store a credential (``setup.local_secrets: false``)."""
+    return cfg(ws, setup={"local_secrets": False}, **top)
+
+
+class TestNoLocalSecrets:
+    """``setup.local_secrets: false``: a step whose only purpose is to store a
+    credential on this machine is ``blocked`` with ``policy`` — never pending,
+    never counted — unless a fact that stores none already made it done."""
+
+    POLICY_STEPS = ("memory", "channels", "sources", "agents")
+
+    @pytest.mark.parametrize("step_id", POLICY_STEPS)
+    def test_steps_that_store_a_credential_are_closed(self, personal, step_id):
+        s = step(facts(personal, keyless(personal)), step_id)
+        assert s["status"] == "blocked"
+        assert s["blocked_kind"] == "policy"
+        assert s["blocked_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+        assert s["read_only"] is True and s["read_only_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+
+    def test_the_other_steps_are_untouched(self, personal):
+        s = statuses(facts(personal, keyless(personal), account_username="alice"))
+        assert s["claim"] == "done" and s["mode"] == "done"
+        assert s["provider"] == "pending" and s["profile"] == "pending" and s["automation"] == "pending"
+        provider = step(facts(personal, keyless(personal)), "provider")
+        assert provider["read_only"] is False and provider["blocked_kind"] is None
+
+    def test_the_policy_beats_a_skip_and_the_wait_for_mode(self, tmp_path):
+        """Choosing a mode would not open these steps, so they are not work
+        left to do either: ``policy``, not ``sequencing``."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        summary = checklist.summarize(facts(ws, keyless(ws), state=SetupState(skipped={"memory"})))
+        kinds = {s["id"]: s["blocked_kind"] for s in summary["steps"] if s["status"] == "blocked"}
+        assert kinds["memory"] == kinds["sources"] == kinds["agents"] == "policy"
+        assert kinds["profile"] == kinds["automation"] == "sequencing"
+        assert summary["steps_left"] == 4  # mode, provider, profile, automation
+
+    def test_hosted_slack_keeps_the_channels_step_done_and_its_switch(self, personal):
+        config = keyless(personal, slack={"mode": "hosted"})
+        s = step(facts(personal, config), "channels")
+        assert s["status"] == "done" and s["read_only"] is False
+        assert s["detail"]["slack"]["bot_token"]["source"] == "gateway"
+        assert s["detail"]["telegram"]["pairing_available"] is False
+        assert s["detail"]["telegram"]["pairing_unavailable_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+
+    def test_a_credential_the_operator_provided_stays_done_but_read_only(self, personal):
+        config = keyless(
+            personal, openai_api_key="sk-REPLACE00000000",
+            telegram={"bot_token": "123456:REPLACEabcdefghijklmnopqrstuvwxyz0123"},
+        )
+        sources = {"openai_api_key": "environment", "telegram.bot_token": "environment"}
+        f = facts(personal, config, credential_sources=sources)
+        memory = step(f, "memory")
+        assert memory["status"] == "done" and memory["read_only"] is True
+        assert memory["read_only_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+        assert memory["detail"]["openai_api_key"]["source"] == "environment"
+        channels = step(f, "channels")
+        assert channels["status"] == "done" and channels["read_only"] is True
+        assert channels["detail"]["telegram"]["pairing_unavailable_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+
+    def test_an_answer_that_stores_nothing_stays_done(self, personal):
+        f = facts(personal, keyless(personal), state=SetupState(answered={"memory", "sources", "agents"}))
+        for step_id in ("memory", "sources", "agents"):
+            s = step(f, step_id)
+            assert s["status"] == "done" and s["read_only"] is True, step_id
+
+    def test_the_model_step_is_not_blocked(self, personal):
+        """Bedrock needs no secret on disk and a credential can arrive from the
+        environment, so the required step stays answerable."""
+        pending = step(facts(personal, keyless(personal)), "provider")
+        assert pending["status"] == "pending"
+        env = step(facts(personal, keyless(personal), env_credential=True), "provider")
+        assert env["status"] == "done" and env["detail"]["credential_source"] == "environment"
+        assert env["read_only"] is False  # the model picker stays open
+        bedrock = step(facts(personal, keyless(personal, provider={"type": "bedrock", "aws_region": "eu-central-1"})), "provider")
+        assert bedrock["status"] == "done" and bedrock["read_only"] is False
+
+    def test_steps_left_and_finished_ignore_the_closed_steps(self, personal):
+        config = keyless(personal, slack={"mode": "hosted"})
+        f = facts(personal, config, env_credential=True, state=SetupState(answered={"profile", "automation"}))
+        summary = checklist.summarize(f)
+        assert summary["local_secrets"] is False
+        assert summary["steps_left"] == 0
+        assert summary["finished"] is True
+        # Still writable: the policy governs what the page stores, not the files.
+        assert summary["writable"] is True and summary["read_only_reason"] is None
+
+    def test_the_summary_says_when_secrets_may_be_kept(self, personal):
+        assert checklist.summarize(facts(personal))["local_secrets"] is True
+
+
 class TestMaskingAndEtag:
     def test_a_credential_from_the_environment_reads_as_managed(self, personal):
         env = step(facts(personal, env_credential=True), "provider")["detail"]

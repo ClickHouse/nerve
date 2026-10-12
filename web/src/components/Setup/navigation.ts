@@ -1,4 +1,5 @@
 import type { SetupState, SetupStep, SetupStepId } from '../../api/client';
+import { NO_LOCAL_SECRETS_TEXT } from './copy';
 
 /** The route segment of the review screen; a frontend route, not a server step. */
 export const REVIEW = 'review';
@@ -89,6 +90,22 @@ const SEQUENCING_PREFIX = 'Choose a mode first';
  */
 export function waitsForMode(step: Pick<SetupStep, 'status' | 'blocked_reason'>): boolean {
   return step.status === 'blocked' && (step.blocked_reason ?? '').startsWith(SEQUENCING_PREFIX);
+}
+
+/**
+ * A step the instance has closed because it keeps no credentials on disk
+ * and the step's only purpose is to store one. Nothing on the page can
+ * open it, so it reads "Not available" and shows the reason, not a form.
+ * The sentence is matched too, for a backend that sends no `blocked_kind`.
+ */
+export function closedByPolicy(step: Pick<SetupStep, 'status' | 'blocked_kind' | 'blocked_reason'>): boolean {
+  return step.status === 'blocked'
+    && (step.blocked_kind === 'policy' || step.blocked_reason === NO_LOCAL_SECRETS_TEXT);
+}
+
+/** Whether the setup page may store a credential here; an older backend says nothing, which means yes. */
+export function keepsLocalSecrets(state: Pick<SetupState, 'local_secrets'>): boolean {
+  return state.local_secrets !== false;
 }
 
 export function providerDone(state: SetupState): boolean {

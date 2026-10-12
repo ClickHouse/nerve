@@ -67,9 +67,17 @@ STATUS_BLOCKED = "blocked"
 # do and is counted in ``steps_left`` (otherwise the number would *rise* as
 # the person progresses: choosing a mode turns four blocked steps pending).
 # ``lockdown``: nothing on this page can change it, so it is never counted
-# (C13) and ``finished`` can become true around it.
+# (C13) and ``finished`` can become true around it. ``policy``: the instance
+# keeps no credentials on disk (``setup.local_secrets: false``) and the step's
+# only purpose is to store one — never counted, like lockdown.
 BLOCKED_SEQUENCING = "sequencing"
 BLOCKED_LOCKDOWN = "lockdown"
+BLOCKED_POLICY = "policy"
+
+# The steps that exist to store a credential on this machine: an OpenAI key,
+# bot tokens, the sync credentials and sign-in, the MCP token the external
+# agents' config files carry. These are the ones the policy closes.
+_POLICY_STEPS = frozenset({STEP_MEMORY, STEP_CHANNELS, STEP_SOURCES, STEP_AGENTS})
 
 # (id, wire title, modes, required, can_skip). Order is the order offered.
 STEP_CATALOGUE: tuple[tuple[str, str, tuple[str, ...], bool, bool], ...] = (
@@ -102,6 +110,16 @@ _LOCKDOWN_MODE = (
 _LOCKDOWN_PROFILE_EXTERNAL = (
     LOCKDOWN_TEXT + " Your name comes from your organisation's sign-in; USER.md is "
     "managed from the config repository."
+)
+# The wording under ``setup.local_secrets: false``. The same two sentences
+# everywhere: the reason of every step the policy closes, the read-only reason
+# of one the operator provided, and the detail of every refused write. They
+# claim only what the setting controls — what the page stores — and nothing
+# about what else the machine holds (a key written at install time, the
+# Telegram pairing list the bot keeps).
+NO_LOCAL_SECRETS_TEXT = (
+    "This instance does not store credentials entered here. "
+    "Connections are provided by the operator of this deployment."
 )
 MODE_LOCK_REASON = (
     "Mode was chosen when the workspace was created. Changing it means starting a "
@@ -225,7 +243,8 @@ class Step:
     summary: str
     files: list[str]
     detail: dict[str, Any]
-    #: ``sequencing`` | ``lockdown`` while ``status == blocked``, else ``None``.
+    #: ``sequencing`` | ``lockdown`` | ``policy`` while ``status == blocked``,
+    #: else ``None``.
     blocked_kind: str | None = None
 
     @property
@@ -556,6 +575,8 @@ def _channels_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     token_set = bool(tg.bot_token)
     if facts.lockdown:
         pairing_available, reason = False, LOCKDOWN_TEXT
+    elif not config.setup.local_secrets:
+        pairing_available, reason = False, NO_LOCAL_SECRETS_TEXT
     elif not token_set:
         pairing_available, reason = False, "Add a bot token first."
     elif tg.dm_policy != "pairing":
@@ -787,10 +808,18 @@ def derive(facts: Facts) -> list[Step]:
     mode = workspace_mode(ws)
     answered = facts.state.answered
     locked = facts.lockdown
+    # ``setup.local_secrets: false``: the page may not store a credential, so
+    # a step that exists to store one is closed unless a fact already made it
+    # done — a key from the environment, a Slack the channel gateway holds, an
+    # answer that stores nothing.
+    keyless = not config.setup.local_secrets
     steps: list[Step] = []
 
     def _lockdown(reason: str) -> tuple[str, str, str]:
         return STATUS_BLOCKED, reason, BLOCKED_LOCKDOWN
+
+    def _policy() -> tuple[str, str, str]:
+        return STATUS_BLOCKED, NO_LOCAL_SECRETS_TEXT, BLOCKED_POLICY
 
     def _until_mode(reason: str) -> tuple[str, str, str]:
         # Waiting for the Mode step is work left to do — unless the instance
@@ -871,6 +900,10 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
+            elif keyless:
+                # The only thing this step stores is an OpenAI key; without
+                # one recall is LLM-ranked, which needs no answer.
+                status, blocked_reason, blocked_kind = _policy()
             else:
                 status = _skipped_or_pending(step_id, facts)
 
@@ -887,6 +920,10 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
+            elif keyless:
+                # Bot tokens would land in config.local.yaml. (A hosted Slack
+                # stores none and is done above.)
+                status, blocked_reason, blocked_kind = _policy()
             else:
                 status = _skipped_or_pending(step_id, facts)
 
@@ -901,6 +938,10 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
+            elif keyless:
+                # A GitHub login or token, the Gmail keyring, the Telegram
+                # API credentials and the signed-in session.
+                status, blocked_reason, blocked_kind = _policy()
             elif mode is None:
                 status, blocked_reason, blocked_kind = _until_mode(_CHOOSE_MODE_FIRST)
             else:
@@ -925,6 +966,10 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
+            elif keyless:
+                # Connecting an agent writes an MCP token into its config
+                # file in the home directory.
+                status, blocked_reason, blocked_kind = _policy()
             elif mode is None:
                 status, blocked_reason, blocked_kind = _until_mode(_CHOOSE_MODE_FIRST)
             else:
@@ -940,6 +985,15 @@ def derive(facts: Facts) -> list[Step]:
         ):
             if not read_only:
                 read_only, read_only_reason = True, LOCKDOWN_TEXT
+        # Without local secrets a done step the policy covers is read-only
+        # too: whatever made it done (a key from the environment, a token
+        # already on disk, an answer) is not replaced from here. A Slack the
+        # channel gateway holds keeps its one control, the on/off switch.
+        if keyless and status == STATUS_DONE and step_id in _POLICY_STEPS and not (
+            step_id == STEP_CHANNELS and config.slack.mode == "hosted"
+        ):
+            if not read_only:
+                read_only, read_only_reason = True, NO_LOCAL_SECRETS_TEXT
         if status == STATUS_BLOCKED:
             read_only = True
             read_only_reason = read_only_reason or blocked_reason
@@ -975,6 +1029,9 @@ def summarize(facts: Facts) -> dict[str, Any]:
         "auth_mode": "external" if facts.external_auth else "local",
         "mode": workspace_mode(facts.workspace),
         "lockdown": bool(facts.lockdown),
+        # ``False`` on an instance that keeps no credentials on disk
+        # (``setup.local_secrets``), so the page can label what it closes.
+        "local_secrets": bool(facts.config.setup.local_secrets),
         "writable": facts.writable_problem is None,
         "read_only_reason": facts.writable_problem,
         "restart_pending": restart_pending,

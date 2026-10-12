@@ -2029,6 +2029,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             )
         else:
             lines.append(f"[--] Setup checklist: nothing left to decide here{caveat}")
+    if not getattr(getattr(config, "setup", None), "local_secrets", True):
+        # The setup page stores no credential here (setup.local_secrets:
+        # false): say so once, next to the checklist it shapes.
+        lines.append(
+            "[--] Setup page keeps no credentials on this instance "
+            "(setup.local_secrets: false) — connections come from the operator; "
+            "the Memory, Channels, Sources and Agents steps are not offered"
+        )
     try:
         from nerve import setup_state as _setup_state
 

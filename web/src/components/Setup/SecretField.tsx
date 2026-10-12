@@ -25,7 +25,7 @@ const TOUCH = 'min-h-[44px] md:min-h-0';
  */
 export function SecretField({
   label, help, error, secret, value, onChange, placeholder, autoComplete = 'off',
-  disabled, removable = true, startReplacing = false, onReplace, id: givenId,
+  disabled, removable = true, replaceable = true, startReplacing = false, onReplace, id: givenId,
 }: {
   label: ReactNode;
   help?: ReactNode;
@@ -37,6 +37,8 @@ export function SecretField({
   autoComplete?: string;
   disabled?: boolean;
   removable?: boolean;
+  /** Offer Replace on a configured value; off where a new value could not be stored anyway. */
+  replaceable?: boolean;
   /** Open on the input even though a value is configured (a Replace already pressed elsewhere). */
   startReplacing?: boolean;
   /** Called when Replace is pressed, for a parent that reveals more on it. */
@@ -115,17 +117,19 @@ export function SecretField({
         <div className="flex flex-wrap items-center gap-2">
           <p id={id} className="text-sm text-text-muted" tabIndex={-1}>
             Configured{secret?.last4 ? <> · <span className="font-mono">…{secret.last4}</span></> : null}
-            {' '}— leave blank to keep
+            {replaceable ? ' — leave blank to keep' : null}
           </p>
-          <Button
-            variant="secondary"
-            size="xs"
-            onClick={() => { setReplacing(true); onReplace?.(); }}
-            disabled={disabled}
-            className={TOUCH}
-          >
-            Replace
-          </Button>
+          {replaceable && (
+            <Button
+              variant="secondary"
+              size="xs"
+              onClick={() => { setReplacing(true); onReplace?.(); }}
+              disabled={disabled}
+              className={TOUCH}
+            >
+              Replace
+            </Button>
+          )}
           {removable && (
             <Button variant="dangerGhost" size="xs" onClick={() => onChange(null)} disabled={disabled} className={TOUCH}>
               Remove

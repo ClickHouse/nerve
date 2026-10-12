@@ -59,6 +59,12 @@ export interface SecretOut {
 export type SetupAuthMode = 'local' | 'external';
 export type SetupMode = 'personal' | 'worker';
 export type SetupStepStatus = 'done' | 'pending' | 'skipped' | 'blocked';
+/**
+ * Why a step is `blocked`: it waits for the Mode step (`sequencing`), the
+ * instance is in lockdown, or the instance keeps no credentials on disk and
+ * the step's only purpose is to store one (`policy`).
+ */
+export type SetupBlockedKind = 'sequencing' | 'lockdown' | 'policy';
 export type SetupStepId =
   | 'claim' | 'mode' | 'provider' | 'profile' | 'memory'
   | 'channels' | 'sources' | 'automation' | 'agents';
@@ -259,6 +265,8 @@ export interface SetupStep {
   required: boolean;
   can_skip: boolean;
   blocked_reason: string | null;
+  /** Set while `status` is `blocked`; absent from an older backend. */
+  blocked_kind?: SetupBlockedKind | null;
   read_only: boolean;
   read_only_reason: string | null;
   /** Hash of the persisted part of `detail`; forms remount when it changes. */
@@ -273,6 +281,12 @@ export interface SetupState {
   auth_mode: SetupAuthMode;
   mode: SetupMode | null;
   lockdown: boolean;
+  /**
+   * `false` on an instance that keeps no credentials on disk
+   * (`setup.local_secrets`): the steps that would store one are blocked
+   * with `policy`. Absent from an older backend, which means `true`.
+   */
+  local_secrets?: boolean;
   writable: boolean;
   read_only_reason: string | null;
   restart_pending: boolean;
