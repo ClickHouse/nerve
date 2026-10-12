@@ -661,9 +661,10 @@ read on every request, so a reload applies it. The wizard then says so instead
 of offering the fields:
 
 - **Memory**, **Sources** and **Agents** read "Not available on this
-  instance", with the reason: *This instance does not keep credentials on
-  disk. Connections are provided by the operator of this deployment.* They
-  are not counted as left to do, so the checklist can finish without them.
+  instance", with the reason: *This instance does not store credentials
+  entered here. Connections are provided by the operator of this
+  deployment.* They are not counted as left to do, so the checklist can
+  finish without them.
   Recall is LLM-ranked, as it is on any instance without an OpenAI key.
 - **Channels** reads the same way — unless Slack runs through a channel
   gateway (`slack.mode: hosted`), which stores no token on this machine: the
@@ -680,8 +681,10 @@ of offering the fields:
   reads read-only.
 - The writes behind those steps answer `409` with the same two sentences:
   the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
-  mode excepted), the key and token tests, Telegram pairing, the Telegram
-  sign-in, and skipping one of the closed steps (there is nothing to decide).
+  mode excepted), the OpenAI key test and the bot-token tests, Telegram
+  pairing, the Telegram sign-in, and skipping one of the closed steps (there
+  is nothing to decide). The Model step's connection test is not among them:
+  Bedrock and a credential from the environment are still worth testing.
 
 What stays available: the model provider from the environment, Slack through
 a channel gateway, the model and effort choice, About you, Automation, the

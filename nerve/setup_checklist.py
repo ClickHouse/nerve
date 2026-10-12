@@ -111,12 +111,14 @@ _LOCKDOWN_PROFILE_EXTERNAL = (
     LOCKDOWN_TEXT + " Your name comes from your organisation's sign-in; USER.md is "
     "managed from the config repository."
 )
-# The wording of an instance that keeps no credentials on disk
-# (``setup.local_secrets: false``). The same two sentences everywhere: the
-# reason of every step the policy closes, the read-only reason of one the
-# operator provided, and the detail of every refused write.
+# The wording under ``setup.local_secrets: false``. The same two sentences
+# everywhere: the reason of every step the policy closes, the read-only reason
+# of one the operator provided, and the detail of every refused write. They
+# claim only what the setting controls — what the page stores — and nothing
+# about what else the machine holds (a key written at install time, the
+# Telegram pairing list the bot keeps).
 NO_LOCAL_SECRETS_TEXT = (
-    "This instance does not keep credentials on disk. "
+    "This instance does not store credentials entered here. "
     "Connections are provided by the operator of this deployment."
 )
 MODE_LOCK_REASON = (

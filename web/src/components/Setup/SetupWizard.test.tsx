@@ -1688,7 +1688,7 @@ describe('lockdown', () => {
 });
 
 describe('instances that keep no credentials on disk', () => {
-  const CLOSED = 'This instance does not keep credentials on disk. Connections are provided by the operator of this deployment.';
+  const CLOSED = 'This instance does not store credentials entered here. Connections are provided by the operator of this deployment.';
   const closed = (id: Parameters<typeof step>[0]) => step(id, {
     status: 'blocked', blocked_kind: 'policy', blocked_reason: CLOSED, read_only: true, read_only_reason: CLOSED,
   });

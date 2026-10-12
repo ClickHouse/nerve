@@ -3233,7 +3233,7 @@ class TestManagedValues:
 # --------------------------------------------------------------------------- #
 
 
-_NO_SECRETS = "This instance does not keep credentials on disk. Connections are provided by the operator of this deployment."
+_NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
