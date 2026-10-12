@@ -30,6 +30,15 @@
 # default off because machine config is ignored.
 # lockdown: true
 
+# The browser setup page may store the credentials it is given (an API key,
+# a bot token, a Telegram sign-in) on the machine. On an instance whose
+# connections the operator provides — a model credential in the service
+# environment, Slack through a channel gateway — set local_secrets: false and
+# the page says so instead of offering the fields. NERVE_SETUP_LOCAL_SECRETS=0
+# in the service environment forces it off (one-way, like NERVE_LOCKDOWN).
+# setup:
+#   local_secrets: true
+
 # timezone: America/New_York
 
 # Where the gateway listens. A box needing a different port overrides in its own

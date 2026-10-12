@@ -12,6 +12,18 @@
 workspace: ~/nerve-workspace    # Path to workspace with SOUL.md, MEMORY.md, etc.
 timezone: America/New_York
 
+# Setup page — whether it may store the credentials it is given (an API key,
+# a bot token, a Telegram sign-in) on this machine. On an instance whose
+# connections the operator provides (a model credential in the service
+# environment, Slack through a channel gateway), local_secrets: false closes
+# the Memory, Channels, Sources and Agents steps ("Not available on this
+# instance") and the Model step accepts only Bedrock or the credential from
+# the environment. Usually set in the tracked workspace/config/settings.yaml;
+# NERVE_SETUP_LOCAL_SECRETS=0 in the service environment forces it off
+# (one-way, like NERVE_LOCKDOWN). See docs/setup.md.
+# setup:
+#   local_secrets: true
+
 # Provider — how Nerve connects to Claude (default: anthropic)
 # provider:
 #   type: bedrock              # "anthropic" or "bedrock"

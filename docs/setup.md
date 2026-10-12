@@ -641,6 +641,58 @@ banner stays quiet. What still works: the claim (it writes to `nerve.db`), a
 worker's `TASK.md` once the templates have arrived from the repository, your
 display name (local mode), skipping, finishing and restarting.
 
+## Instances that keep no credentials
+
+Some instances never hold a credential on the machine Nerve runs on: the model
+credential arrives from the service environment, Slack runs through a channel
+gateway, and nothing a person pastes into the setup page should end up in
+`config.local.yaml`. For those, set `setup.local_secrets: false` in the
+tracked `workspace/config/settings.yaml`:
+
+```yaml
+setup:
+  local_secrets: false
+```
+
+or `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment. The variable
+works like `NERVE_LOCKDOWN`, one way only: it can turn the storage off over a
+file that allows it, never back on over a file that forbids it. The setting is
+read on every request, so a reload applies it. The wizard then says so instead
+of offering the fields:
+
+- **Memory**, **Sources** and **Agents** read "Not available on this
+  instance", with the reason: *This instance does not keep credentials on
+  disk. Connections are provided by the operator of this deployment.* They
+  are not counted as left to do, so the checklist can finish without them.
+  Recall is LLM-ranked, as it is on any instance without an OpenAI key.
+- **Channels** reads the same way — unless Slack runs through a channel
+  gateway (`slack.mode: hosted`), which stores no token on this machine: the
+  step is done and the on/off switch stays its one control, as before.
+- **Model** still has to be answered. A credential from the environment (or a
+  `${VAR}` reference) reads as configured and managed, exactly as under
+  [Pre-configuring connections](#pre-configuring-connections); AWS Bedrock
+  can be chosen (an IAM role, no secret on disk); the model and effort picker
+  stays open. Pasting an API key or a subscription token is refused (`409`,
+  naming the field), and so is copying the Claude Code login found on the
+  server.
+- A step the operator provided — an OpenAI key or a bot token as a `${VAR}`
+  reference, a source switched on in the tracked settings — stays done and
+  reads read-only.
+- The writes behind those steps answer `409` with the same two sentences:
+  the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
+  mode excepted), the key and token tests, Telegram pairing and the Telegram
+  sign-in.
+
+What stays available: the model provider from the environment, Slack through
+a channel gateway, the model and effort choice, About you, Automation, the
+account (local mode), skipping, finishing and restarting. `GET /api/setup`
+carries `local_secrets: false`, and `nerve doctor` prints one line about it.
+
+Unlike [lockdown](#lockdown), this does not change which configuration files
+are read or what the agent may edit; it only governs what the setup page
+stores. `nerve init --non-interactive` is not affected either: what the
+environment provides at install time is written as before.
+
 ## Manual Configuration
 
 The wizard handles all of this automatically, but you can also configure manually:
