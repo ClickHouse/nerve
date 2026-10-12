@@ -843,10 +843,16 @@ describe('forms open on server values and send the right payload', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('agents', { agents: ['claude-code', 'codex'], conflict_policy: 'merge' }));
   });
 
-  it('memory: continuing without embeddings is a decision; a key is sent when chosen', async () => {
+  it('memory: embeddings are the opening choice; declining them is a decision; a key is sent when chosen', async () => {
     renderAt('/setup/memory');
     await heading('Memory');
-    expect(screen.getByRole('radio', { name: /No embeddings/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /Use embeddings/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /No embeddings/ })).not.toBeChecked();
+    // Continue with the recommended choice but no key asks for one; nothing is sent.
+    await userEvent.click(continueButton());
+    expect(screen.getByText(/Paste an OpenAI key, or choose No embeddings\./)).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('radio', { name: /No embeddings/ }));
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('memory', { openai_api_key: null, embeddings: false }));
 

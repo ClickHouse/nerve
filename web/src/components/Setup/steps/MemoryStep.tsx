@@ -27,8 +27,11 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
   const locked = step.read_only || step.status === 'blocked';
   const configured = detail.openai_api_key.configured;
   const managed = secretManaged(detail.openai_api_key) !== null;
+  // Embeddings are the recommended choice, so a step not yet decided opens on
+  // them; a step that was answered without a key reflects that answer.
+  const initialChoice: Choice = configured || step.status !== 'done' ? 'embeddings' : 'without';
 
-  const [choice, setChoice] = useState<Choice>(() => (configured ? 'embeddings' : 'without'));
+  const [choice, setChoice] = useState<Choice>(initialChoice);
   const [key, setKey] = useState<string | null>('');
   const [clientError, setClientError] = useState<string | null>(null);
   const [weakKeyWarning, setWeakKeyWarning] = useState(false);
@@ -69,7 +72,7 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
       intro={STEP_HEADINGS.memory.intro}
       onSubmit={submit}
       readOnly={locked}
-      dirty={(key ?? '') !== '' || key === null || choice !== (configured ? 'embeddings' : 'without')}
+      dirty={(key ?? '') !== '' || key === null || choice !== initialChoice}
       continueLabel={weakKeyWarning ? 'Save anyway' : undefined}
     >
       <ChoiceCards
