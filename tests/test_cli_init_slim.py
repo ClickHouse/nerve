@@ -595,6 +595,46 @@ class TestDockerSlim:
         assert "[--] Setup checklist: not derived here" in report
         assert "steps:" not in report
 
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root (or a platform without POSIX uids) ignores directory permissions",
+    )
+    def test_host_view_survives_a_container_path_this_account_cannot_stat(self, tmp_path, docker_host):
+        """On a Linux host the container workspace path (``/root/…``) sits under
+        a directory the CLI's user may not traverse, so ``Path.exists()`` raises
+        PermissionError there — unlike macOS, where the path is simply absent.
+        Modelled with an unreadable directory: status and doctor must answer as
+        the two tests above do, with and without the readable mount."""
+        config_dir = tmp_path / "config"
+        ws = tmp_path / "ws"
+        assert _init(config_dir, "--deployment", "docker", "--workspace", str(ws), "--port", "8977",
+                     "--bind", "localhost", "--no-browser", "--no-clipboard", "--yes").exit_code == 0
+        _claimed_db()
+        locked = tmp_path / "locked"
+        container_ws = locked / "nerve-workspace"
+        container_ws.mkdir(parents=True)
+        machine = yaml.safe_load((config_dir / "config.yaml").read_text())
+        machine["workspace"] = str(container_ws)
+        (config_dir / "config.yaml").write_text(yaml.safe_dump(machine), encoding="utf-8")
+        locked.chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                (container_ws / "config" / "settings.yaml").exists()  # the Linux condition
+            status = CliRunner().invoke(cli.main, ["-c", str(config_dir), "status"])
+            assert status.exit_code == 0, status.output
+            assert "Setup checklist: 8 steps left — http://localhost:8977/setup" in status.output
+            report = cli.doctor_report(load_config(config_dir))
+            assert "Setup checklist incomplete" in report
+            (config_dir / "docker-compose.yml").unlink()
+            status = CliRunner().invoke(cli.main, ["-c", str(config_dir), "status"])
+            assert status.exit_code == 0, status.output
+            assert "Setup checklist: open http://localhost:8977/setup" in status.output
+            assert "steps left" not in status.output
+            report = cli.doctor_report(load_config(config_dir))
+            assert "[--] Setup checklist: not derived here" in report
+        finally:
+            locked.chmod(0o700)
+
     def test_gh_token_is_forwarded_only_after_confirmation(self, tmp_path, docker_host, monkeypatch):
         """The operator's personal GitHub token lands in the instance's secret
         file only after the same confirmation the Claude login gets; "n" keeps

@@ -375,6 +375,19 @@ def _setup_url(config) -> str:
     return f"http://{host}:{port}/setup"
 
 
+def _setup_unclaimed(config, external: bool | None = None) -> bool:
+    """Whether the instance still waits for its first claim: the read-only
+    database answer, which a CLI process can take without the daemon. Always
+    ``False`` under external authentication, where there is no claim step."""
+    from nerve.db.accounts import read_setup_required
+
+    if external is None:
+        external = _external_auth_in_this_shell()
+    if external:
+        return False
+    return read_setup_required(paths.db_path(), configured_password=bool(config.auth.password_hash))
+
+
 def _setup_summary(config) -> dict | None:
     """The setup checklist as a CLI process can derive it (no daemon needed).
 
@@ -390,11 +403,7 @@ def _setup_summary(config) -> dict | None:
         from nerve.setup_writer import workspace_mode
 
         external = _external_auth_in_this_shell()
-        unclaimed = False
-        if not external:
-            unclaimed = read_setup_required(
-                paths.db_path(), configured_password=bool(config.auth.password_hash),
-            )
+        unclaimed = _setup_unclaimed(config, external)
         facts = setup_checklist.Facts(
             config=config,
             workspace=Path(config.workspace),
@@ -506,17 +515,25 @@ def _checklist_config(config) -> tuple:
 def _echo_checklist_line(config) -> None:
     """``Setup checklist: N steps left — <url>`` when claimed but unfinished."""
     view, note = _checklist_config(config)
+    if view is None and note:
+        # Docker on the host without a readable mount: nothing about the
+        # workspace can be derived here (config names the container's path,
+        # which this account may not even stat), so the only fact taken is the
+        # database's — claimed or not — and the line says where to look.
+        try:
+            unclaimed = _setup_unclaimed(config)
+        except Exception as e:  # noqa: BLE001 — status must never die on the checklist
+            logging.getLogger(__name__).debug("setup claim state unavailable: %s", e)
+            return
+        if not unclaimed:  # while unclaimed the token lines already say what to do
+            click.echo(f"  Setup checklist: open {_setup_url(config)} ({note})")
+        return
     summary = _setup_summary(view if view is not None else config)
-    if not summary or (view is not None and summary.get("finished")):
+    if not summary or summary.get("finished"):
         return
     claim = next((s for s in summary["steps"] if s["id"] == "claim"), None)
     if claim is not None and claim["status"] != "done":
         return  # the token lines already say what to do
-    if view is None:
-        # Docker on the host without a readable mount: the count would be
-        # derived against a path that is not here, so say where to look instead.
-        click.echo(f"  Setup checklist: open {_setup_url(config)} ({note})")
-        return
     left = summary.get("steps_left", 0)
     noun = "step" if left == 1 else "steps"
     click.echo(f"  Setup checklist: {left} {noun} left — {_setup_url(config)}{_shell_view_caveat()}")
@@ -1573,8 +1590,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         suffix = f" (via {source_label})" if source_label else ""
         has_base = (Path(config_dir) / "config.yaml").exists()
         has_local = (Path(config_dir) / "config.local.yaml").exists()
-        from nerve.config import workspace_settings_file
-        has_settings = workspace_settings_file(config.workspace).exists()
+        from nerve.config import _path_exists, workspace_settings_file
+        # The workspace may be a path this account cannot stat (the container's
+        # path, seen from a Docker host): absent, not a crash.
+        has_settings = _path_exists(workspace_settings_file(config.workspace))
         if has_base or has_local or has_settings:
             present = " + ".join(
                 n for n, ok in (
@@ -1610,7 +1629,9 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Daemon not running")
 
     # Check workspace
-    if config.workspace.exists():
+    from nerve.config import _path_exists as _ws_path_exists
+
+    if _ws_path_exists(config.workspace):
         lines.append(f"[OK] Workspace: {config.workspace}")
         # The mode is what the workspace says it is (SOUL.md and friends), not
         # a config key — NerveConfig has none. Before a mode is chosen the
@@ -1638,6 +1659,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                     lines.append(f"  [OK] {f}")
                 else:
                     warnings.append(f"  [WARN] {f} not found")
+    elif _is_docker_mode(config):
+        # The host side of a Docker deployment: config names the container's
+        # path, which this host may not even stat. The files live at the mount.
+        host_ws = _compose_host_workspace(getattr(config, "config_dir", "") or Path.cwd())
+        where = f"bind-mounted from {host_ws}" if host_ws is not None else _DOCKER_VIEW_UNAVAILABLE
+        lines.append(f"[--] Workspace: {config.workspace} (the container's path; {where})")
     else:
         errors.append(f"[ERR] Workspace not found: {config.workspace}")
 
@@ -2035,8 +2062,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     try:
         from nerve.cron.jobs import describe_reserved_job_ids, is_reserved_job_id, load_jobs
 
-        system_jobs = load_jobs(config.cron.system_file) if config.cron.system_file.exists() else []
-        user_jobs = load_jobs(config.cron.jobs_file) if config.cron.jobs_file.exists() else []
+        system_jobs = load_jobs(config.cron.system_file) if _ws_path_exists(config.cron.system_file) else []
+        user_jobs = load_jobs(config.cron.jobs_file) if _ws_path_exists(config.cron.jobs_file) else []
 
         # Merge: user jobs override system jobs with the same ID
         merged: dict[str, object] = {j.id: j for j in system_jobs}
@@ -2068,9 +2095,9 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             lines.append("[--] No cron jobs configured")
     except Exception:
         # Fallback: just report file existence
-        if config.cron.system_file.exists():
+        if _ws_path_exists(config.cron.system_file):
             lines.append(f"[OK] System crons: {config.cron.system_file}")
-        if config.cron.jobs_file.exists():
+        if _ws_path_exists(config.cron.jobs_file):
             lines.append(f"[OK] User crons: {config.cron.jobs_file}")
 
     # Check backups
