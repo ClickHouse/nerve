@@ -1652,7 +1652,10 @@ class MemUBridge:
             # inside memU's LLMConfig.  It will never be used because we
             # replace the clients immediately after init.
             chat_base_url = self.config.anthropic_api_base_url or "https://placeholder.invalid/v1"
-            chat_api_key = self.config.effective_api_key or "placeholder"
+            # The configured key, else ANTHROPIC_API_KEY from the environment
+            # (an env-provisioned instance), else a placeholder that passes
+            # memU's validation on an instance that has no provider yet.
+            chat_api_key = self.config.resolve_anthropic_api_key() or "placeholder"
 
             llm_profiles: dict[str, Any] = {
                 "default": {
@@ -1913,7 +1916,19 @@ class MemUBridge:
             # connection can hang (HTTP/2 negotiation issue with Cloudflare,
             # or cold Bedrock endpoint).  A cheap throwaway call here forces
             # the connection open so real memorize calls don't stall.
-            for profile in ("memorize", "fast", "default"):
+            #
+            # Not without a credential: an instance that has not finished setup
+            # would otherwise make three 401s against the API on every boot.
+            warm_profiles = (
+                ("memorize", "fast", "default")
+                if self.config.credential_available() else ()
+            )
+            if not warm_profiles:
+                logger.info(
+                    "memU: no model provider configured yet — skipping LLM "
+                    "warm-up; memory works once setup is finished at /setup",
+                )
+            for profile in warm_profiles:
                 try:
                     client = self._service._get_llm_base_client(profile)
                     if isinstance(client, _BedrockLLMClient):
@@ -2069,9 +2084,14 @@ class MemUBridge:
             logger.error("Failed to initialize memU: %s", e, exc_info=True)
             return False
 
-    async def _ensure_categories(self) -> None:
-        """Create seed categories from config that don't already exist in the DB."""
-        if not self._service or not self.config.memory.categories:
+    async def _ensure_categories(self, categories: list[Any] | None = None) -> None:
+        """Create seed categories that don't already exist in the DB.
+
+        ``categories`` defaults to the configured set this bridge was built
+        with; :meth:`apply_categories` passes the freshly reloaded one.
+        """
+        wanted = list(categories) if categories is not None else list(self.config.memory.categories)
+        if not self._service or not wanted:
             return
 
         existing: set[str] = set()
@@ -2082,7 +2102,7 @@ class MemUBridge:
         except Exception:
             pass
 
-        for cat_cfg in self.config.memory.categories:
+        for cat_cfg in wanted:
             if cat_cfg.name in existing:
                 continue
             try:
@@ -3019,6 +3039,16 @@ class MemUBridge:
         """
         if not self._available or not self._service:
             return []
+        if not self.config.credential_available():
+            # Quietly, once per process: a recall with no provider can only
+            # fail, and failing on every turn is noise.
+            if not getattr(self, "_said_no_credential", False):
+                self._said_no_credential = True
+                logger.info(
+                    "memU recall skipped: no model provider configured; finish "
+                    "setup at /setup",
+                )
+            return []
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
             # Retrieve runs vector search (numpy) and possibly SQLite reads
@@ -3231,6 +3261,51 @@ class MemUBridge:
         except Exception as e:
             logger.error("delete_item failed for %s: %s", memory_id, e)
             return False
+
+    async def apply_categories(self, categories: list[Any]) -> bool:
+        """Make the running service use ``categories`` now — what a restart
+        would do with ``memory.categories``, without the restart.
+
+        The setup page's Mode step is the caller: on a fresh install memU was
+        built with no categories (memU's own defaults), and the step writes
+        the mode's set into ``settings.yaml``. ``memory.*`` is restart-only in
+        the reload table, so without this the Review step would demand a
+        restart for the one thing every browser setup does. Returns whether
+        the set was applied; ``False`` when memU is not running (the restart
+        debt then stays, truthfully). Idempotent; no LLM call without an
+        embedding provider.
+        """
+        if not self._available or not self._service:
+            return False
+        return await self._submit(self._apply_categories_impl(list(categories)))
+
+    async def _apply_categories_impl(self, categories: list[Any]) -> bool:
+        """``apply_categories`` on the memU loop; mirrors the tail of
+        :meth:`_initialize_impl` (seed the DB, rebuild the prompt list and the
+        name→id mapping, mark the categories ready)."""
+        from memu.app.service import CategoryConfig
+
+        svc = self._service
+        if svc is None:
+            return False
+        await self._ensure_categories(categories)
+        configs = [CategoryConfig(name=c.name, description=c.description) for c in categories]
+        try:
+            svc.memorize_config.memory_categories = list(configs)
+        except Exception:  # noqa: BLE001 — a frozen model; the lists below are what memorize reads
+            pass
+        svc.category_configs = list(configs)
+        svc.category_config_map = {cfg.name: cfg for cfg in configs}
+        svc._category_prompt_str = svc._format_categories_for_prompt(svc.category_configs)
+        svc._context.categories_ready = True
+        ctx = svc._get_context()
+        ctx.category_ids = []
+        ctx.category_name_to_id = {}
+        for _cat_id, cat in svc.database.memory_category_repo.categories.items():
+            ctx.category_ids.append(cat.id)
+            ctx.category_name_to_id[cat.name.lower()] = cat.id
+        logger.info("memU: applied %d configured categories to the running service", len(configs))
+        return True
 
     async def create_category(self, name: str, description: str, source: str = "bridge") -> bool:
         """Create a new memory category at runtime."""

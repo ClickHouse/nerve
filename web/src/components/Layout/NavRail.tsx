@@ -7,8 +7,9 @@ import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { IconButton } from '../ui';
 import { LogOut } from '../ui/icons';
+import { useSetupStore } from '../../stores/setupStore';
 import { ThemeToggle } from './ThemeToggle';
-import { NAV_ITEMS } from './navItems';
+import { NAV_ITEMS, visibleNavItems } from './navItems';
 
 export function NavRail() {
   const location = useLocation();
@@ -18,6 +19,9 @@ export function NavRail() {
   const loadNotifications = useNotificationStore(s => s.loadNotifications);
   const [ultracodeEnabled, setUltracodeEnabled] = useState(false);
   const hosted = useHostedStore(s => s.mode === 'external');
+  // A hook subscription, so the entry appears the moment the checklist is
+  // read — not on the next unrelated re-render.
+  const setupKnown = useSetupStore(s => s.state !== null);
 
   // Load notification count + feature flags on mount
   useEffect(() => {
@@ -27,11 +31,7 @@ export function NavRail() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []);
 
-  const visibleItems = NAV_ITEMS.filter(item => {
-    if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
-    if (item.feature === 'accounts' && hosted) return false;
-    return true;
-  });
+  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown });
 
   return (
     <div className="w-14 bg-surface border-r border-border flex flex-col items-center py-3 shrink-0">

@@ -26,7 +26,7 @@ Ship a **personal assistant** that develops a personality, remembers your prefer
 curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh | bash
 ```
 
-The installer handles everything — installs dependencies (Python, Node.js, uv), clones the repo, builds the web UI, and launches the interactive setup wizard.
+The installer puts the dependencies in place (Python, Node.js, uv), clones the repo and runs `nerve init`. That asks three questions in the terminal — server or Docker, where the files live, which port and address — then starts Nerve and prints the address of the setup page with a one-time setup token. Everything else (your account, personal assistant or worker, the model provider, channels, memory, scheduled jobs) is decided in the browser. See the [Setup Guide](docs/setup.md).
 
 <details>
 <summary><strong>Manual install</strong></summary>
@@ -37,10 +37,12 @@ The installer handles everything — installs dependencies (Python, Node.js, uv)
 git clone https://github.com/ClickHouse/nerve.git && cd nerve
 uv sync                      # creates .venv from uv.lock
 source .venv/bin/activate
-cd web && npm ci && npm run build && cd ..
-nerve init
-nerve start -f
+nerve init                   # builds the web UI, starts Nerve, prints the setup page + token
 ```
+
+Prefer to answer everything in the terminal? `nerve init --terminal` is the full
+wizard; it does not start Nerve, so follow it with `nerve start`. For hosts with
+no terminal at all, see [unattended installation](docs/setup.md#unattended-installation).
 </details>
 
 ### Upgrading
@@ -60,7 +62,7 @@ Runs `git pull`, reinstalls Python deps, and rebuilds the web UI in one shot. Us
 
 A full-featured assistant for one human. Syncs your email, remembers your preferences, develops personality over time. Comes with a web UI, Telegram bot, memory, cron jobs, and notifications out of the box.
 
-> *"You're not a chatbot. You're becoming someone."* — from the Personal SOUL template
+> *"You assist one person over the long run."* — from the Personal SOUL template
 
 - Workspace files define personality (`SOUL.md`), identity (`IDENTITY.md`), and user context (`USER.md`)
 - Memory categories are life-oriented: relationships, finances, travel, health, work
@@ -71,18 +73,24 @@ A full-featured assistant for one human. Syncs your email, remembers your prefer
 
 A task-focused autonomous agent for teams or programmatic deployment. Monitors something, proposes fixes, implements after approval. Plan-driven with a full audit trail.
 
-> *"You're a specialist, not a script."* — from the Worker SOUL template
+> *"You are a specialist with one mission, set out in `TASK.md`, and an explicit quality bar."* — from the Worker SOUL template
 
 - **Self-configuring**: give it a plain-English task description and it researches, writes its own `TASK.md`, creates skills, sets up cron jobs, and starts working
 - Memory categories are operational: patterns, procedures, decisions, approvals, infrastructure
 - No `IDENTITY.md` or `USER.md` — workers execute a mission, not build a relationship
 - Built for reliability: plan before acting, verify after executing, log everything
 
+The mode is chosen on the setup page: run `nerve init`, open the page it
+prints, and pick **Worker** on the Mode step — it asks for a plain-English task
+description and the agent onboards itself on first boot. The same choice in a
+terminal is `nerve init --terminal`; unattended installs set `NERVE_MODE=worker`
+(and `NERVE_TASK`):
+
 ```bash
-# Spin up a worker that monitors CI and fixes flaky tests
-nerve init --mode worker
-# → Wizard asks for a task description
-# → Agent onboards itself on first boot
+# Spin up a worker that monitors CI and fixes flaky tests, with no browser
+NERVE_MODE=worker NERVE_TASK="Monitor CI for flaky tests and propose fixes" \
+ANTHROPIC_API_KEY=sk-ant-REPLACE NERVE_PASSWORD=REPLACE \
+nerve init --non-interactive && nerve start
 ```
 
 ## Why Nerve?
@@ -107,6 +115,7 @@ Every channel shares the same agent engine, memory, and tools.
 Full React + Vite + TailwindCSS frontend served by FastAPI. Real-time streaming over WebSocket.
 
 - Chat with session history, branching, and resume
+- Setup wizard: claim the instance, choose a mode, connect a model, configure channels, sources and jobs — re-enterable from the Setup entry
 - Inline diff viewer for file changes (no git required)
 - Task manager, memory browser, skill editor
 - Source inbox, notification center, cron logs
@@ -144,7 +153,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (15min), `task-planner` (4h). Worker mode ships with `skill-reviser`, `skill-extractor`, and `task-planner` by default; additional crons are configured during onboarding.
+Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h). Worker mode ships with `skill-reviser` and `skill-extractor` on and `task-planner` off; the onboarding session enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
 
 ### 📡 Source Sync
 
@@ -287,10 +296,12 @@ See [docs/config.md](docs/config.md) for all options.
 | Doc | Description |
 |-----|-------------|
 | [Architecture](docs/architecture.md) | System overview, modes, deployment, data flow |
-| [Setup](docs/setup.md) | Installation, config, Docker, HTTPS, systemd |
+| [Setup](docs/setup.md) | Installation, the browser setup wizard, the setup token, Docker, HTTPS, systemd |
 | [Config](docs/config.md) | All config options with descriptions and defaults |
 | [Accounts](docs/accounts.md) | Local accounts, actor identity, the first-start bootstrap and the signing secret |
 | [Worker Guide](docs/worker-guide.md) | Worker mode setup, onboarding, plan-approve loop |
+| [Personal Best Practices](docs/personal-best-practices.md) | Running a personal assistant well: brain files, memory tiers, approval classes, turn shape, safety hygiene |
+| [Worker Best Practices](docs/worker-best-practices.md) | Running an autonomous worker well: `TASK.md` anatomy, plan-approve-execute, task state machine, CI results comments, escalation |
 | [API Reference](docs/api.md) | REST API and WebSocket protocol |
 | [SDK Sessions](docs/sdk-sessions.md) | Session lifecycle, resume, forking |
 | [Sources](docs/sources.md) | Sync engine, cursors, consumer model |

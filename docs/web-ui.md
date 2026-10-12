@@ -23,10 +23,14 @@ web/src/
 │   │   ├── blockHelpers.ts       # Panel block append/update, auto-close timers
 │   │   └── bufferReplay.ts       # Session reconnect replay, deriveStatus, extractTodos
 │   ├── authStore.ts    # Auth state (Zustand)
+│   ├── setupStore.ts   # Setup checklist state, mutations, restart wait, banner (Zustand)
 │   ├── taskStore.ts    # Task list/detail state (Zustand)
 │   └── skillsStore.ts  # Skills CRUD + usage stats (Zustand)
 ├── components/
 │   ├── Auth/           # Login page and session-expired overlay
+│   ├── Setup/          # Setup wizard: shell, progress rail, step forms, restart overlay, banner
+│   │   ├── steps/      # ClaimForm, ModeStep, ProviderStep, ProfileStep, …, ReviewStep
+│   │   └── copy.ts     # Every heading, intro and hint of the wizard (no JSX)
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
 │   │   ├── tools/      # Specialized tool call renderers
 │   │   ├── FileChangesPanel.tsx  # Modified files list + detail navigation
@@ -39,6 +43,8 @@ web/src/
 │   ├── dateGroups.ts       # Date grouping (Today/Yesterday/This Week/Older)
 │   ├── extractResultText.ts # Extract text from MCP content blocks
 │   ├── hydrateMessage.ts
+│   ├── passwordStrength.ts # The claim form's strength meter
+│   ├── timeZones.ts        # Typed Intl.supportedValuesOf shim, browser zone and language
 │   └── toolSummary.ts
 └── App.tsx             # Main layout
 ```
@@ -110,6 +116,122 @@ Generic tabbed panel that replaces the old plan-only preview panel. Auto-opens w
 - **Keyboard shortcut** — `Cmd/Ctrl + \` toggles panel visibility.
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
 - **Selection comments** — Select text in plan content to add/remove/improve/ask/note, same as in chat messages.
+
+### Setup
+
+`/setup` is two things, decided by `SetupPage`:
+
+- **The claim form** (`steps/ClaimForm.tsx`) while `GET /api/auth/status`
+  says `login: setup` in local mode: username, password with a strength meter,
+  "Keep this installation passwordless" with its warning, display name, and
+  the setup token in a password field. It is mounted outside the app shell
+  (nobody is signed in yet). The token lives in component state only and is
+  cleared on success; nothing about it reaches `localStorage`. A successful
+  claim stores the session token, refreshes auth and the actor directory,
+  loads the checklist and navigates to `/setup/mode` — not to chat.
+- **The wizard** (`WizardShell`) for a signed-in person, in both
+  authentication modes, at `/setup` (the Overview) and `/setup/:stepId`.
+
+The wizard is a `PageHeader` ("Set up Nerve"), a progress rail
+(`ProgressRail`: `<nav aria-label="Setup steps">` with an ordered list,
+`aria-current="step"`, a status badge per step — done, To do, Skipped,
+Blocked with the reason as helper text, a lock on read-only steps) and the
+current step. On desktop the rail is a 220 px column; on phones it lives in a
+drawer opened from the header and a line under the header reads "Step 3 of 9 ·
+Model". Every step is a `<form aria-label>` with an `<h1 tabIndex={-1}>` that
+receives focus on navigation, so Enter in a field submits and screen readers
+land on the heading. The footer is sticky inside the scroller (never fixed, so
+it cannot collide with the bottom nav): Back · Skip for now (or Undo skip on a
+skipped step) · Continue — which reads **Next** on a blocked or read-only
+step and sends nothing — and, once a provider is configured, **Finish now**.
+Back on a dirty form asks "Leave without saving?" inline (`role="alertdialog"`).
+
+The **Overview** orients: "Signed in as alice" (in external mode: "Signed in
+as Alice Example through your organisation's sign-in"), what the wizard does,
+N of M steps done, the step list with badges and Change links, a notice when a
+restart is pending, and Continue to the first pending step.
+
+Step forms (`steps/*.tsx`) open on the server's values and are keyed by
+`${viewer.id}:${step.etag}`, so another person's save — or a restart —
+remounts them with fresh data, while a test result or a pairing poll (which
+leave the persisted values alone) never wipes what you are typing. The server
+is the source of truth: every save replaces the whole state with the
+response; the client never computes a status. On a pending or skipped step
+Continue always sends the step's decision (so accepting a prefilled time zone
+is saved and recorded); on a done step it sends only what differs from the
+server's detail. A `400` with a `field` lands under that input
+(`aria-describedby`, `aria-invalid`); anything else is a `role="alert"` above
+the footer; a `409` is shown as the server worded it, then the state is
+reloaded. Secrets render through `SecretField`: "Configured · …ab12 — leave
+blank to keep", with Replace and Remove (which sends `null`). Choice cards
+are a `radiogroup`; test buttons report in a `role="status"` region.
+
+Per-step behaviour worth knowing: Mode is read-only once chosen; the Model
+step shows the "Claude Code login on this server" card only when
+`GET /api/setup/provider/host-login` finds one, offers "Test connection", and
+shows the model and effort picker (with one line of guidance each) once a
+credential works; About you prefills the browser's time zone, shows quiet
+hours as a switch above the two times (on with 22:00–07:00 when a personal
+instance still has the defaults, off for a worker; off sends
+`quiet_enabled: false`), and offers theme pills (client-side only); Channels
+verifies a Telegram token with the test button,
+shows the saved token's start error when the bot failed to boot, and embeds
+the `PairingWidget` (t.me link, code, 2 s poll) when the bot is live, with a
+manual user id fallback; Sources load `GET /api/setup/sources/preflight` and
+warn when a toggle is on but its tool is missing; Automation renders
+schedules in the chosen time zone and, for a worker, shows `task-planner` off
+by default with a note that the onboarding session enables it when the worker
+should plan through the approval loop; Agents default-checks what is installed.
+
+**Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
+runs the server check-up (`GET /api/setup/environment`) with its hints — an
+HTTPS warning when the page is served over plain HTTP from a non-loopback
+address, a passwordless-on-LAN warning — shows what was written where from
+`steps[].files`, and ends with one button: **Finish** (`POST
+/api/setup/finish`, hot reload) or **Restart Nerve** when something needs a
+restart, with the reasons listed. Under systemd (or an operator-declared
+supervisor) the operator's command is shown before the click — it arrives as
+`restart_command` in the setup state (and `command` from `/api/setup/environment`),
+never parsed out of the message. Then `ReadyScreen`: "Nerve is ready", three summary
+lines, **Say hello** (opens a new chat with a suggested first message),
+a pairing card when a live Telegram bot has nobody paired yet, and "Open
+the setup page". A worker's ending is "Your worker is ready" with the onboarding
+session's status and a link to it, polled every 5 s while it runs.
+
+**RestartOverlay** covers the page while the daemon restarts and is never a
+trap: "Restarting Nerve… (12 s)" with **Not now** after ten seconds; for an
+`unsupported` restart, who must act and the command with Copy; after the time
+box, "Nerve did not come back" with **Keep waiting** and Close. Escape maps to
+the secondary action. The wait itself is owned by `setupStore`
+(`waitForGeneration`): it polls `/health` once a second until `generation`
+differs from the one the restart answered with, then clears the hosted
+"unavailable" state, re-reads the auth descriptor and the viewer, and reloads
+the checklist — closing the overlay does not stop it, so the banner and the
+Review step update on their own when Nerve is back. 5xx and network errors
+count as "still restarting". If `/health` is not reachable through a front
+gateway (two 404 or non-JSON answers), the store reads `generation` from a raw
+`GET /api/setup` instead. Neither probe goes through the normal request
+helper, so no sign-in handling fires mid-restart.
+
+**SetupBanner** is mounted next to the notification toast: "Finish setting up
+Nerve — 3 steps left · Continue" (plus " · A restart is pending"), or "Restart
+Nerve to apply your setup · Restart" linking to `/setup/review` when only the
+restart is left. Bottom-left on desktop, top on phones. Hidden on `/setup`,
+when setup is finished, while the state is unknown, during a restart, and
+after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
+The **Setup** entry in the navigation appears as soon as the checklist has
+been read, in both auth modes, and stays visible when setup is finished. The
+chat page's empty state reads "Connect a model to start a conversation" with a
+link to `/setup/provider` while the server says no provider is configured.
+
+**External authentication.** `/setup` and `/setup/:stepId` are registered in
+the hosted frontend too; only the claim form is local-only, and the switch
+keys on the hosted store's `mode === 'external'`, never on `login`. In that
+mode no password, passwordless or token control renders anywhere in the
+wizard, About you takes the name from the gateway's sign-in and only sets what
+Nerve writes in `USER.md`, the profile step never calls an account endpoint,
+and the reconnect after a restart goes through the hosted adapter's own
+session probe, so no login form can appear.
 
 ### Accounts
 
@@ -209,6 +331,13 @@ cd web && npx vite build
 
 Uses Zustand for lightweight state management:
 - `authStore` — Login/logout, token management
+- `setupStore` — The setup checklist exactly as the server last sent it
+  (`state`), one mutation in flight at a time (`busy`), field errors, the
+  restart wait (`waitForGeneration`, `retryWait`, `dismissRestartOverlay`),
+  cached preflights (models, host login, sources, agents, environment) and
+  the banner dismissal. Loaded once per app session in both auth modes;
+  silent on an older backend without the endpoint. Selectors:
+  `setupIsUnfinished`, `stepsLeft`, `providerConfigured`, `stepById`
 - `actorStore` — The actor id → display name map behind attribution labels. In
   memory only; same-tab account mutations refresh it, while cross-tab renames
   converge on reload

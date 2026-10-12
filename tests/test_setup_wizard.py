@@ -50,6 +50,9 @@ async def test_validation_errors_never_echo_the_setup_token():
 
 def _app() -> FastAPI:
     app = FastAPI()
+    # The claim lives on its own router now (registered only in local mode);
+    # the checklist is `setup_routes.router`. This file is the claim contract.
+    app.include_router(setup_routes.claim_router)
     app.include_router(setup_routes.router)
     app.include_router(accounts_routes.router)
     app.include_router(auth_routes.router)

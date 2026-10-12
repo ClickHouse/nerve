@@ -82,6 +82,51 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_provider_credential(monkeypatch):
+    """Strip the developer shell's model credentials from every test.
+
+    ``NerveConfig.credential_available()`` and ``resolve_anthropic_api_key()``
+    read ``ANTHROPIC_API_KEY`` / ``CLAUDE_CODE_OAUTH_TOKEN`` so that an
+    environment-provisioned instance works. A test that means "no credential"
+    must therefore not inherit one from whoever runs the suite; tests about
+    the environment set the variables themselves.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_setup_process_state(monkeypatch):
+    """The setup modules keep per-process memory (detection caches, the last
+    provider test, the restart flag, the startup-config snapshot). None of it
+    may leak from one test into the next, whichever file the tests live in.
+    """
+    from nerve import config_reload, setup_checks
+
+    setup_checks.reset_caches()
+    monkeypatch.setattr(config_reload, "_startup_config", None)
+    catalog = sys.modules.get("nerve.models_catalog")
+    if catalog is not None:
+        catalog.reset_cache()  # the fingerprint-keyed catalog and any warm-up
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
+        monkeypatch.setattr(routes, "_restart_requested", False)
+        monkeypatch.setattr(routes, "_last_provider_test", None)
+        # One pending Telegram sign-in per process: never one left by another test.
+        from nerve import setup_telegram_login
+
+        monkeypatch.setattr(routes, "_telegram_login", setup_telegram_login.TelegramLogin())
+    yield
+    setup_checks.reset_caches()
+    if catalog is not None:
+        catalog.reset_cache()
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
+
+
+@pytest.fixture(autouse=True)
 def _unpin_jwt_secret():
     """Clear the process signing secret before and after each test.
 

@@ -33,7 +33,9 @@ import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { SetupPage } from './pages/SetupPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
+import { SetupBanner } from './components/Setup/SetupBanner';
 import { ShortcutsModal } from './components/ShortcutsModal';
+import { useSetupStore } from './stores/setupStore';
 
 function App() {
   const {
@@ -58,6 +60,10 @@ function App() {
     ws.connect();
     const unsub = ws.onMessage(handleWSMessage);
     loadSessions();
+    // The setup checklist drives the nav entry and the finish-setup banner;
+    // one read per app session, in both auth modes. Silent on an older
+    // backend without it.
+    void useSetupStore.getState().load();
     return () => { unsub(); ws.disconnect(); };
   }, [live]);
 
@@ -122,7 +128,12 @@ function App() {
           <Route path="/cron" element={<CronPage />} />
           <Route path="/memory" element={<MemuPage />} />
           {!hosted && <Route path="/accounts" element={<AccountsPage />} />}
-          {!hosted && <Route path="/setup" element={<SetupPage />} />}
+          {/* The wizard is for both auth modes: on an instance behind a
+              front gateway (external auth mode) any signed-in person sets it
+              up through the same checklist. Only the pre-sign-in claim
+              (above) is local-only. */}
+          <Route path="/setup" element={<SetupPage />} />
+          <Route path="/setup/:stepId" element={<SetupPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -134,6 +145,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <SetupBanner />
       <ShortcutsModal />
     </>
   );

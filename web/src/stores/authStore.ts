@@ -10,6 +10,7 @@ import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
 import { selectViewerStorage } from './helpers/viewerStorage';
+import { useSetupStore } from './setupStore';
 
 /** Who a session belongs to. Enough to tell one person's session from another's. */
 export interface SignedInAccount {
@@ -33,6 +34,11 @@ function purgeAccountScopedState(): void {
   clearAllReads();
   // Do not let a name snapshot outlive the session that read it.
   useActorStore.getState().reset();
+  // Nor the setup checklist: its state, a pending restart wait and its
+  // overlay, and any field error belong to the person who was signed in.
+  // (`setupStore` imports this module too; both only touch each other from
+  // inside functions, never while loading, so the cycle is harmless.)
+  useSetupStore.getState().reset();
 }
 
 /**

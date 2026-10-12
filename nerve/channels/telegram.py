@@ -515,6 +515,29 @@ class TelegramChannel(BaseChannel):
         self._notification_service = service
 
     @property
+    def bot_username(self) -> str | None:
+        """The bot's ``@username`` once ``Application.initialize()`` ran, else ``None``.
+
+        Read by the setup page so the process that comes up after the restart
+        can offer the ``t.me`` pairing link without a second ``getMe``. Never
+        raises: a half-built application answers ``None``.
+        """
+        app = self._app
+        if app is None:
+            return None
+        try:
+            bot = app.bot
+            name = getattr(bot, "username", None)
+        except Exception:  # noqa: BLE001 — python-telegram-bot raises before initialize()
+            return None
+        return str(name) if name else None
+
+    @property
+    def allowed_users(self) -> frozenset[int]:
+        """The allow-list the running bot honours (a frozen copy)."""
+        return frozenset(self._allowed_users)
+
+    @property
     def config(self) -> NerveConfig:
         """The live config, resolved per read rather than captured.
 
@@ -1176,6 +1199,26 @@ class TelegramChannel(BaseChannel):
         self._allowed_users.add(user_id)
         try:
             append_telegram_allowed_user(self.config.config_dir, user_id)
+            # The running bot honours the new id already, so the next config
+            # reload must not report telegram.allowed_users as waiting on a
+            # restart: tell the restart bookkeeping this value is live.
+            #
+            # Recorded exactly as it landed on disk — the startup list with
+            # the id appended — because the bookkeeping compares lists with
+            # ``!=``: a sorted set would read as a change whenever the file's
+            # order is not ascending (a hand-written [333, 111], or pairing an
+            # id smaller than one already present).
+            from nerve import config_reload
+
+            started = config_reload.startup_config()
+            base = list(
+                started.telegram.allowed_users if started is not None
+                else self.config.telegram.allowed_users
+            )
+            config_reload.note_applied(
+                "telegram.allowed_users",
+                base if user_id in base else [*base, user_id],
+            )
         except LockdownError:
             # Belt-and-suspenders: config was locked between the check and here.
             self._allowed_users.discard(user_id)

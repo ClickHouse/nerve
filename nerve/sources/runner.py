@@ -134,7 +134,7 @@ class SourceRunner:
         db: Database for cursor persistence and logging.
         batch_size: Max records per fetch.
         condense: Enable LLM condensation for long records.
-        condense_model: Model name for condensation (e.g. "claude-haiku-4-5-20251001").
+        condense_model: Model name for condensation (the configured ``memory.fast_model``).
         condense_prompt: Custom system prompt for condensation (uses default if empty).
         condense_client_factory: Callable that creates an async Anthropic client.
             Provided by NerveConfig.create_async_anthropic_client — handles provider

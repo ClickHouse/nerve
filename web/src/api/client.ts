@@ -33,6 +33,443 @@ export interface SetupClaim {
   token: string;
 }
 
+// ---------------------------------------------------------------------------
+// Setup wizard (`GET /api/setup` and friends). The server derives every status
+// from configuration, workspace files and the database; the browser never
+// computes one. Secrets travel only as `{configured, last4}`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a configured value lives. `file` is `config.local.yaml`, written by
+ * this wizard or `nerve init`; the other three were provided outside the
+ * wizard — an environment variable (directly or as a `${VAR}` reference),
+ * the tracked `settings.yaml` of a configuration repository, or the shared
+ * channel gateway — and the page shows them as managed, with nothing to
+ * replace or remove. Absent from an older backend, which means `file`.
+ */
+export type CredentialSource = 'file' | 'environment' | 'config-repo' | 'gateway';
+
+/** A secret as the server reports it: whether it is set, its last four, and where it lives. */
+export interface SecretOut {
+  configured: boolean;
+  last4: string | null;
+  source?: CredentialSource | null;
+}
+
+export type SetupAuthMode = 'local' | 'external';
+export type SetupMode = 'personal' | 'worker';
+export type SetupStepStatus = 'done' | 'pending' | 'skipped' | 'blocked';
+export type SetupStepId =
+  | 'claim' | 'mode' | 'provider' | 'profile' | 'memory'
+  | 'channels' | 'sources' | 'automation' | 'agents';
+export type SetupRestartMode = 'restart' | 'reload' | 'unsupported';
+
+export interface SetupClaimDetail {
+  username: string | null;
+  passwordless: boolean;
+}
+
+/**
+ * A worker's onboarding session. `ended` is a session that stopped without
+ * writing a plan into TASK.md (a placeholder key, a crash): the page links
+ * to it and offers to try again instead of waiting for it.
+ */
+export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'ended' | 'done';
+
+export interface SetupModeDetail {
+  mode: SetupMode | null;
+  templates_present: string[];
+  task_present: boolean;
+  onboarding: SetupOnboarding;
+  onboarding_session_id: string | null;
+}
+
+export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';
+export type SetupCredential =
+  | 'bedrock' | 'proxy' | 'api_key' | 'oauth_token' | 'environment' | 'none';
+
+export interface SetupProviderDetail {
+  type: SetupProviderType | string;
+  credential: SetupCredential;
+  /**
+   * Where the effective credential came from, when the server states it
+   * for the provider as a whole; otherwise it is read off the saved
+   * secret's own `source` (and `credential: 'environment'`).
+   */
+  credential_source?: CredentialSource | null;
+  anthropic_api_key: SecretOut;
+  claude_oauth_token: SecretOut;
+  proxy_enabled: boolean;
+  aws_region: string;
+  aws_profile: string;
+  model: string;
+  effort: string;
+  cron_model: string;
+  /** A short label the frontend turns into copy; `oauth_background_jobs` today. */
+  warning: string | null;
+  last_test: { ok: boolean; checked_at: string } | null;
+}
+
+export interface SetupProfileDetail {
+  /** What the instance holds (USER.md once filled; before that the person's own name). */
+  name: string | null;
+  name_source: 'account' | 'actor_header' | 'user_md' | string;
+  /**
+   * The requesting person's own name: the gateway header in external mode,
+   * the account's display name locally. Always theirs, never the shared
+   * USER.md value.
+   */
+  actor_name?: string | null;
+  display_name_editable: boolean;
+  /** `["name"]` under lockdown in local mode; `null` otherwise. */
+  writable_fields: string[] | null;
+  timezone: string;
+  timezone_is_default: boolean;
+  /** `HH:MM`, or `''` for both while quiet hours are off. */
+  quiet_start: string;
+  quiet_end: string;
+  /**
+   * Whether quiet hours are on (both times set). Off by default for a
+   * worker. Absent from an older backend, which always has both times.
+   */
+  quiet_enabled?: boolean;
+  /** The quiet hours are still the mode's default: personal 02:00–08:00, worker off. */
+  quiet_is_default: boolean;
+  language: string | null;
+  agent_name: string | null;
+  agent_emoji: string | null;
+  about_set: boolean;
+  user_md_pristine: Record<string, boolean>;
+  identity_md_pristine: Record<string, boolean>;
+}
+
+export interface SetupMemoryDetail {
+  openai_api_key: SecretOut;
+  embeddings_chosen: boolean;
+  embed_model: string;
+}
+
+export interface SetupTelegramDetail {
+  enabled: boolean;
+  bot_token: SecretOut;
+  bot_username: string | null;
+  live: boolean;
+  start_error: string | null;
+  dm_policy: string;
+  allowed_users_count: number;
+  pairing_available: boolean;
+  pairing_unavailable_reason: string | null;
+}
+
+/** The shared channel gateway's view of this instance's Slack streams (`slack.mode: hosted`). */
+export interface SlackGatewayStatus {
+  streams: number;
+  connected: boolean;
+  last_event_at: string | null;
+}
+
+export interface SetupSlackDetail {
+  enabled: boolean;
+  mode: 'socket' | 'hosted' | string;
+  bot_token: SecretOut;
+  app_token: SecretOut;
+  allow_users: string[];
+  allow_direct_messages: boolean;
+  allow_channels: string[];
+  /** Present when the channel gateway holds the connection; `null` or absent otherwise. */
+  gateway?: SlackGatewayStatus | null;
+}
+
+export interface SetupChannelsDetail {
+  telegram: SetupTelegramDetail;
+  slack: SetupSlackDetail;
+}
+
+/** The Telegram account a message-sync session is signed in as. */
+export interface TelegramSyncUser {
+  id: number;
+  username: string | null;
+  first_name: string;
+}
+
+/**
+ * What the checklist knows about the sync's user session file: whether it
+ * exists, whether it is authorised (`null` when it could not be checked —
+ * the sync was using it), and whose it is.
+ */
+export interface TelegramSyncSessionSummary {
+  present: boolean;
+  authorized: boolean | null;
+  user: TelegramSyncUser | null;
+}
+
+export interface SetupSourcesDetail {
+  github: { enabled: boolean; source?: CredentialSource | null };
+  gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
+  telegram: {
+    enabled: boolean;
+    api_id: SecretOut;
+    api_hash: SecretOut;
+    /** Absent from an older backend, which knows nothing about the session. */
+    session?: TelegramSyncSessionSummary | null;
+  };
+}
+
+export interface SetupCronJob {
+  id: string;
+  name: string;
+  description: string;
+  schedule: string;
+  schedule_text: string;
+  requires?: string | null;
+  requirement_met?: boolean;
+  enabled?: boolean;
+  /** Same value as `default_enabled`; the older name. */
+  default?: boolean;
+  /**
+   * Whether the mode's first-run default turns this optional job on. A
+   * worker's `task-planner` is off until its onboarding session decides.
+   * Absent from an older backend.
+   */
+  default_enabled?: boolean;
+}
+
+export interface SetupAutomationDetail {
+  file_present: boolean;
+  timezone: string;
+  core: SetupCronJob[];
+  optional: SetupCronJob[];
+}
+
+export interface SetupAgentsDetail {
+  enabled: string[];
+  conflict_policy: 'backup' | 'skip' | 'merge' | string;
+  available: string[];
+}
+
+export type SetupStepDetail =
+  | SetupClaimDetail | SetupModeDetail | SetupProviderDetail | SetupProfileDetail
+  | SetupMemoryDetail | SetupChannelsDetail | SetupSourcesDetail
+  | SetupAutomationDetail | SetupAgentsDetail;
+
+export interface SetupStep {
+  id: SetupStepId;
+  title: string;
+  status: SetupStepStatus;
+  required: boolean;
+  can_skip: boolean;
+  blocked_reason: string | null;
+  read_only: boolean;
+  read_only_reason: string | null;
+  /** Hash of the persisted part of `detail`; forms remount when it changes. */
+  etag: string;
+  summary: string;
+  files: string[];
+  detail: SetupStepDetail;
+}
+
+export interface SetupState {
+  generation: string;
+  auth_mode: SetupAuthMode;
+  mode: SetupMode | null;
+  lockdown: boolean;
+  writable: boolean;
+  read_only_reason: string | null;
+  restart_pending: boolean;
+  restart_reasons: string[];
+  restart_mode: SetupRestartMode;
+  restart_message: string;
+  /**
+   * The operator's command when `restart_mode` is `unsupported` (what
+   * `POST /api/system/restart` would answer as `command`). Optional: a
+   * backend that does not send it yet makes the Review step fall back to
+   * reading the command out of `restart_message`.
+   */
+  restart_command?: string | null;
+  finished: boolean;
+  steps_left: number;
+  warning: string | null;
+  steps: SetupStep[];
+}
+
+export interface RestartResponse {
+  mode: SetupRestartMode;
+  generation: string;
+  message: string;
+  command: string | null;
+  timeout_hint_seconds: number;
+}
+
+export interface SetupFinishResponse {
+  state: SetupState;
+  action: 'reloaded' | 'restart_required';
+  onboarding: { status: SetupOnboarding; session_id: string | null };
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  checked: 'api' | 'skipped' | string;
+  code: 'ok' | 'invalid_key' | 'network' | 'model_access' | 'timeout' | 'no_cli' | 'unknown' | string;
+  detail: string;
+  hint: string | null;
+  latency_ms: number | null;
+}
+
+export interface HostLogin {
+  available: boolean;
+  kind: 'oauth' | 'api_key' | string | null;
+  source: string | null;
+  /**
+   * How the detection ended: `found`, `none` (every source was readable and
+   * held no login) or `unreadable` (a source — the Keychain — could not be
+   * consulted from the service). Absent from an older backend.
+   */
+  lookup?: 'found' | 'none' | 'unreadable' | string;
+  /** Why nothing was found, in words; may carry the terminal fallback. */
+  reason?: string | null;
+}
+
+export interface SetupModel {
+  id: string;
+  label: string;
+  family: 'opus' | 'fable' | 'sonnet' | 'haiku' | 'other' | string;
+  /** The instance's configured model (Nerve's default on a fresh install). */
+  recommended: boolean;
+}
+
+export interface SetupModelsResponse {
+  /** The configured model first, then the catalogue as the API orders it (newest first). */
+  models: SetupModel[];
+  current: { model: string; effort: string };
+  efforts: string[];
+  discovered: boolean;
+  /**
+   * Nerve's own default, so the picker can say so when the instance was
+   * changed to something else. Absent from an older backend.
+   */
+  default_model?: string;
+}
+
+export interface SimpleTestResult {
+  ok: boolean;
+  detail: string | null;
+  hint?: string | null;
+}
+
+export interface TelegramTestResult extends SimpleTestResult {
+  bot_username?: string | null;
+}
+
+export interface SlackTestResult extends SimpleTestResult {
+  team?: string | null;
+  bot_user?: string | null;
+}
+
+export interface PairingStatus {
+  available: boolean;
+  reason: string | null;
+  live: boolean;
+  bot_username: string | null;
+  link: string | null;
+  allowed_users_count: number;
+  code_active: boolean;
+  expires_at: string | null;
+}
+
+export interface PairingCode {
+  code: string;
+  expires_at: string;
+  bot_username: string | null;
+  link: string | null;
+  allowed_users_count: number;
+}
+
+export interface SourcesPreflight {
+  github: { cli: boolean; authenticated: boolean; login: string | null; hint: string | null };
+  gmail: { cli: boolean; hint: string | null };
+  telegram: { credentials_configured: boolean };
+  checked_at: string;
+}
+
+/**
+ * The Telegram message sync's user session, as `GET
+ * /api/setup/sources/telegram/session` reports it — and as every login
+ * step except `start` answers. `configured` is the API id and hash being
+ * saved; `authorized: null` means the session could not be checked —
+ * `reason: "busy"` (the running sync holds the file) or `"unreachable"`
+ * (Telegram did not answer the probe); other reasons: `not_configured`,
+ * `no_session`, `telethon_missing`. `pending` names the login step the
+ * server is waiting on: `code`, or `password` when the account has two-step
+ * verification. The phone comes back masked only; the code, the password
+ * and the hash never come back. The login POSTs answer `400 {detail,
+ * field}` for a refused value, `429 {detail, retry_after}` for a flood
+ * wait, `409 {detail}` when nothing is pending or the code expired, and
+ * `502 {detail}` when Telegram could not be reached.
+ */
+export interface TelegramSyncSession {
+  configured: boolean;
+  session_present: boolean;
+  authorized: boolean | null;
+  user: TelegramSyncUser | null;
+  pending: 'code' | 'password' | null;
+  phone_masked: string | null;
+  reason: 'busy' | 'unreachable' | 'not_configured' | 'no_session' | 'telethon_missing' | string | null;
+}
+
+/** `POST …/session/start`: Telegram sent a login code. */
+export interface TelegramSyncLoginStarted {
+  pending: 'code';
+  phone_masked: string;
+  expires_in: number;
+}
+
+export interface DetectedAgent {
+  id: string;
+  label: string;
+  installed: boolean;
+  version: string | null;
+  config_paths: string[];
+  config_exists: boolean;
+  enabled: boolean;
+}
+
+export interface AgentsDetect {
+  agents: DetectedAgent[];
+}
+
+export interface EnvironmentCheck {
+  id: string;
+  label: string;
+  status: 'ok' | 'warn' | 'missing';
+  detail: string | null;
+  hint: string | null;
+}
+
+export interface SetupEnvironment {
+  checks: EnvironmentCheck[];
+  served: {
+    scheme: string;
+    host_is_loopback: boolean;
+    client_is_loopback: boolean;
+    https_hint: boolean;
+  };
+  bind_host: string;
+  port: number;
+  in_container: boolean;
+  supervision: 'none' | 'systemd' | 'docker' | string;
+  passwordless: boolean | null;
+  restart_mode: SetupRestartMode;
+  restart_message: string;
+  checked_at: string;
+}
+
+export interface HealthResponse {
+  status: string;
+  version?: string;
+  /** Boot generation; absent from an older backend. */
+  generation?: string;
+}
+
 /** One local account, as `/api/accounts` returns it. Never carries a credential. */
 export interface Account {
   id: string;
@@ -416,6 +853,87 @@ async function request<T>(path: string, options: RequestInit = {}, authenticate 
   return res.json();
 }
 
+/**
+ * `GET /health` — not under `/api`, unauthenticated, and deliberately a raw
+ * `fetch`: during a restart it answers with connection errors and 5xx, and
+ * none of those may reach the 401 handler or the hosted re-entry path.
+ */
+async function health(): Promise<HealthResponse> {
+  const res = await fetch('/health', { cache: 'no-store' });
+  if (!res.ok) throw new ApiError(res.status, await res.text());
+  return res.json() as Promise<HealthResponse>;
+}
+
+/** Consecutive `/health` answers that carried no generation (not 5xx). */
+let healthMisses = 0;
+const HEALTH_MISSES_BEFORE_FALLBACK = 2;
+
+/**
+ * The boot generation of whatever process is answering right now, or `null`
+ * while nothing usable answers (connection refused, 502/503/504, a gateway
+ * page). A front gateway that does not forward `/health` answers it with a
+ * 404, a 401/403 from its own auth wall, a 405, or an HTML page; after two
+ * such answers in a row this reads the generation from a raw `GET /api/setup`
+ * instead, with the gateway cookie and CSRF header — still outside
+ * `request()`, so a 401 mid-restart is just "not yet", not a sign-out.
+ *
+ * Only a network error or a 5xx means "still restarting". Every other answer
+ * without a JSON `generation` is a miss: Nerve's own `/health` is
+ * unauthenticated and always JSON, so anything else is something in front of
+ * it, and the fallback is the only path that reaches the new process there.
+ */
+/**
+ * A per-request deadline for the probe. During a restart a half-open
+ * connection would otherwise hang one poll for the browser's default (minutes),
+ * and the store's time-box could not fire. A timed-out request rejects and
+ * counts as "still restarting". Older runtimes without `AbortSignal.timeout`
+ * get an unbounded request, as before.
+ */
+const HEALTH_PROBE_TIMEOUT_MS = 5000;
+function probeSignal(): AbortSignal | undefined {
+  return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+    ? AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS)
+    : undefined;
+}
+
+async function healthGeneration(): Promise<string | null> {
+  if (healthMisses < HEALTH_MISSES_BEFORE_FALLBACK) {
+    let res: Response;
+    try {
+      res = await fetch('/health', { cache: 'no-store', signal: probeSignal() });
+    } catch {
+      return null;  // network or the deadline: still restarting
+    }
+    if (res.status >= 500) {
+      return null;  // 5xx: still restarting
+    } else if (!res.ok) {
+      healthMisses += 1;  // 401/403/404/405…: a gateway answering for Nerve
+    } else {
+      try {
+        const body = await res.json() as HealthResponse;
+        healthMisses = 0;
+        return typeof body.generation === 'string' ? body.generation : null;
+      } catch {
+        healthMisses += 1;  // a 200 that is not JSON: a gateway page
+      }
+    }
+    if (healthMisses < HEALTH_MISSES_BEFORE_FALLBACK) return null;
+  }
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (isHosted()) Object.assign(headers, csrfHeaders('GET'));
+    else if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const res = await fetch(`${API_BASE}/setup`, {
+      credentials: 'same-origin', headers, cache: 'no-store', signal: probeSignal(),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as { generation?: unknown };
+    return typeof body.generation === 'string' ? body.generation : null;
+  } catch {
+    return null;
+  }
+}
+
 export const api = {
   // Auth
   /**
@@ -454,6 +972,93 @@ export const api = {
   }) => request<SetupClaim>('/setup/claim', {
     method: 'POST', body: JSON.stringify(body),
   }),
+
+  // Setup wizard. Every call goes through `request()` so it carries the
+  // bearer locally and the gateway cookie plus CSRF header when hosted; none
+  // of these ever builds a `?token=` URL.
+  setupState: () => request<SetupState>('/setup'),
+
+  /** `PUT /api/setup/{step}` — patch semantics; answers the whole state. */
+  setupStep: (step: SetupStepId, body: Record<string, unknown>) =>
+    request<SetupState>(`/setup/${encodeURIComponent(step)}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
+
+  setupSkip: (step: SetupStepId, skipped: boolean) =>
+    request<SetupState>(
+      `/setup/steps/${encodeURIComponent(step)}/${skipped ? 'skip' : 'unskip'}`,
+      { method: 'POST', body: '{}' },
+    ),
+
+  setupFinish: () =>
+    request<SetupFinishResponse>('/setup/finish', { method: 'POST', body: '{}' }),
+
+  setupProviderTest: (body: Record<string, unknown>) =>
+    request<ProviderTestResult>('/setup/provider/test', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+
+  setupHostLogin: (refresh = false) =>
+    request<HostLogin>(`/setup/provider/host-login${refresh ? '?refresh=1' : ''}`),
+
+  setupModels: () => request<SetupModelsResponse>('/setup/models'),
+
+  setupMemoryTest: (body: { openai_api_key: string }) =>
+    request<SimpleTestResult>('/setup/memory/test', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+
+  setupTelegramTest: (body: { bot_token: string }) =>
+    request<TelegramTestResult>('/setup/channels/telegram/test', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+
+  setupSlackTest: (body: { bot_token: string; app_token: string }) =>
+    request<SlackTestResult>('/setup/channels/slack/test', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+
+  /** Pure read: never carries the code. */
+  setupPairing: () => request<PairingStatus>('/setup/channels/telegram/pairing'),
+
+  /** Issues a code; the only response that carries it. */
+  setupPairingStart: () =>
+    request<PairingCode>('/setup/channels/telegram/pairing', {
+      method: 'POST', body: '{}',
+    }),
+
+  setupSourcesPreflight: () => request<SourcesPreflight>('/setup/sources/preflight'),
+
+  // Telegram message sync: the one-time sign-in of the person's own account,
+  // done on the server (the session file never leaves it). The phone, the
+  // code and the password travel in the JSON body only.
+  setupTelegramSession: () => request<TelegramSyncSession>('/setup/sources/telegram/session'),
+  setupTelegramSessionStart: (body: { phone: string }) =>
+    request<TelegramSyncLoginStarted>('/setup/sources/telegram/session/start', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionCode: (body: { code: string }) =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/code', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionPassword: (body: { password: string }) =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/password', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  setupTelegramSessionCancel: () =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/cancel', { method: 'POST', body: '{}' }),
+  setupTelegramSessionLogout: () =>
+    request<TelegramSyncSession>('/setup/sources/telegram/session/logout', { method: 'POST', body: '{}' }),
+
+  setupAgentsDetect: () => request<AgentsDetect>('/setup/agents/detect'),
+
+  setupEnvironment: () => request<SetupEnvironment>('/setup/environment'),
+
+  restartSystem: () =>
+    request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),
+
+  health,
+  healthGeneration,
 
   // Accounts
   listAccounts: () => request<{ accounts: Account[] }>('/accounts'),

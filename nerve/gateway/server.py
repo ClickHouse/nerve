@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
 )
+from nerve.setup_checks import scrub_secrets as _scrub
 from nerve.utils.aio import stop_background_task
 
 logger = logging.getLogger(__name__)
@@ -323,6 +325,20 @@ async def lifespan(app: FastAPI):
     # Database.connect refuses a state directory that other users can write to.
     paths.ensure_nerve_home()
 
+    # Remember the configuration this process starts with: "is a restart
+    # pending" is answered by comparing it with what is on disk later. And
+    # retire the setup checklist's notes from the previous process — its
+    # restart debts and start-up errors describe a process that no longer runs.
+    from nerve import config_reload, setup_state
+
+    config_reload.remember_startup_config(config)
+    try:
+        _setup_notes = setup_state.load_state()
+        if setup_state.retire_on_boot(_setup_notes):
+            setup_state.save_state(_setup_notes)
+    except Exception as e:  # noqa: BLE001 — the wizard's scratch file must never stop a boot
+        logger.warning("Setup state could not be retired at boot: %s", e)
+
     # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
     os.environ.pop("CLAUDECODE", None)
 
@@ -484,18 +500,40 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logger.error("Failed to start Codex MCP loopback listener: %s", e)
 
-        # Start Telegram bot if enabled
+        # Start Telegram bot if enabled. A channel must never take the gateway
+        # down: ``TelegramChannel.start()`` runs ``Application.initialize()``,
+        # which calls getMe, so a revoked token would otherwise abort the whole
+        # lifespan — including the restart the setup wizard itself ends with.
+        # The failure is logged with the token scrubbed (python-telegram-bot
+        # embeds it in the message), recorded for the setup page and `nerve
+        # doctor`, and the gateway keeps booting without the channel.
         telegram_channel = None
         if config.telegram.enabled and config.telegram.bot_token:
             from nerve.channels.telegram import TelegramChannel
             # get_config, not the object read above: the channel resolves config per
             # use so a reload reaches the reads that happen per update (dm_policy).
-            telegram_channel = TelegramChannel(get_config, _engine.router)
-            telegram_channel.set_notification_service(notification_service)
-            _engine.register_channel(telegram_channel)
-            await telegram_channel.start()
-            startup_cleanups.append(("Telegram bot", telegram_channel.stop))
-            logger.info("Telegram bot started")
+            channel = TelegramChannel(get_config, _engine.router)
+            channel.set_notification_service(notification_service)
+            try:
+                await channel.start()
+            except Exception as exc:  # noqa: BLE001 — a channel must never take the gateway down
+                text = _scrub(f"{type(exc).__name__}: {exc}", config.telegram.bot_token)
+                logger.error("[ERR] Telegram bot failed to start: %s", text)
+                try:
+                    setup_state.record_boot_error("telegram", text)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Could not record the Telegram start failure: %s", e)
+                try:
+                    await channel.stop()
+                except Exception:  # noqa: BLE001 — half-built application
+                    pass
+            else:
+                telegram_channel = channel
+                # Registered only after a successful start, so a half-initialised
+                # channel is never reachable from the engine.
+                _engine.register_channel(telegram_channel)
+                startup_cleanups.append(("Telegram bot", telegram_channel.stop))
+                logger.info("Telegram bot started")
 
         # Install the lifecycle owner even when Slack starts disabled, so a later
         # reload can enable it without rebuilding gateway state.
@@ -823,17 +861,20 @@ async def lifespan(app: FastAPI):
 
         logger.info("Nerve started on %s:%d", config.gateway.host, config.gateway.port)
 
-        # Send startup notification to the user (Telegram only, silent)
-        try:
-            await notification_service.send_notification(
-                session_id="system",
-                title=f"Nerve started (pid {os.getpid()})",
-                priority="low",
-                channels=["telegram"],
-                silent=True,
-            )
-        except Exception as e:
-            logger.error("Failed to send startup notification: %s", e)
+        # Send startup notification to the user (Telegram only, silent). Skipped
+        # — not warned about — when Telegram is off or failed to start: an
+        # unconfigured instance must boot quietly.
+        if telegram_channel is not None:
+            try:
+                await notification_service.send_notification(
+                    session_id="system",
+                    title=f"Nerve started (pid {os.getpid()})",
+                    priority="low",
+                    channels=["telegram"],
+                    silent=True,
+                )
+            except Exception as e:
+                logger.error("Failed to send startup notification: %s", e)
 
         # Re-drive any sessions enrolled via `nerve restart --resume`. Runs as a
         # background task so a (possibly long) resumed turn never blocks startup;
@@ -984,6 +1025,12 @@ def create_app() -> FastAPI:
     @app.exception_handler(SkillIdError)
     async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # Setup field errors render as ``{"detail", "field"}`` so the wizard can
+    # attach the message to the input it is about.
+    from nerve.gateway.routes.setup import install_handlers as _install_setup_handlers
+
+    _install_setup_handlers(app)
 
     # FastAPI validation errors echo the rejected input, which can include the
     # setup token. Return them without the input.
@@ -1289,10 +1336,14 @@ def create_app() -> FastAPI:
 
         return Response(status_code=404)
 
-    # Health check (no auth required) — must be before static mount
+    # Health check (no auth required) — must be before static mount.
+    # ``generation`` is this process's boot id: the setup page polls it after
+    # a restart to know when the *new* process is answering.
+    from nerve import boot as _boot
+
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.1.0"}
+        return {"status": "ok", "version": "0.1.0", "generation": _boot.boot_id()}
 
     # Favicon from the tracked config subtree (see config.workspace_favicon).
     # No auth: a browser asks for this before anyone has logged in, so requiring
@@ -1320,6 +1371,21 @@ def create_app() -> FastAPI:
             str(path), media_type=content_type, headers=FAVICON_RESPONSE_HEADERS,
         )
 
+    # Every API path that no router claimed answers 404 JSON — registered
+    # after all routers (route order decides) and ahead of the SPA fallback,
+    # so an unregistered route (the claim in external mode, a typo) never
+    # becomes a 405 from the catch-all or a 200 carrying index.html that the
+    # frontend's request() would try to parse as JSON.
+    from fastapi.responses import JSONResponse
+
+    @app.api_route(
+        "/api/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def api_not_found(path: str):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+
     # Serve static web UI files if built
     web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
     if web_dist.exists():
@@ -1339,8 +1405,35 @@ def create_app() -> FastAPI:
                 return FileResponse(str(file_path))
             # Otherwise serve index.html for SPA routing
             return FileResponse(str(web_dist / "index.html"))
+    else:
+        # No built UI: a dead URL after `nerve init` is the worst first
+        # impression, so / and /setup answer with a static page that says what
+        # to do. Inline CSS, no JavaScript, no token. /api/* is unaffected.
+        from fastapi.responses import HTMLResponse
+
+        @app.get("/", include_in_schema=False)
+        @app.get("/setup{path:path}", include_in_schema=False)
+        async def ui_not_built(path: str = ""):
+            return HTMLResponse(_UI_NOT_BUILT_PAGE, status_code=200)
 
     return app
+
+
+_UI_NOT_BUILT_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nerve — web UI not built</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1.5rem;color:#1f2933;background:#f8fafc}
+h1{font-size:1.4rem}code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#e8edf2;border-radius:4px;padding:.1rem .35rem}
+pre{padding:.75rem 1rem;overflow:auto}p{margin:.75rem 0}
+</style></head><body>
+<h1>Nerve is running, but its web UI has not been built yet</h1>
+<p>The API answers; the page you asked for needs the built front end. On the server, run one of:</p>
+<pre>cd web &amp;&amp; npm ci &amp;&amp; npm run build</pre>
+<pre>nerve upgrade</pre>
+<p>then reload this page. Nothing else needs to change.</p>
+</body></html>
+"""
 
 
 async def _load_uploaded_files(
@@ -1407,6 +1500,58 @@ async def _load_uploaded_files(
     return images, image_refs
 
 
+class RedactTokenQuery(logging.Filter):
+    """Drop ``token=<value>`` query values from uvicorn's access-log lines.
+
+    The local-mode frontend opens ``/ws?token=<session jwt>`` and uvicorn
+    logs the full request target, so without this the instance log would
+    hold a live bearer credential in plain text after every browser session
+    (``WebSocket /ws?token=… [accepted]``). The filter rewrites the record's
+    arguments in place and never drops a line.
+    """
+
+    _PATTERN = re.compile(r"([?&](?:token|access_token)=)[^&\s\"']+")
+
+    @classmethod
+    def redact(cls, text: str) -> str:
+        return cls._PATTERN.sub(r"\1<redacted>", text)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple):
+            record.args = tuple(self.redact(a) if isinstance(a, str) else a for a in args)
+        elif isinstance(args, dict):
+            record.args = {k: (self.redact(v) if isinstance(v, str) else v) for k, v in args.items()}
+        if isinstance(record.msg, str) and "token=" in record.msg:
+            record.msg = self.redact(record.msg)
+        return True
+
+
+#: Every logger uvicorn writes request lines through. HTTP access lines go to
+#: ``uvicorn.access``; the WebSocket ``"WebSocket /ws?token=…" [accepted]``
+#: line goes through ``uvicorn.error`` (uvicorn's protocol logger), so the
+#: filter has to sit on all of them.
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def uvicorn_log_config() -> dict[str, Any]:
+    """uvicorn's default logging config with :class:`RedactTokenQuery` on
+    every uvicorn logger. A copy: uvicorn's own dict is never mutated."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config.setdefault("filters", {})["redact_token_query"] = {
+        "()": "nerve.gateway.server.RedactTokenQuery",
+    }
+    loggers = config.setdefault("loggers", {})
+    for name in _UVICORN_LOGGERS:
+        entry = loggers.setdefault(name, {})
+        entry["filters"] = [*entry.get("filters", []), "redact_token_query"]
+    return config
+
+
 def run_server(config: NerveConfig | None = None) -> None:
     """Run the Nerve server with uvicorn."""
     import uvicorn
@@ -1430,5 +1575,6 @@ def run_server(config: NerveConfig | None = None) -> None:
         # GatewayConfig.loop for why that stalls a large gateway.
         loop=config.gateway.loop,
         log_level="info",
+        log_config=uvicorn_log_config(),
         **ssl_config,
     )

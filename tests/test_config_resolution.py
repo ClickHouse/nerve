@@ -396,11 +396,11 @@ class TestAppendTelegramAllowedUser:
 
 
 class TestModelDefaultsAndAliases:
-    def test_default_model_is_opus_5(self):
-        from nerve.config import AgentConfig
+    def test_default_model_is_the_one_constant(self):
+        from nerve.config import DEFAULT_MODEL, AgentConfig
 
         cfg = AgentConfig.from_dict({})
-        assert cfg.model == "claude-opus-5"
+        assert cfg.model == DEFAULT_MODEL == "claude-opus-5-5"
         assert cfg.model_aliases == {}
 
     def test_model_aliases_parsed_and_normalized(self):

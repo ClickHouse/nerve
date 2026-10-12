@@ -25,6 +25,34 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+# Default Claude models — update HERE when Anthropic ships a new generation.
+#
+# This block is the only place a default model id is spelled. Every other
+# site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
+# ``opus`` alias, the terminal wizard's example line) references these names,
+# and ``tests/test_default_models.py`` fails on a model-id literal anywhere
+# else under ``nerve/`` — so the next update is one edit here plus the
+# regenerated goldens, examples and docs.
+DEFAULT_MODEL = "claude-opus-5-5"               # agent.model (conversations)
+DEFAULT_CRON_MODEL = "claude-sonnet-4-6"        # agent.cron_model
+DEFAULT_TITLE_MODEL = "claude-haiku-4-5-20251001"  # agent.title_model
+DEFAULT_RECALL_MODEL = "claude-sonnet-4-6"      # memory.recall_model
+DEFAULT_MEMORIZE_MODEL = "claude-sonnet-4-6"    # memory.memorize_model
+DEFAULT_FAST_MODEL = "claude-haiku-4-5-20251001"   # memory.fast_model
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
+
+# Fallback for the composer's Claude model picker when ``agent.models`` is
+# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
+# — the current generation, the configured default first. Bare Anthropic API
+# IDs: they do not apply on Bedrock, where model IDs are region-prefixed.
+DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
+    DEFAULT_MODEL,
+    DEFAULT_FALLBACK_MODEL,
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+)
+
 # Runtime queue of session ids to auto-resume after ``nerve restart --resume``.
 # The CLI appends ids here (synchronously, before triggering the restart) and
 # the fresh daemon drains it on startup. Kept next to the other machine-local
@@ -202,6 +230,24 @@ def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
 # letting shared settings live in the workspace.
 
 
+def _path_exists(path: Path) -> bool:
+    """``path.exists()`` that answers ``False`` for a path this account cannot
+    even stat.
+
+    ``Path.exists()`` raises ``PermissionError`` when a parent directory may not
+    be traversed. The host side of a Docker deployment hits that on Linux:
+    ``config.yaml`` names the container's workspace under ``/root``, which the
+    host's user cannot look into, and there is nothing of ours to read there.
+    For the config loader an unreachable path is an absent one; a file we can
+    see but not open is still reported by the caller (``open()`` fails).
+    """
+    try:
+        return path.exists()
+    except OSError as e:
+        logger.debug("config: %s is not reachable from this account (%s); treating it as absent", path, e)
+        return False
+
+
 def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Read a YAML file into a dict; ``{}`` if absent or empty.
 
@@ -235,7 +281,7 @@ def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     to debug. YAML is UTF-8 by spec, so pinning it is also the correct reading
     of the file.
     """
-    if not path.exists():
+    if not _path_exists(path):
         return {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -648,12 +694,20 @@ def read_machine_layers(config_dir: Path) -> dict[str, Any]:
     )
 
 
-def _read_config_sources(config_dir: Path) -> dict[str, Any]:
+def _read_config_sources(config_dir: Path, *, workspace: Path | None = None) -> dict[str, Any]:
     """Merge all config layers for ``config_dir`` and resolve ${ENV_VAR} refs.
 
     Returns the fully-merged, env-interpolated config dict (untyped). Shared by
     :func:`load_config` and :func:`load_mcp_servers` so both see the same view.
+
+    ``workspace`` overrides where the workspace is: the tracked settings file
+    is read from there and the ``workspace`` key resolves to it. The host side
+    of a Docker deployment needs this — ``config.yaml`` names the *container*
+    path while the same directory is bind-mounted somewhere on the host — so
+    ``nerve status``/``doctor`` can derive the setup checklist from the real
+    files. A lockdown anchor still wins (the environment decides there).
     """
+    override = Path(workspace).expanduser() if workspace is not None else None
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
     # Check each layer's ``auth`` before the merge. After it, a valid machine
@@ -671,6 +725,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     anchored = lockdown_anchor()
     if anchored:
         workspace = _anchored_workspace()
+    elif override is not None:
+        workspace = override
     else:
         # The workspace path comes from the machine-local config (or the
         # default), never from the tracked settings file — resolve it first.
@@ -712,6 +768,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     else:
         # Precedence, lowest first: settings < config.yaml < config.local.yaml
         merged = _deep_merge(_deep_merge(ws_settings, base), local)
+        if override is not None:
+            merged["workspace"] = str(workspace)  # the caller's view, not config.yaml's
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
 
@@ -836,17 +894,8 @@ class PromptRewriteConfig:
         )
 
 
-# Fallback for the composer's Claude model picker when ``agent.models`` is
-# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
-# — the current-generation models Nerve itself defaults to elsewhere in this
-# file. Bare Anthropic API IDs: they do not apply on Bedrock, where model IDs
-# are region-prefixed.
-DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
-    "claude-opus-5",
-    "claude-opus-5-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-)
+# The default model ids live in the constants block at the top of this file
+# (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
 
 
 @dataclass
@@ -860,14 +909,14 @@ class AgentConfig:
     # Wakeup turns fire on existing sessions and inherit their stored
     # backend — this only affects freshly minted cron/hook sessions.
     cron_backend: str = ""
-    model: str = "claude-opus-5"
-    cron_model: str = "claude-sonnet-4-6"
-    title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
+    model: str = DEFAULT_MODEL
+    cron_model: str = DEFAULT_CRON_MODEL
+    title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → claude-opus-5 on
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL on
     # non-Bedrock providers; entries here merge over that default, and an
     # empty value ("") unsets it (falls back to the CLI's built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
@@ -901,7 +950,7 @@ class AgentConfig:
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
-    effort: str = "max"         # max, xhigh, high, medium, low
+    effort: str = DEFAULT_EFFORT  # max, xhigh, high, medium, low
     # Effort for cron- and hook-sourced turns (sensing / triage work). These
     # fire far more often than interactive sessions and rarely need Opus-tier
     # deliberation, so they default lower than `effort` above to cut token
@@ -989,9 +1038,9 @@ class AgentConfig:
         return cls(
             backend=str(d.get("backend", "claude")).strip().lower(),
             cron_backend=str(d.get("cron_backend") or "").strip().lower(),
-            model=d.get("model", "claude-opus-5"),
-            cron_model=d.get("cron_model", "claude-sonnet-4-6"),
-            title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
+            model=d.get("model", DEFAULT_MODEL),
+            cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
+            title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
@@ -1004,7 +1053,7 @@ class AgentConfig:
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
-            effort=str(d.get("effort", "max")),
+            effort=str(d.get("effort", DEFAULT_EFFORT)),
             cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=_str_list(
@@ -1939,9 +1988,9 @@ class MemoryCategoryConfig:
 
 @dataclass
 class MemoryConfig:
-    recall_model: str = "claude-sonnet-4-6"  # Recall routing
-    memorize_model: str = "claude-sonnet-4-6"  # Extraction & preprocessing
-    fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
+    recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
+    memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
+    fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
     embed_model: str = ""
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
@@ -1955,9 +2004,9 @@ class MemoryConfig:
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
         return cls(
-            recall_model=d.get("recall_model", "claude-sonnet-4-6"),
-            memorize_model=d.get("memorize_model", "claude-sonnet-4-6"),
-            fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
+            recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
+            memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
+            fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
             embed_model=d.get("embed_model", ""),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
@@ -1968,7 +2017,7 @@ class MemoryConfig:
 
 def _cron_dir_has_jobs(d: Path) -> bool:
     """True if a cron dir actually holds job definitions (jobs.yaml or system.yaml)."""
-    return (d / "jobs.yaml").exists() or (d / "system.yaml").exists()
+    return _path_exists(d / "jobs.yaml") or _path_exists(d / "system.yaml")
 
 
 def _resolve_cron_dir(workspace: Path | None, locked: bool = False) -> Path:
@@ -3219,6 +3268,11 @@ class NerveConfig:
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     brave_search_api_key: str = ""
+    # A Claude subscription token (`claude setup-token`), exported to the
+    # Claude CLI as CLAUDE_CODE_OAUTH_TOKEN when no API key is set. Not an
+    # API key: background jobs that call the API directly (memory, titles)
+    # still need one.
+    claude_oauth_token: str = ""
 
     # Where this config was loaded from (set by load_config, not a YAML key).
     # Used by anything that needs to write back (e.g. Telegram pairing
@@ -3242,6 +3296,36 @@ class NerveConfig:
         if self.proxy.enabled:
             return self.proxy.api_key
         return self.anthropic_api_key
+
+    def credential_available(self) -> bool:
+        """Whether the agent can talk to a model at all.
+
+        One answer for the setup page, memU, title generation and the model
+        catalogue, so an environment-provisioned instance (``ANTHROPIC_API_KEY``
+        or ``CLAUDE_CODE_OAUTH_TOKEN`` in the gateway's environment, which the
+        Claude CLI subprocess inherits) is not "done" in Setup and "no
+        credential" in memory at the same time.
+        """
+        return bool(
+            self.effective_api_key
+            or self.provider.is_bedrock
+            or self.proxy.enabled
+            or self.claude_oauth_token
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+
+    def resolve_anthropic_api_key(self) -> str:
+        """The API key background jobs should use: config, else the environment.
+
+        Empty for Bedrock and the proxy (they do not take one) and when only
+        an OAuth token exists (it is not an API key).
+        """
+        if self.effective_api_key:
+            return self.effective_api_key
+        if self.provider.is_bedrock or self.proxy.enabled:
+            return ""
+        return os.environ.get("ANTHROPIC_API_KEY", "") or ""
 
     @property
     def ollama_routable(self) -> bool:
@@ -3335,8 +3419,12 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        # The key the checks accept (config, else the environment). An explicit
+        # ``api_key`` — ``""`` included — stops the SDK from reading the
+        # environment itself, so the environment-only install the checks call
+        # "configured" would otherwise send an empty key and get a 401.
         return anthropic.Anthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),
             base_url=base_url,
             timeout=timeout,
         )
@@ -3365,7 +3453,7 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         return anthropic.AsyncAnthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
             timeout=timeout,
         )
@@ -3469,6 +3557,7 @@ class NerveConfig:
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
+            claude_oauth_token=str(d.get("claude_oauth_token", "") or ""),
         )
 
 
@@ -3563,7 +3652,7 @@ def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
     return cwd, "default"
 
 
-def load_config(config_dir: Path | None = None) -> NerveConfig:
+def load_config(config_dir: Path | None = None, *, workspace: Path | None = None) -> NerveConfig:
     """Load and type the effective configuration.
 
     Merges (lowest→highest precedence) ``workspace/config/settings.yaml``
@@ -3571,7 +3660,8 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
     ``config.local.yaml`` (machine secrets/overrides), then resolves
     ``${ENV_VAR}`` references. The workspace location is taken from the
     machine-local config (or the default) before the tracked settings file is
-    read.
+    read — unless ``workspace`` names it explicitly (the host side of a Docker
+    deployment, where ``config.yaml`` carries the container path).
 
     If config_dir is None, the directory is resolved via the waterfall in
     :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
@@ -3582,7 +3672,7 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
 
     # Assemble config from workspace/config/settings.yaml + config.yaml +
     # config.local.yaml (lowest→highest precedence) and resolve ${ENV_VAR} refs.
-    merged = _read_config_sources(config_dir)
+    merged = _read_config_sources(config_dir, workspace=workspace)
 
     # Surface typos and stale keys instead of silently ignoring them.
     for warning in validate_config_keys(merged):
@@ -3834,8 +3924,9 @@ def lockdown_machine_local_notes(
 # --- Unknown-key validation ---
 
 # YAML keys that are intentionally not dataclass fields — keyed by dotted
-# prefix ("" is the top level). claude_oauth_token / github_token are read
-# from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+# prefix ("" is the top level). github_token is read from config.local.yaml by
+# the Docker entrypoint, not by NerveConfig (claude_oauth_token became a field:
+# the Claude backend exports it to the CLI).
 #
 # The `<channel>.source` entries are the transport's own spelling of
 # ChannelSourceConfig's `allow_conversations` / `deny_conversations`:
@@ -3847,7 +3938,7 @@ def lockdown_machine_local_notes(
 # teaching the walk about the remap keeps a real typo (`allow_channel`)
 # reported, which making the subtree opaque would not.
 _EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
-    "": {"claude_oauth_token", "github_token"},
+    "": {"github_token"},
     "slack.source": {"allow_channels", "deny_channels"},
     "telegram.source": {"allow_chats", "deny_chats"},
 }

@@ -52,6 +52,7 @@ from nerve.agent.prompts import (
     current_time_str,
     prepend_session_preamble,
     set_skill_manager,
+    worker_onboarding_prompt,
 )
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
@@ -70,7 +71,15 @@ from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import Actor
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.setup_writer import (
+    TASK_ONBOARDING_MARKER,
+    publish_text,
+    render_task_md,
+    task_description_from,
+    task_onboarding_pending,
+)
 from nerve.skills.manager import SkillManager
+from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +314,16 @@ class AgentEngine:
         # Keyed by session id; an entry survives a client rebuild that
         # happens before any turn was sent (the rebuild re-renders it).
         self._pending_preambles: dict[str, str] = {}
+
+    @property
+    def memory_bridge(self) -> Any | None:
+        """The memU bridge once :meth:`initialize` built it, else ``None``.
+
+        The setup page's Mode step applies the chosen memory categories to
+        the running service through it (``apply_categories``), so a browser
+        setup does not end in a restart for that alone.
+        """
+        return self._memory_bridge
 
     @property
     def config(self) -> NerveConfig:
@@ -567,14 +586,40 @@ class AgentEngine:
         return self._mcp_servers_cache
 
     def _needs_worker_onboarding(self) -> bool:
-        """Check if this is a worker instance that needs first-boot onboarding."""
+        """Check if this is a worker instance that needs first-boot onboarding.
+
+        Pending while ``TASK.md`` carries the template's onboarding marker —
+        the onboarding session deletes that line last, once every section is
+        filled — and, for files written by older versions, while it is still
+        the raw ``# Task`` form (:func:`nerve.setup_writer.task_onboarding_pending`).
+        """
         task_md = self.config.workspace / "TASK.md"
         if not task_md.exists():
             return False
-        content = task_md.read_text(encoding="utf-8").strip()
-        # Raw task description from init starts with "# Task\n\n"
-        # Structured TASK.md (post-onboarding) has "## Mission"
-        return content.startswith("# Task\n") and "## Mission" not in content
+        try:
+            content = task_md.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Worker onboarding: cannot read %s: %s", task_md, e)
+            return False
+        return task_onboarding_pending(content)
+
+    def ensure_worker_onboarding(self) -> bool:
+        """Start the first-boot onboarding session if it is due and not running.
+
+        The public, idempotent-per-process entry the setup wizard's finish
+        step uses when the mode was chosen in the browser after boot (the
+        start-up check in :meth:`initialize` has already run by then). Returns
+        whether a session was scheduled now. The session it creates is the one
+        :meth:`run_cron` names ``Cron: worker-onboarding`` with
+        ``source="cron"``, which is how the checklist recognises it.
+        """
+        task = getattr(self, "_onboarding_task", None)
+        if task is not None and not task.done():
+            return False
+        if not self._needs_worker_onboarding():
+            return False
+        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
+        return True
 
     async def _run_worker_onboarding(self) -> None:
         """Run the worker onboarding agent session on first boot."""
@@ -582,64 +627,19 @@ class AgentEngine:
 
         task_md = self.config.workspace / "TASK.md"
         raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
-        task_description = raw_task.strip()
-        # Strip the "# Task\n\n" prefix
-        if task_description.startswith("# Task\n\n"):
-            task_description = task_description[len("# Task\n\n"):]
+        task_description = task_description_from(raw_task)
+        if task_description is None:  # completed since the check; nothing to do
+            logger.info("Worker onboarding: TASK.md is already complete")
+            return
+        if TASK_ONBOARDING_MARKER not in raw_task:
+            # A raw ``# Task`` file from an older install. The session is told
+            # to fill the template in place, so give it the template: its text
+            # kept under the description heading, the marker on line 2.
+            await asyncio.to_thread(publish_text, task_md, render_task_md(task_description))
+            logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
 
-        prompt = (
-            "You are running the **first-boot onboarding** for this Nerve worker instance.\n\n"
-            f"The user described the task as:\n\n> {task_description}\n\n"
-            "Your job is to research this task thoroughly and configure the worker.\n\n"
-            "## Step 1: Research\n\n"
-            "Use your tools to understand the task deeply:\n"
-            "- **Fetch URLs** mentioned in the description (repos, docs, APIs)\n"
-            "- **Search the web** for relevant documentation and tools\n"
-            "- **Clone repos** if needed to understand their structure\n"
-            "- **Explore CI systems**, databases, APIs referenced in the task\n"
-            "- Take notes on what you discover — you'll need them for configuration\n\n"
-            "## Step 2: Rewrite TASK.md\n\n"
-            "Replace the raw description in TASK.md with a structured version:\n"
-            "- **## Mission**: What this worker does (1-2 sentences)\n"
-            "- **## Scope**: Repos, services, or systems to monitor\n"
-            "- **## Triggers**: What events to watch for\n"
-            "- **## Actions**: What to do when triggered (step by step)\n"
-            "- **## Approval**: What needs human approval vs autonomous action\n"
-            "- **## References**: Links to docs, APIs, tools discovered during research\n\n"
-            "## Step 3: Create Skills\n\n"
-            "Use `skill_create` to create domain-specific skills the worker will need.\n"
-            "Each skill should have clear step-by-step instructions for a procedure\n"
-            "(e.g., 'how to query the monitoring API', 'how to debug a deployment failure').\n\n"
-            "## Step 4: Configure Cron Jobs\n\n"
-            "Set up monitoring cron jobs by editing `<workspace>/config/cron/jobs.yaml`\n"
-            "(legacy installs may still use `~/.nerve/cron/jobs.yaml`).\n"
-            "This is the Nerve cron system — NOT the Anthropic SDK or system crontab.\n\n"
-            "The YAML format is:\n"
-            "```yaml\n"
-            "jobs:\n"
-            "  - id: my-monitor\n"
-            "    schedule: '*/15 * * * *'  # cron expression\n"
-            "    description: What this job does\n"
-            "    session_mode: persistent  # or 'isolated' for one-shot\n"
-            "    context_rotate_hours: 24  # reset context daily (persistent only)\n"
-            "    enabled: true\n"
-            "    prompt: |\n"
-            "      Instructions for what the agent should do each run.\n"
-            "      Reference Nerve tools: task_create, plan_propose, notify,\n"
-            "      memorize, skill_get, web_fetch, bash, etc.\n"
-            "```\n\n"
-            "Create cron jobs that implement the monitoring/actions described in the task.\n"
-            "Use `persistent` session_mode for jobs that need context across runs.\n\n"
-            "## Step 5: Create Initial Tasks\n\n"
-            "Use `task_create` for any remaining manual setup work the user needs to do.\n\n"
-            "## Step 6: Notify\n\n"
-            "When done, use `notify` to tell the user that onboarding is complete.\n"
-            "Include a summary of what was configured: TASK.md sections, skills created,\n"
-            "cron jobs added, and any tasks that need manual attention.\n\n"
-            "---\n\n"
-            "Be thorough. You have full tool access — bash, web fetch, file read/write,\n"
-            "skill_create, task_create, notify. This is a one-time setup — do it right.\n"
-        )
+        guide = await asyncio.to_thread(read_worker_guide)
+        prompt = worker_onboarding_prompt(task_description, guide)
 
         try:
             await self.run_cron(
@@ -728,6 +728,12 @@ class AgentEngine:
     def register_channel(self, channel: Any) -> None:
         """Register a channel with the router."""
         self.router.register(channel)
+
+    def channel(self, name: str) -> Any | None:
+        """The registered channel called ``name`` (``"telegram"``), or ``None``."""
+        if self._router is None:
+            return None
+        return self._router.get_channel(name)
 
     def register_channel_runtime(self, name: str, runtime: Any) -> None:
         """Publish the lifecycle owner for a dynamically managed channel."""
@@ -3613,8 +3619,11 @@ class AgentEngine:
     ) -> None:
         """Generate a meaningful short title for a session using a fast model."""
         try:
-            # Skip if no credentials are configured (neither API key nor Bedrock)
-            if not self.config.provider.is_bedrock and not self.config.effective_api_key:
+            # Skip if no credentials are configured. An OAuth-only credential
+            # cannot drive the API directly either (it is not an API key).
+            if not self.config.provider.is_bedrock and not (
+                self.config.resolve_anthropic_api_key()
+            ):
                 return
 
             client = self.config.create_anthropic_client(timeout=10.0)

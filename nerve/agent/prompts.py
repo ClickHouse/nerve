@@ -69,6 +69,169 @@ def _format_tool_list(excluded_tools: "set[str] | None" = None) -> str:
 PROMPT_FILES = ["SOUL.md", "TASK.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 
 
+# --- The worker's first-boot onboarding prompt --------------------------------
+
+WORKER_GUIDE_URL = "https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md"
+
+_ONBOARDING_STEPS = """\
+## Steps
+
+### 1. Research
+
+Fetch the URLs the description names (repositories, docs, APIs, dashboards); \
+clone the repositories the worker will work in; look at the CI systems, \
+databases and APIs involved; search the web for what you do not know. Keep \
+notes: the References section, the skills and the cron prompts come from them. \
+Record where each credential lives and how it is passed — never its value.
+
+### 2. Fill TASK.md in place
+
+`<workspace>/TASK.md` (already in your system prompt) is the worker template \
+with the description under `## Task description (as given)`. Fill every \
+section where it stands:
+
+- Keep every `##` heading, in its order, and keep the description section as \
+the operator wrote it.
+- Replace each `_(onboarding fills this in: …)_` placeholder and every \
+`Example:` line with this worker's content; the guide's anatomy table says \
+what belongs in each section and how long it may be.
+- Hard rules: one `### ⛔ HARD RULE: <one sentence of rule> [operator directive \
+YYYY-MM-DD]` heading per rule (`[added YYYY-MM-DD]` for a rule you derive), \
+the rule before any why, failing closed by enumeration. Rules the operator \
+stated in the description are operator directives; date them today.
+- Actions: the transition table (`| From | Event | To | Who holds the ball |`) \
+followed by an anti-patterns list. Statuses beyond `pending`, `in_progress`, \
+`done` and `deferred` are created once, with `task_status_create`.
+- Approval Required: the autonomous column is a standing grant; until it says \
+so, `SOUL.md`'s default — ask before anything external — applies.
+- References: pointers (auth mode, schema columns, canonical filters, label \
+vocabulary), never secrets; the long form goes to `TOOLS.md` under a dated \
+heading.
+- Keep the closing `Read the full guide:` link. Keep the file within about 4 KB: \
+rationale, measurements and history go to `memory/contexts/`, not here.
+
+### 3. Create skills
+
+`skill_create` one skill per procedure the worker will repeat: the \
+build-and-test routine, querying the failure database or CI API, reproducing \
+a failure class, publishing a PR the way the project expects. Steps, exact \
+commands, gotchas and an example in each; a third-person description with \
+trigger phrases.
+
+### 4. Configure cron jobs
+
+Append the worker's jobs to `<workspace>/config/cron/jobs.yaml` — Nerve's \
+scheduler (`nerve cron <id>` runs one by hand), not the system crontab. One job \
+per line of `TASK.md` § Triggers. Gate a job with `run_if` where the guide says, \
+so it stays idle until there is work: a `tasks` gate on the status and tag a \
+work job owns, a `messages` gate for inbox-driven \
+work, a `github_pr_activity` gate (with the bot's login as `author`) for a PR \
+monitor. Scan jobs that create the work run on their schedule, ungated. \
+`lock: true` and `catchup: false` on anything that may outrun its interval. \
+Procedure for one job goes in `config/cron/prompts/<job>.md`, loaded with \
+`prompt_file` and opening with "`TASK.md` is the kernel; this file is your \
+charter for the <job> phase." Format:
+
+```yaml
+jobs:
+  - id: work-queue
+    schedule: '*/15 * * * *'
+    description: Work one actionable task per run
+    session_mode: isolated          # persistent keeps context across runs
+    lock: true
+    catchup: false
+    run_if:
+      - type: tasks
+        status: pending
+        tag: source:ci-main
+    enabled: true
+    prompt_file: prompts/work-queue.md   # or an inline `prompt: |`
+```
+
+Then decide on the planner. The built-in jobs are in \
+`<workspace>/config/cron/system.yaml`: for a worker `task-planner` ships \
+disabled (after `nerve init --terminal` the skill jobs are disabled too). When \
+this worker should plan through the approval loop, enable `task-planner` by \
+overriding it by id in `jobs.yaml` (a job there replaces the `system.yaml` job \
+with the same id): `enabled: true`, with a prompt and a `tasks` gate \
+(`status: pending` and this worker's `tag`) scoped to the tasks it plans. Leave \
+it off when a work job with a standing grant covers the routine items. Say \
+which in `TASK.md` § Approval Required.
+
+### 5. Create initial tasks
+
+`task_create` one task per thing only the operator can do: credentials to \
+grant, accounts to create, access to request, decisions the description leaves \
+open.
+
+### 6. Walk through everything you did, then give next steps
+
+First `memorize` what you learned about the domain (`knowledge`) and what you \
+decided (`event`); the next session starts from zero. Then `notify` (priority \
+`high`) a walkthrough, and after step 7 end the session with the same \
+walkthrough as your final message. Both enumerate every change:
+
+- the `TASK.md` sections you filled;
+- the statuses you created;
+- the skills you created, by name;
+- the cron jobs you added or enabled: id, schedule, gate, session mode, and \
+whether it is enabled;
+- the tasks you created: their ids and what the operator must do for each;
+- what you memorized.
+
+Close both with a numbered **Next steps for the operator**: credentials and \
+access to grant (with the task ids), plans to approve, jobs to review or \
+enable, how to run a job by hand (`nerve cron <id>`), and what to watch during \
+the first runs.
+
+### 7. Delete the marker — last
+
+Only when every section of `TASK.md` is filled, delete its second line, the \
+`<!-- nerve:onboarding pending … -->` comment. That line is how Nerve knows \
+onboarding is still due: while it stands, the setup page reports onboarding as \
+pending and the next start runs this session again; once it is gone, the file \
+is the worker's. Do not remove it before the file is complete, and do not add \
+it back.
+"""
+
+
+def worker_onboarding_prompt(task_description: str, guide: str) -> str:
+    """The first-boot onboarding session's prompt for a worker.
+
+    Role line, the operator's description, the worker guide in full (it is
+    the standard the filled ``TASK.md`` is held to, so the session gets the
+    whole text rather than a link), then the steps. ``guide`` is the text of
+    ``docs/worker-best-practices.md`` (:func:`nerve.workspace.read_worker_guide`);
+    when it is empty the prompt points at the published copy instead.
+    """
+    quoted = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in task_description.strip().splitlines()
+    ) or "> (no description was given)"
+    body = guide.strip() or (
+        "(The guide could not be read from this installation. Fetch it from "
+        f"{WORKER_GUIDE_URL} and read it in full before step 2.)"
+    )
+    return (
+        "You are running the **first-boot onboarding** for this Nerve worker: one "
+        "session with full tool access that turns the operator's description into "
+        "a configured worker. Every later session is short and starts from zero; "
+        "what you write here is what they start from.\n\n"
+        "## The task, as the operator described it\n\n"
+        f"{quoted}\n\n"
+        "## The worker guide — apply it\n\n"
+        "Between the two rules below is `docs/worker-best-practices.md`, in full. "
+        "It is the standard this worker is held to: the `TASK.md` anatomy you are "
+        "about to fill, how to write rules that survive context pressure, the "
+        "plan-approve-execute loop, the task state machine, boundaries, execution "
+        "hygiene, memory, escalation. Read it before you research; before you "
+        "finish, check `TASK.md` against its One-Page Checklist.\n\n"
+        "---\n\n"
+        f"{body}\n\n"
+        "---\n\n"
+        f"{_ONBOARDING_STEPS}"
+    )
+
+
 def current_time_str(timezone_name: str = "America/New_York") -> str:
     """Minute-resolution local time, for the per-turn message reminder."""
     try:

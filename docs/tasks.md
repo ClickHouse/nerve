@@ -168,7 +168,7 @@ When a task has a deadline, reminders escalate:
 | 2 | +30 minutes | Follow-up |
 | 3 | +2 hours | URGENT |
 
-Escalation respects quiet hours (configurable, default 2AM-12PM).
+The escalation check pauses during quiet hours when they are set (`quiet_start`/`quiet_end`, see [config.md](config.md#quiet-hours)); with none set, a worker's default, it never pauses.
 
 ## Web UI
 

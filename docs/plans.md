@@ -16,7 +16,7 @@ Cron (every 4h) → persistent "task-planner" job
 User reviews (via /plans UI or chat tools)
   → approve → spawns implementation session (visible in Chat)
   → decline → marks plan declined
-  → request revision → sends feedback to same persistent planner session
+  → request revision → sends feedback to the session that proposed the plan
 ```
 
 ## Agent Tools
@@ -29,7 +29,7 @@ User reviews (via /plans UI or chat tools)
 | `plan_read` | Read full plan content. Used to review details before approving/declining. |
 | `plan_approve` | Approve a pending plan and spawn an implementation session. |
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
-| `plan_revise` | Request revision of a pending plan — sends feedback to the planner session, which calls `plan_update` to produce v+1. |
+| `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
 
 ### `plan_propose(task_id, content, plan_type?)`
 
@@ -73,7 +73,7 @@ User reviews (via /plans UI or chat tools)
 **When to use which:**
 - `plan_update` — you (or the planner) want to refine your own pending plan. The task stays open, history is linked. **Default choice for revisions.**
 - `plan_decline` — the user truly rejects the plan and abandons the effort. The task moves to `done`.
-- `plan_revise` — the user wants the original planner agent to rethink the plan. Sends feedback to the planner session, which then calls `plan_update`.
+- `plan_revise` — the user wants the agent that proposed the plan to rethink it. Sends feedback to the proposing session (the planner session for cron-made plans), which then calls `plan_update`.
 
 ### `plan_decline(plan_id, feedback?)`
 
@@ -88,7 +88,7 @@ User reviews (via /plans UI or chat tools)
 - Guards: only pending plans can be revised; feedback is required
 - Stores feedback on the plan record
 - Writes revision note to task history
-- Sends feedback as a message to the persistent `cron:task-planner` session
+- Sends feedback as a message to the session that proposed the plan (`cron:task-planner` for the planner's own plans)
 - Planner agent sees prior context + feedback, calls `plan_update` to produce v+1 linked to the existing plan
 - The current pending plan is automatically superseded by the update
 
@@ -118,7 +118,7 @@ The planner is a standard persistent cron job — no special service or engine c
 When the user requests a revision:
 
 1. User writes feedback in the plan detail page
-2. API sends feedback as a new message to the persistent `cron:task-planner` session
+2. API sends feedback as a new message to the session that proposed the plan (the persistent `cron:task-planner` session for its plans)
 3. The agent sees its prior planning context + the feedback
 4. Agent calls `plan_update(plan_id, content, feedback)` — old version becomes `superseded`, new version (v+1) is pending review
 5. The two plans stay linked via `parent_plan_id` so reviewers can see what changed
@@ -139,14 +139,13 @@ The user can monitor, stop, or interact with the implementation session from the
 
 ### Skill Proposals
 
-Plans from the `skill-extractor` and `skill-reviser` cron jobs follow a different approval path. When approved:
+Plans from the `skill-extractor` and `skill-reviser` cron jobs (`plan_type` `skill-create` / `skill-update`, auto-detected from the task's `source` field) go through the same approval path as any other plan — an `impl-<id>` session is spawned — with a skill-specific prompt:
 
-1. Plan content is parsed as a full SKILL.md file (YAML frontmatter + body)
-2. If the skill already exists → updated; otherwise → created
-3. Plan status → `completed`; task status → `done`
-4. No implementation session is spawned — the plan *is* the deliverable
+1. The session reads the approved plan as a full SKILL.md file (YAML frontmatter + body)
+2. `skill-create` → it calls `skill_create` with the name, description and body; `skill-update` → it calls `skill_update` with the full SKILL.md content
+3. It then calls `task_done` with a note describing what was done
 
-This is handled automatically by the plan approval handler based on the task's `source` field (`skill-extractor` or `skill-reviser`).
+The plan is marked `implementing` on approval and `failed` if the session raises.
 
 ## Database
 
