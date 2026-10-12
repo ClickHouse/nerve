@@ -41,13 +41,97 @@ class TestTheSetting:
         config_dir = _install(tmp_path, settings="setup:\n  local_secrets: false\n")
         assert load_config(config_dir).setup.local_secrets is False
 
-    @pytest.mark.parametrize("spelling", ["false", "no", "0", "off"])
-    def test_string_spellings_are_coerced_like_every_other_flag(self, spelling):
+    @pytest.mark.parametrize("spelling", ["false", "no", "0", "off", "False", " NO "])
+    def test_string_spellings_are_read_as_lockdown_reads_them(self, spelling):
         """An env reference interpolates to a string; ``bool("false")`` must not win."""
         assert NerveConfig.from_dict({"setup": {"local_secrets": spelling}}).setup.local_secrets is False
 
+    @pytest.mark.parametrize("spelling", ["true", "yes", "1", "on", "TRUE"])
+    def test_truthy_spellings_keep_the_permission(self, spelling):
+        assert NerveConfig.from_dict({"setup": {"local_secrets": spelling}}).setup.local_secrets is True
+
+    @pytest.mark.parametrize("value", ["flase", "ture", "maybe", "off,", "", "  ", "${KEEP_SECRETS}", 0, 1, 2, [], {}])
+    def test_an_unreadable_value_is_refused_not_read_as_allowed(self, value):
+        """The lenient coercion every other flag gets would fall back to the
+        default — ``True``, the position in which the page stores every key it
+        is handed — with one log line as the only signal. Refused instead."""
+        with pytest.raises(ConfigError) as ei:
+            NerveConfig.from_dict({"setup": {"local_secrets": value}})
+        assert "setup.local_secrets must be true or false" in str(ei.value)
+
+    def test_a_bare_key_is_refused_not_read_as_allowed(self):
+        """``local_secrets:`` with no value: unlike ``lockdown:``, where a bare
+        key is the restrictive default, here it would be the permissive one."""
+        with pytest.raises(ConfigError) as ei:
+            NerveConfig.from_dict({"setup": {"local_secrets": None}})
+        assert "setup.local_secrets must be true or false" in str(ei.value)
+
     def test_a_bare_section_is_the_default(self):
         assert NerveConfig.from_dict({"setup": None}).setup.local_secrets is True
+        assert NerveConfig.from_dict({"setup": {}}).setup.local_secrets is True
+
+
+class TestTheTrackedFileValue:
+    """What ``settings.yaml`` says is read strictly, the way ``lockdown`` is:
+    a typo in the one key that decides whether the page stores credentials
+    stops the load rather than quietly reading as "allowed"."""
+
+    @pytest.mark.parametrize("text", ["flase", "ture", "maybe", '"maybe"', "off,", "null", "~", "", '""'])
+    def test_an_unreadable_value_is_refused(self, tmp_path, text):
+        config_dir = _install(tmp_path, settings=f"setup:\n  local_secrets: {text}\n")
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "setup.local_secrets must be true or false" in str(ei.value)
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("true", True), ("false", False), ("yes", True), ("no", False), ("off", False),
+            ('"false"', False), ("'no'", False), ('"0"', False), ('"1"', True), ('"on"', True),
+        ],
+    )
+    def test_a_readable_value_still_works(self, tmp_path, text, expected):
+        """Real YAML booleans and the quoted spellings an env reference leaves behind."""
+        config_dir = _install(tmp_path, settings=f"setup:\n  local_secrets: {text}\n")
+        assert load_config(config_dir).setup.local_secrets is expected
+
+    def test_an_unset_reference_is_refused_by_name(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("KEEP_SECRETS", raising=False)
+        config_dir = _install(tmp_path, settings="setup:\n  local_secrets: ${KEEP_SECRETS}\n")
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "KEEP_SECRETS" in str(ei.value)
+
+    @pytest.mark.parametrize("value, expected", [("no", False), ("0", False), ("1", True), ("true", True)])
+    def test_a_reference_is_judged_by_what_it_resolves_to(self, tmp_path, monkeypatch, value, expected):
+        monkeypatch.setenv("KEEP_SECRETS", value)
+        config_dir = _install(tmp_path, settings="setup:\n  local_secrets: ${KEEP_SECRETS}\n")
+        assert load_config(config_dir).setup.local_secrets is expected
+
+    @pytest.mark.parametrize("value", ["junk", "", " "])
+    def test_a_reference_that_resolves_to_junk_or_nothing_is_refused(self, tmp_path, monkeypatch, value):
+        monkeypatch.setenv("KEEP_SECRETS", value)
+        config_dir = _install(tmp_path, settings="setup:\n  local_secrets: ${KEEP_SECRETS}\n")
+        with pytest.raises(ConfigError) as ei:
+            load_config(config_dir)
+        assert "setup.local_secrets must be true or false" in str(ei.value)
+
+    def test_a_default_in_the_reference_is_read(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("KEEP_SECRETS", raising=False)
+        config_dir = _install(tmp_path, settings="setup:\n  local_secrets: ${KEEP_SECRETS:-false}\n")
+        assert load_config(config_dir).setup.local_secrets is False
+
+    def test_a_machine_layer_value_is_read_the_same_way(self, tmp_path):
+        config_dir = _install(tmp_path, base="setup:\n  local_secrets: flase\n")
+        with pytest.raises(ConfigError):
+            load_config(config_dir)
+
+    def test_the_validator_reports_it(self, tmp_path):
+        from nerve.config_validate import validate_config_bundle
+
+        config_dir = _install(tmp_path, settings="setup:\n  local_secrets: flase\n")
+        result = validate_config_bundle(config_dir, workspace_override=tmp_path / "ws")
+        assert any("setup.local_secrets must be true or false" in e for e in result.errors)
 
     def test_an_unknown_key_under_setup_is_reported_not_fatal(self):
         from nerve.config import validate_config_keys
@@ -131,3 +215,16 @@ class TestDoctor:
     def test_says_nothing_otherwise(self, tmp_path):
         config_dir, _workspace = self._slim(tmp_path)
         assert "local_secrets" not in cli.doctor_report(load_config(config_dir))
+
+    def test_reports_an_unreadable_value_instead_of_crashing(self, tmp_path):
+        """The same path a ``lockdown`` typo takes: the config does not load,
+        and the doctor says why rather than raising."""
+        from click.testing import CliRunner
+
+        config_dir, workspace = self._slim(tmp_path)
+        merge_settings_paths(workspace, {"setup.local_secrets": "flase"})
+        result = CliRunner().invoke(cli.main, ["-c", str(config_dir), "doctor"])
+        assert result.exit_code == 1
+        assert "config failed to load" in result.output
+        assert "setup.local_secrets must be true or false" in result.output
+        assert "Traceback" not in result.output

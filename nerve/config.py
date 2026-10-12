@@ -664,6 +664,45 @@ def _as_lockdown(value: Any) -> bool:
     )
 
 
+def _as_local_secrets(value: Any) -> bool:
+    """Parse ``setup.local_secrets``, refusing anything that isn't a plain yes/no.
+
+    The lenient coercion every other boolean gets falls back to the field's
+    default for a value it cannot read — and this field's default is ``True``,
+    the position in which the setup page stores every credential it is
+    handed. An operator who wrote ``local_secrets: flase`` into the tracked
+    settings meant to keep credentials off this instance; reading that as
+    "allowed" would undo the instruction with one log line as the only
+    signal, and the first person through the page would store the keys the
+    setting exists to keep away. So the key is read the way ``lockdown`` is:
+    real booleans and the documented spellings pass, anything else is a hard
+    :class:`ConfigError`. Unlike ``lockdown``, a bare key (``local_secrets:``)
+    is refused too: there the bare key is the restrictive default, here it
+    would be the permissive one, and a value that says nothing must not
+    grant it.
+
+    By the time this runs the ``${VAR}`` pass is over, so a reference that
+    did not resolve has already been refused by name; what reaches here is
+    the resolved text, judged as the setting's value.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in TRUTHY:
+            return True
+        if text in FALSY:
+            return False
+    raise ConfigError(
+        f"setup.local_secrets must be true or false, got {value!r}. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); a "
+        f"bare key or an empty value is not one of them. Refused rather than "
+        f"assumed, because assuming would mean assuming 'true' — letting the "
+        f"setup page store on this instance the credentials the setting exists "
+        f"to keep off it."
+    )
+
+
 def _resolved(path: Path) -> Path:
     """``path`` with symlinks followed; the path itself if it cannot be resolved."""
     try:
@@ -2521,7 +2560,12 @@ class SetupConfig:
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> SetupConfig:
-        return cls(local_secrets=d.get("local_secrets", True))
+        # Parsed strictly rather than left to @_coerced, which would read a
+        # value it cannot parse as the default — "store credentials here".
+        # See :func:`_as_local_secrets`. An absent key is the default.
+        if "local_secrets" not in d:
+            return cls()
+        return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
 
 
 @dataclass
