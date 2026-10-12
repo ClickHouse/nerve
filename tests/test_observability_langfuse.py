@@ -1,9 +1,11 @@
 """Tests for nerve.observability.langfuse — covers no-op behavior when
 keys are absent, redaction, init wiring with mocked SDK, and flush.
 
-These tests deliberately avoid importing the real langfuse package by
-patching ``sys.modules`` before ``init_langfuse`` runs. That way they
-pass regardless of whether the optional observability deps are installed.
+The ``init_langfuse`` tests patch ``sys.modules`` with a fake SDK before
+``init_langfuse`` runs, so they never touch the real packages or the
+network. The span redaction tests use the real ``langfuse`` types and span
+processor (skipped when the package is missing), because the hook contract
+belongs to the SDK.
 """
 
 from __future__ import annotations
@@ -24,18 +26,22 @@ def _reset_lf_state(monkeypatch):
     """Reset module state and clear LANGFUSE_* env vars between tests."""
     lf._enabled = False
     lf._host = ""
+    lf._project_id = None
     lf._redact_patterns = []
     lf._last_flush_at = None
     lf._auth_ok = False
     lf._usage_rewriter = False
+    lf._client = None
     for var in (
         "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST",
+        "LANGFUSE_BASE_URL",
         "LANGSMITH_OTEL_ENABLED", "LANGSMITH_OTEL_ONLY", "LANGSMITH_TRACING",
     ):
         monkeypatch.delenv(var, raising=False)
     yield
     lf._enabled = False
     lf._redact_patterns = []
+    lf._client = None
 
 
 def _config_with(**kwargs):
@@ -79,19 +85,34 @@ def test_init_noop_when_config_lacks_langfuse_attr():
 # ---------------------------------------------------------------------------
 
 
+class _FakeApiError(Exception):
+    """Stands in for langfuse.api.core.api_error.ApiError."""
+
+    def __init__(self, status_code: int | None) -> None:
+        super().__init__(f"status_code: {status_code}")
+        self.status_code = status_code
+
+
 def _install_fake_langfuse(monkeypatch, *, auth_ok: bool = True):
     """Install a fake langfuse + langsmith + opentelemetry-instrumentation
     into sys.modules so ``init_langfuse`` doesn't touch the real packages.
 
-    Returns the configure_claude_agent_sdk and AnthropicInstrumentor mocks
-    so tests can assert they were called.
+    ``auth_ok=True`` makes the key check return one project; ``False`` makes
+    it raise an HTTP 401 error. Returns the client, the ``Langfuse``
+    constructor, and the configure_claude_agent_sdk and AnthropicInstrumentor
+    mocks so tests can assert they were called.
     """
     fake_client = MagicMock()
-    fake_client.auth_check.return_value = auth_ok
+    if auth_ok:
+        fake_client.api.projects.get.return_value = SimpleNamespace(
+            data=[SimpleNamespace(id="proj-test", name="test project")],
+        )
+    else:
+        fake_client.api.projects.get.side_effect = _FakeApiError(401)
     fake_client.flush = MagicMock()
 
     fake_lf = MagicMock()
-    fake_lf.get_client = MagicMock(return_value=fake_client)
+    fake_lf.Langfuse = MagicMock(return_value=fake_client)
     # propagate_attributes returns a context manager — use MagicMock's
     # __enter__/__exit__ defaults.
     fake_lf.propagate_attributes = MagicMock(return_value=MagicMock(
@@ -123,36 +144,74 @@ def _install_fake_langfuse(monkeypatch, *, auth_ok: bool = True):
     )
     return SimpleNamespace(
         client=fake_client,
+        constructor=fake_lf.Langfuse,
         configure=fake_configure,
         instrumentor_inst=fake_instrumentor_inst,
         instrumentor_cls=fake_instrumentor_cls,
     )
 
 
-def test_init_with_keys_sets_env_and_calls_instrumentors(monkeypatch):
+def test_init_with_keys_passes_keys_to_client_and_calls_instrumentors(monkeypatch):
     fakes = _install_fake_langfuse(monkeypatch, auth_ok=True)
 
     cfg = _config_with(
         public_key="pk-lf-test",
         secret_key="sk-lf-test",
-        host="https://cloud.langfuse.com",
+        host="https://cloud.langfuse.com/",
     )
     assert lf.init_langfuse(cfg) is True
     assert lf.is_enabled() is True
 
-    # Env vars set
-    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-lf-test"
-    assert os.environ["LANGFUSE_SECRET_KEY"] == "sk-lf-test"
-    assert os.environ["LANGFUSE_HOST"] == "https://cloud.langfuse.com"
+    # The keys go to the client constructor, with the redaction hook.
+    fakes.constructor.assert_called_once()
+    kwargs = fakes.constructor.call_args.kwargs
+    assert kwargs["public_key"] == "pk-lf-test"
+    assert kwargs["secret_key"] == "sk-lf-test"
+    assert kwargs["base_url"] == "https://cloud.langfuse.com"
+    assert kwargs["mask_otel_spans"] is lf._mask_otel_spans
+
+    # LangSmith flags are set; they hold no credentials.
     assert os.environ["LANGSMITH_OTEL_ENABLED"] == "true"
     assert os.environ["LANGSMITH_OTEL_ONLY"] == "true"
     assert os.environ["LANGSMITH_TRACING"] == "true"
 
+    # Key check ran once and its project id reaches the status block.
+    fakes.client.api.projects.get.assert_called_once()
+    status = lf.get_status()
+    assert status["project_id"] == "proj-test"
+    assert status["auth_ok"] is True
+    assert status["host"] == "https://cloud.langfuse.com"
+
     # Instrumentors called
-    fakes.client.auth_check.assert_called_once()
     fakes.configure.assert_called_once()
     fakes.instrumentor_cls.assert_called_once()
     fakes.instrumentor_inst.instrument.assert_called_once()
+
+
+def test_init_keeps_keys_out_of_the_process_environment(monkeypatch):
+    """Child processes (the Claude CLI, shell tools, Codex) copy
+    ``os.environ``, so the keys must never be written there."""
+    _install_fake_langfuse(monkeypatch, auth_ok=True)
+    cfg = _config_with(public_key="pk-lf-test", secret_key="sk-lf-test")
+    assert lf.init_langfuse(cfg) is True
+
+    assert "LANGFUSE_PUBLIC_KEY" not in os.environ
+    assert "LANGFUSE_SECRET_KEY" not in os.environ
+    assert "LANGFUSE_HOST" not in os.environ
+    assert not any("sk-lf-test" in value for value in os.environ.values())
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_init_disabled_when_host_rejects_keys(monkeypatch, status_code):
+    fakes = _install_fake_langfuse(monkeypatch, auth_ok=True)
+    fakes.client.api.projects.get.side_effect = _FakeApiError(status_code)
+    cfg = _config_with(public_key="pk-lf-bad", secret_key="sk-lf-bad")
+
+    assert lf.init_langfuse(cfg) is False
+    assert lf.is_enabled() is False
+    fakes.client.shutdown.assert_called_once()
+    fakes.configure.assert_not_called()
+    fakes.instrumentor_cls.assert_not_called()
 
 
 def test_init_disabled_when_auth_check_fails(monkeypatch):
@@ -162,12 +221,44 @@ def test_init_disabled_when_auth_check_fails(monkeypatch):
     assert lf.is_enabled() is False
 
 
-def test_init_disabled_when_auth_check_raises(monkeypatch):
+def test_init_disabled_when_no_project_matches_keys(monkeypatch):
     fakes = _install_fake_langfuse(monkeypatch, auth_ok=True)
-    fakes.client.auth_check.side_effect = RuntimeError("network down")
+    fakes.client.api.projects.get.return_value = SimpleNamespace(data=[])
     cfg = _config_with(public_key="pk-lf-x", secret_key="sk-lf-x")
+
     assert lf.init_langfuse(cfg) is False
     assert lf.is_enabled() is False
+    fakes.client.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "error", [ConnectionError("network down"), _FakeApiError(503)],
+)
+def test_init_stays_enabled_when_key_check_cannot_reach_host(monkeypatch, error):
+    """A Langfuse outage at startup must not turn tracing off until the
+    next restart; only a rejected key pair does that."""
+    fakes = _install_fake_langfuse(monkeypatch, auth_ok=True)
+    fakes.client.api.projects.get.side_effect = error
+    cfg = _config_with(public_key="pk-lf-x", secret_key="sk-lf-x")
+
+    assert lf.init_langfuse(cfg) is True
+    assert lf.is_enabled() is True
+    status = lf.get_status()
+    assert status["auth_ok"] is False
+    assert status["project_id"] is None
+    fakes.client.shutdown.assert_not_called()
+    fakes.configure.assert_called_once()
+    fakes.instrumentor_inst.instrument.assert_called_once()
+
+
+def test_init_disabled_when_client_constructor_raises(monkeypatch):
+    fakes = _install_fake_langfuse(monkeypatch, auth_ok=True)
+    fakes.constructor.side_effect = ValueError("bad base_url")
+    cfg = _config_with(public_key="pk-lf-x", secret_key="sk-lf-x")
+
+    assert lf.init_langfuse(cfg) is False
+    assert lf.is_enabled() is False
+    fakes.configure.assert_not_called()
 
 
 def test_init_continues_when_anthropic_instrumentor_fails(monkeypatch):
@@ -308,6 +399,167 @@ def test_redact_handles_no_patterns():
     lf._enabled = True
     lf._redact_patterns = []
     assert lf.redact("anything") == "anything"
+
+
+# ---------------------------------------------------------------------------
+# Span redaction on export (mask_otel_spans)
+# ---------------------------------------------------------------------------
+
+# Synthetic values in the shape of the default patterns. Not real keys.
+_FAKE_ANTHROPIC_KEY = "sk-ant-" + "A1b2C3d4" * 4
+_FAKE_LANGFUSE_SECRET = "sk-lf-" + "0f0f0f0f" * 4
+
+
+def _default_patterns():
+    from nerve.config import LangfuseConfig
+    return lf._compile_patterns(LangfuseConfig().redact_patterns)
+
+
+def test_compile_patterns_skips_invalid_regex():
+    compiled = lf._compile_patterns(["(", r"ok-\d+"])
+    assert [p.pattern for p in compiled] == [r"ok-\d+"]
+
+
+def test_redact_attributes_returns_only_changed_values():
+    patterns = _default_patterns()
+    attributes = {
+        "gen_ai.prompt.0.content": f"use {_FAKE_ANTHROPIC_KEY} for the call",
+        "gen_ai.prompt.1.content": "nothing secret here",
+        "gen_ai.usage.input_tokens": 12,
+        "langfuse.trace.tags": ("source:web", _FAKE_LANGFUSE_SECRET),
+        "flags": (True, False),
+    }
+    changed = lf.redact_attributes(attributes, patterns)
+
+    assert changed == {
+        "gen_ai.prompt.0.content": "use [REDACTED] for the call",
+        "langfuse.trace.tags": ("source:web", "[REDACTED]"),
+    }
+
+
+def test_redact_attributes_without_patterns_changes_nothing():
+    assert lf.redact_attributes({"a": _FAKE_ANTHROPIC_KEY}, []) == {}
+
+
+def test_mask_hook_patches_only_spans_with_secrets():
+    types = pytest.importorskip("langfuse.types", reason="langfuse not installed")
+    lf._redact_patterns = _default_patterns()
+
+    def span(span_id: str, attributes: dict):
+        return types.OtelSpanData(
+            trace_id="0" * 32, span_id=span_id, parent_span_id=None,
+            name="claude.assistant.turn", instrumentation_scope_name="langsmith",
+            instrumentation_scope_version=None, attributes=attributes,
+            resource_attributes={},
+        )
+
+    secret_id = types.OtelSpanIdentifier(trace_id="0" * 32, span_id="1" * 16)
+    clean_id = types.OtelSpanIdentifier(trace_id="0" * 32, span_id="2" * 16)
+    params = types.MaskOtelSpansParams(spans={
+        secret_id: span("1" * 16, {"output": f"key={_FAKE_LANGFUSE_SECRET}"}),
+        clean_id: span("2" * 16, {"output": "plain text"}),
+    })
+
+    result = lf._mask_otel_spans(params=params)
+
+    assert isinstance(result, types.MaskOtelSpansResult)
+    assert set(result.span_patches) == {secret_id}
+    assert dict(result.span_patches[secret_id].set_attributes) == {
+        "output": "key=[REDACTED]",
+    }
+
+
+def test_mask_hook_returns_none_without_patterns_or_matches():
+    types = pytest.importorskip("langfuse.types", reason="langfuse not installed")
+    identifier = types.OtelSpanIdentifier(trace_id="0" * 32, span_id="1" * 16)
+    params = types.MaskOtelSpansParams(spans={
+        identifier: types.OtelSpanData(
+            trace_id="0" * 32, span_id="1" * 16, parent_span_id=None, name="s",
+            instrumentation_scope_name="langsmith",
+            instrumentation_scope_version=None,
+            attributes={"output": "plain text"}, resource_attributes={},
+        ),
+    })
+
+    lf._redact_patterns = []
+    assert lf._mask_otel_spans(params=params) is None
+    lf._redact_patterns = _default_patterns()
+    assert lf._mask_otel_spans(params=params) is None
+
+
+class _RecordingExporter:
+    """Minimal SpanExporter that keeps every exported batch."""
+
+    def __init__(self):
+        self.batches = []
+
+    def export(self, spans):
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        self.batches.append(list(spans))
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self):
+        return None
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True
+
+
+def test_real_pipeline_redacts_spans_and_keeps_usage_rewrite():
+    """End a span through a real LangfuseSpanProcessor that has the hook
+    and the usage rewriter installed, the way init_langfuse wires them."""
+    span_processor = pytest.importorskip(
+        "langfuse._client.span_processor", reason="langfuse not installed",
+    )
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from nerve.observability.usage_rewrite import (
+        GEN_AI_CACHE_READ_TOKENS,
+        GEN_AI_INPUT_TOKENS,
+        USAGE_METADATA_ATTR,
+        install_usage_rewriter,
+    )
+
+    lf._redact_patterns = _default_patterns()
+    delegate = _RecordingExporter()
+    processor = span_processor.LangfuseSpanProcessor(
+        public_key="pk-test",
+        secret_key="sk-test",
+        base_url="http://localhost:9",
+        span_exporter=delegate,
+        mask_otel_spans=lf._mask_otel_spans,
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    client = SimpleNamespace(_resources=SimpleNamespace(tracer_provider=provider))
+
+    try:
+        assert install_usage_rewriter(client) is True
+        tracer = provider.get_tracer("langsmith")
+        with tracer.start_as_current_span("claude.assistant.turn") as span:
+            span.set_attribute(
+                "gen_ai.prompt.0.content", f"token {_FAKE_ANTHROPIC_KEY} here",
+            )
+            span.set_attribute(
+                USAGE_METADATA_ATTR,
+                '{"input_tokens": 100, "output_tokens": 5, '
+                '"input_token_details": {"cache_read": 90}}',
+            )
+            span.set_attribute(GEN_AI_INPUT_TOKENS, 100)
+        processor.force_flush()
+
+        exported = [s for batch in delegate.batches for s in batch]
+        assert len(exported) == 1
+        attributes = exported[0].attributes
+        assert attributes["gen_ai.prompt.0.content"] == "token [REDACTED] here"
+        assert attributes[GEN_AI_INPUT_TOKENS] == 10
+        assert attributes[GEN_AI_CACHE_READ_TOKENS] == 90
+        assert not any(
+            isinstance(v, str) and _FAKE_ANTHROPIC_KEY in v
+            for v in attributes.values()
+        )
+    finally:
+        provider.shutdown()
 
 
 # ---------------------------------------------------------------------------

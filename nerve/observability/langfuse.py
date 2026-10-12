@@ -2,27 +2,38 @@
 
 Activation is purely config-driven: when both ``langfuse.public_key`` and
 ``langfuse.secret_key`` are set in config, this module wires up tracing of
-the agent loop and memU LLM calls. With keys absent, every public function
-is a no-op and Nerve runs identically.
+the agent loop and of direct Anthropic SDK calls. With keys absent, every
+public function is a no-op and Nerve runs identically.
 
 Implementation notes
 --------------------
-- Built on the Langfuse Python SDK (>= 3.0), which itself wraps OpenTelemetry.
+- Built on the Langfuse Python SDK (>= 4.17), which itself wraps
+  OpenTelemetry.
+- The keys go only to the ``Langfuse`` client constructor. Nerve does not
+  write them to ``os.environ``, so child processes (the Claude CLI, the
+  agent's shell tools, Codex) do not inherit them.
 - The Claude Agent SDK is instrumented via
   ``langsmith.integrations.claude_agent_sdk.configure_claude_agent_sdk``,
   which routes its OTEL spans into Langfuse via the ``LANGSMITH_OTEL_*``
   flags.
-- Direct Anthropic SDK calls (used in :mod:`nerve.memory.memu_bridge`) are
-  instrumented via ``opentelemetry.instrumentation.anthropic.AnthropicInstrumentor``.
-- Trace-level attributes (``session_id``, ``user_id``, ``tags``, ``metadata``)
-  are propagated to every span inside a wrapped block via OpenTelemetry
-  Baggage using :func:`langfuse.propagate_attributes`.
+- Direct Anthropic SDK calls (session titles, memU on Bedrock, memU date
+  resolution) are instrumented via
+  ``opentelemetry.instrumentation.anthropic.AnthropicInstrumentor``.
+- Trace-level attributes (``session_id``, ``user_id``, ``tags``,
+  ``metadata``) are propagated to every span inside a wrapped block via
+  :func:`langfuse.propagate_attributes`, through the in-process
+  OpenTelemetry context.
+- ``langfuse.redact_patterns`` are applied to the string attributes of
+  every span this client exports, through the SDK's ``mask_otel_spans``
+  export hook. Span names and span events are not redacted.
 
 Failure mode
 ------------
-Initialization is best-effort. Bad keys, network failures, or missing
-optional packages log a warning and leave Nerve running with observability
-disabled — they never raise.
+Initialization is best-effort. A key pair that the host rejects, or a
+missing package, logs a warning and leaves Nerve running with
+observability disabled. If the startup key check cannot reach the host,
+tracing stays on and the exporter sends spans once the host answers.
+Nothing here raises.
 """
 
 from __future__ import annotations
@@ -36,6 +47,11 @@ from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
+REDACTED = "[REDACTED]"
+
+# HTTP statuses with which a Langfuse host rejects a key pair.
+_REJECTED_KEY_STATUSES = frozenset({401, 403})
+
 # ---------------------------------------------------------------------------
 # Module state
 # ---------------------------------------------------------------------------
@@ -44,10 +60,12 @@ logger = logging.getLogger(__name__)
 
 _enabled: bool = False
 _host: str = ""
+_project_id: str | None = None
 _redact_patterns: list[re.Pattern[str]] = []
 _last_flush_at: str | None = None
 _auth_ok: bool = False
 _usage_rewriter: bool = False
+_client: Any = None
 
 
 def is_enabled() -> bool:
@@ -56,10 +74,16 @@ def is_enabled() -> bool:
 
 
 def get_status() -> dict[str, Any]:
-    """Status block for ``/api/diagnostics`` and the UI deep-link."""
+    """Status block for ``/api/diagnostics`` and the UI deep-link.
+
+    ``project_id`` is None until the startup key check reaches the host.
+    The UI needs it to link to a session, because Langfuse UI routes start
+    with ``/project/<id>``.
+    """
     return {
         "enabled": _enabled,
         "host": _host or None,
+        "project_id": _project_id,
         "auth_ok": _auth_ok,
         "last_flush_at": _last_flush_at,
         "usage_rewriter": _usage_rewriter,
@@ -70,10 +94,11 @@ def init_langfuse(config: Any) -> bool:
     """Initialize Langfuse + OTEL instrumentation if keys are configured.
 
     Returns True when active, False when disabled (no keys, missing
-    packages, or auth failure). Never raises — observability must not be
-    able to take down the gateway.
+    packages, or a rejected key pair). Never raises: observability must
+    not be able to take down the gateway.
     """
-    global _enabled, _host, _redact_patterns, _auth_ok, _usage_rewriter
+    global _enabled, _host, _project_id, _redact_patterns, _auth_ok
+    global _usage_rewriter, _client
 
     lf = getattr(config, "langfuse", None)
     if lf is None:
@@ -87,38 +112,68 @@ def init_langfuse(config: Any) -> bool:
 
     host = (getattr(lf, "host", "") or "https://cloud.langfuse.com").rstrip("/")
 
-    # Set env vars before any import — both the Langfuse SDK and the
-    # LangSmith integration read these at import / client-init time.
-    os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
-    os.environ["LANGFUSE_SECRET_KEY"] = secret_key
-    os.environ["LANGFUSE_HOST"] = host
+    # The LangSmith integration reads these flags when it is configured.
+    # They hold no credentials.
     os.environ.setdefault("LANGSMITH_OTEL_ENABLED", "true")
     os.environ.setdefault("LANGSMITH_OTEL_ONLY", "true")
     os.environ.setdefault("LANGSMITH_TRACING", "true")
 
     try:
-        from langfuse import get_client
+        from langfuse import Langfuse
     except ImportError as e:
         logger.warning(
-            "Langfuse: package not installed (%s) — observability disabled. "
-            "Install with: uv pip install -e .[observability]", e,
+            "Langfuse: package not importable (%s) — observability disabled. "
+            "Run `uv sync` to reinstall Nerve's dependencies.", e,
         )
         return False
 
+    # The export hook reads the compiled patterns, so compile them before
+    # the client can export anything.
+    _redact_patterns = _compile_patterns(getattr(lf, "redact_patterns", []))
+
     try:
-        client = get_client()
-        _auth_ok = bool(client.auth_check())
-        if not _auth_ok:
-            logger.warning(
-                "Langfuse: auth_check failed against %s — observability disabled. "
-                "Verify pk/sk pair.", host,
-            )
-            return False
+        client = Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=host,
+            mask_otel_spans=_mask_otel_spans,
+        )
     except Exception as e:
         logger.warning(
-            "Langfuse: auth_check raised (%s) — observability disabled", e,
+            "Langfuse: client setup failed (%s) — observability disabled",
+            type(e).__name__,
         )
         return False
+
+    # Key check: the same request as ``Langfuse.auth_check()``, which also
+    # returns the project id for the UI deep link.
+    try:
+        projects = client.api.projects.get()
+        data = list(getattr(projects, "data", None) or [])
+        if not data:
+            logger.warning(
+                "Langfuse: %s returned no project for this key pair — "
+                "observability disabled. Verify the pk/sk pair.", host,
+            )
+            _shutdown_quietly(client)
+            return False
+        _project_id = str(data[0].id)
+        _auth_ok = True
+    except Exception as e:
+        status = getattr(e, "status_code", None)
+        if status in _REJECTED_KEY_STATUSES:
+            logger.warning(
+                "Langfuse: %s rejected the key pair (HTTP %s) — "
+                "observability disabled. Verify the pk/sk pair.", host, status,
+            )
+            _shutdown_quietly(client)
+            return False
+        logger.warning(
+            "Langfuse: could not verify the keys against %s (%s) — tracing "
+            "stays on, and spans are sent when the host answers",
+            host, f"HTTP {status}" if status else type(e).__name__,
+        )
+        _auth_ok = False
 
     # Wrap the Langfuse OTLP exporter so LangSmith agent spans get
     # cache-aware usage attributes. Without this, Langfuse prices every
@@ -144,8 +199,8 @@ def init_langfuse(config: Any) -> bool:
         )
 
     # Wrap Claude Agent SDK. Failure here disables agent tracing but doesn't
-    # disable the rest — direct Anthropic instrumentation can still cover
-    # the memU pipeline.
+    # disable the rest — direct Anthropic instrumentation still covers
+    # session titles and memU's Anthropic calls.
     try:
         from langsmith.integrations.claude_agent_sdk import (
             configure_claude_agent_sdk,
@@ -157,32 +212,107 @@ def init_langfuse(config: Any) -> bool:
             "agent loop will not be traced", e,
         )
 
-    # Wrap direct Anthropic SDK (memU embeddings/condensation/classification).
+    # Wrap direct Anthropic SDK calls (session titles, memU on Bedrock,
+    # memU date resolution).
     try:
         from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
         AnthropicInstrumentor().instrument()
     except Exception as e:
         logger.warning(
             "Langfuse: failed to instrument Anthropic SDK (%s) — "
-            "memU LLM calls will not be traced", e,
+            "direct Anthropic calls will not be traced", e,
         )
 
-    # Compile redact patterns once. Bad regexes are skipped, not fatal.
-    raw_patterns = list(getattr(lf, "redact_patterns", []) or [])
+    _client = client
+    _enabled = True
+    _host = host
+    logger.info(
+        "Langfuse: enabled (host=%s, project=%s)", host, _project_id or "unverified",
+    )
+    return True
+
+
+def _compile_patterns(raw_patterns: Any) -> list[re.Pattern[str]]:
+    """Compile redact patterns. Bad regexes are skipped, not fatal."""
     compiled: list[re.Pattern[str]] = []
-    for pat in raw_patterns:
+    for pat in list(raw_patterns or []):
         try:
             compiled.append(re.compile(pat))
-        except re.error as e:
+        except (re.error, TypeError) as e:
             logger.warning(
                 "Langfuse: invalid redact pattern %r (%s) — skipped", pat, e,
             )
-    _redact_patterns = compiled
+    return compiled
 
-    _enabled = True
-    _host = host
-    logger.info("Langfuse: enabled (host=%s)", host)
-    return True
+
+def _shutdown_quietly(client: Any) -> None:
+    """Stop a client that will not be used. Errors are logged, never raised."""
+    try:
+        client.shutdown()
+    except Exception as e:
+        logger.debug("Langfuse: client shutdown failed (%s)", e)
+
+
+def _redact_text(text: str, patterns: list[re.Pattern[str]]) -> str:
+    out = text
+    for pat in patterns:
+        out = pat.sub(REDACTED, out)
+    return out
+
+
+def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
+    """Return a redacted copy of an OTEL attribute value.
+
+    Returns ``value`` itself when nothing matched, so callers can detect a
+    change with ``is``. Attribute values are scalars or homogeneous
+    sequences of scalars; only strings can hold a secret.
+    """
+    if isinstance(value, str):
+        redacted = _redact_text(value, patterns)
+        return value if redacted == value else redacted
+    if isinstance(value, (list, tuple)) and any(isinstance(v, str) for v in value):
+        items = [
+            _redact_text(v, patterns) if isinstance(v, str) else v for v in value
+        ]
+        return value if list(value) == items else tuple(items)
+    return value
+
+
+def redact_attributes(
+    attributes: Any, patterns: list[re.Pattern[str]],
+) -> dict[str, Any]:
+    """Return only the attributes that the patterns change, redacted."""
+    changed: dict[str, Any] = {}
+    if not patterns:
+        return changed
+    for key, value in attributes.items():
+        redacted = _redact_value(value, patterns)
+        if redacted is not value:
+            changed[key] = redacted
+    return changed
+
+
+def _mask_otel_spans(*, params: Any) -> Any:
+    """Langfuse ``mask_otel_spans`` hook: redact span attributes on export.
+
+    Runs on the span processor's export thread for every batch this client
+    sends. If it raises, Langfuse drops the whole batch, so a bug here
+    loses spans and never sends them unredacted.
+    """
+    patterns = _redact_patterns
+    if not patterns:
+        return None
+
+    from langfuse.types import MaskOtelSpansResult, OtelSpanPatch
+
+    patches = {}
+    for identifier, span in params.spans.items():
+        changed = redact_attributes(span.attributes, patterns)
+        if changed:
+            patches[identifier] = OtelSpanPatch(set_attributes=changed)
+    if not patches:
+        return None
+    return MaskOtelSpansResult(span_patches=patches)
 
 
 @contextmanager
@@ -246,10 +376,7 @@ def redact(text: str) -> str:
     """Apply configured redact patterns to a string. No-op when disabled."""
     if not _enabled or not text or not _redact_patterns:
         return text
-    out = text
-    for pat in _redact_patterns:
-        out = pat.sub("[REDACTED]", out)
-    return out
+    return _redact_text(text, _redact_patterns)
 
 
 def flush(timeout: float = 5.0) -> None:
@@ -259,12 +386,10 @@ def flush(timeout: float = 5.0) -> None:
     Langfuse Python SDK doesn't expose a per-call timeout on ``flush()``.
     """
     global _last_flush_at
-    if not _enabled:
+    if not _enabled or _client is None:
         return
     try:
-        from langfuse import get_client
-        client = get_client()
-        client.flush()
+        _client.flush()
         _last_flush_at = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         logger.debug("Langfuse flush failed (%s)", e)
