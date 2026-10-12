@@ -94,7 +94,7 @@ export function makeState(overrides: Partial<SetupState> = {}): SetupState {
   ];
   const pending = steps.filter((s) => s.status === 'pending').length;
   return {
-    generation: 'G0', auth_mode: 'local', mode: 'personal', lockdown: false, writable: true,
+    generation: 'G0', auth_mode: 'local', mode: 'personal', lockdown: false, local_secrets: true, writable: true,
     read_only_reason: null, restart_pending: false, restart_reasons: [], restart_mode: 'restart',
     restart_message: 'Restarting stops this process and starts a new one; this page reconnects on its own.',
     finished: false, steps_left: pending, warning: null,

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import {
-  api, type SetupProviderDetail, type SetupProviderType, type SetupStep,
+  api, type SetupProviderDetail, type SetupProviderType, type SetupState, type SetupStep,
 } from '../../../api/client';
 import { useSetupStore } from '../../../stores/setupStore';
 import { Button, Select, TextField } from '../../ui';
@@ -9,12 +9,13 @@ import { ChoiceCards } from '../ChoiceCards';
 import {
   COMMON_AWS_REGIONS, EFFORT_GUIDANCE, EFFORT_SERVER_DEFAULT, HOST_LOGIN_FOUND,
   HOST_LOGIN_NONE, HOST_LOGIN_UNREADABLE, HOST_LOGIN_UNREADABLE_HINT, MANAGED_SOURCE_HINT, MANAGED_SOURCE_TEXT,
-  MODEL_DEFAULT_LINE, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT,
+  MODEL_DEFAULT_LINE, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT, NO_LOCAL_SECRETS_TEXT,
   OAUTH_BACKGROUND_WARNING, PROVIDER_CARDS, PROVIDER_SAVED_PICK_MODEL, PROVIDER_TEST_FAILED_WARNING,
   STEP_HEADINGS, SUBSCRIPTION_NOTICE,
 } from '../copy';
 import { providerManaged } from '../credentialSource';
 import { CodeText, Field } from '../Field';
+import { keepsLocalSecrets } from '../navigation';
 import { Notice } from '../Notice';
 import { changedFields, decides, same, secretPayload } from '../payload';
 import { focusRadio, radioTabIndex, radioTarget } from '../rovingRadio';
@@ -83,8 +84,14 @@ interface Form {
  * configuration repository) is shown as managed: no cards, no key field,
  * no Replace, Remove or Test. The model and effort stay this instance's to
  * choose, so the picker still renders and a PUT can only carry those two.
+ *
+ * On an instance that keeps no credentials on disk (`local_secrets: false`)
+ * a pasted key or token could not be stored, so the cards for them are not
+ * offered: the sentence stands where the key field would be, AWS Bedrock
+ * (an IAM role, no secret) is the one card, a credential from the
+ * environment reads as managed exactly as above, and the picker is open.
  */
-export function ProviderStep({ step }: { step: SetupStep }) {
+export function ProviderStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupProviderDetail;
   const save = useSetupStore((s) => s.save);
   const fieldError = useSetupStore((s) => s.fieldError);
@@ -100,9 +107,13 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   const proxy = detail.credential === 'proxy';
   const locked = step.read_only || step.status === 'blocked';
   const done = step.status === 'done';
+  const keyless = !keepsLocalSecrets(state);
 
   const [initial] = useState<Form>(() => ({
-    type: TYPES.includes(detail.type as SetupProviderType) ? detail.type as SetupProviderType : 'anthropic',
+    // Nothing configured on an instance that stores no key: Bedrock is the
+    // one card left, so it opens selected rather than on a card that is gone.
+    type: keyless && detail.credential === 'none' ? 'bedrock'
+      : TYPES.includes(detail.type as SetupProviderType) ? detail.type as SetupProviderType : 'anthropic',
     anthropic_api_key: '',
     claude_oauth_token: '',
     aws_region: detail.aws_region || 'us-east-1',
@@ -289,6 +300,8 @@ export function ProviderStep({ step }: { step: SetupStep }) {
 
   const cards = PROVIDER_CARDS
     .filter((c) => c.value !== 'host_login' || hostLogin?.available)
+    // A key, a token and the server's login would all be stored here.
+    .filter((c) => !keyless || c.value === 'bedrock')
     .map((c) => ({
       value: c.value,
       title: c.title,
@@ -313,7 +326,10 @@ export function ProviderStep({ step }: { step: SetupStep }) {
   const dirty = !same(form, initial);
   const effortOff = () => !!locked;
 
-  const secretField = (key: SecretKey, extra: { removable?: boolean; onReplace?: () => void; startReplacing?: boolean } = {}) => (
+  const secretField = (
+    key: SecretKey,
+    extra: { removable?: boolean; replaceable?: boolean; onReplace?: () => void; startReplacing?: boolean } = {},
+  ) => (
     <SecretField
       label={SECRET_LABELS[key]}
       help={<CodeText text={SECRET_HELP[key]} />}
@@ -340,6 +356,9 @@ export function ProviderStep({ step }: { step: SetupStep }) {
       continueLabel={weakKeyWarning || testFailedWarning ? 'Save anyway' : undefined}
     >
       {managed && <Notice tone="locked">{MANAGED_SOURCE_TEXT[managed]}. {MANAGED_SOURCE_HINT[managed]}</Notice>}
+      {/* Where a key could otherwise be entered or replaced, the reason it
+          cannot be; a managed credential has already said who provides it. */}
+      {keyless && !managed && <Notice tone="locked">{NO_LOCAL_SECRETS_TEXT}</Notice>}
       {proxy && <Notice tone="info">Nerve reaches Claude through the local proxy that <code>nerve init --terminal</code> set up. You can change the model and effort here.</Notice>}
       {detail.warning === 'oauth_background_jobs' && <Notice tone="warning"><CodeText text={OAUTH_BACKGROUND_WARNING} /></Notice>}
       {savedNotice === 'provider' && <Notice tone="info">{PROVIDER_SAVED_PICK_MODEL}</Notice>}
@@ -347,7 +366,9 @@ export function ProviderStep({ step }: { step: SetupStep }) {
       {compact && (
         <div className="flex flex-col gap-3">
           {savedSecret ? (
-            secretField(savedSecret, { removable: false, onReplace: () => setChanging(true) })
+            // A replacement key could not be stored on an instance without
+            // local secrets; removing the saved one still can.
+            secretField(savedSecret, { removable: false, replaceable: !keyless, onReplace: () => setChanging(true) })
           ) : (
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-sm text-text-muted">

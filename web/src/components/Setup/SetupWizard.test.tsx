@@ -1687,6 +1687,120 @@ describe('lockdown', () => {
   });
 });
 
+describe('instances that keep no credentials on disk', () => {
+  const CLOSED = 'This instance does not keep credentials on disk. Connections are provided by the operator of this deployment.';
+  const closed = (id: Parameters<typeof step>[0]) => step(id, {
+    status: 'blocked', blocked_kind: 'policy', blocked_reason: CLOSED, read_only: true, read_only_reason: CLOSED,
+  });
+
+  /** Nothing provided yet: Model, About you and Automation still to do; the four storing steps closed. */
+  function keylessState(overrides: Partial<SetupState> = {}) {
+    return makeState({
+      local_secrets: false, steps_left: 3,
+      steps: [
+        step('claim', { status: 'done' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }),
+        step('provider'),
+        step('profile'),
+        closed('memory'), closed('channels'), closed('sources'),
+        step('automation'),
+        closed('agents'),
+      ],
+      ...overrides,
+    });
+  }
+
+  it('the overview says which steps are not available on this instance, and why', async () => {
+    current = keylessState();
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByText('Not available on this instance')).toHaveLength(4);
+    expect(rows.getAllByText(CLOSED)).toHaveLength(4);
+    for (const title of ['Memory', 'Channels', 'Sources', 'Agents']) {
+      const row = rows.getByRole('link', { name: title }).closest('li')!;
+      expect(row).toHaveTextContent('Not available on this instance');
+      expect(within(row).queryByText('Blocked')).not.toBeInTheDocument();
+      expect(within(row).queryByText('To do')).not.toBeInTheDocument();
+    }
+    expect(rows.getByRole('link', { name: 'Model' }).closest('li')).toHaveTextContent('To do');
+    // Not "already configured" either: nothing was configured, the steps are closed.
+    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    // The rail says the same in a chip, with a lock, and never calls it a chore.
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getAllByText('Not available')).toHaveLength(4);
+    expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+  });
+
+  it('opening a closed step shows the sentence instead of the form and reads Next', async () => {
+    current = keylessState();
+    renderAt('/setup/memory');
+    await heading('Memory');
+    expect(screen.getByText('Not available on this instance.')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent(CLOSED);
+    expect(screen.queryByRole('radiogroup', { name: 'Memory recall' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('OpenAI API key')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Test key/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Skip for now/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Next/ }));
+    // Continue passes over the closed steps: Memory → Automation.
+    expect(await heading('Scheduled jobs')).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+
+  it('the model step offers Bedrock and says why a key cannot be entered', async () => {
+    current = keylessState();
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    // Scoped to the form: the rail beside it repeats the sentence for every closed step.
+    const form = within(screen.getByRole('form', { name: 'Connect a model' }));
+    expect(form.getAllByRole('status').some((el) => el.textContent === CLOSED)).toBe(true);
+    const cards = within(screen.getByRole('radiogroup', { name: 'Model provider' }));
+    expect(cards.getAllByRole('radio')).toHaveLength(1);
+    expect(cards.getByRole('radio', { name: /AWS Bedrock/ })).toBeChecked();
+    expect(screen.queryByLabelText(/API key|subscription token/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('AWS region')).toHaveValue('us-east-1');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { type: 'bedrock', aws_region: 'us-east-1' }));
+  });
+
+  it('a credential from the environment reads as managed and the picker stays open', async () => {
+    current = keylessState({
+      steps: keylessState().steps.map((s) => (
+        s.id === 'provider' ? step('provider', { status: 'done' }, { credential: 'environment', credential_source: 'environment', anthropic_api_key: on('', 'environment') }) : s
+      )),
+    });
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    const form = within(screen.getByRole('form', { name: 'Connect a model' }));
+    expect(form.getByText(/Configured by your operator \(environment\)\./)).toBeInTheDocument();
+    // The managed line already says who provides the key; the sentence is not repeated under it.
+    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByRole('radiogroup', { name: 'Model provider' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^(Replace|Remove)$/ })).not.toBeInTheDocument();
+    expect(await screen.findByLabelText('Model')).toBeEnabled();
+  });
+
+  it('Slack through a channel gateway keeps its switch and nothing else', async () => {
+    const hosted = step('channels', { status: 'done', summary: 'Slack managed by the channel gateway · connected' }, {
+      telegram: CHANNELS.telegram,
+      slack: { ...CHANNELS.slack, mode: 'hosted', enabled: true, bot_token: on('', 'gateway'), app_token: on('', 'gateway'), gateway: { streams: 1, connected: true, last_event_at: null } },
+    });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'channels' ? hosted : s)) });
+    renderAt('/setup/channels');
+    await heading('Connect Telegram or Slack');
+    expect(screen.getAllByRole('status').some((el) => el.textContent === CLOSED)).toBe(true);
+    expect(screen.queryByRole('region', { name: 'Telegram' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Bot token')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Also connect Slack/ })).not.toBeInTheDocument();
+    const toggle = screen.getByLabelText('Slack enabled');
+    expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('channels', { slack: { enabled: false } }));
+  });
+});
+
 describe('review and the ending', () => {
   it('lists what waits on a restart and what the server check-up found', async () => {
     current = makeState({

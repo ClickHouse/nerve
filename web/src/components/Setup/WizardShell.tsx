@@ -6,7 +6,7 @@ import { useSetupStore } from '../../stores/setupStore';
 import { Button, Drawer, PageHeader, PaneToggle } from '../ui';
 import { ShieldCheck } from '../ui/icons';
 import {
-  REVIEW, nextStop, previousStop, stepOf, stepTitle, stopPath, stopPosition, type WizardStop,
+  REVIEW, closedByPolicy, nextStop, previousStop, stepOf, stepTitle, stopPath, stopPosition, type WizardStop,
 } from './navigation';
 import { Overview } from './Overview';
 import { ProgressRail } from './ProgressRail';
@@ -21,6 +21,7 @@ import { ProviderStep } from './steps/ProviderStep';
 import { ReviewStep } from './steps/ReviewStep';
 import { SourcesStep } from './steps/SourcesStep';
 import { ClaimDoneStep } from './steps/ClaimDoneStep';
+import { UnavailableStep } from './steps/UnavailableStep';
 import { WizardContext, type WizardNav } from './wizardContext';
 
 /**
@@ -134,12 +135,16 @@ export function WizardShell() {
     const step = stepOf(state, current);
     if (!step) {
       body = <Navigate to="/setup" replace />;
+    } else if (closedByPolicy(step)) {
+      // The instance keeps no credentials on disk and this step would store
+      // one: the reason, and Next — never the form.
+      body = <UnavailableStep key={`${viewerId}:${step.etag}`} step={step} />;
     } else {
       const key = `${viewerId}:${step.etag}`;
       switch (step.id) {
         case 'claim': body = <ClaimDoneStep key={key} step={step} />; break;
         case 'mode': body = <ModeStep key={key} step={step} state={state} />; break;
-        case 'provider': body = <ProviderStep key={key} step={step} />; break;
+        case 'provider': body = <ProviderStep key={key} step={step} state={state} />; break;
         case 'profile': body = <ProfileStep key={key} step={step} state={state} />; break;
         case 'memory': body = <MemoryStep key={key} step={step} state={state} />; break;
         case 'channels': body = <ChannelsStep key={key} step={step} state={state} />; break;

@@ -154,6 +154,17 @@ export const managedLine = (what: string, source: ManagedSource) => {
   return `${what}: ${text.charAt(0).toLowerCase()}${text.slice(1)}`;
 };
 
+/**
+ * An instance that keeps no credentials on disk (`setup.local_secrets:
+ * false`). The server sends these two sentences as the reason of every
+ * step it closes and the detail of every write it refuses; the page
+ * repeats them where a key could otherwise be entered, and labels the
+ * closed steps on the overview.
+ */
+export const NO_LOCAL_SECRETS_TEXT =
+  'This instance does not keep credentials on disk. Connections are provided by the operator of this deployment.';
+export const NOT_AVAILABLE_HERE = 'Not available on this instance';
+
 /** Every source was readable and held no login. */
 export const HOST_LOGIN_NONE = 'No Claude Code login was found on this server.';
 /**
