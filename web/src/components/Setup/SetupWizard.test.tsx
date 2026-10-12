@@ -1799,6 +1799,27 @@ describe('instances that keep no credentials on disk', () => {
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('channels', { slack: { enabled: false } }));
   });
+
+  it('a bot token the operator provided says the sentence once', async () => {
+    // Done and read-only: the frame shows the read-only reason, which is the
+    // sentence. The step must not say it again, and the pairing card (whose
+    // server-side reason would be the sentence a third time) is not shown.
+    const provided = step('channels', { status: 'done', read_only: true, read_only_reason: CLOSED }, {
+      telegram: {
+        ...CHANNELS.telegram, enabled: true, bot_token: on('', 'environment'), bot_username: 'example_bot', live: true,
+        pairing_available: false, pairing_unavailable_reason: CLOSED,
+      },
+    });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'channels' ? provided : s)) });
+    renderAt('/setup/channels');
+    await heading('Connect Telegram or Slack');
+    const form = within(screen.getByRole('form', { name: 'Connect Telegram or Slack' }));
+    expect(form.getAllByText(CLOSED)).toHaveLength(1);
+    expect(form.getByRole('region', { name: 'Telegram' })).toHaveTextContent('@example_bot');
+    expect(form.queryByLabelText(/Telegram user id/)).not.toBeInTheDocument();
+    expect(form.queryByRole('button', { name: /Test token|Also connect Slack/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
+  });
 });
 
 describe('review and the ending', () => {

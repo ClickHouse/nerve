@@ -41,11 +41,14 @@ interface Sent { telegram: boolean; slack: boolean }
  * shared channel gateway shows the gateway's status line and only the
  * switch; there are no tokens to enter.
  *
- * On an instance that keeps no credentials on disk (`local_secrets: false`)
- * this step is reached only when something made it done without a token
- * on this machine — a Slack the channel gateway holds, whose switch stays
- * the one control. The sentence replaces the token fields; a Telegram card
- * appears only for a token already configured, read-only.
+ * On an instance whose setup page stores no credential (`local_secrets:
+ * false`) this step is reached only when something made it done without a
+ * token entered here — a Slack the channel gateway holds, whose switch
+ * stays the one control, or a token the operator provided. The sentence
+ * replaces the token fields and is said once: by the frame when it is the
+ * step's read-only reason, by this step otherwise. A Telegram card appears
+ * only for a token already configured, read-only and without the pairing
+ * controls (pairing would store the paired account here).
  */
 export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupChannelsDetail;
@@ -209,7 +212,11 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
       continueLabel={primaryIsSkip ? NO_CHANNELS_LABEL : undefined}
       hideSkip={primaryIsSkip}
     >
-      {keyless && <Notice tone="locked">{NO_LOCAL_SECRETS_TEXT}</Notice>}
+      {/* The frame already shows the step's read-only reason, which under
+          the policy is this very sentence: it is not repeated beneath it. */}
+      {keyless && step.read_only_reason !== NO_LOCAL_SECRETS_TEXT && (
+        <Notice tone="locked">{NO_LOCAL_SECRETS_TEXT}</Notice>
+      )}
 
       {(!keyless || tg.bot_token.configured) && (
         <section aria-label="Telegram" className="flex flex-col gap-3 rounded-lg border border-border bg-surface-raised p-4">
@@ -245,7 +252,10 @@ export function ChannelsStep({ step, state }: { step: SetupStep; state: SetupSta
           )}
           {botName && <p className="text-xs text-text-dim">Saving connects @{botName}.</p>}
 
-          {tg.bot_token.configured && (
+          {/* Pairing stores the paired account on this machine, so without
+              local secrets neither the widget nor the manual id has anything
+              to offer — and the server's reason would be the sentence again. */}
+          {tg.bot_token.configured && !keyless && (
             tg.pairing_available
               ? <PairingWidget onPaired={() => void load()} />
               : (
