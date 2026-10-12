@@ -60,7 +60,7 @@ import App from './App';
 import { useAuthStore } from './stores/authStore';
 import { useChatStore } from './stores/chatStore';
 import { useSetupStore } from './stores/setupStore';
-import { makeExternalState, makeState } from './test/setupFixtures';
+import { makeExternalState, makeFreshState, makeState } from './test/setupFixtures';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
@@ -331,6 +331,27 @@ describe('hosted startup', () => {
     expect(await screen.findByRole('status')).toHaveTextContent(/Finish setting up Nerve — 7 steps left/);
   });
 
+  it('lands an instance that has never chosen a mode on the setup page, after the session check', async () => {
+    setupState.mockResolvedValue(makeExternalState({}, makeFreshState()));
+    let admit: (viewer: ReturnType<typeof hostedMe>) => void = () => {};
+    getViewer.mockReturnValue(new Promise((resolve) => { admit = resolve; }));
+
+    const { container } = renderApp();
+
+    // Until the gateway session is verified nothing is routed and the
+    // checklist has not even been read: the landing cannot run ahead of
+    // the sign-in.
+    await waitFor(() => expect(getViewer).toHaveBeenCalled());
+    expect(container).toBeEmptyDOMElement();
+    expect(setupState).not.toHaveBeenCalled();
+
+    await act(async () => { admit(hostedMe()); });
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Carol' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
+  });
+
   it('has no accounts page', async () => {
     // The router warns that no route matches, which is the point.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -443,6 +464,45 @@ describe('setup checklist in local mode', () => {
     expect(await screen.findByText('the chat page')).toBeInTheDocument();
     expect(await screen.findByRole('status')).toHaveTextContent(/7 steps left/);
     expect(setupState).toHaveBeenCalledTimes(1);
+    // Mode chosen with steps left is the banner's case: the page stays.
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('opens an instance that has never chosen a mode on the setup page, not on chat with a banner', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    renderApp();
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Alice' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
+  });
+
+  it('lands there from a direct visit to another route too', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    render(<MemoryRouter initialEntries={['/accounts']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Alice' })).toBeInTheDocument();
+    expect(screen.queryByText('the accounts page')).not.toBeInTheDocument();
+  });
+
+  it('leaves a deep link into the wizard where it points', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    render(<MemoryRouter initialEntries={['/setup/mode']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Choose a mode' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { level: 1, name: /^Welcome, / })).not.toBeInTheDocument();
+  });
+
+  it('shows neither the landing nor the banner once setup is finished', async () => {
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    await waitFor(() => expect(useSetupStore.getState().state).not.toBeNull());
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
   });
 
   it('keeps the banner away while the checklist is unknown', async () => {

@@ -132,6 +132,13 @@ Generic tabbed panel that replaces the old plan-only preview panel. Auto-opens w
 - **The wizard** (`WizardShell`) for a signed-in person, in both
   authentication modes, at `/setup` (the Overview) and `/setup/:stepId`.
 
+`App` mounts `SetupLanding` beside the banner once the app is live — behind a
+front gateway, that is after the session check. The first read of the
+checklist in a sign-in sends an instance that has never chosen a mode (the
+Mode step still `pending`) to `/setup`, once; a deep link into the wizard is
+left alone, and a partially set-up instance — Mode chosen, steps left — gets
+the banner instead.
+
 The wizard is a `PageHeader` ("Set up Nerve"), a progress rail
 (`ProgressRail`: `<nav aria-label="Setup steps">` with an ordered list,
 `aria-current="step"`, a status badge per step — done, To do, Skipped,
