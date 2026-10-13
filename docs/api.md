@@ -269,8 +269,8 @@ Response: {
                   "anthropic_api_key": { "configured": true, "last4": "ab12", "source": "file" },
                   "claude_oauth_token": { "configured": false, "last4": null, "source": null },
                   "proxy_enabled": false, "aws_region": "", "aws_profile": "",
-                  "model": "claude-opus-5-5", "effort": "xhigh", "cron_model": "claude-sonnet-4-6",
-                  "warning": null, "last_test": { "ok": true, "code": "ok", "detail": "claude-haiku-4-5-20251001 answered", "checked_at": "2026-10-10T09:12:03Z" } } },
+                  "model": "claude-opus-5-5", "effort": "xhigh", "cron_model": "claude-sonnet-5-5",
+                  "warning": null, "last_test": { "ok": true, "code": "ok", "detail": "claude-haiku-5-5 answered", "checked_at": "2026-10-10T09:12:03Z" } } },
     { "id": "profile", "title": "About you", "status": "pending", "required": false, "can_skip": true,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
       "summary": "Alice · Europe/Berlin", "files": ["workspace/config/settings.yaml", "workspace/USER.md", "workspace/IDENTITY.md"],
@@ -442,7 +442,7 @@ Test a candidate provider configuration without saving it. Same body as
 `max_tokens: 1` call on the server, 20 s limit.
 
 ```json
-Response: { "ok": true,  "checked": "api", "code": "ok", "detail": "claude-haiku-4-5-20251001 answered", "hint": null, "latency_ms": 812 }
+Response: { "ok": true,  "checked": "api", "code": "ok", "detail": "claude-haiku-5-5 answered", "hint": null, "latency_ms": 812 }
 Response: { "ok": false, "checked": "api", "code": "invalid_key", "detail": "Anthropic rejected this key (401 authentication_error).",
             "hint": "Keys start with sk-ant-. Check for a missing last character or a revoked key.", "latency_ms": 640 }
 Response: { "ok": false, "checked": "api", "code": "network", "detail": "The server could not reach api.anthropic.com (connection refused).",

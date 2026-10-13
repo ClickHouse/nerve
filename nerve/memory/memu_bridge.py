@@ -12,6 +12,7 @@ import gc
 import json
 import logging
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,15 +45,12 @@ class MemoryBackendUnavailable(RuntimeError):
     never mistakes "memory is DOWN" for "no relevant memories"."""
 
 
-def _is_transient_llm_error(exc: BaseException) -> bool:
-    """True if ``exc`` looks like a transient proxy/auth failure — worth
-    retrying, and worth surfacing as backend-down — vs a permanent/logic error.
+def _llm_error_status(exc: BaseException) -> int | None:
+    """The HTTP status of an LLM SDK error, or None if it has none.
 
-    Detects the OpenAI-SDK ``APIStatusError`` family by HTTP status (429 / 5xx)
-    plus the proxy's ``auth_unavailable`` / revoked-OAuth signatures on 401/403.
-    Status is read from ``status_code`` (or ``response.status_code``), falling
-    back to parsing ``"Error code: NNN"`` from the message so this stays
-    decoupled from the ``openai`` import."""
+    Read from ``status_code`` (or ``response.status_code``), falling back to
+    parsing ``"Error code: NNN"`` from the message so this stays decoupled
+    from the ``openai`` and ``anthropic`` imports."""
     msg = str(exc)
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -62,14 +60,56 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
             status = int(msg.split("Error code: ", 1)[1].strip()[:3])
         except (ValueError, IndexError):
             status = None
+    return status
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a transient proxy/auth failure — worth
+    retrying, and worth surfacing as backend-down — vs a permanent/logic error.
+
+    Detects the OpenAI-SDK ``APIStatusError`` family by HTTP status (429 / 5xx)
+    plus the proxy's ``auth_unavailable`` / revoked-OAuth signatures on 401/403.
+    The status comes from :func:`_llm_error_status`."""
+    status = _llm_error_status(exc)
     if status in (429, 500, 502, 503, 504):
         return True
-    low = msg.lower()
+    low = str(exc).lower()
     if status in (401, 403) and ("auth_unavailable" in low or "revoked" in low):
         return True
     # Belt-and-suspenders: the proxy's stuck-cooldown signature regardless of
     # how the status surfaced.
     return "auth_unavailable" in low
+
+
+# The generation of a Claude model id: the major version after the family
+# name. A search, not a full match, so bare, dated, ``[1m]`` and Bedrock
+# geo-prefixed ids all match.
+_CLAUDE_GENERATION_RE = re.compile(r"claude-[a-z]+-(\d+)")
+
+# Model ids that rejected ``temperature`` although :func:`_sends_temperature`
+# allowed it, for example a Bedrock application inference profile ARN.
+_TEMPERATURE_REJECTED: set[str] = set()
+
+
+def _sends_temperature(model: str) -> bool:
+    """Whether memU calls to ``model`` may carry ``temperature``.
+
+    Claude 5 and later models reject sampling parameters with a 400
+    ("`temperature` is deprecated for this model"). Older models accept it.
+    An id with no readable generation (an inference profile ARN, a gateway
+    alias) keeps it until the API rejects it once; the chat wrapper in
+    :meth:`MemUBridge._instrument_llm_timeouts` then records the id in
+    :data:`_TEMPERATURE_REJECTED`.
+    """
+    if model in _TEMPERATURE_REJECTED:
+        return False
+    match = _CLAUDE_GENERATION_RE.search(model.lower())
+    return match is None or int(match.group(1)) < 5
+
+
+def _is_temperature_rejected(exc: BaseException) -> bool:
+    """True if ``exc`` is the 400 a model returns when it does not accept ``temperature``."""
+    return _llm_error_status(exc) == 400 and "temperature" in str(exc).lower()
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -459,14 +499,16 @@ class _BedrockLLMClient:
         *,
         max_tokens: int | None = None,
         system_prompt: str | None = None,
-        temperature: float = 0.2,
+        temperature: float | None = 0.2,
     ) -> tuple[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.chat_model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens or 4096,
-            "temperature": temperature,
         }
+        # None leaves temperature out, and so does a model that rejects it.
+        if temperature is not None and _sends_temperature(self.chat_model):
+            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         # Tag the OTEL spans emitted by AnthropicInstrumentor so memU calls
@@ -2243,15 +2285,53 @@ class MemUBridge:
                 if getattr(client.chat, "_nerve_timeout_wrapped", False):
                     continue
                 original_chat = client.chat
+                # The temperature value that leaves the field out of the
+                # request. memU's OpenAI client sends None as JSON null, so it
+                # needs the SDK's ``omit`` sentinel.
+                if isinstance(client, _BedrockLLMClient):
+                    no_temperature: Any = None
+                else:
+                    from openai import omit as no_temperature
 
                 async def _timeout_chat(
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,
                     _orig=original_chat, _prof=profile,
+                    _model=str(getattr(client, "chat_model", "") or ""),
+                    _omit=no_temperature,
                 ):
                     # Anthropic API requires max_tokens >= 1; memU sometimes
                     # omits it.  Default to 4096 to prevent 400 errors.
                     if max_tokens is None:
                         max_tokens = 4096
+
+                    async def _chat_once():
+                        # Claude 5 and later reject temperature (see
+                        # _sends_temperature). A model whose id the check
+                        # cannot read may reject it too: on that 400, record
+                        # the id and send the same request without it.
+                        temp = temperature if _sends_temperature(_model) else _omit
+                        try:
+                            return await _orig(
+                                prompt,
+                                max_tokens=max_tokens,
+                                system_prompt=system_prompt,
+                                temperature=temp,
+                            )
+                        except Exception as exc:
+                            if temp is _omit or not _is_temperature_rejected(exc):
+                                raise
+                        _TEMPERATURE_REJECTED.add(_model)
+                        logger.warning(
+                            "memU LLM [%s]: model %s rejects temperature; "
+                            "sending without it from now on", _prof, _model,
+                        )
+                        return await _orig(
+                            prompt,
+                            max_tokens=max_tokens,
+                            system_prompt=system_prompt,
+                            temperature=_omit,
+                        )
+
                     # memU otherwise fails fast with SDK retries disabled
                     # (see max_retries=0 above), so a transient proxy/auth blip
                     # (503/429/auth_unavailable) that the agent SDK rides out via
@@ -2267,12 +2347,7 @@ class MemUBridge:
                         t0 = time.monotonic()
                         try:
                             return await asyncio.wait_for(
-                                _orig(
-                                    prompt,
-                                    max_tokens=max_tokens,
-                                    system_prompt=system_prompt,
-                                    temperature=temperature,
-                                ),
+                                _chat_once(),
                                 timeout=self._LLM_CALL_TIMEOUT,
                             )
                         except asyncio.TimeoutError:

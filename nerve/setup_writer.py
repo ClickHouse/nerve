@@ -622,15 +622,18 @@ def build_config_layers(
         portable["provider"]["aws_region"] = choices.aws_region
         # The prefix is geography-scoped (us./eu./apac.) and must match the
         # configured region or every call 400s. Since the region is now in
-        # the tracked layer, these belong there too.
+        # the tracked layer, these belong there too. Every default is an
+        # undated id, and Bedrock names an undated model `<geo>.anthropic.<id>`
+        # with no version suffix. A dated id (`...-20251001`) needs one, such
+        # as `-v1:0`.
         geo = bedrock_geo_prefix(choices.aws_region)
         for section, key, value in (
             ("agent", "model", f"{geo}.anthropic.{DEFAULT_MODEL}"),
             ("agent", "cron_model", f"{geo}.anthropic.{DEFAULT_CRON_MODEL}"),
-            ("agent", "title_model", f"{geo}.anthropic.{DEFAULT_TITLE_MODEL}-v1:0"),
+            ("agent", "title_model", f"{geo}.anthropic.{DEFAULT_TITLE_MODEL}"),
             ("memory", "recall_model", f"{geo}.anthropic.{DEFAULT_RECALL_MODEL}"),
             ("memory", "memorize_model", f"{geo}.anthropic.{DEFAULT_MEMORIZE_MODEL}"),
-            ("memory", "fast_model", f"{geo}.anthropic.{DEFAULT_FAST_MODEL}-v1:0"),
+            ("memory", "fast_model", f"{geo}.anthropic.{DEFAULT_FAST_MODEL}"),
         ):
             portable[section][key] = value
     else:

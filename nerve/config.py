@@ -30,16 +30,16 @@ logger = logging.getLogger(__name__)
 #
 # This block is the only place a default model id is spelled. Every other
 # site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
-# ``opus`` alias, the terminal wizard's example line) references these names,
-# and ``tests/test_default_models.py`` fails on a model-id literal anywhere
-# else under ``nerve/`` — so the next update is one edit here plus the
-# regenerated goldens, examples and docs.
+# ``opus`` and ``haiku`` aliases, the terminal wizard's example line)
+# references these names, and ``tests/test_default_models.py`` fails on a
+# model-id literal anywhere else under ``nerve/`` — so the next update is one
+# edit here plus the regenerated goldens, examples and docs.
 DEFAULT_MODEL = "claude-opus-5-5"               # agent.model (conversations)
-DEFAULT_CRON_MODEL = "claude-sonnet-4-6"        # agent.cron_model
-DEFAULT_TITLE_MODEL = "claude-haiku-4-5-20251001"  # agent.title_model
-DEFAULT_RECALL_MODEL = "claude-sonnet-4-6"      # memory.recall_model
-DEFAULT_MEMORIZE_MODEL = "claude-sonnet-4-6"    # memory.memorize_model
-DEFAULT_FAST_MODEL = "claude-haiku-4-5-20251001"   # memory.fast_model
+DEFAULT_CRON_MODEL = "claude-sonnet-5-5"        # agent.cron_model
+DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
+DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
+DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
+DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
 DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
 DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
 
@@ -1035,9 +1035,11 @@ class AgentConfig:
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL on
-    # non-Bedrock providers; entries here merge over that default, and an
-    # empty value ("") unsets it (falls back to the CLI's built-in mapping).
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL and
+    # haiku → DEFAULT_FAST_MODEL on non-Bedrock providers; the CLI also uses
+    # the haiku model for its background calls. Entries here merge over those
+    # defaults, and an empty value ("") unsets one (falls back to the CLI's
+    # built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
     # Claude models selectable in the web composer's model picker
     # (GET /api/models). The configured `model` above is always offered

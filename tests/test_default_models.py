@@ -2,8 +2,8 @@
 
 ``nerve/config.py`` carries a constants block (``DEFAULT_MODEL`` and friends,
 ``DEFAULT_CLAUDE_MODELS``); every other site — the setup writer, the Bedrock
-geo-prefixed ids, the Claude CLI's ``opus`` alias, the terminal wizard's
-example line, the picker's fallback — references those names. This file is
+geo-prefixed ids, the Claude CLI's ``opus`` and ``haiku`` aliases, the terminal
+wizard's example line, the picker's fallback — references those names. This file is
 what makes the next model update a one-line edit: a model-id literal anywhere
 else under ``nerve/`` fails with its ``file:line``.
 """
@@ -59,6 +59,7 @@ def test_no_default_model_literal_outside_the_constants_block():
 
 def test_the_constants_agree_with_each_other():
     assert DEFAULT_MODEL == "claude-opus-5-5"
+    assert DEFAULT_TITLE_MODEL == DEFAULT_FAST_MODEL == "claude-haiku-5-5"
     assert DEFAULT_CLAUDE_MODELS[0] == DEFAULT_MODEL
     assert DEFAULT_CLAUDE_MODELS[1] == DEFAULT_FALLBACK_MODEL
     assert len(set(DEFAULT_CLAUDE_MODELS)) == len(DEFAULT_CLAUDE_MODELS)
@@ -111,10 +112,14 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     geo = bedrock_geo_prefix("eu-west-1")
     assert bedrock["agent"]["model"] == f"{geo}.anthropic.{DEFAULT_MODEL}"
     assert bedrock["agent"]["cron_model"] == f"{geo}.anthropic.{DEFAULT_CRON_MODEL}"
-    assert bedrock["agent"]["title_model"] == f"{geo}.anthropic.{DEFAULT_TITLE_MODEL}-v1:0"
-    assert bedrock["memory"]["fast_model"] == f"{geo}.anthropic.{DEFAULT_FAST_MODEL}-v1:0"
+    # Undated ids take no Bedrock version suffix, Haiku included.
+    assert bedrock["agent"]["title_model"] == f"{geo}.anthropic.{DEFAULT_TITLE_MODEL}"
+    assert bedrock["memory"]["recall_model"] == f"{geo}.anthropic.{DEFAULT_RECALL_MODEL}"
+    assert bedrock["memory"]["memorize_model"] == f"{geo}.anthropic.{DEFAULT_MEMORIZE_MODEL}"
+    assert bedrock["memory"]["fast_model"] == f"{geo}.anthropic.{DEFAULT_FAST_MODEL}"
+    assert bedrock["memory"]["fast_model"] == "eu.anthropic.claude-haiku-5-5"
 
-    # The Claude CLI's built-in `opus` alias is the default model.
+    # The Claude CLI's built-in `opus` and `haiku` aliases are the defaults.
     from types import SimpleNamespace
 
     from nerve.agent.backends.claude import ClaudeBackend
@@ -131,6 +136,7 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     )
     env = ClaudeBackend(SimpleNamespace(config=lambda: config))._build_env()
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == DEFAULT_FAST_MODEL
 
 
 def test_the_examples_and_templates_carry_the_default():
@@ -151,5 +157,8 @@ def test_the_examples_and_templates_carry_the_default():
         (ROOT / "tests" / "fixtures" / "setup_writer" / "worker" / "settings.yaml.golden").read_text(encoding="utf-8"),
     )
     assert worker["agent"]["model"] == f"eu.anthropic.{DEFAULT_MODEL}"
+    assert worker["agent"]["title_model"] == f"eu.anthropic.{DEFAULT_TITLE_MODEL}"
+    assert worker["memory"]["fast_model"] == f"eu.anthropic.{DEFAULT_FAST_MODEL}"
     config_doc = (ROOT / "docs" / "config.md").read_text(encoding="utf-8")
     assert f"| `agent.model` | string | `{DEFAULT_MODEL}` |" in config_doc
+    assert f"| `memory.fast_model` | string | `{DEFAULT_FAST_MODEL}` |" in config_doc
