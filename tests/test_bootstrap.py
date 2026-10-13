@@ -26,6 +26,7 @@ from nerve.bootstrap import (
     _DOCKERIGNORE_TEMPLATE,
 )
 from nerve.cli import main
+from nerve.config import DEFAULT_MODEL
 
 
 @pytest.fixture
@@ -202,6 +203,39 @@ class TestNonInteractiveSetup:
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
 
+    def test_worker_mode_defaults(self, tmp_path: Path) -> None:
+        """Worker non-interactive: the two skill jobs on, task-planner
+        written but off (the onboarding session decides), quiet hours none."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Watch the nightly build for example/repo and propose fixes.",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.enabled_crons == ["skill-reviser", "skill-extractor"]
+        ws = tmp_path / "ws"
+        system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
+        assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
+            "memory-maintenance": True, "task-planner": False,
+            "skill-extractor": True, "skill-reviser": True,
+        }
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+
+    def test_personal_mode_keeps_its_quiet_hours(self, tmp_path: Path) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load((tmp_path / "ws" / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
+
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
         from nerve.bootstrap import PRODUCTIVITY_CRONS
@@ -302,9 +336,13 @@ class TestCliInit:
         lose and lives in a git-tracked directory. So a flat "all three are
         backed up" is a promise the code does not keep, exactly where being
         misled costs the most.
+
+        The regenerate-with-backup prompt belongs to the full terminal wizard
+        (``--terminal``); the default ``nerve init`` on a configured install
+        prints the status and exits without touching anything.
         """
         result = CliRunner().invoke(
-            main, ["-c", str(configured_dir), "init"], input="n\n"
+            main, ["-c", str(configured_dir), "init", "--terminal"], input="n\n"
         )
         assert result.exit_code == 0
         assert "*.bak" in result.output
@@ -1393,7 +1431,7 @@ class TestPortableSettingsSplit:
         assert after["provider"]["type"] == "anthropic"
         assert "aws_region" not in after.get("provider", {})
         # The non-prefixed names overwrite rather than needing deletion.
-        assert after["agent"]["model"] == "claude-opus-5"
+        assert after["agent"]["model"] == DEFAULT_MODEL
 
     def test_gateway_host_and_port_are_shared(self, tmp_path: Path) -> None:
         """The tracked layer has to be able to state the bind address.
@@ -1448,9 +1486,7 @@ class TestPortableSettingsSplit:
         """
         self._wizard(tmp_path)._apply()
         settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
-        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == (
-            "claude-opus-5"
-        )
+        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == DEFAULT_MODEL
 
         self._wizard(
             tmp_path, provider_type="bedrock", aws_region="eu-west-1"

@@ -27,7 +27,7 @@ Nerve is a single-process Python application that serves as a personal AI assist
 
 ## Modes
 
-Nerve supports two modes, selected during `nerve init`:
+Nerve supports two modes, chosen once — on the Mode step of the browser setup, in `nerve init --terminal`, or by `NERVE_MODE` for an unattended install. The mode is not a config key: it is read back from the workspace templates (`SOUL.md`'s first line, then the other files), and until it is chosen the gateway runs with no templates and the setup page asks for it.
 
 **Personal** — a full-featured assistant for one human. Ships with sync sources (Telegram, Gmail, GitHub), life-oriented memory categories, identity files (`IDENTITY.md`, `USER.md`), and the inbox-processor cron. The agent develops personality over time.
 
@@ -35,21 +35,25 @@ Nerve supports two modes, selected during `nerve init`:
 
 Mode affects which workspace templates are generated, which cron jobs are enabled, and which memory categories are seeded — but the underlying engine is identical. Both modes run the same agent, tools, and infrastructure.
 
+How to operate each mode well is covered in [Personal Best Practices](personal-best-practices.md) (brain files, memory tiers, approval classes) and [Worker Best Practices](worker-best-practices.md) (`TASK.md` anatomy, plan-approve-execute, the task state machine).
+
 ## Deployment
 
 Two deployment options:
 
 **Server (bare metal)** — Nerve runs directly as a Python process. Uses `nerve start` for daemon management, `nerve stop` / `nerve restart` for lifecycle.
 
-**Docker** — `nerve init` generates `Dockerfile`, `docker-compose.yml`, and `docker-entrypoint.sh`. The code is bind-mounted (editable), while databases and workspace are in named volumes. CLI commands (`nerve start`, `nerve logs`, etc.) automatically proxy to `docker compose` when `deployment: docker` is set in config. Credentials are resolved from the host (macOS Keychain, env vars, credential files) and injected into the container — `~/.claude` is NOT mounted.
+**Docker** — `nerve init` generates `Dockerfile`, `docker-compose.yml`, and `docker-entrypoint.sh`, carrying the chosen port and bind address. The code is bind-mounted (editable), and the state directory and workspace are bind-mounted from the host. CLI commands (`nerve start`, `nerve logs`, etc.) automatically proxy to `docker compose` when `deployment: docker` is set in config. A Claude Code credential found on the host (macOS Keychain, env vars, credential files) is forwarded into `config.local.yaml` for the container — `~/.claude` is NOT mounted. A restart asked for from the browser makes the container exit; Compose (`restart: unless-stopped`) brings it back.
 
 ## Components
 
 ### Gateway (`nerve/gateway/`)
 FastAPI application serving:
 - REST API for sessions, tasks, memory files, diagnostics
+- The setup API (`/api/setup/*`): the first-account claim (local mode, guarded by the setup token) and the setup checklist, whose step status is derived from configuration, workspace files and the database (`nerve/setup_checklist.py`) and whose writes go through the same writer as `nerve init` (`nerve/setup_writer.py`); plus `POST /api/system/restart`, which shares its detached restart helper with `nerve restart` (`nerve/daemon.py`)
 - WebSocket endpoint for real-time chat streaming
-- Static file serving for the built React web UI
+- Static file serving for the built React web UI — or, when `web/dist` is missing, a plain page at `/` and `/setup` saying how to build it
+- `GET /health` with a per-process boot `generation`, so a client can tell the new process from the one shutting down
 - JWT authentication
 
 ### Agent Engine (`nerve/agent/`)
@@ -78,8 +82,13 @@ Abstract communication layer with three components:
 - **ChannelRouter** — centralized session resolution, streaming adapter lifecycle, interactive tool routing, and cron output delivery. Replaces per-channel session management.
 - **StreamAdapter** — translates `StreamBroadcaster` events into channel-appropriate output (edit-in-place for Telegram, accumulated send for simple channels). Created per inbound message.
 
+- **Access matching** (`access.py`) — transport-neutral identity aliases and fail-closed allow/deny pattern matching. Channels compose these primitives into their own policy before creating an `InboundMessage`.
+- **Archives** (`archives.py`) — bounded one-level ZIP unpacking shared by Telegram and Slack. The download cap is on compressed bytes, so entry count, per-entry and aggregate uncompressed size, and compression ratio are all checked against the archive directory before an entry is read.
+
 Implementations:
 - **Telegram** — python-telegram-bot v21+ with partial message streaming (edit-in-place, 1.5s rate limit), inline keyboard buttons for notification questions, `/reply` command for free-text answers
+- **Slack** — slack_sdk Socket Mode (outbound WebSocket, no public URL) with partial streaming via `chat.update`, Block Kit buttons, `/nerve` slash command, and per-thread sessions. `SlackAccessPolicy` (`slack_access.py`) composes user, channel, and DM guardrails; in channels the bot answers only on mention or in a thread it already owns.
+- **Hosted** (`hosted/`): provider traffic that a shared channel gateway holds (`slack.mode: hosted`). Nerve has no provider tokens. Each gateway replica opens a WebSocket to `/_internal/channel/v1/stream`, authenticated with a token that the gateway signs (ES256, issuer `nerve-gateway`, audience `nerve-channel`, subject naming this exact tenant and agent, at most 300 seconds of lifetime). One inbox reader pulls admitted events over the preferred stream: read, process, acknowledge, and read again until a page is empty. `HostedChannel` registers under the provider's name, so the router and tools see `slack` as with Socket Mode, and uses the same session keys. The gateway decides which events invoke the agent: a direct message, a mention of the agent, a thread reply, a reaction, an interaction, or a command. A mention of the agent carries the `self` flag, so intake needs no capabilities. Outbound messages are contract operations: `OperationRunner` (`hosted/operations.py`) sends each on a stream that advertised it for the connection, within the stream and connection in-flight limits, and never sends a side-effecting operation again after its result is lost. File uploads and attachment reads use transfers on the stream of their operation; a read is sent only while its length fits Nerve's stream memory limit. Notification cards carry buttons, and a press arrives as an `interaction` event that answers the notification. `hosted/contract/` holds the version 1 channel contract frames that Nerve reads and sends. The gateway checks the contract; Nerve checks only the members and values that its code uses, and its size limits.
 - **Web** — Passive channel using gateway WebSocket
 
 Adding a new channel (Discord, WhatsApp, etc.) requires implementing ~5 methods and zero session/routing logic.
@@ -89,8 +98,8 @@ Async notification system for agent→user communication:
 - **`notify` tool** — fire-and-forget notifications (status updates, alerts, reminders)
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
-- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons for questions
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
+- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
@@ -218,7 +227,7 @@ The `Database` class in `base.py` inherits all domain mixins, preserving a singl
 
 Migrations are individual Python files in `nerve/db/migrations/` named `vNNN_description.py`. Each exports an `async def up(db)` function. The runner discovers them by scanning the directory, applies pending ones in version order, and wraps each in a transaction. `SCHEMA_VERSION` is derived dynamically from the highest migration file number.
 
-To add a new migration: create `nerve/db/migrations/v017_your_feature.py` with an `up()` function.
+To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with an `up()` function, numbered above the highest version on `main`: the runner skips versions at or below the database's current one, and CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not.
 
 ### Schema
 
@@ -254,19 +263,22 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 
 ## Startup Sequence
 
-1. Load config (`config.yaml` + `config.local.yaml` deep merge)
-2. Run database migrations (file-based migration system in `nerve/db/migrations/`)
-3. Initialize memory system (memU SQLite, load categories)
+1. Load config (`settings.yaml` + `config.yaml` + `config.local.yaml` deep merge). The loaded object is remembered as the *startup configuration*: the setup page later compares it with what is on disk to say whether a restart is pending. The previous process's setup notes (restart debts, start-up errors) are retired
+2. Run database migrations (file-based migration system in `nerve/db/migrations/`); bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
+3. Initialize memory system (memU SQLite, load categories). With no model credential yet the warm-up is skipped and recall answers empty; nothing calls out
 4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
 5. Recover orphan sessions (active in DB but no live client → idle or stopped)
-6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs)
-7. Start gateway (FastAPI + uvicorn, WebSocket, static files)
-8. Start Telegram bot if configured
-9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session
+6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs). Sources the installer left `enabled: false` are not scheduled
+7. Start gateway (FastAPI + uvicorn, WebSocket, static files or the "web UI not built" page)
+8. Start Telegram bot if configured. A token Telegram rejects does not stop the boot: the failure is logged with the token scrubbed, recorded for the setup page and `nerve doctor`, and the gateway runs without the bot
+9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session (the setup page's Finish also starts it when no restart is needed)
+
+The gateway boots and serves `/setup` with nothing configured — no mode, no provider — and stays idle rather than failing, so the browser setup can do its work against a running instance.
 
 ## Security
 
-- JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode
+- JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode. The one unauthenticated write — the first-account claim — requires the setup token, which never appears in a URL, response, log, state file or browser storage; every other setup endpoint needs a signed-in person, and system or MCP tokens cannot drive setup
+- Channel gateway streams (`/_internal/channel/v1/stream`) have their own authentication: a gateway-signed token in the `Authorization` header, verified against the public keys in a local key file (`channels.hosted.gateway_jwks_file`). Nerve fetches no keys over the network. The web session token never opens a stream, a stream token never reaches the web UI or the API, and an upgrade with an `Origin` header (every browser sends one) is refused
 - bcrypt password hashing
 - Path traversal prevention on file operations
 - Self-signed HTTPS (mkcert)

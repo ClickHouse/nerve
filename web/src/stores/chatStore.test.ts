@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Node 25 injects an inert `localStorage` global that shadows jsdom's Storage
 // (see dateGroups.test.ts); the store reads localStorage at module init, so
@@ -21,7 +21,7 @@ function installStorage(): void {
 installStorage();
 
 // Mock the API + websocket modules so importing the store has no live side
-// effects; only listSessions behaviour matters for these assertions.
+// effects. The tests use listSessions and the WebSocket queue.
 vi.mock('../api/client', () => ({
   api: {
     listSessions: vi.fn(),
@@ -34,11 +34,16 @@ vi.mock('../api/client', () => ({
   setUnauthorizedHandler: vi.fn(),
 }));
 vi.mock('../api/websocket', () => ({
-  ws: { switchSession: vi.fn(), send: vi.fn(), connect: vi.fn() },
+  ws: {
+    switchSession: vi.fn(), send: vi.fn(), connect: vi.fn(),
+    takePendingMessages: vi.fn(() => []),
+  },
 }));
 
 const { api } = await import('../api/client');
-const { useChatStore } = await import('./chatStore');
+const { ws } = await import('../api/websocket');
+const { useChatStore, registerComposerFlush } = await import('./chatStore');
+const { reenter, setAuthMode, useHostedStore } = await import('../api/hosted');
 
 const PAGE = 50;
 const rows = (from: number, count: number) =>
@@ -96,5 +101,86 @@ describe('loadSessions depth preservation', () => {
     const s = useChatStore.getState();
     expect(s.sessions.length).toBe(100);
     expect(s.sessionsHasMore).toBe(false);
+  });
+});
+
+describe('unsent work on re-entry', () => {
+  const takePending = ws.takePendingMessages as unknown as ReturnType<typeof vi.fn>;
+  let unregister: () => void = () => {};
+
+  beforeEach(() => {
+    localStorage.clear();
+    useChatStore.setState({ drafts: {}, activeSession: 's1' });
+    takePending.mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    unregister();
+    unregister = () => {};
+    vi.unstubAllGlobals();
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+  });
+
+  it('writes the composer text at once', () => {
+    unregister = registerComposerFlush(() => useChatStore.getState().setDraft('s1', 'half a thought'));
+
+    useChatStore.getState().keepUnsentWork();
+
+    expect(useChatStore.getState().drafts.s1).toBe('half a thought');
+    expect(localStorage.getItem('nerve_draft_s1')).toBe('half a thought');
+  });
+
+  it('puts queued messages back into the drafts, before the composer text', () => {
+    unregister = registerComposerFlush(() => useChatStore.getState().setDraft('s1', 'typed later'));
+    takePending.mockReturnValue([
+      { session_id: 's1', content: 'queued first' },
+      { session_id: 's2', content: 'for another chat' },
+      { session_id: 's1', content: 'queued second' },
+      { session_id: 's1', content: '   ' },
+    ]);
+
+    useChatStore.getState().keepUnsentWork();
+
+    const expected = 'queued first\n\nqueued second\n\ntyped later';
+    expect(useChatStore.getState().drafts.s1).toBe(expected);
+    expect(localStorage.getItem('nerve_draft_s1')).toBe(expected);
+    expect(useChatStore.getState().drafts.s2).toBe('for another chat');
+    expect(localStorage.getItem('nerve_draft_s2')).toBe('for another chat');
+  });
+
+  it('works without a mounted composer', () => {
+    takePending.mockReturnValue([{ session_id: 's3', content: 'queued' }]);
+
+    useChatStore.getState().keepUnsentWork();
+
+    expect(localStorage.getItem('nerve_draft_s3')).toBe('queued');
+  });
+
+  it('stops using a composer flush after it is removed', () => {
+    const flush = vi.fn();
+    registerComposerFlush(flush)();
+
+    useChatStore.getState().keepUnsentWork();
+
+    expect(flush).not.toHaveBeenCalled();
+  });
+
+  it('is done before re-entry leaves the page', () => {
+    setAuthMode('external');
+    let stored: Record<string, string | null> = {};
+    const assign = vi.fn(() => {
+      stored = {
+        s1: localStorage.getItem('nerve_draft_s1'),
+        s2: localStorage.getItem('nerve_draft_s2'),
+      };
+    });
+    vi.stubGlobal('location', { ...window.location, pathname: '/chat/s1', search: '', assign });
+    unregister = registerComposerFlush(() => useChatStore.getState().setDraft('s1', 'in the composer'));
+    takePending.mockReturnValue([{ session_id: 's2', content: 'waiting to send' }]);
+
+    reenter();
+
+    expect(assign).toHaveBeenCalledOnce();
+    expect(stored).toEqual({ s1: 'in the composer', s2: 'waiting to send' });
   });
 });

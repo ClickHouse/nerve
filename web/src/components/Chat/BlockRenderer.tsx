@@ -7,7 +7,7 @@ import { ToolCallGroupBlock } from './ToolCallGroupBlock';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
 import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
-import { getToken } from '../../api/client';
+import { authUrl } from '../../api/hosted';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -106,7 +106,7 @@ export function BlockRenderer({
             );
           }
           case 'image': {
-            const imgUrl = `${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`;
+            const imgUrl = authUrl(item.url);
             return (
               <div key={i} className="my-2">
                 <a href={imgUrl} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
@@ -119,7 +119,7 @@ export function BlockRenderer({
             return (
               <div key={i} className="my-2">
                 <a
-                  href={`${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                  href={authUrl(item.url)}
                   download={item.filename}
                   className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
                 >

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
@@ -13,6 +14,7 @@ import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
+import { onViewerStorageChange } from './helpers/viewerStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
@@ -233,6 +235,12 @@ interface ChatState {
   ensureRealSession: (running?: boolean) => Promise<string>;
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
+  /**
+   * Write all unsent text to the drafts at once: the composer text, and the
+   * messages that wait in the WebSocket queue. Re-entry calls this before the
+   * page leaves for the gateway login. Attachments are in memory and are lost.
+   */
+  keepUnsentWork: () => void;
   markSeen: (sessionId: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
@@ -804,6 +812,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { drafts: { ...s.drafts, [sessionId]: text } };
     }),
 
+  keepUnsentWork: () => {
+    flushComposer?.();
+    const queued = ws.takePendingMessages();
+    if (queued.length === 0) return;
+    const drafts = { ...get().drafts };
+    const bySession = new Map<string, string[]>();
+    for (const { session_id, content } of queued) {
+      if (!content.trim()) continue;
+      bySession.set(session_id, [...(bySession.get(session_id) ?? []), content]);
+    }
+    for (const [sessionId, texts] of bySession) {
+      // The queued messages are older than the text in the composer, so they
+      // come first.
+      const current = drafts[sessionId];
+      const text = [...texts, ...(current?.trim() ? [current] : [])].join('\n\n');
+      drafts[sessionId] = text;
+      persistDraft(sessionId, text);
+    }
+    set({ drafts });
+  },
+
   markSeen: (sessionId: string) => {
     if (!sessionId) return;
     const now = Date.now();
@@ -1285,3 +1314,31 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
 // Re-export ChatState for handler type imports
 export type { ChatState };
+
+/** Writes the composer text to the drafts at once. ChatInput installs it. */
+let flushComposer: (() => void) | null = null;
+
+/**
+ * Install the function that writes the composer text to the drafts at once.
+ * The composer saves its text after a delay, and re-entry cannot wait for it.
+ * Returns the function that removes it.
+ */
+export function registerComposerFlush(flush: () => void): () => void {
+  flushComposer = flush;
+  return () => {
+    if (flushComposer === flush) flushComposer = null;
+  };
+}
+
+setBeforeReenter(() => useChatStore.getState().keepUnsentWork());
+
+onViewerStorageChange(() => {
+  clearAllAutoCloseTimers();
+  useChatStore.setState({
+    ...useChatStore.getInitialState(),
+    drafts: loadDrafts(),
+    reads: loadReads(),
+    readsBaseline: loadBaseline(),
+    virtualSession: restoreVirtualSession(),
+  });
+});

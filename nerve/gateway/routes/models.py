@@ -8,10 +8,12 @@ models (auto-discovered from the running Ollama server). The web composer's
 model picker calls GET /api/models to populate its options.
 
 The Claude catalog comes from :mod:`nerve.models_catalog`, which asks the
-Anthropic Models API which models the configured credentials can actually
-reach — so a newly released model appears in the picker without a code
-change. It is cached (primed at startup) and falls back to the built-in
-list whenever discovery is off or unavailable.
+Anthropic Models API which models the configured credentials' catalog
+endpoint advertises — so a newly released model appears in the picker
+without a code change. Catalog membership is not a serving guarantee (an
+advertised ID can still 404 on send); ``agent.model_discovery_excluded_models``
+prunes such entries. It is cached (primed at startup) and falls back to the
+built-in list whenever discovery is off or unavailable.
 
 Ollama models are only listed when they are actually routable
 (``config.ollama_routable`` — Ollama enabled *and* the proxy running),

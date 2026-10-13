@@ -15,7 +15,7 @@ from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec, TransportDiedError
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
-from nerve.config import AgentConfig, NerveConfig
+from nerve.config import DEFAULT_EFFORT, AgentConfig, NerveConfig
 
 
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_agent_config_cron_effort_default_and_override():
     # Explicit value is respected, and interactive effort stays independent.
     cfg = AgentConfig.from_dict({"cron_effort": "low"})
     assert cfg.cron_effort == "low"
-    assert cfg.effort == "max"
+    assert cfg.effort == DEFAULT_EFFORT
 
 
 def test_agent_config_model_effort_replaces_effort_for_matching_models():
@@ -160,12 +160,12 @@ def test_agent_config_model_effort_order_and_validation():
     }})
     assert cfg.model_effort == {"opus-5": "medium", "opus-5-5": "high"}
     assert cfg.effort_for_model("claude-opus-5-5") == "medium"
-    assert cfg.effort_for_model("claude-sonnet-5") == "max"
+    assert cfg.effort_for_model("claude-sonnet-5") == DEFAULT_EFFORT
 
 
 def test_agent_config_model_effort_default_and_malformed():
     assert AgentConfig.from_dict({}).model_effort == {}
-    assert AgentConfig.from_dict({}).effort_for_model("claude-opus-5-5") == "max"
+    assert AgentConfig.from_dict({}).effort_for_model("claude-opus-5-5") == DEFAULT_EFFORT
     # A non-mapping value is ignored rather than failing the load.
     assert AgentConfig.from_dict({"model_effort": ["opus-5-5"]}).model_effort == {}
 

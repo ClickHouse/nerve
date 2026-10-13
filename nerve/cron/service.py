@@ -12,6 +12,7 @@ from datetime import datetime, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from apscheduler.events import EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 # tool clamps delays to >= 60s, so a 20s sweep keeps fire latency well under
 # the granularity the model can request.
 _WAKEUP_SWEEP_SECONDS = 20
+
+# How late a run may start before APScheduler drops it instead of running it.
+# Overrides a 1-second default that any I/O on the shared event loop can exceed.
+# Bounded, not None: a run delayed past usefulness should still be discarded.
+# Read when the scheduler is built, so changing it needs a restart.
+_MISFIRE_GRACE_SECONDS = 30
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
@@ -253,7 +260,10 @@ class CronService:
         self.engine = engine
         self.db = db
         self.timezone = ZoneInfo(config.timezone)
-        self.scheduler = AsyncIOScheduler(timezone=self.timezone)
+        self.scheduler = AsyncIOScheduler(
+            timezone=self.timezone,
+            job_defaults={"misfire_grace_time": _MISFIRE_GRACE_SECONDS},
+        )
         self._jobs: list[CronJob] = []
         # Ids from the last load that were refused for being reserved. Reported
         # by reload() so the operator hears about it through the same channel
@@ -350,6 +360,8 @@ class CronService:
             replace_existing=True,
         )
 
+        self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
+
         self.scheduler.start()
         logger.info(
             "Cron service started with %d jobs + %d sources",
@@ -358,6 +370,32 @@ class CronService:
 
         # Catch up missed jobs in background (don't block startup)
         asyncio.create_task(self._catchup_missed_jobs())
+
+    def _on_job_missed(self, event) -> None:
+        """Record a run APScheduler dropped for starting too late.
+
+        Such a run never reaches _run_job_wrapper, so without this row nothing
+        distinguishes it from a run that was never scheduled. Listeners are
+        called synchronously on the event loop, so the write is dispatched
+        rather than awaited.
+        """
+        asyncio.create_task(
+            self._record_missed_run(event.job_id, event.scheduled_run_time),
+        )
+
+    async def _record_missed_run(self, job_id: str, due: datetime) -> None:
+        """Persist one missed run. Logging a drop must not itself break cron."""
+        try:
+            await self.db.log_cron_missed(
+                job_id,
+                due.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                error=(
+                    f"run dropped: not started within "
+                    f"{_MISFIRE_GRACE_SECONDS}s of its scheduled time"
+                ),
+            )
+        except Exception as e:
+            logger.warning("Failed to log missed run for %s: %s", job_id, e)
 
     async def reload(self) -> dict:
         """Re-read cron config and apply changes to the running scheduler.
@@ -547,9 +585,21 @@ class CronService:
     def _source_schedule(self, runner) -> str | None:
         """The configured schedule for *runner*, or ``None`` if it has no config.
 
-        Source names can be compound (e.g. "gmail:account@email.com"). The
-        config key is the base type before the colon.
+        A runner that carries its own schedule wins. Sources configured
+        outside ``config.sync`` — a channel observation drain, say — have no
+        section here to look up, and returning ``None`` for them means the
+        runner is built and then silently never scheduled.
+
+        Otherwise the source name picks the section. Names can be compound
+        (e.g. "gmail:account@email.com"); the config key is the base type
+        before the colon.
         """
+        # Must actually be a string. This reads a duck-typed attribute, and a
+        # test double hands back a truthy stand-in for anything asked of it —
+        # which would put a MagicMock where a crontab expression belongs.
+        carried = getattr(runner, "schedule", "")
+        if isinstance(carried, str) and carried:
+            return carried
         config_key = runner.source.source_name.split(":")[0]
         source_config = getattr(self.config.sync, config_key, None)
         if source_config is None:
@@ -1288,16 +1338,18 @@ class CronService:
             )
 
     async def _cleanup_expired(self) -> None:
-        """Clean up expired source messages, consumer cursors, and old cron logs."""
+        """Clean up expired source messages, cursors, cron logs, and observations."""
         try:
             msg_count = await self.db.cleanup_expired_messages()
             cursor_count = await self.db.cleanup_expired_consumer_cursors()
             cron_log_count = await self.db.cleanup_old_cron_logs(days=14)
-            if msg_count or cursor_count or cron_log_count:
+            obs_count = await self.db.cleanup_expired_channel_observations()
+            if msg_count or cursor_count or cron_log_count or obs_count:
                 logger.info(
                     "Cleanup: %d expired messages, %d expired consumer cursors, "
-                    "%d cron logs older than 14 days",
-                    msg_count, cursor_count, cron_log_count,
+                    "%d cron logs older than 14 days, %d expired channel "
+                    "observations",
+                    msg_count, cursor_count, cron_log_count, obs_count,
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
@@ -1478,11 +1530,14 @@ class CronService:
         # Include source runners
         for runner in self._source_runners:
             source_name = runner.source.source_name
-            config_key = source_name.split(":")[0]
             sched_job = self.scheduler.get_job(runner.job_id)
             next_run = sched_job.next_run_time if sched_job else None
-            source_config = getattr(self.config.sync, config_key, None)
-            schedule = getattr(source_config, "schedule", "?") if source_config else "?"
+            # Ask the resolver the scheduler itself used. Re-deriving this
+            # from config.sync answered "?" for any source configured outside
+            # that section — a channel source drain carries its own schedule
+            # and has no sync.<channel> block to find — so the job ran on the
+            # right trigger while the API reported no cadence for it.
+            schedule = self._source_schedule(runner) or "?"
             result.append({
                 "id": runner.job_id,
                 "type": "source",

@@ -2,14 +2,8 @@ import type { ReactNode } from 'react';
 import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/chat';
 import { ActorLabel } from './ActorLabel';
 import { Download, FileText } from '../ui/icons';
-import { getToken } from '../../api/client';
+import { authUrl } from '../../api/hosted';
 import { formatMessageTime } from '../../utils/messageTime';
-
-function authUrl(url: string): string {
-  const token = getToken();
-  if (!token) return url;
-  return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
-}
 
 export function UserMessage({ message, actions, showActor = false }: {
   message: ChatMessage;
@@ -65,7 +59,7 @@ export function UserMessage({ message, actions, showActor = false }: {
                 {files.map((file, idx) => (
                   <a
                     key={idx}
-                    href={`${file.url}${file.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                    href={authUrl(file.url)}
                     download={file.filename}
                     className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
                   >
