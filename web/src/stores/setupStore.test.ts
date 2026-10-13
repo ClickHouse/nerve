@@ -111,6 +111,16 @@ describe('load', () => {
     expect(useSetupStore.getState().state).toBeNull();
   });
 
+  it('drops an answer that arrives after a reset, so a later view never opens on the state it cleared', async () => {
+    const pending = deferred<ReturnType<typeof makeState>>();
+    setupState.mockReturnValueOnce(pending.promise);
+    const loading = useSetupStore.getState().load();
+    useSetupStore.getState().reset();
+    pending.resolve(makeState());
+    await loading;
+    expect(useSetupStore.getState().state).toBeNull();
+  });
+
   it('drops a read that was in flight when a mutation started, so a stale state never overwrites a save', async () => {
     // The server serves the GET first (pre-save state) under its lock; the
     // browser receives it after the save's answer.
@@ -137,6 +147,16 @@ describe('save, skip, finish', () => {
     expect(stepById(useSetupStore.getState(), 'profile')?.status).toBe('done');
     expect(listActors).toHaveBeenCalled();
     expect(useSetupStore.getState().busy).toBeNull();
+  });
+
+  it('drops a save answered after a reset', async () => {
+    const pending = deferred<ReturnType<typeof makeState>>();
+    setupStep.mockReturnValueOnce(pending.promise);
+    const saving = useSetupStore.getState().save('profile', () => api.setupStep('profile', {}));
+    useSetupStore.getState().reset();
+    pending.resolve(withStep(makeState(), step('profile', { status: 'done' })));
+    expect(await saving).toBe(false);
+    expect(useSetupStore.getState().state).toBeNull();
   });
 
   it('attaches a 400 with a field to that field, not to the page', async () => {

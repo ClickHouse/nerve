@@ -171,6 +171,22 @@ let waitToken = 0;
  */
 let mutationSeq = 0;
 
+/**
+ * Bumped by `reset()`. The answer to a request that started before a reset
+ * belongs to the state that `reset()` cleared, so it is dropped.
+ */
+let resetCount = 0;
+
+/**
+ * Binds a request that starts now: its answer may change the store only if
+ * the same session is signed in and the store was not reset meanwhile.
+ */
+function bindRequest(): () => boolean {
+  const sameSession = bindSender().stillCurrent;
+  const started = resetCount;
+  return () => sameSession() && started === resetCount;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -200,6 +216,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
 
   reset: () => {
     waitToken += 1;
+    resetCount += 1;
     set({
       state: null, loading: true, busy: null, error: null, fieldError: null,
       reconnecting: false, reconnectElapsedMs: 0, reconnectFailed: false,
@@ -213,7 +230,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   load: async () => {
     // Stamped with the session that asked. A read started before a sign-out
     // and answered after it describes somebody else's view of the instance.
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     const seq = mutationSeq;
     try {
       const state = await api.setupState();
@@ -235,7 +252,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   save: async (step, run) => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     mutationSeq += 1;
     set({ busy: step, error: null, fieldError: null });
     try {
@@ -266,7 +283,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   skip: async (step, skipped) => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     mutationSeq += 1;
     set({ busy: step, error: null, fieldError: null });
     try {
@@ -284,7 +301,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   finish: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     mutationSeq += 1;
     set({ busy: 'finish', error: null, fieldError: null });
     try {
@@ -302,7 +319,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   restart: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     mutationSeq += 1;
     set({ busy: 'restart', error: null, fieldError: null, overlayDismissed: false });
     let outcome: RestartResponse;
@@ -409,7 +426,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   loadPreflight: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     try {
       const preflight = await api.setupSourcesPreflight();
       if (asked()) set({ preflight });
@@ -419,7 +436,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   loadAgents: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     try {
       const agentsDetected = await api.setupAgentsDetect();
       if (asked()) set({ agentsDetected });
@@ -429,7 +446,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   loadEnvironment: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     try {
       const environment = await api.setupEnvironment();
       if (asked()) set({ environment });
@@ -439,7 +456,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   loadModels: async () => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     try {
       const models = await api.setupModels();
       if (asked()) set({ models });
@@ -449,7 +466,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   },
 
   loadHostLogin: async (refresh = false) => {
-    const asked = bindSender().stillCurrent;
+    const asked = bindRequest();
     try {
       const hostLogin = await api.setupHostLogin(refresh);
       if (asked()) set({ hostLogin });
