@@ -57,6 +57,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.images import validate_image_data, validate_image_file
 from nerve.agent.cache_policy import cache_ttl_env
@@ -208,6 +209,7 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             ev.NormalizedUsage.from_anthropic(message.usage)
             if message.usage else None
         )
+        status, error = _result_outcome(message)
         out.append(ev.TurnCompleted(
             native_session_id=message.session_id,
             model=None,  # claude reports the model per AssistantMessage
@@ -218,10 +220,33 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             duration_ms=getattr(message, "duration_ms", None),
             duration_api_ms=getattr(message, "duration_api_ms", None),
             num_turns=getattr(message, "num_turns", None),
-            status="completed",
+            status=status,
+            error=error,
         ))
 
     return out
+
+
+def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
+    reason = getattr(message, "terminal_reason", None)
+    if reason in {"aborted_streaming", "aborted_tools"}:
+        return "interrupted", reason.replace("_", " ")
+
+    subtype = getattr(message, "subtype", "")
+    if not getattr(message, "is_error", False) and subtype == "success":
+        return "completed", None
+
+    errors = getattr(message, "errors", None)
+    if errors:
+        detail = "; ".join(errors)
+    elif reason == "max_turns":
+        turns = getattr(message, "num_turns", None)
+        detail = f"max turns ({turns}) exhausted" if turns is not None else "max turns exhausted"
+    elif status := getattr(message, "api_error_status", None):
+        detail = f"API error (HTTP {status})"
+    else:
+        detail = (reason or subtype or "Claude turn failed").replace("_", " ")
+    return "failed", detail
 
 
 def _translate_tool_result(
@@ -410,7 +435,7 @@ class ClaudeBackend:
         # ScheduleWakeup is a Claude CLI built-in (captured via the
         # PostToolUse hook) — the registry equivalent exists for backends
         # without built-ins and would be a confusing duplicate here.
-        return {"schedule_wakeup"}
+        return {"schedule_wakeup"} | config_excluded_tools(self.config)
 
     def validate_resume_target(self, native_id: str, cwd: str) -> bool:
         """Check whether Claude Code still has the conversation .jsonl
@@ -487,7 +512,7 @@ class ClaudeBackend:
             else self._effective_effort(spec.effort, selected_model)
         )
         # Some subscriptions reject the context-1m beta for specific models
-        # (e.g. claude-sonnet-4-6) — skip the beta header for those.
+        # (some Sonnet models, for instance) — skip the beta header for those.
         betas = (
             ["context-1m-2025-08-07"]
             if not is_ollama_model
@@ -544,9 +569,21 @@ class ClaudeBackend:
             betas=betas,
             resume=spec.resume_native_id,
             fork_session=spec.fork,
+            # Mid-conversation fork: truncate the resumed transcript at the
+            # kept turn's last entry (we record it per turn as
+            # native_turn_id — see ClaudeClient._translate_and_capture).
+            # Guarded on spec.fork: without fork_session this flag would
+            # truncate the ORIGINAL session in place.
+            resume_session_at=(
+                spec.fork_last_turn_id if spec.fork else None
+            ),
             hooks=hooks,
             stderr=_cli_stderr,
             extra_args=extra_args,
+            # Per-line cap on the CLI's stdout.  The SDK default (1 MiB) is
+            # fatal to the turn the moment a Read returns a screenshot — see
+            # AgentConfig.cli_max_message_bytes.
+            max_buffer_size=config.agent.cli_max_message_bytes,
             # No allowed_tools — can_use_tool handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
@@ -682,20 +719,32 @@ class ClaudeBackend:
             api_key = config.effective_api_key
             if api_key:
                 env["ANTHROPIC_API_KEY"] = api_key
-            if config.proxy.enabled:
+            elif getattr(config, "claude_oauth_token", ""):
+                # A subscription token from `claude setup-token`: the CLI
+                # reads it from this variable. An API key wins when both exist.
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = config.claude_oauth_token
+            if config.proxy.enabled or config.anthropic_base_url:
+                # The endpoint of Nerve's own SDK clients. The CLI adds /v1.
                 env["ANTHROPIC_BASE_URL"] = (
-                    f"http://{config.proxy.host}:{config.proxy.port}"
+                    config.anthropic_api_base_url.removesuffix("/v1/")
                 )
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
         # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-        # env vars. Nerve defaults "opus" → claude-opus-5 (skipped on Bedrock,
-        # where model IDs need a geo prefix — set agent.model_aliases with
-        # explicit prefixed IDs there). User-configured aliases merge over
-        # the default; an empty value unsets it (CLI built-in mapping wins).
+        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL and
+        # "haiku" → nerve.config.DEFAULT_FAST_MODEL (skipped on Bedrock, where
+        # model IDs need a geo prefix — set agent.model_aliases with explicit
+        # prefixed IDs there). The haiku value is also the CLI's small fast
+        # model for background calls: the CLI reads ANTHROPIC_SMALL_FAST_MODEL
+        # first and falls back to ANTHROPIC_DEFAULT_HAIKU_MODEL.
+        # User-configured aliases merge over the defaults; an empty value
+        # unsets one (CLI built-in mapping wins).
+        from nerve.config import DEFAULT_FAST_MODEL, DEFAULT_MODEL
+
         aliases: dict[str, str] = {}
         if not config.provider.is_bedrock:
-            aliases["opus"] = "claude-opus-5"
+            aliases["opus"] = DEFAULT_MODEL
+            aliases["haiku"] = DEFAULT_FAST_MODEL
         aliases.update(config.agent.model_aliases)
         for alias, target in aliases.items():
             env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
@@ -751,6 +800,7 @@ class ClaudeBackend:
         """
         session_id = spec.session_id
         captured_files: set[str] = set()
+        max_message_bytes = self.config.agent.cli_max_message_bytes
 
         async def _snapshot_hook(hook_input, tool_use_id, context):
             """PreToolUse: capture file content before Edit/Write/NotebookEdit."""
@@ -777,12 +827,17 @@ class ClaudeBackend:
             encodes them into image content blocks. If the file isn't a
             valid image, the API rejects it with 400 and the bad block
             persists in the CLI's history — an unrecoverable poison loop.
-            Check magic bytes and size *before* Read executes.
+            A valid image can still be too big for the SDK transport: the
+            result travels as one stream-json line, and a line over
+            ``max_buffer_size`` aborts the whole turn.  Check magic bytes
+            and both size bounds *before* Read executes.
             """
             tool_input = hook_input.get("tool_input", {})
             file_path = tool_input.get("file_path", "")
 
-            error = validate_image_file(file_path)
+            error = validate_image_file(
+                file_path, max_message_bytes=max_message_bytes,
+            )
             if error:
                 logger.warning(
                     "Blocked Read of invalid image for session %s: %s",
@@ -892,10 +947,18 @@ class ClaudeBackend:
         return "4-5" in m or "4-6" in m
 
     @staticmethod
+    def _model_rejects_disabled_thinking(model: str | None) -> bool:
+        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
+        # level. Effort is the only control.
+        return bool(model) and "opus-5-5" in model.lower()
+
+    @staticmethod
     def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
+            if ClaudeBackend._model_rejects_disabled_thinking(model):
+                return {"type": "adaptive"}
             return {"type": "disabled"}
         if v == "adaptive":
             return {"type": "adaptive"}
@@ -917,11 +980,12 @@ class ClaudeBackend:
             return {"type": "adaptive"}
 
     # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
+    # full model name so dated aliases (a model id with a date suffix) resolve.
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
+        "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
@@ -963,6 +1027,10 @@ class ClaudeBackend:
 class ClaudeClient(AgentClient):
     """One live Claude Code CLI subprocess for one nerve session."""
 
+    # Class-level default so test doubles built via ``__new__`` (and any
+    # partially-initialized instance) read None instead of raising.
+    _last_entry_uuid: str | None = None
+
     def __init__(self, spec: SessionSpec, options: ClaudeAgentOptions):
         self._spec = spec
         self._options = options
@@ -971,6 +1039,11 @@ class ClaudeClient(AgentClient):
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
         self.model: str = options.model or ""
+        # Last main-chain transcript-entry uuid observed this turn — the
+        # fork anchor (``resume_session_at`` wants "the last transcript
+        # entry of the turn you are keeping"). Reset per turn; attached to
+        # TurnCompleted as native_turn_id (codex parity).
+        self._last_entry_uuid: str | None = None
 
     # -- protocol ------------------------------------------------------- #
 
@@ -982,6 +1055,10 @@ class ClaudeClient(AgentClient):
         await self._sdk.connect()
 
     async def start_turn(self, turn: TurnInput) -> None:
+        # Per-turn fork anchor: a turn that yields no transcript entries
+        # (errors out early) must not inherit the previous turn's uuid —
+        # a stale anchor would fork at the WRONG turn.
+        self._last_entry_uuid = None
         try:
             if turn.images or turn.documents:
                 blocks = self._build_content_blocks(turn)
@@ -1115,7 +1192,22 @@ class ClaudeClient(AgentClient):
         msg_sid = getattr(message, "session_id", None)
         if msg_sid:
             self._native_session_id = msg_sid
-        return translate_message(message)
+        # Track the last MAIN-CHAIN transcript entry uuid (assistant text /
+        # tool_use and user tool_result rows both count — a turn ending on
+        # an end-turn tool closes on a user entry). Sidechain (subagent)
+        # entries are skipped: they interleave mid-turn and are not valid
+        # truncation points for ``resume_session_at``.
+        if isinstance(message, (AssistantMessage, UserMessage)):
+            if getattr(message, "parent_tool_use_id", None) is None:
+                entry_uuid = getattr(message, "uuid", None)
+                if entry_uuid:
+                    self._last_entry_uuid = str(entry_uuid)
+        events = translate_message(message)
+        if self._last_entry_uuid:
+            for event in events:
+                if isinstance(event, ev.TurnCompleted):
+                    event.native_turn_id = self._last_entry_uuid
+        return events
 
     async def interrupt(self) -> None:
         await self._sdk.interrupt()

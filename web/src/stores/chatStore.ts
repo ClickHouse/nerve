@@ -1,17 +1,20 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
+import { bindSender, selfActorId } from './authStore';
 // Helpers
 import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
+import { onViewerStorageChange } from './helpers/viewerStorage';
 // Handlers
 import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
@@ -232,6 +235,12 @@ interface ChatState {
   ensureRealSession: (running?: boolean) => Promise<string>;
   discardVirtualSession: () => void;
   setDraft: (sessionId: string, text: string) => void;
+  /**
+   * Write all unsent text to the drafts at once: the composer text, and the
+   * messages that wait in the WebSocket queue. Re-entry calls this before the
+   * page leaves for the gateway login. Attachments are in memory and are lost.
+   */
+  keepUnsentWork: () => void;
   markSeen: (sessionId: string) => void;
   deleteSession: (id: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
@@ -803,6 +812,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { drafts: { ...s.drafts, [sessionId]: text } };
     }),
 
+  keepUnsentWork: () => {
+    flushComposer?.();
+    const queued = ws.takePendingMessages();
+    if (queued.length === 0) return;
+    const drafts = { ...get().drafts };
+    const bySession = new Map<string, string[]>();
+    for (const { session_id, content } of queued) {
+      if (!content.trim()) continue;
+      bySession.set(session_id, [...(bySession.get(session_id) ?? []), content]);
+    }
+    for (const [sessionId, texts] of bySession) {
+      // The queued messages are older than the text in the composer, so they
+      // come first.
+      const current = drafts[sessionId];
+      const text = [...texts, ...(current?.trim() ? [current] : [])].join('\n\n');
+      drafts[sessionId] = text;
+      persistDraft(sessionId, text);
+    }
+    set({ drafts });
+  },
+
   markSeen: (sessionId: string) => {
     if (!sessionId) return;
     const now = Date.now();
@@ -1090,8 +1120,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
+    //
+    // The gateway excludes this tab from its own `user_message` echo, so stamp
+    // the optimistic row with the same stable author id the stored row gets.
+    // Null identity follows the ordinary unattributed-history path.
+    const sender = selfActorId();
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString() }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
@@ -1157,6 +1192,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // deferred prompt into the current chat (fresh, virtual, or existing).
     // If a composer model/backend pick is in flight for a new chat, carry it
     // onto the created row so the header badge is right from the first render.
+    // Bind before the requests so the optimistic row uses the same actor as the
+    // server even if the tab signs out or changes account while they run.
+    const sender = bindSender();
     const vs = get().virtualSession;
     const effBackend = get().newChatBackend ?? null;
     const pickedModel = effBackend
@@ -1165,7 +1203,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const real: Session = await api.createSession(
       undefined, effBackend, undefined, null, pickedModel,
     );
+    // If auth changed, keep the server row but do not show it in this tab.
+    if (!sender.stillCurrent()) return;
     const res = await api.runLater(real.id, content, delay, fileIds, imageBlocks);
+    if (!sender.stillCurrent()) return;
     const now = new Date().toISOString();
     set((state) => {
       // Drop the transient new-chat state so we don't strand an empty virtual
@@ -1187,7 +1228,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' as const },
         messages: [
-          { role: 'user' as const, blocks: buildBlocks(), created_at: now },
+          // Attribute the deferred prompt to the requester; the Nerve-generated
+          // acknowledgement has no actor_id.
+          { role: 'user' as const, blocks: buildBlocks(), created_at: now, actor_id: sender.actorId },
           { role: 'assistant' as const, blocks: [{ type: 'text', content: res.ack }], created_at: now },
         ],
       };
@@ -1271,3 +1314,31 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
 // Re-export ChatState for handler type imports
 export type { ChatState };
+
+/** Writes the composer text to the drafts at once. ChatInput installs it. */
+let flushComposer: (() => void) | null = null;
+
+/**
+ * Install the function that writes the composer text to the drafts at once.
+ * The composer saves its text after a delay, and re-entry cannot wait for it.
+ * Returns the function that removes it.
+ */
+export function registerComposerFlush(flush: () => void): () => void {
+  flushComposer = flush;
+  return () => {
+    if (flushComposer === flush) flushComposer = null;
+  };
+}
+
+setBeforeReenter(() => useChatStore.getState().keepUnsentWork());
+
+onViewerStorageChange(() => {
+  clearAllAutoCloseTimers();
+  useChatStore.setState({
+    ...useChatStore.getInitialState(),
+    drafts: loadDrafts(),
+    reads: loadReads(),
+    readsBaseline: loadBaseline(),
+    virtualSession: restoreVirtualSession(),
+  });
+});

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from nerve.identity import Actor
+
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
 _SYSTEM_SQL = "('" + "', '".join(SYSTEM_SOURCES) + "')"
@@ -25,23 +27,51 @@ class SessionStore:
         backend: str = "claude",
         model: str | None = None,
         cwd: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
+        """Insert a session row, recording who caused it to exist.
+
+        ``actor`` is required — keyword-only and with no default — so that
+        every call site has to answer the question rather than inherit an
+        answer. Pass the request's actor for something a person asked for, the
+        agent's system principal (``Database.system_actor``) for the
+        sessions the instance mints for itself, and ``None`` where attribution
+        is unavailable. ``source`` is transport provenance, never identity.
+
+        The ``OR IGNORE`` insert makes creator attribution write-once;
+        re-resolving an existing session cannot replace it.
+
+        Returns the **stored** row, not the arguments. The distinction only
+        shows up when the insert was ignored — a same-id race, or a short-id
+        collision — and there it is the difference between the caller being
+        told who owns the session and being told who asked to. Everything the
+        old shape returned is a column, so the row is a superset of it.
+        """
         now = datetime.now(timezone.utc).isoformat()
+        created_by = actor.actor_id if actor else None
         await self._write(
             """INSERT OR IGNORE INTO sessions
                (id, title, source, metadata, status, parent_session_id,
-                forked_from_message, backend, model, cwd, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                forked_from_message, backend, model, cwd, created_by_actor_id,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, title or session_id, source,
              json.dumps(metadata or {}), status,
              parent_session_id, forked_from_message, backend, model, cwd,
-             now, now),
+             created_by, now, now),
         )
+        stored = await self.get_session(session_id)
+        if stored is not None:
+            return stored
+        # Unreachable while the insert above succeeded; a row deleted between
+        # the two statements should not turn session creation into a None.
         return {
             "id": session_id, "title": title or session_id,
             "source": source, "status": status,
             "parent_session_id": parent_session_id,
             "backend": backend, "model": model, "cwd": cwd,
+            "created_by_actor_id": created_by,
         }
 
     async def get_session(self, session_id: str) -> dict | None:
@@ -391,6 +421,40 @@ class SessionStore:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def list_channel_sessions_for_conversation(
+        self,
+        channel_key: str,
+        limit: int = 20,
+        exclude_statuses: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """List one conversation mapping and delimiter-bounded descendants.
+
+        Channel keys are otherwise opaque. A descendant is explicitly a key
+        beginning with ``<channel_key>:``; arbitrary string prefixes such as
+        ``chat:1`` and ``chat:12`` never share a scope.
+        """
+        escaped = (
+            channel_key.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        sql = """
+            SELECT cs.channel_key, cs.session_id, cs.updated_at,
+                   s.title, s.status, s.starred
+            FROM channel_sessions cs
+            JOIN sessions s ON s.id = cs.session_id
+            WHERE (cs.channel_key = ? OR cs.channel_key LIKE ? ESCAPE '\\')
+        """
+        params: list = [channel_key, f"{escaped}:%"]
+        if exclude_statuses:
+            placeholders = ",".join("?" for _ in exclude_statuses)
+            sql += f" AND s.status NOT IN ({placeholders})"
+            params.extend(exclude_statuses)
+        sql += " ORDER BY cs.updated_at DESC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(sql, tuple(params)) as cursor:
+            return [dict(row) async for row in cursor]
 
     async def set_channel_session(self, channel_key: str, session_id: str) -> None:
         """Persist a channel-to-session mapping."""

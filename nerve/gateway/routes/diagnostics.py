@@ -17,7 +17,7 @@ from nerve.observability.langfuse import get_status as langfuse_status
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 async def _per_source_status(db, source: str) -> tuple[str, dict]:
@@ -36,7 +36,7 @@ async def _per_source_status(db, source: str) -> tuple[str, dict]:
 
 
 @router.get("/api/diagnostics")
-async def diagnostics(user: dict = Depends(require_auth)):
+async def diagnostics():
     """System health and status information."""
     deps = get_deps()
     config = get_config()
@@ -66,6 +66,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
         daily_usage_res,
         source_usage_res,
         model_usage_res,
+        cron_job_usage_res,
         cache_ttl_rows_res,
     ) = await asyncio.gather(
         deps.db.get_cron_logs(limit=10),
@@ -78,6 +79,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
         deps.db.get_usage_by_period(days=7),
         deps.db.get_usage_by_source(days=7),
         deps.db.get_usage_by_model(days=7),
+        deps.db.get_usage_by_cron_job(days=7),
         deps.db.get_cache_ttl_turn_rows(days=7),
         return_exceptions=True,
     )
@@ -106,6 +108,8 @@ async def diagnostics(user: dict = Depends(require_auth)):
             "daily": daily_usage_res,
             "by_source": source_usage_res,
             "by_model": model_usage_res,
+            # Optional breakdown: a failure here hides only this table.
+            "by_cron_job": _ok(cron_job_usage_res, []),
         }
         # Cache-TTL policy block: 1h write share + estimated savings vs a
         # pure-5m baseline (guardrail — see cache_policy.build_ttl_report).
@@ -185,7 +189,7 @@ async def diagnostics(user: dict = Depends(require_auth)):
 
 
 @router.get("/api/observability/status")
-async def observability_status(user: dict = Depends(require_auth)):
+async def observability_status():
     """Lightweight status endpoint — used by the chat UI to render a
     "View in Langfuse" deep-link when observability is configured.
 
@@ -196,7 +200,7 @@ async def observability_status(user: dict = Depends(require_auth)):
 
 
 @router.post("/api/memorization/sweep")
-async def trigger_memorization_sweep(user: dict = Depends(require_auth)):
+async def trigger_memorization_sweep():
     """Manually trigger a memorization sweep."""
     deps = get_deps()
     if not deps.engine:

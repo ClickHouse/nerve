@@ -2,7 +2,7 @@
 """Fake ``codex app-server`` for offline transport/backend tests.
 
 Speaks newline-delimited JSON-RPC 2.0 on stdio, mimicking the surface
-nerve's CodexAppServerClient uses (schema shapes from codex-cli 0.144.1,
+nerve's CodexAppServerClient uses (schema shapes from codex-cli 0.153.3,
 see tests/fixtures/codex_schema_meta.json). Behavior is selected via the
 FAKE_CODEX_MODE env var:
 
@@ -45,7 +45,7 @@ import threading
 import time
 
 if "--version" in sys.argv:
-    print("codex-cli 0.144.1")
+    print("codex-cli 0.153.3")
     raise SystemExit(0)
 
 MODE = os.environ.get("FAKE_CODEX_MODE", "basic")
@@ -306,7 +306,7 @@ def main() -> None:
 
         if method == "initialize":
             respond(req_id, {
-                "userAgent": "fake-codex/0.144.1",
+                "userAgent": "fake-codex/0.153.3",
                 "_fake": {"configOverrides": _config_overrides(),
                           "env": {"CODEX_HOME": os.environ.get("CODEX_HOME", ""),
                                   "NERVE_MCP_TOKEN_SET": bool(os.environ.get("NERVE_MCP_TOKEN"))}},
@@ -319,7 +319,25 @@ def main() -> None:
         elif method == "account/login/start":
             respond(req_id, {"loginId": "fake-login"})
         elif method == "model/list":
-            respond(req_id, {"data": [{"id": "gpt-5.6-sol"}]})
+            # Mirrors the real codex-cli 0.153 catalog shape: GPT-5.6 Sol
+            # and the hidden, API-only GPT-6 Astra both advertise up to
+            # "ultra"; a hidden internal preview stops at "high". Hidden
+            # entries appear only with includeHidden.
+            def _efforts(*names):
+                return [{"reasoningEffort": n} for n in names]
+            full = _efforts("low", "medium", "high", "xhigh", "max", "ultra")
+            catalog = [
+                {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "hidden": False,
+                 "supportedReasoningEfforts": full},
+                {"id": "gpt-6-astra", "model": "gpt-6-astra", "hidden": True,
+                 "supportedReasoningEfforts": full},
+                {"id": "fake-internal-preview", "model": "fake-internal-preview",
+                 "hidden": True,
+                 "supportedReasoningEfforts": _efforts("low", "medium", "high")},
+            ]
+            if not (msg.get("params") or {}).get("includeHidden"):
+                catalog = [m for m in catalog if not m["hidden"]]
+            respond(req_id, {"data": catalog})
         elif method == "thread/read":
             if MODE == "resume_auth_fail":
                 respond_error(req_id, 401, "authentication expired")
@@ -343,6 +361,11 @@ def main() -> None:
             thread_id = msg["params"]["threadId"]
             turn_id = f"turn_{threads_started}_1"
             _active_turn.update({"threadId": thread_id, "turnId": turn_id})
+            # Expose the received turn params to tests (effort clamping).
+            home = os.environ.get("CODEX_HOME")
+            if home:
+                with open(os.path.join(home, "last_turn_params.json"), "w") as fh:
+                    json.dump(msg["params"], fh)
             respond(req_id, {"turn": {"id": turn_id, "status": "inProgress",
                                       "items": []}})
             threading.Thread(

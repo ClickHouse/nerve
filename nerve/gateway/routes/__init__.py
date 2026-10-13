@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from nerve.gateway.auth import is_external_mode
 from nerve.gateway.routes._deps import (
     get_deps,
     init_deps,
@@ -17,7 +18,10 @@ from nerve.gateway.routes._deps import (
     set_notification_service,
 )
 from nerve.gateway.routes import (
+    accounts,
+    actors,
     auth,
+    setup,
     sessions,
     tasks,
     plans,
@@ -48,9 +52,21 @@ __all__ = [
 
 
 def register_all_routes() -> APIRouter:
-    """Assemble and return the combined API router."""
+    """Assemble and return the combined API router.
+
+    In external mode, the gateway manages people, so the local account routes
+    and the first-account claim are not registered. The setup checklist is
+    registered in both modes: any signed-in person may run setup.
+    """
+    local_accounts = not is_external_mode()
     router = APIRouter()
     router.include_router(auth.router)
+    if local_accounts:
+        router.include_router(accounts.router)
+    router.include_router(actors.router)
+    if local_accounts:
+        router.include_router(setup.claim_router)
+    router.include_router(setup.router)
     router.include_router(sessions.router)
     router.include_router(tasks.router)
     router.include_router(plans.router)

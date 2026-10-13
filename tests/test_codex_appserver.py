@@ -1,7 +1,7 @@
 """CodexBackend / CodexAppServerClient integration tests.
 
 Driven against ``tests/fixtures/fake_codex_appserver.py`` — a scripted
-stdio JSON-RPC subprocess mimicking codex-cli 0.144.1's app-server
+stdio JSON-RPC subprocess mimicking codex-cli 0.153.3's app-server
 surface. Everything runs offline.
 
 The crown-jewel test is ``test_approval_does_not_block_stream``: the
@@ -14,6 +14,7 @@ synchronously); nerve's asyncio client must not.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -129,6 +130,70 @@ async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
         assert shaped["input_tokens"] == 200
         assert shaped["cache_read_input_tokens"] == 1000
         assert shaped["cache_creation_input_tokens"] == 0
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_hidden_catalog_models_are_opt_in(tmp_path, monkeypatch):
+    """GPT-6 Astra is hidden upstream (``model/list`` needs includeHidden):
+    it is offered only through ``codex.models`` (the default names it),
+    while every catalog entry — hidden or not — stays a legal session
+    model. The picker never sees the other hidden entries."""
+    _mode(monkeypatch, "account_api_key")
+    cfg = _config(tmp_path, auth="api_key", api_key="sk-fake")
+    backend = CodexBackend(_deps(cfg))
+    status = await backend.preflight(force=True)
+    assert status["available"] is True
+    assert status["models"] == ["gpt-5.6-sol", "gpt-6-astra"]
+    assert status["hidden_models"] == ["fake-internal-preview", "gpt-6-astra"]
+    await backend.validate_model("gpt-6-astra")
+    await backend.validate_model("fake-internal-preview")   # allowed, not offered
+    with pytest.raises(Exception, match="not available"):
+        await backend.validate_model("claude-opus-5")
+
+    client = await backend.create_client(
+        _spec(cfg, model="gpt-6-astra", effort="max"),
+    )
+    try:
+        assert client.model == "gpt-6-astra"
+        await client.start_turn(TurnInput(text="hello"))
+        done = (await _collect_turn(client))[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.status == "completed"
+        # Astra advertises "ultra" like the 5.6 family — nothing to clamp.
+        sent = json.loads(
+            (tmp_path / "codex-home" / "last_turn_params.json").read_text(),
+        )
+        assert sent["effort"] == "ultra"
+        # API-billed at Astra's rate: 200*10 + 1000*1 + 50*50 = 5500 per 1M
+        assert done.total_cost_usd == pytest.approx(0.0055)
+        assert done.cost_basis == "api_billed"
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_effort_is_clamped_to_the_models_catalog(tmp_path, monkeypatch):
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path, models=[])       # offer no hidden entries ...
+    backend = CodexBackend(_deps(cfg))
+    status = await backend.preflight(force=True)
+    assert status["models"] == ["gpt-5.6-sol"]
+    # ... yet the catalog still allows them, and an entry that only
+    # advertises up to "high" caps the request: nerve "max" → codex
+    # "ultra" → "high", instead of a turn the app-server would reject.
+    client = await backend.create_client(
+        _spec(cfg, model="fake-internal-preview", effort="max"),
+    )
+    try:
+        assert client.turn_effort() == "high"
+        await client.start_turn(TurnInput(text="hello"))
+        await _collect_turn(client)
+        sent = json.loads(
+            (tmp_path / "codex-home" / "last_turn_params.json").read_text(),
+        )
+        assert sent["effort"] == "high"
     finally:
         await client.disconnect()
 

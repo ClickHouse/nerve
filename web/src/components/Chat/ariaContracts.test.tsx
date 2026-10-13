@@ -14,7 +14,11 @@ vi.mock('../../api/client', () => ({
     getModels: vi.fn(async () => ({ models: [], default: null })),
     rewritePrompt: vi.fn(),
     uploadFiles: vi.fn(),
+    getViewer: vi.fn(async () => { throw new Error("401"); }),
   },
+  // chatStore reads these authStore dependencies when it stamps optimistic rows.
+  getToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
 }));
 
 /**

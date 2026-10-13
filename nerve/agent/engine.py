@@ -47,9 +47,12 @@ from nerve.agent.interactive import (
     get_handler,
 )
 from nerve.agent.prompts import (
+    build_session_preamble,
     build_system_prompt,
     current_time_str,
+    prepend_session_preamble,
     set_skill_manager,
+    worker_onboarding_prompt,
 )
 from nerve.agent.sessions import SessionManager, SessionStatus
 from nerve.agent.streaming import broadcaster
@@ -66,8 +69,17 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
+from nerve.identity import Actor
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.setup_writer import (
+    TASK_ONBOARDING_MARKER,
+    publish_text,
+    render_task_md,
+    task_description_from,
+    task_onboarding_pending,
+)
 from nerve.skills.manager import SkillManager
+from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +266,7 @@ class AgentEngine:
         # survives restarts without re-firing on every resume.
         self._observed_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
+        self._channel_runtimes: dict[str, Any] = {}
         # Gateways expose an ephemeral plaintext MCP listener on loopback for
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
@@ -293,6 +306,24 @@ class AgentEngine:
             )
         )
         self._session_backends: dict[str, str] = {}
+        # Per-session context awaiting delivery (static-prompt mode). The
+        # system prompt is byte-identical across sessions, so the session
+        # id and the frozen recall are rendered separately at client build
+        # (_get_or_create_client) and prepended to the FIRST user message
+        # of the native conversation by _run_inner, which pops the entry.
+        # Keyed by session id; an entry survives a client rebuild that
+        # happens before any turn was sent (the rebuild re-renders it).
+        self._pending_preambles: dict[str, str] = {}
+
+    @property
+    def memory_bridge(self) -> Any | None:
+        """The memU bridge once :meth:`initialize` built it, else ``None``.
+
+        The setup page's Mode step applies the chosen memory categories to
+        the running service through it (``apply_categories``), so a browser
+        setup does not end in a restart for that alone.
+        """
+        return self._memory_bridge
 
     @property
     def config(self) -> NerveConfig:
@@ -373,11 +404,14 @@ class AgentEngine:
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
-        from nerve.gateway.auth import create_mcp_session_token
+        from nerve.gateway.auth import create_mcp_session_token, effective_jwt_secret
 
-        if not self.config.auth.jwt_secret:
-            return ""  # dev mode — endpoint accepts unauthenticated calls
-        return create_mcp_session_token(self.config.auth.jwt_secret, session_id)
+        secret = effective_jwt_secret(self.config)
+        if not secret:
+            # No secret is pinned before startup completes. The endpoint
+            # refuses every request then, so an empty token is enough.
+            return ""
+        return create_mcp_session_token(secret, session_id)
 
     def _backend_for(self, session: dict | None, source: str) -> AgentBackend:
         """Resolve the backend for a session — STICKY on the stored column.
@@ -552,14 +586,40 @@ class AgentEngine:
         return self._mcp_servers_cache
 
     def _needs_worker_onboarding(self) -> bool:
-        """Check if this is a worker instance that needs first-boot onboarding."""
+        """Check if this is a worker instance that needs first-boot onboarding.
+
+        Pending while ``TASK.md`` carries the template's onboarding marker —
+        the onboarding session deletes that line last, once every section is
+        filled — and, for files written by older versions, while it is still
+        the raw ``# Task`` form (:func:`nerve.setup_writer.task_onboarding_pending`).
+        """
         task_md = self.config.workspace / "TASK.md"
         if not task_md.exists():
             return False
-        content = task_md.read_text(encoding="utf-8").strip()
-        # Raw task description from init starts with "# Task\n\n"
-        # Structured TASK.md (post-onboarding) has "## Mission"
-        return content.startswith("# Task\n") and "## Mission" not in content
+        try:
+            content = task_md.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Worker onboarding: cannot read %s: %s", task_md, e)
+            return False
+        return task_onboarding_pending(content)
+
+    def ensure_worker_onboarding(self) -> bool:
+        """Start the first-boot onboarding session if it is due and not running.
+
+        The public, idempotent-per-process entry the setup wizard's finish
+        step uses when the mode was chosen in the browser after boot (the
+        start-up check in :meth:`initialize` has already run by then). Returns
+        whether a session was scheduled now. The session it creates is the one
+        :meth:`run_cron` names ``Cron: worker-onboarding`` with
+        ``source="cron"``, which is how the checklist recognises it.
+        """
+        task = getattr(self, "_onboarding_task", None)
+        if task is not None and not task.done():
+            return False
+        if not self._needs_worker_onboarding():
+            return False
+        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
+        return True
 
     async def _run_worker_onboarding(self) -> None:
         """Run the worker onboarding agent session on first boot."""
@@ -567,64 +627,19 @@ class AgentEngine:
 
         task_md = self.config.workspace / "TASK.md"
         raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
-        task_description = raw_task.strip()
-        # Strip the "# Task\n\n" prefix
-        if task_description.startswith("# Task\n\n"):
-            task_description = task_description[len("# Task\n\n"):]
+        task_description = task_description_from(raw_task)
+        if task_description is None:  # completed since the check; nothing to do
+            logger.info("Worker onboarding: TASK.md is already complete")
+            return
+        if TASK_ONBOARDING_MARKER not in raw_task:
+            # A raw ``# Task`` file from an older install. The session is told
+            # to fill the template in place, so give it the template: its text
+            # kept under the description heading, the marker on line 2.
+            await asyncio.to_thread(publish_text, task_md, render_task_md(task_description))
+            logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
 
-        prompt = (
-            "You are running the **first-boot onboarding** for this Nerve worker instance.\n\n"
-            f"The user described the task as:\n\n> {task_description}\n\n"
-            "Your job is to research this task thoroughly and configure the worker.\n\n"
-            "## Step 1: Research\n\n"
-            "Use your tools to understand the task deeply:\n"
-            "- **Fetch URLs** mentioned in the description (repos, docs, APIs)\n"
-            "- **Search the web** for relevant documentation and tools\n"
-            "- **Clone repos** if needed to understand their structure\n"
-            "- **Explore CI systems**, databases, APIs referenced in the task\n"
-            "- Take notes on what you discover — you'll need them for configuration\n\n"
-            "## Step 2: Rewrite TASK.md\n\n"
-            "Replace the raw description in TASK.md with a structured version:\n"
-            "- **## Mission**: What this worker does (1-2 sentences)\n"
-            "- **## Scope**: Repos, services, or systems to monitor\n"
-            "- **## Triggers**: What events to watch for\n"
-            "- **## Actions**: What to do when triggered (step by step)\n"
-            "- **## Approval**: What needs human approval vs autonomous action\n"
-            "- **## References**: Links to docs, APIs, tools discovered during research\n\n"
-            "## Step 3: Create Skills\n\n"
-            "Use `skill_create` to create domain-specific skills the worker will need.\n"
-            "Each skill should have clear step-by-step instructions for a procedure\n"
-            "(e.g., 'how to query the monitoring API', 'how to debug a deployment failure').\n\n"
-            "## Step 4: Configure Cron Jobs\n\n"
-            "Set up monitoring cron jobs by editing `<workspace>/config/cron/jobs.yaml`\n"
-            "(legacy installs may still use `~/.nerve/cron/jobs.yaml`).\n"
-            "This is the Nerve cron system — NOT the Anthropic SDK or system crontab.\n\n"
-            "The YAML format is:\n"
-            "```yaml\n"
-            "jobs:\n"
-            "  - id: my-monitor\n"
-            "    schedule: '*/15 * * * *'  # cron expression\n"
-            "    description: What this job does\n"
-            "    session_mode: persistent  # or 'isolated' for one-shot\n"
-            "    context_rotate_hours: 24  # reset context daily (persistent only)\n"
-            "    enabled: true\n"
-            "    prompt: |\n"
-            "      Instructions for what the agent should do each run.\n"
-            "      Reference Nerve tools: task_create, plan_propose, notify,\n"
-            "      memorize, skill_get, web_fetch, bash, etc.\n"
-            "```\n\n"
-            "Create cron jobs that implement the monitoring/actions described in the task.\n"
-            "Use `persistent` session_mode for jobs that need context across runs.\n\n"
-            "## Step 5: Create Initial Tasks\n\n"
-            "Use `task_create` for any remaining manual setup work the user needs to do.\n\n"
-            "## Step 6: Notify\n\n"
-            "When done, use `notify` to tell the user that onboarding is complete.\n"
-            "Include a summary of what was configured: TASK.md sections, skills created,\n"
-            "cron jobs added, and any tasks that need manual attention.\n\n"
-            "---\n\n"
-            "Be thorough. You have full tool access — bash, web fetch, file read/write,\n"
-            "skill_create, task_create, notify. This is a one-time setup — do it right.\n"
-        )
+        guide = await asyncio.to_thread(read_worker_guide)
+        prompt = worker_onboarding_prompt(task_description, guide)
 
         try:
             await self.run_cron(
@@ -713,6 +728,20 @@ class AgentEngine:
     def register_channel(self, channel: Any) -> None:
         """Register a channel with the router."""
         self.router.register(channel)
+
+    def channel(self, name: str) -> Any | None:
+        """The registered channel called ``name`` (``"telegram"``), or ``None``."""
+        if self._router is None:
+            return None
+        return self._router.get_channel(name)
+
+    def register_channel_runtime(self, name: str, runtime: Any) -> None:
+        """Publish the lifecycle owner for a dynamically managed channel."""
+        self._channel_runtimes[name] = runtime
+
+    def get_channel_runtime(self, name: str) -> Any | None:
+        """Return a channel lifecycle owner, if one was installed."""
+        return self._channel_runtimes.get(name)
 
     # ------------------------------------------------------------------ #
     #  File snapshot for diff tracking                                     #
@@ -1206,12 +1235,31 @@ class AgentEngine:
                 if session_meta.get("cache_ttl") != cache_ttl:
                     meta_updates["cache_ttl"] = cache_ttl
 
+            # Determine if this is a fork
+            is_fork = fork_from is not None
+
+            # Static-prompt mode (agent.static_system_prompt): the session
+            # id and the frozen recall stay OUT of the system prompt so its
+            # bytes are shared across sessions (exact-prefix cache), and
+            # are prepended to the first user message of the native
+            # conversation instead. Deliver when the transcript is fresh
+            # (no resume target), on a fork (new id; the parent's history
+            # carries the parent's), and once for a resumed session that
+            # never received one (created before this mode existed). The
+            # ``preamble_sent`` marker records the delivery so a resume
+            # doesn't repeat it; the transcript replays it on later turns.
+            static_prompt = bool(self.config.agent.static_system_prompt)
+            deliver_preamble = static_prompt and (
+                not sdk_resume_id
+                or is_fork
+                or not session_meta.get("preamble_sent")
+            )
+            if deliver_preamble and session and not session_meta.get("preamble_sent"):
+                meta_updates["preamble_sent"] = True
+
             if meta_updates and session:
                 session_meta.update(meta_updates)
                 await self.db.update_session_metadata(session_id, session_meta)
-
-            # Determine if this is a fork
-            is_fork = fork_from is not None
 
             # Create interactive hub for this session.
             # Non-web sessions (telegram, cron, hook) cannot handle
@@ -1226,9 +1274,10 @@ class AgentEngine:
             register_handler(session_id, handler)
 
             # Render the system prompt (engine-owned: identity files,
-            # frozen recall, skills; the tool list respects the backend's
-            # exclusions so the prompt never advertises a tool this
-            # session's MCP server doesn't serve).
+            # skills; the tool list respects the backend's exclusions so
+            # the prompt never advertises a tool this session's MCP server
+            # doesn't serve). In static mode the id and the frozen recall
+            # are ignored here and go into the preamble below.
             system_prompt = build_system_prompt(
                 workspace=self.config.workspace,
                 session_id=session_id,
@@ -1237,6 +1286,7 @@ class AgentEngine:
                 recalled_memories=recalled_memories or None,
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
+                static=static_prompt,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1308,6 +1358,12 @@ class AgentEngine:
                     session_id, {"sdk_session_id": None},
                 )
                 sdk_resume_id = None
+                # The transcript is fresh after all — it needs the preamble.
+                deliver_preamble = static_prompt
+            if deliver_preamble:
+                self._pending_preambles[session_id] = build_session_preamble(
+                    session_id, source, recalled_memories or None,
+                )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
 
@@ -1512,12 +1568,16 @@ class AgentEngine:
         at_message_id: str | None = None,
         title: str | None = None,
         source: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Fork a session. Returns the new session dict.
 
         Args:
             source: Override the source field on the fork (default: inherit
                     from parent).
+            actor: Who asked for the fork. Stamped on the new session; the
+                   copied messages keep their original senders.
         """
         parent = await self.db.get_session(source_session_id)
         if not parent:
@@ -1525,6 +1585,7 @@ class AgentEngine:
 
         fork = await self.sessions.fork_session(
             source_session_id, at_message_id, title, source=source,
+            actor=actor,
         )
         return fork
 
@@ -1613,6 +1674,11 @@ class AgentEngine:
                     user_message=_RESUME_AFTER_RESTART_PROMPT,
                     source=session.get("source") or "web",
                     internal=True,
+                    # The trigger is the instance's own, and `internal` keeps
+                    # it out of the transcript anyway. Whoever was talking to
+                    # the session keeps their messages; the continuation is
+                    # the assistant's.
+                    actor=self.db.system_actor,
                 )
                 resumed += 1
             except Exception as e:
@@ -2255,7 +2321,9 @@ class AgentEngine:
         # Longer workflows that settle after finalize are handled by that merge.
         self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
-        # Store assistant message in DB
+        # Assistant output has no actor_id: ``role`` records model authorship,
+        # while actor_id identifies principals that supplied input. Causal
+        # attribution to the prompting actor is not stored.
         await self.sessions.add_message(
             session_id, "assistant", st.full_response_text,
             channel=channel,
@@ -2263,6 +2331,7 @@ class AgentEngine:
             blocks=st.ordered_blocks if st.ordered_blocks else None,
             native_turn_id=st.native_turn_id,
             bump_updated_at=bump_updated_at,
+            actor=None,
         )
 
         # Persist SDK session ID and update status
@@ -2422,10 +2491,21 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
         Args:
+            actor: Who supplied ``user_message``. The person who typed it for
+                      a web, WebSocket or API turn; the agent's system
+                      principal when the instance composed the prompt itself
+                      (cron, a wakeup, a plan revision, a workflow leg). It is
+                      stored on the persisted user message and on the session
+                      if this run has to create one — never on the assistant's
+                      reply, whose authorship is its ``role``. Required
+                      keyword-only: an autonomous caller must say so rather
+                      than inherit a person's identity by omission.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2472,6 +2552,7 @@ class AgentEngine:
                         internal=internal, images=images,
                         image_refs=image_refs,
                         bump_updated_at=bump_updated_at,
+                        actor=actor,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2516,9 +2597,11 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> str:
         # Ensure session exists in DB
-        await self.sessions.get_or_create(session_id, source=source)
+        await self.sessions.get_or_create(session_id, source=source, actor=actor)
 
         session = await self.db.get_session(session_id)
 
@@ -2553,6 +2636,7 @@ class AgentEngine:
             await self.sessions.add_message(
                 session_id, "user", db_text, channel=channel,
                 blocks=image_refs,
+                actor=actor,
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
@@ -2586,9 +2670,14 @@ class AgentEngine:
                             fork_last_turn_id = await self.db.get_native_turn_at_message(
                                 parent_id, fork_msg,
                             )
-                            if parent.get("backend") == "codex" and not fork_last_turn_id:
+                            # Both backends truncate by native turn id now
+                            # (codex: thread/fork lastTurnId; claude:
+                            # --resume-session-at). A message fork without a
+                            # mapping would silently carry the FULL context —
+                            # the opposite of what was asked — so refuse.
+                            if not fork_last_turn_id:
                                 raise ValueError(
-                                    "Cannot fork this Codex session at the selected "
+                                    "Cannot fork this session at the selected "
                                     "message: no native turn mapping is available."
                                 )
 
@@ -2660,6 +2749,23 @@ class AgentEngine:
             # rules (e.g. the Claude CLI's slash-command interception).
             turn_input = TurnInput(text=query_text, images=images)
 
+            def _with_session_preamble(base: TurnInput) -> TurnInput:
+                # Leading session-context block (static-prompt mode): the
+                # session id and the frozen recall that the shared system
+                # prompt leaves out. Rendered at client build; popped here
+                # so it ships exactly once — with the FIRST user message of
+                # the native conversation (later turns replay the
+                # transcript). Rebuilt from ``query_text`` so a retry that
+                # re-renders it never stacks two blocks. Like the time
+                # note, not persisted to the DB message (db_text above).
+                preamble = self._pending_preambles.pop(session_id, None)
+                if not preamble:
+                    return base
+                return TurnInput(
+                    text=prepend_session_preamble(query_text, preamble),
+                    images=images,
+                )
+
             # Send query + read response, with auto-retry on runtime crash.
             # The runtime may die during start_turn (TransportDiedError) or
             # during response reading (generic Exception from the stream).
@@ -2690,6 +2796,9 @@ class AgentEngine:
                 metadata=_lf_metadata,
             ):
                 for _attempt in range(2):
+                    # Re-checked per attempt: a crash-retry that rebuilt the
+                    # client on a fresh transcript re-renders the preamble.
+                    turn_input = _with_session_preamble(turn_input)
                     try:
                         await client.start_turn(turn_input)
                     except TransportDiedError as _qerr:
@@ -2786,6 +2895,7 @@ class AgentEngine:
                     channel=channel,
                     thinking=st.thinking_text if st.thinking_text else None,
                     blocks=st.ordered_blocks if st.ordered_blocks else None,
+                    actor=None,   # the model's own partial output
                 )
                 await broadcaster.broadcast(session_id, {
                     "type": "stopped", "session_id": session_id,
@@ -2816,6 +2926,11 @@ class AgentEngine:
                 "Could not process image" in err_str
                 or "Could not process document" in err_str
             )
+            # One oversized stream-json line (a large image tool result is
+            # the routine case — see AgentConfig.cli_max_message_bytes) kills
+            # the SDK's reader and with it the turn.  The CLI transcript is
+            # intact, so the session stays resumable; say what happened.
+            is_oversized = "exceeded maximum buffer size" in err_str
             # Preserve resumability on crashed turns (parity with the old
             # any-message early capture): the terminal event never arrived,
             # so pull the native id off the live client. _finalize_turn's
@@ -2843,6 +2958,16 @@ class AgentEngine:
                 # Clear sdk_session_id so next turn creates a fresh CLI
                 await self.db.update_session_fields(
                     session_id, {"sdk_session_id": None},
+                )
+
+            if is_oversized:
+                limit_mib = self.config.agent.cli_max_message_bytes / (1024 * 1024)
+                error_msg = (
+                    f"Agent error: a tool result exceeded the CLI transport's "
+                    f"{limit_mib:.0f} MiB per-message limit (usually a large "
+                    "image read), so the turn was aborted. The session can "
+                    "continue; downscale the image or raise "
+                    "agent.cli_max_message_bytes."
                 )
 
             await broadcaster.broadcast_error(session_id, error_msg)
@@ -3109,6 +3234,7 @@ class AgentEngine:
                         channel=channel,
                         thinking=st.thinking_text or None,
                         blocks=st.ordered_blocks or None,
+                        actor=None,   # the model's own partial output
                     )
                     await broadcaster.broadcast(session_id, {
                         "type": "stopped", "session_id": session_id,
@@ -3332,7 +3458,12 @@ class AgentEngine:
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        session = await self.sessions.create_cron_session(job_id, run_id=run_id)
+        # A scheduled run is the instance's own work, regardless of who wrote
+        # the schedule. Human attribution belongs to the schedule mutation.
+        actor = self.db.system_actor
+        session = await self.sessions.create_cron_session(
+            job_id, run_id=run_id, actor=actor,
+        )
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
         try:
@@ -3342,6 +3473,7 @@ class AgentEngine:
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3371,8 +3503,9 @@ class AgentEngine:
         isolated cron for long background work).
         """
         session_id = session_id or f"cron:{job_id}"
+        actor = self.db.system_actor
         await self.sessions.get_or_create(
-            session_id, title=f"Cron: {job_id}", source="cron",
+            session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
@@ -3382,6 +3515,7 @@ class AgentEngine:
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             # The session is reused by the next run (until rotation), which
@@ -3403,7 +3537,10 @@ class AgentEngine:
         task, in which case it is kept alive so the agent can resume when the
         task completes (see ``_teardown_oneshot_client``).
         """
-        session = await self.sessions.create_hook_session(hook_name, hook_id)
+        actor = self.db.system_actor
+        session = await self.sessions.create_hook_session(
+            hook_name, hook_id, actor=actor,
+        )
         session_id = session["id"]
         try:
             return await self.run(
@@ -3411,6 +3548,7 @@ class AgentEngine:
                 user_message=prompt,
                 source="hook",
                 model=model,  # backend default_model(source) fills cron defaults
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3481,8 +3619,11 @@ class AgentEngine:
     ) -> None:
         """Generate a meaningful short title for a session using a fast model."""
         try:
-            # Skip if no credentials are configured (neither API key nor Bedrock)
-            if not self.config.provider.is_bedrock and not self.config.effective_api_key:
+            # Skip if no credentials are configured. An OAuth-only credential
+            # cannot drive the API directly either (it is not an API key).
+            if not self.config.provider.is_bedrock and not (
+                self.config.resolve_anthropic_api_key()
+            ):
                 return
 
             client = self.config.create_anthropic_client(timeout=10.0)

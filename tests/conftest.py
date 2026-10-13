@@ -1,8 +1,10 @@
 """Shared test fixtures for Nerve tests."""
 
 import asyncio
+import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ import pytest_asyncio
 import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
 from nerve import paths
 from nerve.db import Database
+from nerve.identity import Actor
 
 # Machine-local paths that are already materialized by the time a fixture runs,
 # keyed by attribute name -> location under the state dir.
@@ -76,6 +79,192 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_provider_credential(monkeypatch):
+    """Strip the developer shell's model credentials from every test.
+
+    ``NerveConfig.credential_available()`` and ``resolve_anthropic_api_key()``
+    read ``ANTHROPIC_API_KEY`` / ``CLAUDE_CODE_OAUTH_TOKEN`` so that an
+    environment-provisioned instance works. A test that means "no credential"
+    must therefore not inherit one from whoever runs the suite; tests about
+    the environment set the variables themselves.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_setup_process_state(monkeypatch):
+    """The setup modules keep per-process memory (detection caches, the last
+    provider test, the restart flag, the startup-config snapshot). None of it
+    may leak from one test into the next, whichever file the tests live in.
+    """
+    from nerve import config_reload, setup_checks
+
+    setup_checks.reset_caches()
+    monkeypatch.setattr(config_reload, "_startup_config", None)
+    catalog = sys.modules.get("nerve.models_catalog")
+    if catalog is not None:
+        catalog.reset_cache()  # the fingerprint-keyed catalog and any warm-up
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
+        monkeypatch.setattr(routes, "_restart_requested", False)
+        monkeypatch.setattr(routes, "_last_provider_test", None)
+        # One pending Telegram sign-in per process: never one left by another test.
+        from nerve import setup_telegram_login
+
+        monkeypatch.setattr(routes, "_telegram_login", setup_telegram_login.TelegramLogin())
+    yield
+    setup_checks.reset_caches()
+    if catalog is not None:
+        catalog.reset_cache()
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
+
+
+@pytest.fixture(autouse=True)
+def _unpin_jwt_secret():
+    """Clear the process signing secret before and after each test.
+
+    Startup pins the secret once per process. A test that pins one must not
+    leave it in force for the next test.
+    """
+    from nerve.gateway.auth import unpin_jwt_secret
+
+    unpin_jwt_secret()
+    yield
+    unpin_jwt_secret()
+
+
+@pytest.fixture(autouse=True)
+def _unpin_auth_mode(monkeypatch):
+    """Clear the authentication mode before and after each test.
+
+    ``create_app()`` pins the mode once per process, and before a pin the mode
+    comes from ``NERVE_AUTH_MODE``. Each test starts in local mode, whatever
+    the shell sets, and a test that pins a mode does not leave it in force.
+    """
+    from nerve.gateway.auth import AUTH_MODE_ENV, unpin_auth_mode
+
+    monkeypatch.delenv(AUTH_MODE_ENV, raising=False)
+    unpin_auth_mode()
+    yield
+    unpin_auth_mode()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _deterministic_umask():
+    """Run the suite under umask 022, whatever the developer's shell has.
+
+    ``Database.connect`` refuses a group-writable state directory, and under
+    umask 002 every plain ``mkdir()`` in a fixture makes one. Tests about the
+    umask set their own.
+    """
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
+
+
+# The actor a test that is not about authentication runs as. Its synthetic ids
+# are UUID-shaped like production ids and are not rows in ``actor_refs``
+# — these fixtures do not store actor ids, so no foreign key checks them. Tests
+# that persist an actor id must create the corresponding ``actor_refs`` row.
+TEST_ACTOR = Actor(
+    actor_id="00000000-0000-4000-8000-00000000ac70",
+    kind="human",
+    account_id="00000000-0000-4000-8000-00000000acc7",
+    display_name="Test Account",
+)
+
+
+@pytest.fixture
+def bypass_auth():
+    """Replace ``require_auth`` on a test app.
+
+    Without a signing secret every auth check fails closed, so route tests
+    that are not about auth use this. Yields a function that takes the app
+    and returns it. Auth tests use the real dependency.
+
+    The override returns a real :class:`~nerve.identity.Actor`, not a stub
+    dict: a route that starts reading the actor must see the same type in tests
+    that it sees in production.
+    """
+    from nerve.gateway.auth import require_auth
+
+    apps = []
+
+    def _bypass(app):
+        app.dependency_overrides[require_auth] = lambda: TEST_ACTOR
+        apps.append(app)
+        return app
+
+    yield _bypass
+    for app in apps:
+        app.dependency_overrides.pop(require_auth, None)
+
+
+@dataclass(frozen=True)
+class _TestIdentity:
+    owner_account_id: str
+    owner_actor_id: str
+    system_actor_id: str
+
+
+@pytest.fixture
+def open_identity_db():
+    """Factory: a connected ``Database`` with one test account.
+
+    Returns ``(db, identity)`` with the account, human actor, and the
+    migration-created system actor ids. This intentionally uses the narrow
+    internal bootstrap primitive: tests create exceptional account states
+    directly instead of expanding the production Database API for fixtures.
+    Await it **in the event loop that will use the database**: a sync
+    ``TestClient`` test should call it through ``client.portal`` so the
+    connection's write lock belongs to the loop the app runs in.
+
+    The caller closes the database.
+    """
+
+    async def _open(db_path, *, credential_source: str = "none", display_name=None):
+        database = Database(Path(db_path))
+        await database.connect()
+        account = await database._bootstrap_first_account(
+            credential_source=credential_source, display_name=display_name,
+        )
+        assert account.created and account.account_id and account.actor_id
+        identity = _TestIdentity(
+            owner_account_id=account.account_id,
+            owner_actor_id=account.actor_id,
+            system_actor_id=database.system_actor_id,
+        )
+        return database, identity
+
+    return _open
+
+
+@pytest.fixture
+def wire_identity_store(monkeypatch):
+    """Point the request path's actor resolution at a database.
+
+    ``require_auth`` resolves the actor against ``get_deps().db``, which the
+    gateway lifespan wires before it serves. A test that builds its own app
+    wires it here instead; ``monkeypatch`` puts the previous container back
+    afterwards, so one test's (closed) database can never be resolved against
+    by the next.
+    """
+    from nerve.gateway.routes import _deps as deps_module
+
+    def _wire(database):
+        monkeypatch.setattr(
+            deps_module, "_deps", deps_module.RouteDeps(engine=None, db=database),
+        )
+        return database
+
+    return _wire
 
 
 @pytest.fixture

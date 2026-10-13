@@ -14,6 +14,14 @@ import os
 # Anthropic API image limit; a sane general ceiling for codex too.
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 
+# How the Claude CLI puts a Read image on its stdout: the base64 payload
+# appears twice in one stream-json line (the tool_result content block and
+# the top-level ``tool_use_result``), and the CLI never emits more than this
+# much base64 for one image — it downsizes to fit.
+CLI_MAX_IMAGE_BASE64 = 5 * 1024 * 1024
+IMAGE_WIRE_COPIES = 2
+IMAGE_WIRE_OVERHEAD = 4096  # JSON envelope, ids, timestamps
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # Magic byte signatures for supported image formats.
@@ -29,13 +37,31 @@ IMAGE_MAGIC: dict[str, list[list[tuple[bytes, int]]]] = {
 }
 
 
-def validate_image_file(file_path: str) -> str | None:
+def estimate_image_wire_bytes(size: int) -> int:
+    """Lower bound on the stream-json line a Read of a ``size``-byte image makes.
+
+    A lower bound, not an estimate of the typical case: the CLI re-encodes
+    images wider or taller than 2000 px, and the re-encoded PNG is often
+    larger than the file on disk (a 269 KB screenshot became a 1.3 MB line).
+    """
+    b64 = min(4 * ((size + 2) // 3), CLI_MAX_IMAGE_BASE64)
+    return IMAGE_WIRE_COPIES * b64 + IMAGE_WIRE_OVERHEAD
+
+
+def validate_image_file(
+    file_path: str, max_message_bytes: int | None = None,
+) -> str | None:
     """Validate that a file with an image extension contains actual image data.
 
     Returns None if valid, or an error string describing the problem.
     This prevents the runtime from base64-encoding non-image files (e.g.
     HTML redirect pages saved with a .png extension) and poisoning the
     conversation context with an unprocessable image block.
+
+    ``max_message_bytes`` is the transport's per-message cap (the Agent
+    SDK's ``max_buffer_size``): an image whose encoded line cannot fit
+    under it is refused up front, because a line over the cap aborts the
+    whole turn instead of failing the one tool call.
     """
     from pathlib import Path
 
@@ -56,6 +82,16 @@ def validate_image_file(file_path: str) -> str | None:
         return (
             f"Image file too large ({size_mb:.1f} MB > 5 MB API limit): {file_path}. "
             f"The Anthropic API rejects images larger than 5 MB."
+        )
+
+    if max_message_bytes and estimate_image_wire_bytes(size) > max_message_bytes:
+        return (
+            f"Image {file_path} ({size / 1024:.0f} KB on disk) would exceed the "
+            f"agent transport's {max_message_bytes / (1024 * 1024):.0f} MiB "
+            f"per-message limit once base64-encoded, and reading it would abort "
+            f"the whole turn. Downscale it first (e.g. "
+            f"`sips -Z 1600 in.png --out small.png`) or raise "
+            f"agent.cli_max_message_bytes."
         )
 
     # Check magic bytes

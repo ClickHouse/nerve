@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,10 +23,13 @@ def canonical_hash(path: Path) -> str:
 
 
 def main() -> int:
+    # Optional argv[1]: the codex binary to check (default: PATH `codex`),
+    # so a downloaded CLI can be verified before it is installed.
+    codex_bin = sys.argv[1] if len(sys.argv) > 1 else "codex"
     meta = json.loads(META_PATH.read_text(encoding="utf-8"))
     with tempfile.TemporaryDirectory(prefix="nerve-codex-schema-") as tmp:
         subprocess.run(
-            ["codex", "app-server", "generate-json-schema", "--out", tmp],
+            [codex_bin, "app-server", "generate-json-schema", "--out", tmp],
             check=True,
         )
         schema_path = Path(tmp) / "codex_app_server_protocol.v2.schemas.json"

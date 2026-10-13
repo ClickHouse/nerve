@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -25,6 +26,7 @@ from nerve.bootstrap import (
     _DOCKERIGNORE_TEMPLATE,
 )
 from nerve.cli import main
+from nerve.config import DEFAULT_MODEL
 
 
 @pytest.fixture
@@ -154,6 +156,40 @@ class TestNonInteractiveSetup:
         assert (ws / "TASK.md").exists()
         assert "Monitor CI" in (ws / "TASK.md").read_text()
 
+    @pytest.mark.parametrize("password, flag, expected", [
+        ("", "", False),
+        ("", "0", False),
+        ("", "1", True),
+        ("a-password", "", False),
+    ])
+    def test_passwordless_is_an_explicit_choice(
+        self, tmp_path: Path, password: str, flag: str, expected: bool,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+        assert choices.passwordless is expected
+
+    @pytest.mark.parametrize("password, flag", [("a-password", "1"), ("", "yes")])
+    def test_passwordless_flag_conflicts_are_refused(
+        self, tmp_path: Path, password: str, flag: str,
+    ) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_PASSWORD": password,
+            "NERVE_PASSWORDLESS": flag,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(click.ClickException, match="NERVE_PASSWORD"):
+                run_non_interactive(tmp_path)
+        assert not (tmp_path / "config.local.yaml").exists()
+
     def test_personal_mode_default_crons(self, tmp_path: Path) -> None:
         """Personal non-interactive should enable inbox-processor and task-planner."""
         env = {
@@ -166,6 +202,39 @@ class TestNonInteractiveSetup:
 
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
+
+    def test_worker_mode_defaults(self, tmp_path: Path) -> None:
+        """Worker non-interactive: the two skill jobs on, task-planner
+        written but off (the onboarding session decides), quiet hours none."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Watch the nightly build for example/repo and propose fixes.",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.enabled_crons == ["skill-reviser", "skill-extractor"]
+        ws = tmp_path / "ws"
+        system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
+        assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
+            "memory-maintenance": True, "task-planner": False,
+            "skill-extractor": True, "skill-reviser": True,
+        }
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+
+    def test_personal_mode_keeps_its_quiet_hours(self, tmp_path: Path) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load((tmp_path / "ws" / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
 
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
@@ -267,9 +336,13 @@ class TestCliInit:
         lose and lives in a git-tracked directory. So a flat "all three are
         backed up" is a promise the code does not keep, exactly where being
         misled costs the most.
+
+        The regenerate-with-backup prompt belongs to the full terminal wizard
+        (``--terminal``); the default ``nerve init`` on a configured install
+        prints the status and exits without touching anything.
         """
         result = CliRunner().invoke(
-            main, ["-c", str(configured_dir), "init"], input="n\n"
+            main, ["-c", str(configured_dir), "init", "--terminal"], input="n\n"
         )
         assert result.exit_code == 0
         assert "*.bak" in result.output
@@ -307,6 +380,66 @@ class TestConfigLocalPermissions:
         # Check permissions (Unix only)
         mode = oct(local_path.stat().st_mode)[-3:]
         assert mode == "600"
+
+    def test_it_is_never_created_at_a_wider_mode(self, tmp_path: Path) -> None:
+        """The file holds credentials, so it is created 0600, with no chmod
+        afterwards. The test runs under umask 000."""
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        old = os.umask(0o000)
+        try:
+            wizard._apply()
+        finally:
+            os.umask(old)
+
+        local_path = tmp_path / "config.local.yaml"
+        assert stat.S_IMODE(local_path.stat().st_mode) == 0o600
+        assert not local_path.with_name(local_path.name + ".tmp").exists()
+        local = yaml.safe_load(local_path.read_text())
+        assert local["auth"]["jwt_secret"] and local["auth"]["password_hash"]
+
+    def test_setup_fails_rather_than_write_secrets_a_filesystem_will_not_protect(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """On a filesystem that ignores the mode, setup writes no secrets file
+        and fails."""
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        wizard = SetupWizard(tmp_path)
+        wizard.choices.anthropic_api_key = "sk-ant-api03-test"
+        wizard.choices.workspace_path = tmp_path / "workspace"
+        wizard.choices.mode = "personal"
+        wizard.choices.password = "pw-for-the-owner-account"
+
+        with pytest.raises(click.ClickException) as ei:
+            wizard._apply()
+        assert "Nothing was written" in str(ei.value)
+        assert not (tmp_path / "config.local.yaml").exists()
+        assert not (tmp_path / "config.local.yaml.tmp").exists()
+
+    def test_nerve_init_exits_non_zero_on_that_filesystem(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from nerve import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+        result = CliRunner().invoke(
+            main,
+            ["-c", str(tmp_path), "init", "--non-interactive"],
+            env={
+                "ANTHROPIC_API_KEY": "sk-ant-api03-clitest",
+                "NERVE_MODE": "personal",
+                "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            },
+        )
+        assert result.exit_code != 0
+        assert "owner-only" in result.output and "Nothing was written" in result.output
+        assert not (tmp_path / "config.local.yaml").exists()
 
 
 class TestInsideDockerFlag:
@@ -1298,7 +1431,7 @@ class TestPortableSettingsSplit:
         assert after["provider"]["type"] == "anthropic"
         assert "aws_region" not in after.get("provider", {})
         # The non-prefixed names overwrite rather than needing deletion.
-        assert after["agent"]["model"] == "claude-opus-5"
+        assert after["agent"]["model"] == DEFAULT_MODEL
 
     def test_gateway_host_and_port_are_shared(self, tmp_path: Path) -> None:
         """The tracked layer has to be able to state the bind address.
@@ -1353,9 +1486,7 @@ class TestPortableSettingsSplit:
         """
         self._wizard(tmp_path)._apply()
         settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
-        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == (
-            "claude-opus-5"
-        )
+        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == DEFAULT_MODEL
 
         self._wizard(
             tmp_path, provider_type="bedrock", aws_region="eu-west-1"
@@ -1438,3 +1569,28 @@ class TestPortableSettingsSplit:
         assert cfg.gateway.port == 8900                     # from config.yaml
         assert cfg.agent.thinking == "max"                  # from settings.yaml
         assert cfg.sessions.max_sessions == 500             # from settings.yaml
+
+
+class TestWizardPasswordStep:
+    """An empty password is passwordless only after explicit confirmation."""
+
+    def _run(self, tmp_path: Path, answers: list, confirms: list[bool]):
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step = lambda title: title
+        prompts = iter(answers)
+        decisions = iter(confirms)
+        with patch("click.clear"), \
+                patch("click.prompt", side_effect=lambda *a, **k: next(prompts)), \
+                patch("click.confirm", side_effect=lambda *a, **k: next(decisions)):
+            wizard._step_password()
+        return wizard.choices
+
+    def test_confirmed_empty_answer_is_passwordless(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, [""], [True])
+        assert choices.passwordless is True
+        assert choices.password == ""
+
+    def test_declined_confirmation_asks_for_a_password_again(self, tmp_path: Path) -> None:
+        choices = self._run(tmp_path, ["", "pw-one", "pw-one"], [False])
+        assert choices.passwordless is False
+        assert choices.password == "pw-one"

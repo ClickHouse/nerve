@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from nerve import paths
 from nerve.coerce import FALSY, TRUTHY
@@ -23,6 +25,34 @@ from nerve.coerce import lenient_int as _lenient_int
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# Default Claude models — update HERE when Anthropic ships a new generation.
+#
+# This block is the only place a default model id is spelled. Every other
+# site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
+# ``opus`` and ``haiku`` aliases, the terminal wizard's example line)
+# references these names, and ``tests/test_default_models.py`` fails on a
+# model-id literal anywhere else under ``nerve/`` — so the next update is one
+# edit here plus the regenerated goldens, examples and docs.
+DEFAULT_MODEL = "claude-opus-5-5"               # agent.model (conversations)
+DEFAULT_CRON_MODEL = "claude-sonnet-5-5"        # agent.cron_model
+DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
+DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
+DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
+DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
+
+# Fallback for the composer's Claude model picker when ``agent.models`` is
+# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
+# — the current generation, the configured default first. Bare Anthropic API
+# IDs: they do not apply on Bedrock, where model IDs are region-prefixed.
+DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
+    DEFAULT_MODEL,
+    DEFAULT_FALLBACK_MODEL,
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+)
 
 # Runtime queue of session ids to auto-resume after ``nerve restart --resume``.
 # The CLI appends ids here (synchronously, before triggering the restart) and
@@ -43,6 +73,34 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _normalize_anthropic_base_url(value: Any) -> str:
+    """Return ``anthropic_base_url`` without a trailing ``/`` or ``/v1``.
+
+    The SDK clients and the Claude CLI add ``/v1/...`` themselves, so a value
+    that ends in ``/v1`` would otherwise request ``/v1/v1/messages``. Raises
+    ValueError for a value that is not an http or https URL with a host. The
+    URL may not carry credentials: it is logged, and the key goes in
+    ``anthropic_api_key``.
+    """
+    url = "" if value is None else str(value).strip()
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            "anthropic_base_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    url = url.rstrip("/")
+    return url.removesuffix("/v1")
 
 
 def _expand_path(p: str | None) -> Path | None:
@@ -201,6 +259,24 @@ def _resolve_env_refs(merged: dict[str, Any]) -> dict[str, Any]:
 # letting shared settings live in the workspace.
 
 
+def _path_exists(path: Path) -> bool:
+    """``path.exists()`` that answers ``False`` for a path this account cannot
+    even stat.
+
+    ``Path.exists()`` raises ``PermissionError`` when a parent directory may not
+    be traversed. The host side of a Docker deployment hits that on Linux:
+    ``config.yaml`` names the container's workspace under ``/root``, which the
+    host's user cannot look into, and there is nothing of ours to read there.
+    For the config loader an unreachable path is an absent one; a file we can
+    see but not open is still reported by the caller (``open()`` fails).
+    """
+    try:
+        return path.exists()
+    except OSError as e:
+        logger.debug("config: %s is not reachable from this account (%s); treating it as absent", path, e)
+        return False
+
+
 def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Read a YAML file into a dict; ``{}`` if absent or empty.
 
@@ -234,7 +310,7 @@ def _read_yaml_mapping(path: Path, *, strict: bool = False) -> dict[str, Any]:
     to debug. YAML is UTF-8 by spec, so pinning it is also the correct reading
     of the file.
     """
-    if not path.exists():
+    if not _path_exists(path):
         return {}
     try:
         with open(path, encoding="utf-8") as f:
@@ -412,6 +488,40 @@ _UNRESOLVED_REF = "${"
 # one place neither the agent nor a config edit reaches.
 LOCKDOWN_ANCHOR_ENV = "NERVE_LOCKDOWN"
 WORKSPACE_ANCHOR_ENV = "NERVE_WORKSPACE"
+# Turns ``setup.local_secrets`` off from the service definition, so the setup
+# page of an instance whose connections the operator provides cannot be talked
+# into storing a credential by a file on the box. One-way, like the anchor.
+LOCAL_SECRETS_ENV = "NERVE_SETUP_LOCAL_SECRETS"
+
+def _require_auth_mapping(value: Any, where: str) -> None:
+    """Refuse an ``auth`` section that is present but not a mapping.
+
+    Reading a malformed section as "no auth" would turn a broken or tampered
+    configuration into a passwordless instance.
+    """
+    if value is not None and not isinstance(value, dict):
+        raise ConfigError(
+            f"auth in {where} must be a mapping of settings, got "
+            f"{type(value).__name__} {value!r}. A malformed auth section is refused "
+            f"rather than read as 'no authentication'."
+        )
+
+
+def _normalise_layer_auth(layer: dict[str, Any], where: str) -> dict[str, Any]:
+    """Validate and normalise one layer's ``auth`` section before any merge.
+
+    A non-mapping ``auth`` is refused. A null ``auth:`` becomes ``{}``:
+    :func:`_deep_merge` replaces a lower section with ``None``, so a bare
+    ``auth:`` line would erase the ``password_hash`` and ``jwt_secret`` below
+    it. Other sections keep that merge behavior, because removing them resets
+    a default rather than removing protection.
+
+    Mutates and returns ``layer``.
+    """
+    _require_auth_mapping(layer.get("auth"), where)
+    if "auth" in layer and layer["auth"] is None:
+        layer["auth"] = {}
+    return layer
 
 
 def lockdown_anchor() -> bool:
@@ -493,6 +603,40 @@ def _anchored_workspace() -> Path:
     return workspace
 
 
+def local_secrets_denied_by_environment() -> bool:
+    """Whether the environment forbids the setup page to store credentials.
+
+    ``NERVE_SETUP_LOCAL_SECRETS`` is read the way the lockdown anchor is, and
+    with the same one-way rule: a falsy value (``0``, ``false``, ``no``,
+    ``off``) turns ``setup.local_secrets`` off whatever the files say; a
+    truthy, empty or unset one is "no opinion" and leaves the files to decide.
+    The environment can take the page's permission to store a credential
+    away, never grant it over a tracked ``false`` — so an operator who
+    provisions an instance to keep nothing on disk keeps that guarantee
+    whatever a file on the box says later.
+
+    An unreadable value is refused rather than read as "no opinion", because
+    that reading would discard an operator's instruction to keep credentials
+    off this machine.
+    """
+    raw = os.environ.get(LOCAL_SECRETS_ENV)
+    if raw is None:
+        return False
+    text = raw.strip().lower()
+    if not text or text in TRUTHY:
+        return False
+    if text in FALSY:
+        return True
+    raise ConfigError(
+        f"{LOCAL_SECRETS_ENV}={raw!r} is neither true nor false. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); "
+        f"unset or empty means the environment has no opinion and "
+        f"setup.local_secrets in the settings decides. Refused rather than "
+        f"assumed, because assuming would mean discarding an instruction to "
+        f"keep credentials off this instance."
+    )
+
+
 def _as_lockdown(value: Any) -> bool:
     """Parse the ``lockdown`` flag, refusing anything that isn't a plain yes/no.
 
@@ -546,6 +690,53 @@ def _as_lockdown(value: Any) -> bool:
         f"not one of them. Refused rather than assumed, because assuming would "
         f"mean assuming 'unlocked' — the setting that drops every restriction "
         f"lockdown exists to impose."
+    )
+
+
+def _as_local_secrets(value: Any) -> bool:
+    """Parse ``setup.local_secrets``, refusing anything that isn't a plain yes/no.
+
+    The lenient coercion every other boolean gets falls back to the field's
+    default for a value it cannot read — and this field's default is ``True``,
+    the position in which the setup page stores every credential it is
+    handed. An operator who wrote ``local_secrets: flase`` into the tracked
+    settings meant to keep credentials off this instance; reading that as
+    "allowed" would undo the instruction with one log line as the only
+    signal, and the first person through the page would store the keys the
+    setting exists to keep away. So the key is read the way ``lockdown`` is:
+    real booleans and the documented spellings pass, anything else is a hard
+    :class:`ConfigError`.
+
+    A bare key (``local_secrets:``, YAML ``null``) is ``False`` — the rule
+    every boolean in this module follows (see :func:`nerve.coerce.as_bool`):
+    a key written with no value is "off", never "use the default", because
+    here the default is the permissive position and a value that says
+    nothing must not grant it. That is also what ``lockdown`` does with its
+    bare key — read it as the restrictive position — which for that flag
+    happens to be its default. An *empty string* is not a bare key: it comes
+    from a ``${VAR}`` that is set to nothing, and is refused like ``lockdown``
+    refuses it.
+
+    By the time this runs the ``${VAR}`` pass is over, so a reference that
+    did not resolve has already been refused by name; what reaches here is
+    the resolved text, judged as the setting's value.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in TRUTHY:
+            return True
+        if text in FALSY:
+            return False
+    raise ConfigError(
+        f"setup.local_secrets must be true or false, got {value!r}. Accepted "
+        f"spellings are true/false, 1/0, yes/no, on/off (case-insensitive); an "
+        f"empty value is not one of them. Refused rather than assumed, because "
+        f"assuming would mean assuming 'true' — letting the setup page store on "
+        f"this instance the credentials the setting exists to keep off it."
     )
 
 
@@ -617,14 +808,27 @@ def read_machine_layers(config_dir: Path) -> dict[str, Any]:
     )
 
 
-def _read_config_sources(config_dir: Path) -> dict[str, Any]:
+def _read_config_sources(config_dir: Path, *, workspace: Path | None = None) -> dict[str, Any]:
     """Merge all config layers for ``config_dir`` and resolve ${ENV_VAR} refs.
 
     Returns the fully-merged, env-interpolated config dict (untyped). Shared by
     :func:`load_config` and :func:`load_mcp_servers` so both see the same view.
+
+    ``workspace`` overrides where the workspace is: the tracked settings file
+    is read from there and the ``workspace`` key resolves to it. The host side
+    of a Docker deployment needs this — ``config.yaml`` names the *container*
+    path while the same directory is bind-mounted somewhere on the host — so
+    ``nerve status``/``doctor`` can derive the setup checklist from the real
+    files. A lockdown anchor still wins (the environment decides there).
     """
+    override = Path(workspace).expanduser() if workspace is not None else None
     base = _read_yaml_mapping(config_dir / "config.yaml")
     local = _read_yaml_mapping(config_dir / "config.local.yaml")
+    # Check each layer's ``auth`` before the merge. After it, a valid machine
+    # section would hide a broken tracked one, and a bare ``auth:`` would
+    # already have replaced the credentials below it.
+    _normalise_layer_auth(base, "config.yaml")
+    _normalise_layer_auth(local, "config.local.yaml")
 
     machine = _deep_merge(base, local)
     # An env-anchored instance takes its workspace from the environment too, so
@@ -635,6 +839,8 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     anchored = lockdown_anchor()
     if anchored:
         workspace = _anchored_workspace()
+    elif override is not None:
+        workspace = override
     else:
         # The workspace path comes from the machine-local config (or the
         # default), never from the tracked settings file — resolve it first.
@@ -648,6 +854,7 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
         workspace = _expand_path(ws_raw) or paths.default_workspace()
 
     ws_settings = _load_workspace_settings(workspace)
+    _normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
 
     # Lockdown is owned by the *tracked* settings file only, so a local edit to
     # config.yaml/config.local.yaml can't unlock (or fake-lock) an instance — the
@@ -675,8 +882,15 @@ def _read_config_sources(config_dir: Path) -> dict[str, Any]:
     else:
         # Precedence, lowest first: settings < config.yaml < config.local.yaml
         merged = _deep_merge(_deep_merge(ws_settings, base), local)
+        if override is not None:
+            merged["workspace"] = str(workspace)  # the caller's view, not config.yaml's
     # Authoritative: the effective lockdown flag matches the resolution decision.
     merged["lockdown"] = locked
+    # The same one-way rule for the setup page's permission to store a
+    # credential: the environment can only take it away.
+    if local_secrets_denied_by_environment():
+        section = merged.get("setup")
+        merged["setup"] = {**(section if isinstance(section, dict) else {}), "local_secrets": False}
 
     return _resolve_env_refs(merged)
 
@@ -696,19 +910,41 @@ class SSLConfig:
         return self.cert is not None and self.key is not None
 
 
+# Event-loop implementations uvicorn can be asked for (its ``--loop`` option).
+# ``auto`` is uvicorn's own default: uvloop whenever it is importable, which it is
+# here because ``uvicorn[standard]`` pulls it in.
+_GATEWAY_LOOPS = ("asyncio", "uvloop", "auto")
+
+
 @dataclass
 class GatewayConfig:
     host: str = "0.0.0.0"
     port: int = 8900
     ssl: SSLConfig = field(default_factory=SSLConfig)
+    # The stdlib loop is the default on purpose. uvloop spawns subprocesses with a
+    # full ``fork()``, which copies the parent's page tables: at the ~100 GB RSS a
+    # memU-loaded gateway reaches, every spawn — each agent CLI session, each
+    # ``gh api`` call of the GitHub source, each cron-gate plugin — blocks the
+    # loop for seconds, and the gateway's own HTTP/WebSocket traffic stalls with
+    # it. The stdlib loop spawns with ``vfork()`` (milliseconds, independent of
+    # process size); uvloop's faster I/O buys nothing at the gateway's request
+    # rates. ``uvloop``/``auto`` remain available for a deployment that wants
+    # them. Takes effect at startup only.
+    loop: str = "asyncio"
 
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> GatewayConfig:
+        loop = _setting_str(d.get("loop"), "asyncio").lower()
+        if loop not in _GATEWAY_LOOPS:
+            raise ValueError(
+                f"gateway.loop must be one of {_GATEWAY_LOOPS}, got {loop!r}"
+            )
         return cls(
             host=d.get("host", "0.0.0.0"),
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
+            loop=loop,
         )
 
 
@@ -777,16 +1013,8 @@ class PromptRewriteConfig:
         )
 
 
-# Fallback for the composer's Claude model picker when ``agent.models`` is
-# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
-# — the current-generation models Nerve itself defaults to elsewhere in this
-# file. Bare Anthropic API IDs: they do not apply on Bedrock, where model IDs
-# are region-prefixed.
-DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
-    "claude-opus-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-)
+# The default model ids live in the constants block at the top of this file
+# (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
 
 
 @dataclass
@@ -800,16 +1028,18 @@ class AgentConfig:
     # Wakeup turns fire on existing sessions and inherit their stored
     # backend — this only affects freshly minted cron/hook sessions.
     cron_backend: str = ""
-    model: str = "claude-opus-5"
-    cron_model: str = "claude-sonnet-4-6"
-    title_model: str = "claude-haiku-4-5-20251001"  # Session title generation
+    model: str = DEFAULT_MODEL
+    cron_model: str = DEFAULT_CRON_MODEL
+    title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → claude-opus-5 on
-    # non-Bedrock providers; entries here merge over that default, and an
-    # empty value ("") unsets it (falls back to the CLI's built-in mapping).
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL and
+    # haiku → DEFAULT_FAST_MODEL on non-Bedrock providers; the CLI also uses
+    # the haiku model for its background calls. Entries here merge over those
+    # defaults, and an empty value ("") unsets one (falls back to the CLI's
+    # built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
     # Claude models selectable in the web composer's model picker
     # (GET /api/models). The configured `model` above is always offered
@@ -822,15 +1052,26 @@ class AgentConfig:
     # resolve there).
     models: list[str] = field(default_factory=list)
     # Ask the Anthropic Models API (GET /v1/models) which models the
-    # configured credentials can reach, and offer those in the picker, so a
-    # newly released model needs no code change or config edit. Best-effort:
+    # configured credentials' catalog endpoint advertises, and offer those in
+    # the picker, so a newly released model needs no code change or config
+    # edit. Catalog membership is not a serving guarantee — an advertised ID
+    # can still fail on send, and discovery runs no serving probe (see
+    # `model_discovery_excluded_models` to prune such entries). Best-effort:
     # ignored when `models` above is set explicitly, on Bedrock, without an
     # API key, or when the API is unreachable — the built-in list applies.
     model_discovery: bool = True
+    # Case-insensitive model-ID substrings pruned from the discovered catalog
+    # before it reaches the picker (empty/whitespace patterns ignored). A
+    # catalog advertising a model is not a serving guarantee — an advertised ID
+    # can still fail on send, and discovery runs no probe — so this drops such
+    # entries without a code change, and hot-reloads. Only discovered entries
+    # are filtered; the configured default and an explicit `models` list are
+    # authoritative, so naming a model in config overrides a pattern.
+    model_discovery_excluded_models: list[str] = field(default_factory=list)
     max_turns: int = 100
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
-    effort: str = "max"         # max, xhigh, high, medium, low
+    effort: str = DEFAULT_EFFORT  # max, xhigh, high, medium, low
     # Effort for cron- and hook-sourced turns (sensing / triage work). These
     # fire far more often than interactive sessions and rarely need Opus-tier
     # deliberation, so they default lower than `effort` above to cut token
@@ -854,12 +1095,30 @@ class AgentConfig:
     # Substrings of model names that must never request the 1h cache TTL
     # (same matching semantics as context_1m_excluded_models).
     cache_ttl_excluded_models: list[str] = field(default_factory=list)
+    # Keep the appended system prompt byte-identical across sessions of the
+    # same workspace/source/tool set so Anthropic's exact-prefix prompt cache
+    # can share it: the per-session parts (session id, pre-recalled memories)
+    # are delivered in a <session-context> block at the top of the first user
+    # message instead of in the system prompt. With per-session bytes in the
+    # prompt, every session start is a cache WRITE of the whole block (on a
+    # fleet of ~800 cron sessions/day that was measured at ~$850/day) instead
+    # of a cache READ. False restores the legacy shape (id + recall inline).
+    static_system_prompt: bool = True
     # Hung-CLI detection: max idle time between SDK messages on a single
     # turn before the engine treats the subprocess as dead and falls into
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
     cli_idle_timeout_seconds: int = 900
+    # Upper bound on ONE stream-json message read from the CLI subprocess (the
+    # Agent SDK's ``max_buffer_size``).  The SDK's own default is 1 MiB and a
+    # line over it is fatal to the SDK's reader, i.e. it aborts the whole turn.
+    # Image tool results are the routine offender: the Read tool ships the
+    # base64 image TWICE per line (content block + ``tool_use_result``) and
+    # re-encodes anything over 2000 px, so a 300 KB screenshot can become a
+    # 1.3 MB line.  The CLI caps one image at 5 MiB of base64 (~10.5 MB per
+    # line worst case); 64 MiB leaves headroom for document blocks.
+    cli_max_message_bytes: int = 64 * 1024 * 1024
     # When True, background sub-agents (the Agent tool with run_in_background, or
     # background Bash) get the SAME auto-approved tool permissions as foreground
     # agents, via a PreToolUse hook that pre-approves all non-interactive tools.
@@ -900,19 +1159,22 @@ class AgentConfig:
         return cls(
             backend=str(d.get("backend", "claude")).strip().lower(),
             cron_backend=str(d.get("cron_backend") or "").strip().lower(),
-            model=d.get("model", "claude-opus-5"),
-            cron_model=d.get("cron_model", "claude-sonnet-4-6"),
-            title_model=d.get("title_model", "claude-haiku-4-5-20251001"),
+            model=d.get("model", DEFAULT_MODEL),
+            cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
+            title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
             },
             models=_str_list(d.get("models"), clean=True),
             model_discovery=d.get("model_discovery", True),
+            model_discovery_excluded_models=_str_list(
+                d.get("model_discovery_excluded_models")
+            ),
             max_turns=d.get("max_turns", 100),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
-            effort=str(d.get("effort", "max")),
+            effort=str(d.get("effort", DEFAULT_EFFORT)),
             cron_effort=str(d.get("cron_effort", "medium")),
             context_1m=d.get("context_1m", True),
             context_1m_excluded_models=_str_list(
@@ -922,7 +1184,11 @@ class AgentConfig:
             cache_ttl_excluded_models=_str_list(
                 d.get("cache_ttl_excluded_models")
             ),
+            static_system_prompt=d.get("static_system_prompt", True),
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
+            cli_max_message_bytes=int(
+                d.get("cli_max_message_bytes", 64 * 1024 * 1024)
+            ),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
@@ -937,6 +1203,225 @@ class AgentConfig:
         resolved = (model or self.model).lower()
         return not any(
             tok and tok.lower() in resolved for tok in self.context_1m_excluded_models
+        )
+
+    def is_model_discovery_excluded(self, model: str | None) -> bool:
+        """Whether *model* is pruned from DISCOVERY results.
+
+        Case-insensitive substring match against any non-empty entry in
+        ``model_discovery_excluded_models``; empty/whitespace patterns are
+        ignored (an empty pattern must never match everything). Only entries
+        taken from discovery are checked — see
+        :meth:`NerveConfig.selectable_claude_models`."""
+        resolved = (model or "").lower()
+        if not resolved:
+            return False
+        patterns = self.model_discovery_excluded_models
+        # A non-list value (e.g. a YAML mapping) is invalid for this field and
+        # carries no patterns — never iterate a dict's keys as exclusions.
+        if not isinstance(patterns, list):
+            return False
+        for tok in patterns:
+            pattern = str(tok or "").strip().lower()
+            if pattern and pattern in resolved:
+                return True
+        return False
+
+
+_DEFAULT_CHANNEL_SOURCE_SCHEDULE = "*/5 * * * *"
+
+
+def _pattern_list(value: object, label: str) -> list[str]:
+    """Coerce a ``source`` allow/deny value to a list of patterns.
+
+    Stricter than the generic coercion, because these lists decide whose
+    messages get recorded. The case that matters is a **mapping**:
+    ``allow_conversations: {"*": false}`` survives the general coercion
+    unchanged, and ``list()`` of it yields its *keys* — so a rule that reads
+    like a disabled wildcard silently becomes one that grants everything.
+    A mapping is discarded rather than salvaged.
+
+    A bare scalar still wraps to a single pattern. That is how a ``${VAR}``
+    env reference arrives, and dropping it would break the documented way to
+    configure a list field from the environment.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (dict, set)):
+        logger.warning(
+            "source.%s must be a list of patterns, got %s — discarding it. "
+            "A mapping's keys would read as patterns, so a rule that looks "
+            "switched off would grant them.",
+            label, type(value).__name__,
+        )
+        return []
+    if not isinstance(value, (list, tuple)):
+        text = _strip_display_sigil(value)
+        return [text] if text else []
+    patterns: list[str] = []
+    for entry in value:
+        if isinstance(entry, (dict, list, tuple, set)):
+            logger.warning(
+                "source.%s: ignoring non-scalar entry %r", label, entry,
+            )
+            continue
+        text = _strip_display_sigil(entry)
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def _strip_display_sigil(value: object) -> str:
+    """Drop a leading ``#`` or ``@`` from a pattern.
+
+    Chat UIs render a channel as ``#eng-backend`` and a person as ``@alice``,
+    so that is what an operator copies — but the API names carry no sigil and
+    matching is literal. Left alone, ``#eng-backend`` matches nothing, which
+    on an allow list means an inbox that stays empty with no error to explain
+    why.
+
+    Unambiguous to strip: neither platform lets a channel, chat, or user name
+    begin with ``#`` or ``@``. A ``@`` *inside* the value is untouched, so an
+    email pattern like ``*@example.com`` still works.
+    """
+    text = str(value).strip()
+    return text[1:].strip() if text[:1] in "#@" else text
+
+
+_MIN_STORED_MESSAGES = 100
+
+
+def _stored_message_target(value: object, default: int) -> int:
+    """Coerce a ``source.max_stored_messages``, holding it above a floor.
+
+    Zero is the case to catch: it reads like "no limit" and tells the trim to
+    keep no rows, emptying the buffer before the drain reads it. A negative
+    does the same, since SQLite reads a negative OFFSET as zero.
+    """
+    target = _lenient_int(value, default, label="source.max_stored_messages")
+    if target >= _MIN_STORED_MESSAGES:
+        return target
+    logger.warning(
+        "source.max_stored_messages is %r, which would trim the buffer to "
+        "nothing before the drain reads it. Using %d instead.",
+        value, _MIN_STORED_MESSAGES,
+    )
+    return _MIN_STORED_MESSAGES
+
+
+def _channel_source_schedule(value: object) -> str:
+    """Coerce a ``source.schedule``, falling back to the default.
+
+    A channel source carries its own schedule, so an unusable value has
+    no ``sync.<name>`` section to fall back to — it would leave the channel
+    buffering with nothing ever draining it. Fall back loudly instead.
+    """
+    if value is None:
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    if not isinstance(value, str) or not value.strip():
+        logger.warning(
+            "source.schedule must be a non-empty crontab or interval "
+            "string, got %r — falling back to %r. Left unset, the buffer "
+            "would fill with nothing draining it.",
+            value, _DEFAULT_CHANNEL_SOURCE_SCHEDULE,
+        )
+        return _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    return value.strip()
+
+
+@dataclass
+class ChannelSourceConfig:
+    """Which conversations feed the inbox, independent of live routing.
+
+    A separate grant from the access rules, and evaluated independently of
+    them. "May this person drive the agent?" and "may this room's traffic
+    reach the agent's inbox?" are different questions. A message can qualify
+    for the live route, the source route, both, or neither. Deriving one answer
+    from the other would block watching a channel the agent takes no orders
+    from, or widen command access to everything worth watching.
+
+    Fail-closed twice over: off unless ``enabled``, and collecting nothing
+    unless the allow list names something. An empty allow list here means
+    "nothing", not "everything" — the opposite of the access gates, because
+    this one is a standing grant to record other people's messages rather
+    than a check that already ran a sender rule first.
+
+    The fields are transport-neutral, but the YAML keys are not: each channel
+    passes the ``subject`` its own users would recognise, so Slack reads
+    ``allow_channels`` and Telegram reads ``allow_chats``. Sharing one noun
+    was worse than it looks — on Telegram a "channel" is a specific entity
+    type distinct from a group, so ``allow_channels`` there would name the
+    wrong thing, and "conversations" named nothing anyone could act on.
+
+    What actually matches is per transport and documented in ``config.md``;
+    the short version is that a platform id always works, and a name works
+    only where the platform, not the subject, controls it.
+
+    ``schedule`` is the drain cadence, not a poll: the messages are already
+    in the buffer by the time it fires.
+    """
+
+    enabled: bool = False
+    allow_conversations: list[str] = field(default_factory=list)
+    deny_conversations: list[str] = field(default_factory=list)
+    allow_senders: list[str] = field(default_factory=list)
+    deny_senders: list[str] = field(default_factory=list)
+    schedule: str = _DEFAULT_CHANNEL_SOURCE_SCHEDULE
+    batch_size: int = 50
+    # Off by default: most chat messages are shorter than the runner's
+    # 800-char condense threshold, so this would build an LLM client that
+    # never gets used.
+    condense: bool = False
+    # Trim target per transport, checked every 100 writes. One budget for all
+    # of a transport's watched conversations, not one each.
+    max_stored_messages: int = 10_000
+    # Whether a message accepted for live routing is also collected.
+    # Off by default. Turn it on only when source consumers should receive the
+    # same message later, such as when the source is an archive or digest.
+    include_handled_messages: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(
+        cls, d: dict, *, subject: str = "conversations",
+    ) -> ChannelSourceConfig:
+        """Parse a ``<channel>.source`` block.
+
+        ``subject`` is the noun this transport calls the thing being watched
+        — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
+        the YAML keys and every warning, so an operator is told about the key
+        they actually wrote.
+        """
+        enabled = _as_bool(
+            d.get("enabled", False), False, label="source.enabled",
+        )
+        allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
+        allow = _pattern_list(d.get(allow_key), allow_key)
+        if enabled and not allow:
+            logger.warning(
+                "source.enabled is set but source.%s names nothing usable — "
+                "nothing will be collected. List the %s to watch; an empty "
+                "list is not a wildcard here.",
+                allow_key, subject,
+            )
+        return cls(
+            enabled=enabled,
+            allow_conversations=allow,
+            deny_conversations=_pattern_list(d.get(deny_key), deny_key),
+            allow_senders=_pattern_list(d.get("allow_senders"), "allow_senders"),
+            deny_senders=_pattern_list(d.get("deny_senders"), "deny_senders"),
+            schedule=_channel_source_schedule(d.get("schedule")),
+            batch_size=d.get("batch_size", 50),
+            condense=_as_bool(
+                d.get("condense", False), False, label="source.condense",
+            ),
+            max_stored_messages=_stored_message_target(
+                d.get("max_stored_messages"), 10_000,
+            ),
+            include_handled_messages=_as_bool(
+                d.get("include_handled_messages", False), False,
+                label="source.include_handled_messages",
+            ),
         )
 
 
@@ -959,6 +1444,8 @@ class TelegramConfig:
     # session. When False (default) a reply is context-only — it quotes the
     # replied-to message and lands in the active session, like a plain message.
     reply_routes_to_origin_session: bool = False
+    # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
     @classmethod
     @_coerced
@@ -1004,6 +1491,166 @@ class TelegramConfig:
             dm_policy=dm_policy,
             reply_routes_to_origin_session=d.get(
                 "reply_routes_to_origin_session", False,
+            ),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="chats",
+            ),
+        )
+
+
+# Every `/nerve` subcommand, and the set enabled when the operator says
+# nothing. Kept here rather than in the channel so config validation can
+# name them without importing the transport.
+SLACK_ALL_COMMANDS: tuple[str, ...] = (
+    "sessions", "new", "stop", "star", "unstar", "reply", "doctor", "restart",
+)
+# `sessions` is absent on purpose: it reaches every interactive session in the
+# instance, and Slack has no ownership model yet to narrow that list. Replies
+# are safe by default because notification lookup is delivery-target scoped.
+SLACK_DEFAULT_COMMANDS: tuple[str, ...] = (
+    "new", "stop", "star", "unstar", "reply",
+)
+# Subcommands that act on the host rather than on the conversation they were
+# typed in, and are refused in a shared channel however the allow lists read.
+# Enabling one is a decision about this instance; letting any member of a
+# shared channel invoke it is a second decision, and `commands` — one flat
+# list — cannot express the difference.
+#
+# The rest stay channel-usable because they cannot reach past the conversation:
+# `stop`, `star` and `unstar` choose among that channel's own thread sessions,
+# and `reply` answers a question already delivered there, which is the whole
+# point of `notifications.slack_channel_id`. `sessions` and `new` are refused
+# in a channel as well, for the unrelated reason that a slash payload carries
+# no thread to bind a session to — see ``_THREADED_CHANNEL_REFUSAL``.
+SLACK_HOST_COMMANDS: tuple[str, ...] = ("doctor", "restart")
+# How Slack traffic reaches this process: its own Socket Mode connection, or
+# streams from a shared channel gateway.
+SLACK_MODES: tuple[str, ...] = ("socket", "hosted")
+
+
+def _slack_commands(raw: object) -> list[str] | None:
+    """Normalize ``slack.commands``.
+
+    Absence keeps the defaults, an empty list disables commands, and a sole
+    ``all`` or ``*`` enables every command. Unknown names are warned and dropped.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "slack.commands must be a list — ignoring %r and keeping the "
+            "default set", raw,
+        )
+        return None
+
+    names = [str(v).strip().lstrip("/").lower() for v in raw if str(v).strip()]
+    if names == ["all"] or names == ["*"]:
+        return list(SLACK_ALL_COMMANDS)
+
+    kept, unknown = [], []
+    for name in names:
+        (kept if name in SLACK_ALL_COMMANDS else unknown).append(name)
+    if unknown:
+        logger.warning(
+            "slack.commands has no such subcommand(s): %s — known ones are %s",
+            ", ".join(sorted(set(unknown))), ", ".join(SLACK_ALL_COMMANDS),
+        )
+    return kept
+
+
+@dataclass
+class SlackConfig:
+    """Slack transport and access settings.
+
+    Direct messages require explicit opt-in. Sender and channel patterns match
+    Slack IDs or resolved names using :mod:`nerve.channels.access` semantics.
+    In hosted mode the tokens and access lists are unused; the source grant
+    still decides what reaches the inbox.
+    """
+
+    # Off until the workspace is set up. Slack reaches an installation that
+    # never asked for it, so an absent or credential-less section resolves to
+    # disabled and `nerve doctor` stays quiet about a channel nobody uses.
+    enabled: bool = False
+    bot_token: str = ""      # xoxb-… — Web API calls
+    app_token: str = ""      # xapp-… — Socket Mode connection
+    allow_users: list[str] = field(default_factory=list)
+    deny_users: list[str] = field(default_factory=list)
+    # Direct messages are a distinct conversation kind, not a channel name.
+    # Keep them opt-in even when a sender allow-list grants access elsewhere.
+    allow_direct_messages: bool = False
+    allow_channels: list[str] = field(default_factory=list)
+    deny_channels: list[str] = field(default_factory=list)
+    # Whether an agent may post to a conversation it names, unprompted
+    # (send_channel_message). Off by default and separate from the read
+    # grant: allow_channels is set by nearly every Slack deployment for
+    # inbound access, so deriving writes from it alone would hand every
+    # cron run a megaphone into those channels on upgrade. Turning this on
+    # never widens where writes may go — allow_channels still bounds that.
+    allow_outbound: bool = False
+    stream_mode: str = "partial"
+    # None keeps safe defaults; [] disables commands. Host-wide and
+    # cross-channel commands are opt-in. See SLACK_*_COMMANDS.
+    commands: list[str] | None = None
+    # Channels whose traffic feeds the inbox. Its own grant, not derived
+    # from allow_channels — see ChannelSourceConfig.
+    source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # "socket": this process holds the tokens and a Socket Mode connection.
+    # "hosted": a shared channel gateway holds them and streams events here
+    # (see HostedChannelsConfig). The access lists above apply to socket
+    # mode only; in hosted mode the gateway admits each event.
+    mode: str = "socket"
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict, locked: bool = False) -> SlackConfig:
+        stream_mode = d.get("stream_mode", "partial")
+        if stream_mode not in ("partial", "full"):
+            logger.warning(
+                "slack.stream_mode %r is not one of ('partial', 'full') — "
+                "falling back to 'partial'",
+                stream_mode,
+            )
+            stream_mode = "partial"
+        mode = str(d.get("mode") or "socket").strip().lower()
+        if mode not in SLACK_MODES:
+            logger.warning(
+                "slack.mode %r is not one of %s; falling back to 'socket'",
+                mode, SLACK_MODES,
+            )
+            mode = "socket"
+        bot_token = d.get("bot_token", "")
+        app_token = d.get("app_token", "")
+        # Explicit `enabled` wins. Otherwise hosted mode enables Slack, since
+        # naming the mode is an explicit opt-in that needs no token. In socket
+        # mode both tokens enable it, except under lockdown where the
+        # machine-local opt-in is unavailable. Invalid boolean values fail
+        # closed.
+        enabled = (
+            _as_bool(d["enabled"], False, label="SlackConfig.enabled")
+            if "enabled" in d
+            else mode == "hosted" or (bool(bot_token and app_token) and not locked)
+        )
+        return cls(
+            mode=mode,
+            enabled=enabled,
+            bot_token=bot_token,
+            app_token=app_token,
+            allow_users=d.get("allow_users") or [],
+            deny_users=d.get("deny_users") or [],
+            allow_direct_messages=d.get("allow_direct_messages", False),
+            allow_channels=d.get("allow_channels") or [],
+            deny_channels=d.get("deny_channels") or [],
+            allow_outbound=_as_bool(
+                d.get("allow_outbound", False), False,
+                label="SlackConfig.allow_outbound",
+            ),
+            stream_mode=stream_mode,
+            commands=_slack_commands(d.get("commands")),
+            source=ChannelSourceConfig.from_dict(
+                d.get("source", {}), subject="channels",
             ),
         )
 
@@ -1471,9 +2118,9 @@ class MemoryCategoryConfig:
 
 @dataclass
 class MemoryConfig:
-    recall_model: str = "claude-sonnet-4-6"  # Recall routing
-    memorize_model: str = "claude-sonnet-4-6"  # Extraction & preprocessing
-    fast_model: str = "claude-haiku-4-5-20251001"  # Category summaries, date resolution
+    recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
+    memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
+    fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
     embed_model: str = ""
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
@@ -1487,9 +2134,9 @@ class MemoryConfig:
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
         return cls(
-            recall_model=d.get("recall_model", "claude-sonnet-4-6"),
-            memorize_model=d.get("memorize_model", "claude-sonnet-4-6"),
-            fast_model=d.get("fast_model", "claude-haiku-4-5-20251001"),
+            recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
+            memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
+            fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
             embed_model=d.get("embed_model", ""),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
@@ -1500,7 +2147,7 @@ class MemoryConfig:
 
 def _cron_dir_has_jobs(d: Path) -> bool:
     """True if a cron dir actually holds job definitions (jobs.yaml or system.yaml)."""
-    return (d / "jobs.yaml").exists() or (d / "system.yaml").exists()
+    return _path_exists(d / "jobs.yaml") or _path_exists(d / "system.yaml")
 
 
 def _resolve_cron_dir(workspace: Path | None, locked: bool = False) -> Path:
@@ -1920,6 +2567,9 @@ class RetentionConfig:
 @dataclass
 class AuthConfig:
     password_hash: str = ""
+    # Session-token signing secret. When unset, one is generated into nerve.db
+    # on first start (nerve.migrate.ensure_jwt_secret). Read the value in force
+    # through nerve.gateway.auth.effective_jwt_secret(), not this field.
     jwt_secret: str = ""
     # Web-session lifetime. This is an *idle* timeout, not a cap on a working
     # session: the gateway slides the token forward on every authenticated
@@ -1939,10 +2589,47 @@ class AuthConfig:
 
 
 @dataclass
+class SetupConfig:
+    """What the browser setup page may do on this instance.
+
+    ``local_secrets``: whether the page may store a credential it is given —
+    an API key, a bot token, a Telegram sign-in — in the files on this
+    machine. ``False`` on an instance whose connections the operator provides
+    (a model credential in the service environment, Slack through a channel
+    gateway): the steps whose only purpose is to store one read "not
+    available", their writes are refused, and the Model step accepts Bedrock
+    or the credential from the environment. Read on every request, so a
+    reload applies it. ``NERVE_SETUP_LOCAL_SECRETS=0`` in the service
+    environment forces it off (one-way, like the lockdown anchor).
+    """
+
+    local_secrets: bool = True
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> SetupConfig:
+        # Parsed strictly rather than left to @_coerced, which would read a
+        # value it cannot parse as the default — "store credentials here".
+        # See :func:`_as_local_secrets`. An absent key is the default.
+        if "local_secrets" not in d:
+            return cls()
+        return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
+
+
+@dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
-    channels: list[str] = field(default_factory=lambda: ["web", "telegram"])
+    channels: list[str] = field(
+        default_factory=lambda: ["web", "telegram", "slack"],
+    )
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
+    # Opt-in, default off = backward compatible. When true AND telegram_chat_id
+    # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
+    # are still sent there, but inbound messages never start an agent turn. Leave
+    # false to preserve the historical behaviour where a group set as the sink
+    # still responds to messages.
+    delivery_only_sink: bool = False
+    slack_channel_id: str = ""                # Target conversation; falls back to a literal id in slack.allow_channels
     default_expiry_hours: int = 48            # Auto-expire unanswered questions
     max_redeliveries: int = 3                 # Per-row cap on snooze/re-delivery cycles
     priority_prefixes: dict[str, str] = field(default_factory=lambda: {
@@ -1959,8 +2646,10 @@ class NotificationsConfig:
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
-            channels=d.get("channels", ["web", "telegram"]),
+            channels=d.get("channels", ["web", "telegram", "slack"]),
             telegram_chat_id=d.get("telegram_chat_id"),
+            delivery_only_sink=d.get("delivery_only_sink", False),
+            slack_channel_id=str(d.get("slack_channel_id") or ""),
             default_expiry_hours=d.get("default_expiry_hours", 48),
             max_redeliveries=d.get("max_redeliveries", 3),
             priority_prefixes=d.get("priority_prefixes", {
@@ -1971,14 +2660,83 @@ class NotificationsConfig:
         )
 
 
+HOSTED_CHANNEL_ISSUER = "nerve-gateway"
+HOSTED_CHANNEL_AUDIENCE = "nerve-channel"
+_HOSTED_MAX_STREAMS = 64
+
+
+@dataclass
+class HostedChannelsConfig:
+    """Streams from a shared channel gateway, for providers in hosted mode.
+
+    In hosted mode (``slack.mode: hosted``) Nerve holds no provider tokens.
+    Gateway replicas open streams to ``/_internal/channel/v1/stream`` on the
+    gateway port, and Nerve accepts a stream only with a token that the
+    gateway signs: a key from the local JWK Set file ``gateway_jwks_file``,
+    ``issuer`` and ``audience``, and exactly ``tenant_id`` and ``agent_id``.
+    ``max_streams`` bounds the streams open at one time; a gateway normally
+    holds one per replica.
+    """
+
+    gateway_jwks_file: Path | None = None
+    issuer: str = HOSTED_CHANNEL_ISSUER
+    audience: str = HOSTED_CHANNEL_AUDIENCE
+    tenant_id: str = ""
+    agent_id: str = ""
+    max_streams: int = 8
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> HostedChannelsConfig:
+        return cls(
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            issuer=str(d.get("issuer") or HOSTED_CHANNEL_ISSUER).strip(),
+            audience=str(d.get("audience") or HOSTED_CHANNEL_AUDIENCE).strip(),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            max_streams=d.get("max_streams", 8),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot authenticate a stream. Empty when they can.
+
+        The key file itself is read by the stream verifier and by ``nerve doctor``.
+        """
+        found: list[str] = []
+        if self.gateway_jwks_file is None:
+            found.append("channels.hosted.gateway_jwks_file must name the gateway's public key file")
+        elif not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("channels.hosted.gateway_jwks_file must be an absolute path")
+        if not self.issuer:
+            found.append("channels.hosted.issuer must not be empty")
+        if not self.audience:
+            found.append("channels.hosted.audience must not be empty")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"channels.hosted.{key} must be a lowercase UUID")
+        if not 1 <= self.max_streams <= _HOSTED_MAX_STREAMS:
+            found.append(
+                f"channels.hosted.max_streams must be from 1 to {_HOSTED_MAX_STREAMS}",
+            )
+        return found
+
+
 @dataclass
 class ChannelsConfig:
     """Global channel settings."""
 
+    hosted: HostedChannelsConfig = field(default_factory=HostedChannelsConfig)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> ChannelsConfig:
-        return cls()
+        return cls(hosted=HostedChannelsConfig.from_dict(d.get("hosted") or {}))
 
 
 @dataclass
@@ -2167,11 +2925,37 @@ _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 # $/1M tokens; cached input bills at the discounted rate. Config values
 # under codex.pricing REPLACE entries per model key (dict deep-merge).
+# GPT-6 Astra's long-context tier (requests above 272K input tokens bill
+# 2x input / 1.5x output) is not modelled: the app-server reports usage
+# per turn, not per request, so the threshold cannot be attributed.
 _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
+    "gpt-6-astra":    {"input": 10.0, "cached_input": 1.0,  "output": 50.0},
     "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
     "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
 }
+
+# Catalog entries the app-server hides from its default ``model/list``
+# (served only with ``includeHidden``) that Nerve still offers in the
+# picker when the authenticated account can reach them. GPT-6 Astra is
+# hidden upstream on purpose (API-key accounts; codex-cli 0.153.1+).
+_DEFAULT_CODEX_MODELS: tuple[str, ...] = ("gpt-6-astra",)
+
+
+def _codex_models(raw: Any) -> list[str]:
+    """``codex.models``: unset → built-in list; ``[]`` → offer none."""
+    if raw is None:
+        return list(_DEFAULT_CODEX_MODELS)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return list(_DEFAULT_CODEX_MODELS)
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 @dataclass
@@ -2242,11 +3026,16 @@ class CodexConfig:
     """
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
-    min_version: str = "0.144.1"            # inclusive tested protocol range
-    max_version: str = "0.145.0"            # exclusive
+    min_version: str = "0.153.1"            # inclusive tested protocol range
+    max_version: str = "0.156.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
+    # Hidden catalog models to offer next to the visible ``model/list``
+    # (only when the live catalog serves them). Any model named here is
+    # also always accepted as a session model — the app-server stays the
+    # authority on whether a turn on it succeeds.
+    models: list[str] = field(default_factory=lambda: list(_DEFAULT_CODEX_MODELS))
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
     api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
@@ -2297,13 +3086,14 @@ class CodexConfig:
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
-            min_version=str(d.get("min_version", "0.144.1")),
-            max_version=str(d.get("max_version", "0.145.0")),
+            min_version=str(d.get("min_version", "0.153.1")),
+            max_version=str(d.get("max_version", "0.156.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
             model=str(d.get("model", "gpt-5.6-sol")),
             cron_model=str(d.get("cron_model") or ""),
+            models=_codex_models(d.get("models")),
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
@@ -2609,6 +3399,7 @@ class NerveConfig:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    slack: SlackConfig = field(default_factory=SlackConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -2617,6 +3408,7 @@ class NerveConfig:
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    setup: SetupConfig = field(default_factory=SetupConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
@@ -2635,6 +3427,16 @@ class NerveConfig:
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     brave_search_api_key: str = ""
+    # A Claude subscription token (`claude setup-token`), exported to the
+    # Claude CLI as CLAUDE_CODE_OAUTH_TOKEN when no API key is set. Not an
+    # API key: background jobs that call the API directly (memory, titles)
+    # still need one.
+    claude_oauth_token: str = ""
+
+    # Anthropic-compatible endpoint for every model request: the Claude CLI,
+    # the direct SDK calls and memU. Empty means api.anthropic.com. Stored
+    # without a trailing "/" or "/v1".
+    anthropic_base_url: str = ""
 
     # Where this config was loaded from (set by load_config, not a YAML key).
     # Used by anything that needs to write back (e.g. Telegram pairing
@@ -2643,11 +3445,17 @@ class NerveConfig:
 
     @property
     def anthropic_api_base_url(self) -> str:
-        """Effective Anthropic API base URL — proxy or direct."""
+        """Effective Anthropic API base URL, ending in ``/v1/``.
+
+        The local proxy comes first, then ``anthropic_base_url``, then
+        api.anthropic.com. Bedrock uses none.
+        """
         if self.provider.is_bedrock:
             return ""  # Bedrock doesn't use Anthropic base URL
         if self.proxy.enabled:
             return f"http://{self.proxy.host}:{self.proxy.port}/v1/"
+        if self.anthropic_base_url:
+            return f"{self.anthropic_base_url}/v1/"
         return "https://api.anthropic.com/v1/"
 
     @property
@@ -2659,6 +3467,36 @@ class NerveConfig:
             return self.proxy.api_key
         return self.anthropic_api_key
 
+    def credential_available(self) -> bool:
+        """Whether the agent can talk to a model at all.
+
+        One answer for the setup page, memU, title generation and the model
+        catalogue, so an environment-provisioned instance (``ANTHROPIC_API_KEY``
+        or ``CLAUDE_CODE_OAUTH_TOKEN`` in the gateway's environment, which the
+        Claude CLI subprocess inherits) is not "done" in Setup and "no
+        credential" in memory at the same time.
+        """
+        return bool(
+            self.effective_api_key
+            or self.provider.is_bedrock
+            or self.proxy.enabled
+            or self.claude_oauth_token
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+
+    def resolve_anthropic_api_key(self) -> str:
+        """The API key background jobs should use: config, else the environment.
+
+        Empty for Bedrock and the proxy (they do not take one) and when only
+        an OAuth token exists (it is not an API key).
+        """
+        if self.effective_api_key:
+            return self.effective_api_key
+        if self.provider.is_bedrock or self.proxy.enabled:
+            return ""
+        return os.environ.get("ANTHROPIC_API_KEY", "") or ""
+
     @property
     def ollama_routable(self) -> bool:
         """True when Ollama models can actually be served.
@@ -2667,6 +3505,17 @@ class NerveConfig:
         the Anthropic↔OpenAI translation layer Ollama is reached through).
         """
         return self.ollama.enabled and self.proxy.enabled
+
+    @property
+    def outbound_channels(self) -> list[str]:
+        """Transports an agent may post to unprompted.
+
+        A channel that is not running has nothing to post through, and one
+        without its own outbound switch refuses every target. Empty means
+        ``send_channel_message`` can only refuse, which is what decides
+        whether it is offered at all.
+        """
+        return ["slack"] if self.slack.enabled and self.slack.allow_outbound else []
 
     def selectable_claude_models(
         self, discovered: list[str] | None = None,
@@ -2677,17 +3526,29 @@ class NerveConfig:
         from the first source that has anything to say:
 
         1. ``agent.models`` — an explicit list always wins,
-        2. *discovered* — what the Anthropic Models API reports the
-           credentials can reach (see :mod:`nerve.models_catalog`),
+        2. *discovered* — what the Anthropic Models API catalog advertises for
+           the configured credentials (see :mod:`nerve.models_catalog`; catalog
+           membership does not validate servability), minus any entry matching
+           ``agent.model_discovery_excluded_models``,
         3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
 
         Bedrock model IDs are region-prefixed, so neither discovery nor the
         bare built-ins apply there — Bedrock offers only configured models.
+
+        Exclusions apply at pick time to the *discovered* branch only, so a
+        hot-reloaded pattern re-filters the cached catalog with no refetch, and
+        the configured default / an explicit ``agent.models`` list are never
+        filtered. If every discovered entry is excluded the result is just the
+        configured default — not a discovery failure, so it does not fall
+        through to the built-in list and re-introduce an excluded ID.
         """
         if self.agent.models:
             extras = list(self.agent.models)
         elif discovered:
-            extras = list(discovered)
+            extras = [
+                m for m in discovered
+                if not self.agent.is_model_discovery_excluded(m)
+            ]
         elif self.provider.is_bedrock:
             extras = []
         else:
@@ -2728,8 +3589,12 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        # The key the checks accept (config, else the environment). An explicit
+        # ``api_key`` — ``""`` included — stops the SDK from reading the
+        # environment itself, so the environment-only install the checks call
+        # "configured" would otherwise send an empty key and get a 401.
         return anthropic.Anthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),
             base_url=base_url,
             timeout=timeout,
         )
@@ -2758,7 +3623,7 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         return anthropic.AsyncAnthropic(
-            api_key=self.effective_api_key,
+            api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
             timeout=timeout,
         )
@@ -2814,7 +3679,25 @@ class NerveConfig:
     def from_dict(cls, d: dict) -> NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
+        config._validate_anthropic_base_url()
         return config
+
+    def _validate_anthropic_base_url(self) -> None:
+        """Refuse ``anthropic_base_url`` together with another endpoint setting.
+
+        The proxy and Bedrock each decide the endpoint, so the key would be
+        ignored without a word.
+        """
+        if not self.anthropic_base_url:
+            return
+        if self.proxy.enabled:
+            raise ValueError(
+                "anthropic_base_url cannot be set together with proxy.enabled"
+            )
+        if self.provider.is_bedrock:
+            raise ValueError(
+                "anthropic_base_url cannot be set together with provider.type: bedrock"
+            )
 
     @classmethod
     def _build_from_dict(cls, d: dict) -> NerveConfig:
@@ -2837,6 +3720,7 @@ class NerveConfig:
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
+            slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
@@ -2845,6 +3729,7 @@ class NerveConfig:
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),
+            setup=SetupConfig.from_dict(d.get("setup") or {}),
             channels=ChannelsConfig.from_dict(d.get("channels", {})),
             notifications=NotificationsConfig.from_dict(d.get("notifications", {})),
             docker=DockerConfig.from_dict(d.get("docker", {})),
@@ -2861,6 +3746,10 @@ class NerveConfig:
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
             brave_search_api_key=d.get("brave_search_api_key", ""),
+            claude_oauth_token=str(d.get("claude_oauth_token", "") or ""),
+            anthropic_base_url=_normalize_anthropic_base_url(
+                d.get("anthropic_base_url"),
+            ),
         )
 
 
@@ -2925,7 +3814,7 @@ def write_config_pointer(config_dir: Path) -> None:
     """
     pointer = paths.config_pointer_file()
     try:
-        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # the state dir, owner-only
         pointer.write_text(str(Path(config_dir).expanduser().resolve()), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write config pointer %s: %s", pointer, e)
@@ -2955,7 +3844,7 @@ def resolve_config_dir(explicit: str | Path | None = None) -> tuple[Path, str]:
     return cwd, "default"
 
 
-def load_config(config_dir: Path | None = None) -> NerveConfig:
+def load_config(config_dir: Path | None = None, *, workspace: Path | None = None) -> NerveConfig:
     """Load and type the effective configuration.
 
     Merges (lowest→highest precedence) ``workspace/config/settings.yaml``
@@ -2963,7 +3852,8 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
     ``config.local.yaml`` (machine secrets/overrides), then resolves
     ``${ENV_VAR}`` references. The workspace location is taken from the
     machine-local config (or the default) before the tracked settings file is
-    read.
+    read — unless ``workspace`` names it explicitly (the host side of a Docker
+    deployment, where ``config.yaml`` carries the container path).
 
     If config_dir is None, the directory is resolved via the waterfall in
     :func:`resolve_config_dir` (flag/env/cwd/pointer), so commands behave the
@@ -2974,7 +3864,7 @@ def load_config(config_dir: Path | None = None) -> NerveConfig:
 
     # Assemble config from workspace/config/settings.yaml + config.yaml +
     # config.local.yaml (lowest→highest precedence) and resolve ${ENV_VAR} refs.
-    merged = _read_config_sources(config_dir)
+    merged = _read_config_sources(config_dir, workspace=workspace)
 
     # Surface typos and stale keys instead of silently ignoring them.
     for warning in validate_config_keys(merged):
@@ -3226,10 +4116,23 @@ def lockdown_machine_local_notes(
 # --- Unknown-key validation ---
 
 # YAML keys that are intentionally not dataclass fields — keyed by dotted
-# prefix ("" is the top level). claude_oauth_token / github_token are read
-# from config.local.yaml by the Docker entrypoint, not by NerveConfig.
+# prefix ("" is the top level). github_token is read from config.local.yaml by
+# the Docker entrypoint, not by NerveConfig (claude_oauth_token became a field:
+# the Claude backend exports it to the CLI).
+#
+# The `<channel>.source` entries are the transport's own spelling of
+# ChannelSourceConfig's `allow_conversations` / `deny_conversations`:
+# `from_dict` reads `allow_{subject}`, so Slack writes `allow_channels` and
+# Telegram `allow_chats`. The validator compares against dataclass field
+# names, which inverts the answer without these — the two spellings that
+# work would be reported as ignored, and `allow_conversations`, which no
+# transport ever reads, would validate clean. Listing them here rather than
+# teaching the walk about the remap keeps a real typo (`allow_channel`)
+# reported, which making the subtree opaque would not.
 _EXTRA_ALLOWED_KEYS: dict[str, set[str]] = {
-    "": {"claude_oauth_token", "github_token"},
+    "": {"github_token"},
+    "slack.source": {"allow_channels", "deny_channels"},
+    "telegram.source": {"allow_chats", "deny_chats"},
 }
 
 # Subtrees we don't descend into: free-form mappings or lists of mappings
@@ -3317,14 +4220,15 @@ def append_telegram_allowed_user(config_dir: Path, user_id: int) -> bool:
         return False
     users.append(user_id)
 
-    with open(local_path, "w", encoding="utf-8") as f:
-        f.write("# Nerve — Secrets (gitignored)\n")
-        f.write("# API keys, tokens, and other sensitive configuration.\n\n")
-        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-    try:
-        os.chmod(local_path, 0o600)
-    except OSError:
-        pass
+    # The file holds the signing secret and the password hash, so it is written
+    # owner-only. ``paths.InsecureFileError`` propagates: ``False`` already
+    # means "the id was already there", so a failure must not return it.
+    paths.write_private_text(
+        local_path,
+        "# Nerve — Secrets (gitignored)\n"
+        "# API keys, tokens, and other sensitive configuration.\n\n"
+        + yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+    )
     logger.info("Persisted Telegram user %d to %s", user_id, local_path)
     return True
 

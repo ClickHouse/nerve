@@ -11,8 +11,7 @@ from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 class NotificationAnswerRequest(BaseModel):
@@ -31,7 +30,6 @@ async def list_notifications(
     type: str = "",
     session_id: str = "",
     limit: int = 50,
-    user: dict = Depends(require_auth),
 ):
     deps = get_deps()
     notifications = await deps.db.list_notifications(
@@ -56,7 +54,6 @@ async def list_notifications(
 @router.get("/api/notifications/silences")
 async def list_silences(
     include_disabled: bool = False,
-    user: dict = Depends(require_auth),
 ):
     deps = get_deps()
     silences = await deps.db.list_silences(include_disabled=include_disabled)
@@ -66,7 +63,6 @@ async def list_silences(
 @router.post("/api/notifications/silences")
 async def create_silence(
     req: SilenceCreateRequest,
-    user: dict = Depends(require_auth),
 ):
     pattern = (req.pattern or "").strip()
     if not pattern:
@@ -97,7 +93,7 @@ async def create_silence(
 
 
 @router.delete("/api/notifications/silences/{silence_id}")
-async def delete_silence(silence_id: str, user: dict = Depends(require_auth)):
+async def delete_silence(silence_id: str):
     deps = get_deps()
     ok = await deps.db.delete_silence(silence_id)
     if not ok:
@@ -108,7 +104,7 @@ async def delete_silence(silence_id: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/api/notifications/{notification_id}")
-async def get_notification(notification_id: str, user: dict = Depends(require_auth)):
+async def get_notification(notification_id: str):
     deps = get_deps()
     notif = await deps.db.get_notification(notification_id)
     if not notif:
@@ -120,7 +116,6 @@ async def get_notification(notification_id: str, user: dict = Depends(require_au
 async def answer_notification(
     notification_id: str,
     req: NotificationAnswerRequest,
-    user: dict = Depends(require_auth),
 ):
     deps = get_deps()
     if not deps.notification_service:
@@ -138,7 +133,6 @@ async def answer_notification(
 @router.post("/api/notifications/{notification_id}/dismiss")
 async def dismiss_notification(
     notification_id: str,
-    user: dict = Depends(require_auth),
 ):
     deps = get_deps()
     if not deps.notification_service:
@@ -150,7 +144,7 @@ async def dismiss_notification(
 
 
 @router.post("/api/notifications/dismiss-all")
-async def dismiss_all_notifications(user: dict = Depends(require_auth)):
+async def dismiss_all_notifications():
     deps = get_deps()
     count = await deps.db.dismiss_all_notifications()
     return {"dismissed": count}

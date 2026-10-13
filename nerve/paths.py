@@ -25,6 +25,7 @@ Keep this module dependency-free (only ``os``/``pathlib``) so that
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 # Environment override for the machine-local state directory.
@@ -169,3 +170,91 @@ def default_workspace() -> Path:
     workspace is configurable via ``config.workspace``.
     """
     return Path.home() / "nerve-workspace"
+
+
+def ensure_nerve_home() -> Path:
+    """Create the state directory if it does not exist, owner-only, and return it.
+
+    :meth:`nerve.db.Database.connect` refuses a state directory that other
+    users can write to. ``mkdir`` applies ``0700`` itself, so a directory Nerve
+    creates passes that check even under a ``002`` umask. An existing directory
+    is not changed; ``connect()`` checks it.
+    """
+    home = nerve_home()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return home
+
+
+# Mode for a file that carries a credential: owner read/write, nothing else.
+SECRET_FILE_MODE = 0o600
+
+
+class InsecureFileError(RuntimeError):
+    """A credential-bearing file could not be created owner-only.
+
+    Raised before any content is written. It is not an ``OSError``, so generic
+    I/O error handlers do not catch it.
+    """
+
+
+def _mode_is_private(st_mode: int) -> bool:
+    """True when a stat mode carries no group/world permission bit."""
+    return (stat.S_IMODE(st_mode) & 0o077) == 0
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` as a file only its owner can read.
+
+    The file is never readable by other users, not even briefly:
+
+    1. Create a temporary with ``O_CREAT|O_EXCL`` at ``0600``.
+    2. ``fstat`` the descriptor. If the filesystem ignored the mode, raise
+       :class:`InsecureFileError` before anything is written.
+    3. Write through the descriptor, flush and fsync.
+    4. Check that the temporary is still the same file (device and inode),
+       then rename it into place.
+
+    ``OSError`` from the write propagates.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    # O_EXCL refuses an existing name, including a symlink. O_NOFOLLOW makes
+    # the symlink case explicit.
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        SECRET_FILE_MODE,
+    )
+    try:
+        st = os.fstat(fd)
+        if not _mode_is_private(st.st_mode):
+            raise InsecureFileError(
+                f"{path} cannot be created owner-only ({SECRET_FILE_MODE:04o}): the "
+                f"filesystem reports mode {stat.S_IMODE(st.st_mode):04o} on a file "
+                f"just created with it. Nothing was written. It holds credentials, so "
+                f"it is not written at a mode other users can read — put the "
+                f"configuration on a filesystem with Unix permissions, or keep the "
+                f"secrets in the environment and reference them as ${{VAR}}."
+            )
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # The rename works on the name. If another user replaced the temporary
+        # (for example with a symlink), the rename would install their file.
+        current = os.stat(tmp, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino):
+            raise InsecureFileError(
+                f"{tmp} was replaced while it was being written; refusing to install "
+                f"it as {path}. Nothing was published."
+            )
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass  # never mask the failure being raised
+        raise
+    finally:
+        os.close(fd)

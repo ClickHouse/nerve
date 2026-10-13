@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from nerve.identity import Actor
+
 
 class MessageStore:
     """Mixin providing message CRUD and file snapshot operations."""
@@ -21,9 +23,20 @@ class MessageStore:
         native_turn_id: str | None = None,
         created_at: str | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> int:
         """Insert a message row. ``external_id`` enables idempotent ingest
         from external sources (Codex thread sync, MCP server).
+
+        ``actor`` is the principal whose *input* this row records, and is
+        required — keyword-only with no default — so no call site can acquire
+        an answer by omission. Pass the person who typed it, the agent's system
+        principal for input the instance generated for itself (a cron prompt, a
+        scheduled wakeup), or ``None`` for assistant and tool output, whose
+        authorship is already represented by ``role``. Causal attribution to
+        the principal that prompted output is not stored. ``channel`` is
+        transport provenance, never identity.
 
         ``created_at`` lets external ingesters preserve original Codex
         timestamps. Defaults to ``CURRENT_TIMESTAMP`` for native callers.
@@ -35,27 +48,28 @@ class MessageStore:
         advances — the message is real, only the "last activity" clock is
         left alone.
         """
+        actor_id = actor.actor_id if actor else None
         async with self._atomic():
             if created_at is not None:
                 async with self.db.execute(
                     """INSERT INTO messages
                          (session_id, role, content, thinking, blocks, channel,
-                          external_id, native_turn_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          external_id, native_turn_id, actor_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id, native_turn_id, created_at),
+                     channel, external_id, native_turn_id, actor_id, created_at),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             else:
                 async with self.db.execute(
                     """INSERT INTO messages
                          (session_id, role, content, thinking, blocks, channel,
-                          external_id, native_turn_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          external_id, native_turn_id, actor_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id, native_turn_id),
+                     channel, external_id, native_turn_id, actor_id),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             # Update session timestamp and message counter
@@ -107,6 +121,72 @@ class MessageStore:
             row = await cursor.fetchone()
         return str(row[0]) if row else None
 
+    async def copy_messages_to_session(
+        self,
+        source_session_id: str,
+        dest_session_id: str,
+        up_to_native_turn_id: str | None = None,
+    ) -> int:
+        """Copy message rows into a freshly forked session.
+
+        The fork's *native* context is carried by the backend (Claude
+        ``--fork-session`` / Codex ``thread/fork``); these copies exist so
+        the forked chat *displays* the conversation it remembers. Copies
+        keep ``created_at`` (history reads chronologically), ``native_turn_id``
+        (so a fork can itself be forked at a copied message — both backends
+        preserve entry/turn ids across a fork), and get a synthetic
+        ``external_id`` (``forkcopy:<source row id>``) for provenance.
+
+        ``up_to_native_turn_id`` bounds the copy at the assistant row that
+        completed that native turn — the same boundary the backend truncates
+        the native context at, so display and context never disagree.
+        Returns the number of rows copied.
+
+        ``actor_id`` is copied with the rest: a fork displays the same
+        conversation, so its copied turns keep the people who actually sent
+        them rather than being re-attributed to whoever forked. Who made the
+        *fork* is recorded on the new session's ``created_by_actor_id``.
+        """
+        boundary_id: int | None = None
+        if up_to_native_turn_id is not None:
+            async with self.db.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND native_turn_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (source_session_id, up_to_native_turn_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                raise ValueError(
+                    f"native turn {up_to_native_turn_id!r} not found in "
+                    f"session {source_session_id}"
+                )
+            boundary_id = int(row[0])
+
+        where = "session_id = ?"
+        params: list = [dest_session_id, source_session_id]
+        if boundary_id is not None:
+            where += " AND id <= ?"
+            params.append(boundary_id)
+
+        async with self._atomic():
+            async with self.db.execute(
+                f"""INSERT INTO messages
+                      (session_id, role, content, thinking, blocks, channel,
+                       external_id, native_turn_id, actor_id, created_at)
+                    SELECT ?, role, content, thinking, blocks, channel,
+                           'forkcopy:' || id, native_turn_id, actor_id, created_at
+                    FROM messages WHERE {where} ORDER BY id ASC""",
+                params,
+            ) as cursor:
+                copied = cursor.rowcount or 0
+            if copied:
+                await self.db.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (copied, dest_session_id),
+                )
+        return copied
+
     async def add_message_idempotent(
         self,
         session_id: str,
@@ -117,11 +197,18 @@ class MessageStore:
         thinking: str | None = None,
         blocks: list | None = None,
         created_at: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> int | None:
         """Insert a message keyed on ``(session_id, external_id)``.
 
         Returns the new message id, or ``None`` if a row with the same
         ``external_id`` already exists for the session (no-op).
+
+        ``actor`` means what it means on :meth:`add_message` and is required
+        the same way. Idempotency makes it write-once: a re-ingested row is
+        skipped whole, so nothing can re-attribute a message that already
+        exists.
 
         Relies on the partial unique index added in v028 — callers MUST
         pass a non-empty ``external_id``. Use :meth:`add_message` for
@@ -129,16 +216,17 @@ class MessageStore:
         """
         if not external_id:
             raise ValueError("add_message_idempotent requires non-empty external_id")
+        actor_id = actor.actor_id if actor else None
         async with self._atomic():
             ts = created_at or datetime.now(timezone.utc).isoformat()
             async with self.db.execute(
                 """INSERT OR IGNORE INTO messages
                      (session_id, role, content, thinking, blocks, channel,
-                      external_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      external_id, actor_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, role, content, thinking,
                  json.dumps(blocks) if blocks else None,
-                 channel, external_id, ts),
+                 channel, external_id, actor_id, ts),
             ) as cursor:
                 msg_id = cursor.lastrowid
                 # rowcount==0 on IGNORE-skipped insert; lastrowid still

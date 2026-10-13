@@ -41,6 +41,7 @@ const SECTIONS: Section[] = [
       { combo: { mod: true, shift: true, key: 's' }, description: 'Toggle session sidebar' },
       { combo: { mod: true, shift: true, key: ';' }, description: 'Focus message input' },
       { combo: { mod: true, shift: true, key: 'c' }, description: 'Copy last response' },
+      { combo: { mod: true, shift: true, key: 'f' }, description: 'Fork this chat' },
       { combo: { mod: true, shift: true, key: 'Backspace' }, description: 'Delete current conversation' },
       { combo: { mod: true, key: '\\' }, description: 'Toggle side panel' },
     ],

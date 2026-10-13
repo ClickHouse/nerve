@@ -1,12 +1,16 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { Link } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink } from '../ui/icons';
+import { Link, useNavigate } from 'react-router-dom';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
 import { useChatStore } from '../../stores/chatStore';
+import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAuthStore } from '../../stores/authStore';
+import { SessionCreatorMarker } from './ActorLabel';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
+import { forkChat } from '../../utils/forkChat';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -102,6 +106,14 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
 
   const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
+
+  const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
+  const creatorIds = useMemo(() => [
+    ...sessions.map(s => s.created_by_actor_id),
+    ...(searchResults ?? []).map(s => s.created_by_actor_id),
+    ...(archivedSessions ?? []).map(s => s.created_by_actor_id),
+  ], [sessions, searchResults, archivedSessions]);
+  const namedCreators = useVisibleActorIds(creatorIds, viewerActorId);
 
   // In drawer mode the list is a modal overlay: it needs focus, Tab
   // containment, Escape, and focus restoration. Declared before the search
@@ -374,6 +386,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       onArchive={archiveSession}
       onRemoveParent={handleRemoveParent}
       onSelect={handleSelect}
+      namedCreators={namedCreators}
     />
   );
 
@@ -556,6 +569,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                       onToggleStar={toggleStar}
                       onArchive={archiveSession}
                       onSelect={handleSelect}
+                      namedCreators={namedCreators}
                       showDate
                     />
                   ))
@@ -777,6 +791,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                         onUnarchive={unarchiveSession}
                         onStarArchived={starArchivedSession}
                         onSelect={handleSelect}
+                        namedCreators={namedCreators}
                         archived
                         showDate
                       />
@@ -963,6 +978,7 @@ function SessionTree({
   session, depth, childrenByParent, expandedParents, onToggleExpand,
   activeSession, activeIsRunning, dnd,
   onDelete, onRename, onToggleStar, onArchive, onRemoveParent, onSelect,
+  namedCreators,
 }: {
   session: Session;
   depth: number;
@@ -978,6 +994,7 @@ function SessionTree({
   onArchive: (id: string) => Promise<void>;
   onRemoveParent: (id: string) => void;
   onSelect?: () => void;
+  namedCreators: Set<string>;
 }) {
   const kids = childrenByParent.get(session.id);
   const hasChildren = !!kids && kids.length > 0;
@@ -1000,6 +1017,7 @@ function SessionTree({
         onArchive={onArchive}
         onRemoveParent={onRemoveParent}
         onSelect={onSelect}
+        namedCreators={namedCreators}
         draggable
         dnd={dnd}
       />
@@ -1020,6 +1038,7 @@ function SessionTree({
           onArchive={onArchive}
           onRemoveParent={onRemoveParent}
           onSelect={onSelect}
+          namedCreators={namedCreators}
         />
       ))}
     </>
@@ -1028,7 +1047,7 @@ function SessionTree({
 
 
 function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggleStar, onArchive, onUnarchive, onStarArchived, archived, onSelect, showDate, showUnread = false,
-  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd }: {
+  depth = 0, hasChildren = false, childCount = 0, expanded = false, onToggleExpand, onRemoveParent, draggable = false, dnd, namedCreators }: {
   session: Session;
   isActive: boolean;
   isRunning: boolean;
@@ -1056,12 +1075,14 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Drag-to-nest: only feed rows are draggable; search/archived rows aren't. */
   draggable?: boolean;
   dnd?: RowDnd;
+  namedCreators?: Set<string>;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const navigate = useNavigate();
   // Unsent draft for this chat (hidden on the active one — its text is in the box).
   const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
   // Unread = updated since you last opened it (client-only, see readStorage).
@@ -1163,12 +1184,18 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
       ) : isImplementSession(session) ? (
         <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
+      ) : session.id.startsWith('fork-') ? (
+        <GitBranch size={13} className="shrink-0 text-hue-violet/70" />
       ) : (
         <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
       </div>
+
+      {session.created_by_actor_id && namedCreators?.has(session.created_by_actor_id) && (
+        <SessionCreatorMarker actorId={session.created_by_actor_id} />
+      )}
 
       {/* Collapsed parent: badge the hidden direct-child count (mirrors GroupHeader). */}
       {hasChildren && !expanded && childCount > 0 && (
@@ -1316,6 +1343,28 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               >
                 <Unlink size={14} />
                 Remove from parent
+              </Button>
+            )}
+            {/* Forkable = has a native conversation to branch (materializes
+                after the first completed turn). Self-contained: fork, then
+                jump into the new chat. */}
+            {session.sdk_session_id && (
+              <Button
+                variant="subtle"
+                size="sm"
+                fullWidth
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  void forkChat(session.id).then((forkId) => {
+                    if (forkId) navigate(`/chat/${forkId}`);
+                  });
+                }}
+                className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
+              >
+                <GitBranch size={14} />
+                Fork
               </Button>
             )}
             <div className="border-t border-border my-1" />

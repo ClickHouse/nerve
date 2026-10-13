@@ -8,7 +8,7 @@ description: >
   a cron job, create or change a skill, adjust settings, or "change your config".
   Triggers on "add a cron", "change your schedule", "edit your config",
   "update settings", "propose a config change".
-version: 1.0.0
+version: 1.0.1
 context: domain
 ---
 
@@ -34,8 +34,9 @@ is to propose rather than to edit. It may equally be a plain local directory tha
 belongs to this instance alone — that is what an ordinary install looks like.
 
 - **Locked instance** (lockdown / remote-only) — a PR is the *only* thing that
-  works. Direct edits to tracked config are blocked, and would be overwritten by
-  the next sync even if they weren't.
+  works. Direct edits to tracked config are refused (the skill endpoints answer
+  403, your `Write`/`Edit` are declined across that surface), and a change that
+  got in some other way would block every later sync until someone cleared it.
 - **Workspace has a remote, not locked** — route every change to the reviewed
   surface through `propose_config_change`, even though nothing forces you to. A
   direct write leaves the workspace diverged from the reviewed revision, and sync
@@ -64,8 +65,10 @@ keeps every change reviewed, approved, and traceable.
 `changes` — each the **full new content** of a file, path relative to the
 workspace root. It:
 
-1. stages your change on a branch off the remote's default branch (in an isolated
-   worktree — your live workspace is untouched),
+1. stages your change on a branch off the branch workspace sync pulls from
+   (`workspace_sync.branch`, or `origin`'s default branch when that is unset — the
+   remote must be named `origin`), in an isolated worktree — your live workspace
+   is untouched,
 2. **validates** the resulting bundle (an invalid change is rejected with the
    errors to fix — no PR is opened),
 3. pushes the branch and opens a PR via `gh` for a human to review and merge.
@@ -91,8 +94,11 @@ refused, including:
 A proposal containing even one refused path is rejected whole; nothing is
 dropped quietly. Fix the reported paths and re-submit.
 
-`skills/<id>/scripts/` **is** proposable — it's a normal part of a skill — so a
-script there reaches the instance through this route like anything else.
+`skills/<id>/scripts/` is inside the surface, but the code-suffix rule above
+still applies there: `scripts/run.py` or `scripts/run.sh` is refused, while a
+`.md` reference or an extension-less script passes (and replacing a file the
+repository marks executable is flagged in the PR body). A script a skill needs
+that this route refuses has to be committed by a human — say so.
 
 Proposals carry **text**, so a binary file cannot go through this tool at all.
 That matters for one thing in practice: the instance's favicon
@@ -112,8 +118,9 @@ the normal thing rather than a workaround.
 
 That's also why changes that alter *what runs* are flagged rather than refused.
 When the tool can tell — a gate plugin, a script replacing an executable file, an
-`mcp_servers` or `codex` or `proxy` entry in `settings.yaml` — it puts a notice at
-the top of the PR. It can only recognise what it knows about, so **say it in your
+`mcp_servers`, `external_agents`, `codex`, `proxy` or `cron.gate_plugins_dir`
+entry in `settings.yaml`, or a change to `lockdown` — it puts a notice at the top
+of the PR. It can only recognise what it knows about, so **say it in your
 own words too** whenever your change causes something new to execute. The
 reviewer approving the PR is the only check there is.
 

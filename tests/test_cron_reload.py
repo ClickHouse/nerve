@@ -882,7 +882,7 @@ class TestReloadRoute:
 
         monkeypatch.setattr(srv, "_cron_service", None, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 503
 
     @pytest.mark.asyncio
@@ -896,7 +896,7 @@ class TestReloadRoute:
             return_value={"added": ["a"], "removed": [], "updated": [], "enabled": 1}
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
-        result = await reload_cron_jobs(user={})
+        result = await reload_cron_jobs()
         assert result["reloaded"] is True
         assert result["added"] == ["a"]
 
@@ -912,7 +912,7 @@ class TestReloadRoute:
         fake.reload = AsyncMock(side_effect=ConfigError("bad cron file"))
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 400
         assert "bad cron file" in ei.value.detail
 
@@ -931,7 +931,7 @@ class TestReloadRoute:
         )
         monkeypatch.setattr(srv, "_cron_service", fake, raising=False)
         with pytest.raises(HTTPException) as ei:
-            await reload_cron_jobs(user={})
+            await reload_cron_jobs()
         assert ei.value.status_code == 400
         assert "typo" in ei.value.detail
 
@@ -1064,3 +1064,46 @@ class TestReservedIdsInCli:
         assert "Cron jobs: 1/1 enabled" in result.output
         assert "source:rss" in result.output
         assert "reserved" in result.output
+
+
+class TestSourceScheduleReporting:
+    """``list_jobs`` must report the trigger the scheduler actually used.
+
+    The cadence reaches the API by a second path, and only the scheduler's own
+    resolver knows about a runner that carries its schedule instead of naming a
+    ``sync.<name>`` section to read it from.
+    """
+
+    @pytest.mark.asyncio
+    async def test_channel_source_reports_its_carried_schedule(self, svc):
+        service, _ = svc
+        runner = MagicMock()
+        runner.job_id = "source:slack:observed"
+        runner.schedule = "*/5 * * * *"
+        runner.source = SimpleNamespace(source_name="slack:observed")
+        service._source_runners = [runner]
+
+        rows = await service.list_jobs()
+        row = next(r for r in rows if r["id"] == "source:slack:observed")
+        # There is no sync.slack section to look this up in, so re-deriving it
+        # from config.sync reported no cadence at all while the job itself ran
+        # on the right trigger.
+        assert row["schedule"] == "*/5 * * * *"
+
+    @pytest.mark.asyncio
+    async def test_sync_configured_source_still_reads_its_section(self, svc):
+        """The regression guard: a pull source has no carried schedule, so it
+        must still resolve through ``sync.<name>``."""
+        service, _ = svc
+        runner = MagicMock()
+        runner.job_id = "source:github"
+        runner.schedule = ""          # nothing carried
+        runner.source = SimpleNamespace(source_name="github")
+        service.config.sync = SimpleNamespace(
+            github=SimpleNamespace(schedule="*/15 * * * *"),
+        )
+        service._source_runners = [runner]
+
+        rows = await service.list_jobs()
+        row = next(r for r in rows if r["id"] == "source:github")
+        assert row["schedule"] == "*/15 * * * *"

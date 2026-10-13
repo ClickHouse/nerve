@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from nerve import paths
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
     AgentClient,
@@ -39,6 +40,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
@@ -113,6 +115,51 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# Reasoning-effort vocabulary shared by nerve's effort_map values and the
+# app-server catalog, weakest first. Used only to clamp a requested effort
+# down to what the serving model advertises.
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _catalog_entries(result: dict) -> list[dict]:
+    """The model entries of a ``model/list`` result (defensive)."""
+    models = result.get("data") or result.get("models") or []
+    return [item for item in models if isinstance(item, dict)]
+
+
+def _model_id(item: dict) -> str:
+    return str(item.get("id") or item.get("model") or item.get("slug") or "")
+
+
+def _supported_efforts(item: dict) -> list[str]:
+    """``supportedReasoningEfforts`` as plain strings (empty = unknown)."""
+    out: list[str] = []
+    for entry in item.get("supportedReasoningEfforts") or []:
+        value = entry.get("reasoningEffort") if isinstance(entry, dict) else entry
+        if isinstance(value, str) and value and value not in out:
+            out.append(value)
+    return out
+
+
+def clamp_effort(effort: str | None, supported: list[str]) -> str | None:
+    """Clamp *effort* to the strongest advertised level at or below it.
+
+    The catalog is advisory: an unknown model, an empty list or an effort
+    outside the shared vocabulary passes through untouched and the
+    app-server decides. An entry that advertises only up to ``high`` gets
+    ``high`` for a ``max``/``ultra`` request instead of a failed turn.
+    """
+    if not effort or not supported or effort in supported:
+        return effort
+    if effort not in _EFFORT_ORDER:
+        return effort
+    rank = {name: i for i, name in enumerate(_EFFORT_ORDER)}
+    lower = [s for s in supported if s in rank and rank[s] <= rank[effort]]
+    if not lower:
+        return effort
+    return max(lower, key=lambda s: rank[s])
+
+
 class CodexBackend:
     """OpenAI Codex app-server backend."""
 
@@ -127,11 +174,43 @@ class CodexBackend:
 
     def __init__(self, deps: Any):
         self._deps = deps
+        paths.ensure_nerve_home()  # the default CODEX_HOME is under the state dir
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
         self._preflight_cache: tuple[float, dict[str, Any]] | None = None
         self._preflight_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
+
+    def catalog(self, entries: list[dict]) -> dict[str, Any]:
+        """Digest a ``model/list`` (``includeHidden``) result.
+
+        ``offered`` feeds the picker: every visible entry plus the configured
+        ``codex.models`` the live catalog actually serves (hidden entries are
+        hidden upstream for a reason — internal previews, reviewers — so they
+        are opt-in by name). ``allowed`` is what a session may run on: the
+        whole catalog, hidden included, plus the configured models
+        unconditionally. ``efforts`` maps model id → advertised reasoning
+        efforts, for clamping turn requests.
+        """
+        visible: list[str] = []
+        all_ids: list[str] = []
+        efforts: dict[str, list[str]] = {}
+        for item in entries:
+            model_id = _model_id(item)
+            if not model_id:
+                continue
+            all_ids.append(model_id)
+            if not item.get("hidden"):
+                visible.append(model_id)
+            efforts[model_id] = _supported_efforts(item)
+        configured = [m for m in (self.codex.models or []) if m]
+        return {
+            "listed": sorted(set(all_ids)),
+            "offered": sorted({*visible, *(m for m in configured if m in all_ids)}),
+            "allowed": sorted({*all_ids, *configured}),
+            "hidden": sorted(set(all_ids) - set(visible)),
+            "efforts": efforts,
+        }
 
     @property
     def config(self):
@@ -159,7 +238,7 @@ class CodexBackend:
         return self.codex.model
 
     def excluded_tools(self) -> set[str]:
-        return set()
+        return config_excluded_tools(self.config)
 
     async def validate_model(self, model: str) -> None:
         """Reject obvious cross-backend model leakage before spawning Codex.
@@ -171,6 +250,7 @@ class CodexBackend:
         allowed = {
             self.codex.model,
             self.codex.cron_model or self.codex.model,
+            *(self.codex.models or []),
             *(self.codex.pricing or {}).keys(),
             *self._live_models,
         }
@@ -275,7 +355,12 @@ class CodexBackend:
                         raise BackendError(
                             "Codex is not authenticated. To fix: " + self.auth_hint()
                         )
-                    model_result = await transport.request("model/list", {}, timeout=10)
+                    # includeHidden: the catalog omits API-only entries such
+                    # as GPT-6 Astra from the default picker list; nerve
+                    # decides what to offer (see ``catalog``).
+                    model_result = await transport.request(
+                        "model/list", {"includeHidden": True}, timeout=10,
+                    )
                     try:
                         rate_result = await transport.request(
                             "account/rateLimits/read", {}, timeout=10,
@@ -284,17 +369,15 @@ class CodexBackend:
                         rate_result = {}
                 finally:
                     await transport.close()
-                models = model_result.get("data") or model_result.get("models") or []
-                model_ids = sorted({
-                    str(item.get("id") or item.get("model") or item.get("slug"))
-                    for item in models if isinstance(item, dict)
-                    and (item.get("id") or item.get("model") or item.get("slug"))
-                })
-                if model_ids and self.codex.model not in model_ids:
+                catalog = self.catalog(_catalog_entries(model_result))
+                model_ids = catalog["offered"]
+                # An empty catalog (older/odd app-server) skips the check,
+                # as before; a populated one must allow the default model.
+                if catalog["listed"] and self.codex.model not in catalog["allowed"]:
                     raise BackendError(
                         f"Configured Codex model {self.codex.model!r} is unavailable"
                     )
-                self._live_models = set(model_ids)
+                self._live_models = set(catalog["allowed"])
                 rate_limits = rate_result.get("rateLimits")
                 if isinstance(rate_limits, dict):
                     self._rate_limits = rate_limits
@@ -318,6 +401,7 @@ class CodexBackend:
                     ),
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
+                    "hidden_models": catalog["hidden"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,
                     "ultracode": plugin,
@@ -627,6 +711,17 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
+        # Cumulative `total` at the end of the previous turn on this client,
+        # kept across turns; the baseline for the next turn's delta when known.
+        self._prev_total_usage: dict | None = None
+        # Fallback baseline for the first turn on a fresh client (no previous
+        # total yet): (total - last) from the turn's first tokenUsage
+        # notification. Reset per turn.
+        self._turn_total_base: dict[str, int] | None = None
+        # Count of model responses (tokenUsage notifications) in this turn,
+        # reported as num_turns so the context bar can divide the turn-aggregate
+        # usage back down to a single call's context occupancy.
+        self._turn_response_count: int = 0
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -634,6 +729,9 @@ class CodexClient(AgentClient):
         self._ultracode_priced_worker_count = 0
         self._ultracode_runs: set[str] = set()
         self._effective_auth = "unknown"
+        # model id -> advertised reasoning efforts (from model/list at
+        # connect); empty until then, which leaves efforts unclamped.
+        self._model_efforts: dict[str, list[str]] = {}
 
     # -- protocol --------------------------------------------------------- #
 
@@ -722,25 +820,40 @@ class CodexClient(AgentClient):
         self._thread_id = str(thread_id)
 
     async def _validate_live_model(self) -> None:
-        """Confirm the selected model against the authenticated app-server."""
+        """Confirm the selected model against the authenticated app-server.
+
+        Hidden catalog entries count (GPT-6 Astra is hidden upstream), as
+        do the configured ``codex.models``; the model's advertised
+        reasoning efforts are kept for :meth:`start_turn` to clamp against.
+        """
         try:
-            response = await self._transport.request("model/list", {})
+            response = await self._transport.request(
+                "model/list", {"includeHidden": True},
+            )
         except CodexRpcError as e:
             raise BackendError(
                 f"Codex model discovery failed; the app-server protocol is "
                 f"not compatible: {e}"
             ) from e
-        models = response.get("data") or response.get("models") or []
-        ids = {
-            str(item.get("id") or item.get("model") or item.get("slug"))
-            for item in models if isinstance(item, dict)
-        }
-        ids.discard("")
-        if ids and self.model not in ids:
+        catalog = self._backend.catalog(_catalog_entries(response))
+        self._model_efforts = catalog["efforts"]
+        allowed = catalog["allowed"]
+        if catalog["listed"] and self.model not in allowed:
             raise BackendError(
                 f"Codex model {self.model!r} is unavailable for the current "
-                f"account (available: {sorted(ids)})"
+                f"account (available: {catalog['offered'] or allowed})"
             )
+
+    def turn_effort(self) -> str | None:
+        """The reasoning effort for the next turn, clamped to the model."""
+        effort = self._backend.map_effort(self._spec.effort)
+        clamped = clamp_effort(effort, self._model_efforts.get(self.model) or [])
+        if clamped != effort:
+            logger.info(
+                "Codex model %s does not advertise effort %r; sending %r",
+                self.model, effort, clamped,
+            )
+        return clamped
 
     async def _ensure_auth(self) -> None:
         """Best-effort auth check with a clear operator hint.
@@ -789,7 +902,7 @@ class CodexClient(AgentClient):
     async def start_turn(self, turn: TurnInput) -> None:
         if not self._thread_id:
             raise BackendError("codex client has no thread")
-        self._turn_usage = None
+        self._reset_turn_usage_accounting()
         self._last_error = None
         self._items.clear()
         self._ultracode_usage = None
@@ -809,7 +922,7 @@ class CodexClient(AgentClient):
             "threadId": self._thread_id,
             "input": self._build_input_items(turn),
         }
-        effort = self._backend.map_effort(self._spec.effort)
+        effort = self.turn_effort()
         if effort:
             params["effort"] = effort
 
@@ -962,6 +1075,8 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
+                self._turn_response_count += 1
+                self._capture_turn_total_base(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
                     self._context_window = window
@@ -1246,7 +1361,12 @@ class CodexClient(AgentClient):
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
-        usage = self._normalize_usage(self._turn_usage)
+        baseline = (
+            self._prev_total_usage
+            if self._prev_total_usage is not None
+            else self._turn_total_base
+        )
+        usage = self._normalize_usage(self._turn_usage, baseline)
         if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
             # notification. Child usage is still authoritative and must not
@@ -1273,7 +1393,7 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(self._turn_usage)
+            parent_usage = self._normalize_usage(self._turn_usage, baseline)
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1297,6 +1417,13 @@ class CodexClient(AgentClient):
             cost = None
             cost_basis = "unknown"
             estimated_cost = estimate
+        # Carry this turn's ending cumulative total as the next turn's baseline.
+        # A ContextWindowExceeded error resets total to 0 and later responses
+        # re-accumulate from 0, so the latest total is always the baseline.
+        if isinstance(self._turn_usage, dict) and isinstance(
+            self._turn_usage.get("total"), dict
+        ):
+            self._prev_total_usage = self._turn_usage["total"]
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
@@ -1307,15 +1434,51 @@ class CodexClient(AgentClient):
             estimated_cost_usd=estimated_cost,
             duration_ms=turn.get("durationMs"),
             duration_api_ms=None,
-            num_turns=1,
+            num_turns=max(1, self._turn_response_count),
             context_window=self._context_window,
             status=status,  # type: ignore[arg-type]
             error=error,
         )
 
+    def _reset_turn_usage_accounting(self) -> None:
+        """Clear per-turn token-accounting state (latest tokenUsage payload,
+        turn-start cumulative baseline, response count) at turn start."""
+        self._turn_usage = None
+        self._turn_total_base = None
+        self._turn_response_count = 0
+
+    def _capture_turn_total_base(self, usage: dict) -> None:
+        """Record the fallback turn-start baseline from the turn's first
+        tokenUsage notification, used only when no previous-turn total is
+        carried (the first turn on a fresh client).
+
+        ``tokenUsage.total`` is the per-thread cumulative counter and
+        ``tokenUsage.last`` the most recent single response, so ``total - last``
+        on that first notification is the cumulative total just before the
+        turn's first response.
+        """
+        if self._turn_total_base is not None:
+            return
+        total = usage.get("total")
+        if not isinstance(total, dict):
+            return
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+        self._turn_total_base = {
+            key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
+            for key in ("inputTokens", "cachedInputTokens", "outputTokens")
+        }
+
     @staticmethod
-    def _normalize_usage(usage: dict | None) -> ev.NormalizedUsage | None:
+    def _normalize_usage(
+        usage: dict | None,
+        baseline: dict | None = None,
+    ) -> ev.NormalizedUsage | None:
         """``thread/tokenUsage/updated`` → NormalizedUsage.
+
+        The turn's usage is the cumulative-``total`` delta over the turn:
+        ``total`` minus ``baseline`` (the cumulative counters as of turn start).
+        When no cumulative ``total`` is present, ``last`` — the most recent
+        single response — is used instead.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
@@ -1324,15 +1487,28 @@ class CodexClient(AgentClient):
         """
         if not usage:
             return None
-        last = usage.get("last") or {}
-        if not isinstance(last, dict):
+        total = usage.get("total") if isinstance(usage.get("total"), dict) else None
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else None
+        if total is not None:
+            # Per-turn delta of the cumulative thread total (clamped at zero).
+            base = baseline or {}
+            raw_input = max(0, int(total.get("inputTokens") or 0)
+                            - int(base.get("inputTokens") or 0))
+            raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
+                             - int(base.get("cachedInputTokens") or 0))
+            raw_output = max(0, int(total.get("outputTokens") or 0)
+                             - int(base.get("outputTokens") or 0))
+        elif last is not None:
+            # No cumulative total available: use the single last response.
+            raw_input = int(last.get("inputTokens") or 0)
+            raw_cached = int(last.get("cachedInputTokens") or 0)
+            raw_output = int(last.get("outputTokens") or 0)
+        else:
             return None
-        input_tokens = int(last.get("inputTokens") or 0)
-        cached = int(last.get("cachedInputTokens") or 0)
         return ev.NormalizedUsage(
-            input_tokens=max(0, input_tokens - cached),
-            output_tokens=int(last.get("outputTokens") or 0),
-            cache_read_tokens=cached,
+            input_tokens=max(0, raw_input - raw_cached),
+            output_tokens=raw_output,
+            cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
             raw={"last": last, "total": usage.get("total")},
         )

@@ -18,6 +18,15 @@ import pytest_asyncio
 
 from nerve.db import Database
 
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
+
 
 class FakeSessionManager:
     """Records get_or_create calls; the service passes backend/model/cwd.
@@ -38,7 +47,7 @@ class FakeSessionManager:
             source=kwargs.get("source", "workflow"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
 
 
@@ -90,7 +99,7 @@ async def _drain(setup) -> None:
 @pytest.mark.asyncio
 class TestWorkflowRunRoutes:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database, tmp_path, monkeypatch):
+    async def setup(self, db: Database, tmp_path, monkeypatch, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -101,11 +110,8 @@ class TestWorkflowRunRoutes:
         from nerve.gateway.routes.workflow_runs import router as wf_router
         from nerve.workflows.service import WorkflowRunService
 
-        # Auth dependency reads get_config().auth.jwt_secret — install a
-        # config with no secret so require_auth is a no-op.
         cfg = NerveConfig()
         cfg.workspace = tmp_path
-        cfg.auth.jwt_secret = ""
         cfg.workflows.runs_dir = tmp_path
         cfg.workflows.kill_grace_seconds = 0
         cfg_mod._config = cfg
@@ -123,6 +129,7 @@ class TestWorkflowRunRoutes:
 
         app = FastAPI()
         app.include_router(wf_router)
+        bypass_auth(app)  # these routes are not about auth
         client = TestClient(app)
 
         ns = SimpleNamespace(

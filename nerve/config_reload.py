@@ -1,39 +1,11 @@
-"""Unified config hot-reload.
+"""Unified best-effort config hot reload.
 
-A single entry point that re-reads config from disk and reloads every subsystem
-that supports it without a restart: the process config object (so lockdown and
-settings changes engage), the long-lived services that captured that object at
-start-up, cron jobs, cron sources, MCP servers, and skills. Best-effort per
-subsystem — one failure is reported but does not abort the rest, because
-refusing a valid cron edit over an unrelated typo in ``settings.yaml`` is the
-worse outcome. Which subsystems fell over is reported, never inferred: see
-:func:`reload_failures`.
+``reload_all`` replaces process config and refreshes services, cron sources,
+MCP servers, and skills. It reports each failure without aborting the others.
+Reloads happen only through the CLI/API or workspace sync.
 
-Nothing reloads on its own. A reload happens when an operator asks for one
-(``nerve reload`` / ``POST /api/config/reload``) or when a workspace sync merges a
-change. Editing a config file on the box does not apply itself.
-
-Restart-only (NOT reloaded here): the gateway socket (host/port/SSL), the
-Telegram bot's token and allow-list, the MCP endpoint (including the
-``auth.jwt_secret`` it checks ``/mcp/v1`` against, which the web gateway reads
-per request), Langfuse, the memory bridges, the Codex thread-sync service
-(``sync.codex.*`` — a different service from the cron sources under ``sync.*``,
-and the one place those two names diverge), anything a service derived from
-config at construction, and a background loop that was never started because its
-feature was off. The hot-reload table in ``docs/config.md`` is the
-operator-facing list of exactly what a reload covers; keep the two in step.
-
-:func:`restart_required` diffs the old and new config over
-:data:`_RESTART_ONLY_PATHS` and records what changed in the summary. Without it
-the summary reports only what was applied, which a caller cannot distinguish from
-"nothing needed applying". ``gateway.host``/``port`` are the case that matters:
-they live in the tracked settings, so the change can arrive by workspace sync.
-
-It reports; it does not gate. A setting whose only protection is a line in that
-report is a setting the daemon is not applying — which is tolerable for a bound
-socket and not for a policy that was tightened. Where the holder can resolve
-config per read instead, that is the fix, and the path leaves this list: see
-:func:`_repoint`.
+``_RESTART_ONLY_PATHS`` tracks settings that cannot apply live and must match
+the operator table in ``docs/config.md``.
 """
 
 from __future__ import annotations
@@ -70,10 +42,13 @@ _ERROR_PREFIX = "error: "
 # the field.
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
+    "anthropic_base_url",
     "auth.jwt_secret",
+    "channels.hosted",
     "codex.home_dir",
     "external_agents.enabled",
     "gateway.host",
+    "gateway.loop",
     "gateway.port",
     "gateway.ssl.cert",
     "gateway.ssl.key",
@@ -86,6 +61,7 @@ _RESTART_ONLY_PATHS = (
     "mcp_endpoint.path",
     "memory",
     "proxy",
+    "slack.mode",
     "sync.codex",
     "telegram.allowed_users",
     "telegram.bot_token",
@@ -105,6 +81,8 @@ _SECRET_PATHS = frozenset({
     "auth.jwt_secret",
     "langfuse.public_key",
     "langfuse.secret_key",
+    "slack.app_token",
+    "slack.bot_token",
     "telegram.bot_token",
 })
 
@@ -155,6 +133,79 @@ def restart_required(old_config, new_config) -> list[str]:
         if before != after:
             changed.append(_describe(path, before, after))
     return changed
+
+
+# The configuration this process *started* with. "Is a restart pending" is
+# answered by comparing it with what is on disk now, so a value written and
+# then reverted disappears from the answer, and the answer is empty after a
+# restart by construction — nothing has to remember to clear it.
+_startup_config = None
+
+
+def remember_startup_config(config) -> None:
+    """Capture the configuration the running process was built from.
+
+    Called by the gateway lifespan right after the config is pinned. A deep
+    copy, so later in-place edits to the live object (the external-agents
+    routes mutate it) cannot make the snapshot agree with them.
+    """
+    global _startup_config
+    import copy
+
+    try:
+        _startup_config = copy.deepcopy(config)
+    except Exception:  # noqa: BLE001 — an uncopyable stand-in (tests): keep the reference
+        _startup_config = config
+
+
+def startup_config():
+    """The snapshot, or ``None`` outside a started gateway."""
+    return _startup_config
+
+
+def restart_pending() -> list[str]:
+    """Restart-only paths whose on-disk value differs from the running one.
+
+    ``[]`` when there is no snapshot (CLI processes, tests): nothing can be
+    said, and saying "a restart is pending" with nothing to compare would be
+    a guess.
+    """
+    if _startup_config is None:
+        return []
+    try:
+        from nerve.config import get_config
+
+        live = get_config()
+    except Exception:  # noqa: BLE001 — no config loaded
+        return []
+    return restart_required(_startup_config, live)
+
+
+def note_applied(path: str, value) -> None:
+    """Record that the running process now honours ``value`` at ``path``.
+
+    For the one restart-only path a live handler applies itself:
+    ``telegram.allowed_users`` after a successful ``/pair``. Rebuilds the
+    startup snapshot with that single leaf replaced, so the next reload does
+    not report a change the channel already honours. No-op without a
+    snapshot; a path that names nothing is ignored.
+    """
+    global _startup_config
+    if _startup_config is None:
+        return
+    parts = path.split(".")
+    nodes = [_startup_config]
+    for part in parts[:-1]:
+        node = getattr(nodes[-1], part, _UNSET)
+        if node is _UNSET or not dataclasses.is_dataclass(node):
+            return
+        nodes.append(node)
+    if not hasattr(nodes[-1], parts[-1]):
+        return
+    rebuilt = dataclasses.replace(nodes[-1], **{parts[-1]: value})
+    for parent, part in zip(reversed(nodes[:-1]), reversed(parts[:-1])):
+        rebuilt = dataclasses.replace(parent, **{part: rebuilt})
+    _startup_config = rebuilt
 
 
 def reload_failures(summary: dict) -> dict[str, str]:
@@ -271,6 +322,36 @@ def _repoint(new_config, engine, cron_service) -> list[str]:
     return problems
 
 
+async def _reconcile_slack(new_config, engine) -> str | None:
+    """Ask the installed Slack lifecycle owner to reconcile this generation."""
+    if engine is None:
+        return None
+    try:
+        runtime = engine.get_channel_runtime("slack")
+        if runtime is None:
+            return None
+        return await runtime.reconcile(new_config)
+    except Exception as e:  # noqa: BLE001 — report the subsystem, continue reload
+        detail = str(e) or type(e).__name__
+        logger.warning("Slack reload failed: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
+def _reload_hosted_keys(engine) -> str | None:
+    """Read the gateway key file of the running hosted channels again."""
+    if engine is None:
+        return None
+    try:
+        runtime = engine.get_channel_runtime("hosted")
+        if runtime is None:
+            return None
+        return runtime.reload_keys()
+    except Exception as e:  # noqa: BLE001 - report the subsystem and continue
+        detail = str(e) or type(e).__name__
+        logger.warning("Hosted channel key reload failed: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     """Re-read config and hot-reload all reloadable subsystems.
 
@@ -314,6 +395,12 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
             # running the new config in some places and the old one in others,
             # which is the state worth shouting about.
             summary["services"] = f"{_ERROR_PREFIX}{'; '.join(stale)}"
+        slack = await _reconcile_slack(new_config, engine)
+        if slack is not None:
+            summary["slack"] = slack
+        hosted = _reload_hosted_keys(engine)
+        if hosted is not None:
+            summary["hosted"] = hosted
 
     # 2. Cron jobs + sources.
     if cron_service is not None:

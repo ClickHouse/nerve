@@ -98,17 +98,31 @@ export interface ChatMessage {
   blocks: MessageBlock[];
   channel?: string;
   created_at?: string;
+  /** Backend-native turn id recorded on completed assistant rows — the
+      anchor that makes "fork from here" possible at this point. */
+  native_turn_id?: string | null;
+  /** Who sent this message: an actor id to resolve against GET /api/actors.
+      Null for unidentified external people, assistant/tool output, and
+      history that predates attribution. */
+  actor_id?: string | null;
 }
 
 export interface Session {
   id: string;
   title: string;
   source: string;
+  /** Who created this session: an actor id to resolve against
+      GET /api/actors. Null for legacy sessions and unidentified external
+      people. This is an actor id, not an account id. */
+  created_by_actor_id?: string | null;
   updated_at: string;
   // V3 lifecycle fields
   status?: string;
   sdk_session_id?: string;
   parent_session_id?: string;
+  /** Set on message-anchored forks: the source-session message id the
+      fork branched at (whole-chat forks leave it null). */
+  forked_from_message?: string | null;
   connected_at?: string;
   message_count?: number;
   total_cost_usd?: number;

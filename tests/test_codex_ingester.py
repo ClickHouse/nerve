@@ -15,16 +15,27 @@ exercise:
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from nerve.sources.codex_threads.base import (
     ThreadEvent,
     WorkspaceFilter,
 )
 from nerve.sources.codex_threads.ingester import CodexIngester, codex_session_id
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 # ``db`` fixture is supplied by tests/conftest.py
 
@@ -180,7 +191,7 @@ async def test_native_thread_reuses_nerve_session_and_does_not_archive_it(
 ):
     tid = "native-thread-1"
     await db.create_session(
-        "nerve-chat", source="web", backend="codex", status="active",
+        "nerve-chat", source="web", backend="codex", status="active", actor=None,
     )
     await db.bind_native_thread("codex", tid, "nerve-chat")
     ing = CodexIngester(
@@ -239,7 +250,7 @@ async def test_existing_satellite_session_is_merged_not_duplicated(
             "runtime": "codex-external",
             "origin_ids": ["nerve-mcp-detected"],
         },
-        status="active",
+        status="active", actor=None,
     )
 
     ing = CodexIngester(
@@ -261,6 +272,44 @@ async def test_existing_satellite_session_is_merged_not_duplicated(
     # Sync source backfilled the codex_* fields the MCP server didn't have.
     assert meta["codex_thread_id"] == tid
     assert meta["codex_cwd"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_replay_repairs_native_binding_after_session_creation(
+    db, tmp_path, monkeypatch,
+):
+    tid = "11111111-2222-3333-4444-555555555555"
+    sid = codex_session_id(tid)
+    ing = CodexIngester(
+        db, origin_id="local-pi",
+        workspace_filter=_filter(tmp_path),
+        broadcaster=_NullBroadcaster(),
+    )
+    event = _evt(
+        "thread_in_scope", thread_id=tid,
+        payload=_session_meta_payload(tid, str(tmp_path)),
+    )
+    real_bind = db.bind_native_thread
+    calls = 0
+
+    async def fail_once(backend, native_thread_id, session_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        await real_bind(backend, native_thread_id, session_id)
+
+    monkeypatch.setattr(db, "bind_native_thread", fail_once)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        await ing.ingest(event)
+    assert await db.get_session(sid) is not None
+    assert await db.get_session_for_native_thread("codex", tid) is None
+    assert ing.stats["threads_in_scope"] == 0
+
+    await ing.ingest(event)
+    assert await db.get_session_for_native_thread("codex", tid) == sid
+    assert ing.stats["threads_in_scope"] == 1
 
 
 @pytest.mark.asyncio
