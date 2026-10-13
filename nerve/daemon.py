@@ -177,6 +177,15 @@ def start_command(config_dir: Path | str, *, verbose: bool = False) -> list[str]
     return parts
 
 
+def shutdown_wait_ticks(drain_timeout_seconds: int) -> int:
+    """Half-second checks to make after SIGTERM before the SIGKILL.
+
+    The daemon first drains for up to ``drain_timeout_seconds``, then gets
+    15 seconds for the rest of its shutdown.
+    """
+    return (max(0, drain_timeout_seconds) + 15) * 2
+
+
 @dataclass(frozen=True)
 class RestartOutcome:
     """What was arranged. ``message`` is written for a person to read."""
@@ -216,6 +225,7 @@ def restart_daemon(
     old_pid: int | None = None,
     systemd: bool | None = None,
     delay_seconds: float = 0.0,
+    drain_timeout_seconds: int = 0,
 ) -> RestartOutcome:
     """Arrange for the daemon to stop and a fresh one to take its place.
 
@@ -223,6 +233,10 @@ def restart_daemon(
     (then this only starts one). ``systemd`` overrides the environment check —
     the CLI passes what its own helper decided so that stays patchable in
     tests.
+
+    ``drain_timeout_seconds`` is the old daemon's
+    ``gateway.drain_timeout_seconds``. The helper waits that long plus 15
+    seconds after SIGTERM before it sends SIGKILL (:func:`shutdown_wait_ticks`).
 
     ``delay_seconds`` holds the helper back before it signals anything, which
     is what a caller *inside* the daemon needs: an HTTP response has to reach
@@ -272,7 +286,7 @@ def restart_daemon(
         "        os.kill(old_pid, signal.SIGTERM)\n"
         "    except ProcessLookupError:\n"
         "        pass\n"
-        "    for _ in range(30):\n"
+        f"    for _ in range({shutdown_wait_ticks(drain_timeout_seconds)}):\n"
         "        time.sleep(0.5)\n"
         "        try:\n"
         "            os.kill(old_pid, 0)\n"

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels import slack as slack_module
 from nerve.channels.base import ChannelCapability, OutboundMessage
 from nerve.channels.slack import (
@@ -490,6 +491,18 @@ class TestMessageEvents:
         assert msg.text == "hello"
         assert msg.sender_id == "D1"
         assert msg.metadata["message_id"] == "1.1"
+
+    @pytest.mark.asyncio
+    async def test_a_message_refused_by_a_drain_posts_no_second_error(self):
+        """The stream adapter sends the engine's error. The handler posts nothing."""
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel.router.handle_message = AsyncMock(side_effect=NotAcceptingTurnsError())
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "1.1", "text": "hello",
+        })
+        channel.router.handle_message.assert_awaited_once()
+        channel._web.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_sender_never_reaches_the_router(self):

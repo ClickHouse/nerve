@@ -26,6 +26,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.archives import (
     IMAGE_EXT_TO_MIME,
     MAX_TEXT_SIZE,
@@ -1868,6 +1869,9 @@ class TelegramChannel(BaseChannel):
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a message from chat %s", chat_id)
         except Exception as e:
             logger.error("Agent error for chat %s: %s", chat_id, e, exc_info=True)
             try:
@@ -1950,6 +1954,9 @@ class TelegramChannel(BaseChannel):
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a reaction from chat %s", chat_id)
         except Exception as e:
             logger.error("Agent error for reaction in chat %s: %s", chat_id, e, exc_info=True)
 
@@ -2043,6 +2050,9 @@ class TelegramChannel(BaseChannel):
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused an album from chat %s", chat_id)
         except Exception as e:
             logger.error("Agent error for chat %s: %s", chat_id, e, exc_info=True)
             try:

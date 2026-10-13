@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
-from nerve.agent.engine import AgentEngine
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.config import ConfigError, NerveConfig
 from nerve.cron.jobs import (
     CronJob,
@@ -1121,6 +1121,12 @@ class CronService:
 
     async def _run_job_inner(self, job: CronJob) -> None:
         """Inner implementation of job execution."""
+        # The engine is draining before a shutdown. Write no log row, so the
+        # catch-up after the restart sees the job as overdue.
+        if not self.engine.accepting_turns:
+            logger.info("Skipping cron job %s: Nerve is draining", job.id)
+            return
+
         # Pre-check: skip if any configured run gate is unsatisfied.
         if job.gates:
             from nerve.cron.gates import GateContext, evaluate_gates
@@ -1363,6 +1369,10 @@ class CronService:
         dispatched (not awaited) so one long turn can't stall the sweep; the
         per-session lock inside ``run`` serialises it behind any live turn.
         """
+        # During a drain, leave due wakeups pending: a claimed wakeup whose
+        # run is refused is lost. The sweep after the restart fires them.
+        if not self.engine.accepting_turns:
+            return
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
             due = await self.db.get_due_wakeups(now_iso)
@@ -1437,6 +1447,9 @@ class CronService:
 
         if not job:
             raise ValueError(f"Job not found: {job_id}")
+        # The wrapper skips a job during a drain. A manual trigger must say so.
+        if not self.engine.accepting_turns:
+            raise NotAcceptingTurnsError()
 
         await self._run_job_wrapper(job)
 
