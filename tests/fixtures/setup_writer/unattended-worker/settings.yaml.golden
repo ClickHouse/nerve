@@ -24,7 +24,7 @@ quiet_end: ''
 memory:
   recall_model: claude-sonnet-4-6
   memorize_model: claude-sonnet-4-6
-  fast_model: claude-haiku-4-5-20251001
+  fast_model: claude-haiku-5-5
   embed_model: text-embedding-3-small
   categories:
   - name: task_domain

@@ -403,7 +403,7 @@ class TestConfigMemoryModels:
         config = MemoryConfig()
         assert config.recall_model == "claude-sonnet-4-6"
         assert config.memorize_model == "claude-sonnet-4-6"
-        assert config.fast_model == "claude-haiku-4-5-20251001"
+        assert config.fast_model == "claude-haiku-5-5"
         assert config.embed_model == ""
 
     def test_from_dict(self):
@@ -1403,3 +1403,247 @@ class TestContentHashReinforce:
             assert port.extra["reinforcement_count"] == up.extra["reinforcement_count"]
 
         assert _scope_count(repo, "par-port") == _scope_count(repo, "par-up") == 3
+
+
+# ---------------------------------------------------------------------------
+# Sampling parameters: Claude 5 and later reject `temperature` (issue #489)
+# ---------------------------------------------------------------------------
+
+_TEMPERATURE_400 = "`temperature` is deprecated for this model."
+
+
+def _bedrock_temperature_400():
+    import anthropic
+    import httpx
+
+    request = httpx.Request("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke")
+    return anthropic.BadRequestError(
+        f"Error code: 400 - {{'message': '{_TEMPERATURE_400}'}}",
+        response=httpx.Response(400, request=request),
+        body={"message": _TEMPERATURE_400},
+    )
+
+
+def _fake_bedrock_client(model: str, create):
+    """A real _BedrockLLMClient whose Anthropic client is ``create``."""
+    from types import SimpleNamespace
+
+    from nerve.memory.memu_bridge import _BedrockLLMClient
+
+    client = _BedrockLLMClient(
+        chat_model=model, aws_region="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test",
+    )
+    client._bedrock = SimpleNamespace(messages=SimpleNamespace(create=create))
+    return client
+
+
+def _bedrock_ok():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(content=[SimpleNamespace(text="ok")])
+
+
+def _openai_sdk_client(model: str, bodies: list[dict], reject_temperature: bool = False):
+    """memU's own OpenAI client, served by an in-process transport that
+    records each request body and can reject ``temperature`` like Claude 5."""
+    import httpx
+    from memu.llm.openai_sdk import OpenAISDKClient
+    from openai import AsyncOpenAI
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if reject_temperature and "temperature" in body:
+            return httpx.Response(400, json={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": _TEMPERATURE_400},
+            })
+        return httpx.Response(200, json={
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": model,
+            "choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }],
+        })
+
+    client = OpenAISDKClient(
+        base_url="https://api.example.test/v1", api_key="test",
+        chat_model=model, embed_model="",
+    )
+    client.client = AsyncOpenAI(
+        api_key="test", base_url="https://api.example.test/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    return client
+
+
+def _instrumented(tmp_path: Path, client):
+    """Run _instrument_llm_timeouts over ``client`` as every memU profile."""
+    from types import SimpleNamespace
+
+    bridge = MemUBridge(_make_config(tmp_path))
+    bridge._service = SimpleNamespace(_get_llm_base_client=lambda _profile: client)
+    bridge._instrument_llm_timeouts()
+    assert getattr(client.chat, "_nerve_timeout_wrapped", False)
+    return client
+
+
+@pytest.fixture
+def fresh_temperature_memory(monkeypatch):
+    """Isolate the process-wide set of ids that rejected temperature."""
+    from nerve.memory import memu_bridge
+
+    rejected: set[str] = set()
+    monkeypatch.setattr(memu_bridge, "_TEMPERATURE_REJECTED", rejected)
+    return rejected
+
+
+class TestSendsTemperature:
+    @pytest.mark.parametrize("model", [
+        "claude-haiku-5-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5",
+        "claude-fable-5-1",
+        "claude-opus-5-5[1m]",
+        "claude-sonnet-5-20260601",
+        "us.anthropic.claude-sonnet-5",
+        "eu.anthropic.claude-haiku-5-5",
+        "global.anthropic.claude-opus-5-5",
+        "us.anthropic.claude-fable-5-20260601-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5",
+    ])
+    def test_claude_5_and_later_omit_temperature(self, model, fresh_temperature_memory):
+        from nerve.memory.memu_bridge import _sends_temperature
+
+        assert not _sends_temperature(model)
+
+    @pytest.mark.parametrize("model", [
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-8",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "eu.anthropic.claude-sonnet-4-6",
+        "claude-3-5-haiku-20241022",
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+        "",
+    ])
+    def test_older_and_unreadable_ids_keep_temperature(self, model, fresh_temperature_memory):
+        from nerve.memory.memu_bridge import _sends_temperature
+
+        assert _sends_temperature(model)
+
+    def test_a_rejected_id_stops_sending_it(self, fresh_temperature_memory):
+        from nerve.memory.memu_bridge import _sends_temperature
+
+        arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+        fresh_temperature_memory.add(arn)
+        assert not _sends_temperature(arn)
+
+    def test_only_a_400_about_temperature_counts_as_rejection(self):
+        from nerve.memory.memu_bridge import _is_temperature_rejected
+
+        assert _is_temperature_rejected(_bedrock_temperature_400())
+        assert not _is_temperature_rejected(Exception(f"Error code: 500 - {_TEMPERATURE_400}"))
+        assert not _is_temperature_rejected(Exception("Error code: 400 - max_tokens too large"))
+
+
+@pytest.mark.asyncio
+class TestBedrockChatTemperature:
+    async def test_claude_5_request_has_no_temperature(self, fresh_temperature_memory):
+        create = AsyncMock(return_value=_bedrock_ok())
+        client = _fake_bedrock_client("us.anthropic.claude-sonnet-5", create)
+        text, _ = await client.chat("hello")
+        assert text == "ok"
+        assert "temperature" not in create.call_args.kwargs
+
+    async def test_claude_4_request_keeps_temperature(self, fresh_temperature_memory):
+        create = AsyncMock(return_value=_bedrock_ok())
+        client = _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", create)
+        await client.chat("hello", temperature=0.3)
+        assert create.call_args.kwargs["temperature"] == 0.3
+
+    async def test_none_leaves_temperature_out(self, fresh_temperature_memory):
+        create = AsyncMock(return_value=_bedrock_ok())
+        client = _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", create)
+        await client.chat("hello", temperature=None)
+        assert "temperature" not in create.call_args.kwargs
+
+    async def test_wrapped_client_retries_an_unreadable_id_once_without_temperature(
+        self, tmp_path, fresh_temperature_memory,
+    ):
+        arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+
+        async def create(**kwargs):
+            if "temperature" in kwargs:
+                raise _bedrock_temperature_400()
+            return _bedrock_ok()
+
+        mock = AsyncMock(side_effect=create)
+        client = _instrumented(tmp_path, _fake_bedrock_client(arn, mock))
+
+        text, _ = await client.chat("hello")
+        assert text == "ok"
+        assert ["temperature" in c.kwargs for c in mock.call_args_list] == [True, False]
+        assert arn in fresh_temperature_memory
+
+        # Later calls go straight out without temperature.
+        await client.chat("again")
+        assert mock.call_count == 3
+        assert "temperature" not in mock.call_args.kwargs
+
+    async def test_wrapped_client_does_not_retry_other_400s(self, tmp_path, fresh_temperature_memory):
+        import anthropic
+        import httpx
+
+        request = httpx.Request("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke")
+        error = anthropic.BadRequestError(
+            "Error code: 400 - {'message': 'prompt is too long'}",
+            response=httpx.Response(400, request=request),
+            body={"message": "prompt is too long"},
+        )
+        mock = AsyncMock(side_effect=error)
+        client = _instrumented(
+            tmp_path, _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", mock),
+        )
+        with pytest.raises(anthropic.BadRequestError):
+            await client.chat("hello")
+        assert mock.call_count == 1
+        assert not fresh_temperature_memory
+
+
+@pytest.mark.asyncio
+class TestOpenAIChatTemperature:
+    """memU's OpenAI client (the direct Anthropic API path) through Nerve's
+    chat wrapper. It always passes ``temperature``, so the wrapper must hand
+    it the SDK's omit sentinel: None would send JSON null."""
+
+    async def test_claude_5_request_has_no_temperature(self, tmp_path, fresh_temperature_memory):
+        bodies: list[dict] = []
+        client = _instrumented(tmp_path, _openai_sdk_client("claude-haiku-5-5", bodies))
+        text, _ = await client.chat("hello")
+        assert text == "ok"
+        assert len(bodies) == 1
+        assert "temperature" not in bodies[0]
+
+    async def test_claude_4_request_keeps_temperature(self, tmp_path, fresh_temperature_memory):
+        bodies: list[dict] = []
+        client = _instrumented(tmp_path, _openai_sdk_client("claude-haiku-4-5-20251001", bodies))
+        await client.chat("hello")
+        assert bodies[0]["temperature"] == 0.2
+
+    async def test_unreadable_id_is_retried_once_without_temperature(
+        self, tmp_path, fresh_temperature_memory,
+    ):
+        bodies: list[dict] = []
+        client = _instrumented(
+            tmp_path, _openai_sdk_client("gateway-small", bodies, reject_temperature=True),
+        )
+        text, _ = await client.chat("hello")
+        assert text == "ok"
+        assert ["temperature" in b for b in bodies] == [True, False]
+        assert "gateway-small" in fresh_temperature_memory
+
+        await client.chat("again")
+        assert ["temperature" in b for b in bodies] == [True, False, False]

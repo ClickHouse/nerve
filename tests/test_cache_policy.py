@@ -240,6 +240,28 @@ def test_build_env_default_opus_alias_maps_to_the_default_model():
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL == "claude-opus-5-5"
 
 
+def test_build_env_default_haiku_alias_maps_to_the_fast_model():
+    # The "haiku" alias resolves to nerve.config.DEFAULT_FAST_MODEL. The CLI
+    # also takes its small fast model (background calls) from this variable
+    # when ANTHROPIC_SMALL_FAST_MODEL is unset, so Nerve does not set that.
+    from nerve.config import DEFAULT_FAST_MODEL
+
+    env = _make_env_backend()._build_env()
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == DEFAULT_FAST_MODEL == "claude-haiku-5-5"
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
+
+
+def test_build_env_haiku_alias_config_overrides_and_unsets_default():
+    env = _make_env_backend(aliases={"haiku": "claude-haiku-4-5"})._build_env()
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"
+    env = _make_env_backend(aliases={"haiku": ""})._build_env()
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in env
+    # Unsetting haiku leaves the opus default alone.
+    from nerve.config import DEFAULT_MODEL
+
+    assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL
+
+
 def test_build_env_alias_config_overrides_default():
     env = _make_env_backend(aliases={"opus": "claude-opus-4-8"})._build_env()
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-4-8"
@@ -265,13 +287,16 @@ def test_build_env_bedrock_skips_default_alias():
     # default there.
     env = _make_env_backend(is_bedrock=True)._build_env()
     assert "ANTHROPIC_DEFAULT_OPUS_MODEL" not in env
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in env
 
 
 def test_build_env_bedrock_explicit_alias_respected():
     env = _make_env_backend(
-        is_bedrock=True, aliases={"opus": "us.anthropic.claude-opus-5"}
+        is_bedrock=True,
+        aliases={"opus": "us.anthropic.claude-opus-5", "haiku": "us.anthropic.claude-haiku-5-5"},
     )._build_env()
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-5"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "us.anthropic.claude-haiku-5-5"
 
 
 def test_build_env_unknown_alias_ignored():

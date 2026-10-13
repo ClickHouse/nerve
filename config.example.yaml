@@ -60,13 +60,16 @@ agent:
   # Use claude-fable-5-1 for Anthropic's newest generation (Mythos-class).
   # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
   cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
-  title_model: claude-haiku-4-5-20251001  # Session title generation
+  title_model: claude-haiku-5-5  # Session title generation
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
   # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5
-  # is the built-in default (not applied on Bedrock); "" unsets an alias.
+  # and haiku → claude-haiku-5-5 are the built-in defaults (not applied on
+  # Bedrock); "" unsets an alias. The CLI also uses the haiku model for its
+  # background calls.
   # model_aliases:
   #   opus: claude-opus-5-5
+  #   haiku: claude-haiku-5-5
   # Claude models selectable in the web composer's model picker. The
   # configured `model` above is always offered first; entries here extend
   # the list. Unset → the models the Anthropic Models API reports for your
@@ -113,7 +116,7 @@ agent:
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-5-5
   #   cron_model: us.anthropic.claude-sonnet-4-6
-  #   title_model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  #   title_model: us.anthropic.claude-haiku-5-5
 
 # Gateway
 gateway:

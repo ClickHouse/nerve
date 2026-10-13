@@ -731,16 +731,20 @@ class ClaudeBackend:
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
         # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL (skipped
-        # on Bedrock, where model IDs need a geo prefix — set
-        # agent.model_aliases with explicit prefixed IDs there).
-        # User-configured aliases merge over the default; an empty value
-        # unsets it (CLI built-in mapping wins).
-        from nerve.config import DEFAULT_MODEL
+        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL and
+        # "haiku" → nerve.config.DEFAULT_FAST_MODEL (skipped on Bedrock, where
+        # model IDs need a geo prefix — set agent.model_aliases with explicit
+        # prefixed IDs there). The haiku value is also the CLI's small fast
+        # model for background calls: the CLI reads ANTHROPIC_SMALL_FAST_MODEL
+        # first and falls back to ANTHROPIC_DEFAULT_HAIKU_MODEL.
+        # User-configured aliases merge over the defaults; an empty value
+        # unsets one (CLI built-in mapping wins).
+        from nerve.config import DEFAULT_FAST_MODEL, DEFAULT_MODEL
 
         aliases: dict[str, str] = {}
         if not config.provider.is_bedrock:
             aliases["opus"] = DEFAULT_MODEL
+            aliases["haiku"] = DEFAULT_FAST_MODEL
         aliases.update(config.agent.model_aliases)
         for alias, target in aliases.items():
             env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
