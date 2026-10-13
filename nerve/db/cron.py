@@ -40,6 +40,25 @@ class CronStore:
             (now, status, output, error, session_id, log_id),
         )
 
+    async def log_cron_missed(
+        self, job_id: str, scheduled_run_time: str, error: str | None = None,
+    ) -> int:
+        """Record a run the scheduler dropped for starting too late.
+
+        Written already closed out: the run never started, so nothing will call
+        log_cron_finish for it. ``started_at`` is when the run was *due*, which
+        is what lines the row up with the runs around it. The ``missed`` status
+        keeps it out of get_last_successful_cron_run, so interval alignment and
+        startup catch-up are unaffected.
+        """
+        now = utc_now_iso()
+        result = await self._write(
+            "INSERT INTO cron_logs (job_id, started_at, finished_at, status, error) "
+            "VALUES (?, ?, ?, 'missed', ?)",
+            (job_id, scheduled_run_time, now, error),
+        )
+        return result.lastrowid
+
     async def get_cron_logs(
         self, job_id: str | None = None, limit: int = 50, offset: int = 0,
     ) -> list[dict]:

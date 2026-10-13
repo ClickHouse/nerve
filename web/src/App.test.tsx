@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Outlet } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthStatus } from './api/client';
@@ -12,6 +12,8 @@ vi.mock('./api/client', async () => {
     api: {
       authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(),
       listActors: vi.fn().mockResolvedValue({ actors: [] }),
+      setupState: vi.fn(),
+      setupHostLogin: vi.fn(async () => ({ available: false, kind: null, source: null })),
     },
     setToken: vi.fn(),
     clearToken: vi.fn(),
@@ -50,12 +52,20 @@ vi.mock('./components/Notifications/NotificationToast', () => ({
 }));
 
 import { api, getToken } from './api/client';
+import {
+  ApiError, handleHostedError, reportError, showProblem, useHostedStore,
+} from './api/hosted';
+import { ws } from './api/websocket';
 import App from './App';
 import { useAuthStore } from './stores/authStore';
+import { useChatStore } from './stores/chatStore';
+import { useSetupStore } from './stores/setupStore';
+import { makeExternalState, makeFreshState, makeState } from './test/setupFixtures';
 
 const authStatus = api.authStatus as unknown as ReturnType<typeof vi.fn>;
 const getViewer = api.getViewer as unknown as ReturnType<typeof vi.fn>;
 const apiLogin = api.login as unknown as ReturnType<typeof vi.fn>;
+const setupState = api.setupState as unknown as ReturnType<typeof vi.fn>;
 const tokenInStorage = getToken as unknown as ReturnType<typeof vi.fn>;
 
 function me() {
@@ -84,6 +94,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   tokenInStorage.mockReturnValue(null);
   getViewer.mockResolvedValue(me());
+  // A finished checklist by default, so the banner stays out of the way of
+  // the routing cases; the setup cases below override it.
+  setupState.mockResolvedValue(makeState({ finished: true, steps_left: 0 }));
+  useSetupStore.getState().reset();
   useAuthStore.setState({
     authenticated: false,
     loading: false,
@@ -107,7 +121,7 @@ describe('startup with a token already in storage', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -147,9 +161,10 @@ describe('startup with a token already in storage', () => {
     expect(container).toBeEmptyDOMElement();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(ws.connect).not.toHaveBeenCalled();
 
     answer(status({ login: 'setup' }));
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
   });
 
   it('reaches setup on a real reload, not just with a reset store', async () => {
@@ -161,7 +176,7 @@ describe('startup with a token already in storage', () => {
 
     render(<MemoryRouter initialEntries={['/']}><FreshApp /></MemoryRouter>);
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
   });
 
@@ -229,7 +244,7 @@ describe('startup with no token', () => {
 
     renderApp();
 
-    expect(await screen.findByRole('form', { name: 'Claim this instance' })).toBeInTheDocument();
+    expect(await screen.findByRole('form', { name: 'Create your account' })).toBeInTheDocument();
     expect(apiLogin).not.toHaveBeenCalled();
   });
 
@@ -253,5 +268,310 @@ describe('startup with no token', () => {
     await waitFor(() =>
       expect(useAuthStore.getState().loginMode).toBe('username_password'));
     expect(apiLogin).not.toHaveBeenCalled();
+  });
+});
+
+describe('hosted startup', () => {
+  /** The actor of a gateway principal: no account, so no login name. */
+  function hostedMe() {
+    return {
+      actor: { id: 'principal-1', kind: 'human', display_name: 'Carol', username: null },
+      account: null,
+    };
+  }
+
+  function renderAt(path: string) {
+    return render(<MemoryRouter initialEntries={[path]}><App /></MemoryRouter>);
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    authStatus.mockResolvedValue(status({ mode: 'external', login: 'password' }));
+    getViewer.mockResolvedValue(hostedMe());
+  });
+
+  it('opens the app without a token or a login page', async () => {
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(apiLogin).not.toHaveBeenCalled();
+    expect(ws.connect).toHaveBeenCalled();
+  });
+
+  it('never shows the setup page', async () => {
+    authStatus.mockResolvedValue(status({ mode: 'external', login: 'setup' }));
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
+  });
+
+  it('mounts the setup wizard at /setup and /setup/:stepId, without a claim', async () => {
+    setupState.mockResolvedValue(makeExternalState());
+
+    renderAt('/setup');
+
+    expect(await screen.findByRole('navigation', { name: 'Setup steps' })).toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Create your account' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Setup token')).not.toBeInTheDocument();
+    cleanup();
+
+    renderAt('/setup/provider');
+    expect(await screen.findByRole('heading', { level: 1, name: 'Connect a model' })).toBeInTheDocument();
+  });
+
+  it('shows the finish-setup banner inside the hosted adapter', async () => {
+    setupState.mockResolvedValue(makeExternalState());
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent(/Finish setting up Nerve — 7 steps left/);
+  });
+
+  it('lands an instance that has never chosen a mode on the setup page, after the session check', async () => {
+    setupState.mockResolvedValue(makeExternalState({}, makeFreshState()));
+    let admit: (viewer: ReturnType<typeof hostedMe>) => void = () => {};
+    getViewer.mockReturnValue(new Promise((resolve) => { admit = resolve; }));
+
+    const { container } = renderApp();
+
+    // Until the gateway session is verified nothing is routed and the
+    // checklist has not even been read: the landing cannot run ahead of
+    // the sign-in.
+    await waitFor(() => expect(getViewer).toHaveBeenCalled());
+    expect(container).toBeEmptyDOMElement();
+    expect(setupState).not.toHaveBeenCalled();
+
+    await act(async () => { admit(hostedMe()); });
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Carol' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
+  });
+
+  it('has no accounts page', async () => {
+    // The router warns that no route matches, which is the point.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    renderAt('/accounts');
+
+    await waitFor(() => expect(useAuthStore.getState().authenticated).toBe(true));
+    expect(screen.queryByText('the accounts page')).not.toBeInTheDocument();
+    warn.mockRestore();
+  });
+
+  it('keeps the accounts page in local mode', async () => {
+    authStatus.mockResolvedValue(status());
+    tokenInStorage.mockReturnValue('a-stored-token');
+    getViewer.mockResolvedValue(me());
+
+    renderAt('/accounts');
+
+    expect(await screen.findByText('the accounts page')).toBeInTheDocument();
+  });
+
+  it('shows the no-access screen, and not the app or a login', async () => {
+    getViewer.mockImplementation(async () => {
+      const error = new ApiError(403, '{"reason":"access_denied","requestId":"r-1"}');
+      reportError(error);
+      throw error;
+    });
+
+    renderApp();
+
+    const screenMain = await screen.findByRole('main', { name: 'No access' });
+    expect(screenMain).toHaveAccessibleDescription(/do not have access/);
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+    expect(ws.connect).not.toHaveBeenCalled();
+  });
+
+  it('replaces a live app with the no-access screen and closes the socket', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => showProblem('access_denied'));
+
+    expect(screen.getByRole('main', { name: 'No access' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(ws.disconnect).toHaveBeenCalled();
+  });
+
+  it('shows the archived screen', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => showProblem('agent_archived'));
+
+    expect(screen.getByRole('main', { name: 'Agent archived' })).toBeInTheDocument();
+  });
+
+  it('offers a retry when the agent is unavailable at startup', async () => {
+    getViewer.mockRejectedValueOnce(new TypeError('network'));
+
+    renderApp();
+    fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(authStatus).toHaveBeenCalledTimes(2);
+    expect(useHostedStore.getState().problem).toBeNull();
+  });
+
+  it('shows the unavailable dialog over a live app and keeps the app', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    const loadSessions = useChatStore.getState().loadSessions as ReturnType<typeof vi.fn>;
+    loadSessions.mockClear();
+
+    act(() => showProblem('unavailable'));
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent unavailable' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(screen.getByRole('button', { name: 'Try again' })).toHaveFocus();
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(screen.queryByRole('dialog', { name: 'Agent unavailable' })).not.toBeInTheDocument();
+    expect(loadSessions).toHaveBeenCalledOnce();
+  });
+
+  it('shows no session-expired overlay', async () => {
+    renderApp();
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+
+    act(() => useAuthStore.setState({ sessionExpired: true }));
+
+    expect(screen.queryByRole('dialog', { name: 'Session expired' })).not.toBeInTheDocument();
+  });
+});
+
+describe('setup checklist in local mode', () => {
+  beforeEach(() => {
+    tokenInStorage.mockReturnValue('a-stored-token');
+    authStatus.mockResolvedValue(status());
+  });
+
+  it('reads the checklist once when the app goes live and mounts the banner', async () => {
+    setupState.mockResolvedValue(makeState());
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent(/7 steps left/);
+    expect(setupState).toHaveBeenCalledTimes(1);
+    // Mode chosen with steps left is the banner's case: the page stays.
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('opens an instance that has never chosen a mode on the setup page, not on chat with a banner', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    renderApp();
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Alice' })).toBeInTheDocument();
+    expect(screen.queryByText('the chat page')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
+  });
+
+  it('lands there from a direct visit to another route too', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    render(<MemoryRouter initialEntries={['/accounts']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, Alice' })).toBeInTheDocument();
+    expect(screen.queryByText('the accounts page')).not.toBeInTheDocument();
+  });
+
+  it('leaves a deep link into the wizard where it points', async () => {
+    setupState.mockResolvedValue(makeFreshState());
+
+    render(<MemoryRouter initialEntries={['/setup/mode']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Choose a mode' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { level: 1, name: /^Welcome, / })).not.toBeInTheDocument();
+  });
+
+  it('shows neither the landing nor the banner once setup is finished', async () => {
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    await waitFor(() => expect(useSetupStore.getState().state).not.toBeNull());
+    expect(screen.getByText('the chat page')).toBeInTheDocument();
+    expect(screen.queryByText(/Finish setting up Nerve/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the banner away while the checklist is unknown', async () => {
+    setupState.mockRejectedValue(new ApiError(404, 'Not Found'));
+
+    renderApp();
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+    await waitFor(() => expect(setupState).toHaveBeenCalled());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('serves the wizard on /setup/:stepId for a claimed instance', async () => {
+    setupState.mockResolvedValue(makeState());
+
+    render(<MemoryRouter initialEntries={['/setup/memory']}><App /></MemoryRouter>);
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Memory' })).toBeInTheDocument();
+  });
+});
+
+describe('startup when the status call fails behind the gateway', () => {
+  /** A status call that fails the way `api/client` fails it for this body. */
+  function statusFailsOnce(status: number, body: string) {
+    authStatus.mockImplementationOnce(async () => {
+      const error = new ApiError(status, body);
+      handleHostedError(error);
+      throw error;
+    });
+  }
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+    authStatus.mockResolvedValue(status({ mode: 'external' }));
+    getViewer.mockResolvedValue({
+      actor: { id: 'principal-1', kind: 'human', display_name: 'Carol', username: null },
+      account: null,
+    });
+  });
+
+  it('shows the unavailable screen with a retry, and no login page', async () => {
+    statusFailsOnce(503, '{"reason":"agent_starting","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'Agent unavailable' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('shows the no-access screen for access_denied', async () => {
+    statusFailsOnce(403, '{"reason":"access_denied","requestId":"r-1"}');
+
+    renderApp();
+
+    expect(await screen.findByRole('main', { name: 'No access' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Password')).not.toBeInTheDocument();
+  });
+
+  it('shows the login page for a failure without a gateway body', async () => {
+    // The login page reads the status again, so every read fails.
+    authStatus.mockRejectedValue(new ApiError(502, '<html>Bad Gateway</html>'));
+
+    renderApp();
+
+    expect(await screen.findByLabelText('Password')).toBeInTheDocument();
+    expect(useHostedStore.getState().mode).toBe('local');
   });
 });

@@ -1,8 +1,9 @@
-"""``nerve init`` names the owner it creates.
+"""``nerve init --terminal`` names the owner it creates.
 
-The wizard's "Your name" answer is not written to any file, so the installer
-creates the owner account in-process while it has the answer. The gateway's
-bootstrap at first start then finds that account.
+The terminal wizard's "Your name" answer is not written to any file, so the
+installer creates the owner account in-process while it has the answer. The
+gateway's bootstrap at first start then finds that account. (The default slim
+``nerve init`` collects no name: the setup page asks.)
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ class TestInstallerDisplayName:
                 local_yaml=f"auth:\n  password_hash: '{_HASH}'\n  jwt_secret: {_SECRET}\n",
             ),
         )
-        result = CliRunner().invoke(main, ["-c", str(config_dir), "init"])
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "init", "--terminal"])
         assert result.exit_code == 0, result.output
         assert "created the local owner account" in result.output
 
@@ -109,7 +110,7 @@ class TestInstallerDisplayName:
             "nerve.bootstrap.SetupWizard",
             _stub_wizard(ws, name="bob", local_yaml=f"auth:\n  jwt_secret: {_SECRET}\n"),
         )
-        assert CliRunner().invoke(main, ["-c", str(config_dir), "init"]).exit_code == 0
+        assert CliRunner().invoke(main, ["-c", str(config_dir), "init", "--terminal"]).exit_code == 0
 
         # What `nerve start` and the lifespan do next.
         report = migrate(config_dir, workspace=ws, config=load_config(config_dir))
@@ -126,7 +127,7 @@ class TestInstallerDisplayName:
             "nerve.bootstrap.SetupWizard",
             _stub_wizard(ws, name="   ", local_yaml=f"auth:\n  jwt_secret: {_SECRET}\n"),
         )
-        assert CliRunner().invoke(main, ["-c", str(config_dir), "init"]).exit_code == 0
+        assert CliRunner().invoke(main, ["-c", str(config_dir), "init", "--terminal"]).exit_code == 0
         assert _db_rows(
             paths.db_path(), "SELECT display_name FROM actor_refs WHERE kind = 'human'",
         ) == [(None,)]
@@ -206,7 +207,7 @@ class TestInstallerBootstrapFailure:
 
         monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
 
-        result = CliRunner().invoke(main, ["-c", str(config_dir), "init"])
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "init", "--terminal"])
 
         assert result.exit_code != 0
         assert "could not be created" in result.output
@@ -239,7 +240,7 @@ class TestInstallerBootstrapFailure:
 
         monkeypatch.setattr(migrate_mod, "bootstrap_identity_sync", boom)
 
-        result = CliRunner().invoke(main, ["-c", str(config_dir), "init"])
+        result = CliRunner().invoke(main, ["-c", str(config_dir), "init", "--terminal"])
         assert result.exit_code != 0
         assert "could not be created" in result.output
         assert "could not be saved" in result.output

@@ -27,6 +27,7 @@ Treat the returned token as opaque.
 | Valid credentials for a disabled account | `401` |
 | Setup is not complete (`login` is `setup`) | `409` |
 | Authentication is not ready | `503` |
+| External mode (`mode` is `external`) | `404` |
 
 #### Authenticated requests
 
@@ -36,17 +37,21 @@ or as `?token=` (for `<img src>` and downloads, which cannot set headers).
 Every request resolves its token to an account actor or the system principal.
 Unknown and disabled accounts fail with `401`; unavailable startup identity
 state fails with `503`. See [Accounts and identity](accounts.md) for token
-types and legacy-session compatibility.
+types and legacy-session compatibility. In external mode, the gateway names the
+person in the `X-Nerve-Actor-Context` header and session tokens are refused; see
+[External mode](accounts.md#external-mode).
 
 When a session is more than halfway to expiry, the response includes a refreshed
 token in `X-Nerve-Token`. Replace the current token with it. The header also
 upgrades sessions created before per-account login and is exposed through CORS.
 
 #### `GET /api/auth/status`
-Return the required login fields. Authentication is not required.
+Return the authentication mode and the required login fields. Authentication is
+not required.
 
 ```json
 Response: {
+  "mode": "local",
   "auth_required": true,
   "login": "password"
 }
@@ -54,6 +59,7 @@ Response: {
 
 | Field | Meaning |
 |---|---|
+| `mode` | `local` or `external`; see [Authentication mode](config.md#authentication-mode) |
 | `login` | `setup`, `none`, `password`, or `username_password` |
 | `auth_required` | Compatibility field; equivalent to `login != "none"` |
 
@@ -63,6 +69,11 @@ passwordless installation.
 
 The response does not expose usernames or the account count. Before
 authentication is ready, it returns the fail-closed `username_password` state.
+
+In `external` mode, the gateway signs people in and local login is not
+available. The response does not read local login state and always returns
+`auth_required: true` and `login: "username_password"`. Use `mode` to decide
+whether to show a login form.
 
 #### `GET /api/auth/check`
 Verify current authentication.
@@ -129,13 +140,55 @@ Failures:
 
 Disabling an account affects its next request and closes its open WebSockets.
 
-### Setup claim
+### Setup
+
+The browser setup wizard (see [Setup](setup.md#finishing-setup-in-the-browser)).
+Two groups of endpoints:
+
+- **The claim** — `POST /api/setup/claim`. Registered in local mode only. The
+  one unauthenticated write in the product, guarded by the setup token.
+- **The checklist** — everything else under `/api/setup/*` plus
+  `POST /api/system/restart`. Registered in **both** authentication modes.
+  Every route requires a signed-in *person*: a system or MCP token is refused
+  with `403` (`Setup is driven by a person, not by a system or MCP token.`).
+  In local mode every checklist route answers `409` while the instance is
+  unclaimed; in external mode no local-account state is read at all.
+
+Common behaviour of the checklist routes:
+
+| Response | When |
+|---|---|
+| `401` | no or invalid credential |
+| `403` | a system or MCP token |
+| `409` | local mode, instance unclaimed (`Setup of this instance is not complete; claim it first.`); a step that writes configuration under lockdown or with no machine-local config directory (the message says why); a state conflict named in the message (mode already chosen, no bot token, Slack managed by the gateway, …) |
+| `400` | a field was refused: `{"detail": "<sentence>", "field": "<json key>"}`, so a form can attach the message to its input |
+| `429` | a server-side check (test, preflight, detection) while three are already running: `Another check is running; try again in a moment.` |
+| `500` | a write failed; the message names what landed (`Landed so far: config.local.yaml`) |
+
+Secrets never leave the server: a stored secret is reported as
+`{"configured": true, "last4": "ab12"}` (`last4` only for string secrets of
+twelve characters or more, never for an integer such as a Telegram API id).
+No setup response sets a cookie, and no error message contains a secret value.
+Nor does any response carry an absolute server path: files are named by the
+display paths the Review table uses (`config.local.yaml`, `config.yaml`,
+`workspace/config/settings.yaml`, `workspace/config/cron/system.yaml`,
+`setup-state.json in the state directory`), and a failing write reports the
+error text without the filename; the full paths go to the server log.
+
+| Endpoint | no credential | system/MCP token | person, unclaimed (local) | person, claimed | external actor | lockdown |
+|---|---|---|---|---|---|---|
+| `POST /api/setup/claim` | `403` bad token / `200` | same | `200` | `409` | `404` | `200` |
+| `GET /api/setup` | `401` | `403` | `409` | `200` | `200` | `200` |
+| `PUT /api/setup/*`, skip/unskip, finish | `401` | `403` | `409` | `200` | `200` | `409` for steps that write configuration (they read as `blocked`), except `mode` (a worker's `TASK.md`), `profile` `{name}` (local), skip/unskip, finish |
+| tests, preflights, detect, models, environment, host-login, pairing `GET` | `401` | `403` | `409` | `200` | `200` | `200` |
+| pairing `POST` | `401` | `403` | `409` | `200`/`409` | `200`/`409` | `409` |
+| `POST /api/system/restart` | `401` | `403` | `409` | `200` | `200` | `200` |
 
 #### `POST /api/setup/claim`
 
 Complete setup of the one account on an install whose `login` status is
 `setup`. This is the only unauthenticated account write; every request must
-include the persisted setup token.
+include the persisted setup token. Not registered in external mode (`404`).
 
 ```json
 Request: {
@@ -174,6 +227,488 @@ concurrent claimants exactly one can win.
 | `409` | setup is already complete, including a request that passed token validation before a concurrent winner, or a configured password |
 | `422` | the setup token is missing/empty, the password is empty, or a field has the wrong type |
 | `503` | no signing secret, or identity startup is incomplete |
+
+#### `GET /api/setup`
+
+The checklist, in one read. Pure: it reads configuration, workspace files,
+the database and the state file, and never shells out or calls the network.
+
+```json
+Response: {
+  "generation": "6f1a0c2b9e4d7a31",
+  "auth_mode": "local",
+  "mode": "personal",
+  "lockdown": false,
+  "writable": true,
+  "read_only_reason": null,
+  "restart_pending": true,
+  "restart_reasons": ["timezone: 'America/New_York' → 'Europe/Berlin'", "openai_api_key: embeddings start after a restart"],
+  "restart_mode": "restart",
+  "restart_message": "Restarting. This page reconnects on its own.",
+  "restart_command": null,
+  "finished": false,
+  "steps_left": 2,
+  "warning": null,
+  "steps": [
+    { "id": "claim", "title": "Claim", "status": "done", "required": true, "can_skip": false,
+      "blocked_reason": null, "blocked_kind": null, "read_only": false, "read_only_reason": null, "etag": "0a1b2c3d4e5f",
+      "summary": "alice · password set", "files": [],
+      "detail": { "username": "alice", "passwordless": false } },
+    { "id": "mode", "title": "Mode", "status": "done", "required": true, "can_skip": false,
+      "blocked_reason": null, "blocked_kind": null, "read_only": true,
+      "read_only_reason": "Mode was chosen when the workspace was created. …",
+      "etag": "…", "summary": "Personal assistant",
+      "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
+      "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
+                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null } },
+    { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
+      "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
+      "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort xhigh",
+      "files": ["config.local.yaml", "workspace/config/settings.yaml", "config.yaml"],
+      "detail": { "type": "anthropic", "credential": "api_key", "credential_source": "file",
+                  "anthropic_api_key": { "configured": true, "last4": "ab12", "source": "file" },
+                  "claude_oauth_token": { "configured": false, "last4": null, "source": null },
+                  "proxy_enabled": false, "aws_region": "", "aws_profile": "",
+                  "model": "claude-opus-5-5", "effort": "xhigh", "cron_model": "claude-sonnet-5-5",
+                  "warning": null, "last_test": { "ok": true, "code": "ok", "detail": "claude-haiku-5-5 answered", "checked_at": "2026-10-10T09:12:03Z" } } },
+    { "id": "profile", "title": "About you", "status": "pending", "required": false, "can_skip": true,
+      "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
+      "summary": "Alice · Europe/Berlin", "files": ["workspace/config/settings.yaml", "workspace/USER.md", "workspace/IDENTITY.md"],
+      "detail": { "name": "Alice", "name_source": "account", "display_name_editable": true, "writable_fields": null,
+                  "timezone": "Europe/Berlin", "timezone_is_default": false,
+                  "quiet_enabled": true, "quiet_start": "02:00", "quiet_end": "08:00", "quiet_is_default": true,
+                  "language": null, "agent_name": null, "agent_emoji": null, "about_set": false,
+                  "user_md_pristine": { "name": true, "timezone": false, "language": true, "quiet_hours": true, "work": true },
+                  "identity_md_pristine": { "name": true, "emoji": true } } },
+    { "id": "memory", "…": "…" },
+    { "id": "channels", "…": "…" },
+    { "id": "sources", "…": "…" },
+    { "id": "automation", "…": "…" },
+    { "id": "agents", "…": "…" }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `generation` | this process's boot id; the same value `GET /health` reports, used to notice a restart |
+| `auth_mode` | `local` or `external`. In external mode the `claim` step is absent |
+| `mode` | `personal`, `worker`, or `null` before the Mode step. Derived from the workspace files, never stored |
+| `lockdown`, `writable`, `read_only_reason` | whether configuration can be written here, and why not |
+| `restart_pending`, `restart_reasons` | restart-only keys whose on-disk value differs from the one the running process started with, plus anything else waiting on a restart (embeddings after an OpenAI key change, a cron reload that failed). Computed by comparison, so a reverted value disappears and the list is empty after a restart |
+| `restart_mode`, `restart_message`, `restart_command` | what `POST /api/system/restart` *would* answer now (`restart`, `reload` or `unsupported`), its sentence, and the operator's command as data (`systemctl restart <unit>`, `systemctl --user restart <unit>` under a systemd user manager, `docker compose up -d`, or the value of `NERVE_RESTART_COMMAND`; `null` when there is none) — so the page shows the command before anyone clicks and never has to parse it out of the sentence |
+| `finished` | every required step is `done` or `blocked`, every other step is `done`, `skipped` or `blocked`, and nothing waits on a restart |
+| `steps_left` | the number of `pending` steps plus the steps blocked only because the Mode step has not been answered yet (`blocked_kind: "sequencing"`) — they are still work left to do, so the count only ever goes down as a person progresses. Steps blocked by lockdown (`blocked_kind: "lockdown"`) are never counted |
+| `warning` | set when configuration was written but the state file could not be saved or a reload reported errors (`Saved. Reload reported: cron: error: …`) |
+
+Each step carries `id`, a short `title`, a `status` (`done`, `pending`,
+`skipped`, `blocked`), `required`, `can_skip`, `blocked_reason`, `blocked_kind`
+(`sequencing` while the step waits for the Mode step, `lockdown` when
+configuration is managed from a repository; `null` unless `blocked`),
+`read_only` with `read_only_reason`, an `etag` (a hash of the persisted part
+of `detail`; forms remount when it changes, and never for a test result or a
+pairing count), a one-line `summary`, the display paths it writes (`files`)
+and a `detail` object with the current values, secrets masked.
+
+A step is `done` because a fact says so — `mode` when `SOUL.md` exists;
+`provider` when a credential is configured (including one from the gateway's
+environment, reported as `"credential": "environment"`); `profile` when the
+time zone differs from the default or `USER.md` carries a name; `channels`
+when a Telegram or Slack token is stored; `sources`/`agents`/`automation`
+when something is enabled or the step was answered — so an instance set up at
+the terminal or from the environment shows the same list. `done` beats
+`skipped`; `blocked` beats `skipped`. Steps are `blocked` before the Mode step
+when they depend on the mode (`blocked_kind: "sequencing"` — counted in
+`steps_left`, since choosing a mode makes them actionable), and under lockdown
+when they would write configuration (`blocked_kind: "lockdown"` — never
+counted; on a locked instance whose templates have not arrived yet, the steps
+waiting for Mode read `lockdown` too, because Mode itself cannot be answered
+there). Steps: `claim` (local only), `mode`, `provider`, `profile` (titled
+`Operator` for a worker), `memory`, `channels`, `sources` (personal),
+`automation`, `agents` (personal).
+
+`detail.provider.credential` is `bedrock`, `proxy`, `api_key`, `oauth_token`,
+`environment` or `none`; `detail.provider.warning` is `oauth_background_jobs`
+when the only credential is a subscription token (memory, titles and cron
+need an API key). `detail.channels.telegram.start_error` carries the scrubbed
+reason when the bot failed to start at this boot. In external mode
+`detail.profile.name_source` is `actor_header` and `display_name_editable` is
+`false`.
+
+`detail.profile.quiet_enabled` is `true` when both quiet times are set; both
+empty means no quiet hours. `quiet_is_default` compares with the mode's
+default: `02:00`–`08:00` for a personal install, none for a worker. Each job in
+`detail.automation.optional` carries `id`, `name`, `description`, `schedule`
+and `schedule_text`, `requires` and `requirement_met`, `enabled`, and
+`default_enabled`: whether the mode's default set switches it on (`false` for
+a worker's `task-planner`, which the onboarding session decides on; `default`
+is the older name for the same value).
+
+**Where a value came from.** Every masked secret is
+`{"configured": bool, "last4": str | null, "source": str | null}`. `source`
+says where a configured value came from — `file` (`config.local.yaml` or
+`config.yaml` on this machine; the page may replace or remove it),
+`environment` (a variable Nerve reads directly — `ANTHROPIC_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` — or a `${VAR}` reference in any
+configuration layer, judged on the raw files before interpolation),
+`config-repo` (the tracked `settings.yaml` under lockdown) or `gateway`
+(held by the shared channel gateway, `slack.mode: hosted`); `null` when
+nothing is configured. A value with a `source` other than `file` is
+configured and managed: the page renders it read-only, and a `PUT` that would
+replace or remove it answers `409 {"detail", "field"}`. The same enum
+appears as `detail.provider.credential_source` (the active credential's
+origin; `null` for Bedrock, the proxy or none), `detail.sources.github.source`
+(a GitHub token Nerve forwards to the CLI; `null` when only the CLI's own
+login exists) and `detail.sources.gmail.source` (the address list). A
+credential that exists only in the gateway's environment reads
+`{"configured": true, "last4": null, "source": "environment"}` with
+`credential: "environment"`.
+
+`detail.channels.slack.gateway` is `{"streams": n, "connected": bool,
+"last_event_at": iso | null}` when `slack.mode` is `hosted` — what the stream
+manager reports about the gateway's streams (`connected` once a stream has
+negotiated; `last_event_at` the last frame received, heartbeats included) —
+and `null` in socket mode. A hosted Slack makes the channels step `done`; its
+tokens read `source: "gateway"` and `enabled` is the only accepted field.
+`detail.sources.telegram.session` is `{"present": bool, "authorized": true |
+false | null, "user": {"id", "username", "first_name"} | null}` for the
+Telegram message sync: `present` is the session file, `authorized` what the
+last sign-in or session check established (`null` when a file exists but
+nothing has verified it in this install — the session endpoint below answers
+live), and the summary reads `Telegram sync · signed in as @name` or
+`Telegram sync · not signed in`. Both `gateway` and `session` are volatile
+and outside the step's `etag`.
+
+#### `PUT /api/setup/{step}`
+
+One per step: `mode`, `provider`, `profile`, `memory`, `channels`, `sources`,
+`automation`, `agents`. **PATCH semantics**: an omitted field is left exactly
+as it is; `null` removes a secret or optional value; a blank secret is omitted
+(never written); the same value twice changes no file and creates no restart
+debt. Each returns the whole `GET /api/setup` body, so one round trip both
+writes and refreshes. Writes go through the same writer as `nerve init`,
+merged into what is on disk, never regenerating a file; `config.local.yaml`
+stays owner-only. After every write the configuration is hot-reloaded. One
+mutation runs at a time.
+
+```json
+PUT /api/setup/mode        { "mode": "worker", "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything." }
+PUT /api/setup/provider    { "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE", "model": "claude-opus-5-5", "effort": "high" }
+PUT /api/setup/provider    { "type": "oauth", "claude_oauth_token": "sk-ant-oat01-REPLACE" }
+PUT /api/setup/provider    { "type": "host_login" }
+PUT /api/setup/provider    { "type": "bedrock", "aws_region": "eu-central-1", "aws_profile": "nerve" }
+PUT /api/setup/provider    { "model": "claude-sonnet-4-6", "effort": "medium" }
+PUT /api/setup/profile     { "name": "Alice", "timezone": "Europe/Berlin", "quiet_enabled": true, "quiet_start": "22:00", "quiet_end": "07:00",
+                             "language": "English", "agent_name": "Nerve", "agent_emoji": "⚡", "about": "I run a two-person design studio." }
+PUT /api/setup/profile     { "quiet_enabled": false }
+PUT /api/setup/memory      { "openai_api_key": "sk-REPLACE" }
+PUT /api/setup/memory      { "openai_api_key": null, "embeddings": false }
+PUT /api/setup/channels    { "telegram": { "bot_token": "123456:REPLACE_REPLACE_REPLACE_REPLACE_REPLACE", "enabled": true } }
+PUT /api/setup/channels    { "telegram": { "allowed_users_add": [123456789] } }
+PUT /api/setup/channels    { "slack": { "bot_token": "xoxb-REPLACE", "app_token": "xapp-REPLACE", "enabled": true,
+                                        "allow_users": ["U0123456789"], "allow_direct_messages": true, "allow_channels": [] } }
+PUT /api/setup/sources     { "github": true, "gmail": true, "gmail_accounts": ["alice@example.com"],
+                             "telegram": true, "telegram_api_id": 12345, "telegram_api_hash": "REPLACE" }
+PUT /api/setup/automation  { "crons": ["inbox-processor", "task-planner"] }
+PUT /api/setup/agents      { "agents": ["codex"], "conflict_policy": "backup" }
+```
+
+| Step | Rules |
+|---|---|
+| `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker needs `task_description` (20–4000 characters → `400`, `field: task_description`). Once `TASK.md` exists, the same mode with a **different** description is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); only a worker whose templates exist but whose `TASK.md` is still absent gets it written by a later PUT. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
+| `provider` | `type` is `anthropic`, `oauth`, `host_login` or `bedrock`, optional when only `model`/`effort` change. `anthropic_api_key` must start with `sk-ant-`; `aws_region` must look like a region; `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` must be in the catalogue for these credentials or be a Claude id. `host_login` is accepted only when `GET /api/setup/provider/host-login` finds one (`409` otherwise; `429` while other checks are running) and copies that credential into `config.local.yaml`; the value is never returned. In external authentication mode `host_login` is `409` unless the operator set `NERVE_SETUP_HOST_LOGIN=1` (see the host-login endpoint). Switching the credential type deletes the other secret; leaving Bedrock drops the region-scoped model ids. A credential whose `source` is not `file` (provisioned from the environment or the configuration repository) is neither replaced nor removed from here: `409` with `field: anthropic_api_key` / `claude_oauth_token` (`host_login` too); a `model`/`effort`-only save still works. The model catalogue and the host-login detection run before the write lock is taken, so other people's reads and saves never wait on them. No catalogue reset after a save: the cache is keyed by the credentials' fingerprint, so a new key finds the catalogue the provider test warmed for it |
+| `profile` | `timezone` must be an IANA name; `quiet_start`/`quiet_end` are `HH:MM`; `name` ≤ 80, `agent_name` ≤ 40, `language` ≤ 40, `about` ≤ 600 characters. Every field becomes one line of a file the agent reads: `name`, `language`, `agent_name`, `agent_emoji` refuse control characters and line breaks (`400` with the `field`), and `about` is folded to a single line. A `null` time zone or quiet time is treated as omitted (nothing written, no decision recorded). `quiet_enabled` switches quiet hours: `false` writes both times empty (no quiet hours; the personal `USER.md` line reads `none`) and ignores any times sent with it; `true` needs both times (`400` naming the missing or invalid one), or neither, which keeps the window configured now or else uses `02:00`–`08:00`; omitted or `null` changes nothing, except that times sent alone switch quiet hours on with those times (the other time is kept, or set to its `02:00`–`08:00` default when there was none). Writes `timezone`/`quiet_*` to `settings.yaml`, the still-pristine template lines of `USER.md`/`IDENTITY.md` (personal), and — local mode only — the display name on your account. In external mode the name goes to `USER.md` alone; no account is touched. Under lockdown (local) only `name` is accepted; any other key is `409` with that `field` and the lockdown reason (a read-only state, not a validation error) |
+| `memory` | `openai_api_key` must start with `sk-`. Adding, changing or removing it records that embeddings start after a restart. `{"openai_api_key": null}` alone removes the key; `"embeddings": false` records "continue without" as a decision. A key whose `source` is not `file` is `409` `field: openai_api_key` |
+| `channels` | A Telegram `bot_token` must look like one from BotFather, and when the channel would be enabled it is **verified against Telegram before anything is written**: rejected → `400` `field: bot_token` `Telegram rejected this token: …`; unreachable → `400` `The server could not reach api.telegram.org to verify the token; nothing was saved. Try again.` The verification runs *before* the write lock is taken (a probe can take 10–20 s and must not stall other people's reads and saves); inside the lock the decision is recomputed against the configuration as it is then, and a token that was not the one verified — the stored token changed meanwhile — is verified again. `enabled` defaults to true when a token is given; `"bot_token": null` removes the token and disables the channel; `enabled: true` without a token is `409`. `allowed_users` replaces the allow-list, `allowed_users_add` appends; not both. Slack tokens need the `xoxb-`/`xapp-` prefixes, `enabled` needs both, and they are verified the same way (`auth_test` and a Socket Mode connection). With `slack.mode: hosted` only `enabled` is accepted (`409` for tokens). A token whose `source` is not `file` (environment, configuration repository) is `409` with `field: bot_token` / `app_token`, before any verification runs |
+| `sources` | personal mode only (`409` for a worker). `gmail: true` needs at least one address in `gmail_accounts`; `telegram: true` needs `telegram_api_id` (positive) and `telegram_api_hash`. The two Telegram credentials follow the secret rules independently — omitted keeps, blank is omitted, `null` removes — and a hash without an id (new or stored) is `400` `field: telegram_api_id` rather than being dropped. A credential or address list whose `source` is not `file` is `409` with `field: telegram_api_id` / `telegram_api_hash` / `gmail_accounts`. Sending all three booleans records the decision, so "none of these" counts as answered. The credentials alone do not make the Telegram sync work — see the sign-in endpoints below |
+| `automation` | `crons` is the full set of enabled optional job ids; an unknown id is `400` `field: crons`. Always records the decision; the scheduler reloads |
+| `agents` | personal mode only. `agents` names from the registry (`codex`, `claude-code`); `conflict_policy` is `backup`, `skip` or `merge`. Writes each agent's config file (per-agent failures are reported in `warning`, the others still apply) and `external_agents.*`/`mcp_endpoint.enabled` in `config.yaml`. `[]` is a decision too |
+
+#### `POST /api/setup/steps/{id}/skip` · `POST /api/setup/steps/{id}/unskip`
+
+Remember that an optional step was declined, or put it back. `400` for a
+required or unknown step, and for a step that does not exist on this instance
+(a worker has no `sources` or `agents` step: `The sources step does not apply
+to this instance.`). Skipping a step that is already `done` changes nothing:
+`200` with the unchanged checklist, and nothing is recorded, so the state file
+holds only meaningful decisions. Allowed under lockdown (it is runtime state,
+not configuration). Returns the whole checklist. A skipped step that later
+becomes true reads `done`; writing the step clears the skip.
+
+#### `POST /api/setup/provider/test`
+
+Test a candidate provider configuration without saving it. Same body as
+`PUT /api/setup/provider`; `{}` tests the saved configuration. One
+`max_tokens: 1` call on the server, 20 s limit.
+
+```json
+Response: { "ok": true,  "checked": "api", "code": "ok", "detail": "claude-haiku-5-5 answered", "hint": null, "latency_ms": 812 }
+Response: { "ok": false, "checked": "api", "code": "invalid_key", "detail": "Anthropic rejected this key (401 authentication_error).",
+            "hint": "Keys start with sk-ant-. Check for a missing last character or a revoked key.", "latency_ms": 640 }
+Response: { "ok": false, "checked": "api", "code": "network", "detail": "The server could not reach api.anthropic.com (connection refused).",
+            "hint": "This runs on the server, not in your browser. Check its internet access or proxy settings.", "latency_ms": null }
+Response: { "ok": true,  "checked": "skipped", "code": "ok", "detail": "Subscription tokens are verified on first use; the Anthropic API cannot test them.",
+            "hint": "Background jobs (memory, titles, cron) also need an API key; add one later in Memory.", "latency_ms": null }
+```
+
+`code` is `ok`, `invalid_key`, `model_access`, `network`, `timeout` or
+`unknown`. The last test — success **or failure** — is remembered as
+`detail.provider.last_test` = `{"ok", "code", "detail", "checked_at"}` for the
+life of the process, so the Review and Ready screens can say that the last
+connection test failed; `detail` carries no secret. It is forgotten when the
+saved credential changes (a key written or removed, a type switch, a Bedrock
+region or profile); a model/effort-only change keeps it. It is not part of the
+step's `etag`, so remembering it never remounts a form.
+
+#### `GET /api/setup/provider/host-login`
+
+Whether the gateway host has a Claude Code login the Model step can copy.
+Only the masked source label leaves the server.
+
+```json
+Response: { "available": true,  "kind": "oauth", "source": "~/.claude/.credentials.json", "reason": null, "lookup": "found" }
+Response: { "available": false, "kind": null, "source": null, "reason": "No ~/.claude/.credentials.json; no Claude Code entry in the Keychain.", "lookup": "none" }
+Response: { "available": false, "kind": null, "source": null, "reason": "No ~/.claude/.credentials.json; the Keychain is not readable from a background process (it would need to ask on the server's screen). On the server, nerve init --terminal runs the same detection interactively and can use the login; or paste an API key here.", "lookup": "unreadable" }
+```
+
+Evaluated at most once per process (plus once more with `?refresh=1`),
+non-prompting sources first (environment variables, the credentials file) and
+the macOS Keychain last, because a Keychain lookup can raise a prompt on the
+server's desktop. Always `available: false` inside a container.
+
+**External authentication mode.** The login found on the gateway host is the
+personal credential of whoever runs the server, and in this mode every person
+the gateway signs in may run setup. So the option is not offered there — the
+endpoint answers `available: false` with `lookup: "none"` and a `reason` that
+says so, **without looking the login up** (the answer alone would reveal that
+it exists and where), and `PUT /api/setup/provider {"type": "host_login"}`
+and the matching `POST …/provider/test` answer `409`. The operator can allow
+it explicitly with `NERVE_SETUP_HOST_LOGIN=1` in the service environment;
+the `reason` names the variable.
+
+#### `GET /api/setup/models`
+
+```json
+Response: {
+  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+             { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
+             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": false }],
+  "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
+  "efforts": ["max", "xhigh", "high", "medium", "low"],
+  "discovered": true,
+  "default_model": "claude-opus-5-5"
+}
+```
+
+The configured model comes first, then the catalogue as the Anthropic Models
+API orders it (newest first), nothing else; without discovery the built-in
+list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
+(`fable` is checked first); `recommended` marks the configured model;
+`default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
+page can say which entry it is even when this instance was changed to another
+model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
+
+The catalogue is cached per credential fingerprint (provider, base URL, key
+tail). A successful `POST /api/setup/provider/test` with an API key fetches
+the catalogue for that candidate key in the background, keyed by its
+fingerprint, so the picker is complete the moment the key is saved; a failure
+recorded while no key was configured is never served for a configuration
+that now carries one.
+
+#### Telegram message sync: `GET /api/setup/sources/telegram/session` and the sign-in
+
+The Telethon source reads the person's own Telegram account and needs an
+authorised user session on disk (`NERVE_HOME/telegram_sync.session`); the
+API id and hash alone do nothing. These routes run the same sign-in the
+terminal command `nerve setup-telegram` runs interactively. All of them need
+a signed-in person and a claimed instance (local mode); the `POST`s also need
+the sources step to be actionable — `409` for a worker instance, under
+lockdown, or before the Mode step. One sign-in is pending per process, in
+memory only, for ten minutes; a new start cancels the previous one.
+
+```json
+GET  /api/setup/sources/telegram/session
+Response: { "configured": true, "session_present": true, "authorized": true,
+            "user": { "id": 424242, "username": "alice_example", "first_name": "Alice" },
+            "pending": null, "phone_masked": null, "reason": null }
+Response: { "configured": true, "session_present": false, "authorized": false, "user": null,
+            "pending": null, "phone_masked": null, "reason": "no_session" }
+Response: { "configured": true, "session_present": true, "authorized": null, "user": null,
+            "pending": null, "phone_masked": null, "reason": "busy" }
+Response: { "configured": true, "session_present": true, "authorized": false, "user": null,
+            "pending": "code", "phone_masked": "+1••••••••23", "reason": null }
+
+POST /api/setup/sources/telegram/session/start     { "phone": "+1 555 010 0123" }
+Response: { "pending": "code", "phone_masked": "+1••••••••23", "expires_in": 600 }
+POST /api/setup/sources/telegram/session/code      { "code": "73146" }
+POST /api/setup/sources/telegram/session/password  { "password": "…" }
+POST /api/setup/sources/telegram/session/cancel    {}
+POST /api/setup/sources/telegram/session/logout    {}
+```
+
+`configured` is whether the API id and hash are saved. The `GET` opens a
+short-lived client on the session file (five seconds at most), never while
+a sign-in is pending; `reason` is a short machine string — `busy` (the file
+is locked by a running sync; `authorized` is then `null` rather than an
+error), `not_configured`, `no_session`, `unreachable`, `telethon_missing` —
+or `null`. `code`, `password`, `cancel` and `logout` answer the `GET` shape:
+when Telegram asks for the two-step password, `code` answers with
+`pending: "password"` and `authorized: false`; on success `authorized: true`
+with `user`. `logout` calls `log_out()` on the saved session and removes the
+file. Errors: `400 {"detail", "field"}` with `field` `phone`, `code` or
+`password`; `429 {"detail", "retry_after"}` (seconds) for a Telegram flood
+wait; `409 {"detail"}` when nothing is configured, no sign-in is in progress,
+the code expired, or the session file is in use; `502 {"detail"}` when
+Telegram cannot be reached. The phone appears only masked; the code, the
+password and Telegram's hash never appear in a response, a log line or the
+state file. A successful sign-in makes the session file owner-only and notes
+who is signed in (`id`, `username`, `first_name`) in the state file, which
+is what `detail.sources.telegram.session` and `nerve doctor` report.
+
+#### `POST /api/setup/memory/test` · `POST /api/setup/channels/telegram/test` · `POST /api/setup/channels/slack/test`
+
+Server-side checks of a candidate secret (or, with an empty body, the saved
+one). Nothing is written. A successful Telegram test remembers the bot's
+username in memory for that token only; it reaches the state file — and
+`detail.channels.telegram.bot_username`, the pairing `link` — when
+`PUT /api/setup/channels` saves that same token, so the page never names a
+bot the instance is not configured with. Removing the token clears the name.
+
+```json
+POST /api/setup/memory/test             { "openai_api_key": "sk-REPLACE" }
+Response: { "ok": false, "detail": "OpenAI rejected the key (401).", "hint": "Check the key in the OpenAI dashboard." }
+
+POST /api/setup/channels/telegram/test  { "bot_token": "123456:REPLACE…" }
+Response: { "ok": true,  "bot_username": "example_assistant_bot", "detail": null, "hint": null }
+Response: { "ok": false, "bot_username": null, "detail": "Telegram rejected this token: Unauthorized", "hint": "In Telegram open @BotFather → /mybots → API Token and paste it again; a token that was revoked or re-issued answers Unauthorized." }
+
+POST /api/setup/channels/slack/test     { "bot_token": "xoxb-…", "app_token": "xapp-…" }
+Response: { "ok": true, "team": "Example Team", "bot_user": "nerve", "detail": null }
+```
+
+#### `GET /api/setup/channels/telegram/pairing` · `POST /api/setup/channels/telegram/pairing`
+
+`GET` reports whether in-app pairing is possible right now. Pure; never
+carries the code. `allowed_users_count` is re-read from `config.local.yaml`
+on every call, because the bot's `/pair` handler appends there — polling it
+is how the page notices that your message arrived.
+
+```json
+Response: { "available": false, "reason": "The bot starts with this token after the restart at the end of setup. Pairing is offered there.",
+            "live": false, "bot_username": "example_assistant_bot", "link": "https://t.me/example_assistant_bot",
+            "allowed_users_count": 0, "code_active": false, "expires_at": null }
+Response: { "available": true, "reason": null, "live": true, "bot_username": "example_assistant_bot",
+            "link": "https://t.me/example_assistant_bot", "allowed_users_count": 1, "code_active": true, "expires_at": "2026-10-10T10:12:03Z" }
+```
+
+`POST` issues the pairing code (one hour, five attempts, single use — the
+same code `nerve pair` prints) and is the only response that carries it:
+
+```json
+Response: { "code": "483920", "expires_at": "2026-10-10T10:12:03Z", "bot_username": "example_assistant_bot",
+            "link": "https://t.me/example_assistant_bot", "allowed_users_count": 0 }
+```
+
+`409` when there is no bot token, when `telegram.dm_policy` is not
+`pairing`, when the bot is not running with the saved token yet (`Restart,
+then pair.`), and under lockdown. `link` is `null` when no username is known
+from any source.
+
+#### `GET /api/setup/sources/preflight` · `GET /api/setup/agents/detect` · `GET /api/setup/environment`
+
+Server-side detection for the Sources, Agents and Review steps. Each
+subprocess runs with a timeout; the results are cached for 60 s.
+
+```json
+GET /api/setup/sources/preflight
+Response: { "github": { "cli": true, "authenticated": true, "login": "alice", "hint": null },
+            "gmail": { "cli": false, "hint": "Install gog, then run gog gmail setup <account> on the server." },
+            "telegram": { "credentials_configured": false },
+            "checked_at": "2026-10-10T09:12:03Z" }
+
+GET /api/setup/agents/detect
+Response: { "agents": [{ "id": "codex", "label": "Codex", "installed": true, "version": "codex-cli 0.40.0",
+                         "config_paths": ["~/.codex/config.toml"], "config_exists": true, "enabled": false }] }
+
+GET /api/setup/environment
+Response: { "checks": [{ "id": "claude_cli", "label": "Claude Code CLI", "status": "ok", "detail": "2.1.0", "hint": null },
+                       { "id": "node", "label": "Node.js", "status": "warn", "detail": "v20.19.0", "hint": "Nerve builds its web UI with Node 22.12 or newer." },
+                       { "id": "gh", "…": "…" }, { "id": "gog", "…": "…" }, { "id": "disk", "…": "…" },
+                       { "id": "web_ui", "…": "…" }, { "id": "python", "…": "…" }, { "id": "timezone", "…": "…" }],
+            "served": { "scheme": "http", "host_is_loopback": true, "client_is_loopback": true, "https_hint": false },
+            "bind_host": "127.0.0.1", "port": 8900, "in_container": false, "supervision": "none",
+            "passwordless": false, "restart_mode": "restart", "restart_message": "Restarting. This page reconnects on its own.",
+            "command": null,
+            "checked_at": "2026-10-10T09:12:03Z" }
+```
+
+A check's `status` is `ok`, `warn` or `missing`. `served.https_hint` is true
+when the page is served over plain HTTP and either end is not loopback; it is
+advisory only and never an authorisation input. `supervision` is `none`,
+`systemd`, `docker` or `supervisor` (an operator-declared supervisor via
+`NERVE_SUPERVISOR=exit|refuse` on a host that is neither a container nor
+systemd-managed); `passwordless` is `null` in external mode. `restart_mode`,
+`restart_message` and `command` are the same three values `GET /api/setup`
+reports as `restart_mode`, `restart_message` and `restart_command`.
+
+#### `POST /api/setup/finish`
+
+Body `{}`. Reloads the configuration, recomputes the checklist and, for a
+worker whose `TASK.md` still carries the onboarding marker (the comment on its
+second line, deleted by the onboarding session when the file is complete), a
+provider is configured and nothing waits on a restart, starts the onboarding
+session. Idempotent; allowed under lockdown (it writes nothing).
+
+```json
+Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "cron:worker-onboarding:…" } }
+Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_required", "onboarding": { "status": "pending", "session_id": null } }
+```
+
+`onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
+`not_applicable`, `pending`, `running`, `ended` or `done`. `ended` means the
+onboarding session exists but the engine is no longer driving it while
+`TASK.md` still carries the onboarding marker — it stopped before completing
+the file (a placeholder key, a crash); the session id is carried so the page
+can link to it instead of waiting. Calling `finish` again schedules the session anew; the
+ended row stays in the table, and a session the engine is driving always wins
+over an ended one (among several ended ones the newest is named), so every
+tab reads `running` with the new id.
+
+#### `POST /api/system/restart`
+
+Restart the daemon — what `nerve restart` does, asked for over HTTP. Body
+`{}`. The handler first waits for any save in flight to finish, so nothing
+is mid-write when the process is signalled.
+
+```json
+Response: { "mode": "reload",      "generation": "6f1a0c2b9e4d7a31", "message": "Nothing needed a restart; the configuration was reloaded.", "command": null, "timeout_hint_seconds": 0 }
+Response: { "mode": "restart",     "generation": "6f1a0c2b9e4d7a31", "message": "Restarting. This page reconnects on its own.", "command": null, "timeout_hint_seconds": 120 }
+Response: { "mode": "restart",     "generation": "6f1a0c2b9e4d7a31", "message": "The container exits and Docker starts it again (restart: unless-stopped). If you stopped it with docker compose stop, run docker compose up -d.", "command": "docker compose up -d", "timeout_hint_seconds": 180 }
+Response: { "mode": "unsupported", "generation": "6f1a0c2b9e4d7a31", "message": "This instance is managed by systemd. On the server run: systemctl restart nerve.service — this page reconnects by itself.", "command": "systemctl restart nerve.service", "timeout_hint_seconds": 300 }
+```
+
+| `mode` | When |
+|---|---|
+| `reload` | nothing needs a restart; the configuration was reloaded instead and no process was touched |
+| `restart` | on a plain `nerve start` install a detached helper stops this process and starts a new one; inside the generated container the process exits and Compose restarts it. `NERVE_SUPERVISOR=exit` forces the latter |
+| `unsupported` | under systemd (or `NERVE_SUPERVISOR=refuse`): nothing was started, and `command` is what the operator must run — under systemd `systemctl restart <unit>` with the unit read from the *leaf* of the process's cgroup (anything but a `.service` leaf, such as a transient scope, falls back to `nerve.service`), or `systemctl --user restart <unit>` when a systemd user manager (`user@<uid>.service`) started the process; otherwise the value of `NERVE_RESTART_COMMAND` from the service environment, or `null` when it is not set (the `message` then says to set it) |
+
+`generation` is the boot id of the process that answered. **Poll `GET
+/health` until it reports a different one** — the process being replaced
+answers perfectly well while it shuts down, so waiting for any answer at all
+accepts the old process. `timeout_hint_seconds` is how long a client should
+wait before giving up.
+
+| Response | When |
+|---|---|
+| `409` | a restart is already in progress (once per process) |
+| `500` | the helper could not be started; the instance is still running and the message says to run `nerve restart` on the server |
+
+Sessions survive the restart: the signing secret is pinned and persisted, and
+nothing in the wizard rotates it. Allowed under lockdown, because a restart
+writes no configuration.
 
 ### Actors
 
@@ -721,15 +1256,36 @@ Response: {
   "system": { "hostname": "...", "memory_mb": 65.2, "disk_free_gb": 180.5 },
   "tasks": { "total": 92, "active": 16, "done": 76, "fts_indexed": 92, "fts_ok": true },
   "sync": { "github": { "cursor": "...", "last_run": "...", "records_fetched": 3, "records_processed": 3, "error": null } },
-  "recent_cron_logs": [...]
+  "recent_cron_logs": [...],
+  "usage": {
+    "last_7d": { ... }, "daily": [...], "by_model": [...], "by_source": [...],
+    "by_cron_job": [ { "job_id": "daily-digest", "runs": 7, "sessions": 7, "turns": 9, "input_tokens": 120, "cache_read": 410000, "cache_creation": 95000, "output_tokens": 5400, "cost_usd": 1.84, "estimated_cost_usd": 0.0, ... } ]
+  }
 }
 ```
+
+In every usage row, `input_tokens` counts only uncached input. Cache reads
+(`cache_read`) and cache writes (`cache_creation`) are separate fields, so
+the total input is the sum of the three.
+
+`usage.by_cron_job` attributes each turn to the cron job that caused it:
+turns in the job's own sessions (`cron:<job>`, `cron:<job>:<run>`), and
+turns of workflow runs that the job started, either as a workflow-run job
+or through a `workflow_run_start` call in one of its sessions (review-loop
+legs and runs started from another workflow run are not attributed).
+Workflow-run turns have source `workflow` in `by_source`, so the per-job
+totals can be larger than the `cron` row there. `runs` counts the job's
+runs in the same 7-day window that did agent work: runs linked to a cron
+session, and workflow runs that began execution. Missed and skipped runs,
+and workflow runs that were cancelled while still queued, are not counted,
+so `cost_usd / runs` is the average cost per run. Jobs without usage are
+omitted.
 
 #### `GET /api/cron/logs?job_id=&limit=50&offset=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
-runners).
+runners and missed runs).
 
 ```json
 Response: {
@@ -746,8 +1302,14 @@ Response: {
 No auth required.
 
 ```json
-Response: { "status": "ok", "version": "0.1.0" }
+Response: { "status": "ok", "version": "0.1.0", "generation": "6f1a0c2b9e4d7a31" }
 ```
+
+`generation` is a random value fixed when the process started. It is what
+tells the new process from the old one still answering as it shuts down,
+which is what makes `POST /api/system/restart` observable: the setup page
+polls `/health` until the value changes. Deliberately opaque — an uptime or
+a counter would tell an anonymous caller how long the box has been up.
 
 ## WebSocket Protocol
 

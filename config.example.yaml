@@ -12,6 +12,18 @@
 workspace: ~/nerve-workspace    # Path to workspace with SOUL.md, MEMORY.md, etc.
 timezone: America/New_York
 
+# Setup page — whether it may store the credentials it is given (an API key,
+# a bot token, a Telegram sign-in) on this machine. On an instance whose
+# connections the operator provides (a model credential in the service
+# environment, Slack through a channel gateway), local_secrets: false closes
+# the Memory, Channels, Sources and Agents steps ("Not available on this
+# instance") and the Model step accepts only Bedrock or the credential from
+# the environment. Usually set in the tracked workspace/config/settings.yaml;
+# NERVE_SETUP_LOCAL_SECRETS=0 in the service environment forces it off
+# (one-way, like NERVE_LOCKDOWN). See docs/setup.md.
+# setup:
+#   local_secrets: true
+
 # Provider — how Nerve connects to Claude (default: anthropic)
 # provider:
 #   type: bedrock              # "anthropic" or "bedrock"
@@ -26,6 +38,11 @@ timezone: America/New_York
 #   port: 8317
 #   host: 127.0.0.1
 
+# Anthropic-compatible endpoint (optional), for example an LLM gateway. Every
+# model request goes here in place of api.anthropic.com: the Claude CLI, the
+# direct SDK calls and memU. Not with proxy.enabled or Bedrock.
+# anthropic_base_url: https://llm-gateway.example.com
+
 # Local Ollama — expose locally-installed Ollama models as selectable chat
 # models in the web composer's model picker. Ollama speaks an OpenAI-compatible
 # API, so this requires proxy.enabled: true (the proxy translates the
@@ -39,31 +56,37 @@ timezone: America/New_York
 
 # Agent
 agent:
-  model: claude-opus-5           # Primary model for conversations
-  # Use claude-fable-5 for Anthropic's most capable (Mythos-class) model.
-  # Note: ~2x the cost of Opus 5 ($10/$50 per MTok in/out).
-  cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
-  title_model: claude-haiku-4-5-20251001  # Session title generation
+  model: claude-opus-5-5         # Primary model for conversations (Nerve's default)
+  # Use claude-fable-5-1 for Anthropic's newest generation (Mythos-class).
+  # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
+  cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
+  title_model: claude-haiku-5-5  # Session title generation
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
-  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5
-  # is the built-in default (not applied on Bedrock); "" unsets an alias.
+  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5
+  # and haiku → claude-haiku-5-5 are the built-in defaults (not applied on
+  # Bedrock); "" unsets an alias. The CLI also uses the haiku model for its
+  # background calls.
   # model_aliases:
-  #   opus: claude-opus-5
+  #   opus: claude-opus-5-5
+  #   haiku: claude-haiku-5-5
   # Claude models selectable in the web composer's model picker. The
   # configured `model` above is always offered first; entries here extend
   # the list. Unset → the models the Anthropic Models API reports for your
   # credentials (see model_discovery below), falling back to a built-in
-  # current-generation list (opus / sonnet / haiku). On Bedrock only models
-  # named in config are offered (Bedrock IDs are region-prefixed, so
+  # current-generation list (opus / fable / sonnet / haiku). On Bedrock only
+  # models named in config are offered (Bedrock IDs are region-prefixed, so
   # neither discovery nor the bare built-ins would resolve).
   # models:
-  #   - claude-opus-5
-  #   - claude-sonnet-4-6
-  # Ask the Anthropic Models API (GET /v1/models) at startup which models
-  # the configured credentials can reach, so a newly released model shows up
-  # in the picker without a config edit. Ignored when `models` above is set,
-  # on Bedrock, or without an API key. false → always use the built-in list.
+  #   - claude-opus-5-5
+  #   - claude-sonnet-5-5
+  # Ask the Anthropic Models API (GET /v1/models) at startup which models the
+  # configured credentials' catalog endpoint advertises, so a newly released
+  # model shows up in the picker without a config edit. Catalog membership is
+  # not a serving guarantee — an advertised ID can still fail on send, and
+  # discovery runs no serving probe (see model_discovery_excluded_models to
+  # prune such entries). Ignored when `models` above is set, on Bedrock, or
+  # without an API key. false → always use the built-in list.
   model_discovery: true
   max_turns: 50                  # Max agentic turns per request
   max_concurrent: 32             # Max concurrent agent sessions
@@ -91,9 +114,9 @@ agent:
     max_tokens: 1024
     timeout_seconds: 45
   # For Bedrock, use model IDs like:
-  #   model: us.anthropic.claude-opus-5
-  #   cron_model: us.anthropic.claude-sonnet-4-6
-  #   title_model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  #   model: us.anthropic.claude-opus-5-5
+  #   cron_model: us.anthropic.claude-sonnet-5-5
+  #   title_model: us.anthropic.claude-haiku-5-5
 
 # Gateway
 gateway:
@@ -106,17 +129,139 @@ gateway:
 # Channels
 telegram:
   enabled: true
-  # DM authorization:
+  # Live-message authorization in private and group chats:
   #   pairing — only users in allowed_users may talk to the bot. New users
   #             authorize with a one-time code: run `nerve pair` on the
-  #             server, then send the bot `/pair <code>`. Paired IDs are
-  #             persisted to config.local.yaml automatically.
+  #             server, then send the bot `/pair <code>` in a private chat.
+  #             Paired IDs are persisted to config.local.yaml automatically.
   #   open    — anyone can talk to the bot (dangerous: full agent access).
   dm_policy: pairing
-  # allowed_users: [123456789]   # numeric Telegram user IDs (or pair instead)
+  # allowed_users: [123456789]   # users allowed to use the bot (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  #
+  # Feed the source inbox from watched group chats, reaching it as the source
+  # "telegram:observed". This grant is independent of allowed_users: a sender
+  # who cannot use the bot may still reach the source. A live-routed message is
+  # not collected unless include_handled_messages is true. Only numeric IDs may
+  # grant; titles and @usernames can only deny. Private chats, other bots, and
+  # /pair commands are never collected. With privacy mode enabled, a non-admin
+  # bot does not receive ordinary group messages. Make it an admin or disable
+  # privacy mode with BotFather.
+  # See docs/sources.md before enabling.
+  # source:
+  #   enabled: true
+  #   allow_chats: ["-1001234567890"]
+  #   deny_senders: ["12345"]
+  #   include_handled_messages: false   # true also collects live-routed messages
 
-# Quiet hours (local timezone)
+# Notifications — where the notify tool and async questions/approvals are delivered.
+# By default they go to the owner's DM. Point telegram_chat_id at a dedicated group
+# to collect them there instead; enable delivery_only_sink to make that group one-way
+# (inbound messages and reactions there never start an agent turn). Default: off.
+# notifications:
+#   telegram_chat_id: -1000000000000
+#   delivery_only_sink: false
+
+slack:
+  # Omitting this key leaves Slack off until both tokens below are set, so an
+  # install that does not use Slack never has to say so. Set it to true to be
+  # told about a missing token instead of having the channel stay down.
+  enabled: false
+  # "socket" (default): this process holds the tokens below. "hosted": a
+  # shared channel gateway holds them and streams events to this process;
+  # no token is needed, and channels.hosted below must name the gateway's
+  # public key file and this agent. See docs/config.md#hosted-mode.
+  # mode: socket
+  # Socket Mode needs both tokens in config.local.yaml; no public URL is needed:
+  #   bot_token: xoxb-…   (OAuth & Permissions → Bot User OAuth Token)
+  #   app_token: xapp-…   (Basic Information → App-Level Tokens, connections:write)
+  #
+  # Access patterns match Slack IDs or names, case-insensitively with globs.
+  # Deny wins, DMs require explicit opt-in, and no allow grant refuses everyone.
+  # Grant users by member ID, handle, or email only: a member edits their own
+  # display and full name, so allow_users never matches those.
+  # allow_users: ["U0123ABC", "alice.example"]
+  # deny_users: ["*-bot"]
+  allow_direct_messages: false
+  # allow_channels: ["eng-*", "C0456DEF"]
+  # deny_channels: ["*-random", "*-social"]
+  #
+  # Let an agent post to a conversation it names (send_channel_message),
+  # including from a cron run with no chat attached. Off by default and
+  # separate from the read grant above: allow_channels is set by nearly every
+  # deployment for inbound access, so deriving writes from it alone would open
+  # unprompted posting on upgrade. Turning this on never widens where writes
+  # may go — allow_channels still bounds that, and DMs are always refused.
+  # While this is off, the send_channel_message tool is not offered at all.
+  # allow_outbound: false
+  #
+  # Every shared-channel thread is its own session; DMs use one conversation.
+  #
+  # How a reply appears while the agent works. "partial" posts a placeholder
+  # and edits it as tokens and tool labels arrive, so a long turn shows
+  # progress; the finished reply is then posted as a new message. "full" waits
+  # and posts once. Prefer "full" in a busy channel, where the placeholder is
+  # visible to everyone, or where the edits crowd Slack's rate limit.
+  stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  # `/nerve` defaults to new, stop, star, unstar, and reply.
+  #   omitted  — new, stop, star, unstar, reply
+  #   []       — no slash commands at all
+  #   [all]    — everything, including doctor and restart
+  # doctor/restart affect the host; sessions lists other channels. Opt in.
+  # commands: [sessions, new, stop, reply]
+  #
+  # Feed the source inbox from watched channels, reaching it as the source
+  # "slack:observed", where poll_source and the `messages` cron gate read it.
+  # Nothing here starts an agent turn.
+  #
+  # A SEPARATE grant from the access rules above, decided independently of
+  # them: those say who may drive the agent, this says whose traffic may reach
+  # its inbox. So an empty allow_channels collects NOTHING rather than
+  # everything. A mention from someone access refuses is still collected; a
+  # live-routed message is not collected unless include_handled_messages is true.
+  # DMs (group DMs included), other apps, and the bot's own posts are never
+  # collected.
+  #
+  # allow_channels takes a channel ID or a channel name, with globs and a
+  # leading "#" tolerated; deny_channels the same. allow_senders takes a
+  # member ID, handle, or email — a display name can only ever deny, since
+  # its owner picks it. Prefer uppercase IDs: everything else uses cached Slack
+  # API lookups.
+  #
+  # Everything collected is untrusted input: the grant decides whose messages
+  # are kept, not whether their contents can be believed. See docs/sources.md.
+  # source:
+  #   enabled: true
+  #   allow_channels: ["C0456DEF", "eng-*"]
+  #   deny_channels: ["*-social"]
+  #   deny_senders: ["*-bot"]
+  #   include_handled_messages: false   # true also collects live-routed messages
+  #   schedule: "*/5 * * * *"     # how often the buffer drains into the inbox
+
+# Streams from a shared channel gateway, for a provider in hosted mode
+# (slack.mode: hosted). A stream opens only with a token that the gateway
+# signs for this exact tenant and agent. gateway_jwks_file holds the
+# gateway's public keys only; Nerve fetches no keys over the network.
+# channels:
+#   hosted:
+#     gateway_jwks_file: /etc/nerve/gateway-jwks.json
+#     issuer: nerve-gateway
+#     audience: nerve-channel
+#     tenant_id: 00000000-0000-0000-0000-000000000000
+#     agent_id: 00000000-0000-0000-0000-000000000000
+#     max_streams: 8
+
+# Where notify, ask_user, and propose_action deliver. The list replaces the
+# default rather than adding to it, so name every transport you want. A
+# transport that is off costs nothing here.
+notifications:
+  channels: [web, telegram, slack]
+  # Target conversation for Slack cards. Without this, the first literal ID
+  # in slack.allow_channels is used; names and globs are not resolved.
+  # slack_channel_id: "C0456DEF"
+
+# Quiet hours (local timezone). Optional: set both to "" for none, which is
+# what a worker gets by default.
 quiet_start: "02:00"
 quiet_end: "12:00"
 
@@ -173,7 +318,7 @@ sync:
 
 # Memory (memU)
 memory:
-  recall_model: claude-sonnet-4-6
+  recall_model: claude-sonnet-5-5
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
 
 # Cron — no path keys needed. Cron config lives in <workspace>/config/cron/

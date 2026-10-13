@@ -17,8 +17,9 @@ this interacts catastrophically with subprocess spawning:
 1. **fork vs. BLAS atfork collision.**  glibc ``fork()`` runs registered
    ``pthread_atfork`` prepare handlers.  OpenBLAS registers one
    (``blas_thread_shutdown_``) that ``pthread_join``\\ s its *entire*
-   worker pool before allowing the fork to proceed.  The event loop
-   spawns agent CLI subprocesses via ``fork()`` (libuv/uvloop), while the
+   worker pool before allowing the fork to proceed.  Under uvloop
+   (``gateway.loop: uvloop``) the event loop spawns agent CLI subprocesses
+   via ``fork()`` (libuv), while the
    dedicated memU thread keeps the BLAS pool busy with vector-index
    mat-vecs over a multi-hundred-MB embedding matrix.  Under a recall
    storm the pool never quiesces, so a spawn on the loop thread can block
@@ -34,6 +35,11 @@ this interacts catastrophically with subprocess spawning:
 
 With ``OPENBLAS_NUM_THREADS=1`` the pool is never created, the atfork
 handler returns immediately, and forks never stall.
+
+The default loop (``gateway.loop: asyncio``) spawns with ``vfork()``, which
+skips the atfork handlers — and the page-table copy — altogether.  The cap
+stays as defense in depth: for the uvloop opt-in, and for any other
+``fork()`` user in the process.
 
 ``os.environ.setdefault`` is used throughout: an explicitly configured
 environment always wins over these defaults.

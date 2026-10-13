@@ -19,6 +19,7 @@ from __future__ import annotations
 import nerve._env  # noqa: F401  isort: skip
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -228,15 +229,47 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
 @click.option("--if-needed", is_flag=True, help="Only run if fresh install detected")
 @click.option("--non-interactive", is_flag=True, help="Use env vars, no prompts (for Docker)")
 @click.option("--inside-docker", is_flag=True, hidden=True, help="Skip deployment step (running inside Docker)")
+@click.option("--terminal", is_flag=True, help="Ask everything in this terminal instead of the setup page")
+@click.option("--deployment", type=click.Choice(["server", "docker"]), default=None, help="Slim setup: how to run Nerve")
+@click.option("--workspace", "workspace_opt", default=None, help="Slim setup: the workspace directory")
+@click.option("--port", type=int, default=None, help="Slim setup: the gateway port")
+@click.option("--bind", type=click.Choice(["localhost", "lan"]), default=None, help="Slim setup: who can reach the web UI")
+@click.option("--no-start", is_flag=True, help="Slim setup: write the files but do not start Nerve")
+@click.option("--no-browser", is_flag=True, help="Slim setup: do not offer to open the setup page")
+@click.option("--no-clipboard", is_flag=True, help="Slim setup: do not copy the setup token to the clipboard")
+@click.option("--yes", "-y", is_flag=True, help="Slim setup: accept every default without asking")
+@click.option(
+    "--keep-env", is_flag=True,
+    help="Slim setup: pass ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from this shell to the daemon",
+)
 @click.pass_context
-def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool) -> None:
-    """First-run setup wizard — configure Nerve interactively."""
+def init(
+    ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
+    terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
+    bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
+    keep_env: bool,
+) -> None:
+    """Set up Nerve: decide how it runs here, then finish in your browser.
+
+    The default asks only what the browser cannot decide (deployment, paths,
+    port), starts Nerve and prints the setup page and token. ``--terminal``
+    asks everything here instead; ``--non-interactive`` reads the environment.
+    """
     from nerve.bootstrap import SetupWizard, is_fresh_install, run_non_interactive
 
     config_dir = Path(ctx.obj["config_dir"])
 
     if if_needed and not is_fresh_install(config_dir):
         return  # Already configured, exit silently
+
+    if not terminal and not non_interactive and not inside_docker:
+        _slim_init(
+            ctx, config_dir,
+            deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
+            start=not no_start, browser=False if no_browser else None,
+            clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
+        )
+        return
 
     if not is_fresh_install(config_dir):
         if non_interactive:
@@ -308,7 +341,9 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         click.echo(f"  {action}")
     from nerve.db.accounts import read_setup_required
 
-    if read_setup_required(
+    # In external mode there are no local accounts to claim, so the hint
+    # would point at a token that is never generated.
+    if not _external_auth_in_this_shell() and read_setup_required(
         paths.db_path(), configured_password=bool(config.auth.password_hash),
     ):
         click.echo(
@@ -318,11 +353,540 @@ def init(ctx: click.Context, if_needed: bool, non_interactive: bool, inside_dock
         )
 
 
+# --- The slim init: host decisions, then the browser --------------------------
+
+
+def _external_auth_in_this_shell() -> bool:
+    """Whether ``NERVE_AUTH_MODE`` in this shell says external (unknown → False)."""
+    from nerve.config import ConfigError
+    from nerve.gateway.auth import AUTH_MODE_EXTERNAL, auth_mode_from_env
+
+    try:
+        return auth_mode_from_env() == AUTH_MODE_EXTERNAL
+    except ConfigError:
+        return False
+
+
+def _setup_url(config) -> str:
+    host = config.gateway.host if config is not None else "localhost"
+    port = config.gateway.port if config is not None else 8900
+    if host in {"0.0.0.0", "::", "[::]", ""}:
+        host = "localhost"
+    return f"http://{host}:{port}/setup"
+
+
+def _setup_unclaimed(config, external: bool | None = None) -> bool:
+    """Whether the instance still waits for its first claim: the read-only
+    database answer, which a CLI process can take without the daemon. Always
+    ``False`` under external authentication, where there is no claim step."""
+    from nerve.db.accounts import read_setup_required
+
+    if external is None:
+        external = _external_auth_in_this_shell()
+    if external:
+        return False
+    return read_setup_required(paths.db_path(), configured_password=bool(config.auth.password_hash))
+
+
+def _setup_summary(config) -> dict | None:
+    """The setup checklist as a CLI process can derive it (no daemon needed).
+
+    Same derivation as ``GET /api/setup``, fed with the facts a separate
+    process can read: config, workspace files, the state file and — in local
+    mode only — the read-only "is setup required" answer from the database.
+    """
+    if config is None:
+        return None
+    try:
+        from nerve import setup_checklist, setup_provenance, setup_state, setup_telegram_login
+        from nerve.db.accounts import read_setup_required
+        from nerve.setup_writer import workspace_mode
+
+        external = _external_auth_in_this_shell()
+        unclaimed = _setup_unclaimed(config, external)
+        facts = setup_checklist.Facts(
+            config=config,
+            workspace=Path(config.workspace),
+            state=setup_state.load_state(),
+            external_auth=external,
+            unclaimed=unclaimed,
+            lockdown=bool(config.lockdown),
+            writable_problem=setup_checklist.LOCKDOWN_TEXT if config.lockdown else None,
+            restart_pending=[],
+            telegram_live=False,
+            credential_sources=setup_provenance.credential_sources(config),
+            telegram_session_present=setup_telegram_login.session_present(),
+            env_credential=bool(
+                os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            ),
+            env_oauth_only=bool(
+                os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not os.environ.get("ANTHROPIC_API_KEY")
+            ),
+            onboarding=setup_checklist.onboarding_from_task(
+                Path(config.workspace), workspace_mode(Path(config.workspace)),
+            ),
+        )
+        return setup_checklist.summarize(facts)
+    except Exception as e:  # noqa: BLE001 — status/doctor must never die on the checklist
+        logging.getLogger(__name__).debug("setup checklist unavailable: %s", e)
+        return None
+
+
+_SHELL_VIEW_CAVEAT = (
+    " (as seen from this shell; set NERVE_AUTH_MODE/NERVE_LOCKDOWN as the service does)"
+)
+
+
+def _shell_view_caveat() -> str:
+    """Suffix for checklist lines a CLI process derives from *its own* shell.
+
+    The auth mode and lockdown come from the environment, so a shell without
+    ``NERVE_AUTH_MODE``/``NERVE_LOCKDOWN`` sees a supervised external or
+    locked instance the local way. While a daemon runs and neither variable is
+    set here, say so instead of presenting that view as the instance's.
+    """
+    if os.environ.get("NERVE_AUTH_MODE") or os.environ.get("NERVE_LOCKDOWN"):
+        return ""
+    try:
+        running, _pid = _get_daemon_status()
+    except Exception:  # noqa: BLE001
+        return ""
+    return _SHELL_VIEW_CAVEAT if running else ""
+
+
+def _compose_host_workspace(config_dir: str | Path) -> Path | None:
+    """The host path bind-mounted as the container's workspace, from the
+    generated ``docker-compose.yml`` (the volume whose container side is the
+    container workspace path). ``None`` when the file or the mount is absent."""
+    import yaml
+
+    from nerve.setup_writer import _DOCKER_WORKSPACE
+
+    compose_file = Path(config_dir) / "docker-compose.yml"
+    try:
+        data = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    services = data.get("services") if isinstance(data, dict) else None
+    if not isinstance(services, dict):
+        return None
+    for service in services.values():
+        volumes = service.get("volumes") if isinstance(service, dict) else None
+        for volume in volumes or []:
+            if not isinstance(volume, str):
+                continue
+            host, sep, container = volume.rpartition(":")
+            if sep and container == _DOCKER_WORKSPACE and host:
+                return Path(host).expanduser()
+    return None
+
+
+_DOCKER_VIEW_UNAVAILABLE = (
+    "the workspace mount could not be read from docker-compose.yml on this host"
+)
+
+
+def _checklist_config(config) -> tuple:
+    """``(config, note)``: what the setup checklist is derived from, or
+    ``(None, why)`` when nothing truthful can be derived from this host.
+
+    On the host side of a Docker deployment ``config.workspace`` is the
+    *container* path (``/root/nerve-workspace``): it does not exist here and
+    the tracked settings under it were never loaded, so deriving against it
+    would report a finished install as "3 steps left" forever (the mode
+    pending, its dependents blocked). The checklist is derived against the
+    same files at their bind-mounted host path instead; when that path cannot
+    be found the caller prints a neutral line rather than a wrong count.
+    """
+    if config is None:
+        return None, None
+    if not _is_docker_mode(config):
+        return config, None
+    host_workspace = _compose_host_workspace(getattr(config, "config_dir", "") or Path.cwd())
+    if host_workspace is None or not host_workspace.is_dir():
+        return None, _DOCKER_VIEW_UNAVAILABLE
+    try:
+        return load_config(Path(config.config_dir), workspace=host_workspace), None
+    except Exception as e:  # noqa: BLE001 — status/doctor must never die on the checklist
+        logging.getLogger(__name__).debug("docker host view of the config unavailable: %s", e)
+        return None, _DOCKER_VIEW_UNAVAILABLE
+
+
+def _echo_checklist_line(config) -> None:
+    """``Setup checklist: N steps left — <url>`` when claimed but unfinished."""
+    view, note = _checklist_config(config)
+    if view is None and note:
+        # Docker on the host without a readable mount: nothing about the
+        # workspace can be derived here (config names the container's path,
+        # which this account may not even stat), so the only fact taken is the
+        # database's — claimed or not — and the line says where to look.
+        try:
+            unclaimed = _setup_unclaimed(config)
+        except Exception as e:  # noqa: BLE001 — status must never die on the checklist
+            logging.getLogger(__name__).debug("setup claim state unavailable: %s", e)
+            return
+        if not unclaimed:  # while unclaimed the token lines already say what to do
+            click.echo(f"  Setup checklist: open {_setup_url(config)} ({note})")
+        return
+    summary = _setup_summary(view if view is not None else config)
+    if not summary or summary.get("finished"):
+        return
+    claim = next((s for s in summary["steps"] if s["id"] == "claim"), None)
+    if claim is not None and claim["status"] != "done":
+        return  # the token lines already say what to do
+    left = summary.get("steps_left", 0)
+    noun = "step" if left == 1 else "steps"
+    click.echo(f"  Setup checklist: {left} {noun} left — {_setup_url(config)}{_shell_view_caveat()}")
+
+
+def _spawn_daemon(
+    config_dir: str | Path, verbose: bool, env: dict[str, str] | None = None,
+) -> "subprocess.Popen":
+    """Start ``nerve start --foreground`` detached, logging to the state dir.
+
+    ``env`` replaces the inherited environment when given (the slim init drops
+    shell credentials, see :func:`_daemon_environment`); ``None`` inherits.
+    """
+    nerve_bin = sys.argv[0]
+    cmd = [sys.executable, nerve_bin, "-c", str(config_dir)]
+    if verbose:
+        cmd.append("-v")
+    cmd.extend(["start", "--foreground"])
+    paths.ensure_nerve_home()
+    log_fd = open(paths.log_file(), "a")
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=log_fd,
+            stderr=log_fd,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        log_fd.close()
+
+
+_ENV_CREDENTIALS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def _daemon_environment(*, keep_env: bool) -> tuple[dict[str, str] | None, list[str]]:
+    """The environment for the daemon the slim init spawns.
+
+    A credential exported in the operator's interactive shell would otherwise
+    become the daemon's provider for this run only: Setup would read "Model:
+    done, from the environment", nothing would be saved, and the next
+    ``nerve start`` from a clean shell (or a reboot) would lose it. Unless
+    ``--keep-env`` asks for exactly that, the two variables are dropped and
+    the setup page is where the key is saved. Returns ``(env, dropped)`` —
+    ``env`` is ``None`` (inherit) when nothing had to change.
+    """
+    present = [name for name in _ENV_CREDENTIALS if os.environ.get(name)]
+    if keep_env or not present:
+        return None, []
+    env = {k: v for k, v in os.environ.items() if k not in _ENV_CREDENTIALS}
+    return env, present
+
+
+def _spawned_daemon_problem(proc) -> str | None:
+    """Why the process just spawned is not the one answering ``/health``.
+
+    ``/health`` going green proves only that *something* listens on the port:
+    when it was busy, the child dies on ``address already in use`` while the
+    other program keeps answering. The child must still be alive and the pid
+    file (which ``start --foreground`` writes first thing) must name it.
+    """
+    if proc.poll() is not None:
+        return f"the new process exited with code {proc.returncode} right after starting"
+    recorded = _read_pid()
+    if recorded != proc.pid:
+        return (
+            "something else answers on that port (the pid file names "
+            f"{recorded if recorded else 'no process'}, the process just started is {proc.pid})"
+        )
+    return None
+
+
+_START_FAILED_HINT = (
+    " The configuration is written. Fix the cause, start Nerve with: nerve start "
+    "— then read the setup token with: nerve status"
+)
+
+
+@contextlib.contextmanager
+def _quiet_console(log_path: Path | None):
+    """Keep INFO lines off the terminal while the slim init prints its transcript.
+
+    The skills install, the database migrations and the identity bootstrap
+    each log at INFO; interleaved with the transcript they bury the token
+    block. Console handlers are raised to WARNING for the duration and INFO
+    goes to the log file instead, so nothing is lost. Restored afterwards.
+    """
+    root = logging.getLogger()
+    console = [
+        h for h in root.handlers
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+    ]
+    previous = [(h, h.level) for h in console]
+    for handler in console:
+        handler.setLevel(max(handler.level, logging.WARNING))
+    file_handler = None
+    if log_path is not None:
+        try:
+            paths.ensure_nerve_home()
+            file_handler = logging.FileHandler(log_path)
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S")
+            )
+            root.addHandler(file_handler)
+        except OSError:
+            file_handler = None
+    try:
+        yield
+    finally:
+        for handler, level in previous:
+            handler.setLevel(level)
+        if file_handler is not None:
+            root.removeHandler(file_handler)
+            file_handler.close()
+
+
+def _wait_for_health(url: str, timeout: float) -> float | None:
+    """Poll ``url`` every 0.5 s until it answers 200; seconds taken, or ``None``."""
+    import urllib.error
+    import urllib.request
+
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310 — loopback health
+                if response.status == 200:
+                    return time.monotonic() - started
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(0.5)
+    return None
+
+
+_CLIPBOARD_COMMANDS = (
+    ["pbcopy"],
+    ["wl-copy"],
+    ["xclip", "-selection", "clipboard"],
+    ["xsel", "--clipboard", "--input"],
+)
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy ``text`` through the first clipboard tool on PATH. Stdin only:
+    the value is never an argv element."""
+    for argv in _CLIPBOARD_COMMANDS:
+        if not shutil.which(argv[0]):
+            continue
+        try:
+            result = subprocess.run(argv, input=text.encode("utf-8"), timeout=3, capture_output=True)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+    return False
+
+
+def _print_setup_block(url: str, token: str | None, *, copied: bool, external: bool) -> None:
+    width = 62
+    top = "  ┌" + "─" * width + "┐"
+    bottom = "  └" + "─" * width + "┘"
+
+    def row(text: str = "") -> None:
+        click.echo("  │  " + text.ljust(width - 2) + "│")
+
+    click.echo()
+    click.echo(top)
+    row("Finish setup in your browser")
+    row()
+    row(f"Setup page   {url}")
+    if external:
+        # Two clauses on two lines — never a sentence broken mid-clause.
+        row("Sign in through your gateway.")
+        row("No setup token is used in external mode.")
+    elif token:
+        row(f"Setup token  {token}")
+        if copied:
+            row("             (copied to your clipboard)")
+        row()
+        row("The token is a one-time credential. It is pasted into")
+        row("the page and never part of the URL. To see it again:")
+        row("nerve status")
+    else:
+        row("Setup token  (run nerve status in a moment)")
+    click.echo(bottom)
+    click.echo()
+
+
+def _print_configured_status(ctx: click.Context, config) -> None:
+    """The slim path on an already configured install: say so, show status."""
+    click.echo("Nerve is already configured.")
+    if config is None:
+        click.echo("  (its configuration could not be loaded; run 'nerve doctor')")
+    elif _is_docker_mode(config):
+        click.echo("  Deployment: docker — 'nerve status' shows the container state.")
+        _echo_setup_token(config)
+        _echo_checklist_line(config)
+    else:
+        running, pid = _get_daemon_status()
+        if running:
+            click.echo(f"  Nerve is running (PID {pid})")
+            click.echo(f"  Listening on {config.gateway.host}:{config.gateway.port}")
+        else:
+            click.echo("  Nerve is not running — start it with: nerve start")
+        _echo_setup_token(config)
+        _echo_checklist_line(config)
+    click.echo("  Reconfigure everything: nerve init --terminal")
+
+
+def _slim_init(
+    ctx: click.Context,
+    config_dir: Path,
+    *,
+    deployment: str | None,
+    workspace: str | None,
+    port: int | None,
+    bind: str | None,
+    start: bool,
+    browser: bool | None,
+    clipboard: bool,
+    yes: bool,
+    keep_env: bool = False,
+) -> None:
+    from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
+
+    if not is_fresh_install(config_dir):
+        _print_configured_status(ctx, ctx.obj.get("config"))
+        return
+
+    # A non-TTY stdin still answers the prompts (click reads piped lines, as
+    # the full wizard always has); only --yes skips them.
+    flags = SlimFlags(
+        deployment=deployment, workspace=workspace, port=port, bind=bind,
+        yes=yes, start=start, browser=browser, clipboard=clipboard,
+    )
+    with _quiet_console(paths.log_file()):
+        result = SlimSetup(config_dir, flags).run()
+
+        write_config_pointer(config_dir)
+        config = load_config(config_dir)
+        set_config(config)
+        ctx.obj["config"] = config
+
+        # The owner account exists before the daemon answers, so the setup
+        # token is available the moment /health is green. No name: the setup
+        # page asks.
+        from nerve.migrate import bootstrap_identity_sync
+
+        try:
+            bootstrap_identity_sync(config, display_name=None, passwordless=False)
+        except Exception as e:  # noqa: BLE001 — the files are written; say what is missing
+            raise click.ClickException(
+                f"Setup wrote the configuration, but the local owner account could not "
+                f"be created: {e}. Fix the cause and run 'nerve init' again."
+            ) from e
+
+    docker = result.choices.deployment == "docker"
+    external = _external_auth_in_this_shell()
+    url = f"http://{'127.0.0.1' if result.bind == 'localhost' else 'localhost'}:{result.choices.gateway_port}/setup"
+    health = f"http://127.0.0.1:{result.choices.gateway_port}/health"
+
+    if not start:
+        click.echo()
+        click.echo("  Not started (--no-start). Start it with: nerve start")
+        click.echo(f"  Then open {url} — 'nerve status' prints the setup token.")
+        return
+
+    if docker:
+        click.echo("    Starting the container (docker compose up -d --build)…")
+        rc = _docker_compose(config_dir, ["up", "-d", "--build"])
+        if rc != 0:
+            raise click.ClickException(
+                "docker compose up failed. Fix the cause and run: docker compose up -d --build"
+            )
+        waited = _wait_for_health(health, timeout=300)
+        if waited is None:
+            raise click.ClickException(
+                "Nerve did not answer within 300 s. Logs: nerve logs (docker compose logs)."
+                " The configuration is written. Fix the cause, then: docker compose up -d "
+                "— and read the setup token with: nerve status"
+            )
+        click.secho(f"    ✓ Nerve started in Docker — ready in {waited:.1f} s", fg="green")
+        click.echo("    Container restarts are automatic (restart: unless-stopped). nerve stop is docker compose down.")
+    else:
+        running, pid = _get_daemon_status()
+        if running:
+            click.secho(f"    ✓ Nerve is already running (PID {pid})", fg="green")
+        else:
+            env, dropped = _daemon_environment(keep_env=keep_env)
+            if dropped:
+                click.echo(
+                    f"    {' and '.join(dropped)} is set in this shell; not passed to Nerve "
+                    "— save a key on the setup page so it survives a restart "
+                    "(or re-run with --keep-env to use it for this run only)."
+                )
+            proc = _spawn_daemon(config_dir, ctx.obj.get("verbose", False), env=env)
+            waited = _wait_for_health(health, timeout=60)
+            if waited is None:
+                raise click.ClickException(
+                    f"Nerve did not answer within 60 s. Logs: nerve logs.{_START_FAILED_HINT}"
+                )
+            problem = _spawned_daemon_problem(proc)
+            if problem:
+                raise click.ClickException(
+                    f"Nerve did not start cleanly: {problem}. Logs: {paths.log_file()}.{_START_FAILED_HINT}"
+                )
+            click.secho(f"    ✓ Nerve started (PID {proc.pid}) — ready in {waited:.1f} s", fg="green")
+
+    token = None
+    if not external:
+        from nerve.db.accounts import read_instance_secret
+        from nerve.setup_token import SETUP_TOKEN_NAME
+
+        token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME) or None
+    copied = bool(token) and clipboard and _copy_to_clipboard(token)
+    _print_setup_block(url, token, copied=copied, external=external)
+
+    open_it = browser
+    if open_it is None:
+        open_it = sys.stdin.isatty() and not yes and click.confirm(
+            "  Open the setup page in your browser now?", default=True,
+        )
+    if open_it:
+        click.launch(url)
+    if external:
+        click.echo("  Later: `nerve status` prints the page again.")
+    else:
+        click.echo("  Later: `nerve status` prints the page and token again.")
+    click.echo("  Prefer the terminal? `nerve init --terminal` asks everything here.")
+
+
+def _refuse_unknown_auth_mode() -> None:
+    """Stop the command when ``NERVE_AUTH_MODE`` has an unknown value.
+
+    The server reads the variable when it starts and refuses an unknown
+    value. ``start`` and ``restart`` check it first, so that they show the
+    error, and do not stop the running daemon or start one that stops at once.
+    """
+    from nerve.config import ConfigError
+    from nerve.gateway.auth import auth_mode_from_env
+
+    try:
+        auth_mode_from_env()
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
+
+
 @main.command()
 @click.option("--foreground", "-f", is_flag=True, help="Run in foreground (don't daemonize)")
 @click.pass_context
 def start(ctx: click.Context, foreground: bool) -> None:
     """Start the Nerve server."""
+    _refuse_unknown_auth_mode()
     config_dir = Path(ctx.obj["config_dir"])
     config = ctx.obj["config"]
 
@@ -352,10 +916,21 @@ def start(ctx: click.Context, foreground: bool) -> None:
     from nerve.bootstrap import is_fresh_install
     if is_fresh_install(config_dir):
         if foreground:
-            click.echo("Fresh install detected — running setup wizard...")
-            ctx.invoke(init)
-            # Reload config after wizard
-            config = ctx.obj["config"]
+            # The slim init writes the files; *this* process is the server, so
+            # it must not spawn a second one (a supervisor unit running
+            # `start --foreground` would otherwise exit 1 and leave an
+            # unsupervised daemon holding the port).
+            click.echo("Fresh install detected — running setup...")
+            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True)
+            config = ctx.obj.get("config")
+            if config is None:
+                raise click.ClickException(
+                    "Setup did not produce a configuration. Run 'nerve init' and then 'nerve start -f'."
+                )
+            click.echo(
+                f"  Setup page: {_setup_url(config)} — in another terminal, 'nerve status' "
+                "prints the setup token once Nerve answers."
+            )
         else:
             click.echo("Fresh install detected. Run 'nerve init' first, or 'nerve start -f' for guided setup.")
             ctx.exit(1)
@@ -391,29 +966,8 @@ def start(ctx: click.Context, foreground: bool) -> None:
         finally:
             _remove_pid()
     else:
-        # Daemonize: spawn a background process
-        config_dir = ctx.obj["config_dir"]
-        verbose = ctx.obj["verbose"]
-
-        # Build the command to run nerve start --foreground
-        nerve_bin = sys.argv[0]
-        cmd = [sys.executable, nerve_bin, "-c", config_dir]
-        if verbose:
-            cmd.append("-v")
-        cmd.extend(["start", "--foreground"])
-
-        # Ensure log directory exists
-        paths.ensure_nerve_home()
-
-        log_fd = open(paths.log_file(), "a")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fd,
-            stderr=log_fd,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log_fd.close()
+        # Daemonize: spawn a background process (shared with the slim init)
+        proc = _spawn_daemon(ctx.obj["config_dir"], ctx.obj["verbose"])
 
         # Wait briefly to verify the process started
         time.sleep(1)
@@ -495,6 +1049,8 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     the restart: their ids are written to the resume queue now, and the fresh
     daemon re-drives each interrupted turn on startup.
     """
+    _refuse_unknown_auth_mode()
+
     # Enroll ids before anything else so the queue file is on disk — and
     # survives even a hard kill — by the time the new instance reads it.
     # Append mode lets concurrent enrollments from different sessions coexist.
@@ -532,77 +1088,17 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
             click.echo("Nerve is not running — systemd will start it shortly.")
         return
 
-    # Build the command that `start` would use to launch the daemon.
-    # Always use ``-m nerve`` so the restart works regardless of how *this*
-    # process was invoked (console-script, ``python -m nerve``, etc.).
-    verbose = ctx.obj["verbose"]
-    start_cmd_parts = [sys.executable, "-m", "nerve", "-c", str(config_dir)]
-    if verbose:
-        start_cmd_parts.append("-v")
-    start_cmd_parts.extend(["start", "--foreground"])
+    # The detached helper lives in nerve.daemon, shared with the setup page's
+    # POST /api/system/restart, so a restart typed here and one clicked in the
+    # browser are the same restart.
+    from nerve import daemon
 
     running, old_pid = _get_daemon_status()
-
-    # Spawn a detached helper that: waits for old PID to exit, then starts
-    # a new daemon.  Written as an inline Python script so we don't need an
-    # external shell script on disk.
-    helper_script = (
-        "import os, signal, subprocess, sys, time\n"
-        f"old_pid = {old_pid if running else 'None'}\n"
-        f"pid_file = {str(paths.pid_file())!r}\n"
-        f"log_file = {str(paths.log_file())!r}\n"
-        f"start_cmd = {start_cmd_parts!r}\n"
-        "if old_pid is not None:\n"
-        "    try:\n"
-        "        os.kill(old_pid, signal.SIGTERM)\n"
-        "    except ProcessLookupError:\n"
-        "        pass\n"
-        "    for _ in range(30):\n"
-        "        time.sleep(0.5)\n"
-        "        try:\n"
-        "            os.kill(old_pid, 0)\n"
-        "        except ProcessLookupError:\n"
-        "            break\n"
-        "    else:\n"
-        "        try:\n"
-        "            os.kill(old_pid, signal.SIGKILL)\n"
-        "            time.sleep(0.5)\n"
-        "        except ProcessLookupError:\n"
-        "            pass\n"
-        "    # Remove stale PID file\n"
-        "    try:\n"
-        "        os.unlink(pid_file)\n"
-        "    except FileNotFoundError:\n"
-        "        pass\n"
-        "time.sleep(0.5)\n"
-        "log_fd = open(log_file, 'a')\n"
-        "proc = subprocess.Popen(\n"
-        "    start_cmd,\n"
-        "    stdout=log_fd,\n"
-        "    stderr=log_fd,\n"
-        "    stdin=subprocess.DEVNULL,\n"
-        "    start_new_session=True,\n"
-        ")\n"
-        "log_fd.close()\n"
-        "time.sleep(1)\n"
-        "if proc.poll() is not None:\n"
-        "    sys.exit(1)\n"
+    outcome = daemon.restart_daemon(
+        config_dir, verbose=ctx.obj["verbose"],
+        old_pid=old_pid if running else None, systemd=False,
     )
-
-    log_fd = open(paths.log_file(), "a")
-    subprocess.Popen(
-        [sys.executable, "-c", helper_script],
-        stdout=log_fd,
-        stderr=log_fd,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    log_fd.close()
-
-    if running:
-        click.echo(f"Restarting Nerve (PID {old_pid})... new instance will start shortly.")
-    else:
-        click.echo("Starting Nerve... new instance will start shortly.")
+    click.echo(outcome.message)
 
 
 def _echo_setup_token(config) -> None:
@@ -639,6 +1135,7 @@ def status(ctx: click.Context, follow: bool) -> None:
     if _is_docker_mode(config):
         rc = _docker_compose(config_dir, ["ps"])
         _echo_setup_token(config)
+        _echo_checklist_line(config)
         if follow:
             _docker_compose(config_dir, ["logs", "-f"], replace_process=True)
         ctx.exit(rc)
@@ -686,6 +1183,7 @@ def status(ctx: click.Context, follow: bool) -> None:
         click.echo("Nerve is not running")
 
     _echo_setup_token(config)
+    _echo_checklist_line(config)
 
     if follow and paths.log_file().exists():
         click.echo(f"\n--- Tailing {paths.log_file()} ---")
@@ -969,6 +1467,107 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
         return False, f"{model}: {detail}"
 
 
+def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
+    """Doctor lines for the local Slack settings that still apply in hosted mode.
+
+    The gateway decides admission and where the agent may post, so only the
+    send tool switch, its local conversation limit, and the notification
+    conversation are reported. Slash commands do not reach Nerve.
+    """
+    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.config import SLACK_HOST_COMMANDS
+
+    slack = config.slack
+    lines: list[str] = []
+    if not slack.allow_outbound:
+        lines.append("[--] Slack send tool off (slack.allow_outbound is false)")
+    elif slack.allow_channels or slack.deny_channels:
+        lines.append(
+            f"[OK] Slack send tool on, limited to {len(slack.allow_channels)} allow "
+            f"and {len(slack.deny_channels)} deny rule(s); the gateway also decides"
+        )
+        if any(not is_slack_id(rule) for rule in slack.deny_channels):
+            warnings.append(
+                "[WARN] slack.deny_channels has a rule that is not a conversation "
+                "id; in hosted mode the send tool then refuses every conversation"
+            )
+        if any(not is_slack_id(rule) for rule in slack.allow_channels):
+            warnings.append(
+                "[WARN] slack.allow_channels has a rule that is not a conversation "
+                "id; in hosted mode rules match conversation ids only"
+            )
+    else:
+        lines.append("[OK] Slack send tool on; the gateway decides where it may post")
+    target = notification_target(config)
+    if target:
+        lines.append(f"[OK] Slack notifications go to {target}")
+    else:
+        warnings.append(
+            "[WARN] Slack notifications have no conversation: set "
+            "notifications.slack_channel_id"
+        )
+    lines.append("[--] Slack /nerve commands are not available in hosted mode")
+    host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
+    if host:
+        warnings.append(
+            f"[WARN] slack.commands enables {', '.join(host)}, but host commands "
+            "are not available in hosted mode"
+        )
+    return lines
+
+
+def _source_suffix(config, path: str) -> str:
+    """`` (environment)`` / `` (config-repo)`` after a configured connection
+    line when the value did not come from a file on this machine; ``""`` for
+    the normal case. Never raises — doctor must not die on a report detail."""
+    try:
+        from nerve import setup_provenance
+
+        return setup_provenance.describe(setup_provenance.credential_sources(config).get(path))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
+    """Doctor lines for the Telegram *message sync*: credentials, and whether
+    the session is signed in. Reads the session file's presence and the state
+    file's note of the last sign-in — no network from a CLI process."""
+    lines: list[str] = []
+    sync = config.sync.telegram
+    if not sync.enabled:
+        lines.append("[--] Telegram sync disabled")
+        return lines
+    if not (sync.api_id and sync.api_hash):
+        warnings.append(
+            "[WARN] Telegram sync: enabled but sync.telegram.api_id/api_hash are not set — "
+            "add them on the setup page (Sources → Telegram) or in config.local.yaml"
+        )
+        return lines
+    lines.append(
+        f"[OK] Telegram sync: API credentials configured{_source_suffix(config, 'sync.telegram.api_hash')}"
+    )
+    try:
+        from nerve import setup_state, setup_telegram_login
+
+        present = setup_telegram_login.session_present()
+        user = setup_state.load_state().telegram_sync_user
+        where = f"{paths.home_label()}/{setup_telegram_login.SESSION_NAME}.session"
+    except Exception:  # noqa: BLE001
+        return lines
+    both_routes = "sign in on the setup page (Sources → Telegram) or run 'nerve setup-telegram' on the server"
+    if not present:
+        warnings.append(f"[WARN] Telegram sync: no signed-in session at {where} — {both_routes}")
+    elif user:
+        handle = f"@{user['username']}" if user.get("username") else (user.get("first_name") or f"id {user.get('id')}")
+        lines.append(f"[OK] Telegram sync: signed in as {handle}")
+    else:
+        warnings.append(
+            f"[WARN] Telegram sync: a session file exists at {where} but no sign-in has been "
+            f"verified — {both_routes}"
+        )
+    return lines
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -991,8 +1590,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         suffix = f" (via {source_label})" if source_label else ""
         has_base = (Path(config_dir) / "config.yaml").exists()
         has_local = (Path(config_dir) / "config.local.yaml").exists()
-        from nerve.config import workspace_settings_file
-        has_settings = workspace_settings_file(config.workspace).exists()
+        from nerve.config import _path_exists, workspace_settings_file
+        # The workspace may be a path this account cannot stat (the container's
+        # path, seen from a Docker host): absent, not a crash.
+        has_settings = _path_exists(workspace_settings_file(config.workspace))
         if has_base or has_local or has_settings:
             present = " + ".join(
                 n for n, ok in (
@@ -1028,16 +1629,29 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Daemon not running")
 
     # Check workspace
-    if config.workspace.exists():
+    from nerve.config import _path_exists as _ws_path_exists
+
+    if _ws_path_exists(config.workspace):
         lines.append(f"[OK] Workspace: {config.workspace}")
-        mode = getattr(config, "mode", "personal")
+        # The mode is what the workspace says it is (SOUL.md and friends), not
+        # a config key — NerveConfig has none. Before a mode is chosen the
+        # template files are not expected yet.
+        from nerve.setup_writer import workspace_mode
+
+        detected_mode = workspace_mode(config.workspace)
+        mode = detected_mode or "personal"
         try:
             from nerve.workspace import get_expected_files
             expected = get_expected_files(mode)
+            if detected_mode is None:
+                warnings.append(
+                    "  [WARN] no mode chosen yet — open /setup to choose personal or worker "
+                    "(the identity files are written then)"
+                )
             for f in expected:
                 if (config.workspace / f).exists():
                     lines.append(f"  [OK] {f}")
-                else:
+                elif detected_mode is not None:
                     warnings.append(f"  [WARN] {f} not found (expected for {mode} mode)")
         except (FileNotFoundError, ValueError):
             for f in ["SOUL.md", "IDENTITY.md", "MEMORY.md"]:
@@ -1045,6 +1659,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                     lines.append(f"  [OK] {f}")
                 else:
                     warnings.append(f"  [WARN] {f} not found")
+    elif _is_docker_mode(config):
+        # The host side of a Docker deployment: config names the container's
+        # path, which this host may not even stat. The files live at the mount.
+        host_ws = _compose_host_workspace(getattr(config, "config_dir", "") or Path.cwd())
+        where = f"bind-mounted from {host_ws}" if host_ws is not None else _DOCKER_VIEW_UNAVAILABLE
+        lines.append(f"[--] Workspace: {config.workspace} (the container's path; {where})")
     else:
         errors.append(f"[ERR] Workspace not found: {config.workspace}")
 
@@ -1145,7 +1765,21 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             lines.append("[--] Anthropic API key not set (using proxy)")
     elif config.anthropic_api_key:
-        lines.append(f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}")
+        lines.append(
+            f"[OK] Anthropic API key: ...{config.anthropic_api_key[-4:]}"
+            f"{_source_suffix(config, 'anthropic_api_key')}"
+        )
+    elif os.environ.get("ANTHROPIC_API_KEY"):
+        # Provisioned by the operator: the gateway's environment carries it
+        # (Docker entrypoint, systemd Environment=), nothing in the files.
+        lines.append("[OK] Anthropic API key: configured (environment)")
+    elif config.claude_oauth_token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        where = _source_suffix(config, "claude_oauth_token") if config.claude_oauth_token else " (environment)"
+        lines.append(f"[OK] Claude subscription token: configured{where}")
+        warnings.append(
+            "[WARN] Only a subscription token is configured — background jobs "
+            "(memory, titles, cron) need an API key"
+        )
     elif config.lockdown:
         # The generic message names config.local.yaml, which a locked instance
         # never reads. The cause is also often upstream of the key: if the
@@ -1171,14 +1805,20 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             errors.append(f"[ERR] Claude API: {detail}")
 
     if config.openai_api_key:
-        lines.append(f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]} (vector embeddings enabled)")
+        lines.append(
+            f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
+            f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"
+        )
     else:
         lines.append("[--] OpenAI API key not set (using LLM-based memory recall)")
 
     # Check Telegram
     if config.telegram.enabled:
         if config.telegram.bot_token:
-            lines.append(f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}")
+            lines.append(
+                f"[OK] Telegram bot token: ...{config.telegram.bot_token[-4:]}"
+                f"{_source_suffix(config, 'telegram.bot_token')}"
+            )
             if config.telegram.dm_policy == "open":
                 warnings.append(
                     "[WARN] telegram.dm_policy is 'open' — any Telegram user "
@@ -1188,12 +1828,86 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 warnings.append(
                     "[WARN] telegram.allowed_users is empty — the bot rejects "
                     "all DMs until you pair (run 'nerve pair', then send the "
-                    "bot /pair <code>)"
+                    "bot /pair <code> in a private chat)"
                 )
         else:
             errors.append("[ERR] Telegram enabled but bot_token not set")
     else:
         lines.append("[--] Telegram disabled")
+
+    # Telegram message sync (the Telethon source): API credentials alone do
+    # nothing — it needs a signed-in session of the person's own account.
+    lines.extend(_telegram_sync_lines(config, warnings))
+
+    # Check Slack
+    if config.slack.mode == "hosted":
+        # A gateway holds the tokens, so there are none to check here. The
+        # settings are checked also when Slack is switched off, because the
+        # hosted channel is built at startup and a reload cannot repair it.
+        from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
+        if not config.slack.enabled:
+            lines.append(
+                "[--] Slack is hosted but switched off (slack.enabled is false); "
+                "events wait in the gateway inbox"
+            )
+        hosted = config.channels.hosted
+        problems = hosted.problems()
+        if not problems:
+            try:
+                keys = read_key_file(hosted.gateway_jwks_file)
+            except KeyFileError as error:
+                problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+        if problems:
+            errors.extend(
+                f"[ERR] Slack is hosted but {problem}" for problem in problems
+            )
+        else:
+            lines.append(
+                f"[OK] Slack hosted by the channel gateway: agent "
+                f"{hosted.agent_id}, {len(keys)} gateway key(s) from "
+                f"{hosted.gateway_jwks_file}"
+            )
+            lines.extend(_hosted_slack_lines(config, warnings))
+    elif config.slack.enabled:
+        missing = [
+            name for name, value in (
+                ("bot_token", config.slack.bot_token),
+                ("app_token", config.slack.app_token),
+            ) if not value
+        ]
+        if missing:
+            errors.append(
+                f"[ERR] Slack enabled but {', '.join(missing)} not set "
+                "(Socket Mode needs both)"
+            )
+        else:
+            lines.append(
+                f"[OK] Slack bot token: ...{config.slack.bot_token[-4:]}"
+                f"{_source_suffix(config, 'slack.bot_token')}"
+            )
+            slack = config.slack
+            if not (
+                slack.allow_users
+                or slack.allow_channels
+                or slack.allow_direct_messages
+            ):
+                warnings.append(
+                    "[WARN] slack.allow_users and slack.allow_channels are "
+                    "empty and slack.allow_direct_messages is false — the bot "
+                    "refuses every message. Add your Slack member id to "
+                    "slack.allow_users"
+                )
+            else:
+                lines.append(
+                    f"[OK] Slack guardrails: {len(slack.allow_users)} allowed "
+                    f"user(s), {len(slack.allow_channels)} allowed channel(s), "
+                    f"{len(slack.deny_users) + len(slack.deny_channels)} deny "
+                    f"rule(s), direct messages "
+                    f"{'allowed' if slack.allow_direct_messages else 'refused'}"
+                )
+    else:
+        lines.append("[--] Slack disabled")
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -1220,8 +1934,32 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     # the row), so judging by the row alone told operators that an *active*
     # password did nothing — and removing it on that advice would have opened
     # the instance.
+    #
+    # In external mode, the gateway names people and local accounts are not
+    # used, so the account checks do not apply. The doctor does not ask the
+    # running server for its mode: it reads NERVE_AUTH_MODE in its own shell,
+    # and the environment of the daemon can be different.
+    from nerve.config import ConfigError
     from nerve.db.accounts import inspect_bootstrap_state, read_setup_required
-    from nerve.gateway.auth import source_authenticates
+    from nerve.gateway.auth import (
+        AUTH_MODE_ENV,
+        AUTH_MODE_EXTERNAL,
+        auth_mode_from_env,
+        source_authenticates,
+    )
+
+    mode_source = f"from {AUTH_MODE_ENV} in this shell, not from the running server"
+    try:
+        mode = auth_mode_from_env()
+    except ConfigError as e:
+        mode = None
+        errors.append(
+            f"[ERR] Auth mode ({mode_source}): {e} The server does not start "
+            "with this value."
+        )
+    else:
+        lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
+    external = mode == AUTH_MODE_EXTERNAL
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -1230,7 +1968,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         source for source in (sources or [])
         if source_authenticates(source, configured_password=configured)
     ]
-    if sources is None:
+    if external:
+        lines.append(
+            "[--] Accounts: not used in external mode; the gateway names the "
+            "person behind each request"
+        )
+    elif sources is None:
         lines.append("[--] Accounts: nerve.db not created yet (first start will)")
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
@@ -1240,7 +1983,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         warnings.append(
             "[WARN] Setup is not complete — sign-in is refused until it is. "
             "Complete it at /setup with the setup token shown by `nerve status` "
-            "on the host"
+            "on the host" + _shell_view_caveat()
         )
     elif not usable:
         warnings.append(
@@ -1251,7 +1994,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append(
             f"[OK] Accounts: {len(sources)} ({len(usable)} with a password)"
         )
-    if configured and sources is not None:
+    if configured and sources is not None and not external:
         reading = [source for source in sources if source != "local"]
         if reading:
             lines.append(
@@ -1263,6 +2006,49 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "[WARN] auth.password_hash is set but no account uses it — every "
                 "account has its own password now; the configured value does nothing"
             )
+
+    # The setup checklist: the same derivation the setup page uses, over the
+    # facts this process can read. Never prints the token — `nerve status`
+    # is the one place that does. On the host of a Docker deployment the
+    # files are read at their bind-mounted path (_checklist_config).
+    checklist_config, host_note = _checklist_config(config)
+    summary = _setup_summary(checklist_config) if checklist_config is not None else None
+    if summary is None and host_note:
+        lines.append(f"[--] Setup checklist: not derived here — {host_note}")
+    if summary is not None:
+        pending = [s["id"] for s in summary["steps"] if s["status"] == "pending"]
+        caveat = _shell_view_caveat()
+        if summary["finished"]:
+            lines.append(f"[OK] Setup checklist complete{caveat}")
+        elif pending:
+            warnings.append(
+                f"[WARN] Setup checklist incomplete (steps: {', '.join(pending)}) — "
+                "finish at /setup"
+                + ("" if external else " (run 'nerve status' for the token while unclaimed)")
+                + caveat
+            )
+        else:
+            lines.append(f"[--] Setup checklist: nothing left to decide here{caveat}")
+    if not getattr(getattr(config, "setup", None), "local_secrets", True):
+        # The setup page stores no credential here (setup.local_secrets:
+        # false): say so once, next to the checklist it shapes.
+        lines.append(
+            "[--] Setup page keeps no credentials on this instance "
+            "(setup.local_secrets: false) — connections come from the operator; "
+            "the Memory, Channels, Sources and Agents steps are not offered"
+        )
+    try:
+        from nerve import setup_state as _setup_state
+
+        telegram_error = _setup_state.load_state().boot_errors.get("telegram")
+    except Exception:  # noqa: BLE001
+        telegram_error = None
+    if telegram_error:
+        (errors if running else warnings).append(
+            f"[{'ERR' if running else 'WARN'}] Telegram bot failed to start at the last "
+            f"boot: {telegram_error} — replace the token at /setup/channels or in "
+            "config.local.yaml"
+        )
 
     if config.auth.jwt_secret:
         lines.append("[OK] JWT secret configured")
@@ -1284,8 +2070,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     try:
         from nerve.cron.jobs import describe_reserved_job_ids, is_reserved_job_id, load_jobs
 
-        system_jobs = load_jobs(config.cron.system_file) if config.cron.system_file.exists() else []
-        user_jobs = load_jobs(config.cron.jobs_file) if config.cron.jobs_file.exists() else []
+        system_jobs = load_jobs(config.cron.system_file) if _ws_path_exists(config.cron.system_file) else []
+        user_jobs = load_jobs(config.cron.jobs_file) if _ws_path_exists(config.cron.jobs_file) else []
 
         # Merge: user jobs override system jobs with the same ID
         merged: dict[str, object] = {j.id: j for j in system_jobs}
@@ -1317,9 +2103,9 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             lines.append("[--] No cron jobs configured")
     except Exception:
         # Fallback: just report file existence
-        if config.cron.system_file.exists():
+        if _ws_path_exists(config.cron.system_file):
             lines.append(f"[OK] System crons: {config.cron.system_file}")
-        if config.cron.jobs_file.exists():
+        if _ws_path_exists(config.cron.jobs_file):
             lines.append(f"[OK] User crons: {config.cron.jobs_file}")
 
     # Check backups
@@ -1884,8 +2670,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
 def pair(ctx: click.Context) -> None:
     """Generate a Telegram pairing code.
 
-    Send /pair <code> to your bot within an hour to authorize your
-    Telegram account. The paired user ID is persisted to
+    Send /pair <code> to your bot in a private chat within an hour to
+    authorize your Telegram account. The paired user ID is persisted to
     config.local.yaml (telegram.allowed_users).
     """
     config = ctx.obj["config"]
@@ -1912,7 +2698,7 @@ def pair(ctx: click.Context) -> None:
     click.echo()
     click.secho(f"  Pairing code: {code}", bold=True)
     click.echo()
-    click.echo(f"  Send this to your bot:  /pair {code}")
+    click.echo(f"  In a private chat, send this to your bot:  /pair {code}")
     click.echo(f"  Valid for {CODE_TTL_SECONDS // 60} minutes, single use.")
     if not running:
         click.echo()
@@ -1989,17 +2775,25 @@ def setup_telegram(ctx: click.Context) -> None:
     api_id = config.sync.telegram.api_id
     api_hash = config.sync.telegram.api_hash
     if not api_id or not api_hash:
-        click.echo("Error: sync.telegram.api_id and api_hash must be set in config.")
+        click.echo(
+            "Error: sync.telegram.api_id and api_hash are not set. Add them on the setup "
+            "page (Sources → Telegram) or in config.local.yaml, then run this again."
+        )
         ctx.exit(1)
         return
 
-    session_path = str(paths.nerve_path("telegram_sync"))
+    from nerve import setup_telegram_login
+
+    session_path = str(setup_telegram_login.session_base())
     click.echo(f"Telethon session: {session_path}.session")
     click.echo(f"API ID: {api_id}")
+    click.echo("(The setup page's Sources step offers the same sign-in in the browser.)")
     click.echo()
 
     async def _run():
         from telethon import TelegramClient, functions
+
+        from nerve import setup_state
 
         client = TelegramClient(session_path, api_id, api_hash)
         await client.start()
@@ -2012,6 +2806,15 @@ def setup_telegram(ctx: click.Context) -> None:
         click.echo(f"Current state: pts={state.pts}, qts={state.qts}, date={state.date}, seq={state.seq}")
 
         await client.disconnect()
+        # Owner-only like every credential file, and noted in the state file
+        # so the setup page and `nerve doctor` can say who is signed in.
+        setup_telegram_login._make_private(setup_telegram_login.session_file())
+        notes = setup_state.load_state()
+        setup_state.retire_on_boot(notes)
+        notes.telegram_sync_user = {
+            "id": int(me.id), "username": me.username or None, "first_name": me.first_name or "",
+        }
+        setup_state.save_state(notes)
         click.echo()
         click.echo(f"Session saved to {session_path}.session")
         click.echo("Telegram source is now ready to use.")

@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom';
 import type { ChatMessage, MessageBlock } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
+import { providerConfigured, useSetupStore } from '../../stores/setupStore';
+import { CHAT_EMPTY_NO_PROVIDER } from '../Setup/copy';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
@@ -34,6 +36,9 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   const namedSenders = useVisibleActorIds(
     messages.map(m => m.actor_id), viewerActorId,
   );
+  // `false` only when the server says no provider is configured; unknown
+  // (`null`) keeps the ordinary empty state, so a failed read never nags.
+  const needsProvider = useSetupStore(providerConfigured) === false;
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
@@ -57,9 +62,18 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
       <SelectionToolbar containerRef={containerRef} />
 
       {messages.length === 0 && !isStreaming && (
-        <div className="flex items-center justify-center h-full text-text-faint text-lg">
-          Start a conversation
-        </div>
+        needsProvider ? (
+          <div role="status" className="flex flex-col items-center justify-center h-full gap-2 text-center px-6">
+            <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
+            <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
+              Finish setup
+            </Link>
+          </div>
+        ) : (
+          <div className="flex items-center justify-center h-full text-text-faint text-lg">
+            Start a conversation
+          </div>
+        )
       )}
 
       {messages.map((msg, i) => {

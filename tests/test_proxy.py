@@ -522,7 +522,7 @@ class TestSubsystemConfigWiring:
         assert len(runners) >= 1
         runner = runners[0]
         # Model should be set from config.memory.fast_model
-        assert runner.condense_model == "claude-haiku-4-5-20251001"
+        assert runner.condense_model == "claude-haiku-5-5"
         # Factory should be set — delegates to config.create_async_anthropic_client
         assert runner._client_factory is not None
         # Calling the factory should produce a client with the proxy base URL
@@ -542,7 +542,7 @@ class TestSubsystemConfigWiring:
         runners = build_source_runners(cfg, mock_db)
         assert len(runners) >= 1
         runner = runners[0]
-        assert runner.condense_model == "claude-haiku-4-5-20251001"
+        assert runner.condense_model == "claude-haiku-5-5"
         assert runner._client_factory is not None
         client = runner._client_factory()
         assert "api.anthropic.com" in str(client.base_url)

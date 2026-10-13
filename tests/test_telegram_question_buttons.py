@@ -109,7 +109,10 @@ def _tap(data: str, card_text: str = "Which one?"):
         edit_message_text=AsyncMock(),
         edit_message_reply_markup=AsyncMock(),
     )
-    return SimpleNamespace(callback_query=query), query
+    update = SimpleNamespace(
+        callback_query=query, effective_chat=SimpleNamespace(id=CHAT_ID),
+    )
+    return update, query
 
 
 async def _ask(service: NotificationService, options: list[str]) -> str:
@@ -348,6 +351,7 @@ async def test_reply_command_answer_is_never_expanded(service, channel, db):
     typed = _old_payload(nid, LONG_OPTION)
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=USER_ID),
+        effective_chat=SimpleNamespace(id=CHAT_ID),
         message=SimpleNamespace(reply_text=AsyncMock()),
     )
 
