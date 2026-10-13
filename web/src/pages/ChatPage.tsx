@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -43,6 +43,13 @@ function formatModelLabel(model: string): string {
 export function ChatPage() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  // A suggested first message (the setup wizard's "Say hello"), read once
+  // from the navigation state so a later history entry does not re-seed.
+  const [suggestedMessage] = useState<string | null>(() => {
+    const seed = (location.state as { suggestedMessage?: unknown } | null)?.suggestedMessage;
+    return typeof seed === 'string' && seed.trim() ? seed : null;
+  });
   const {
     sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
     streamingBlocks, isStreaming, loading,
@@ -238,9 +245,12 @@ export function ChatPage() {
         // No URL param and no active session yet. A restored unsent chat wins
         // over the most recent real one: it only survives a reload when it
         // still holds draft text, and dropping the user somewhere else would
-        // hide the very prompt they were writing.
+        // hide the very prompt they were writing. A suggested first message
+        // (from setup) opens a fresh chat rather than landing in an old one.
         const { sessions: loaded, virtualSession } = useChatStore.getState();
-        if (virtualSession) {
+        if (suggestedMessage && !virtualSession) {
+          void createSession();
+        } else if (virtualSession) {
           switchSession(virtualSession.id);
         } else if (loaded.length > 0) {
           switchSession(loaded[0].id);
@@ -500,6 +510,7 @@ export function ChatPage() {
             onSend={sendMessage}
             onStop={stopSession}
             isStreaming={isStreaming}
+            seed={suggestedMessage}
           />
         </div>
 

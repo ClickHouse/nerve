@@ -11,7 +11,7 @@ git-syncable workspace subtree):
 
 | File | Purpose | Managed by |
 |------|---------|------------|
-| `system.yaml` | Built-in crons (core + productivity) | `nerve init` — safe to regenerate |
+| `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
 | `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
 
 > **Location & migration.** New installs write cron config to
@@ -28,7 +28,7 @@ Both files use the same format. On startup, CronService loads and merges both:
 - If a job ID appears in both files, the **user version wins** (with a warning in the log).
 - Old installs with everything in `jobs.yaml` still work — if `system.yaml` doesn't exist, all jobs load from `jobs.yaml`.
 
-Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`.
+Running `nerve init --terminal` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`. The default `nerve init` leaves it alone, and the setup page's Automation step only changes which optional jobs are enabled.
 
 ### Hot-reload (no restart)
 
@@ -78,7 +78,7 @@ jobs:
     schedule: "30 11 * * *"        # 11:30 AM daily
     prompt: "Give me a morning briefing..."
     description: "Daily morning summary"
-    model: claude-sonnet-4-6       # Optional model override
+    model: claude-sonnet-5-5       # Optional model override
     target: telegram               # Delivery channel
     session_mode: isolated         # "isolated", "persistent", or "main"
     enabled: true
@@ -140,7 +140,7 @@ prompt definition.
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a catch-up or web-triggered run waits for the previous one to finish. An overlapping scheduled fire is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -437,21 +437,21 @@ nerve doctor
 
 ## Built-in System Crons
 
-These ship in `<workspace>/config/cron/system.yaml` and are managed by `nerve init`. Running `nerve init` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
+These ship in `<workspace>/config/cron/system.yaml`, written when the mode is chosen (the setup page's Mode step, or `nerve init --terminal`). Running `nerve init --terminal` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
 | `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
-| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | ✅ default |
+| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
 
 **Mode defaults:**
-- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are presented as optional during `nerve init`.
-- **Worker** — `memory-maintenance` (always on) + `task-planner` + `skill-extractor` + `skill-reviser` enabled by default. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
+- **Worker** — `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided by the onboarding session, which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs with `enabled: false` as well — set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
-Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, the plan approval handler creates/updates the skill directly from the plan content (which is a full SKILL.md file) instead of spawning an implementation session.
+Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
 
 ## Persistent Timers
 

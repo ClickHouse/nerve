@@ -1,6 +1,8 @@
 # Accounts and actor identity
 
-Nerve uses local accounts for login and stable actor IDs for attribution.
+Nerve uses local accounts for login and stable actor IDs for attribution. In
+[external mode](#external-mode), a gateway names the person behind each request
+and Nerve does not use local accounts.
 
 | Table | Purpose |
 |---|---|
@@ -74,12 +76,14 @@ A password cannot be removed.
 
 An installation becomes passwordless only by an explicit choice:
 
-- `nerve init` asks for a password. An empty answer asks you to confirm
-  "Keep this installation passwordless".
+- The default `nerve init` asks nothing about accounts: it prints the setup
+  token and leaves the choice to the browser setup page, whose first step
+  has a "Keep this installation passwordless" option.
+- `nerve init --terminal` asks for a password. An empty answer asks you to
+  confirm "Keep this installation passwordless".
 - `nerve init --non-interactive` reads `NERVE_PASSWORDLESS=1`. It refuses
   `NERVE_PASSWORD` and `NERVE_PASSWORDLESS=1` together. With neither, setup
   stays incomplete, and you complete it in the browser.
-- The browser setup page has a "Keep this installation passwordless" option.
 
 The installer reads these values once. Setup completion is persistent, so
 changing the environment later has no effect.
@@ -87,10 +91,12 @@ changing the environment later has no effect.
 ### Claiming the first account
 
 While setup is not complete, login is refused. Open `/setup`, enter the setup
-token that `nerve status` shows, and set a username and password or keep the
-installation passwordless. The claim updates the existing account, records
-setup as complete and deletes the token, in one transaction. See
-[Setup](setup.md#claiming-an-instance-from-a-browser).
+token that `nerve init` printed (`nerve status` shows it again), and set a
+username and password or keep the installation passwordless. The claim
+updates the existing account, records setup as complete and deletes the
+token, in one transaction. It is the first step of the setup wizard: on
+success you are signed in and the wizard continues with the Mode step. See
+[Setup](setup.md#the-setup-token).
 
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the
@@ -115,6 +121,51 @@ installation's system actor.
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
 connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
+
+### External mode
+
+With `NERVE_AUTH_MODE=external`, a gateway in front of Nerve signs people in
+and names the person behind each request. See
+[Authentication mode](config.md#authentication-mode).
+
+| Credential | Acts as |
+|---|---|
+| `X-Nerve-Actor-Context` header | The human actor that the header names |
+| Login session | Refused with `401` |
+| Nerve CLI and internal API token | The system actor |
+| Backend and external MCP token | The system actor |
+
+The header is a compact JWS. Nerve reads `principal_id` and
+`profile.display_name` from its payload. It does not check the signature or
+any other claim. `principal_id` must be a UUID, and Nerve uses its lowercase
+form as the actor ID. `profile.display_name` must be a string, `null`, or
+absent. A header that Nerve cannot read, a header that names the system actor,
+and a request with more than one header give `401`. When the header is
+present, Nerve does not read `Authorization`, the `nerve_token` cookie or
+`?token=`. The gateway also sends the header on the WebSocket upgrade request.
+The connection keeps the actor of that request until it closes.
+
+Nerve adds an `actor_refs` row of kind `human` when it sees a principal for the
+first time, and writes the display name again when it changes. The row has no
+`accounts` row. Nerve does not check the access of the person; the gateway
+does.
+
+In external mode:
+
+- `POST /api/auth/login` returns `404`. The account routes (`/api/accounts`)
+  and the setup claim (`/api/setup/claim`) are not available. The setup
+  checklist (`/api/setup`, the `/setup` page) is: any person the gateway
+  names may run it, and it never reads local-account state. See
+  [Instances with external authentication](setup.md#instances-with-external-authentication).
+- Startup creates no account and deletes a setup token from an earlier local
+  mode. It still makes the signing secret, because system and MCP tokens need
+  it.
+- Accounts and history from an earlier local mode stay in `nerve.db`.
+
+> **Warning:** Nerve trusts the header. Use external mode only when the
+> gateway is the only caller that can reach Nerve. A caller that can send the
+> header can act as any person, also as the actor of an account from an earlier
+> local mode.
 
 ## Attribution
 

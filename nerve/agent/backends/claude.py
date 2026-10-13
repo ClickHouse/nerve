@@ -57,6 +57,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.images import validate_image_data, validate_image_file
 from nerve.agent.cache_policy import cache_ttl_env
@@ -434,7 +435,7 @@ class ClaudeBackend:
         # ScheduleWakeup is a Claude CLI built-in (captured via the
         # PostToolUse hook) — the registry equivalent exists for backends
         # without built-ins and would be a confusing duplicate here.
-        return {"schedule_wakeup"}
+        return {"schedule_wakeup"} | config_excluded_tools(self.config)
 
     def validate_resume_target(self, native_id: str, cwd: str) -> bool:
         """Check whether Claude Code still has the conversation .jsonl
@@ -511,7 +512,7 @@ class ClaudeBackend:
             else self._effective_effort(spec.effort, selected_model)
         )
         # Some subscriptions reject the context-1m beta for specific models
-        # (e.g. claude-sonnet-4-6) — skip the beta header for those.
+        # (some Sonnet models, for instance) — skip the beta header for those.
         betas = (
             ["context-1m-2025-08-07"]
             if not is_ollama_model
@@ -718,20 +719,32 @@ class ClaudeBackend:
             api_key = config.effective_api_key
             if api_key:
                 env["ANTHROPIC_API_KEY"] = api_key
-            if config.proxy.enabled:
+            elif getattr(config, "claude_oauth_token", ""):
+                # A subscription token from `claude setup-token`: the CLI
+                # reads it from this variable. An API key wins when both exist.
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = config.claude_oauth_token
+            if config.proxy.enabled or config.anthropic_base_url:
+                # The endpoint of Nerve's own SDK clients. The CLI adds /v1.
                 env["ANTHROPIC_BASE_URL"] = (
-                    f"http://{config.proxy.host}:{config.proxy.port}"
+                    config.anthropic_api_base_url.removesuffix("/v1/")
                 )
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
         # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-        # env vars. Nerve defaults "opus" → claude-opus-5 (skipped on Bedrock,
-        # where model IDs need a geo prefix — set agent.model_aliases with
-        # explicit prefixed IDs there). User-configured aliases merge over
-        # the default; an empty value unsets it (CLI built-in mapping wins).
+        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL and
+        # "haiku" → nerve.config.DEFAULT_FAST_MODEL (skipped on Bedrock, where
+        # model IDs need a geo prefix — set agent.model_aliases with explicit
+        # prefixed IDs there). The haiku value is also the CLI's small fast
+        # model for background calls: the CLI reads ANTHROPIC_SMALL_FAST_MODEL
+        # first and falls back to ANTHROPIC_DEFAULT_HAIKU_MODEL.
+        # User-configured aliases merge over the defaults; an empty value
+        # unsets one (CLI built-in mapping wins).
+        from nerve.config import DEFAULT_FAST_MODEL, DEFAULT_MODEL
+
         aliases: dict[str, str] = {}
         if not config.provider.is_bedrock:
-            aliases["opus"] = "claude-opus-5"
+            aliases["opus"] = DEFAULT_MODEL
+            aliases["haiku"] = DEFAULT_FAST_MODEL
         aliases.update(config.agent.model_aliases)
         for alias, target in aliases.items():
             env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
@@ -967,7 +980,7 @@ class ClaudeBackend:
             return {"type": "adaptive"}
 
     # Effort levels accepted per Claude model — substring-matched against the
-    # full model name so dated aliases (e.g. "claude-opus-4-8-20260528") resolve.
+    # full model name so dated aliases (a model id with a date suffix) resolve.
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
