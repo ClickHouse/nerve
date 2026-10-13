@@ -1668,6 +1668,10 @@ those for another session. Events marked *global* go to every socket.
 // Turn stopped by a user / error
 { type: "stopped", session_id: "main" }
 { type: "error", session_id: "main", error: "..." }
+// A message refused because Nerve is shutting down, sent to its sender only.
+// With client_msg_id, a tab that queued the message behind a running turn
+// puts the text back in the composer and keeps streaming that turn.
+{ type: "error", session_id: "main", error: "...", client_msg_id: "4b6f…" | null }
 
 // An autonomous turn starts (the runtime resumed after background work
 // settled). triggers names the agents that settled since the last turn
@@ -1702,7 +1706,8 @@ those for another session. Events marked *global* go to every socket.
 // Live-agent counts changed between turns (global, debounced 1 s)
 { type: "session_agents", session_id: "s-1234", background_count: 5, has_background_tasks: true }
 // The turn queue: the full queue, plus what just left it (never buffered)
-{ type: "queue_update", session_id: "s-1234", queue: [QueueEntryView], removed?: [{ queue_id: "q_9c1d2e3f" | null, client_msg_id: "4b6f…" | null, reason: "started" | "cancelled" | "duplicate" }] }
+{ type: "queue_update", session_id: "s-1234", queue: [QueueEntryView], removed?: [{ queue_id: "q_9c1d2e3f" | null, client_msg_id: "4b6f…" | null, reason: "started" | "cancelled" | "duplicate" | "refused" }] }
+// "refused": Nerve is shutting down and did not run the message (an error event follows)
 // Kept for one release for tabs from before the agent roster (ignored by
 // the current UI): status is running | done | failed
 { type: "background_tasks_update", session_id: "s-1234", tasks: [{ task_id: "a1b2…", label: "build-api", tool: "Agent", status: "running" }] }

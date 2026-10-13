@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.access import (
     Decision,
     Identity,
@@ -1242,6 +1243,9 @@ class SlackChannel(BaseChannel):
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a message from %s", target)
         except Exception as e:
             logger.error("Agent error for %s: %s", target, e, exc_info=True)
             await self._post(target, f"Error: {e}")
@@ -1294,6 +1298,9 @@ class SlackChannel(BaseChannel):
         )
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a reaction from %s", target)
         except Exception as e:
             logger.error("Agent error for reaction in %s: %s", target, e, exc_info=True)
 

@@ -573,6 +573,26 @@ class TestInvoke:
         hosted.config.slack.enabled = True
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
 
+    async def test_a_draining_engine_stops_intake_and_the_event_stays_in_the_inbox(self, hosted):
+        stream = await hosted.stream()
+        await hosted.gateway.wait_for(lambda: len(hosted.gateway.reads) >= 1)
+        hosted.router.engine.accepting_turns = False
+        reads_before = len(hosted.gateway.reads)
+        inbox_id = hosted.gateway.store(message_event(
+            conversation="D0DIRECT", conversation_kind="direct", message_id="8.5",
+        ))
+
+        await stream.nudge("invoke")
+        await asyncio.sleep(0.3)
+        assert len(hosted.gateway.reads) == reads_before
+        assert inbox_id not in hosted.gateway.acknowledged
+        assert hosted.turns.runs == []
+
+        # The next start reads the event that the drain left in the inbox.
+        hosted.router.engine.accepting_turns = True
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await hosted.turns.wait_for(1)
+
     async def test_a_provider_off_before_the_first_stream_takes_events_once_turned_on(self, hosted):
         hosted.config.slack.enabled = False
         stream = await hosted.stream()

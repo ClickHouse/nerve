@@ -1425,6 +1425,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // this session). That says nothing about the turn: the transcript tab
         // shows what its REST fetch found, and the chat keeps streaming.
         if (msg.error === AGENT_NOT_FOUND) return;
+        // The server refused a message that this tab queued behind a running
+        // turn. The turn goes on, so the streaming view stays as it is.
+        if (msg.client_msg_id && useAgentStore.getState().refusePendingSend(msg.client_msg_id)) {
+          set((s) => ({
+            messages: [...s.messages, { role: 'assistant' as const, blocks: [{ type: 'text', content: `Error: ${msg.error}` }] }],
+          }));
+          return;
+        }
         return handleError(msg, get, set);
       // Sessions
       case 'session_updated':  return handleSessionUpdated(msg, get, set);

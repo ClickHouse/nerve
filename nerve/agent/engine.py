@@ -124,6 +124,19 @@ _RESUME_AFTER_RESTART_PROMPT = (
     "and carry on."
 )
 
+# Sent to the session's clients when run() refuses a turn during a drain.
+_NOT_ACCEPTING_TURNS_MESSAGE = (
+    "Nerve is shutting down and did not run this message. "
+    "Send it again when Nerve is back."
+)
+
+
+class NotAcceptingTurnsError(RuntimeError):
+    """``AgentEngine.run`` refused a new turn because the engine is draining."""
+
+    def __init__(self) -> None:
+        super().__init__(_NOT_ACCEPTING_TURNS_MESSAGE)
+
 
 def _sanitize_surrogates(s: str) -> str:
     """Remove orphaned UTF-16 surrogates that break JSON serialization.
@@ -384,6 +397,9 @@ class AgentEngine:
         self.sessions = SessionManager(db, default_cwd=str(config.workspace))
         self.config = config
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
+        # Cleared by stop_accepting_turns(). Never set again: a drain ends
+        # with the process exit.
+        self._accepting_turns = True
         self._memory_bridge = None
         self._xmemory_bridge = None
         self._skill_manager: SkillManager | None = None
@@ -1920,6 +1936,75 @@ class AgentEngine:
                 "Discarded client for session %s (clear_resume=%s)",
                 session_id, clear_resume,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Drain                                                               #
+    # ------------------------------------------------------------------ #
+
+    # How often drain() checks for running turns (seconds).
+    _DRAIN_POLL_SECONDS = 0.5
+
+    @property
+    def accepting_turns(self) -> bool:
+        """False after stop_accepting_turns(). Schedulers read this to skip work."""
+        return self._accepting_turns
+
+    def stop_accepting_turns(self) -> None:
+        """Make run() refuse every new turn. Running turns continue."""
+        if self._accepting_turns:
+            self._accepting_turns = False
+            logger.info("Engine no longer accepts new turns")
+
+    async def drain(self, timeout: float) -> bool:
+        """Stop accepting new turns, then wait for the running turns to end.
+
+        Returns True when no turn is running, or False if ``timeout``
+        seconds pass first. This does not stop the turns that are still
+        running.
+        """
+        self.stop_accepting_turns()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        running = self.sessions.get_running_ids()
+        if not running:
+            return True
+        logger.info(
+            "Drain: waiting up to %ss for %d running turn(s): %s",
+            timeout, len(running), ", ".join(sorted(running)),
+        )
+        while running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Drain: %d turn(s) still running after %ss: %s",
+                    len(running), timeout, ", ".join(sorted(running)),
+                )
+                return False
+            await asyncio.sleep(min(self._DRAIN_POLL_SECONDS, remaining))
+            running = self.sessions.get_running_ids()
+        logger.info("Drain: all running turns ended")
+        return True
+
+    async def _refuse_turn(
+        self,
+        session_id: str,
+        *,
+        entry: QueuedTurn | None = None,
+        client_msg_id: str | None = None,
+    ) -> None:
+        """Tell the session's clients that run() refused the turn, then raise.
+
+        A run that has a queue entry or a ``client_msg_id`` is reported in
+        ``queue_update`` with the reason ``refused``. The caller removes the
+        entry from the queue first.
+        """
+        if entry is not None or client_msg_id:
+            await self._emit_queue_update(session_id, removed=[{
+                "queue_id": entry.queue_id if entry is not None else None,
+                "client_msg_id": client_msg_id, "reason": "refused",
+            }])
+        await broadcaster.broadcast_error(session_id, _NOT_ACCEPTING_TURNS_MESSAGE)
+        raise NotAcceptingTurnsError()
 
     # ------------------------------------------------------------------ #
     #  Public API: run, stop, fork, resume                                 #
@@ -3571,6 +3656,12 @@ class AgentEngine:
             origin: Label of where the message came from, shown on its queue
                       entry (``"web"``, ``"api"``, a channel name). Defaults
                       to ``source``.
+
+        Raises:
+            NotAcceptingTurnsError: the engine is draining. The user message
+                      is not stored, the session's clients get an error
+                      event, and a queued run leaves the queue with the
+                      reason ``refused``.
         """
         return (await self._run_turn(
             session_id=session_id,
@@ -3620,6 +3711,8 @@ class AgentEngine:
                 "queue_id": None, "client_msg_id": client_msg_id, "reason": "duplicate",
             }])
             return TurnResult("", TurnOutcome("interrupted", "dropped as a repeated message"))
+        if not self._accepting_turns:
+            await self._refuse_turn(session_id, client_msg_id=client_msg_id)
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running", and are listed
         # while they wait.
@@ -3656,6 +3749,14 @@ class AgentEngine:
             raise
         turn_task = asyncio.current_task()
         try:
+            # Check again: a drain can start while this run waits in the
+            # queue. Its entry then leaves the queue as refused, not started.
+            if not self._accepting_turns:
+                if entry is not None:
+                    self._dequeue_turn(session_id, entry)
+                await self._refuse_turn(
+                    session_id, entry=entry, client_msg_id=client_msg_id,
+                )
             # The Stop target from the moment this run holds the run lock:
             # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
@@ -3698,6 +3799,13 @@ class AgentEngine:
         :meth:`_run_inner`."""
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
+            # Check again: a drain can start after the check in _run_turn,
+            # for example while this turn waits for a concurrency slot. No
+            # await between this check and mark_running, so drain() cannot
+            # miss this turn.
+            if not self._accepting_turns:
+                broadcaster.stop_buffering(session_id)
+                await self._refuse_turn(session_id)
             # Clear any stale deferred-stop flag left over from a *previous*
             # turn.  If /stop arrived while the old turn was still cleaning up
             # (mark_not_running hadn't run yet), the flag lingers and would
