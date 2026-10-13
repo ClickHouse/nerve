@@ -40,6 +40,10 @@ from nerve.config import DEFAULT_EFFORT, AgentConfig, NerveConfig
         ("max",    "claude-sonnet-5-5",         "max"),
         ("xhigh",  "claude-sonnet-5-5",         "xhigh"),
         ("low",    "claude-sonnet-5-5",         "low"),
+        # Haiku 5.5 supports the full ladder
+        ("max",    "claude-haiku-5-5",          "max"),
+        ("xhigh",  "claude-haiku-5-5",          "xhigh"),
+        ("low",    "claude-haiku-5-5",          "low"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),
@@ -96,6 +100,23 @@ def test_effective_effort_model_default_none():
 )
 def test_parse_thinking_config_disabled(model, expected):
     assert ClaudeBackend._parse_thinking_config("disabled", model) == expected
+
+
+@pytest.mark.parametrize(
+    "effort, expected",
+    [
+        # Haiku 5.5 accepts thinking.type="disabled" at high effort or below.
+        ("low",    {"type": "disabled"}),
+        ("medium", {"type": "disabled"}),
+        ("high",   {"type": "disabled"}),
+        ("xhigh",  {"type": "adaptive"}),
+        ("max",    {"type": "adaptive"}),
+        (None,     {"type": "adaptive"}),
+    ],
+)
+@pytest.mark.parametrize("model", ["claude-haiku-5-5", "us.anthropic.claude-haiku-5-5"])
+def test_parse_thinking_config_disabled_haiku_5_5(model, effort, expected):
+    assert ClaudeBackend._parse_thinking_config("disabled", model, effort) == expected
 
 
 @pytest.mark.parametrize(
