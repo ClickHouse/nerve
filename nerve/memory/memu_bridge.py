@@ -33,6 +33,7 @@ import numpy as np
 from nerve import paths
 from nerve.config import NerveConfig
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.utils.llm import response_text
 
 logger = logging.getLogger(__name__)
 
@@ -516,8 +517,7 @@ class _BedrockLLMClient:
         # when Langfuse is disabled.
         with lf_attrs(tags=["component:memu", f"model:{self.chat_model}"]):
             response = await self._bedrock.messages.create(**kwargs)
-        text = response.content[0].text if response.content else ""
-        return text, response
+        return response_text(response), response
 
     async def summarize(
         self,
@@ -2951,7 +2951,7 @@ class MemUBridge:
         result: dict[str, str | None] = {}
         try:
             import re
-            text = response.content[0].text
+            text = response_text(response)
             json_match = re.search(r"\[.*\]", text, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -3076,12 +3076,14 @@ class MemUBridge:
         client = self._get_anthropic_client()
         response = client.messages.create(
             model=model,
-            max_tokens=512,
+            # Thinking counts toward max_tokens, and the 5.5 models think by
+            # default.
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
 
         try:
-            text = response.content[0].text
+            text = response_text(response)
             json_match = _re.search(r"\[.*?\]", text, _re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())

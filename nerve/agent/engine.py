@@ -79,6 +79,7 @@ from nerve.setup_writer import (
     task_onboarding_pending,
 )
 from nerve.skills.manager import SkillManager
+from nerve.utils.llm import response_text
 from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
@@ -3629,7 +3630,9 @@ class AgentEngine:
             client = self.config.create_anthropic_client(timeout=10.0)
             response = client.messages.create(
                 model=self.config.agent.title_model,
-                max_tokens=30,
+                # Thinking counts toward max_tokens, and the 5.5 models think
+                # by default.
+                max_tokens=1024,
                 messages=[{
                     "role": "user",
                     "content": (
@@ -3639,7 +3642,7 @@ class AgentEngine:
                     ),
                 }],
             )
-            title = response.content[0].text.strip().strip('"\'').lstrip('#').strip()
+            title = response_text(response).strip().strip('"\'').lstrip('#').strip()
             if title and len(title) < 60:
                 await self.db.update_session_title(session_id, title)
                 await broadcaster.broadcast(session_id, {
