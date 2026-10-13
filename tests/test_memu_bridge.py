@@ -401,8 +401,8 @@ class TestConfigMemoryModels:
 
     def test_defaults(self):
         config = MemoryConfig()
-        assert config.recall_model == "claude-sonnet-4-6"
-        assert config.memorize_model == "claude-sonnet-4-6"
+        assert config.recall_model == "claude-sonnet-5-5"
+        assert config.memorize_model == "claude-sonnet-5-5"
         assert config.fast_model == "claude-haiku-5-5"
         assert config.embed_model == ""
 
@@ -420,8 +420,8 @@ class TestConfigMemoryModels:
 
     def test_from_dict_uses_defaults(self):
         config = MemoryConfig.from_dict({})
-        assert config.recall_model == "claude-sonnet-4-6"
-        assert config.memorize_model == "claude-sonnet-4-6"
+        assert config.recall_model == "claude-sonnet-5-5"
+        assert config.memorize_model == "claude-sonnet-5-5"
 
     def test_semantic_dedup_threshold_default(self):
         config = MemoryConfig()

@@ -84,7 +84,7 @@ Reinforced items rank higher in search results via salience-aware ranking: `simi
 ### Configuration
 
 memU uses two or three LLM profiles depending on configuration:
-- **Chat** — Anthropic API for recall routing (claude-sonnet-4-6)
+- **Chat** — Anthropic API for recall routing (claude-sonnet-5-5)
 - **Fast** — Anthropic API for fact extraction and categorization (claude-haiku-5-5)
 - **Embedding** *(optional)* — OpenAI text-embedding-3-small for vector search. Only active when `openai_api_key` is set.
 
@@ -93,8 +93,8 @@ When no OpenAI key is configured, memU uses **LLM-based recall** instead of vect
 Config in `<workspace>/config/settings.yaml`:
 ```yaml
 memory:
-  recall_model: claude-sonnet-4-6         # recall routing
-  memorize_model: claude-sonnet-4-6       # writing memories back
+  recall_model: claude-sonnet-5-5         # recall routing
+  memorize_model: claude-sonnet-5-5       # writing memories back
   fast_model: claude-haiku-5-5            # extraction & categorization
   # embed_model: text-embedding-3-small   # only needed with openai_api_key
   categories: [...]  # see Categories section above

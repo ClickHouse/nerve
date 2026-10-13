@@ -78,7 +78,7 @@ jobs:
     schedule: "30 11 * * *"        # 11:30 AM daily
     prompt: "Give me a morning briefing..."
     description: "Daily morning summary"
-    model: claude-sonnet-4-6       # Optional model override
+    model: claude-sonnet-5-5       # Optional model override
     target: telegram               # Delivery channel
     session_mode: isolated         # "isolated", "persistent", or "main"
     enabled: true

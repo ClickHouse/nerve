@@ -13,7 +13,7 @@ gateway:
   port: 8900
 agent:
   model: eu.anthropic.claude-opus-5-5
-  cron_model: eu.anthropic.claude-sonnet-4-6
+  cron_model: eu.anthropic.claude-sonnet-5-5
   max_turns: 50
   max_concurrent: 32
   thinking: max
@@ -23,8 +23,8 @@ agent:
 quiet_start: ''
 quiet_end: ''
 memory:
-  recall_model: eu.anthropic.claude-sonnet-4-6
-  memorize_model: eu.anthropic.claude-sonnet-4-6
+  recall_model: eu.anthropic.claude-sonnet-5-5
+  memorize_model: eu.anthropic.claude-sonnet-5-5
   fast_model: eu.anthropic.claude-haiku-5-5
   embed_model: text-embedding-3-small
   categories:

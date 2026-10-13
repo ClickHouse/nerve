@@ -59,7 +59,7 @@ agent:
   model: claude-opus-5-5         # Primary model for conversations (Nerve's default)
   # Use claude-fable-5-1 for Anthropic's newest generation (Mythos-class).
   # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
-  cron_model: claude-sonnet-4-6  # Cheaper model for cron jobs
+  cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
   title_model: claude-haiku-5-5  # Session title generation
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
@@ -79,7 +79,7 @@ agent:
   # neither discovery nor the bare built-ins would resolve).
   # models:
   #   - claude-opus-5-5
-  #   - claude-sonnet-4-6
+  #   - claude-sonnet-5-5
   # Ask the Anthropic Models API (GET /v1/models) at startup which models the
   # configured credentials' catalog endpoint advertises, so a newly released
   # model shows up in the picker without a config edit. Catalog membership is
@@ -115,7 +115,7 @@ agent:
     timeout_seconds: 45
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-5-5
-  #   cron_model: us.anthropic.claude-sonnet-4-6
+  #   cron_model: us.anthropic.claude-sonnet-5-5
   #   title_model: us.anthropic.claude-haiku-5-5
 
 # Gateway
@@ -318,7 +318,7 @@ sync:
 
 # Memory (memU)
 memory:
-  recall_model: claude-sonnet-4-6
+  recall_model: claude-sonnet-5-5
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
 
 # Cron — no path keys needed. Cron config lives in <workspace>/config/cron/

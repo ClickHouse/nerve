@@ -269,7 +269,7 @@ Response: {
                   "anthropic_api_key": { "configured": true, "last4": "ab12", "source": "file" },
                   "claude_oauth_token": { "configured": false, "last4": null, "source": null },
                   "proxy_enabled": false, "aws_region": "", "aws_profile": "",
-                  "model": "claude-opus-5-5", "effort": "xhigh", "cron_model": "claude-sonnet-4-6",
+                  "model": "claude-opus-5-5", "effort": "xhigh", "cron_model": "claude-sonnet-5-5",
                   "warning": null, "last_test": { "ok": true, "code": "ok", "detail": "claude-haiku-5-5 answered", "checked_at": "2026-10-10T09:12:03Z" } } },
     { "id": "profile", "title": "About you", "status": "pending", "required": false, "can_skip": true,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",

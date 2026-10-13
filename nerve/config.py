@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 # model-id literal anywhere else under ``nerve/`` — so the next update is one
 # edit here plus the regenerated goldens, examples and docs.
 DEFAULT_MODEL = "claude-opus-5-5"               # agent.model (conversations)
-DEFAULT_CRON_MODEL = "claude-sonnet-4-6"        # agent.cron_model
+DEFAULT_CRON_MODEL = "claude-sonnet-5-5"        # agent.cron_model
 DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
-DEFAULT_RECALL_MODEL = "claude-sonnet-4-6"      # memory.recall_model
-DEFAULT_MEMORIZE_MODEL = "claude-sonnet-4-6"    # memory.memorize_model
+DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
+DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
 DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
 DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
 DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
