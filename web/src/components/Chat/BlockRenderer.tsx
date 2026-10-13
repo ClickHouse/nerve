@@ -6,7 +6,8 @@ import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
-import { getToken } from '../../api/client';
+import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
+import { authUrl } from '../../api/hosted';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -25,6 +26,7 @@ export function BlockRenderer({
   textClassName,
 }: BlockRendererProps) {
   const renderItems = useMemo(() => groupToolCalls(blocks), [blocks]);
+  const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
 
   return (
     <>
@@ -83,9 +85,9 @@ export function BlockRenderer({
           case 'thinking':
             return <ThinkingBlock key={i} content={item.content} streaming={isLast} />;
           case 'tool_call':
-            return <ToolCallBlock key={i} block={item} />;
+            return <ToolCallBlock key={i} block={item} repeatRunCard={repeatRunCalls.has(item.toolUseId)} />;
           case 'tool_call_group':
-            return <ToolCallGroupBlock key={i} group={item} />;
+            return <ToolCallGroupBlock key={i} group={item} repeatRunCalls={repeatRunCalls} />;
           case 'text': {
             const inner = (
               <>
@@ -104,7 +106,7 @@ export function BlockRenderer({
             );
           }
           case 'image': {
-            const imgUrl = `${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`;
+            const imgUrl = authUrl(item.url);
             return (
               <div key={i} className="my-2">
                 <a href={imgUrl} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
@@ -117,7 +119,7 @@ export function BlockRenderer({
             return (
               <div key={i} className="my-2">
                 <a
-                  href={`${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                  href={authUrl(item.url)}
                   download={item.filename}
                   className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
                 >

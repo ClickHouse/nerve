@@ -1,21 +1,30 @@
 """First-run bootstrap wizard — interactive CLI that guides through initial setup.
 
-Each step explains what the component does before asking for configuration.
-All choices are collected in memory; nothing is written until the final apply step.
-Ctrl+C at any point leaves the system untouched.
+Two interactive shapes live here. :class:`SlimSetup` is the default
+``nerve init``: it decides only what a browser cannot — how Nerve runs on this
+machine, where its files live, how the gateway listens — starts the daemon and
+hands over to the setup page. :class:`SetupWizard` is the full terminal wizard
+(``nerve init --terminal``) that asks everything; ``run_non_interactive`` is
+the unattended path.
+
+What the wizards *ask* lives here. What setup *writes* lives in
+:mod:`nerve.setup_writer`, because the web setup wizard has to produce the
+same configuration this does, and two implementations of setup drift.
 """
 
 from __future__ import annotations
 
-import copy
+import errno
 import json
 import os
+import socket
 import stat
 import secrets
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,164 +32,59 @@ import click
 import yaml
 
 from nerve import paths
-from nerve.config import _expand_path, _interpolate_str, workspace_settings_file
+from nerve.config import DEFAULT_MODEL, workspace_settings_file
+from nerve.setup_writer import (
+    CONFIG_YAML_HEADER,
+    CORE_CRONS,
+    DEFAULT_CRONS,
+    PRODUCTIVITY_CRONS,
+    SetupChoices,
+    SlimOutcome,
+    WRITER_OWNED_TEMPLATES,
+    _DOCKER_NERVE_HOME,
+    _DOCKER_TOOLS_SECTION,
+    _DOCKER_WORKSPACE,
+    _PERSONAL_MEMORY_CATEGORIES,
+    _WORKER_MEMORY_CATEGORIES,
+    apply_profile_templates,
+    apply_task_md,
+    bedrock_geo_prefix,
+    build_config_layers,
+    # Re-exported under its old private name: this module has been its import
+    # site since the wizard was written, and `nerve init` is not the only
+    # caller that expands a workspace path the way the loader does.
+    expand_workspace as _expand_workspace,
+    leaf_paths,
+    merge_external_agents,
+    write_config_local_yaml,
+    write_config_yaml,
+    write_cron_jobs,
+    write_slim_install,
+    workspace_dir,
+    write_workspace_settings,
+)
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
     install_config_scaffold,
 )
 
-
-# --- Cron definitions for the wizard ---
-
-# Core crons are always enabled and not presented for selection.
-CORE_CRONS = [
-    {
-        "id": "memory-maintenance",
-        "schedule": "0 5 * * *",
-        "description": "Daily memory cleanup — dedup, prune stale entries, improve wording",
-        "session_mode": "isolated",
-        "model": "",
-        "prompt": (
-            "You are running a daily memory maintenance job. Work completely silently — do not output any text, only think.\n\n"
-            "Do the following:\n\n"
-            "## Phase 1: Gather Yesterday's Data\n\n"
-            "1. Use memory_records_by_date(date=yesterday, updated=true, limit=200) to get ALL records created or updated yesterday.\n"
-            "2. Optionally: use conversation_history(date=yesterday) for additional event context.\n\n"
-            "## Phase 2: Evaluate Each Record\n\n"
-            "For each record from yesterday, evaluate and act:\n"
-            "- **Exact duplicates**: Same fact already stored elsewhere → delete the worse copy\n"
-            "- **Category-redundant**: Adds nothing beyond category summary → delete\n"
-            "- **Stale/completed**: No longer true → delete\n"
-            "- **Generic knowledge**: Textbook facts not personal to the user → delete\n"
-            "- **Meta-noise**: Observations about the memory system itself → delete\n"
-            "- **Improvable**: Poorly worded or could be more useful → update via memory_update\n\n"
-            "## Phase 3: Category Review\n\n"
-            "If yesterday's memories revealed new important context, check whether category summaries need updating.\n\n"
-            "Rules:\n"
-            "- Never delete entries about people, relationships, or preferences unless exact duplicates\n"
-            "- Never delete actionable/pending items\n"
-            "- Updating is better than deleting\n"
-            "- When in doubt, keep the memory\n"
-            "- Do NOT log or memorize anything about this maintenance run\n"
-        ),
-    },
-]
-
-# Productivity crons the user can enable/disable.
-PRODUCTIVITY_CRONS = [
-    {
-        "id": "inbox-processor",
-        "name": "Inbox Processor",
-        "schedule": "*/30 * * * *",
-        "description": "Polls your connected sources (email, GitHub, Telegram) every 30 minutes. Creates tasks for actionable items, memorizes important facts, and sends you notifications for urgent things.",
-        "requires": "At least one sync source connected",
-        "session_mode": "persistent",
-        "context_rotate_hours": 24,
-        "reminder_mode": True,
-        # Skip idle polls: only wake when the inbox actually has new messages.
-        # No "sources" list → any source the "inbox" consumer tracks.
-        "run_if": [{"type": "messages", "consumer": "inbox"}],
-        "prompt": (
-            "Process the sync inbox by calling poll_all_sources(consumer=\"inbox\").\n\n"
-            "If there are new messages, review them and take appropriate action:\n"
-            "- **Create tasks** (via task_create) for items requiring follow-up\n"
-            "- **Memorize** important facts (via memorize) worth remembering\n"
-            "- **Ignore** routine notifications, spam, or low-signal items\n\n"
-            "Cross-source deduplication: if multiple sources report the same event, treat as ONE.\n\n"
-            "**Notifications — use them!**\n"
-            "- Use `notify` for urgent/high-priority items\n"
-            "- Use `ask_user` when unsure\n"
-            "- Do NOT notify for routine items\n\n"
-            "Be selective. If no new messages, reply \"No new messages.\"\n"
-        ),
-    },
-    {
-        "id": "task-planner",
-        "name": "Task Planner",
-        "schedule": "0 */4 * * *",
-        "description": "Every 4 hours, reviews your open tasks and proposes implementation plans. Plans go through an approval flow — nothing is executed without your OK.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        # Only fire when there is actually something to plan.
-        "run_if": [{"type": "tasks", "status": "pending"}],
-        "prompt": (
-            "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
-            "1. Use task_list to browse open tasks\n"
-            "2. Use plan_list to see which tasks already have plans — skip those\n"
-            "3. Pick ONE task and explore the relevant codebase\n"
-            "4. Call plan_propose(task_id, content) with your plan\n\n"
-            "If all tasks have plans or none are actionable, say so and stop.\n\n"
-            "After proposing a plan, use `notify` to alert the user.\n"
-        ),
-    },
-    {
-        "id": "skill-extractor",
-        "name": "Skill Extractor",
-        "schedule": "0 */12 * * *",
-        "description": "Every 12 hours, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        "prompt": (
-            "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
-            "1. Recall recent behavior patterns and events\n"
-            "2. Check existing skills to avoid duplicates\n"
-            "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
-            "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
-            "If no candidates found, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
-        ),
-    },
-    {
-        "id": "skill-reviser",
-        "name": "Skill Reviser",
-        "schedule": "0 3 * * 0",
-        "description": "Weekly review of existing skills — checks if instructions are still accurate, complete, and well-written. Proposes fixes through the approval flow.",
-        "requires": None,
-        "session_mode": "persistent",
-        "context_rotate_hours": 168,
-        "reminder_mode": False,
-        "prompt": (
-            "You are a skill revision agent. Review existing skills and propose improvements.\n\n"
-            "1. Load all skills and their content\n"
-            "2. Check accuracy (outdated paths, commands, URLs)\n"
-            "3. Check completeness (missing steps, known gotchas)\n"
-            "4. Check quality (clear descriptions, good trigger phrases)\n"
-            "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
-            "If all skills look good, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
-        ),
-    },
-]
-
-# Default memory categories for a fresh install.
-# Generic enough for any user — they can customize in config.yaml later.
-_PERSONAL_MEMORY_CATEGORIES = [
-    {"name": "personal_info", "description": "Identity, contact details, timezone, background"},
-    {"name": "preferences", "description": "Communication style, tool preferences, how things should be done"},
-    {"name": "relationships", "description": "People, dynamics, contact context"},
-    {"name": "work", "description": "Job, projects, PRs, code reviews, meetings"},
-    {"name": "infrastructure", "description": "Servers, deployments, CI/CD, system ops"},
-    {"name": "finances", "description": "Accounts, payments, subscriptions, budgets"},
-    {"name": "tasks_deadlines", "description": "Active tasks, deadlines, pending follow-ups"},
-    {"name": "conversations", "description": "Key things said, promises, follow-ups"},
-    {"name": "agent_ops", "description": "Operational lessons, memory design, prompt tuning"},
-    {"name": "people", "description": "Information and facts about people"},
-]
-
-_WORKER_MEMORY_CATEGORIES = [
-    {"name": "task_domain", "description": "Domain-specific knowledge: CI systems, APIs, database schemas, repo structure"},
-    {"name": "patterns", "description": "Recurring patterns: common failure modes, root causes, known flaky tests, seasonal issues"},
-    {"name": "procedures", "description": "How to do things: reproduction steps, debug workflows, fix templates that worked"},
-    {"name": "decisions", "description": "Past decisions and outcomes: what was tried, what worked, why approach X over Y"},
-    {"name": "approvals", "description": "What got approved/rejected, approval preferences, risk thresholds"},
-    {"name": "contacts", "description": "People involved: who owns what, who to notify, escalation paths"},
-    {"name": "infrastructure", "description": "Systems, endpoints, service dependencies, deployment details"},
-    {"name": "agent_ops", "description": "Operational lessons about the worker itself: tool gotchas, performance observations"},
+# The wizard's answers, the layering rules and the writers live in
+# nerve.setup_writer, so the web setup wizard writes configuration through
+# exactly the code `nerve init` does rather than through a second
+# implementation that drifts. Re-exported here because this module has been
+# their import site since the wizard was written.
+__all__ = [
+    "CORE_CRONS",
+    "DEFAULT_CRONS",
+    "PRODUCTIVITY_CRONS",
+    "PASSWORDLESS_WARNING",
+    "SetupChoices",
+    "SetupWizard",
+    "SlimSetup",
+    "bedrock_geo_prefix",
+    "is_fresh_install",
+    "run_non_interactive",
 ]
 
 PASSWORDLESS_WARNING = (
@@ -190,69 +94,59 @@ PASSWORDLESS_WARNING = (
 )
 
 
-@dataclass
-class SetupChoices:
-    """Collected user choices — nothing is written until apply()."""
-
-    deployment: str = "server"  # "server" or "docker"
-    mode: str = "personal"
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
-    use_proxy: bool = False  # Use CLIProxyAPI instead of direct API key
-    # Provider
-    provider_type: str = "anthropic"  # "anthropic" | "bedrock"
-    aws_region: str = ""
-    aws_profile: str = ""
-    workspace_path: Path = field(default_factory=lambda: Path("~/nerve-workspace"))
-    timezone: str = "America/New_York"
-    user_name: str = ""
-    telegram_bot_token: str = ""
-    # Telegram user IDs authorized to DM the bot. Empty = pair after setup
-    # via `nerve pair` + /pair <code>.
-    telegram_allowed_users: list[int] = field(default_factory=list)
-    password: str = ""  # plaintext during wizard, hashed at write time
-    # The operator chose a passwordless installation. Without a password and
-    # without this, setup stays incomplete until the setup-token claim.
-    passwordless: bool = False
-    enabled_crons: list[str] = field(default_factory=list)
-    # sync sources
-    github_sync: bool = False
-    gmail_sync: bool = False
-    gmail_accounts: list[str] = field(default_factory=list)
-    telegram_sync: bool = False
-    telegram_api_id: int = 0
-    telegram_api_hash: str = ""
-    # docker credential forwarding
-    claude_oauth_token: str = ""  # OAuth token (from keychain/credentials.json/manual)
-    github_token: str = ""  # GitHub PAT (from gh auth token/env)
-    # worker-specific
-    task_description: str = ""
-    # external agents (Codex, Claude Code, ...)
-    external_agents: list[str] = field(default_factory=list)
-    external_agents_conflict_policy: str = "backup"   # "backup" | "skip" | "merge"
-    external_agents_mcp_url: str = ""                  # e.g. "https://localhost:8900/mcp/v1/"
-    external_agents_token: str = ""                    # bearer JWT (one-shot at bootstrap)
-
-
 # --- Credential resolution (priority waterfall) ---
 
 
 def _resolve_claude_credential() -> tuple[str, str, list[str]]:
     """Resolve Claude credential from host. First match wins.
 
-    Waterfall (priority cascade):
-      1a. macOS Keychain "Claude Code-credentials" (OAuth JSON)
-      1b. macOS Keychain "Claude Code" (raw API key)
-      2.  CLAUDE_CODE_OAUTH_TOKEN env var
-      3.  ~/.claude/.credentials.json file
-      4.  ANTHROPIC_API_KEY env var
+    Waterfall (priority cascade), non-prompting sources first — the Keychain
+    can raise an "allow access" dialog on the desktop, so it is asked last:
+      1.  CLAUDE_CODE_OAUTH_TOKEN env var
+      2.  ANTHROPIC_API_KEY env var
+      3.  ~/.claude/.credentials.json file (claudeAiOauth.accessToken)
+      4a. macOS Keychain "Claude Code-credentials" (OAuth JSON)
+      4b. macOS Keychain "Claude Code" (raw API key)
 
     Returns (token_value, source_label, debug_log).
     debug_log contains details about each step tried, useful when nothing is found.
     """
     debug: list[str] = []
 
-    # 1a. macOS Keychain — OAuth entry ("Claude Code-credentials")
+    # 1. CLAUDE_CODE_OAUTH_TOKEN env var
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if token:
+        debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: found")
+        return (token, "CLAUDE_CODE_OAUTH_TOKEN env var", debug)
+    debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: not set")
+
+    # 2. ANTHROPIC_API_KEY env var
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        debug.append("ANTHROPIC_API_KEY env var: found")
+        return (key, "ANTHROPIC_API_KEY env var", debug)
+    debug.append("ANTHROPIC_API_KEY env var: not set")
+
+    # 3. ~/.claude/.credentials.json file (Linux stores creds here; on a Mac
+    #    where Claude Code is signed in it may hold only mcpOAuth)
+    creds_file = Path("~/.claude/.credentials.json").expanduser()
+    if creds_file.exists():
+        try:
+            data = json.loads(creds_file.read_text(encoding="utf-8"))
+            token = data.get("claudeAiOauth", {}).get("accessToken", "")
+            if token:
+                debug.append("~/.claude/.credentials.json: found OAuth token")
+                return (token, "~/.claude/.credentials.json", debug)
+            debug.append(
+                f"~/.claude/.credentials.json: exists but no claudeAiOauth.accessToken "
+                f"(keys: {list(data.keys())})"
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            debug.append(f"~/.claude/.credentials.json: parse error — {exc}")
+    else:
+        debug.append(f"~/.claude/.credentials.json: file not found ({creds_file})")
+
+    # 4a. macOS Keychain — OAuth entry ("Claude Code-credentials")
     #     This is where `claude login` stores OAuth tokens on macOS.
     #     The value is a JSON blob; we extract claudeAiOauth.accessToken.
     if sys.platform == "darwin" and shutil.which("security"):
@@ -286,7 +180,7 @@ def _resolve_claude_credential() -> tuple[str, str, list[str]]:
         except (subprocess.TimeoutExpired, OSError) as exc:
             debug.append(f'keychain "Claude Code-credentials": error — {exc}')
 
-        # 1b. macOS Keychain — API key entry ("Claude Code")
+        # 4b. macOS Keychain — API key entry ("Claude Code")
         #     Plain string, not JSON. Used when an API key is stored directly.
         try:
             result = subprocess.run(
@@ -308,38 +202,6 @@ def _resolve_claude_credential() -> tuple[str, str, list[str]]:
             f"keychain: skipped (platform={sys.platform}, "
             f"security={'found' if shutil.which('security') else 'missing'})"
         )
-
-    # 2. CLAUDE_CODE_OAUTH_TOKEN env var
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    if token:
-        debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: found")
-        return (token, "CLAUDE_CODE_OAUTH_TOKEN env var", debug)
-    debug.append("CLAUDE_CODE_OAUTH_TOKEN env var: not set")
-
-    # 3. ~/.claude/.credentials.json file (Linux stores creds here)
-    creds_file = Path("~/.claude/.credentials.json").expanduser()
-    if creds_file.exists():
-        try:
-            data = json.loads(creds_file.read_text(encoding="utf-8"))
-            token = data.get("claudeAiOauth", {}).get("accessToken", "")
-            if token:
-                debug.append("~/.claude/.credentials.json: found OAuth token")
-                return (token, "~/.claude/.credentials.json", debug)
-            debug.append(
-                f"~/.claude/.credentials.json: exists but no claudeAiOauth.accessToken "
-                f"(keys: {list(data.keys())})"
-            )
-        except (json.JSONDecodeError, OSError) as exc:
-            debug.append(f"~/.claude/.credentials.json: parse error — {exc}")
-    else:
-        debug.append(f"~/.claude/.credentials.json: file not found ({creds_file})")
-
-    # 4. ANTHROPIC_API_KEY env var
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if key:
-        debug.append("ANTHROPIC_API_KEY env var: found")
-        return (key, "ANTHROPIC_API_KEY env var", debug)
-    debug.append("ANTHROPIC_API_KEY env var: not set")
 
     return ("", "none", debug)
 
@@ -371,25 +233,6 @@ def _resolve_gh_token() -> tuple[str, str]:
         return (token, "GH_TOKEN env var")
 
     return ("", "none")
-
-
-# --- Bedrock helpers ---
-
-
-def bedrock_geo_prefix(region: str) -> str:
-    """Map an AWS region to its Bedrock cross-region inference-profile prefix.
-
-    Bedrock inference profiles are geography-scoped: ``us.``, ``eu.`` and
-    ``apac.``. Writing a ``us.`` model ID for an ``eu-*`` region yields an
-    instant 400 ("The provided model identifier is invalid").
-    """
-    region = (region or "").lower()
-    if region.startswith("eu-"):
-        return "eu"
-    if region.startswith(("ap-", "au-")):
-        return "apac"
-    # us-*, ca-*, sa-*, mx-* and unknown regions route via the US profile
-    return "us"
 
 
 # --- Credential validators (used by the wizard and preflight) ---
@@ -524,6 +367,58 @@ def _choices_from_dict(data: dict) -> SetupChoices:
     if "workspace_path" in kwargs:
         kwargs["workspace_path"] = Path(kwargs["workspace_path"])
     return SetupChoices(**kwargs)
+
+
+def _ensure_docker_files(
+    config_dir: Path,
+    workspace: str,
+    *,
+    port: int = 8900,
+    bind: str = "lan",
+    extra_mounts: list[str] | None = None,
+) -> list[str]:
+    """Generate the Docker files that are missing; never overwrite one.
+
+    Returns the names of the files created. When an existing compose file
+    publishes a different port than the one chosen now, the two lines to edit
+    are printed rather than the file being rewritten under the operator.
+    """
+    files = {
+        "Dockerfile": _build_dockerfile(port),
+        "docker-compose.yml": _build_docker_compose(
+            workspace_path=workspace, extra_mounts=extra_mounts, port=port, bind=bind,
+        ),
+        "docker-entrypoint.sh": _DOCKER_ENTRYPOINT_TEMPLATE,
+        ".dockerignore": _DOCKERIGNORE_TEMPLATE,
+    }
+    created: list[str] = []
+    wanted = f'"{"127.0.0.1:" if bind == "localhost" else ""}{int(port)}:{int(port)}"'
+    for filename, content in files.items():
+        filepath = Path(config_dir) / filename
+        if filepath.exists():
+            click.echo(f"  {filename} already exists — skipping")
+            if filename == "docker-compose.yml":
+                try:
+                    existing = filepath.read_text(encoding="utf-8")
+                except OSError:
+                    existing = ""
+                if wanted not in existing:
+                    click.secho(
+                        f"    It does not publish port {int(port)}. To use it, edit "
+                        f"{filename} (ports: - {wanted}) and Dockerfile "
+                        f"(EXPOSE {int(port)} and the HEALTHCHECK URL).",
+                        fg="yellow",
+                    )
+            continue
+        filepath.write_text(content.lstrip("\n"), encoding="utf-8")
+        if filename == "docker-entrypoint.sh":
+            try:
+                os.chmod(filepath, 0o755)
+            except OSError:
+                pass
+        click.echo(f"  Created {filename}")
+        created.append(filename)
+    return created
 
 
 class SetupWizard:
@@ -876,29 +771,7 @@ class SetupWizard:
 
     def _ensure_docker_files(self) -> None:
         """Generate Dockerfile, docker-compose.yml, entrypoint, and .dockerignore."""
-        # docker-compose.yml is generated dynamically (host paths, extra mounts)
-        compose_content = _build_docker_compose(
-            workspace_path=str(self.choices.workspace_path),
-        )
-
-        files = {
-            "Dockerfile": _DOCKERFILE_TEMPLATE,
-            "docker-compose.yml": compose_content,
-            "docker-entrypoint.sh": _DOCKER_ENTRYPOINT_TEMPLATE,
-            ".dockerignore": _DOCKERIGNORE_TEMPLATE,
-        }
-        for filename, content in files.items():
-            filepath = self.config_dir / filename
-            if filepath.exists():
-                click.echo(f"  {filename} already exists — skipping")
-                continue
-            filepath.write_text(content.lstrip("\n"), encoding="utf-8")
-            if filename == "docker-entrypoint.sh":
-                try:
-                    os.chmod(filepath, 0o755)
-                except OSError:
-                    pass
-            click.echo(f"  Created {filename}")
+        _ensure_docker_files(self.config_dir, str(self.choices.workspace_path))
 
     # --- Step: Mode ---
 
@@ -1052,7 +925,7 @@ class SetupWizard:
         click.echo()
         click.secho(
             f"  → Model IDs will use the '{prefix}.' inference-profile prefix\n"
-            f"    (e.g. {prefix}.anthropic.claude-opus-5) based on region {region}.",
+            f"    (e.g. {prefix}.anthropic.{DEFAULT_MODEL}) based on region {region}.",
             fg="green",
         )
         click.echo()
@@ -1279,7 +1152,8 @@ class SetupWizard:
                     "  numeric Telegram user ID to authorize yourself now\n"
                     "  (message @userinfobot on Telegram to get it).\n\n"
                     "  Or press Enter to skip — after setup, run 'nerve pair'\n"
-                    "  and send the bot /pair <code> to authorize.",
+                    "  and send the bot /pair <code> in a private chat to "
+                    "authorize.",
                     dim=True,
                 )
                 click.echo()
@@ -1696,10 +1570,12 @@ class SetupWizard:
     def _apply(self) -> None:
         click.echo()
 
-        # 1. Create workspace from templates
+        # 1. Create workspace from templates (TASK.md is written in step 5)
         click.echo("  Creating workspace...", nl=False)
         ws_path = self._workspace_dir()
-        created = initialize_workspace(ws_path, self.choices.mode)
+        created = initialize_workspace(
+            ws_path, self.choices.mode, skip=WRITER_OWNED_TEMPLATES,
+        )
         click.secho(" ✓", fg="green")
 
         # 2. Install bundled skills
@@ -1712,14 +1588,14 @@ class SetupWizard:
         install_config_scaffold(ws_path)
         click.secho(" ✓", fg="green")
 
-        # 3. Patch USER.md with name/timezone if provided (personal mode)
+        # 3. Fill the name/timezone lines of USER.md if a name was given
+        # (personal mode). Same gate as before; the substitution itself is the
+        # shared pristine-guarded one, which also fixes the legacy
+        # {{USER_NAME}} token never matching the template's {{NAME}}.
         if self.choices.mode == "personal" and self.choices.user_name:
-            user_md = ws_path / "USER.md"
-            if user_md.exists():
-                content = user_md.read_text(encoding="utf-8")
-                content = content.replace("{{USER_NAME}}", self.choices.user_name)
-                content = content.replace("{{TIMEZONE}}", self.choices.timezone)
-                user_md.write_text(content, encoding="utf-8")
+            apply_profile_templates(
+                ws_path, name=self.choices.user_name, timezone=self.choices.timezone,
+            )
 
         # 4. Patch TOOLS.md with Docker environment layout
         if self._inside_docker:
@@ -1729,13 +1605,11 @@ class SetupWizard:
                 content += _DOCKER_TOOLS_SECTION
                 tools_md.write_text(content, encoding="utf-8")
 
-        # 5. Write TASK.md for worker mode
-        if self.choices.mode == "worker" and self.choices.task_description:
-            task_md = ws_path / "TASK.md"
-            task_md.write_text(
-                f"# Task\n\n{self.choices.task_description}\n",
-                encoding="utf-8",
-            )
+        # 5. Worker: TASK.md from the template with the description in place —
+        #    the same writer the web Mode step uses, so every install path
+        #    produces one file for the onboarding session to fill in.
+        if self.choices.mode == "worker":
+            apply_task_md(ws_path, self.choices.task_description)
 
         # 6. Back up existing configs before regenerating — re-running init
         # must never silently destroy hand edits (model tweaks, paired
@@ -1922,40 +1796,25 @@ class SetupWizard:
         return f"{scheme}://{host}:{port}{mcp_path}/"
 
     def _record_external_agents_in_config_yaml(self, results) -> None:
-        """Append the external_agents block to the freshly-written config.yaml.
+        """Record the external_agents block in the freshly-written config.yaml.
 
-        Called after ``_write_config_yaml`` so we don't have to
-        coordinate the yaml dict structure across two methods.
+        Through the shared writer, so the file keeps its header and is
+        republished atomically.
         """
         path = self.config_dir / "config.yaml"
         if not path.exists():
             return
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            merge_external_agents(
+                self.config_dir,
+                targets=[r.agent for r in results],
+                conflict_policy=self.choices.external_agents_conflict_policy,
+            )
         except Exception as e:
             click.secho(
-                f"  Warning: could not parse config.yaml to record external_agents: {e}",
+                f"  Warning: could not record external_agents in config.yaml: {e}",
                 fg="yellow",
             )
-            return
-
-        targets = []
-        for r in results:
-            targets.append({
-                "name": r.agent,
-                "enabled": True,
-            })
-
-        data["external_agents"] = {
-            "enabled": True,
-            "sync_interval_minutes": 15,
-            "conflict_policy": self.choices.external_agents_conflict_policy,
-            "targets": targets,
-        }
-        endpoint = data.setdefault("mcp_endpoint", {})
-        endpoint["enabled"] = True
-        endpoint.setdefault("path", "/mcp/v1")
-        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
     def _build_web_ui(self) -> None:
         """Build the web UI if not already built."""
@@ -2011,459 +1870,89 @@ class SetupWizard:
             )
 
     def _workspace_dir(self) -> Path:
-        """The workspace path, expanded the same way the config loader does.
-
-        nerve/config.py resolves `workspace` with ${VAR} interpolation *and*
-        expandvars/expanduser. Expanding differently here would put
-        settings.yaml somewhere the loader never looks — the wizard would
-        report success and every portable setting would be silently lost.
-        """
-        return _expand_workspace(str(self.choices.workspace_path))
+        """The workspace path, expanded the same way the config loader does."""
+        return workspace_dir(self.choices)
 
     @staticmethod
     def _leaf_paths(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:
         """Flatten a nested dict to ``{"a.b": value}``. Lists are leaves."""
-        out: dict[str, Any] = {}
-        for key, value in d.items():
-            path = f"{prefix}{key}"
-            if isinstance(value, dict):
-                out.update(SetupWizard._leaf_paths(value, f"{path}."))
-            else:
-                out[path] = value
-        return out
-
-    @staticmethod
-    def _set_leaf(d: dict[str, Any], path: str, value: Any) -> None:
-        *parents, last = path.split(".")
-        node = d
-        for part in parents:
-            child = node.get(part)
-            if not isinstance(child, dict):
-                child = {}
-                node[part] = child
-            node = child
-        node[last] = value
-
-    @staticmethod
-    def _del_leaf(d: dict[str, Any], path: str) -> bool:
-        """Remove ``path``, pruning any dict it leaves empty. True if removed."""
-        *parents, last = path.split(".")
-        chain: list[tuple[dict[str, Any], str]] = []
-        node = d
-        for part in parents:
-            child = node.get(part)
-            if not isinstance(child, dict):
-                return False
-            chain.append((node, part))
-            node = child
-        if last not in node:
-            return False
-        del node[last]
-        for parent, key in reversed(chain):
-            if not parent[key]:
-                del parent[key]
-        return True
-
-    # Keys that describe *this box* and must never travel with the workspace
-    # repo. Everything else the wizard decides is shared behaviour and belongs
-    # in the tracked settings layer, so `nerve config sync` and lockdown mean
-    # something on a default install instead of being no-ops.
-    #
-    # A key must appear in exactly one of the two dicts below. config.yaml
-    # shadows settings.yaml, so writing a portable value to both would make
-    # the tracked copy dead weight -- edit it and nothing happens.
+        return leaf_paths(d, prefix)
 
     def _build_config_layers(
         self,
     ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-        """Split the wizard's answers into (machine-local, portable, shadowed).
-
-        ``shadowed`` lists dotted paths this run must *delete* from a
-        pre-existing settings.yaml rather than merely omit. The tracked file is
-        merge-preserving, so a key the wizard stops emitting would otherwise
-        remain at its old value. The case this covers is switching an install
-        away from Bedrock: ``provider.aws_region`` has to be removed, or the
-        tracked file keeps naming a region the box no longer uses.
-        """
-        machine: dict[str, Any] = {
-            "workspace": str(self.choices.workspace_path),
-            "deployment": self.choices.deployment,
-        }
-        shadowed: list[str] = []
-        portable: dict[str, Any] = {
-            "timezone": self.choices.timezone,
-            # Shared, not machine-local: these describe the deployment, and a
-            # fleet needs one place to set them. The wizard only ever wrote the
-            # declared defaults here, so while they lived in config.yaml the
-            # tracked layer could not state them at all. A box needing a
-            # different port still overrides in config.yaml.
-            #
-            # host/port only. gateway.ssl.cert and .key are local filesystem
-            # paths and stay machine-local.
-            "gateway": {
-                "host": "0.0.0.0",
-                "port": 8900,
-            },
-            "agent": {
-                "model": "claude-opus-5",
-                "cron_model": "claude-sonnet-4-6",
-                "max_turns": 50,
-                "max_concurrent": 32,
-                "thinking": "max",
-                "effort": "max",
-                "context_1m": True,
-            },
-            "quiet_start": "02:00",
-            "quiet_end": "08:00",
-            "memory": {
-                "recall_model": "claude-sonnet-4-6",
-                "memorize_model": "claude-sonnet-4-6",
-                "fast_model": "claude-haiku-4-5-20251001",
-                "embed_model": "text-embedding-3-small",
-                "categories": (
-                    _PERSONAL_MEMORY_CATEGORIES if self.choices.mode == "personal"
-                    else _WORKER_MEMORY_CATEGORIES
-                ),
-            },
-            # Cron config lives in workspace/config/cron (git-syncable); the
-            # loader resolves it from the workspace automatically, so no explicit
-            # cron paths are written here.
-            "sessions": {
-                "sticky_period_minutes": 120,
-                "archive_after_days": 30,
-                "max_sessions": 500,
-                "memorize_interval_minutes": 30,
-            },
-        }
-
-        if self.choices.mode == "personal":
-            # dm_policy/stream_mode are shared behaviour; `enabled` is not --
-            # it is derived from whether *this* machine was given a bot token,
-            # and the token itself lives in config.local.yaml.
-            machine["telegram"] = {"enabled": bool(self.choices.telegram_bot_token)}
-            portable["telegram"] = {
-                "dm_policy": "pairing",
-                "stream_mode": "partial",
-            }
-            portable["sync"] = {
-                "telegram": {"enabled": self.choices.telegram_sync},
-                "gmail": {"enabled": self.choices.gmail_sync},
-                "github": {"enabled": self.choices.github_sync},
-                "github_events": {"enabled": self.choices.github_sync},
-                # Disabled by default — requires an explicit list of repos to watch.
-                "github_repos": {"enabled": False, "repos": []},
-            }
-            # Which sources to sync is shared policy; *whose* mailboxes is
-            # not. These are personal addresses in a file the docs tell you to
-            # commit, and they are per-person rather than per-team.
-            machine.setdefault("sync", {})["gmail"] = {
-                "accounts": self.choices.gmail_accounts
-            }
-
-        # Provider and region are shared; only the AWS profile is a local
-        # credential handle. While the whole block was machine-local, a locked
-        # box never read it and fell back to the declared default, becoming an
-        # `anthropic` instance and then failing for a missing API key that lived
-        # in config.local.yaml, which lockdown also ignores.
-        portable["provider"] = {"type": self.choices.provider_type}
-        if self.choices.aws_profile:
-            machine["provider"] = {"aws_profile": self.choices.aws_profile}
-        if self.choices.provider_type == "bedrock":
-            portable["provider"]["aws_region"] = self.choices.aws_region
-            # The prefix is geography-scoped (us./eu./apac.) and must match the
-            # configured region or every call 400s. Since the region is now in
-            # the tracked layer, these belong there too.
-            geo = bedrock_geo_prefix(self.choices.aws_region)
-            for section, key, value in (
-                ("agent", "model", f"{geo}.anthropic.claude-opus-5"),
-                ("agent", "cron_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("agent", "title_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
-                ("memory", "recall_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("memory", "memorize_model", f"{geo}.anthropic.claude-sonnet-4-6"),
-                ("memory", "fast_model", f"{geo}.anthropic.claude-haiku-4-5-20251001-v1:0"),
-            ):
-                portable[section][key] = value
-        else:
-            # Switching away from Bedrock. The non-prefixed model names in the
-            # base dict above already overwrite the geo-prefixed ones, so only
-            # the region needs deleting.
-            shadowed.append("provider.aws_region")
-
-        if self.choices.use_proxy:
-            # A local helper process on a local port.
-            machine["proxy"] = {"enabled": True, "port": 8317}
-
-        if self.choices.deployment == "docker":
-            machine["docker"] = {
-                "extra_mounts": [],  # e.g. ["~/code:/code", "~/projects:/projects"]
-            }
-
-        return machine, portable, shadowed
+        """Split the wizard's answers into (machine-local, portable, shadowed)."""
+        return build_config_layers(self.choices)
 
     def _write_config_yaml(self) -> None:
         """Write the machine-local base config.yaml."""
-        machine, _portable, _shadowed = self._build_config_layers()
-        config_path = self.config_dir / "config.yaml"
-        # encoding is pinned on every config read and write in this module, to
-        # match nerve.config, which pins it on the way in. Under an ASCII default
-        # encoding an unpinned open() raises on the em-dash in these headers, at
-        # the first write, before any user value is involved. A user value cannot
-        # trigger it: safe_dump escapes non-ASCII to \xNN, so the dumped body is
-        # always ASCII.
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write("# Nerve — Machine-local configuration\n")
-            f.write("# Settings specific to this box: workspace location,\n")
-            f.write("# bind address, deployment style, local credentials handles.\n")
-            f.write("# Shared behaviour lives in <workspace>/config/settings.yaml,\n")
-            f.write("# which this file overrides. Secrets go in config.local.yaml.\n\n")
-            yaml.safe_dump(machine, f, default_flow_style=False, sort_keys=False)
+        write_config_yaml(self.choices, self.config_dir)
 
     def _write_workspace_settings(self) -> None:
         """Write the portable half into ``<workspace>/config/settings.yaml``.
 
-        Ownership model: the wizard owns the keys it generates and rewrites
-        them from this run's answers, exactly as it does for config.yaml.
-        Anything else in the file -- a team policy key, a hand-tuned setting
-        the wizard never emits -- is preserved untouched.
-
-        The alternative ("existing always wins") sounds safer for a file that
-        may be shared through git, but it means re-running init after changing
-        an answer silently does nothing: the wizard prompts for a timezone,
-        prints a tick, and discards the answer because the key already exists.
-        Overwriting is recoverable -- there is a .bak, and the file is in a
-        repo where the diff is visible before anyone commits it.
+        The writer decides what to merge and reports what it did; the words
+        below are this wizard's, because it is the half that talks to a
+        terminal. A file that is not YAML, or not a mapping, is left exactly
+        as it was — the operator is told rather than having a hand-written
+        settings file replaced by generated one.
         """
-        _machine, portable, shadowed = self._build_config_layers()
-        settings_path = workspace_settings_file(self._workspace_dir())
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-        raw = ""
-        existing: dict[str, Any] = {}
-        if settings_path.exists():
-            raw = settings_path.read_text(encoding="utf-8")
-            try:
-                loaded = yaml.safe_load(raw)
-            except yaml.YAMLError as e:
-                click.secho(
-                    f"\n    Warning: {settings_path} is not valid YAML ({e}) —"
-                    " leaving it alone.",
-                    fg="yellow",
-                )
-                return
-            if loaded is not None and not isinstance(loaded, dict):
-                click.secho(
-                    f"\n    Warning: {settings_path} is not a mapping —"
-                    " leaving it alone.",
-                    fg="yellow",
-                )
-                return
-            existing = loaded or {}
-
-        merged = copy.deepcopy(existing)
-        # Diff against the file as it was on disk, not against `merged` while
-        # it is being mutated. The two are equivalent -- no portable leaf path
-        # is a prefix of another, so a _set_leaf can only touch descendants of
-        # its own path -- but flattening once says what is meant and drops the
-        # per-key re-walk.
-        before_paths = self._leaf_paths(existing)
-        added, changed, removed = [], [], []
-        for path, value in self._leaf_paths(portable).items():
-            before = before_paths.get(path, _MISSING)
-            if before is _MISSING:
-                added.append(path)
-            elif before != value:
-                changed.append(f"{path}: {before!r} → {value!r}")
-            self._set_leaf(merged, path, value)
-        for path in shadowed:
-            if self._del_leaf(merged, path):
-                removed.append(path)
-
-        if merged == existing:
+        outcome = write_workspace_settings(self.choices)
+        if outcome.status == "invalid_yaml":
+            click.secho(
+                f"\n    Warning: {outcome.path} is not valid YAML"
+                f" ({outcome.detail}) — leaving it alone.",
+                fg="yellow",
+            )
+            return
+        if outcome.status == "not_a_mapping":
+            click.secho(
+                f"\n    Warning: {outcome.path} is not a mapping —"
+                " leaving it alone.",
+                fg="yellow",
+            )
+            return
+        if not outcome.wrote:
             return
 
         # safe_dump cannot round-trip comments, and this file is meant to be
         # read by other people in a PR. Say so rather than quietly deleting
         # someone's rationale.
-        if existing and any(
-            line.lstrip().startswith("#")
-            for line in raw.splitlines()[_SETTINGS_HEADER_LINES:]
-        ):
+        if outcome.comments_lost:
             click.secho(
-                f"\n    Note: comments in {settings_path.name} are not preserved"
+                f"\n    Note: comments in {outcome.path.name} are not preserved"
                 " when it is regenerated (the previous file is in"
-                f" {settings_path.name}.bak).",
+                f" {outcome.path.name}.bak).",
                 fg="yellow",
             )
 
-        with open(settings_path, "w", encoding="utf-8") as f:
-            f.write(_SETTINGS_HEADER)
-            yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=False)
-
-        for label, items in (("added", added), ("updated", changed),
-                             ("removed", removed)):
+        for label, items in (("added", outcome.added), ("updated", outcome.changed),
+                             ("removed", outcome.removed)):
             if items:
                 click.secho(f"\n    {label}: {', '.join(items)}", dim=True)
 
     def _write_config_local_yaml(self) -> None:
-        """Write config.local.yaml with secrets."""
-        local: dict[str, Any] = {}
+        """Write config.local.yaml with secrets.
 
-        if self.choices.anthropic_api_key:
-            local["anthropic_api_key"] = self.choices.anthropic_api_key
-
-        if self.choices.claude_oauth_token:
-            local["claude_oauth_token"] = self.choices.claude_oauth_token
-
-        if self.choices.github_token:
-            local["github_token"] = self.choices.github_token
-
-        if self.choices.openai_api_key:
-            local["openai_api_key"] = self.choices.openai_api_key
-
-        if self.choices.telegram_bot_token:
-            local["telegram"] = {
-                "bot_token": self.choices.telegram_bot_token,
-            }
-            if self.choices.telegram_allowed_users:
-                local["telegram"]["allowed_users"] = list(
-                    self.choices.telegram_allowed_users
-                )
-
-        # Sync credentials (secrets — go in local config)
-        if self.choices.telegram_sync and self.choices.telegram_api_id:
-            local.setdefault("sync", {})["telegram"] = {
-                "api_id": self.choices.telegram_api_id,
-                "api_hash": self.choices.telegram_api_hash,
-            }
-
-        # Auth: JWT secret + optional password hash
-        auth: dict[str, str] = {
-            "jwt_secret": secrets.token_hex(32),
-        }
-        if self.choices.password:
-            import bcrypt
-            hashed = bcrypt.hashpw(
-                self.choices.password.encode("utf-8"),
-                bcrypt.gensalt(),
-            ).decode("utf-8")
-            auth["password_hash"] = hashed
-        local["auth"] = auth
-
-        # The file holds the signing secret, the password hash and the API keys,
-        # so it is created owner-only. If the filesystem cannot keep it private,
-        # nothing is written and setup stops.
-        local_path = self.config_dir / "config.local.yaml"
+        If the file cannot be made owner-only, nothing is written and setup
+        stops.
+        """
         try:
-            paths.write_private_text(
-                local_path,
-                "# Nerve — Secrets (gitignored)\n"
-                "# API keys, tokens, and other sensitive configuration.\n\n"
-                + yaml.safe_dump(local, default_flow_style=False, sort_keys=False),
-            )
+            write_config_local_yaml(self.choices, self.config_dir)
         except paths.InsecureFileError as e:
             raise click.ClickException(
-                f"Setup stopped: {e} Nothing was written to {local_path}."
+                f"Setup stopped: {e} Nothing was written to "
+                f"{self.config_dir / 'config.local.yaml'}."
             ) from e
 
     def _write_cron_jobs(self) -> None:
         """Write system crons to system.yaml and scaffold jobs.yaml for user crons."""
-        jobs: list[dict[str, Any]] = []
-
-        # Core crons (always enabled)
-        for cron in CORE_CRONS:
-            jobs.append({
-                "id": cron["id"],
-                "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
-                "description": cron["description"],
-                "model": cron.get("model", ""),
-                "session_mode": cron.get("session_mode", "isolated"),
-                "enabled": True,
-            })
-
-        if self.choices.mode == "personal":
-            # Productivity crons (personal mode)
-            for cron in PRODUCTIVITY_CRONS:
-                enabled = cron["id"] in self.choices.enabled_crons
-                job: dict[str, Any] = {
-                    "id": cron["id"],
-                    "schedule": cron["schedule"],
-                    "prompt": cron["prompt"],
-                    "description": cron["description"],
-                    "model": cron.get("model", ""),
-                    "session_mode": cron.get("session_mode", "isolated"),
-                    "enabled": enabled,
-                }
-                if cron.get("context_rotate_hours"):
-                    job["context_rotate_hours"] = cron["context_rotate_hours"]
-                if cron.get("reminder_mode"):
-                    job["reminder_mode"] = cron["reminder_mode"]
-                if cron.get("run_if"):
-                    job["run_if"] = cron["run_if"]
-                jobs.append(job)
-        elif self.choices.mode == "worker":
-            # Workers get skill crons — they create skills during onboarding
-            # and those skills should be maintained automatically.
-            # Other crons (task-planner, etc.) can be added during onboarding.
-            _WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner")
-            for cron in PRODUCTIVITY_CRONS:
-                if cron["id"] not in _WORKER_CRONS:
-                    continue
-                enabled = cron["id"] in self.choices.enabled_crons
-                job = {
-                    "id": cron["id"],
-                    "schedule": cron["schedule"],
-                    "prompt": cron["prompt"],
-                    "description": cron["description"],
-                    "model": cron.get("model", ""),
-                    "session_mode": cron.get("session_mode", "isolated"),
-                    "enabled": enabled,
-                }
-                if cron.get("context_rotate_hours"):
-                    job["context_rotate_hours"] = cron["context_rotate_hours"]
-                if cron.get("reminder_mode"):
-                    job["reminder_mode"] = cron["reminder_mode"]
-                if cron.get("run_if"):
-                    job["run_if"] = cron["run_if"]
-                jobs.append(job)
-
-        # Cron config lives in the git-syncable workspace/config/cron subtree.
-        # Via _workspace_dir for the reason spelled out there: expanding only
-        # `~` here sent a `workspace: ${VAR}` install's jobs to a literal
-        # "./${VAR}/config/cron" beside the process CWD, where nothing loads
-        # them, while settings.yaml landed correctly and the wizard reported
-        # success.
-        cron_dir = self._workspace_dir() / "config" / "cron"
-        cron_dir.mkdir(parents=True, exist_ok=True)
-        (cron_dir / "gates").mkdir(parents=True, exist_ok=True)
-
-        # Write system crons (managed by nerve init, safe to regenerate)
-        system_file = cron_dir / "system.yaml"
-
-        with open(system_file, "w", encoding="utf-8") as f:
-            f.write("# Nerve — System Cron Jobs\n")
-            f.write("# Managed by 'nerve init'. Safe to re-generate.\n")
-            f.write("# To add custom crons, use jobs.yaml instead.\n\n")
-            yaml.safe_dump({"jobs": jobs}, f, default_flow_style=False, sort_keys=False)
-
-        # Create jobs.yaml scaffold if it doesn't exist. If this is an upgrade
-        # from a legacy install, preserve the user's existing custom crons by
-        # copying the legacy jobs.yaml rather than writing a blank placeholder
-        # (a blank one here would shadow the legacy jobs — see _resolve_cron_dir).
-        jobs_file = cron_dir / "jobs.yaml"
-        if not jobs_file.exists():
-            legacy_jobs = paths.cron_dir() / "jobs.yaml"
-            if legacy_jobs.exists():
-                shutil.copy2(legacy_jobs, jobs_file)
-                click.echo(
-                    f"\n    Migrated custom crons from {legacy_jobs} to {jobs_file}",
-                )
-            else:
-                with open(jobs_file, "w", encoding="utf-8") as f:
-                    f.write("# Nerve — Custom Cron Jobs\n")
-                    f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
-                    f.write("# Format is the same as system.yaml — see it for examples.\n\n")
-                    f.write("jobs: []\n")
+        outcome = write_cron_jobs(self.choices)
+        if outcome.migrated_from is not None:
+            click.echo(
+                f"\n    Migrated custom crons from {outcome.migrated_from} to"
+                f" {outcome.jobs_file}",
+            )
 
     # --- Preflight ---
 
@@ -2570,7 +2059,7 @@ class SetupWizard:
         if self.choices.telegram_bot_token and not self.choices.telegram_allowed_users:
             click.secho("  Telegram pairing:", bold=True)
             click.echo("    1. Start Nerve, then run: nerve pair")
-            click.echo("    2. Send the bot:  /pair <code>")
+            click.echo("    2. In a private chat, send the bot:  /pair <code>")
             click.echo("    (until paired, the bot ignores all DMs)")
             click.echo()
         click.secho(
@@ -2579,6 +2068,431 @@ class SetupWizard:
             dim=True,
         )
         click.echo()
+
+
+# --- The slim host-side setup (default `nerve init`) ---------------------------
+#
+# Only what the browser cannot decide: how Nerve runs on this machine, where
+# its files live, how the gateway listens. Everything else — mode, model,
+# profile, channels — is decided on the setup page the daemon serves. The
+# answers are checkpointed after every prompt (same file the full wizard
+# uses), the writes go through the shared writer, and nothing here starts a
+# process: the CLI command does that, so this stays testable without a daemon.
+
+SLIM_PORT_RANGE = range(8901, 9000)
+_SLIM_STEP_KEYS = ("slim:deployment", "slim:workspace", "slim:network")
+_API_KEY_SOURCES = ("ANTHROPIC_API_KEY env var", "macOS Keychain (API key)")
+
+
+@dataclass
+class SlimFlags:
+    """Scriptable answers for the slim flow; ``None`` means ask (or default)."""
+
+    deployment: str | None = None
+    workspace: str | None = None
+    port: int | None = None
+    bind: str | None = None          # "localhost" | "lan"
+    yes: bool = False
+    start: bool = True
+    browser: bool | None = None
+    clipboard: bool = True
+
+
+@dataclass
+class SlimResult:
+    choices: SetupChoices
+    outcome: SlimOutcome
+    host_workspace: Path
+    bind: str
+    web_ui: str                      # "present" | "built" | "skipped" | "failed" | "not-in-tree"
+    docker_files_created: list[str]
+
+
+_CONNECT_PROBE_TIMEOUT = 0.25
+
+
+def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """Whether the gateway could listen on ``host:port`` right now. Never raises.
+
+    A plain ``bind`` is the first word, not the last: for up to a minute after
+    a listener closes its connections the port is still held by sockets in
+    ``TIME_WAIT``, and a plain bind answers ``EADDRINUSE`` although nothing
+    listens — exactly the moment someone re-runs ``nerve init`` after stopping
+    the previous daemon. The server itself binds with ``SO_REUSEADDR`` (what
+    uvicorn sets), which steps over ``TIME_WAIT`` but not over a listener. (On
+    Linux that step also needs the earlier socket to have had ``SO_REUSEADDR``,
+    which the gateway's always does; BSD kernels ask only the new socket.)
+
+    So on ``EADDRINUSE`` the probe asks the two questions that tell the cases
+    apart: does anything *accept* a connection on the port (a listener — on
+    any interface, since a wildcard listener answers on loopback too), and
+    does a bind with the server's own ``SO_REUSEADDR`` semantics succeed? Only
+    "nobody accepts" *and* "the server's bind would work" counts as free; a
+    listener on another interface alone still fails the second bind.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((host, int(port)))
+        return True
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            return False
+    target = "127.0.0.1" if host in ("", "0.0.0.0") else host
+    try:
+        with socket.create_connection((target, int(port)), timeout=_CONNECT_PROBE_TIMEOUT):
+            return False  # something accepted: a live listener
+    except ConnectionRefusedError:
+        pass  # nobody listens on this side; the bind failed on TIME_WAIT alone
+    except OSError:
+        return False  # a timeout or a filtered port: treat as busy
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def _probe_hosts(bind: str) -> tuple[str, ...]:
+    return ("127.0.0.1",) if bind == "localhost" else ("127.0.0.1", "0.0.0.0")
+
+
+def propose_port(preferred: int, bind: str) -> tuple[int, bool]:
+    """``(port, preferred_was_busy)``: the preferred port, or the first free one after it."""
+    hosts = _probe_hosts(bind)
+    if all(port_is_free(preferred, h) for h in hosts):
+        return preferred, False
+    for candidate in SLIM_PORT_RANGE:
+        if candidate != preferred and all(port_is_free(candidate, h) for h in hosts):
+            return candidate, True
+    return preferred, True
+
+
+def _web_dir(config_dir: Path) -> Path | None:
+    """The ``web/`` directory the gateway serves ``dist`` from.
+
+    Resolved the way ``server.py`` resolves ``web/dist``: next to the ``nerve``
+    package (the install tree), with the config directory as a fallback for a
+    checkout used as its own config dir. ``None`` when neither exists.
+    """
+    import nerve
+
+    for candidate in (Path(nerve.__file__).resolve().parent.parent / "web", Path(config_dir) / "web"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ensure_web_ui(config_dir: Path) -> str:
+    """Build ``web/dist`` if it is missing and Node is available.
+
+    Returns ``present``, ``built``, ``skipped`` (no Node), ``failed`` or
+    ``not-in-tree``. A failure is a warning: the gateway serves a fallback
+    page at ``/setup`` until the UI is built.
+    """
+    web_dir = _web_dir(config_dir)
+    if web_dir is None:
+        return "not-in-tree"
+    if (web_dir / "dist").exists():
+        return "present"
+    if not shutil.which("node") or not shutil.which("npm"):
+        return "skipped"
+    try:
+        subprocess.run(["npm", "ci", "--quiet"], cwd=str(web_dir), capture_output=True, check=True, timeout=900)
+        subprocess.run(["npm", "run", "build"], cwd=str(web_dir), capture_output=True, check=True, timeout=900)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return "failed"
+    return "built"
+
+
+class SlimSetup:
+    """The default ``nerve init``: deployment, paths, network — then the browser."""
+
+    def __init__(self, config_dir: Path, flags: SlimFlags | None = None):
+        self.config_dir = Path(config_dir)
+        self.flags = flags or SlimFlags()
+        self.choices = SetupChoices()
+        self.bind = "localhost"
+        self._host_workspace = Path("~/nerve-workspace")
+        self._completed: set[str] = set()
+        # Steps that printed a header and asked; the rest are summarised in
+        # one "Using:" line so a flag-driven run is not a list of empty headers.
+        self._prompted: set[str] = set()
+
+    # -- prompts ---------------------------------------------------------------
+
+    def _ask(self, label: str, default: str, *, choices: list[str] | None = None) -> str:
+        if self.flags.yes:
+            return default
+        kwargs: dict[str, Any] = {"default": default}
+        if choices:
+            # The label already lists the options ("Choose [server/docker]");
+            # click would otherwise print them a second time in parentheses.
+            kwargs["type"] = click.Choice(choices, case_sensitive=False)
+            kwargs["show_choices"] = False
+        return str(click.prompt(label, **kwargs))
+
+    def _checkpoint(self, key: str) -> None:
+        self._completed.add(key)
+        _save_init_state(self.choices, self._completed)
+
+    def _resume(self) -> None:
+        state = _load_init_state()
+        if not state:
+            return
+        completed = set(state.get("completed") or [])
+        if not completed & set(_SLIM_STEP_KEYS):
+            return
+        try:
+            saved = _choices_from_dict(state.get("choices") or {})
+        except (TypeError, ValueError):
+            _clear_init_state()
+            return
+        # Only the answers this flow owns are taken from the checkpoint.
+        self.choices.deployment = saved.deployment
+        self.choices.workspace_path = saved.workspace_path
+        self.choices.gateway_host = saved.gateway_host
+        self.choices.gateway_port = saved.gateway_port
+        self._host_workspace = (
+            Path(str(state.get("slim_host_workspace") or saved.workspace_path))
+        )
+        self._completed = completed & set(_SLIM_STEP_KEYS)
+        click.secho("  Resuming the answers saved by the previous run.", dim=True)
+
+    def _step_deployment(self) -> None:
+        if self.flags.deployment:
+            self.choices.deployment = self.flags.deployment.lower()
+        elif "slim:deployment" not in self._completed and not self.flags.yes:
+            self._prompted.add("deployment")
+            click.secho("  Step 1 of 3 · How do you want to run Nerve?", bold=True)
+            click.echo("    server   Run directly on this machine. Recommended on a server or your own laptop.")
+            click.echo("    docker   Run in a container. Isolated, easy to remove. Needs Docker.")
+            self.choices.deployment = self._ask(
+                "  Choose [server/docker]", "server", choices=["server", "docker"],
+            ).lower()
+        elif "slim:deployment" not in self._completed:
+            self.choices.deployment = "server"
+        if self.choices.deployment not in ("server", "docker"):
+            raise click.ClickException("--deployment must be server or docker")
+        self._checkpoint("slim:deployment")
+
+    def _step_paths(self) -> None:
+        docker = self.choices.deployment == "docker"
+        if self.flags.workspace:
+            raw = self.flags.workspace
+        elif "slim:workspace" in self._completed:
+            raw = str(self._host_workspace)
+        elif self.flags.yes:
+            raw = "~/nerve-workspace"
+        else:
+            self._prompted.add("paths")
+            click.echo()
+            click.secho("  Step 2 of 3 · Where things live", bold=True)
+            click.echo(f"    Config files   {self.config_dir}   (config.yaml, config.local.yaml)")
+            click.echo(
+                f"    State          {paths.nerve_home()}   (database, logs; set NERVE_HOME "
+                "before running nerve to move it)"
+            )
+            label = (
+                "  Workspace on this computer (mounted into the container)" if docker
+                else "  Workspace — the agent's files: memory, skills, settings"
+            )
+            raw = self._ask(label, "~/nerve-workspace")
+        self._host_workspace = Path(raw.strip() or "~/nerve-workspace")
+        # config.yaml records the container path for a docker install; the
+        # host path is where the tracked settings and the skeleton are written.
+        self.choices.workspace_path = Path(_DOCKER_WORKSPACE) if docker else self._host_workspace
+        self._checkpoint("slim:workspace")
+
+    def _step_network(self) -> None:
+        bind = (self.flags.bind or "").lower() or None
+        resumed = "slim:network" in self._completed
+        if bind is None and resumed:
+            bind = "localhost" if self.choices.gateway_host == "127.0.0.1" else "lan"
+        ask_port = self.flags.port is None and not self.flags.yes
+        ask_bind = bind is None and not self.flags.yes
+        if ask_port or ask_bind:
+            self._prompted.add("network")
+            click.echo()
+            click.secho("  Step 3 of 3 · Network", bold=True)
+        probe_bind = bind or "lan"
+        hosts = _probe_hosts(probe_bind)
+        if self.flags.port is not None:
+            # An explicit port is probed like a typed one: `/health` turning
+            # green on a busy port would be another program's answer.
+            port = int(self.flags.port)
+            if not 1 <= port <= 65535:
+                raise click.ClickException("--port must be a number between 1 and 65535")
+            if not all(port_is_free(port, h) for h in hosts):
+                raise click.ClickException(
+                    f"Port {port} is already in use by another program; pick another with --port"
+                )
+        else:
+            preferred = int(self.choices.gateway_port if resumed else 8900)
+            proposed, busy = propose_port(preferred, probe_bind)
+            if busy:
+                click.echo(f"  Port {preferred} is already in use by another program. {proposed} is free.")
+            while True:
+                answer = self._ask("  Gateway port", str(proposed))
+                try:
+                    port = int(answer)
+                except ValueError:
+                    port = 0
+                if not 1 <= port <= 65535:
+                    click.secho("  A port is a number between 1 and 65535.", fg="yellow")
+                    continue
+                if all(port_is_free(port, h) for h in hosts):
+                    break
+                # Re-validated: a typed port is a choice, not a fact.
+                proposed, _busy = propose_port(port, probe_bind)
+                click.secho(
+                    f"  Port {port} is already in use by another program. {proposed} is free.", fg="yellow",
+                )
+                if self.flags.yes:
+                    port = proposed
+                    break
+        if bind is None:
+            click.echo("  Who should be able to open the web UI?")
+            click.echo("    localhost   Only this computer. Open it here, or through an SSH tunnel from elsewhere.")
+            click.echo("    lan         Other devices on your network too. You will set a password on the setup page.")
+            bind = self._ask("  Reachable from", "localhost", choices=["localhost", "lan"]).lower()
+        if bind not in ("localhost", "lan"):
+            raise click.ClickException("--bind must be localhost or lan")
+        self.bind = bind
+        self.choices.gateway_port = port
+        # Inside a container the gateway listens on every interface; the
+        # compose publish rule limits exposure to the chosen bind.
+        self.choices.gateway_host = (
+            "0.0.0.0" if (bind == "lan" or self.choices.deployment == "docker") else "127.0.0.1"
+        )
+        self._checkpoint("slim:network")
+
+    def _step_docker_credentials(self) -> None:
+        """2b: forward the host's Claude Code login and gh token to the container.
+
+        Both are the operator's *personal* credentials, and both land in the
+        instance's secret file — so each is forwarded only after the same
+        confirmation (``--yes`` accepts), and each forward is said out loud.
+        The values themselves are never printed.
+        """
+        token, source, _debug = _resolve_claude_credential()
+        if token:
+            forward = True
+            if not self.flags.yes:
+                forward = click.confirm(
+                    f"  Found a Claude Code login in this machine's keychain ({source}). "
+                    "Forward it to the container?", default=True,
+                )
+            if forward:
+                if source in _API_KEY_SOURCES:
+                    self.choices.anthropic_api_key = token
+                    key = "anthropic_api_key"
+                else:
+                    self.choices.claude_oauth_token = token
+                    key = "claude_oauth_token"
+                click.secho(
+                    f"    ✓ Forwarding the Claude Code login ({source}) as {key} in config.local.yaml",
+                    fg="green",
+                )
+        gh_token, gh_source = _resolve_gh_token()
+        if gh_token:
+            forward = True
+            if not self.flags.yes:
+                forward = click.confirm(
+                    f"  Found a GitHub login ({gh_source}). Forward it to the container?",
+                    default=True,
+                )
+            if forward:
+                self.choices.github_token = gh_token
+                click.secho(
+                    f"    ✓ Forwarding the GitHub token ({gh_source}) as github_token in config.local.yaml",
+                    fg="green",
+                )
+
+    # -- run -------------------------------------------------------------------
+
+    def run(self) -> SlimResult:
+        click.echo()
+        click.secho("  Nerve setup", bold=True)
+        click.echo(
+            "  Most of the setup happens in your browser. This terminal only decides what the\n"
+            "  browser cannot: how Nerve runs on this machine and where it keeps its files.\n"
+            "  Ctrl+C is safe; answers are saved."
+        )
+        click.echo()
+        self._resume()
+        try:
+            self._step_deployment()
+            self._step_paths()
+            self._step_network()
+            if self.choices.deployment == "docker":
+                self._step_docker_credentials()
+        except (KeyboardInterrupt, click.Abort):
+            click.echo()
+            click.secho("  Setup interrupted — your answers are saved.", fg="yellow")
+            click.secho("  Resume anytime with: nerve init", dim=True)
+            raise SystemExit(130)
+
+        docker = self.choices.deployment == "docker"
+        host_ws = _expand_workspace(str(self._host_workspace))
+        docker_created: list[str] = []
+        if self._prompted != {"deployment", "paths", "network"}:
+            # Whatever was not asked is still said, once, in one line.
+            click.echo(
+                f"  Using: {self.choices.deployment} · workspace {self._host_workspace} · "
+                f"port {self.choices.gateway_port} · {self.bind}"
+            )
+        click.echo()
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        if docker:
+            docker_created = _ensure_docker_files(
+                self.config_dir, str(self._host_workspace),
+                port=self.choices.gateway_port, bind=self.bind,
+            )
+        outcome = write_slim_install(
+            self.choices, self.config_dir, host_workspace=host_ws if docker else None,
+        )
+        click.secho(f"    ✓ Created workspace skeleton in {host_ws} (config/, skills/)", fg="green")
+        click.secho("    ✓ Wrote config.yaml and config/settings.yaml", fg="green")
+        if outcome.jwt_created:
+            click.secho("    ✓ Wrote config.local.yaml (owner-only)", fg="green")
+        else:
+            click.secho("    ✓ Kept config.local.yaml (signing secret unchanged)", fg="green")
+
+        web_ui = "not-in-tree"
+        if not docker:
+            web_dir = _web_dir(self.config_dir)
+            if web_dir is not None and not (web_dir / "dist").exists() and shutil.which("node"):
+                click.echo("    Building the web UI (first time only, about a minute)…")
+            web_ui = _ensure_web_ui(self.config_dir)
+            if web_ui == "present":
+                click.secho("    ✓ Web UI already built", fg="green")
+            elif web_ui == "built":
+                click.secho("    ✓ Web UI built", fg="green")
+            elif web_ui == "not-in-tree":
+                click.secho(
+                    "    ⚠ No web/ directory next to this installation — the setup page will "
+                    "say how to build the UI (nerve upgrade, or cd web && npm ci && npm run build)",
+                    fg="yellow",
+                )
+            elif web_ui == "skipped":
+                click.secho(
+                    "    ⚠ Node.js not found — the web UI was not built. The setup page shows "
+                    "how to build it; install Node.js 22.12+ and run: cd web && npm ci && npm run build",
+                    fg="yellow",
+                )
+            elif web_ui == "failed":
+                click.secho(
+                    "    ⚠ The web UI build failed; the setup page will say so. Build it with: "
+                    "cd web && npm ci && npm run build",
+                    fg="yellow",
+                )
+        _clear_init_state()
+        return SlimResult(
+            choices=self.choices, outcome=outcome, host_workspace=host_ws, bind=self.bind,
+            web_ui=web_ui, docker_files_created=docker_created,
+        )
 
 
 # --- Non-interactive mode ---
@@ -2682,11 +2596,11 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
             except ValueError:
                 pass
 
-    # In non-interactive personal mode, enable all productivity crons by default
-    if choices.mode == "personal":
-        choices.enabled_crons = ["inbox-processor", "task-planner"]
-    elif choices.mode == "worker":
-        choices.enabled_crons = ["skill-reviser", "skill-extractor", "task-planner"]
+    # The mode's default optional crons — the set the web Mode step writes too.
+    # Personal: inbox-processor and task-planner. Worker: the two skill jobs;
+    # its task-planner stays off until the onboarding session enables it.
+    if choices.mode in DEFAULT_CRONS:
+        choices.enabled_crons = list(DEFAULT_CRONS[choices.mode])
 
     # External agents — comma-separated list ("codex,claude-code") and
     # optional conflict policy. Validated against AGENT_REGISTRY so an
@@ -2758,50 +2672,7 @@ def _has_config_content(path: Path) -> bool:
     return bool(data)
 
 
-def _expand_workspace(raw: str) -> Path:
-    """Expand a workspace path exactly as nerve.config resolves it.
-
-    Delegates to ``_expand_path`` rather than repeating it. The previous
-    implementation reversed the order (``expanduser`` before ``expandvars``) and
-    did not strip, and both mattered: ``expanduser`` only expands a *leading*
-    ``~``, so a value carrying leading whitespace — a ``NERVE_WORKSPACE`` with a
-    trailing newline, say — was not expanded at all, and the wizard wrote
-    settings.yaml to a directory the loader never reads.
-
-    Blank means unset, as it does for every other path setting, so it falls back
-    to the same default the loader uses.
-    """
-    if "${" in raw:
-        raw = _interpolate_str(raw, [])
-    return _expand_path(raw) or paths.default_workspace()
-
-
-_MISSING = object()
-
-# Regenerated verbatim on every write; anything below it is user content, so
-# the comment-loss warning only fires for comments the operator added.
-_SETTINGS_HEADER = """\
-# Nerve — Shared configuration
-# Git-tracked and portable: this is the layer that syncs between machines and
-# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
-# which overrides this file. Secrets belong in config.local.yaml or behind an
-# ${ENV_VAR} reference — never here.
-#
-# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
-# does not generate are left alone.
-
-"""
-_SETTINGS_HEADER_LINES = _SETTINGS_HEADER.count("\n")
-
-
 # --- Docker file templates ---
-
-# Container-side locations, referenced by the Dockerfile, the compose mounts and
-# the agent-facing docs below so they can't drift apart. The image sets both as
-# environment variables rather than relying on the root user's $HOME happening
-# to be /root — see nerve.paths.nerve_home() for how NERVE_HOME is consumed.
-_DOCKER_NERVE_HOME = "/root/.nerve"
-_DOCKER_WORKSPACE = "/root/nerve-workspace"
 
 
 def _compose_host_state_dir() -> str:
@@ -2813,7 +2684,7 @@ def _compose_host_state_dir() -> str:
     """
     return os.environ.get(paths.NERVE_HOME_ENV, "").strip() or "~/.nerve"
 
-_DOCKERFILE_TEMPLATE = """
+_DOCKERFILE_HEAD = """
 FROM python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -2864,26 +2735,47 @@ RUN cd /tmp/nerve-deps \\
     && uv sync --locked --no-install-project --no-dev \\
     && rm -rf /tmp/nerve-deps
 
-EXPOSE 8900
+"""
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \\
-    CMD curl -f http://localhost:8900/health || exit 1
-
+_DOCKERFILE_TAIL = """
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 """
 
+
+def _build_dockerfile(port: int = 8900) -> str:
+    """The Dockerfile, exposing and health-checking the chosen gateway port.
+
+    The default reproduces the previous template byte for byte.
+    """
+    return (
+        _DOCKERFILE_HEAD
+        + f"EXPOSE {int(port)}\n\n"
+        + "HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \\\n"
+        + f"    CMD curl -f http://localhost:{int(port)}/health || exit 1\n"
+        + _DOCKERFILE_TAIL
+    )
+
+
+_DOCKERFILE_TEMPLATE = _build_dockerfile()
+
 def _build_docker_compose(
     workspace_path: str = "~/nerve-workspace",
     extra_mounts: list[str] | None = None,
+    *,
+    port: int = 8900,
+    bind: str = "lan",
 ) -> str:
     """Build docker-compose.yml content with host bind-mounts.
 
     Args:
         workspace_path: Host path for the workspace (e.g. ~/nerve-workspace).
         extra_mounts: Additional host:container mount pairs (e.g. ["~/code:/code"]).
+        port: The gateway port, published on the host under the same number.
+        bind: ``"localhost"`` publishes on 127.0.0.1 only; ``"lan"`` (the
+            default, and the previous behaviour) on every host interface.
     """
     # Required mounts (always present)
     # ~/.nerve/claude:/root/.claude persists Claude Code's conversation
@@ -2922,11 +2814,12 @@ def _build_docker_compose(
     # Build YAML by hand to keep formatting clean
     vol_lines = "\n".join(f"      - {v}" for v in volumes)
 
+    prefix = "127.0.0.1:" if bind == "localhost" else ""
     return f"""services:
   nerve:
     build: .
     ports:
-      - "8900:8900"
+      - "{prefix}{int(port)}:{int(port)}"
     volumes:
 {vol_lines}
     restart: unless-stopped
@@ -3001,43 +2894,6 @@ if [ $# -eq 0 ]; then
 else
     exec "$@"
 fi
-"""
-
-_DOCKER_TOOLS_SECTION = f"""
-## Docker Environment
-
-You are running inside a Docker container. Key paths:
-
-| Path | Contents | Writable | Notes |
-|------|----------|----------|-------|
-| `/nerve` | Nerve source code **and config** | ✓ (bind mount) | `pyproject.toml`, `nerve/` package, `web/` — the full repo. The config directory resolves to the working directory, so `config.yaml` and `config.local.yaml` live here. |
-| `{_DOCKER_NERVE_HOME}` | Machine-local state (`$NERVE_HOME`) | ✓ (bind mount) | Databases, logs, PID, caches. Never synced. |
-| `{_DOCKER_WORKSPACE}` | Your workspace (`$NERVE_WORKSPACE`) | ✓ (bind mount) | AGENTS.md, SOUL.md, MEMORY.md, skills, and `config/` — where you live. |
-| `{_DOCKER_WORKSPACE}/config` | Shareable config | ✓ (bind mount) | `settings.yaml` and `cron/` — the git-syncable layer. |
-
-### Working with Nerve source
-
-- The Nerve package is installed in editable mode, from `uv.lock`, by the
-  entrypoint (`uv sync --locked --inexact`). Dependency versions therefore match
-  what CI tested; rebuilding an unchanged commit gets the same set.
-- The Python environment is `/opt/nerve-venv`, deliberately outside `/nerve` —
-  that path is a bind mount, so a `.venv` under it would be shadowed by the
-  host's checkout.
-- After modifying Nerve source code, changes take effect immediately for Python.
-- After changing dependencies in `pyproject.toml`, run `uv lock` on the host and
-  restart the container; the entrypoint refuses a lock that no longer matches.
-- If you modify the web UI (`/nerve/web/`), rebuild with: `cd /nerve/web && npm run build`
-- Config files live in `/nerve/`, NOT in `{_DOCKER_NERVE_HOME}/` — the config
-  directory is the working directory the daemon was started from.
-- Cron jobs live in `{_DOCKER_WORKSPACE}/config/cron/` (`jobs.yaml`, `system.yaml`,
-  `gates/`), not under `$NERVE_HOME` — they are part of the syncable config.
-
-### Credentials
-
-Docker can't access the host's macOS Keychain. Credentials are extracted during
-`nerve init` and stored in `/nerve/config.local.yaml` (alongside `config.yaml`).
-The entrypoint reads that file and exports them as environment variables
-(`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `GH_TOKEN`).
 """
 
 _DOCKERIGNORE_TEMPLATE = """

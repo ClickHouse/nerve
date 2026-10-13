@@ -6,7 +6,7 @@ Escalation levels:
   2 = medium (+30 minutes)
   3 = urgent (+2 hours)
 
-Respects quiet hours.
+Respects quiet hours when they are configured.
 """
 
 from __future__ import annotations
@@ -30,14 +30,22 @@ ESCALATION_INTERVALS = {
 
 
 def _is_quiet_hour(config: NerveConfig) -> bool:
-    """Check if we're in quiet hours."""
+    """Check if we're in quiet hours.
+
+    Quiet hours are optional: an empty ``quiet_start`` or ``quiet_end`` (a
+    worker's default is both) means there are none, so never quiet.
+    """
+    start = str(config.quiet_start or "").strip()
+    end = str(config.quiet_end or "").strip()
+    if not start or not end:
+        return False
     try:
         tz = ZoneInfo(config.timezone)
         now = datetime.now(tz)
         current_minutes = now.hour * 60 + now.minute
 
-        start_h, start_m = map(int, config.quiet_start.split(":"))
-        end_h, end_m = map(int, config.quiet_end.split(":"))
+        start_h, start_m = map(int, start.split(":"))
+        end_h, end_m = map(int, end.split(":"))
         start_minutes = start_h * 60 + start_m
         end_minutes = end_h * 60 + end_m
 

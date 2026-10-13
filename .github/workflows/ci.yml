@@ -7,9 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel superseded runs on the same branch/PR (e.g. rapid pushes).
+# Cancel superseded runs on the same branch/PR (e.g. rapid pushes). Never a push
+# run: the migration check compares each push with the commit it replaced.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'push' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -66,6 +67,24 @@ jobs:
 
       - name: Run test suite
         run: .venv/bin/pytest tests/ -v
+
+      - name: Check new migrations are numbered above main's highest
+        # The runner skips versions at or below the database's current one. A PR is
+        # checked against its base as fetched now (a re-run sees today's main), a push
+        # to main against the commit it replaced. !cancelled(): run even if tests fail.
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            git fetch --no-tags --depth=1 origin "$BEFORE"
+            base=$BEFORE
+          else
+            git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+            base=origin/$BASE_REF
+          fi
+          python3 scripts/check_migration_numbers.py "$base"
 
   frontend-build:
     name: Frontend build (Vite)

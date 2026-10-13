@@ -70,8 +70,9 @@ def _detect_asset_suffix() -> str:
 # documented as unsafe in a process that has threads (which the daemon does).
 # The shell sets the umask and then ``exec``s the proxy, so the pid Nerve tracks
 # and signals is unchanged. The native ``umask=`` / ``process_group=`` subprocess
-# kwargs are deliberately NOT used: the daemon runs its event loop on uvloop,
-# whose subprocess support rejects them (``ValueError: unexpected kwargs``).
+# kwargs are deliberately NOT used: the gateway can run on uvloop
+# (``gateway.loop``), whose subprocess support rejects them (``ValueError:
+# unexpected kwargs``).
 # ``start_new_session`` is accepted by both uvloop and the stdlib loop and gives
 # the proxy its own session/process group so signals aimed at Nerve miss it.
 
@@ -314,7 +315,7 @@ class ProxyService:
                 # its pid (the one stop() signals) is unchanged. Keeps the token
                 # JSON and per-request error logs the proxy creates owner-only
                 # (0600) without a preexec_fn callback or the native
-                # umask=/process_group= kwargs the daemon's uvloop loop rejects.
+                # umask=/process_group= kwargs that uvloop (gateway.loop) rejects.
                 # start_new_session detaches it into its own session/process
                 # group so signals aimed at Nerve's group miss the proxy.
                 "/bin/sh", "-c", 'umask 077 && exec "$0" "$@"',

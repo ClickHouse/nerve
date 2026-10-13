@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Flag, auto
 from typing import Any
 
+from nerve.channels.access import Decision
+
 
 class ChannelCapability(Flag):
     """Capabilities a channel can declare.
@@ -63,6 +65,45 @@ class OutboundMessage:
     text: str
     session_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ObservedMessage:
+    """A message a channel collected for the source inbox.
+
+    Not an :class:`InboundMessage`: nothing here starts an agent turn. It is
+    a record headed for the source inbox, where the existing consumer tools
+    and cron gates can act on it — so the fields are the ones a reader needs
+    to make sense of a line of chat, not the ones the router needs to route.
+
+    Names are left empty when unresolved. Collection runs on the dispatch
+    path and a display name costs an API call, so the channel buffers raw IDs
+    and a reader resolves them later — or does not, if nothing asked.
+    """
+
+    channel_name: str                               # "slack", "telegram"
+    channel_key: str                                # "slack:C0123ABCD:1700000000.000100"
+    conversation_id: str                            # "C0123ABCD"
+    sender_id: str                                  # "U0456DEFG"
+    text: str
+    message_id: str                                 # transport-native id (Slack ts)
+    timestamp: str                                  # ISO 8601
+    conversation_title: str = ""                    # "" until resolved
+    sender_name: str = ""                           # "" until resolved
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class OutboundRefused(Exception):
+    """The transport refused a message by policy after the channel allowed it.
+
+    A channel whose policy is decided outside Nerve, for example by a channel
+    gateway, raises it from :meth:`BaseChannel.send`. The router reports it
+    as a refusal, not as a transport failure. ``reason`` is fit for the agent.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class BaseChannel(abc.ABC):
@@ -125,8 +166,15 @@ class BaseChannel(abc.ABC):
         """
         return None
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
         """Edit a previously sent message (for streaming).
+
+        ``throttle`` marks an edit the caller can afford to lose, so a
+        channel may drop it to stay inside a per-conversation rate limit.
+        A final or recovery edit leaves it False and always goes out.
 
         Only called if channel declares STREAMING capability and
         constraints.supports_message_edit is True.
@@ -183,6 +231,23 @@ class BaseChannel(abc.ABC):
         For Telegram, this could render as inline keyboard buttons.
         For Web, this is a JSON event over WebSocket.
         """
+
+    # ------------------------------------------------------------------ #
+    #  Optional: addressed delivery                                         #
+    # ------------------------------------------------------------------ #
+
+    async def authorize_outbound(self, target: str) -> Decision:
+        """Whether an agent may send an unsolicited message to *target*.
+
+        Addressed delivery is the one path where the destination comes from
+        the agent rather than from a person who wrote in first, so the write
+        policy belongs to the channel that knows what a target means. The
+        router asks; the channel decides.
+
+        Refusing by default matches :meth:`send_file`, which declines rather
+        than infer a destination. A channel opts in by overriding this.
+        """
+        return Decision(False, f"{self.name} does not accept addressed delivery")
 
     # ------------------------------------------------------------------ #
     #  Optional: file delivery                                              #

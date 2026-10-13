@@ -1,0 +1,5 @@
+# Nerve — Secrets (gitignored)
+# API keys, tokens, and other sensitive configuration.
+
+auth:
+  jwt_secret: REDACTED

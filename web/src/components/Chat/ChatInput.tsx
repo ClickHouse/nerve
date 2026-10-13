@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
 import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
 import { Button, IconButton, Select, TextField } from '../ui';
-import { useChatStore, EMPTY_REVIEW_LOOP } from '../../stores/chatStore';
+import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
@@ -52,13 +52,20 @@ interface AttachmentFile {
   error?: string;
 }
 
-export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
+export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }: {
   onSend: (message: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => void;
   onStop: () => void;
   isStreaming: boolean;
   disabled?: boolean;
+  /**
+   * Text to put in the composer once, for the first session that has no
+   * draft of its own — the setup wizard's suggested first message. Never
+   * overwrites a draft somebody typed.
+   */
+  seed?: string | null;
 }) {
   const [input, setInput] = useState('');
+  const seedRef = useRef<string | null>(seed);
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   // "Run later" kebab menu (mirrors the SessionSidebar three-dots menu).
@@ -104,6 +111,11 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   }, [cancelDraftFlush, setDraft]);
   // Clear any pending draft write when the composer unmounts.
   useEffect(() => cancelDraftFlush, [cancelDraftFlush]);
+  // Re-entry leaves the page at once, so it writes the text without the delay.
+  useEffect(() => registerComposerFlush(() => {
+    cancelDraftFlush();
+    setDraft(activeSession, input);
+  }), [activeSession, input, cancelDraftFlush, setDraft]);
 
   // Backend selector renders only while the chat is virtual (unsent):
   // the choice binds at server-side session creation and is sticky.
@@ -184,11 +196,19 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled }: {
   // getState so a draft mutation (the keystrokes below) doesn't reload mid-edit.
   // Focus the composer on every switch so you can start typing right away.
   useEffect(() => {
-    setInput(useChatStore.getState().drafts[activeSession] ?? '');
+    let text = useChatStore.getState().drafts[activeSession] ?? '';
+    // The one-time seed takes the first session that has no draft, and is
+    // persisted as that session's draft so a reload keeps it.
+    if (!text && activeSession && seedRef.current) {
+      text = seedRef.current;
+      seedRef.current = null;
+      setDraft(activeSession, text);
+    }
+    setInput(text);
     historyIndexRef.current = -1;
     historyStashRef.current = '';
     if (activeSession) setTimeout(() => textareaRef.current?.focus(), 0);
-  }, [activeSession]);
+  }, [activeSession, setDraft]);
 
   // Keep the textarea height in sync with its content (typing + draft load).
   useLayoutEffect(() => {
