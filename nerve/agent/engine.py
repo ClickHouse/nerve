@@ -70,10 +70,11 @@ from nerve.agent.tools import init_tools
 from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import Actor
+from nerve.agent.managed_mcp import SessionCatalogs
 from nerve.mcp_gateway import (
     BUILTIN_SERVER_NAME,
+    CatalogServers,
     GatewayCatalog,
-    GatewayServer,
     McpGatewayCatalog,
 )
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -291,6 +292,9 @@ class AgentEngine:
                 config.mcp_gateway_url, on_applied=self._on_mcp_catalog_applied,
                 refresh_interval=config.mcp_gateway_refresh_seconds,
             )
+        # The catalog generation of each running client in external mode,
+        # and the updates of running clients to a newer catalog.
+        self._session_catalogs = SessionCatalogs()
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -434,38 +438,50 @@ class AgentEngine:
         """Whether the organization manages the MCP servers (external mode)."""
         return self._managed_mcp
 
-    def managed_mcp_servers(self) -> tuple[GatewayServer, ...] | None:
+    def managed_mcp_servers(self) -> CatalogServers | None:
         """The MCP gateway servers for a new session.
 
         ``None`` in local mode. In external mode, the servers of the applied
-        catalog, which is empty without a gateway URL or before the first
-        catalog. A server that has the name of Nerve's own server is left out.
+        catalog with its generation and digest, which is empty without a
+        gateway URL or before the first catalog. A server that has the name of
+        Nerve's own server is left out.
         """
         if not self._managed_mcp:
             return None
         if self._mcp_gateway is None:
-            return ()
-        return tuple(
-            server for server in self._mcp_gateway.servers
-            if server.id != BUILTIN_SERVER_NAME
+            return CatalogServers()
+        applied = self._mcp_gateway.applied
+        if applied is None:
+            return CatalogServers()
+        return CatalogServers(
+            (server for server in applied.servers if server.id != BUILTIN_SERVER_NAME),
+            generation=applied.generation,
+            digest=applied.digest,
         )
 
     def mcp_gateway_status(self) -> dict | None:
         """The applied catalog for diagnostics. ``None`` in local mode.
 
         ``not_applied`` maps a catalog server ID to the backends that do not
-        give it to their sessions, each with the reason.
+        give it to their sessions, each with the reason. ``sessions`` lists
+        each running client with its catalog generation and the servers that
+        it does not follow (see :mod:`nerve.agent.managed_mcp`).
         """
         if not self._managed_mcp:
             return None
+        sessions = self._session_catalogs.status(self.sessions.get_client)
         if self._mcp_gateway is None:
             return {
                 "url": None, "generation": None, "digest": None, "servers": [],
                 "applied_at": None, "checked_at": None,
                 "error": "mcp_gateway_url is not set", "retrying": False,
-                "refresh_seconds": None, "not_applied": {},
+                "refresh_seconds": None, "not_applied": {}, "sessions": sessions,
             }
-        return {**self._mcp_gateway.status(), "not_applied": self.managed_mcp_conflicts()}
+        return {
+            **self._mcp_gateway.status(),
+            "not_applied": self.managed_mcp_conflicts(),
+            "sessions": sessions,
+        }
 
     def managed_mcp_conflicts(self) -> dict[str, dict[str, str]]:
         """Catalog servers that a backend leaves out: ID -> backend -> reason.
@@ -1268,6 +1284,14 @@ class AgentEngine:
                     # model_change event for a change the user asked for.
                     self._observed_models.pop(session_id, None)
                 else:
+                    # External mode: a newer catalog reaches the running
+                    # client before this turn, as far as its backend can
+                    # change MCP servers.
+                    if self._managed_mcp:
+                        await self._session_catalogs.update(
+                            session_id, client, self.managed_mcp_servers(),
+                            can_update=backend.capabilities.updates_mcp_servers,
+                        )
                     return client
 
             # Check for stored native session ID for resume
@@ -1504,6 +1528,8 @@ class AgentEngine:
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
+            if self._managed_mcp:
+                self._session_catalogs.record(session_id, backend.name, client)
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):

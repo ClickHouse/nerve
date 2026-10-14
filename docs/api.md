@@ -1321,8 +1321,13 @@ gateway that new sessions use, and the result of the last catalog request.
 `retrying` is true while the background retry runs. `refresh_seconds` is the
 interval of the periodic catalog read (`0` when it is off, `null` without a
 gateway URL). `not_applied` maps a catalog server ID to the backends that
-leave it out, each with the reason (see the MCP server routes above). The
-block is absent in local mode.
+leave it out, each with the reason (see the MCP server routes above).
+`sessions` has one entry for each running session client, sorted by
+`session_id`: `built_generation` is the catalog generation that the client
+was built with, `generation` is the last generation that it took in, and
+`pending` lists the catalog servers whose change only a new session gets
+(see [Catalog changes in running sessions](config.md#catalog-changes-in-running-sessions)).
+The block is absent in local mode.
 
 ```json
 "mcp_gateway": {
@@ -1335,7 +1340,13 @@ block is absent in local mode.
   "error": null,
   "retrying": false,
   "refresh_seconds": 30.0,
-  "not_applied": {}
+  "not_applied": {},
+  "sessions": [
+    {"session_id": "s-1", "backend": "claude", "built_generation": 6,
+     "generation": 7, "pending": ["jira"]},
+    {"session_id": "s-2", "backend": "codex", "built_generation": 7,
+     "generation": 7, "pending": []}
+  ]
 }
 ```
 

@@ -7,6 +7,7 @@ does not change. The gateway is a fake HTTP server on loopback.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -215,6 +216,25 @@ class TestClaudeSnapshot:
         assert len(reads) == 1
         assert set(options.mcp_servers) == {"nerve", "docs"}
         assert options.allowed_tools == ["mcp__docs"]
+
+    @pytest.mark.asyncio
+    async def test_the_client_keeps_the_snapshot_of_its_options(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A client names the catalog generation that its options come from."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            claude = engine._backends["claude"]
+            with patch.object(claude, "_build_hooks", return_value={}):
+                client = await claude.create_client(_spec(engine.config))
+        finally:
+            await engine._mcp_gateway.close()
+        snapshot = client.managed_mcp_servers
+        assert (snapshot.generation, snapshot.digest) == (7, catalog_payload(7, {})["digest"])
+        assert [server.id for server in snapshot] == ["docs", "github"]
+        assert set(client._options.mcp_servers) == {"nerve", "docs", "github"}
 
 
 class TestCodexConfiguration:
@@ -841,6 +861,233 @@ class TestNewSessions:
         assert rows["docs"]["type"] == "http"
         usage = await db.get_mcp_server_usage("docs")
         assert [(u["tool_name"], u["error"]) for u in usage] == [("search", message)]
+
+
+def _claude_without_cli(monkeypatch, engine: AgentEngine, fail: dict | None = None) -> list[tuple]:
+    """Real Claude clients that start no CLI; their MCP server calls are recorded.
+
+    ``fail`` maps a server name to the number of calls that raise first.
+    """
+    from claude_agent_sdk import ClaudeSDKClient
+
+    from nerve.agent.backends import claude as claude_module
+
+    calls: list[tuple] = []
+    failures = dict(fail or {})
+
+    async def connect(self, prompt=None):
+        pass
+
+    def maybe_fail(name):
+        if failures.get(name):
+            failures[name] -= 1
+            raise RuntimeError("MCP server change refused")
+
+    async def toggle(self, name, enabled):
+        calls.append(("toggle", name, enabled))
+        maybe_fail(name)
+
+    async def reconnect(self, name):
+        calls.append(("reconnect", name))
+        maybe_fail(name)
+
+    monkeypatch.setattr(ClaudeSDKClient, "connect", connect)
+    monkeypatch.setattr(ClaudeSDKClient, "toggle_mcp_server", toggle)
+    monkeypatch.setattr(ClaudeSDKClient, "reconnect_mcp_server", reconnect)
+    monkeypatch.setattr(claude_module.ClaudeClient, "is_alive", lambda self: True)
+    # The idle watcher reads the CLI's stream, which these clients do not have.
+    monkeypatch.setattr(engine, "_start_idle_watcher", lambda *args: None)
+    return calls
+
+
+def _sessions_of(engine: AgentEngine) -> dict[str, dict]:
+    return {
+        entry["session_id"]: entry
+        for entry in engine.mcp_gateway_status()["sessions"]
+    }
+
+
+class TestRunningSessions:
+    """A newer catalog reaches a running session at its next turn."""
+
+    @pytest.mark.asyncio
+    async def test_a_running_claude_session_follows_the_catalog(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        calls = _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("s-1", source="web", actor=None)
+            first = await engine._get_or_create_client("s-1", "web", None)
+            assert first.managed_mcp_servers.generation == 7
+            assert _sessions_of(engine)["s-1"] == {
+                "session_id": "s-1", "backend": "claude",
+                "built_generation": 7, "generation": 7, "pending": [],
+            }
+
+            # docs loses a tool, github goes away, jira is new.
+            gateway.catalog = catalog_payload(8, {"docs": ["search"], "jira": ["create"]})
+            await engine._mcp_gateway.refresh()
+            assert calls == []  # nothing happens before the next turn
+            assert await engine._get_or_create_client("s-1", "web", None) is first
+            assert calls == [("toggle", "github", False), ("reconnect", "docs")]
+            assert _sessions_of(engine)["s-1"] == {
+                "session_id": "s-1", "backend": "claude",
+                "built_generation": 7, "generation": 8, "pending": ["jira"],
+            }
+
+            # The next turn with the same catalog changes nothing.
+            calls.clear()
+            await engine._get_or_create_client("s-1", "web", None)
+            assert calls == []
+
+            # github comes back with its old tools; jira goes away again.
+            gateway.catalog = catalog_payload(9, {"docs": ["search"], "github": ["get_issue"]})
+            await engine._mcp_gateway.refresh()
+            await engine._get_or_create_client("s-1", "web", None)
+            assert calls == [("toggle", "github", True)]
+            assert _sessions_of(engine)["s-1"]["generation"] == 9
+            assert _sessions_of(engine)["s-1"]["pending"] == []
+        finally:
+            await engine._mcp_gateway.close()
+
+    @pytest.mark.asyncio
+    async def test_the_periodic_read_reaches_a_running_session(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        cfg = _config(
+            tmp_path, mcp_gateway_url=gateway.url, mcp_gateway_refresh_seconds=1,
+        )
+        engine = AgentEngine(cfg, db)
+        engine._mcp_gateway._refresh_interval = 0.05  # the setting's minimum is 1 s
+        calls = _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("s-1", source="web", actor=None)
+            await engine._get_or_create_client("s-1", "web", None)
+            gateway.catalog = catalog_payload(8, {"docs": ["fetch_page", "search"]})
+            for _ in range(100):
+                if engine.mcp_gateway_status()["generation"] == 8:
+                    break
+                await asyncio.sleep(0.02)
+            await engine._get_or_create_client("s-1", "web", None)
+        finally:
+            await engine._mcp_gateway.close()
+        assert calls == [("toggle", "github", False)]
+        assert _sessions_of(engine)["s-1"]["generation"] == 8
+
+    @pytest.mark.asyncio
+    async def test_a_new_generation_without_a_change_needs_no_call(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        calls = _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("s-1", source="web", actor=None)
+            await engine._get_or_create_client("s-1", "web", None)
+            # Another agent's change: a new generation, the same servers.
+            gateway.catalog = catalog_payload(
+                8, {"docs": ["fetch_page", "search"], "github": ["get_issue"]},
+            )
+            await engine._mcp_gateway.refresh()
+            await engine._get_or_create_client("s-1", "web", None)
+        finally:
+            await engine._mcp_gateway.close()
+        assert calls == []
+        assert _sessions_of(engine)["s-1"]["generation"] == 8
+
+    @pytest.mark.asyncio
+    async def test_a_failed_change_stays_pending_and_is_tried_again(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        calls = _claude_without_cli(monkeypatch, engine, fail={"github": 1})
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("s-1", source="web", actor=None)
+            first = await engine._get_or_create_client("s-1", "web", None)
+            gateway.catalog = catalog_payload(8, {"docs": ["fetch_page", "search"]})
+            await engine._mcp_gateway.refresh()
+            # The turn goes on with the client it has.
+            assert await engine._get_or_create_client("s-1", "web", None) is first
+            assert _sessions_of(engine)["s-1"]["pending"] == ["github"]
+            await engine._get_or_create_client("s-1", "web", None)
+            assert _sessions_of(engine)["s-1"]["pending"] == []
+        finally:
+            await engine._mcp_gateway.close()
+        assert calls == [("toggle", "github", False), ("toggle", "github", False)]
+
+    @pytest.mark.asyncio
+    async def test_a_running_codex_session_keeps_its_servers(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        import nerve.agent.backends.codex.backend as codex_module
+
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        launches = _record_codex_launches(monkeypatch, engine._backends["codex"])
+        monkeypatch.setattr(codex_module.CodexClient, "is_alive", lambda self: True)
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("c-1", source="web", backend="codex", actor=None)
+            first = await engine._get_or_create_client("c-1", "web", None)
+            gateway.catalog = catalog_payload(8, {"docs": ["search"], "jira": ["create"]})
+            await engine._mcp_gateway.refresh()
+            assert await engine._get_or_create_client("c-1", "web", None) is first
+            behind = _sessions_of(engine)["c-1"]
+            # A catalog that matches the client's servers again.
+            gateway.catalog = catalog_payload(
+                9, {"docs": ["fetch_page", "search"], "github": ["get_issue"]},
+            )
+            await engine._mcp_gateway.refresh()
+            await engine._get_or_create_client("c-1", "web", None)
+            current = _sessions_of(engine)["c-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert len(launches) == 1  # no new app-server
+        assert behind == {
+            "session_id": "c-1", "backend": "codex",
+            "built_generation": 7, "generation": 7,
+            "pending": ["docs", "github", "jira"],
+        }
+        assert current["generation"] == 9
+        assert current["pending"] == []
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_list_running_clients_only(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            for sid in ("s-1", "s-2"):
+                await db.create_session(sid, source="web", actor=None)
+                await engine._get_or_create_client(sid, "web", None)
+            assert set(_sessions_of(engine)) == {"s-1", "s-2"}
+            engine.sessions.remove_client("s-1")
+            assert set(_sessions_of(engine)) == {"s-2"}
+            # A rebuilt client starts at the applied generation.
+            gateway.catalog = catalog_payload(8, {"jira": ["create"]})
+            await engine._mcp_gateway.refresh()
+            await engine._get_or_create_client("s-1", "web", None)
+        finally:
+            await engine._mcp_gateway.close()
+        assert _sessions_of(engine)["s-1"] == {
+            "session_id": "s-1", "backend": "claude",
+            "built_generation": 8, "generation": 8, "pending": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_local_mode_tracks_no_session(self, tmp_path, db, monkeypatch):
+        engine = AgentEngine(_config(tmp_path), db)
+        _claude_without_cli(monkeypatch, engine)
+        await db.create_session("s-1", source="web", actor=None)
+        client = await engine._get_or_create_client("s-1", "web", None)
+        assert client.managed_mcp_servers is None
+        assert engine.mcp_gateway_status() is None
+        assert engine._session_catalogs.status(engine.sessions.get_client) == []
 
 
 class TestDenialMessage:

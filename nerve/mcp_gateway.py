@@ -24,7 +24,7 @@ import re
 import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 import httpx
 
@@ -109,6 +109,81 @@ class GatewayCatalog:
     generation: int
     digest: str
     servers: tuple[GatewayServer, ...]
+
+
+class CatalogServers(tuple):
+    """The gateway servers for one client, and the catalog they come from.
+
+    A tuple of :class:`GatewayServer`. ``generation`` and ``digest`` name the
+    applied catalog of the read, and are ``None`` before the first catalog. A
+    backend keeps the value that it built a client with, so the engine knows
+    the generation of each running session.
+    """
+
+    generation: int | None
+    digest: str | None
+
+    def __new__(
+        cls,
+        servers: Iterable[GatewayServer] = (),
+        generation: int | None = None,
+        digest: str | None = None,
+    ) -> "CatalogServers":
+        value = super().__new__(cls, servers)
+        value.generation = generation
+        value.digest = digest
+        return value
+
+
+@dataclass(frozen=True)
+class CatalogUpdate:
+    """What a running session must change to follow a newer catalog.
+
+    ``disable``: servers that the session has turned on and the catalog no
+    longer names. ``enable``: servers that the session has turned off and
+    the catalog names again. ``reconnect``: turned-on servers whose allowed
+    tools changed. ``missing``: catalog servers that the session was not
+    built with; only a new session gets them.
+    """
+
+    disable: tuple[str, ...] = ()
+    enable: tuple[str, ...] = ()
+    reconnect: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not (self.disable or self.enable or self.reconnect or self.missing)
+
+    def servers(self) -> tuple[str, ...]:
+        """Every server that the update names, sorted."""
+        return tuple(sorted({
+            *self.disable, *self.enable, *self.reconnect, *self.missing,
+        }))
+
+
+def plan_catalog_update(
+    configured: Iterable[str],
+    enabled: Mapping[str, tuple[str, ...]],
+    catalog: Iterable[GatewayServer],
+) -> CatalogUpdate:
+    """Compare a running session with a catalog.
+
+    ``configured`` holds the gateway servers that the session's client was
+    built with. ``enabled`` maps the servers that are on to the tools that
+    they had when they were last listed.
+    """
+    configured = set(configured)
+    wanted = {server.id: server.tools for server in catalog}
+    return CatalogUpdate(
+        disable=tuple(sorted(set(enabled) - set(wanted))),
+        enable=tuple(sorted((configured - set(enabled)) & set(wanted))),
+        reconnect=tuple(sorted(
+            server_id for server_id, tools in enabled.items()
+            if server_id in wanted and wanted[server_id] != tools
+        )),
+        missing=tuple(sorted(set(wanted) - configured)),
+    )
 
 
 def _is_int(value: Any) -> bool:

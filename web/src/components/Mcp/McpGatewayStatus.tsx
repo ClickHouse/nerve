@@ -1,6 +1,18 @@
 import { CheckCircle2, XCircle } from '../ui/icons';
 import { notAppliedLines } from '../../stores/mcpStore';
 
+/** One running client: the catalog generation it follows. */
+export interface McpGatewaySession {
+  session_id: string;
+  backend: string;
+  /** The generation that the client was built with. */
+  built_generation: number | null;
+  /** The last generation that the client took in. */
+  generation: number | null;
+  /** Catalog servers whose change only a new session gets. */
+  pending: string[];
+}
+
 /** The `mcp_gateway` block of `GET /api/diagnostics` (external mode only). */
 export interface McpGatewayDiagnostics {
   url: string | null;
@@ -11,13 +23,23 @@ export interface McpGatewayDiagnostics {
   checked_at: string | null;
   error: string | null;
   retrying: boolean;
+  /** Seconds between two catalog reads; 0 when the periodic read is off. */
+  refresh_seconds?: number | null;
   /** Catalog server ID -> backend -> reason, for servers a backend leaves out. */
   not_applied?: Record<string, Record<string, string>>;
+  sessions?: McpGatewaySession[];
+}
+
+/** Whether a running session lacks a part of the applied catalog. */
+function isBehind(session: McpGatewaySession, generation: number | null): boolean {
+  return session.generation !== generation || session.pending.length > 0;
 }
 
 /** The catalog that new sessions use, and the result of the last read. */
 export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) {
   const applied = status.generation !== null;
+  const sessions = status.sessions ?? [];
+  const behind = sessions.filter((session) => isBehind(session, status.generation));
   const healthy = applied && !status.error && Object.keys(status.not_applied ?? {}).length === 0;
   return (
     <div className="text-xs text-text-dim flex items-center gap-3 flex-wrap" role="group" aria-label="MCP gateway">
@@ -47,6 +69,19 @@ export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) 
           </span>
         ),
       )}
+      {applied && sessions.length > 0 && (
+        <span className="text-text-faint">
+          {sessions.length - behind.length} of {sessions.length} running session
+          {sessions.length === 1 ? '' : 's'} on this generation
+        </span>
+      )}
+      {behind.map((session) => (
+        <span key={session.session_id} className="text-hue-amber" role="status">
+          Session {session.session_id} ({session.backend}): generation{' '}
+          {session.generation ?? 'none'}
+          {session.pending.length > 0 && `; for new sessions only: ${session.pending.join(', ')}`}
+        </span>
+      ))}
       {status.retrying && <span className="text-text-faint">retrying</span>}
       {status.checked_at && (
         <span className="text-text-faint">

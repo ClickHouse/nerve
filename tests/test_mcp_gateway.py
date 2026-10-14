@@ -17,9 +17,12 @@ import pytest
 from nerve.mcp_gateway import (
     MAX_CATALOG_BYTES,
     CatalogError,
+    CatalogServers,
+    CatalogUpdate,
     GatewayServer,
     McpGatewayCatalog,
     parse_catalog,
+    plan_catalog_update,
 )
 from tests.fake_mcp_gateway import FakeMcpGateway, catalog_payload
 
@@ -603,3 +606,45 @@ class TestPeriodicRead:
             assert reader.retrying is False
         finally:
             await reader.close()
+
+
+def _server(server_id: str, *tools: str) -> GatewayServer:
+    return GatewayServer(id=server_id, url=f"{BASE}/s/{server_id}/mcp", tools=tools)
+
+
+class TestCatalogUpdatePlan:
+    def test_the_snapshot_is_a_tuple_with_its_generation(self):
+        snapshot = CatalogServers([_server("docs", "search")], generation=7, digest="sha256:x")
+        assert snapshot == (_server("docs", "search"),)
+        assert (snapshot.generation, snapshot.digest) == (7, "sha256:x")
+        empty = CatalogServers()
+        assert empty == () and empty.generation is None and empty.digest is None
+
+    def test_an_equal_catalog_needs_nothing(self):
+        plan = plan_catalog_update(
+            {"docs"}, {"docs": ("search",)}, [_server("docs", "search")],
+        )
+        assert plan == CatalogUpdate()
+        assert plan.empty
+
+    def test_every_kind_of_change(self):
+        plan = plan_catalog_update(
+            configured={"docs", "github", "wiki"},
+            enabled={"docs": ("fetch_page", "search"), "github": ("get_issue",)},
+            catalog=[
+                _server("docs", "search"),      # tools changed
+                _server("jira", "create"),      # new
+                _server("wiki", "read"),        # turned off before, back now
+            ],
+        )
+        assert plan == CatalogUpdate(
+            disable=("github",), enable=("wiki",),
+            reconnect=("docs",), missing=("jira",),
+        )
+        assert plan.servers() == ("docs", "github", "jira", "wiki")
+        assert not plan.empty
+
+    def test_a_turned_off_server_that_stays_away_needs_nothing(self):
+        plan = plan_catalog_update({"docs", "github"}, {"docs": ("search",)}, [_server("docs", "search")])
+        assert plan.empty
+

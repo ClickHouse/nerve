@@ -1816,8 +1816,10 @@ trust store.
 
 - Each server of the catalog is one HTTP MCP server at
   `<mcp_gateway_url>/s/<id>/mcp`.
-- When the catalog changes, new sessions get the new servers. A session that
-  is running keeps the servers that it started with.
+- When the catalog changes, new sessions get the new servers. A running
+  session follows the change at the start of its next turn after Nerve read
+  the new catalog, as far as its backend can change MCP servers in a running
+  client (see [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
 - One catalog request takes at most 5 seconds, from the connection to the
   checked catalog.
 - When the gateway gives no catalog (it is not reachable, it answers with an
@@ -1884,9 +1886,48 @@ The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
 
 `GET /api/diagnostics` and the Diagnostics page show the applied catalog
-generation, its servers, and the result of the last catalog request (see
+generation, its servers, the result of the last catalog request, and the
+catalog generation of each running session (see
 [`GET /api/diagnostics`](api.md#get-apidiagnostics)). `nerve doctor` shows
 the configured `mcp_gateway_url`; it does not ask the running server.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns, until the client is idle for `sessions.client_idle_timeout_minutes`,
+its process ends, its model changes, or Nerve restarts. Each new client gets
+the servers of the applied catalog. For a running client, Nerve compares the
+applied catalog with the client's servers at the start of each turn:
+
+| Change at the gateway | Claude session | Codex session |
+|-----------------------|----------------|---------------|
+| A server is removed | Nerve turns the server off in the CLI; its tools go away at this turn | The session keeps it; new sessions do not get it |
+| The allowed tools of a server change | Nerve reconnects the server; the CLI lists its tools again at this turn | The session keeps the old list; new sessions get the new one |
+| A removed server comes back | Nerve turns it on again; the CLI lists its tools | The session keeps what it has |
+| A server is added | New sessions only | New sessions only |
+
+The Claude CLI has no call in the Python SDK that adds a server to a running
+client, and the Codex app-server has none that changes the servers that Nerve
+gives it at launch (`config/mcpServer/reload` reads the configuration files
+again and keeps the connections of unchanged servers). So these changes reach
+a session only when Nerve builds a new client for it.
+
+The time from a change at the gateway to a running Claude session that sees
+it is at most `mcp_gateway_refresh_seconds` plus the time to its next turn.
+A turn that runs when the catalog changes keeps its tool list until it ends;
+an autonomous turn (a background task that completes) does not start a check.
+A new session reads the catalog before its first turn and gets the change at
+once.
+
+A session that is behind is not a gap in the policy: the gateway checks each
+call against the current policy and refuses a server or a tool that the
+organization took away. The model can still see the old tool and gets the
+gateway's refusal when it calls it.
+
+Diagnostics list each running session in `mcp_gateway.sessions` with the
+generation that its client was built with, the last generation that it took
+in, and the servers whose change only a new session gets. To give a session
+all of a new catalog, start a new session.
 
 ## Auth
 
