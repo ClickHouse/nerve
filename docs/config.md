@@ -1929,17 +1929,20 @@ user turn tries it again.
 
 How long a running Claude session takes to see a change at the gateway:
 
-- **Gateway available:** at most `mcp_gateway_refresh_seconds`, plus the
-  time until the session's next user turn starts. The update adds to that
-  turn normally a few milliseconds and at most 10 seconds, plus the start of a
-  new client when the budget ends.
+- **Gateway available:** at most `mcp_gateway_refresh_seconds` plus the
+  catalog request (at most 5 seconds), plus the time until the session's next
+  user turn starts. The update adds to that turn normally a few milliseconds
+  and at most 10 seconds, plus the start of a new client when the budget
+  ends.
 - **After a gateway outage:** while the gateway gives no catalog, the
   periodic read waits and the retry reads at its own interval (doubling up to
   60 seconds). After the gateway is back, the next catalog read comes within
-  the retry interval at that time (at most 60 seconds), or at once when a new
-  session starts. Then the bound above applies.
+  the retry interval at that time (at most 60 seconds) plus the request (at
+  most 5 seconds), or at once when a new session starts. Then the bound above
+  applies.
 - **While the client is not between turns:** the change waits for the first
-  user turn that finds the client between turns.
+  user turn that finds the client between turns. A session that keeps a
+  background task running waits as long as the task runs.
 - **When the client refuses a change:** there is no time bound. Diagnostics
   list the server as pending until a later turn succeeds, or until the client
   is rebuilt (idle timeout, process end, model change, restart).

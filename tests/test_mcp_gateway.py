@@ -556,6 +556,25 @@ class TestPeriodicRead:
             await reader.close()
 
     @pytest.mark.asyncio
+    async def test_a_slow_answer_adds_its_time_to_the_interval(self, gateway):
+        """The periodic read waits the interval, then the request: a new
+        generation applies after both, within the interval plus the request
+        deadline."""
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0.05, deadline=2.0)
+        try:
+            await reader.start()
+            gateway.delay = 0.4
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            loop = asyncio.get_running_loop()
+            changed = loop.time()
+            await _until(lambda: reader.applied.generation == 8)
+            elapsed = loop.time() - changed
+        finally:
+            gateway.delay = 0.0
+            await reader.close()
+        assert 0.4 <= elapsed < 0.05 + 2.0
+
+    @pytest.mark.asyncio
     async def test_zero_turns_the_periodic_read_off(self, gateway):
         reader = McpGatewayCatalog(gateway.url, refresh_interval=0)
         try:

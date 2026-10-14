@@ -52,6 +52,8 @@ class FakeMcpGateway:
         self.catalog_gate: threading.Event | None = None
         # Seconds between single bytes of the catalog body; None sends it at once.
         self.trickle: float | None = None
+        # Seconds before the catalog answer starts.
+        self.delay = 0.0
         self.mcp_requests: list[tuple[str, dict]] = []
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -73,6 +75,8 @@ class FakeMcpGateway:
                     self._json(404, {"reason": "not_found", "requestId": _ZERO_ID})
                     return
                 gateway.catalog_requests += 1
+                if gateway.delay:
+                    time.sleep(gateway.delay)
                 if gateway.catalog_gate is not None:
                     gateway.catalog_gate.wait(5)
                 if gateway.catalog_status != 200:
