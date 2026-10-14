@@ -503,13 +503,15 @@ class ClaudeBackend:
             config.ollama.enabled and "claude" not in selected_model.lower()
         )
 
-        thinking_config = (
-            None if is_ollama_model
-            else self._parse_thinking_config(config.agent.thinking, selected_model)
-        )
         effort = (
             None if is_ollama_model
             else self._effective_effort(spec.effort, selected_model)
+        )
+        thinking_config = (
+            None if is_ollama_model
+            else self._parse_thinking_config(
+                config.agent.thinking, selected_model, effort,
+            )
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (some Sonnet models, for instance) — skip the beta header for those.
@@ -947,17 +949,28 @@ class ClaudeBackend:
         return "4-5" in m or "4-6" in m
 
     @staticmethod
-    def _model_rejects_disabled_thinking(model: str | None) -> bool:
-        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
-        # level. Effort is the only control.
-        return bool(model) and "opus-5-5" in model.lower()
+    def _model_rejects_disabled_thinking(
+        model: str | None, effort: str | None = None,
+    ) -> bool:
+        # Opus 5.5 and Sonnet 5.5 return 400 for thinking.type="disabled" at
+        # every effort level, so send adaptive and let effort set the depth.
+        # Haiku 5.5 returns 400 for it at xhigh and max. An unset effort can
+        # resolve to either, so only low, medium and high keep it disabled.
+        if not model:
+            return False
+        m = model.lower()
+        if "opus-5-5" in m or "sonnet-5-5" in m:
+            return True
+        return "haiku-5-5" in m and effort not in ("low", "medium", "high")
 
     @staticmethod
-    def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
+    def _parse_thinking_config(
+        value: str, model: str | None = None, effort: str | None = None,
+    ) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
-            if ClaudeBackend._model_rejects_disabled_thinking(model):
+            if ClaudeBackend._model_rejects_disabled_thinking(model, effort):
                 return {"type": "adaptive"}
             return {"type": "disabled"}
         if v == "adaptive":
@@ -987,7 +1000,9 @@ class ClaudeBackend:
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
         "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
+        "sonnet-5-5": ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
+        "haiku-5-5":  ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),

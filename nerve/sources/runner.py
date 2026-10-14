@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.cron.jobs import RESERVED_JOB_ID_PREFIX
 from nerve.sources.models import IngestResult, SourceRecord
+from nerve.utils.llm import response_text
 
 if TYPE_CHECKING:
     from nerve.db import Database
@@ -484,7 +485,9 @@ class SourceRunner:
                     response = await asyncio.wait_for(
                         client.messages.create(
                             model=model,
-                            max_tokens=1024,
+                            # Thinking counts toward max_tokens, and the 5.5
+                            # models think by default.
+                            max_tokens=2048,
                             messages=[{
                                 "role": "user",
                                 "content": prompt_content,
@@ -492,7 +495,13 @@ class SourceRunner:
                         ),
                         timeout=30,
                     )
-                    record.content = response.content[0].text
+                    text = response_text(response)
+                    stop_reason = getattr(response, "stop_reason", None)
+                    if not text or stop_reason == "max_tokens":
+                        raise ValueError(
+                            f"no complete text (stop_reason={stop_reason})"
+                        )
+                    record.content = text
                     logger.debug(
                         "Condensed %s: %d → %d chars",
                         record.id, original_len, len(record.content),
