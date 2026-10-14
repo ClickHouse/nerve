@@ -91,8 +91,8 @@ describe('McpGatewayStatus with running sessions', () => {
     expect(group).toHaveTextContent('1 of 3 running sessions on this generation');
     const lines = screen.getAllByRole('status').map((line) => line.textContent);
     expect(lines).toEqual([
-      'Session s-1 (claude): generation 8; for new sessions only: jira',
-      'Session s-2 (codex): generation 7; for new sessions only: docs, github',
+      'Session s-1 (claude): generation 8; not followed: jira',
+      'Session s-2 (codex): generation 7; not followed: docs, github',
     ]);
   });
 
@@ -107,4 +107,3 @@ describe('McpGatewayStatus with running sessions', () => {
     expect(group).not.toHaveTextContent('running session');
   });
 });
-

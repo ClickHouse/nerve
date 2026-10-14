@@ -1324,8 +1324,10 @@ gateway URL). `not_applied` maps a catalog server ID to the backends that
 leave it out, each with the reason (see the MCP server routes above).
 `sessions` has one entry for each running session client, sorted by
 `session_id`: `built_generation` is the catalog generation that the client
-was built with, `generation` is the last generation that it took in, and
-`pending` lists the catalog servers whose change only a new session gets
+was built with, `generation` is the last generation that it follows in full
+(apart from servers that it cannot add), and `pending` lists the servers that
+it does not follow: added servers, and servers whose change is refused, waits,
+or cannot be made by its backend
 (see [Catalog changes in running sessions](config.md#catalog-changes-in-running-sessions)).
 The block is absent in local mode.
 

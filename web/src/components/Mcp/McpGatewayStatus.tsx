@@ -7,9 +7,9 @@ export interface McpGatewaySession {
   backend: string;
   /** The generation that the client was built with. */
   built_generation: number | null;
-  /** The last generation that the client took in. */
+  /** The last generation that the client follows in full, apart from servers it cannot add. */
   generation: number | null;
-  /** Catalog servers whose change only a new session gets. */
+  /** Servers that the client does not follow (added, refused, waiting, or not changeable). */
   pending: string[];
 }
 
@@ -79,7 +79,7 @@ export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) 
         <span key={session.session_id} className="text-hue-amber" role="status">
           Session {session.session_id} ({session.backend}): generation{' '}
           {session.generation ?? 'none'}
-          {session.pending.length > 0 && `; for new sessions only: ${session.pending.join(', ')}`}
+          {session.pending.length > 0 && `; not followed: ${session.pending.join(', ')}`}
         </span>
       ))}
       {status.retrying && <span className="text-text-faint">retrying</span>}
