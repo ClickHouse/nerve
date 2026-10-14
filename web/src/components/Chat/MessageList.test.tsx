@@ -30,7 +30,7 @@ const { MessageList } = await import('./MessageList');
 function renderEmpty() {
   return render(
     <MemoryRouter>
-      <MessageList messages={[]} streamingBlocks={[]} isStreaming={false} />
+      <MessageList messages={[]} isStreaming={false} />
     </MemoryRouter>,
   );
 }
