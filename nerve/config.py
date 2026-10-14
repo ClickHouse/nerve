@@ -3294,8 +3294,8 @@ class LangfuseConfig:
     """Langfuse observability — optional. Activated by setting both keys.
 
     With ``public_key`` and ``secret_key`` configured Nerve traces the agent
-    loop and memU LLM calls into the Langfuse project pointed at by ``host``.
-    Empty keys = no-op, zero overhead, no SDK calls.
+    loop and direct Anthropic SDK calls into the Langfuse project pointed at
+    by ``host``. Empty keys = no-op, zero overhead, no SDK calls.
     """
 
     public_key: str = ""

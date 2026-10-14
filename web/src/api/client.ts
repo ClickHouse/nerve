@@ -1412,8 +1412,10 @@ export const api = {
       langfuse: {
         enabled: boolean;
         host: string | null;
+        project_id: string | null;
         auth_ok: boolean;
         last_flush_at: string | null;
+        usage_rewriter: boolean;
       };
     }>('/observability/status'),
 
