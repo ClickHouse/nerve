@@ -299,9 +299,6 @@ class AccountStore:
                 f"got {credential_source!r}"
             )
         async with self._atomic():
-            # Take the write lock before the count, so two processes cannot
-            # both see an empty table.
-            await self.db.execute("BEGIN IMMEDIATE")
             if await self._count_accounts():
                 return BootstrapAccount(created=False)
             actor_id, account_id, now = _new_id(), _new_id(), _now()
@@ -368,7 +365,6 @@ class AccountStore:
         credential. The caller checks ``auth.password_hash``.
         """
         async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
             async with self.db.execute(
                 "SELECT credential_source FROM accounts"
             ) as cursor:
@@ -403,11 +399,6 @@ class AccountStore:
 
         actor_id, account_id = _new_id(), _new_id()
         async with self._atomic():
-            # The write lock up front: the guards below are read-then-write, and
-            # a deferred transaction would let two callers both read a state
-            # that permits the insert and then both perform it.
-            await self.db.execute("BEGIN IMMEDIATE")
-
             async with self.db.execute(
                 "SELECT username, credential_source FROM accounts"
             ) as cursor:
@@ -482,7 +473,6 @@ class AccountStore:
             return await self.get_account(account_id)
 
         async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
             async with self.db.execute(
                 "SELECT 1 FROM accounts WHERE id = ?", (account_id,)
             ) as cursor:
@@ -567,7 +557,6 @@ class AccountStore:
             username = None
 
         async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
             async with self.db.execute(
                 "SELECT id, actor_id, credential_source FROM accounts"
             ) as cursor:
@@ -618,7 +607,6 @@ class AccountStore:
     async def disable_account(self, account_id: str) -> dict | None:
         """Idempotently disable an account unless it is the last enabled one."""
         async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
             account = await self.get_account(account_id)
             if account is None:
                 return None
@@ -644,7 +632,6 @@ class AccountStore:
     async def enable_account(self, account_id: str) -> dict | None:
         """Re-enable an account. Idempotent; ``None`` if there is no such account."""
         async with self._atomic():
-            await self.db.execute("BEGIN IMMEDIATE")
             account = await self.get_account(account_id)
             if account is None:
                 return None
