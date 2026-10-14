@@ -1897,7 +1897,8 @@ A session keeps its client (the Claude CLI or the Codex app-server) between
 turns, until the client is idle for `sessions.client_idle_timeout_minutes`,
 its process ends, its model changes, or Nerve restarts. Each new client gets
 the servers of the applied catalog. For a running client, Nerve compares the
-applied catalog with the client's servers at the start of each turn:
+applied catalog with the client's servers before each user turn, after it
+has read the client's buffered autonomous output (see below):
 
 | Change at the gateway | Claude session | Codex session |
 |-----------------------|----------------|---------------|
@@ -1912,12 +1913,37 @@ gives it at launch (`config/mcpServer/reload` reads the configuration files
 again and keeps the connections of unchanged servers). So these changes reach
 a session only when Nerve builds a new client for it.
 
-The time from a change at the gateway to a running Claude session that sees
-it is at most `mcp_gateway_refresh_seconds` plus the time to its next turn.
-A turn that runs when the catalog changes keeps its tool list until it ends;
-an autonomous turn (a background task that completes) does not start a check.
-A new session reads the catalog before its first turn and gets the change at
-once.
+Nerve changes a running Claude client only when the client is between
+turns: the read of its buffered autonomous output (the turn that the CLI runs
+on its own when a background task completes) ended with no such turn open and
+nothing more in the buffer. Otherwise the change waits for a later user turn.
+All changes of one update share a budget of 10 seconds, and the servers that
+the catalog no longer names are turned off first, at the same time. When a
+change has no result at the end of the budget, the CLI could still apply it
+later, so Nerve stops that client and starts a new one (with the applied
+catalog) for the turn. A refused change leaves its server pending; each later
+user turn tries it again.
+
+How long a running Claude session takes to see a change at the gateway:
+
+- **Gateway available:** at most `mcp_gateway_refresh_seconds`, plus the
+  time until the session's next user turn starts. The update adds to that
+  turn normally a few milliseconds and at most 10 seconds, plus the start of a
+  new client when the budget ends.
+- **After a gateway outage:** while the gateway gives no catalog, the
+  periodic read waits and the retry reads at its own interval (doubling up to
+  60 seconds). After the gateway is back, the next catalog read comes within
+  the retry interval at that time (at most 60 seconds), or at once when a new
+  session starts. Then the bound above applies.
+- **While the client is not between turns:** the change waits for the first
+  user turn that finds the client between turns.
+- **When the client refuses a change:** there is no time bound. Diagnostics
+  list the server as pending until a later turn succeeds, or until the client
+  is rebuilt (idle timeout, process end, model change, restart).
+
+A running turn keeps its tool list until it ends, and an autonomous turn does
+not start a check. A new session reads the catalog before its first turn and
+gets the change at once.
 
 A session that is behind is not a gap in the policy: the gateway checks each
 call against the current policy and refuses a server or a tool that the
@@ -1925,9 +1951,11 @@ organization took away. The model can still see the old tool and gets the
 gateway's refusal when it calls it.
 
 Diagnostics list each running session in `mcp_gateway.sessions` with the
-generation that its client was built with, the last generation that it took
-in, and the servers whose change only a new session gets. To give a session
-all of a new catalog, start a new session.
+generation that its client was built with, the last generation that it
+follows in full (apart from servers that it cannot add), and the servers that
+it does not follow: added servers, and servers whose change is refused, waits,
+or (for Codex) cannot be made. To give a session all of a new catalog, start a
+new session.
 
 ## Auth
 

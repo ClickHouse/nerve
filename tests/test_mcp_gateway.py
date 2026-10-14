@@ -647,4 +647,3 @@ class TestCatalogUpdatePlan:
     def test_a_turned_off_server_that_stays_away_needs_nothing(self):
         plan = plan_catalog_update({"docs", "github"}, {"docs": ("search",)}, [_server("docs", "search")])
         assert plan.empty
-
