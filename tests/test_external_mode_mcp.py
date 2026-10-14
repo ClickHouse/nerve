@@ -1137,6 +1137,45 @@ class TestRunningSessions:
         assert _sessions_of(engine)["s-1"]["generation"] == 8
 
     @pytest.mark.asyncio
+    async def test_a_live_background_task_defers_the_change(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A background task that settles makes the CLI start a turn of its
+        own at any time, also after the drain found it quiet. While one
+        runs, the client gets no change."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            client = scripted.client
+            engine._bg_task_registry["s-1"] = {"task-1": {"status": "running"}}
+
+            # The task settles while the first change runs: its turn's output
+            # arrives after the quiet check and before the change ends.
+            async def settles_during_the_change(name, enabled):
+                client.idle.append([ev.SystemEvent(subtype="init")])
+                await client._set_enabled(name, enabled)
+
+            client.set_mcp_server_enabled = settles_during_the_change
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            assert [e for e in scripted.log if e[0] == "begin"] == []
+            behind = _sessions_of(engine)["s-1"]
+
+            # The task ended and its output is drained: the next turn changes.
+            engine._bg_task_registry["s-1"]["task-1"]["status"] = "completed"
+            client.idle.clear()
+            client.set_mcp_server_enabled = client._set_enabled
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert behind["generation"] == 7
+        assert behind["pending"] == ["github"]
+        assert scripted.changes() == [("toggle", "github", False)]
+        assert _sessions_of(engine)["s-1"]["generation"] == 8
+
+    @pytest.mark.asyncio
     async def test_output_that_arrives_after_the_drain_defers_the_change(
         self, tmp_path, db, gateway, external, monkeypatch,
     ):

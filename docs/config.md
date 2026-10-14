@@ -1914,9 +1914,12 @@ again and keeps the connections of unchanged servers). So these changes reach
 a session only when Nerve builds a new client for it.
 
 Nerve changes a running Claude client only when the client is between
-turns: the read of its buffered autonomous output (the turn that the CLI runs
-on its own when a background task completes) ended with no such turn open and
-nothing more in the buffer. Otherwise the change waits for a later user turn.
+turns: the read of its buffered autonomous output ended with no turn open and
+nothing more in the buffer, and the session runs no background task (a
+background command, agent, or monitor). The CLI starts a turn on its own only
+when such a task settles, and Nerve holds the session's run lock during the
+changes, so no turn can start while they run. Otherwise the change waits for
+a later user turn.
 All changes of one update share a budget of 10 seconds, and the servers that
 the catalog no longer names are turned off first, at the same time. When a
 change has no result at the end of the budget, the CLI could still apply it

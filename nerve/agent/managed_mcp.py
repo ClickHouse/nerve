@@ -14,7 +14,9 @@ its backend can change MCP servers in a running client:
   servers reach new sessions only.
 
 The engine asks for an update only when the client is between turns: after
-the drain of buffered autonomous output found nothing more. All changes of
+the drain of buffered autonomous output found nothing more, and while the
+session runs no background task, whose end is what makes the CLI start a
+turn on its own. All changes of
 one update share one time budget, and the disables of removed servers start
 first. A change whose result is unknown when the budget ends (the client may
 still apply it) makes the engine replace the client before the user turn

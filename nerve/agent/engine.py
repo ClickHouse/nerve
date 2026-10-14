@@ -549,8 +549,16 @@ class AgentEngine:
         backend = self._backend_for_live_session(session_id)
 
         def between_turns() -> bool:
-            # The drain proved a quiet runtime; nothing new may have arrived.
-            return drained_quietly and client.buffer_used() <= 0
+            # The drain proved a quiet runtime, and nothing new arrived. A turn
+            # that the CLI starts on its own follows a background task (a
+            # background command, agent, or monitor) that settles; with none
+            # running, no such turn can start while the changes run, because
+            # this turn holds the session's run lock.
+            return (
+                drained_quietly
+                and client.buffer_used() <= 0
+                and not self._has_live_background_tasks(session_id)
+            )
 
         outcome = await self._session_catalogs.update(
             session_id, client, self.managed_mcp_servers(),
