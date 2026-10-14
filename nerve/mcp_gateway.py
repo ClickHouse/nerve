@@ -2,10 +2,10 @@
 
 In external mode (``NERVE_AUTH_MODE=external``), an MCP gateway decides which
 MCP servers and tools the agent can use. Nerve reads the agent's catalog from
-``GET <mcp_gateway_url>/catalog`` when it starts and before each new session.
-Each catalog server becomes one HTTP MCP server of the agent clients, at
-``<mcp_gateway_url>/s/<id>/mcp``. A session that is running keeps the servers
-that it started with.
+``GET <mcp_gateway_url>/catalog`` when it starts, before each new session, and
+at a fixed interval (``mcp_gateway_refresh_seconds``). Each catalog server
+becomes one HTTP MCP server of the agent clients, at
+``<mcp_gateway_url>/s/<id>/mcp``.
 
 The gateway identifies the agent from the connection, so the request carries
 no credential. The catalog holds no upstream address and no secret.
@@ -58,8 +58,9 @@ MANAGED_BY_ORGANIZATION = "organization"
 # Why a reload of the MCP configuration does nothing in external mode.
 MANAGED_RELOAD_DETAIL = (
     "The organization manages the MCP servers of this agent through the MCP "
-    "gateway. Nerve reads the gateway's catalog when it starts and before each "
-    "new session, so there is no configuration to reload."
+    "gateway. Nerve reads the gateway's catalog when it starts, before each "
+    "new session, and at a fixed interval, so there is no configuration to "
+    "reload."
 )
 
 # The largest catalog that Nerve reads. The gateway bounds a tenant snapshot
@@ -203,13 +204,14 @@ def _now() -> str:
 class McpGatewayCatalog:
     """Read the agent's catalog from the MCP gateway and keep the last one.
 
-    :meth:`start` reads the catalog once. :meth:`refresh` reads it again
-    before a new session. Concurrent calls share one request, which takes at
-    most ``deadline`` seconds. A changed catalog replaces the applied one and
-    goes to ``on_applied``; when ``on_applied`` fails, the next successful
-    request calls it again with the applied catalog. A failure keeps the
-    applied catalog and starts the background retry, which stops at the first
-    success.
+    :meth:`start` reads the catalog once and then every ``refresh_interval``
+    seconds (never when it is 0). :meth:`refresh` reads it again before a new
+    session. Concurrent calls share one request, which takes at most
+    ``deadline`` seconds. A changed catalog replaces the applied one and goes
+    to ``on_applied``; when ``on_applied`` fails, the next successful request
+    calls it again with the applied catalog. A failure keeps the applied
+    catalog and starts the background retry, which stops at the first
+    success. While the retry runs, the periodic read waits for it.
     """
 
     def __init__(
@@ -222,6 +224,7 @@ class McpGatewayCatalog:
         retry_initial: float = RETRY_INITIAL_SECONDS,
         retry_max: float = RETRY_MAX_SECONDS,
         deadline: float = FETCH_DEADLINE_SECONDS,
+        refresh_interval: float = 0.0,
     ):
         self._base_url = base_url.rstrip("/")
         self._on_applied = on_applied
@@ -230,6 +233,7 @@ class McpGatewayCatalog:
         self._retry_initial = retry_initial
         self._retry_max = retry_max
         self._deadline = deadline
+        self._refresh_interval = refresh_interval
         self._client: httpx.AsyncClient | None = None
         self._applied: GatewayCatalog | None = None
         # Whether on_applied completed for the applied catalog.
@@ -239,6 +243,7 @@ class McpGatewayCatalog:
         self._error: str | None = None
         self._inflight: asyncio.Task | None = None
         self._retry_task: asyncio.Task | None = None
+        self._poll_task: asyncio.Task | None = None
         self._closed = False
 
     @property
@@ -271,11 +276,21 @@ class McpGatewayCatalog:
             "checked_at": self._checked_at,
             "error": self._error,
             "retrying": self.retrying,
+            "refresh_seconds": self._refresh_interval,
         }
 
     async def start(self) -> None:
-        """Read the catalog once. On a failure, start the background retry."""
+        """Read the catalog once and start the periodic read.
+
+        On a failure, the background retry starts too.
+        """
         await self.refresh()
+        if (
+            self._refresh_interval > 0
+            and not self._closed
+            and self._poll_task is None
+        ):
+            self._poll_task = asyncio.ensure_future(self._poll_loop())
 
     async def refresh(self) -> GatewayCatalog | None:
         """Read the catalog now and return the applied one. Never raises."""
@@ -287,13 +302,14 @@ class McpGatewayCatalog:
     async def close(self) -> None:
         """Stop the background retry and close the HTTP client."""
         self._closed = True
-        for task in (self._retry_task, self._inflight):
+        for task in (self._poll_task, self._retry_task, self._inflight):
             if task is not None and not task.done():
                 task.cancel()
                 try:
                     await task
                 except BaseException:  # noqa: BLE001 - the task is cancelled
                     pass
+        self._poll_task = None
         self._retry_task = None
         self._inflight = None
         if self._client is not None:
@@ -426,6 +442,14 @@ class McpGatewayCatalog:
         self._retry_task = None
         if task is not None and not task.done():
             task.cancel()
+
+    async def _poll_loop(self) -> None:
+        while not self._closed:
+            await self._sleep(self._refresh_interval)
+            if self.retrying:
+                # The retry reads the catalog at its own interval.
+                continue
+            await self._attempt()
 
     async def _retry_loop(self) -> None:
         delay = self._retry_initial

@@ -1318,9 +1318,11 @@ In external mode the response also has `mcp_gateway`: the catalog of the MCP
 gateway that new sessions use, and the result of the last catalog request.
 `generation`, `digest` and `applied_at` are `null` before the first catalog.
 `error` is the problem of the last request, or `null` after a success.
-`retrying` is true while the background retry runs. `not_applied` maps a
-catalog server ID to the backends that leave it out, each with the reason (see
-the MCP server routes above). The block is absent in local mode.
+`retrying` is true while the background retry runs. `refresh_seconds` is the
+interval of the periodic catalog read (`0` when it is off, `null` without a
+gateway URL). `not_applied` maps a catalog server ID to the backends that
+leave it out, each with the reason (see the MCP server routes above). The
+block is absent in local mode.
 
 ```json
 "mcp_gateway": {
@@ -1332,6 +1334,7 @@ the MCP server routes above). The block is absent in local mode.
   "checked_at": "2026-10-08T10:05:00+00:00",
   "error": null,
   "retrying": false,
+  "refresh_seconds": 30.0,
   "not_applied": {}
 }
 ```

@@ -292,7 +292,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
+| `mcp_gateway_url`, `mcp_gateway_refresh_seconds` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1806,11 +1806,13 @@ not change.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment, whitespace or control characters. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+| `mcp_gateway_refresh_seconds` | number | `30` | Seconds between two catalog reads after startup. `0` turns the periodic read off. For a value that is not a number, is negative, or is above `0` and below `1`, Nerve logs a warning and uses `30`. It has an effect only in external mode. A change needs a restart. |
 
-Nerve reads `GET <mcp_gateway_url>/catalog` when it starts and before each new
-session. The request has no credential, because the gateway knows the agent
-from the connection. It does not use the proxy environment variables, and for
-`https` it uses the system trust store.
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every `mcp_gateway_refresh_seconds`. The request has no
+credential, because the gateway knows the agent from the connection. It does
+not use the proxy environment variables, and for `https` it uses the system
+trust store.
 
 - Each server of the catalog is one HTTP MCP server at
   `<mcp_gateway_url>/s/<id>/mcp`.
@@ -1824,7 +1826,7 @@ from the connection. It does not use the proxy environment variables, and for
   start with the `nerve` server only. Nerve then tries again in the
   background: after 1 second, and after each failure with double the
   interval, up to 60 seconds. It stops at the first success. A new session
-  also tries once.
+  also tries once. While these retries run, the periodic read waits.
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
 

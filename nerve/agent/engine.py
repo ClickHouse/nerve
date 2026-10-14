@@ -289,6 +289,7 @@ class AgentEngine:
         if self._managed_mcp and config.mcp_gateway_url:
             self._mcp_gateway = McpGatewayCatalog(
                 config.mcp_gateway_url, on_applied=self._on_mcp_catalog_applied,
+                refresh_interval=config.mcp_gateway_refresh_seconds,
             )
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
@@ -462,7 +463,7 @@ class AgentEngine:
                 "url": None, "generation": None, "digest": None, "servers": [],
                 "applied_at": None, "checked_at": None,
                 "error": "mcp_gateway_url is not set", "retrying": False,
-                "not_applied": {},
+                "refresh_seconds": None, "not_applied": {},
             }
         return {**self._mcp_gateway.status(), "not_applied": self.managed_mcp_conflicts()}
 
