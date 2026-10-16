@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import sqlite3
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -536,6 +537,131 @@ async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
     await _assert_bobs_move_stays(install, task_id)
     task = await install.db.get_task(task_id)
     assert "New body." in (install.config.workspace / task["file_path"]).read_text()
+
+
+def _pause_file_writes(monkeypatch, module) -> tuple[threading.Event, threading.Event]:
+    """Make ``module``'s task file write wait until the test releases it."""
+    entered, release = threading.Event(), threading.Event()
+    real_write = module.write_task_file
+
+    def paused_write(path, content):
+        entered.set()
+        assert release.wait(5), "the test never released the write"
+        real_write(path, content)
+
+    monkeypatch.setattr(module, "write_task_file", paused_write)
+    return entered, release
+
+
+async def _move_while_the_edit_writes(client, install, task_id, status, edit, entered, release):
+    """Start ``edit``, move the task while its file write waits, then finish."""
+    editing = asyncio.create_task(edit)
+    assert await asyncio.to_thread(entered.wait, 5)
+    moving = asyncio.create_task(client.post(
+        f"/api/tasks/{task_id}/move", headers=install.headers("bob"),
+        json={"status": status},
+    ))
+    await asyncio.sleep(0.2)
+    # The move waits for the edit: both change the file and the row.
+    assert not moving.done()
+    release.set()
+    return await editing, await moving
+
+
+def _task_file(install, lane: str, task_id: str):
+    return install.config.workspace / "memory" / "tasks" / lane / f"{task_id}.md"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_edit_and_a_move_into_done_do_not_lose_the_edit(
+    install, monkeypatch,
+):
+    from nerve.agent.tools.handlers import tasks as task_handlers
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+        ctx = ToolContext(
+            session_id="alices-turn", workspace=install.config.workspace,
+            db=install.db, config=install.config, engine=install.engine,
+            actor=install.db.system_actor, cause=install.actor_id("alice"),
+        )
+        await task_handlers.task_read_handler(ctx, {"task_id": task_id})
+        entered, release = _pause_file_writes(monkeypatch, task_handlers)
+        written, moved = await _move_while_the_edit_writes(
+            client, install, task_id, "done",
+            task_handlers.task_write_handler(
+                ctx, {"task_id": task_id, "content": "# Raced\n\nAgent edit.\n"},
+            ),
+            entered, release,
+        )
+
+    assert not written.is_error and moved.status_code == 200
+    task = await install.db.get_task(task_id)
+    assert task["status"] == "done"
+    assert task["file_path"] == f"memory/tasks/done/{task_id}.md"
+    assert "Agent edit." in _task_file(install, "done", task_id).read_text()
+    assert not _task_file(install, "active", task_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_rest_title_edit_and_a_move_into_done_do_not_lose_the_edit(
+    install, monkeypatch,
+):
+    from nerve.agent.tools.handlers import tasks as task_handlers
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+        entered, release = _pause_file_writes(monkeypatch, task_handlers)
+        patched, moved = await _move_while_the_edit_writes(
+            client, install, task_id, "done",
+            client.patch(
+                f"/api/tasks/{task_id}", headers=install.headers("alice"),
+                json={"title": "Raced and renamed"},
+            ),
+            entered, release,
+        )
+
+    assert patched.status_code == 200 and moved.status_code == 200
+    task = await install.db.get_task(task_id)
+    assert (task["status"], task["title"]) == ("done", "Raced and renamed")
+    assert "# Raced and renamed" in _task_file(install, "done", task_id).read_text()
+    assert not _task_file(install, "active", task_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_rest_content_edit_and_a_move_out_of_done_do_not_lose_the_edit(
+    install, monkeypatch,
+):
+    from nerve.gateway.routes import tasks as tasks_route
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+        await client.post(
+            f"/api/tasks/{task_id}/move", headers=install.headers("alice"),
+            json={"status": "done"},
+        )
+        entered, release = _pause_file_writes(monkeypatch, tasks_route)
+        patched, moved = await _move_while_the_edit_writes(
+            client, install, task_id, "pending",
+            client.patch(
+                f"/api/tasks/{task_id}", headers=install.headers("alice"),
+                json={"content": "# Raced\n\nEdited while done.\n"},
+            ),
+            entered, release,
+        )
+
+    assert patched.status_code == 200 and moved.status_code == 200
+    task = await install.db.get_task(task_id)
+    assert task["status"] == "pending"
+    assert task["file_path"] == f"memory/tasks/active/{task_id}.md"
+    assert "Edited while done." in _task_file(install, "active", task_id).read_text()
+    assert not _task_file(install, "done", task_id).exists()
 
 
 @pytest.mark.asyncio

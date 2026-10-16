@@ -169,6 +169,14 @@ Every write to a task row advances `tasks.revision` by one, added in
 migration v052. The row routes return it, and `task_read` ends with a
 `<!-- nerve: revision=N ... -->` line that `task_write` strips again.
 
+Changes of one task that write its file and its row run one at a time: the
+`PATCH` and `move` routes, `task_update`, `task_write`, `task_done` and the
+reopen path hold a lock per task from their first read of the row to their
+last write (`nerve/tasks/locks.py`). So an edit always lands in the file that
+the row names, also when another change moves the file into or out of
+`done/` at the same time. Changes of different tasks do not wait for each
+other.
+
 Pass the value you read as `expect_revision` to `task_update` or `task_done`
 to make the write conditional: if the row has changed since, nothing is
 written and the tool reports a conflict, so re-read and retry. Without it,

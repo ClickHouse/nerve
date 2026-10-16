@@ -11,6 +11,7 @@ from nerve.config import ensure_path_not_tracked_config
 from nerve.db import Database
 from nerve.identity import Attribution, attribution_for
 from nerve.tasks.files import move_task_file
+from nerve.tasks.locks import task_mutation
 from nerve.tasks.models import (
     Task,
     TaskStatus,
@@ -129,6 +130,11 @@ class TaskManager:
         return task
 
     async def mark_done(self, task_id: str, expect_revision: int | None = None) -> bool:
+        """Mark a task as done and move its file, under the task's lock."""
+        async with task_mutation(task_id):
+            return await self._mark_done(task_id, expect_revision)
+
+    async def _mark_done(self, task_id: str, expect_revision: int | None) -> bool:
         """Mark a task as done and move its file.
 
         Returns ``False`` when the task is missing, or when ``expect_revision``

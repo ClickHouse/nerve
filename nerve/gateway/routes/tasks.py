@@ -19,6 +19,7 @@ from nerve.gateway.routes._deps import (
 )
 from nerve.identity import Actor, attribution_for
 from nerve.tasks.files import write_task_file
+from nerve.tasks.locks import task_mutation
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
@@ -260,6 +261,13 @@ async def move_task(
     task_id: str, req: TaskMoveRequest, actor: Actor = Depends(require_auth),
 ):
     """Reorder a task within a lane, or move it to another one."""
+    # One lock for the status change and the rank: a change that lands
+    # between them could move the file while the rank write keeps a status.
+    async with task_mutation(task_id):
+        return await _move_task(task_id, req, actor)
+
+
+async def _move_task(task_id: str, req: TaskMoveRequest, actor: Actor) -> dict:
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:
@@ -323,6 +331,14 @@ async def get_task(task_id: str):
 async def update_task(
     task_id: str, req: TaskUpdateRequest, actor: Actor = Depends(require_auth),
 ):
+    # One lock for the content save and the field and status changes, from
+    # the first read of the row: the file this request writes is the file
+    # that the row names when the request ends.
+    async with task_mutation(task_id):
+        return await _update_task(task_id, req, actor)
+
+
+async def _update_task(task_id: str, req: TaskUpdateRequest, actor: Actor) -> dict:
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:

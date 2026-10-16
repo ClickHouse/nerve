@@ -12,6 +12,7 @@ all sessions).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 from datetime import datetime, timezone
@@ -40,8 +41,24 @@ from nerve.db.task_statuses import (
     random_status_color,
 )
 from nerve.tasks.files import move_task_file, write_task_file
+from nerve.tasks.locks import task_mutation
 
 logger = logging.getLogger(__name__)
+
+
+def _one_change_per_task(handler):
+    """Run a handler that writes a task file and its row under the task's lock.
+
+    See :mod:`nerve.tasks.locks`. The lock covers the handler's first read
+    of the row, so the path that it writes is the path the row names.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(ctx: ToolContext, args: dict) -> ToolResult:
+        async with task_mutation(args["task_id"]):
+            return await handler(ctx, args)
+
+    return wrapper
 
 
 async def _format_status_reminder(ctx: ToolContext, header: str) -> str:
@@ -412,6 +429,7 @@ async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text("\n".join(lines))
 
 
+@_one_change_per_task
 async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     from nerve.tasks.models import parse_tags_string, tags_to_string
 
@@ -625,6 +643,7 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task file not found for: {task_id}")
 
 
+@_one_change_per_task
 async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     new_content = _REVISION_TRAILER_RE.sub("", args.get("content", ""))
@@ -686,6 +705,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task {task_id} written ({len(new_content)} chars).")
 
 
+@_one_change_per_task
 async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     note = args.get("note", "")
@@ -752,6 +772,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task {task_id} marked as done.")
 
 
+@_one_change_per_task
 async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
     """Mirror of ``task_done``: bring a completed task back to life.
 
