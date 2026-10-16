@@ -221,6 +221,8 @@ class TestKeyReload:
 
 
 class _Router:
+    accepting_turns = True
+
     def __init__(self) -> None:
         self.channels: dict[str, Any] = {}
 

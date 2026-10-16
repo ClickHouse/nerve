@@ -807,7 +807,7 @@ Nerve has built-in daemon management. No systemd required for basic usage.
 
 ```bash
 nerve start           # Start as background daemon (nerve init already did this once)
-nerve stop            # Stop the daemon (graceful, 15s timeout)
+nerve stop            # Stop the daemon (graceful: gateway.drain_timeout_seconds + 15s)
 nerve restart         # Stop + start
 nerve status          # Show PID, memory, uptime, setup state
 nerve status -f       # Show status then tail logs

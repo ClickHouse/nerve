@@ -97,6 +97,11 @@ class ChannelRouter:
     #  Inbound: channel → engine                                           #
     # ------------------------------------------------------------------ #
 
+    @property
+    def accepting_turns(self) -> bool:
+        """False while the engine drains. handle_message then refuses the turn."""
+        return self.engine.accepting_turns
+
     # Debounce window (seconds) for collecting simultaneous messages
     # (e.g. forwarded messages, rapid-fire sends) into a single batch.
     BATCH_DEBOUNCE = 0.60

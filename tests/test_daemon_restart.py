@@ -54,6 +54,15 @@ class TestTheHelper:
         assert "time.sleep(0.75)" in script
         assert script.index("time.sleep(0.75)") < script.index("SIGTERM")
 
+    def test_the_sigkill_waits_for_the_drain(self, spawned, tmp_path):
+        daemon.restart_daemon(tmp_path / "config", old_pid=4242, systemd=False)
+        assert "for _ in range(30):" in spawned.call_args[0][0][2]
+
+        daemon.restart_daemon(
+            tmp_path / "config", old_pid=4242, systemd=False, drain_timeout_seconds=45,
+        )
+        assert "for _ in range(120):" in spawned.call_args[0][0][2]
+
     def test_nothing_is_killed_when_nothing_is_running(self, spawned, tmp_path):
         outcome = daemon.restart_daemon(tmp_path / "config", old_pid=None, systemd=False)
         assert "Starting Nerve" in outcome.message

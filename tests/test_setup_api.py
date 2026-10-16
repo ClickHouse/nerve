@@ -28,7 +28,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, get_config, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -1783,7 +1783,18 @@ class TestTheRestartStep:
         assert calls[0][0] == claimed.config_dir
         assert calls[0][1]["old_pid"] == os.getpid()
         assert calls[0][1]["delay_seconds"] == 0.75
+        assert calls[0][1]["drain_timeout_seconds"] == 0
         assert second.status_code == 409
+
+    async def test_helper_restart_waits_for_the_drain(self, claimed, monkeypatch):
+        await self._make_pending(claimed)
+        monkeypatch.setattr(get_config().gateway, "drain_timeout_seconds", 60)
+        calls = []
+        monkeypatch.setattr(daemon, "restart_daemon", lambda config_dir, **kw: calls.append(kw) or daemon.RestartOutcome("helper", "ok", kw.get("old_pid")))
+        async with claimed.client() as http:
+            body = (await http.post("/api/system/restart")).json()
+        assert body["mode"] == "restart" and body["timeout_hint_seconds"] == 180
+        assert calls[0]["drain_timeout_seconds"] == 60
 
     async def test_docker_exits_for_the_supervisor(self, claimed, monkeypatch):
         await self._make_pending(claimed)
