@@ -176,22 +176,25 @@ ID. In external mode, the environment can give the ID of the agent's system
 principal in `NERVE_SYSTEM_PRINCIPAL_ID` (see
 [System principal ID](config.md#system-principal-id)). The identity bootstrap
 of `nerve init` and of each server start then gives the system actor that ID
-when these two conditions are true:
+when these conditions are true:
 
 - No row refers to the system actor. Nerve finds each column that has a
   foreign key to `actor_refs` in the schema, for example `accounts.actor_id`,
   `sessions.created_by_actor_id` and `messages.actor_id`, and checks all of
-  them.
+  them. A check that cannot run counts as a row.
 - No other actor has the new ID.
+- No other process changed the ID after this process opened the database.
+  When two processes start at the same time with different values, the first
+  change stays.
 
 Thus a new installation gets the ID before it attributes work to the system
 actor. After the change, system and MCP tokens act as the new ID, and
 autonomous work is attributed to it.
 
-When a condition is false, the system actor keeps its local ID and Nerve logs
-a warning at each start. Nerve does not change rows that refer to the local
+When a condition is false, the system actor keeps its current ID and Nerve
+logs a warning at each start. Nerve does not change rows that refer to that
 ID. `nerve doctor` shows the difference. A value that is not a canonical
-lower-case UUID also keeps the local ID and gives a warning. Local mode
+lower-case UUID also keeps the current ID and gives a warning. Local mode
 ignores the variable.
 
 The schema trigger `system_actor_id_cannot_change` prevents all other changes

@@ -1835,7 +1835,7 @@ bootstrap.
 | Value | Behavior |
 |---|---|
 | Unset or empty | The system actor keeps its ID. |
-| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor and no other actor has the ID. Otherwise the system actor keeps its local ID and Nerve logs a warning. |
+| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor, no other actor has the ID, and no other process changed the ID first. Otherwise the system actor keeps its current ID and Nerve logs a warning. See [The system actor in external mode](accounts.md#the-system-actor-in-external-mode). |
 | Any other value, also a UUID in upper case | The system actor keeps its ID and Nerve logs a warning. The server starts. |
 
 Set the variable before the first `nerve init` or start, so that the change
