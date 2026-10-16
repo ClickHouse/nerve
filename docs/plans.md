@@ -98,7 +98,7 @@ User reviews (via /plans UI or chat tools)
 | Status | Meaning |
 |--------|---------|
 | `pending` | Awaiting human review |
-| `revising` | A revision was requested; the planner writes a new version. No approve, decline or second revision applies. The plan is `pending` again when the revision turn ends without a new version, and at startup |
+| `revising` | A revision was requested; the planner writes a new version. No approve, decline, second revision or `PATCH` applies. Only the revision ends it: `plan_update` supersedes the plan, or the revision turn ends without a new version and the plan is `pending` again. At startup a revising plan is `pending` again, unless resume-after-restart continues its revision session; then it is `pending` again when that resume ends without a new version |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
 | `declined` | Rejected by user |
@@ -187,6 +187,7 @@ concurrent decisions, one wins; the other changes nothing and gets HTTP 409
 (REST) or a "no longer pending" answer (tools). Only the winner starts an
 implementation or a revision turn. A revision request moves the plan to
 `revising`, so a revision and an approval or a decline never both apply.
+`PATCH` cannot set `revising` (400) or change a revising plan (409).
 
 ## Web UI
 
