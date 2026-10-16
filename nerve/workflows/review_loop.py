@@ -522,174 +522,178 @@ class ReviewLoopService:
         attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Apply a user decision to a parked loop. Returns
-        ``{ok, message, snooze_until?}``; stale decisions are recorded but
+        ``{ok, applied, message, snooze_until?}``; stale decisions are recorded but
         not applied (never crash the answer route).
 
         ``decided_by`` is the origin text (``api``, ``approval-card``).
         ``attribution`` names who decided. Each decision on an existing loop
-        is appended to ``review_loop_decisions`` with its result; an unknown
-        decision string is not a decision and is not recorded."""
+        is appended to ``review_loop_decisions``. A decision that changes the
+        loop is written in the same transaction as the change, with
+        ``applied`` true; ``ok`` can still be false when the leg that it
+        resumes does not start. A decision on a loop that is not parked is
+        recorded with ``applied`` false. An unknown decision string is not
+        recorded. ``remind_4h`` changes no loop column: it is applied when the
+        loop is parked, and the notification service then snoozes the
+        decision card."""
         decision = (decision or "").strip()
         iterate = _ITERATE_RE.match(decision)
         budget_grant = _BUDGET_RE.match(decision)
         if decision not in _DECISIONS and not iterate and not budget_grant:
-            return {"ok": False, "message": f"unknown decision: {decision!r}"}
+            return {
+                "ok": False, "applied": False,
+                "message": f"unknown decision: {decision!r}",
+            }
         loop = await self.db.get_review_loop(loop_id)
         if loop is None:
-            return {"ok": False, "message": f"no such review loop: {loop_id}"}
-
-        if decision == "remind_4h":
-            snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-            result = {"ok": True, "message": "snoozed 4h", "snooze_until": snooze}
-            await self._record_decision(
-                loop_id, decision, result, decided_by, attribution,
-            )
-            return result
-
-        async with self._lock(loop_id):
-            result = await self._apply_decision(
-                loop_id, decision, decided_by, attribution,
-                iterate=iterate, budget_grant=budget_grant,
-            )
-            # Under the lock, so the history has the order in which the
-            # decisions were applied.
-            await self._record_decision(
-                loop_id, decision, result, decided_by, attribution,
-            )
-        return result
-
-    async def _record_decision(
-        self,
-        loop_id: str,
-        decision: str,
-        result: dict,
-        decided_by: str,
-        attribution: Attribution,
-    ) -> None:
-        """Append the decision to the loop's history. A failed write is
-        logged and not raised, because the decision is already applied."""
-        try:
-            await self.db.record_review_loop_decision(
-                loop_id, decision,
-                applied=bool(result.get("ok")),
-                message=str(result.get("message") or ""),
-                decided_by=decided_by,
-                attribution=attribution,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("review loop decision record failed for %s", loop_id)
-
-    async def _apply_decision(
-        self,
-        loop_id: str,
-        decision: str,
-        decided_by: str,
-        attribution: Attribution,
-        *,
-        iterate: re.Match | None,
-        budget_grant: re.Match | None,
-    ) -> dict:
-        """The state change of :meth:`handle_decision` for a decision other
-        than ``remind_4h`` on an existing loop. Caller holds the loop lock."""
-        loop = await self.db.get_review_loop(loop_id)
-        if loop is None or loop["status"] != "awaiting_user":
             return {
-                "ok": False,
-                "message": (
-                    f"review loop {loop_id} is "
-                    f"{(loop or {}).get('status', 'gone')} — decision "
-                    "recorded but not applied"
-                ),
+                "ok": False, "applied": False,
+                "message": f"no such review loop: {loop_id}",
             }
 
-        if decision == "accept":
-            flipped = await self.db.transition_review_loop(
-                loop_id, "passed", expect=("awaiting_user",),
-                failure_reason=None,
-            )
-            if flipped:
-                loop = await self.db.get_review_loop(loop_id) or loop
-                await self._resolve_cards(
-                    loop_id, f"decided:{decision}", attribution,
+        async with self._lock(loop_id):
+            loop = await self.db.get_review_loop(loop_id)
+            if loop is None or loop["status"] != "awaiting_user":
+                return await self._decision_not_applied(
+                    loop_id, decision, decided_by, attribution,
                 )
+
+            if decision == "remind_4h":
+                if not await self.db.apply_review_loop_decision(
+                    loop_id, decision, message="snoozed 4h",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    return await self._decision_not_applied(
+                        loop_id, decision, decided_by, attribution,
+                    )
+                snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+                return {
+                    "ok": True, "applied": True, "message": "snoozed 4h",
+                    "snooze_until": snooze,
+                }
+
+            if decision == "accept":
+                if not await self.db.apply_review_loop_decision(
+                    loop_id, decision, to_status="passed",
+                    fields={"failure_reason": None},
+                    message="accepted as done",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    return await self._decision_not_applied(
+                        loop_id, decision, decided_by, attribution,
+                    )
+                loop = await self.db.get_review_loop(loop_id) or loop
+                await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
                 await self._milestone(
                     loop,
                     f"✅ **Review loop {loop_id} accepted as done** by {decided_by} "
                     f"(spent ${loop.get('spent_usd') or 0.0:.2f}).",
                     notify=True,
                 )
-            return {"ok": bool(flipped), "message": "accepted as done"}
+                return {"ok": True, "applied": True, "message": "accepted as done"}
 
-        if decision == "abandon":
-            flipped = await self.db.transition_review_loop(
-                loop_id, "failed", expect=("awaiting_user",),
-                failure_reason="abandoned",
-            )
-            if flipped:
+            if decision == "abandon":
+                if not await self.db.apply_review_loop_decision(
+                    loop_id, decision, to_status="failed",
+                    fields={"failure_reason": "abandoned"},
+                    message="abandoned",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    return await self._decision_not_applied(
+                        loop_id, decision, decided_by, attribution,
+                    )
                 loop = await self.db.get_review_loop(loop_id) or loop
-                await self._resolve_cards(
-                    loop_id, f"decided:{decision}", attribution,
-                )
+                await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
                 await self._milestone(
                     loop,
                     f"❌ **Review loop {loop_id} abandoned** by {decided_by}.",
                     notify=True,
                 )
-            return {"ok": bool(flipped), "message": "abandoned"}
+                return {"ok": True, "applied": True, "message": "abandoned"}
 
-        reason = str(loop.get("failure_reason") or "")
-        updates: dict = {"failure_reason": None, "discovery_rounds": 0}
-        note = ""
+            reason = str(loop.get("failure_reason") or "")
+            updates: dict = {"failure_reason": None, "discovery_rounds": 0}
+            note = ""
 
-        if budget_grant:
-            # Grant more budget; iterations untouched.
-            grant = max(1.0, float(budget_grant.group(1)))
-            new_budget = round(float(loop["budget_usd"]) + grant, 2)
-            updates["budget_usd"] = new_budget
-            note = f"budget raised to ${new_budget:.2f} (+${grant:.2f})"
-        else:
-            # iterate:N / adopt_and_continue — grant iteration headroom.
-            # Never REDUCE the configured cap (iteration+N can be below
-            # max_iterations when the loop parked early, e.g. on budget).
-            grant = int(iterate.group(1)) if iterate else 2
-            new_max = min(
-                max(int(loop["max_iterations"]), int(loop["iteration"]) + max(1, grant)),
-                ITERATION_CEILING,
-            )
-            updates["max_iterations"] = new_max
-            note = f"max_iterations={new_max}"
-
-        if decision == "adopt_and_continue":
-            verdict = await self._last_verdict(loop_id)
-            if verdict:
-                loop, adopted = await self._adopt_proposals(
-                    loop, verdict, force=True,
+            if budget_grant:
+                # Grant more budget; iterations untouched.
+                grant = max(1.0, float(budget_grant.group(1)))
+                new_budget = round(float(loop["budget_usd"]) + grant, 2)
+                updates["budget_usd"] = new_budget
+                note = f"budget raised to ${new_budget:.2f} (+${grant:.2f})"
+            else:
+                # iterate:N / adopt_and_continue — grant iteration headroom.
+                # Never REDUCE the configured cap (iteration+N can be below
+                # max_iterations when the loop parked early, e.g. on budget).
+                grant = int(iterate.group(1)) if iterate else 2
+                new_max = min(
+                    max(int(loop["max_iterations"]), int(loop["iteration"]) + max(1, grant)),
+                    ITERATION_CEILING,
                 )
-                if adopted:
-                    await self._milestone(
-                        loop,
-                        f"➕ Adopted {len(adopted)} proposed criteria by "
-                        f"{decided_by}: "
-                        + ", ".join(a["id"] for a in adopted),
-                    )
+                updates["max_iterations"] = new_max
+                note = f"max_iterations={new_max}"
 
-        await self.db.update_review_loop(loop_id, updates)
-        loop = await self.db.get_review_loop(loop_id) or loop
-        await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
-        # Resume where the loop actually stopped: an unverified
-        # implementation resumes at the VERIFIER (re-dispatching the
-        # implementer would waste a paid iteration), everything else at
-        # the next implementer iteration.
-        role = await self._resume_role(loop_id, reason)
-        if role == "verifier":
-            ok = await self._dispatch_verifier(loop, expect=("awaiting_user",))
-        else:
-            ok = await self._dispatch_implementer(loop, expect=("awaiting_user",))
-        return {
-            "ok": ok,
-            "message": f"resumed ({note}, next leg: {role})"
-            if ok else "resume dispatch lost a race — check loop status",
-        }
+            adopted: list[dict] = []
+            if decision == "adopt_and_continue":
+                verdict = await self._last_verdict(loop_id)
+                if verdict:
+                    # Adopted criteria are written with the decision below.
+                    adopted = self._select_adoptions(loop, verdict, force=True)
+                    if adopted:
+                        updates["criteria"] = loop["criteria"]
+
+            if not await self.db.apply_review_loop_decision(
+                loop_id, decision, fields=updates, message=note,
+                decided_by=decided_by, attribution=attribution,
+            ):
+                return await self._decision_not_applied(
+                    loop_id, decision, decided_by, attribution,
+                )
+            loop = await self.db.get_review_loop(loop_id) or loop
+            if adopted:
+                await self._milestone(
+                    loop,
+                    f"➕ Adopted {len(adopted)} proposed criteria by "
+                    f"{decided_by}: "
+                    + ", ".join(a["id"] for a in adopted),
+                )
+            await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
+            # Resume where the loop actually stopped: an unverified
+            # implementation resumes at the VERIFIER (re-dispatching the
+            # implementer would waste a paid iteration), everything else at
+            # the next implementer iteration.
+            role = await self._resume_role(loop_id, reason)
+            if role == "verifier":
+                ok = await self._dispatch_verifier(loop, expect=("awaiting_user",))
+            else:
+                ok = await self._dispatch_implementer(loop, expect=("awaiting_user",))
+            return {
+                "ok": ok,
+                "applied": True,
+                "message": f"resumed ({note}, next leg: {role})"
+                if ok else "resume dispatch lost a race — check loop status",
+            }
+
+    async def _decision_not_applied(
+        self,
+        loop_id: str,
+        decision: str,
+        decided_by: str,
+        attribution: Attribution,
+    ) -> dict:
+        """Record a decision that found the loop in a state it does not
+        apply to, and return the result. Caller holds the loop lock."""
+        loop = await self.db.get_review_loop(loop_id)
+        status = (loop or {}).get("status", "gone")
+        message = (
+            f"review loop {loop_id} is {status}; decision recorded but "
+            "not applied"
+        )
+        if loop is not None:
+            await self.db.record_review_loop_decision(
+                loop_id, decision, applied=False, message=message,
+                decided_by=decided_by, attribution=attribution,
+            )
+        return {"ok": False, "applied": False, "message": message}
 
     async def _resume_role(self, loop_id: str, reason: str) -> str:
         """Which leg a decision-resume should dispatch: the verifier when
@@ -1351,6 +1355,17 @@ class ReviewLoopService:
         """Append-only adoption of blocking proposals with caps + dedup.
         ``force`` (adopt_and_continue decision) ignores the per-iteration
         cap but never the total cap."""
+        adopted = self._select_adoptions(loop, verdict, force=force)
+        if adopted:
+            await self.db.update_review_loop(loop["id"], {"criteria": loop["criteria"]})
+            loop = await self.db.get_review_loop(loop["id"]) or loop
+        return loop, adopted
+
+    def _select_adoptions(
+        self, loop: dict, verdict: dict, force: bool = False,
+    ) -> list[dict]:
+        """The blocking proposals that :meth:`_adopt_proposals` adopts,
+        appended to ``loop["criteria"]`` in place. Writes nothing."""
         existing = {
             " ".join(c["statement"].lower().split()) for c in loop["criteria"]
         }
@@ -1381,10 +1396,7 @@ class ReviewLoopService:
             existing.add(key)
             budget_slots -= 1
             next_idx += 1
-        if adopted:
-            await self.db.update_review_loop(loop["id"], {"criteria": loop["criteria"]})
-            loop = await self.db.get_review_loop(loop["id"]) or loop
-        return loop, adopted
+        return adopted
 
     async def _no_progress(self, loop: dict, attempt: dict, verdict: dict) -> bool:
         attempts = await self.db.list_loop_attempts(loop["id"])

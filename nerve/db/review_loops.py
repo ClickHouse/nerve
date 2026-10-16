@@ -364,6 +364,78 @@ class ReviewLoopStore:
     #  Decisions                                                          #
     # ------------------------------------------------------------------ #
 
+    async def apply_review_loop_decision(
+        self,
+        loop_id: str,
+        decision: str,
+        *,
+        expect: tuple[str, ...] = RL_PARKED_STATUSES,
+        to_status: str | None = None,
+        fields: dict | None = None,
+        message: str = "",
+        decided_by: str = "",
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Apply a decision to a loop and append it to the decision history
+        in one transaction.
+
+        The change is a CAS on ``expect``: ``to_status`` (when given) and the
+        whitelisted ``fields`` are written only while the loop's status is in
+        ``expect``, and the decision row (``applied`` 1) only with them. A
+        decision with neither changes no loop column (a reminder); its row is
+        written only while the status is in ``expect``. Returns True when the
+        decision was applied and recorded, False when the loop was not in
+        ``expect`` and nothing was written. ``message`` says what the decision
+        changed. Terminal transitions stamp ``ended_at``.
+        """
+        now = utc_now_iso()
+        cols = _encode({k: v for k, v in (fields or {}).items() if k in _RL_UPDATABLE})
+        if to_status is not None:
+            if to_status not in RL_ALL_STATUSES:
+                raise ValueError(f"unknown review loop status: {to_status}")
+            if to_status in RL_TERMINAL_STATUSES and "ended_at" not in cols:
+                cols["ended_at"] = now
+        placeholders = ",".join("?" for _ in expect)
+        row = (
+            loop_id, decision, message, decided_by,
+            attribution.actor_id, attribution.caused_by_actor_id, now,
+        )
+        async with self._atomic():
+            if to_status is None and not cols:
+                cursor = await self.db.execute(
+                    f"""INSERT INTO review_loop_decisions
+                        (loop_id, decision, applied, message, decided_by,
+                         actor_id, caused_by_actor_id, created_at)
+                        SELECT ?, ?, 1, ?, ?, ?, ?, ?
+                        WHERE EXISTS (
+                            SELECT 1 FROM review_loops
+                            WHERE id = ? AND status IN ({placeholders}))""",
+                    (*row, loop_id, *expect),
+                )
+                applied = (cursor.rowcount or 0) == 1
+                await cursor.close()
+                return applied
+            names = (["status"] if to_status is not None else []) + ["updated_at", *cols]
+            values = ([to_status] if to_status is not None else []) + [now, *cols.values()]
+            assignments = ", ".join(f"{name} = ?" for name in names)
+            cursor = await self.db.execute(
+                f"""UPDATE review_loops SET {assignments}
+                    WHERE id = ? AND status IN ({placeholders})""",
+                (*values, loop_id, *expect),
+            )
+            applied = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if not applied:
+                return False
+            await self.db.execute(
+                """INSERT INTO review_loop_decisions
+                   (loop_id, decision, applied, message, decided_by, actor_id,
+                    caused_by_actor_id, created_at)
+                   VALUES (?, ?, 1, ?, ?, ?, ?, ?)""",
+                row,
+            )
+        return True
+
     async def record_review_loop_decision(
         self,
         loop_id: str,
@@ -377,8 +449,11 @@ class ReviewLoopStore:
         """Append one decision on a loop and return the row.
 
         ``decided_by`` is the origin text (``api``, ``approval-card``).
-        ``applied`` is False for a decision that did not change the loop,
-        for example one that arrived after the loop left ``awaiting_user``.
+        A decision that changes the loop goes through
+        :meth:`apply_review_loop_decision` instead, so that the row and the
+        change commit together. This method is for a decision that did not
+        change the loop (``applied`` False), for example one that arrived
+        after the loop left ``awaiting_user``.
         """
         now = utc_now_iso()
         result = await self._write(

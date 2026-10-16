@@ -127,12 +127,22 @@ async def decide_review_loop(
 ):
     """Apply a decision to a parked loop — the same handler the approval
     card's dispatcher awaits, so the card is never the only path. The loop's
-    decision history records the person who sends the request."""
+    decision history records the person who sends the request.
+
+    ``remind_4h`` is refused: it snoozes the decision card, which only the
+    card's own answer does. A decision that was not applied gives 409. An
+    applied decision whose resumed leg did not start gives 200 with ``ok``
+    false."""
+    if req.decision.strip() == "remind_4h":
+        raise HTTPException(
+            status_code=400,
+            detail="remind_4h snoozes the decision card; answer the card to use it",
+        )
     service = _service()
     result = await service.handle_decision(
         loop_id, req.decision, decided_by="api",
         attribution=attribution_for(actor),
     )
-    if not result.get("ok"):
+    if not result.get("applied"):
         raise HTTPException(status_code=409, detail=result.get("message", "not applied"))
     return result

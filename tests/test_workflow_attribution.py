@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -44,7 +45,7 @@ from nerve.gateway.auth import (
 )
 from nerve.gateway.routes import init_deps, register_all_routes
 from nerve.gateway.routes._deps import set_notification_service
-from nerve.identity import Actor, attribution_for
+from nerve.identity import Actor, Attribution, attribution_for
 from nerve.migrate import bootstrap_identity
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.service import NotificationService
@@ -741,11 +742,12 @@ async def test_a_channel_card_decision_records_no_person(install):
 
 
 @pytest.mark.asyncio
-async def test_a_late_decision_and_a_reminder_are_recorded(install):
+async def test_applied_says_whether_the_decision_changed_the_loop(install):
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     loop_id, _ = await install.parked_loop("alice", "loop-chat")
 
     async with _client(install.app()) as client:
+        # A reminder snoozes the decision card; REST has no card to snooze.
         reminded = await client.post(
             f"/api/review-loops/{loop_id}/decision", headers=install.headers("bob"),
             json={"decision": "remind_4h"},
@@ -762,16 +764,123 @@ async def test_a_late_decision_and_a_reminder_are_recorded(install):
             f"/api/review-loops/{loop_id}/decision", headers=install.headers("bob"),
             json={"decision": "shrug"},
         )
-    assert (reminded.status_code, accepted.status_code) == (200, 200)
+    assert (reminded.status_code, accepted.status_code) == (400, 200)
+    assert accepted.json()["applied"] is True
     assert (late.status_code, unknown.status_code) == (409, 409)
+    # A card reminder on a loop that is no longer parked changes nothing.
+    card_reminder = await install.loops._dispatch_decision(
+        {}, loop_id, "remind_4h", None, actor=install.actor("bob"),
+    )
+    assert not card_reminder.ok and card_reminder.snooze_until is None
 
     assert await install.decisions(loop_id) == [
-        ("remind_4h", True, "api", bob, bob),
         ("accept", True, "api", alice, alice),
         ("abandon", False, "api", bob, bob),
+        ("remind_4h", False, "approval-card", bob, bob),
     ]
-    (*_, recorded) = await install.db.list_review_loop_decisions(loop_id)
-    assert "recorded but not applied" in recorded["message"]
+    rows = await install.db.list_review_loop_decisions(loop_id)
+    assert rows[0]["message"] == "accepted as done"
+    assert "is passed; decision recorded but not applied" in rows[1]["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_grant_whose_leg_does_not_start_is_still_applied(install):
+    bob = install.actor_id("bob")
+    loop_id, _ = await install.parked_loop("alice", "loop-chat")
+    # Too little money for any leg: the resume parks the loop again.
+    install.config.workflows.review_loop.min_leg_budget_usd = 100.0
+
+    async with _client(install.app()) as client:
+        decided = await client.post(
+            f"/api/review-loops/{loop_id}/decision", headers=install.headers("bob"),
+            json={"decision": "budget:1"},
+        )
+    assert decided.status_code == 200, decided.text
+    assert (decided.json()["ok"], decided.json()["applied"]) == (False, True)
+
+    loop = await install.db.get_review_loop(loop_id)
+    assert (loop["budget_usd"], loop["status"], loop["failure_reason"]) == (
+        6.0, "awaiting_user", "budget",
+    )
+    assert await install.decisions(loop_id) == [("budget:1", True, "api", bob, bob)]
+    (row,) = await install.db.list_review_loop_decisions(loop_id)
+    assert row["message"] == "budget raised to $6.00 (+$1.00)"
+    assert install.spawned == []
+
+
+# A synthetic actor ID with no actor_refs row: its decision row cannot be
+# stored, which makes the write of the decision history fail.
+_NO_SUCH_ACTOR = Attribution(
+    actor_id="00000000-0000-4000-8000-0000000000ff",
+    caused_by_actor_id="00000000-0000-4000-8000-0000000000ff",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["accept", "abandon", "iterate:2", "budget:3"])
+async def test_a_decision_that_cannot_be_recorded_changes_nothing(install, decision):
+    loop_id, card_id = await install.parked_loop("alice", "loop-chat")
+    before = await install.db.get_review_loop(loop_id)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await install.loops.handle_decision(
+            loop_id, decision, decided_by="api", attribution=_NO_SUCH_ACTOR,
+        )
+
+    after = await install.db.get_review_loop(loop_id)
+    for column in ("status", "failure_reason", "budget_usd", "max_iterations",
+                   "ended_at", "updated_at"):
+        assert after[column] == before[column], column
+    assert await install.db.list_review_loop_decisions(loop_id) == []
+    assert (await install.db.get_notification(card_id))["status"] == "pending"
+    assert install.spawned == []
+
+
+@pytest.mark.asyncio
+async def test_a_late_decision_that_cannot_be_recorded_is_not_hidden(install):
+    loop_id, _ = await install.parked_loop("alice", "loop-chat")
+    await install.loops.handle_decision(loop_id, "accept", decided_by="api")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await install.loops.handle_decision(
+            loop_id, "abandon", decided_by="api", attribution=_NO_SUCH_ACTOR,
+        )
+    assert [d[0] for d in await install.decisions(loop_id)] == ["accept"]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_is_applied_only_to_a_parked_loop(install):
+    await install.chat_session("loop-chat")
+    loop = await install.loops.create_loop(
+        goal="g", verifier="- C1: v", session_id="loop-chat", autostart=False,
+    )
+    who = attribution_for(install.actor("bob"))
+
+    # The loop is pending, not parked: neither a change nor a reminder lands.
+    assert not await install.db.apply_review_loop_decision(
+        loop["id"], "iterate:2", fields={"max_iterations": 5}, attribution=who,
+    )
+    assert not await install.db.apply_review_loop_decision(
+        loop["id"], "remind_4h", attribution=who,
+    )
+    assert (await install.db.get_review_loop(loop["id"]))["max_iterations"] == 3
+    assert await install.db.list_review_loop_decisions(loop["id"]) == []
+
+    await install.db.transition_review_loop(
+        loop["id"], "awaiting_user", expect=("pending",),
+    )
+    assert await install.db.apply_review_loop_decision(
+        loop["id"], "remind_4h", message="snoozed 4h", attribution=who,
+    )
+    assert await install.db.apply_review_loop_decision(
+        loop["id"], "accept", to_status="passed", attribution=who,
+    )
+    done = await install.db.get_review_loop(loop["id"])
+    assert done["status"] == "passed" and done["ended_at"]
+    assert await install.decisions(loop["id"]) == [
+        ("remind_4h", True, "", install.actor_id("bob"), install.actor_id("bob")),
+        ("accept", True, "", install.actor_id("bob"), install.actor_id("bob")),
+    ]
 
 
 @pytest.mark.asyncio
