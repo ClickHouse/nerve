@@ -427,8 +427,9 @@ With `allow_repos` empty (the default), all repos pass — behavior is unchanged
 ### GitHub actor guardrail
 
 The GitHub notification source also matches on `actors` — the list of every GitHub login
-involved in a notification (issue/PR author, assignees, comment/review authors, and on a
-`reason=assign` notification the account that performed the assignment). This restricts
+involved in a notification (issue/PR author, assignees, comment/review authors, on a
+`reason=assign` notification the account that performed the assignment, and on a
+`reason=review_requested` notification the account that requested the review). This restricts
 **who** can put a notification in front of the worker, so a drive-by `@mention` from an
 untrusted account is dropped before the agent ever sees it:
 
@@ -451,6 +452,21 @@ inbox account itself authored has no third-party login anywhere — every candid
 one account — and a non-empty `allow_actors` would drop it fail-closed. If you rely on
 "a maintainer assigns an issue to the bot" as a work signal, that login needs to be in
 `allow_actors`.
+
+Review requests have the same gap. A `review_requested` notification carries no comment
+text, and neither it nor the PR names the requester, so the requester is read from the PR's
+event history (the newest `review_requested` event that names the inbox account) and
+rendered as `Review requested by: <login>`. Without it, a review request on a PR whose author
+and commenters are all outside the allowlist — a dependency-update bot's PR, say — would be
+dropped. No requester is credited when that request was withdrawn, when the account requested
+itself, or when a different login made a newer request to a team (the account may be in the
+team, and the team request then names no account). Reading the full event history uses
+`gh api --paginate --slurp`, which needs gh 2.48 or later.
+
+Like the assigner, the requester stays among the actors for as long as GitHub keeps
+`review_requested` as the thread's reason, so later activity on the same PR also passes. If
+you rely on "a maintainer requests a review from the bot" as a work signal, that login needs
+to be in `allow_actors`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
