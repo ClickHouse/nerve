@@ -25,12 +25,16 @@ Transitions go through :meth:`transition_review_loop` — a compare-and-set
 UPDATE so duplicate leg-completion signals and kill races can never
 double-apply. ``begin_leg_attempt`` combines the state CAS with the
 attempt-ledger insert in one transaction (the dispatch outbox).
+
+``review_loop_decisions`` is the append-only history of the decisions on
+parked loops, with who made each one.
 """
 
 from __future__ import annotations
 
 import json
 
+from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
 RL_RUNNING_STATUSES = ("pending", "implementing", "verifying")
@@ -71,6 +75,11 @@ def _parse_attempt(row: dict) -> dict:
     return row
 
 
+def _parse_decision(row: dict) -> dict:
+    row["applied"] = bool(row.get("applied"))
+    return row
+
+
 def _encode(fields: dict) -> dict:
     out = dict(fields)
     for col in ("criteria", "verdict", "detail"):
@@ -102,19 +111,28 @@ class ReviewLoopStore:
         max_iterations: int,
         budget_usd: float,
         created_by: str = "user",
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
+        """Insert a new loop in status ``pending`` and return the row.
+
+        ``created_by`` is the origin text. ``attribution`` names who created
+        the loop and on whose behalf; the loop's legs take that cause.
+        """
         now = utc_now_iso()
         await self._write(
             """INSERT INTO review_loops
                (id, title, session_id, status, goal_prompt, verifier_prompt,
                 criteria_adoption, criteria, implementer, verifier, cwd,
-                max_iterations, budget_usd, created_by, created_at, updated_at)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                max_iterations, budget_usd, created_by, created_at, updated_at,
+                created_by_actor_id, caused_by_actor_id)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?)""",
             (
                 loop_id, title, session_id, goal_prompt, verifier_prompt,
                 criteria_adoption, json.dumps(criteria),
                 json.dumps(implementer), json.dumps(verifier), cwd,
                 max_iterations, budget_usd, created_by, now, now,
+                attribution.actor_id, attribution.caused_by_actor_id,
             ),
         )
         loop = await self.get_review_loop(loop_id)
@@ -191,15 +209,26 @@ class ReviewLoopStore:
         loop_id: str,
         to_status: str,
         expect: tuple[str, ...],
+        *,
+        kill_attribution: Attribution | None = None,
         **fields,
     ) -> bool:
         """CAS the loop to ``to_status`` iff current status ∈ ``expect``.
         The winner owns the transition's side effects (dispatch, cards,
-        milestones). Terminal transitions stamp ``ended_at``."""
+        milestones). Terminal transitions stamp ``ended_at``.
+
+        ``kill_attribution`` is only for ``killed``: it names who killed the
+        loop and on whose behalf, written in the same UPDATE. Without it the
+        two kill columns stay NULL (not known)."""
         if to_status not in RL_ALL_STATUSES:
             raise ValueError(f"unknown review loop status: {to_status}")
+        if kill_attribution is not None and to_status != "killed":
+            raise ValueError("kill_attribution is only for the 'killed' status")
         now = utc_now_iso()
         cols = _encode({k: v for k, v in fields.items() if k in _RL_UPDATABLE})
+        if kill_attribution is not None:
+            cols["killed_by_actor_id"] = kill_attribution.actor_id
+            cols["killed_caused_by_actor_id"] = kill_attribution.caused_by_actor_id
         if to_status in RL_TERMINAL_STATUSES and "ended_at" not in cols:
             cols["ended_at"] = now
         assignments = ", ".join(
@@ -330,6 +359,53 @@ class ReviewLoopStore:
             async for row in cursor:
                 return float(row[0] or 0.0)
         return 0.0
+
+    # ------------------------------------------------------------------ #
+    #  Decisions                                                          #
+    # ------------------------------------------------------------------ #
+
+    async def record_review_loop_decision(
+        self,
+        loop_id: str,
+        decision: str,
+        *,
+        applied: bool,
+        message: str = "",
+        decided_by: str = "",
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """Append one decision on a loop and return the row.
+
+        ``decided_by`` is the origin text (``api``, ``approval-card``).
+        ``applied`` is False for a decision that did not change the loop,
+        for example one that arrived after the loop left ``awaiting_user``.
+        """
+        now = utc_now_iso()
+        result = await self._write(
+            """INSERT INTO review_loop_decisions
+               (loop_id, decision, applied, message, decided_by, actor_id,
+                caused_by_actor_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                loop_id, decision, 1 if applied else 0, message, decided_by,
+                attribution.actor_id, attribution.caused_by_actor_id, now,
+            ),
+        )
+        async with self.db.execute(
+            "SELECT * FROM review_loop_decisions WHERE id = ?", (result.lastrowid,),
+        ) as rows:
+            async for row in rows:
+                return _parse_decision(dict(row))
+        raise RuntimeError(f"review loop decision for {loop_id} was not stored")
+
+    async def list_review_loop_decisions(self, loop_id: str) -> list[dict]:
+        """The decisions on a loop, oldest first."""
+        async with self.db.execute(
+            """SELECT * FROM review_loop_decisions WHERE loop_id = ?
+               ORDER BY id ASC""",
+            (loop_id,),
+        ) as cursor:
+            return [_parse_decision(dict(row)) async for row in cursor]
 
     # ------------------------------------------------------------------ #
     #  Escalation support                                                 #

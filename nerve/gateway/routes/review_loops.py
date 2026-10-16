@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +52,16 @@ async def list_review_loops(
 
 @router.get("/api/review-loops/{loop_id}")
 async def get_review_loop(loop_id: str):
-    """Full loop detail: state, criteria, and the attempt ledger with
-    verdicts — everything the loop card renders."""
+    """Full loop detail: state, criteria, the attempt ledger with verdicts
+    (everything the loop card renders), and the decisions made on the loop,
+    with who made each one."""
     service = _service()
     loop = await service.get_loop(loop_id)
     if loop is None:
         raise HTTPException(status_code=404, detail="Review loop not found")
     attempts = await service.list_attempts(loop_id)
-    return {"loop": loop, "attempts": attempts}
+    decisions = await service.list_decisions(loop_id)
+    return {"loop": loop, "attempts": attempts, "decisions": decisions}
 
 
 _STATE_MAX_BYTES = 256 * 1024
@@ -101,12 +104,16 @@ async def get_review_loop_state(loop_id: str):
 async def kill_review_loop(
     loop_id: str,
     req: ReviewLoopKillRequest = ReviewLoopKillRequest(),
+    actor: Actor = Depends(require_auth),
 ):
     service = _service()
     from nerve.workflows.review_loop import ReviewLoopError
 
     try:
-        loop = await service.kill_loop(loop_id, reason=req.reason, killed_by="api")
+        loop = await service.kill_loop(
+            loop_id, reason=req.reason, killed_by="api",
+            attribution=attribution_for(actor),
+        )
     except ReviewLoopError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return service.public_loop(loop)
@@ -116,11 +123,16 @@ async def kill_review_loop(
 async def decide_review_loop(
     loop_id: str,
     req: ReviewLoopDecisionRequest,
+    actor: Actor = Depends(require_auth),
 ):
     """Apply a decision to a parked loop — the same handler the approval
-    card's dispatcher awaits, so the card is never the only path."""
+    card's dispatcher awaits, so the card is never the only path. The loop's
+    decision history records the person who sends the request."""
     service = _service()
-    result = await service.handle_decision(loop_id, req.decision, decided_by="api")
+    result = await service.handle_decision(
+        loop_id, req.decision, decided_by="api",
+        attribution=attribution_for(actor),
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("message", "not applied"))
     return result

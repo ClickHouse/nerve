@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
-from nerve.identity import attribution_for
+from nerve.identity import UNATTRIBUTED, Attribution, attribution_for
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -209,12 +209,21 @@ class WorkflowRunService:
         title: str = "",
         created_by: str = "user",
         run_id: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Validate, persist, journal, and (slots permitting) dispatch.
 
         ``run_id`` lets a controller pre-generate the id and persist its own
         intent row before dispatch (the review-loop outbox pattern). A reused
-        id is a caller error and raises."""
+        id is a caller error and raises.
+
+        ``created_by`` is the origin text, and also the pointer to the
+        session that the run starts from (see :meth:`_origin_session_id`).
+        ``attribution`` names who created the run and on whose behalf: the
+        person for a REST request, the system actor and the turn's cause for
+        a tool call. The run's turns run as the system actor with that
+        cause."""
         if engine_kind not in ENGINE_BACKENDS:
             raise WorkflowRunError(
                 f"unknown engine {engine_kind!r} — expected one of: "
@@ -287,7 +296,7 @@ class WorkflowRunService:
             run = await self.db.create_workflow_run(
                 run_id, engine_kind, spec, budget,
                 title=title.strip(), created_by=created_by,
-                journal_dir=str(journal_dir),
+                journal_dir=str(journal_dir), attribution=attribution,
             )
         except Exception as e:
             if "UNIQUE" in str(e) or "unique" in str(e):
@@ -296,18 +305,30 @@ class WorkflowRunService:
         self._journal_event(run, "created", {
             "engine": engine_kind, "budget_usd": budget,
             "created_by": created_by,
+            "created_by_actor_id": attribution.actor_id,
+            "caused_by_actor_id": attribution.caused_by_actor_id,
         })
         self._write_run_json(run)
         await self._broadcast(run)
         await self._maybe_dispatch()
         return await self.db.get_workflow_run(run_id) or run
 
-    async def kill_run(self, run_id: str, reason: str = "", killed_by: str = "") -> dict:
+    async def kill_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        killed_by: str = "",
+        *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
         """Terminate a run. Scoped strictly to the run's own session.
 
         CAS-loop against dispatch races: a run read as ``pending`` may be
         promoted to ``running`` before our transition lands — retry on the
         running side rather than silently reporting success on a live run.
+
+        ``killed_by`` is the origin text. ``attribution`` names who killed
+        the run and on whose behalf; the transition that wins records it.
         """
         run = await self.db.get_workflow_run(run_id)
         if run is None:
@@ -318,12 +339,14 @@ class WorkflowRunService:
 
         if await self.db.transition_workflow_run(
             run_id, "killed", expect=("pending",), error=detail,
+            kill_attribution=attribution,
         ):
             await self._finalize_terminal(run_id, "killed", {"reason": detail})
             return await self.db.get_workflow_run(run_id) or run
 
         if await self.db.transition_workflow_run(
             run_id, "killed", expect=("running",), error=detail,
+            kill_attribution=attribution,
         ):
             await self._finalize_terminal(run_id, "killed", {"reason": detail})
             self._spawn_enforcement(run_id)
@@ -499,6 +522,8 @@ class WorkflowRunService:
                 else f"Workflow: {label}"
             )
             leg_actor = self.db.system_actor
+            # The session's ``created`` event: the system actor, for the
+            # run's cause.
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=leg_title,
@@ -508,6 +533,7 @@ class WorkflowRunService:
                 model=model,
                 cwd=spec.get("cwd") or None,
                 actor=leg_actor,
+                cause=run.get("caused_by_actor_id"),
             )
             if origin:
                 await self.db.update_session_fields(
@@ -521,6 +547,9 @@ class WorkflowRunService:
             self._write_run_json(run)
             await self._broadcast(run)
 
+            # The turn runs as the system actor on behalf of the run's
+            # cause. A NULL cause stays NULL: the run was started by input
+            # that names no person.
             response = await self.engine.run(
                 session_id=session_id,
                 user_message=self._build_prompt(run),
@@ -528,6 +557,7 @@ class WorkflowRunService:
                 model=model,
                 effort_override=str(spec.get("effort") or "") or None,
                 actor=leg_actor,
+                cause=run.get("caused_by_actor_id"),
             )
 
             # engine.run returns normally even for interrupted, cancelled,

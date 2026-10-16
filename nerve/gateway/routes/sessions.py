@@ -316,7 +316,8 @@ async def _attach_review_loop(
 ) -> dict:
     """Create the review loop for a freshly created observer session. A
     rejected loop config rolls the session back, so no empty session stays.
-    The rollback is a delete by the person who asked for the session."""
+    The rollback is a delete by the person who asked for the session. The
+    person who creates the session creates the loop and is its cause."""
     from nerve.workflows import get_review_loop_service
     from nerve.workflows.review_loop import ReviewLoopError
 
@@ -347,6 +348,7 @@ async def _attach_review_loop(
                 if rl.verifier_leg else None
             ),
             created_by=f"session:{session_id}",
+            attribution=attribution_for(actor),
         )
     except ReviewLoopError as e:
         await deps.db.delete_session(session_id, attribution=attribution_for(actor))

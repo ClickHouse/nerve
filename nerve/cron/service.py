@@ -1294,6 +1294,8 @@ class CronService:
                 budget_usd=w["budget_usd"],
                 title=w.get("title") or job.id,
                 created_by=f"cron:{job.id}",
+                # A scheduled job is autonomous work: system for system.
+                attribution=attribution_for(self.db.system_actor),
             )
             session_id = run.get("session_id") or ("workflow:" + run["id"])
             await self.db.set_cron_log_session(log_id, session_id)

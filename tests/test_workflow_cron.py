@@ -10,6 +10,9 @@ import pytest_asyncio
 import nerve.workflows
 from nerve.cron.jobs import CronJob, load_jobs, save_jobs
 from nerve.cron.service import CronService
+from nerve.identity import Attribution
+
+from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,8 @@ def _make_cron_service() -> CronService:
     db.get_channel_session = AsyncMock(return_value=None)
     db.get_session = AsyncMock(return_value=None)
     db.set_channel_session = AsyncMock()
+    # A scheduled workflow run is attributed to the agent's system actor.
+    mock_system_principal(db)
 
     return CronService(config, engine, db)
 
@@ -199,6 +204,11 @@ class TestRunWorkflowJob:
             budget_usd=5.0,
             title="Nightly audit",
             created_by="cron:wf-job",
+            # Scheduled work: the system actor, for itself.
+            attribution=Attribution(
+                actor_id=FAKE_SYSTEM_ACTOR.actor_id,
+                caused_by_actor_id=FAKE_SYSTEM_ACTOR.actor_id,
+            ),
         )
 
     async def test_links_run_session_and_logs_success(
