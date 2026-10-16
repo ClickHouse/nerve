@@ -21,7 +21,7 @@ import pytest_asyncio
 from fastapi import Depends, FastAPI
 
 from nerve import paths
-from nerve.config import NerveConfig, set_config
+from nerve.config import NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.db.accounts import (
     SYSTEM_ACTOR_ID_TAKEN,
@@ -547,3 +547,90 @@ class TestEntryPoints:
         _inspect_identity(NerveConfig(), paths.db_path(), report)
         assert not report.rekeyed_system_actor
         assert len(report.warnings) == 1 and "canonical" in report.warnings[0]
+
+
+# --------------------------------------------------------------------------- #
+#  nerve doctor                                                                #
+# --------------------------------------------------------------------------- #
+
+
+class TestDoctor:
+    @staticmethod
+    def _config(tmp_path) -> NerveConfig:
+        config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+        config_dir.mkdir()
+        (workspace / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+        (config_dir / "config.local.yaml").write_text("{}\n", encoding="utf-8")
+        return load_config(config_dir)
+
+    @staticmethod
+    def _report(*, external: bool) -> tuple[list[str], list[str]]:
+        from nerve.cli import _system_principal_report
+
+        return _system_principal_report(external=external)
+
+    def test_nothing_is_reported_without_the_variable(self):
+        assert self._report(external=True) == ([], [])
+        assert self._report(external=False) == ([], [])
+
+    @pytest.mark.parametrize("value", [PRINCIPAL, "not-a-uuid"])
+    def test_local_mode_says_the_variable_has_no_effect(self, monkeypatch, value):
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, value)
+        lines, warnings = self._report(external=False)
+        assert warnings == []
+        assert len(lines) == 1 and lines[0].startswith("[--]")
+        assert "no effect in local mode" in lines[0]
+
+    def test_an_invalid_value_is_a_warning(self, monkeypatch):
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, "not-a-uuid")
+        lines, warnings = self._report(external=True)
+        assert lines == []
+        assert len(warnings) == 1 and warnings[0].startswith("[WARN]")
+        assert "canonical" in warnings[0] and "keeps the local system actor ID" in warnings[0]
+
+    def test_no_database_yet(self, seeded):
+        lines, warnings = self._report(external=True)
+        assert warnings == []
+        assert lines == [
+            f"[--] System actor ({SYSTEM_PRINCIPAL_ENV} from this shell): no system "
+            f"actor yet; the next start gives it {PRINCIPAL}"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pending_change_and_a_kept_local_id(self, seeded):
+        database = await _open(paths.db_path())
+        try:
+            local_id = database.system_actor_id
+            lines, warnings = self._report(external=True)
+            assert warnings == []
+            assert lines == [
+                f"[--] System actor ({SYSTEM_PRINCIPAL_ENV} from this shell): "
+                f"{local_id}; the next start changes it to {PRINCIPAL}"
+            ]
+
+            column = await _refer_to_system_actor(database, "session")
+            lines, warnings = self._report(external=True)
+            assert lines == []
+            assert len(warnings) == 1 and warnings[0].startswith("[WARN]")
+            assert f"keeps the local ID {local_id}, not {PRINCIPAL}" in warnings[0]
+            assert f"{column} refers to the current ID" in warnings[0]
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
+    async def test_the_doctor_report_shows_the_id_in_force(
+        self, tmp_path, external, seeded,
+    ):
+        from nerve.cli import doctor_report
+
+        database = await _open(paths.db_path())
+        try:
+            await bootstrap_identity(database, _config())
+        finally:
+            await database.close()
+        report = doctor_report(self._config(tmp_path))
+        assert (
+            f"[OK] System actor ({SYSTEM_PRINCIPAL_ENV} from this shell): {PRINCIPAL}"
+            in report
+        )
