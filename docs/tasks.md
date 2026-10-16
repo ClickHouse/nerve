@@ -119,8 +119,9 @@ Two rules keep ranks meaningful:
 ### Status History
 
 Every status transition is appended to `task_events` (`task_id`,
-`from_status`, `to_status`, `actor`, `created_at`), added in migration v044
-and seeded with one origin row per existing task. `from_status` is NULL on
+`from_status`, `to_status`, `actor`, `actor_id`, `caused_by_actor_id`,
+`created_at`), added in migration v044 and seeded with one origin row per
+existing task. `from_status` is NULL on
 the row recording a task's creation, so an aging calculation can tell
 "created here" from "moved here".
 
@@ -134,11 +135,22 @@ rewrites every row with the status it already had. The one case where
 reindex *does* change a status, resetting an orphaned row to match its
 directory, is a real correction and gets a row.
 
-`actor` is the session id for agent-driven changes, `web` for the HTTP API,
-`backfill` on the origin rows v044 seeded for tasks that predate the table,
-and `system` otherwise. `backfill` is load-bearing rather than cosmetic: a
-real creation also records a NULL `from_status`, so the actor is the only
-thing distinguishing a synthesized origin from one that actually happened.
+`actor` is the origin of the change, not an identity: the session id for
+agent-driven changes, `web` for the HTTP API, `backfill` on the origin rows
+v044 seeded for tasks that predate the table, and `system` otherwise.
+`backfill` is load-bearing rather than cosmetic: a real creation also records
+a NULL `from_status`, so the actor is the only thing distinguishing a
+synthesized origin from one that actually happened.
+
+`actor_id` and `caused_by_actor_id` (migration v053) name who made the change
+and on whose behalf, as actor IDs (see
+[Attribution](accounts.md#attribution)). A change through the HTTP API records
+the person as both. A change by an agent tool call records the system actor
+and the cause of the turn: the person whose message started the turn, or the
+system actor for a cron job. Rows written before v053 have NULL in both
+columns. The `GET /api/tasks/{id}/events` rows include both columns, and the
+timeline shows "Nerve for <person>" when the agent changed the status for a
+person.
 
 This powers the aging indicator on board cards and the timeline in the task
 detail view. Tasks whose last transition predates v044 report no entry time

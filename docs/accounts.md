@@ -169,22 +169,55 @@ In external mode:
 
 ## Attribution
 
-Sessions store who created them in `created_by_actor_id`. User messages store
-who supplied the content in `actor_id`. Both columns contain stable actor IDs;
-clients resolve names through `GET /api/actors` — the display name, or the
-username when none is set.
+Nerve can record two actor IDs for a change:
 
-| Event | Stored actor |
+- The **actor** made the change: a person through the web UI, the REST API or
+  the browser WebSocket, or the system actor when the agent or Nerve did it (a
+  tool call, a cron job, any internal process).
+- The **cause** is the principal on whose behalf the change was made. For a
+  change that a person made directly, the cause is that person. For work by
+  the system actor, the cause is the person whose request started the work,
+  or the system actor for autonomous work.
+
+These columns store actor IDs:
+
+| Column | What it records |
 |---|---|
-| A person creates a session or sends a message | That person's actor |
-| Nerve creates a session or prompt, including MCP and Codex sessions | The system actor |
-| Telegram, Slack, or imported Codex input | None until a local identity mapping exists |
-| Assistant and tool output | None |
+| `sessions.created_by_actor_id` | Who created the session |
+| `messages.actor_id` | Who supplied the content of a user message |
+| `messages.caused_by_actor_id` | The cause of the turn that a user message starts |
+| `task_events.actor_id`, `task_events.caused_by_actor_id` | Actor and cause of a task status change |
 
-Existing records remain unattributed. Nerve does not infer identity from channel
-or source metadata. Account and session administration actions are not yet
-recorded as audit events. Missing attribution means legacy history, unidentified
-external input, or assistant/tool output; autonomous work uses the system actor.
+`nerve/db/actor_columns.py` lists every attribution column. Clients resolve
+names through `GET /api/actors`, which returns every actor that these columns
+can name: the display name, or the username when none is set. The web UI shows
+the system actor with a person as cause as "Nerve for <person>".
+
+Each agent turn has one cause. Tool calls in the turn record the system actor
+as actor and the turn's cause as cause.
+
+| Work | Actor | Cause |
+|---|---|---|
+| A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
+| Nerve creates a session, including MCP and Codex sessions | The system actor | Not recorded |
+| A cron job or a hook | The system actor | The system actor |
+| A plan implementation or a plan revision that a person started | The system actor | That person |
+| A plan approved or a revision requested by the agent in a turn | The system actor | The cause of that turn |
+| The hook turn that starring a session starts | The system actor | The person who starred it |
+| A turn resumed after a restart | The system actor | The cause on the interrupted turn's user message, else the system actor |
+| A turn that the agent starts between turns, when a background task finishes | The system actor | The cause of the session's last turn |
+| A tool call from an external MCP client | The system actor | None |
+| Workflow legs, wakeups, deferred messages when they run, and answers relayed into a session | The system actor | The system actor |
+| Telegram, Slack, or imported Codex input | None until a local identity mapping exists | None |
+| Assistant and tool output | None | None |
+
+Existing records remain unattributed: Nerve does not backfill these columns.
+Nerve does not infer identity from channel or source metadata. The free-text
+origin fields, such as `task_events.actor`, stay as they are; they record where
+a change came from, not who made it. Account and session administration actions
+are not yet recorded as audit events. Missing attribution means legacy history,
+unidentified external input, or assistant/tool output; autonomous work uses the
+system actor.
 
 ## Session-signing secret
 

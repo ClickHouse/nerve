@@ -713,9 +713,9 @@ writes no configuration.
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
-principal. Sessions and messages store an actor id, never a name, so this is
-where a name is looked up at render time — a rename changes every label and
-moves no stored row.
+principal. Sessions, messages and task events store an actor id, never a
+name, so this is where a name is looked up at render time. A rename changes
+every label and moves no stored row.
 
 ```json
 { "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" }
@@ -795,14 +795,16 @@ Get session details.
 Get messages for a session.
 
 ```json
-Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…" }] }
+Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…", "caused_by_actor_id": "…" }] }
 ```
 
 `actor_id` is who supplied the message: the signed-in person who typed it, or
 the system principal for a prompt Nerve composed itself. It is `null` on
 Slack, Telegram, and imported Codex human input until identity mappings exist;
-on assistant/tool output; and on legacy history. `channel` stays transport
-provenance and is never identity. See
+on assistant/tool output; and on legacy history. `caused_by_actor_id` is set on
+a user message that starts a turn: the principal on whose behalf the turn runs.
+It is `null` on other rows, on input with no known person, and on legacy
+history. `channel` stays transport provenance and is never identity. See
 [Accounts and identity](accounts.md) for what is and is not attributed.
 
 #### `DELETE /api/sessions/{id}`
@@ -996,10 +998,16 @@ A task's status history, oldest first.
 
 ```json
 Response: { "events": [
-  { "id": 1, "task_id": "...", "from_status": null, "to_status": "pending", "actor": "system", "created_at": "..." },
-  { "id": 2, "task_id": "...", "from_status": "pending", "to_status": "in_progress", "actor": "impl-abc123", "created_at": "..." }
+  { "id": 1, "task_id": "...", "from_status": null, "to_status": "pending", "actor": "web", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." },
+  { "id": 2, "task_id": "...", "from_status": "pending", "to_status": "in_progress", "actor": "impl-abc123", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
 ] }
 ```
+
+`actor` is the origin of the change (`web`, a session id, `system`,
+`backfill`). `actor_id` is who made the change and `caused_by_actor_id` on
+whose behalf, both actor ids for [`GET /api/actors`](#actors) and `null` on
+rows from before they were recorded. See
+[Status History](tasks.md#status-history).
 
 #### `POST /api/tasks/{id}/move`
 Place a task in a lane — the board's drag-and-drop write. Send *intent*
@@ -1375,8 +1383,9 @@ fresh.
 { type: "error", session_id: "main", error: "..." }
 
 // Another client of this session sent a message (the sender sees its own
-// optimistically; actor_id is who sent it, matching the stored row)
-{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…" }
+// optimistically; actor_id is who sent it and caused_by_actor_id the cause of
+// the turn it starts, matching the stored row)
+{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…", caused_by_actor_id: "…" }
 
 // Session switch confirmed (includes running state, lifecycle status, buffered events for reconnect)
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events: [...] }
