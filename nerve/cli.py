@@ -874,11 +874,13 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
-    # The gateway runs the identity bootstrap when it starts.
+    # The gateway runs the identity bootstrap when it starts. It also reads
+    # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, so the preview here does not.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
             config_dir, workspace=getattr(config, "workspace", None), config=config,
+            preview_system_principal=False,
         )
         if report is not None and report.did_anything:
             # The config in hand was loaded from the old locations, and migration

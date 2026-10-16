@@ -722,6 +722,99 @@ class TestEntryPoints:
         assert not report.rekeyed_system_actor
         assert len(report.warnings) == 1 and "canonical" in report.warnings[0]
 
+    @staticmethod
+    def _install(tmp_path):
+        """A configured install whose gateway starts the proxy, so that a
+        failing proxy stops the start right after the identity steps."""
+        config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+        config_dir.mkdir()
+        (workspace / "config").mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(
+            f"workspace: {workspace}\n"
+            "proxy:\n  enabled: true\n"
+            "mcp_endpoint:\n  enabled: false\n",
+            encoding="utf-8",
+        )
+        (config_dir / "config.local.yaml").write_text("{}\n", encoding="utf-8")
+        return config_dir
+
+    def test_the_start_preview_leaves_out_the_system_actor_step(
+        self, tmp_path, external, seeded,
+    ):
+        from nerve.migrate import maybe_migrate
+
+        config_dir = self._install(tmp_path)
+        start = maybe_migrate(config_dir, preview_system_principal=False)
+        assert not start.rekeyed_system_actor
+        assert not any("system actor" in a for a in start.identity_actions)
+        # Without the flag (nerve upgrade), the preview shows the step.
+        upgrade = maybe_migrate(config_dir)
+        assert upgrade.rekeyed_system_actor
+
+    def test_a_foreground_start_reads_the_variable_once_and_warns_once(
+        self, tmp_path, monkeypatch, seeded,
+    ):
+        from click.testing import CliRunner
+
+        import nerve.identity as identity
+        import nerve.migrate as migrate_module
+        import nerve.proxy.service as proxy_module
+        from nerve import cli
+        from nerve.gateway import server
+
+        config_dir = self._install(tmp_path)
+
+        async def refer_to_the_system_actor():
+            database = await _open(paths.db_path())
+            try:
+                await _refer_to_system_actor(database, "session")
+            finally:
+                await database.close()
+
+        asyncio.run(refer_to_the_system_actor())
+
+        reads: list[str | None] = []
+        read_env = identity.system_principal_id_from_env
+
+        def counted_read():
+            reads.append(read_env())
+            return reads[-1]
+
+        warnings: list[str] = []
+
+        def record_warning(msg, *args, **kwargs):
+            warnings.append(msg % args if args else msg)
+
+        def run_server(config):
+            app = server.create_app()
+
+            async def serve():
+                with pytest.raises(RuntimeError, match="stop after the identity steps"):
+                    async with server.lifespan(app):
+                        pass
+
+            asyncio.run(serve())
+
+        monkeypatch.setattr(identity, "system_principal_id_from_env", counted_read)
+        monkeypatch.setattr(migrate_module.logger, "warning", record_warning)
+        monkeypatch.setattr(server, "run_server", run_server)
+        monkeypatch.setattr(proxy_module, "ProxyService", lambda cfg: _ProxyThatFails())
+        monkeypatch.setattr(cli, "_get_daemon_status", lambda: (False, None))
+        monkeypatch.setattr(cli, "setup_logging", lambda verbose=False: None)
+        monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+        try:
+            result = CliRunner().invoke(
+                cli.main, ["-c", str(config_dir), "start", "-f"], catch_exceptions=False,
+            )
+        finally:
+            set_config(NerveConfig())
+
+        assert result.exit_code == 0, result.output
+        assert reads == [PRINCIPAL]
+        system_warnings = [w for w in warnings if "system actor" in w]
+        assert len(system_warnings) == 1
+        assert system_warnings[0].startswith("Identity: the system actor keeps its current ID")
+
 
 # --------------------------------------------------------------------------- #
 #  nerve doctor                                                                #
