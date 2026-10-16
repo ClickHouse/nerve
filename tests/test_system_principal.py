@@ -994,6 +994,76 @@ class TestEntryPoints:
 
 
 # --------------------------------------------------------------------------- #
+#  Backup and restore                                                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestBackupRestore:
+    @pytest.mark.asyncio
+    async def test_a_no_secrets_restore_keeps_the_claim_and_drops_the_secrets(
+        self, tmp_path, external, monkeypatch, caplog,
+    ):
+        """Seed P1, back up with --no-secrets, restore. A first start with the
+        same value changes nothing. A later start with another value is
+        refused while the first process runs, and the first process can still
+        write rows attributed to the system actor."""
+        from nerve import backup as backup_mod
+        from nerve.db.accounts import JWT_SECRET_NAME
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        source = tmp_path / "source_state"
+        source.mkdir(mode=0o700)
+        workspace, config_dir = tmp_path / "ws", tmp_path / "cfg"
+        workspace.mkdir()
+        (workspace / "SOUL.md").write_text("soul", encoding="utf-8")
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, PRINCIPAL)
+        seeded_db = await _open(source / "nerve.db")
+        try:
+            await bootstrap_identity(seeded_db, NerveConfig())  # generates a signing secret
+            assert seeded_db.system_actor_id == PRINCIPAL
+            assert await seeded_db._get_instance_secret(JWT_SECRET_NAME)
+        finally:
+            await seeded_db.close()
+
+        bundle = backup_mod.create_backup(
+            source, workspace, tmp_path / "out", config_dir=config_dir, include_secrets=False,
+        )
+        restored = tmp_path / "restored_state"
+        report = backup_mod.restore_bundle(
+            bundle.path, restored, tmp_path / "restored_ws",
+            config_dir=tmp_path / "restored_cfg",
+        )
+        assert report.ok, report.errors
+
+        first = await _open(restored / "nerve.db")
+        try:
+            assert await first._get_instance_secret(JWT_SECRET_NAME) is None
+            assert await _claim(first) == PRINCIPAL
+            first_report = await bootstrap_identity(first, _config())
+            assert not first_report.rekeyed_system_actor and not first_report.warnings
+            assert first.system_actor_id == PRINCIPAL
+
+            monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, ALICE)
+            second = await _open(restored / "nerve.db")
+            try:
+                with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+                    late = await bootstrap_identity(second, _config())
+                assert not late.rekeyed_system_actor
+                assert len(late.warnings) == 1 and _claimed(PRINCIPAL) in late.warnings[0]
+                assert second.system_actor_id == PRINCIPAL
+            finally:
+                await second.close()
+
+            assert await _system_rows(first) == [PRINCIPAL]
+            await first.create_session("s-first", actor=first.system_actor)
+        finally:
+            await first.close()
+
+
+# --------------------------------------------------------------------------- #
 #  nerve doctor                                                                #
 # --------------------------------------------------------------------------- #
 

@@ -45,7 +45,8 @@ SYSTEM_ACTOR_ID_TAKEN = "another actor already has the new ID"
 # name/value table for instance state. AccountStore._rekey_system_actor writes
 # it in the same transaction as the change of the ID, and refuses every later
 # different ID while it exists, so a database takes a system principal ID at
-# most once. A backup made with ``--no-secrets`` does not keep it.
+# most once. A backup made with ``--no-secrets`` keeps this row and deletes the
+# secrets (nerve.backup._scrub_instance_secrets).
 SYSTEM_PRINCIPAL_CLAIM_NAME = "system_principal_id"
 
 
