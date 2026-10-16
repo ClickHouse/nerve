@@ -30,6 +30,9 @@ FAKE_CODEX_MODE env var:
   close_stdout_mid_turn — closes stdout mid-turn but KEEPS RUNNING
                  (reader-death liveness: is_alive() must flip False even
                  though the process is still up)
+  resume_usage — after the thread/resume response, sends the restored
+                 usage of the thread for an earlier turn; the turn then
+                 sends those counts again (a retry) before its one response
 
 The process also mirrors received config overrides (argv --config k=v)
 back in the initialize response under _fake.configOverrides so tests can
@@ -111,6 +114,20 @@ def _usage(turn_id: str, thread_id: str) -> None:
             "modelContextWindow": 272000,
         },
     })
+
+
+def _tokens(inp: int, cached: int, out: int) -> dict:
+    return {"inputTokens": inp, "cachedInputTokens": cached,
+            "outputTokens": out, "reasoningOutputTokens": 0,
+            "totalTokens": inp + out}
+
+
+# resume_usage: the usage of the resumed thread at the end of its last turn.
+_RESTORED_USAGE = {
+    "total": _tokens(66_000_000, 64_000_000, 300_000),
+    "last": _tokens(132_000, 130_000, 40),
+    "modelContextWindow": 272000,
+}
 
 
 def _completed(turn_id: str, thread_id: str, status: str = "completed",
@@ -268,6 +285,22 @@ def run_turn(thread_id: str, turn_id: str) -> None:
         _completed(turn_id, thread_id, status="interrupted")
         return
 
+    if MODE == "resume_usage":
+        notify("thread/tokenUsage/updated", {
+            "threadId": thread_id, "turnId": turn_id,
+            "tokenUsage": _RESTORED_USAGE,
+        })
+        notify("thread/tokenUsage/updated", {
+            "threadId": thread_id, "turnId": turn_id,
+            "tokenUsage": {
+                "total": _tokens(66_134_000, 64_131_000, 300_050),
+                "last": _tokens(134_000, 131_000, 50),
+                "modelContextWindow": 272000,
+            },
+        })
+        _completed(turn_id, thread_id)
+        return
+
     if MODE == "failed_turn":
         notify("error", {
             "threadId": thread_id, "turnId": turn_id,
@@ -357,6 +390,12 @@ def main() -> None:
                 respond(req_id, {"thread": {"id": "fork:" + msg["params"]["lastTurnId"]}})
             else:
                 respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
+                if MODE == "resume_usage" and method == "thread/resume":
+                    notify("thread/tokenUsage/updated", {
+                        "threadId": msg["params"]["threadId"],
+                        "turnId": "turn_old",
+                        "tokenUsage": _RESTORED_USAGE,
+                    })
         elif method == "turn/start":
             thread_id = msg["params"]["threadId"]
             turn_id = f"turn_{threads_started}_1"

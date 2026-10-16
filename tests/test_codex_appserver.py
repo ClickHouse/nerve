@@ -485,6 +485,28 @@ async def test_resume_miss_falls_back_to_fresh_thread(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resume_takes_usage_baseline_from_replay(tmp_path, monkeypatch):
+    # After thread/resume, app-server sends the restored usage of the thread.
+    # The first notification of the turn then sends the same counts again (a
+    # retry). Only the one response of the turn is counted.
+    _mode(monkeypatch, "resume_usage")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg, resume_native_id="th_old"))
+    try:
+        await client.start_turn(TurnInput(text="hello"))
+        done = (await _collect_turn(client))[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.usage.input_tokens == 3_000        # 134k - 131k cached
+        assert done.usage.cache_read_tokens == 131_000
+        assert done.usage.output_tokens == 50
+        assert done.num_turns == 1
+        assert done.context_tokens == 134_000
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_resume_auth_error_never_starts_fresh_thread(tmp_path, monkeypatch):
     _mode(monkeypatch, "resume_auth_fail")
     cfg = _config(tmp_path)

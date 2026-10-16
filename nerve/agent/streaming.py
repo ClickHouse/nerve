@@ -209,6 +209,7 @@ class StreamBroadcaster:
         usage: dict[str, Any] | None = None,
         max_context_tokens: int | None = None,
         num_turns: int | None = None,
+        context_tokens: int | None = None,
     ) -> None:
         msg: dict[str, Any] = {"type": "done", "session_id": session_id}
         if usage is not None:
@@ -217,6 +218,8 @@ class StreamBroadcaster:
             msg["max_context_tokens"] = max_context_tokens
         if num_turns is not None:
             msg["num_turns"] = num_turns
+        if context_tokens is not None:
+            msg["context_tokens"] = context_tokens
         await self.broadcast(session_id, msg)
 
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:
