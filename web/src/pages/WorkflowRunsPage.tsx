@@ -23,6 +23,7 @@ import {
   type WorkflowRunStatus,
 } from '../api/client';
 import { useWorkflowRunStore, isActiveRun } from '../stores/workflowRunStore';
+import { ActorAttribution } from '../components/Chat/ActorLabel';
 
 const POLL_INTERVAL_MS = 15_000;
 const EVENT_TAIL = 20;
@@ -144,12 +145,19 @@ function BudgetBar({ run }: { run: WorkflowRun }) {
   );
 }
 
-function Meta({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Meta({ label, value, mono, children, testId }: {
+  label: string;
+  /** Shown when there are no children; always the tooltip. */
+  value: string;
+  mono?: boolean;
+  children?: ReactNode;
+  testId?: string;
+}) {
   return (
-    <div className="min-w-0">
+    <div className="min-w-0" data-testid={testId}>
       <div className="text-2xs uppercase tracking-wider text-text-faint">{label}</div>
       <div className={`mt-0.5 text-xs text-text-secondary truncate ${mono ? 'font-mono' : ''}`} title={value}>
-        {value}
+        {children ?? value}
       </div>
     </div>
   );
@@ -251,6 +259,16 @@ function RunCard({ run }: { run: WorkflowRun }) {
               <span className="shrink-0" title={formatTimestamp(run.created_at)}>
                 created {relativeTime(run.created_at)}
               </span>
+              {run.created_by_actor_id && (
+                <span data-testid="run-creator" className="inline-flex items-center gap-1 min-w-0">
+                  by{' '}
+                  <ActorAttribution
+                    actorId={run.created_by_actor_id}
+                    causeId={run.caused_by_actor_id}
+                    verb="Created by"
+                  />
+                </span>
+              )}
             </div>
           </div>
           <BudgetBar run={run} />
@@ -274,13 +292,32 @@ function RunCard({ run }: { run: WorkflowRun }) {
         <div className="border-t border-border-subtle bg-bg-sunken px-4 py-3.5 space-y-3.5">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-2.5">
             <Meta label="Run id" value={run.id} mono />
-            <Meta label="Created by" value={run.created_by || '—'} />
+            {/* The person, when recorded; the origin text stays in the tooltip
+                and is the whole value for older runs. */}
+            <Meta label="Created by" value={run.created_by || '—'} testId="run-created-by">
+              {run.created_by_actor_id ? (
+                <ActorAttribution
+                  actorId={run.created_by_actor_id}
+                  causeId={run.caused_by_actor_id}
+                  verb="Created by"
+                />
+              ) : undefined}
+            </Meta>
             <Meta label="Model" value={run.spec?.model || 'default'} mono />
             <Meta label="Effort" value={run.spec?.effort || '—'} />
             <Meta label="Working dir" value={run.spec?.cwd || '—'} mono />
             <Meta label="Journal" value={run.journal_dir || '—'} mono />
             <Meta label="Started" value={formatTimestamp(run.started_at)} />
             <Meta label="Finished" value={formatTimestamp(run.finished_at)} />
+            {run.killed_by_actor_id && (
+              <Meta label="Killed by" value={run.error || 'killed'} testId="run-killed-by">
+                <ActorAttribution
+                  actorId={run.killed_by_actor_id}
+                  causeId={run.killed_caused_by_actor_id}
+                  verb="Killed by"
+                />
+              </Meta>
+            )}
           </div>
 
           <DetailBlock label="Prompt">
