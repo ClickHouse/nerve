@@ -1553,6 +1553,44 @@ def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
+def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
+    """Doctor lines about ``NERVE_SYSTEM_PRINCIPAL_ID``: ``(lines, warnings)``.
+
+    Like the auth mode, the value comes from this shell, not from the running
+    server. Nothing is reported when the variable is unset here.
+    """
+    from nerve.db.accounts import inspect_system_actor
+    from nerve.identity import (
+        SYSTEM_PRINCIPAL_ENV,
+        InvalidSystemPrincipalId,
+        system_principal_id_from_env,
+    )
+
+    label = f"System actor ({SYSTEM_PRINCIPAL_ENV} from this shell)"
+    if not external:
+        if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
+            return [f"[--] {label}: set, but it has no effect in local mode"], []
+        return [], []
+    try:
+        wanted = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        return [], [f"[WARN] {label}: {e}. The server keeps the local system actor ID."]
+    if wanted is None:
+        return [], []
+    state = inspect_system_actor(paths.db_path(), wanted)
+    if state is None:
+        return [f"[--] {label}: no system actor yet; the next start gives it {wanted}"], []
+    current, blocker = state
+    if current == wanted:
+        return [f"[OK] {label}: {current}"], []
+    if blocker is None:
+        return [f"[--] {label}: {current}; the next start changes it to {wanted}"], []
+    return [], [
+        f"[WARN] {label}: keeps the local ID {current}, not {wanted}: {blocker}. "
+        "Autonomous work is attributed to the local ID."
+    ]
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1991,6 +2029,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "[WARN] auth.password_hash is set but no account uses it — every "
                 "account has its own password now; the configured value does nothing"
             )
+    if mode is not None:
+        ok, warn = _system_principal_report(external=external)
+        lines.extend(ok)
+        warnings.extend(warn)
 
     # The setup checklist: the same derivation the setup page uses, over the
     # facts this process can read. Never prints the token — `nerve status`
