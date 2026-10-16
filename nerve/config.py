@@ -21,7 +21,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
-from nerve.inference_principal import system_principal_headers
+from nerve.inference_principal import direct_client_headers
 
 import yaml
 
@@ -3582,9 +3582,10 @@ class NerveConfig:
         """The ``default_headers`` argument for an Anthropic client, if any.
 
         In external mode, Nerve's own model calls name the system actor as
-        the principal of the request (see :mod:`nerve.inference_principal`).
+        the principal of the request, and never another principal from the
+        environment (see :func:`nerve.inference_principal.direct_client_headers`).
         """
-        headers = system_principal_headers()
+        headers = direct_client_headers()
         return {"default_headers": headers} if headers else {}
 
     def create_anthropic_client(

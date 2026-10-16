@@ -1836,7 +1836,10 @@ model request that it sends. The value is an actor ID, a lower-case UUID:
 | Session titles, prompt rewrite, source condensing, image description, memory on Bedrock, setup checks, the model catalogue | The system actor |
 
 A session with no cause, for example a session of a channel without an
-identity mapping, sends no header. Local mode sends no header.
+identity mapping, sends no header. Local mode sends no header. In both modes,
+Nerve removes a line for this header from an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, so neither the CLI nor Nerve's own clients send an
+inherited principal.
 
 A proxy in front of the model API can use the header to attribute model usage
 to a person. Nerve does not prove the claim. The proxy must check that the

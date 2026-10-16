@@ -13,6 +13,8 @@ client that records the options it was started with.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import logging
 import re
 
@@ -114,9 +116,18 @@ class TestPrincipal:
 
 
 class TestCliEnvironment:
-    def test_local_mode_leaves_the_environment_alone(self):
-        environ = {CUSTOM_HEADERS_ENV: f"{INFERENCE_PRINCIPAL_HEADER}: {BOB.actor_id}"}
+    def test_local_mode_removes_an_inherited_principal_and_keeps_the_rest(self):
+        environ = {CUSTOM_HEADERS_ENV: (
+            f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}"
+        )}
+        assert custom_headers_env(ALICE.actor_id, environ) == {
+            CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue",
+        }
+
+    def test_local_mode_leaves_other_custom_headers_alone(self):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\n\nX-Other: 1"}
         assert custom_headers_env(ALICE.actor_id, environ) == {}
+        assert custom_headers_env(None, {}) == {}
 
     def test_one_header_line_for_the_principal(self, external):
         env = custom_headers_env(ALICE.actor_id, {})
@@ -360,6 +371,55 @@ async def test_inherited_custom_headers_reach_the_cli(external, engine, cli, mon
     ]
 
 
+async def _process_env(options, monkeypatch) -> dict[str, str]:
+    """The environment that the SDK gives the CLI process it starts for ``options``.
+
+    Runs the SDK's own spawn path up to the process start, which is replaced.
+    """
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    captured: dict[str, str] = {}
+
+    async def _open_process(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        raise OSError("no CLI process in tests")
+
+    monkeypatch.setattr(subprocess_cli.anyio, "open_process", _open_process)
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+    transport = subprocess_cli.SubprocessCLITransport(
+        prompt="", options=dataclasses.replace(options, cli_path="/bin/true"),
+    )
+    with contextlib.suppress(Exception):
+        await transport.connect()
+    assert captured, "the SDK did not reach the process start"
+    return captured
+
+
+_INHERITED = f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}"
+
+
+@pytest.mark.asyncio
+async def test_local_mode_cli_process_inherits_no_principal(engine, cli, monkeypatch):
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+    await _turn(engine, "s1", ALICE)
+
+    env = await _process_env(cli[0].options, monkeypatch)
+    assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [("X-Proxy-Tag", "blue")]
+
+
+@pytest.mark.asyncio
+async def test_external_mode_cli_process_names_only_the_sessions_cause(
+    external, engine, cli, monkeypatch,
+):
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+    await _turn(engine, "s1", ALICE)
+
+    env = await _process_env(cli[0].options, monkeypatch)
+    assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+        ("X-Proxy-Tag", "blue"), (INFERENCE_PRINCIPAL_HEADER, ALICE.actor_id),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_local_mode_sends_no_header(engine, cli):
     await _turn(engine, "s1", ALICE)
@@ -447,3 +507,44 @@ def test_memory_bedrock_clients_name_the_system_actor(external, global_db):
     assert client._bedrock.default_headers[INFERENCE_PRINCIPAL_HEADER] == (
         global_db.system_actor_id
     )
+
+
+def _keyed_config() -> NerveConfig:
+    return NerveConfig.from_dict({"anthropic_api_key": "test-key-not-real"})
+
+
+def _sent_headers(client) -> list[tuple[str, str]]:
+    """The headers that a request of an Anthropic SDK client carries."""
+    from anthropic._models import FinalRequestOptions
+
+    request = client._build_request(FinalRequestOptions.construct(
+        method="post", url="/v1/messages", json_data={},
+    ))
+    return list(request.headers.multi_items())
+
+
+def _principal_values(headers: list[tuple[str, str]]) -> list[str]:
+    return [
+        value for name, value in headers
+        if name.lower() == INFERENCE_PRINCIPAL_HEADER.lower()
+    ]
+
+
+def test_direct_requests_in_local_mode_drop_an_inherited_principal(
+    global_db, monkeypatch,
+):
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+    for client in _direct_clients(_keyed_config()):
+        headers = _sent_headers(client)
+        assert _principal_values(headers) == []
+        assert ("x-proxy-tag", "blue") in headers
+
+
+def test_direct_requests_in_external_mode_name_the_system_actor_once(
+    external, global_db, monkeypatch,
+):
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+    for client in _direct_clients(_keyed_config()):
+        headers = _sent_headers(client)
+        assert _principal_values(headers) == [global_db.system_actor_id]
+        assert ("x-proxy-tag", "blue") in headers

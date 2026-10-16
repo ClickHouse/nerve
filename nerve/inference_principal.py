@@ -9,7 +9,9 @@ started for itself). Nerve's own model calls (session titles, prompt rewrite,
 source condensing, memory, setup checks, the model catalogue) name the system
 actor. Nerve does not prove the claim; the proxy decides what to accept.
 
-Local mode sends no header. A NULL cause sends no header.
+Local mode sends no header, and a NULL cause sends no header: Nerve also removes
+a principal line from the ``ANTHROPIC_CUSTOM_HEADERS`` that its own environment
+gives the CLI.
 
 The Claude CLI reads ``ANTHROPIC_CUSTOM_HEADERS`` from its environment when it
 builds the API client for a request: one ``Name: Value`` header per line,
@@ -98,32 +100,58 @@ def _header_name(line: str) -> str:
     return line[:index].strip().lower() if index >= 0 else ""
 
 
+def direct_client_headers(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Default headers for Nerve's own Anthropic SDK clients.
+
+    The Anthropic SDK also adds the lines of ``ANTHROPIC_CUSTOM_HEADERS`` in
+    the environment of Nerve to its default headers, with the name as written.
+    Each such name of the principal header gets ``anthropic.omit``, which
+    removes it. Then, in external mode, the system actor's header is added
+    (:func:`system_principal_headers`). So a request names the system actor
+    once in external mode, and no principal in local mode.
+    """
+    from anthropic import omit
+
+    env = os.environ if environ is None else environ
+    wanted = INFERENCE_PRINCIPAL_HEADER.lower()
+    headers: dict[str, object] = {
+        line[:line.find(":")].strip(): omit
+        for line in env.get(CUSTOM_HEADERS_ENV, "").split("\n")
+        if _header_name(line) == wanted
+    }
+    headers.update(system_principal_headers())
+    return headers
+
+
 def custom_headers_env(
     principal: str | None, environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Environment entries that make a Claude CLI process name ``principal``.
 
-    ``principal`` comes from :func:`inference_principal`. Local mode gives no
-    entries, so the CLI inherits the environment of Nerve unchanged. In
-    external mode, the value is the inherited ``ANTHROPIC_CUSTOM_HEADERS``
-    without blank lines and without a line for the principal header, plus one
-    line for ``principal`` when it is set. So the CLI sends exactly one
-    principal header, or none. No entry when that value is the inherited
-    value.
+    ``principal`` comes from :func:`inference_principal`. The SDK merges the
+    entries over the environment of Nerve, which the CLI inherits. The value
+    is the inherited ``ANTHROPIC_CUSTOM_HEADERS`` without blank lines and
+    without a line for the principal header, plus, in external mode, one line
+    for ``principal`` when it is set. So the CLI sends exactly one principal
+    header in external mode, or none, and never one in local mode. No entry
+    when that value is the inherited value, and in local mode when the
+    inherited value has no principal line.
     """
-    if not _is_external_mode():
-        return {}
     env = os.environ if environ is None else environ
     inherited = env.get(CUSTOM_HEADERS_ENV, "")
     wanted = INFERENCE_PRINCIPAL_HEADER.lower()
-    lines = [
-        line for line in _LINE_END.split(inherited)
-        if line.strip() and _header_name(line) != wanted
-    ]
+    lines = _LINE_END.split(inherited) if inherited else []
+    if not _is_external_mode():
+        if not any(_header_name(line) == wanted for line in lines):
+            return {}
+        principal = None
+    kept = [line for line in lines if line.strip() and _header_name(line) != wanted]
     # Checked again: the value goes into a header line.
     if principal and _canonical_uuid(principal):
-        lines.append(f"{INFERENCE_PRINCIPAL_HEADER}: {principal}")
-    value = "\n".join(lines)
+        kept.append(f"{INFERENCE_PRINCIPAL_HEADER}: {principal}")
+    value = "\n".join(kept)
     if value == inherited:
         return {}
     return {CUSTOM_HEADERS_ENV: value}
