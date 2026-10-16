@@ -812,6 +812,9 @@ provenance and is never identity. See
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
+The delete removes the session's events. Nerve records the delete in
+`session_deletions` with the signed-in person as actor and cause (see
+[Session changes](accounts.md#session-changes)).
 
 #### `GET /api/sessions/{id}/status`
 Session status with lifecycle info.
@@ -867,12 +870,19 @@ Get session lifecycle event log (newest first).
 ```json
 Response: {
   "events": [
-    { "id": 3, "session_id": "abc", "event_type": "idle", "details": { "resumable": true }, "created_at": "..." },
-    { "id": 2, "session_id": "abc", "event_type": "started", "details": { "sdk_session_id": "..." }, "created_at": "..." },
-    { "id": 1, "session_id": "abc", "event_type": "created", "details": { "source": "web" }, "created_at": "..." }
+    { "id": 4, "session_id": "abc", "event_type": "title_changed", "details": { "title": "Launch plan", "previous": "abc" }, "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." },
+    { "id": 3, "session_id": "abc", "event_type": "idle", "details": { "resumable": true }, "actor_id": null, "caused_by_actor_id": null, "created_at": "..." },
+    { "id": 2, "session_id": "abc", "event_type": "started", "details": { "sdk_session_id": "..." }, "actor_id": null, "caused_by_actor_id": null, "created_at": "..." },
+    { "id": 1, "session_id": "abc", "event_type": "created", "details": { "source": "web" }, "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
   ]
 }
 ```
+
+`actor_id` is who made the change and `caused_by_actor_id` is on whose behalf
+(actor ids for [`GET /api/actors`](#actors)). Both are `null` for an event that
+records the state of the runtime, for a change with no known person, and for
+legacy rows. The event types and their details are in
+[Session changes](accounts.md#session-changes).
 
 ### Modified Files
 
@@ -1339,7 +1349,8 @@ fresh.
 // Send a chat message
 { type: "message", content: "Hello", session_id: "main" }
 
-// Stop the running agent
+// Stop the running agent (records a stop_requested session event for the
+// connection's person)
 { type: "stop", session_id: "main" }
 
 // Switch active session
@@ -1348,7 +1359,8 @@ fresh.
 // Fork a session
 { type: "fork", session_id: "main", at_message_id: "msg-42", title: "My Fork" }
 
-// Resume a stopped/idle session
+// Resume a stopped/idle session (records a created session event with
+// reason "resume" for the connection's person)
 { type: "resume", session_id: "abc123" }
 
 // Keep-alive

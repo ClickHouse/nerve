@@ -191,6 +191,8 @@ These columns store actor IDs:
 | `messages.actor_id` | Who supplied the content of a user message |
 | `task_events.actor_id`, `task_events.caused_by_actor_id` | Actor and cause of a task status change |
 | `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
+| `session_events.actor_id`, `session_events.caused_by_actor_id` | Actor and cause of a session change (see [Session changes](#session-changes)) |
+| `session_deletions.actor_id`, `session_deletions.caused_by_actor_id` | Actor and cause of a session delete |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -235,16 +237,43 @@ in the same way, so the same approximation applies to model usage. See
 |---|---|---|
 | A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
 | The agent works in a session (tool calls, task changes, sessions it starts) | The system actor | The session's cause |
-| Telegram, Slack, or imported Codex input | None until a local identity mapping exists | None |
+| Nerve sets a session title (the placeholder and the generated title) | The system actor | The session's cause |
+| An automatic archive, the archive of a Codex session by the sync | The system actor | The system actor |
+| Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
 | Assistant and tool output | None | None |
 
 Existing records remain unattributed: Nerve does not backfill these columns.
 Nerve does not infer identity from channel or source metadata. The free-text
 origin fields, such as `task_events.actor`, stay as they are; they record where
-a change came from, not who made it. Account and session administration actions
-are not yet recorded as audit events. Missing attribution means legacy history,
+a change came from, not who made it. Account administration actions are not
+yet recorded as audit events. Missing attribution means legacy history,
 unidentified external input, or assistant/tool output; autonomous work uses the
 system actor.
+
+### Session changes
+
+`session_events` records the changes to a session with their actor and cause:
+
+| Event | Change | Details |
+|---|---|---|
+| `created` | The session is created; also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
+| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve sets for a turn, `cron_rotation` for a rotated cron session |
+| `starred`, `unstarred` | The session is starred or unstarred | |
+| `model_changed` | The model changes | `model`, `previous` |
+| `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
+| `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
+| `stop_requested` | A stop reaches a running session | |
+| `external_tool_call` | An external MCP client calls a tool | The tool call |
+
+A change through the web UI, the REST API or the browser WebSocket records the
+person as actor and cause. A field that keeps its value records no event.
+Events that record the state of the runtime (`started`, `idle`, `error`, and a
+`stopped` status after a cancel) have no actor and no cause.
+
+A delete removes the session's events. Nerve writes a row to
+`session_deletions` (the session ID, its last title, the time, the actor and
+the cause) in the same transaction as the delete. A later delete of a session
+with the same ID replaces that row.
 
 ## Session-signing secret
 
