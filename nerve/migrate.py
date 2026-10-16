@@ -1506,8 +1506,8 @@ def _warn_kept_system_actor(
     report: MigrationReport, current_id: str, reason: str, *, dry_run: bool,
 ) -> None:
     warning = (
-        f"the system actor keeps its local ID {current_id}: {reason}. Autonomous "
-        "work is attributed to the local ID. 'nerve doctor' shows this."
+        f"the system actor keeps its current ID {current_id}: {reason}. Autonomous "
+        "work is attributed to that ID. 'nerve doctor' shows this."
     )
     report.warnings.append(warning)
     if not dry_run:
@@ -1544,9 +1544,10 @@ async def _apply_system_principal(
     new installation therefore takes the ID at ``nerve init`` or at its first
     start, before any work is attributed to it.
 
-    In all other cases the local ID stays: an unset value says nothing, and
-    an invalid value, a referenced system actor, or a new ID that another
-    actor has gives one warning. ``nerve doctor`` reports the difference.
+    In all other cases the current ID stays: an unset value says nothing, and
+    an invalid value, a referenced system actor, a new ID that another actor
+    has, or an ID that another process changed first gives one warning.
+    ``nerve doctor`` reports the difference.
     """
     from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
 
@@ -1560,30 +1561,23 @@ async def _apply_system_principal(
         return
 
     if dry_run:
-        blocker = await db._system_actor_rekey_blocker(current_id, new_id)
-        if blocker is None:
-            report.rekeyed_system_actor = True
-            report.identity_actions.append(_rekey_action(current_id, new_id, dry_run=True))
-        else:
-            _warn_kept_system_actor(
-                report, current_id, _rekey_blocked_reason(new_id, blocker), dry_run=True,
-            )
-        return
-
-    result = await db._rekey_system_actor(new_id)
+        result = await db._preview_system_actor_rekey(new_id)
+    else:
+        result = await db._rekey_system_actor(new_id)
     if result.changed:
         report.rekeyed_system_actor = True
         report.identity_actions.append(
-            _rekey_action(result.previous_id, result.actor_id, dry_run=False)
+            _rekey_action(result.previous_id, result.actor_id, dry_run=dry_run)
         )
-        logger.info(
-            "Identity: the system actor ID changed from %s to %s",
-            result.previous_id, result.actor_id,
-        )
+        if not dry_run:
+            logger.info(
+                "Identity: the system actor ID changed from %s to %s",
+                result.previous_id, result.actor_id,
+            )
     elif result.blocker is not None:
         _warn_kept_system_actor(
             report, result.actor_id, _rekey_blocked_reason(new_id, result.blocker),
-            dry_run=False,
+            dry_run=dry_run,
         )
     # Otherwise the stored ID was already the new ID: another process changed
     # it after this connection cached the system actor.

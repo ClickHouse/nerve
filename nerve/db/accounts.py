@@ -166,9 +166,11 @@ class BootstrapAccount:
 
 @dataclass(frozen=True)
 class SystemActorRekey:
-    """The result of :meth:`AccountStore._rekey_system_actor`."""
+    """The result of :meth:`AccountStore._rekey_system_actor` or of
+    :meth:`AccountStore._preview_system_actor_rekey`."""
 
-    # The stored ID of the system actor before and after the call.
+    # The stored ID of the system actor before the call, and the ID after it.
+    # For a preview, ``actor_id`` is the ID that the change would give.
     previous_id: str
     actor_id: str
     # Why the ID did not change, or ``None``.
@@ -183,23 +185,44 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+@dataclass(frozen=True)
+class _Probe:
+    """One check that must find no row before the system actor gets a new ID."""
+
+    sql: str
+    params: tuple[str]
+    # The checked column, as ``table.column``.
+    label: str
+    # Why the ID cannot change when the query returns a row.
+    reason: str
+
+    def failure(self, error: Exception) -> str:
+        """Why the ID cannot change when the query cannot run."""
+        return f"the check of {self.label} could not run ({error})"
+
+
 def _rekey_probes(
     columns: list[tuple[str, str]], current_id: str, new_id: str,
-) -> list[tuple[str, tuple[str], str]]:
+) -> list[_Probe]:
     """The checks that must all find no row before the system actor gets a new ID.
 
-    Each item is ``(sql, params, reason)``. The reason applies when the query
-    returns a row. ``columns`` comes from :data:`ACTOR_REF_COLUMNS_SQL`, so
-    the names are from the schema, never from a caller.
+    ``columns`` comes from :data:`ACTOR_REF_COLUMNS_SQL`, so the names are
+    from the schema, never from a caller. Each comparison uses ``COLLATE
+    BINARY``, as the foreign key does with ``actor_refs.id``, so the declared
+    collation of a column is never loaded.
     """
     probes = [
-        ("SELECT 1 FROM actor_refs WHERE id = ? LIMIT 1", (new_id,), SYSTEM_ACTOR_ID_TAKEN),
+        _Probe(
+            "SELECT 1 FROM actor_refs WHERE id COLLATE BINARY = ? LIMIT 1",
+            (new_id,), "actor_refs.id", SYSTEM_ACTOR_ID_TAKEN,
+        ),
     ]
     for table, column in columns:
-        probes.append((
+        probes.append(_Probe(
             f"SELECT 1 FROM {_quote_identifier(table)} "
-            f"WHERE {_quote_identifier(column)} = ? LIMIT 1",
+            f"WHERE {_quote_identifier(column)} COLLATE BINARY = ? LIMIT 1",
             (current_id,),
+            f"{table}.{column}",
             f"{table}.{column} refers to the current ID",
         ))
     return probes
@@ -291,21 +314,51 @@ class AccountStore:
         """Why the system actor cannot change from ``current_id`` to ``new_id``.
 
         ``None`` when no actor has ``new_id`` and no column with a foreign key
-        to ``actor_refs`` holds ``current_id``.
+        to ``actor_refs`` holds ``current_id``. A check that cannot run is a
+        reason too, so the ID changes only when every check found no row.
         """
-        for sql, params, reason in _rekey_probes(
-            await self._actor_ref_columns(), current_id, new_id,
-        ):
-            async with self.db.execute(sql, params) as cursor:
-                if await cursor.fetchone() is not None:
-                    return reason
+        for probe in _rekey_probes(await self._actor_ref_columns(), current_id, new_id):
+            try:
+                async with self.db.execute(probe.sql, probe.params) as cursor:
+                    found = await cursor.fetchone() is not None
+            except sqlite3.Error as e:
+                return probe.failure(e)
+            if found:
+                return probe.reason
         return None
+
+    async def _decide_system_actor_rekey(self, new_id: str) -> tuple[str, str | None]:
+        """Read the stored system actor ID and decide whether it can become ``new_id``.
+
+        Call inside a transaction. Returns ``(stored_id, blocker)``. The stored
+        ID must still be the ID that this connection has cached: when another
+        connection changed it, this one does not change it again, because the
+        other connection uses the ID it set.
+        """
+        async with self.db.execute(
+            "SELECT id FROM actor_refs WHERE kind = 'system'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            from nerve.db.base import IdentityInvariantError
+
+            raise IdentityInvariantError("actor identity is corrupt: there is no system actor")
+        stored_id = row[0]
+        if stored_id == new_id:
+            return stored_id, None
+        cached_id = self.system_actor_id
+        if stored_id != cached_id:
+            return stored_id, (
+                f"another process changed the ID from {cached_id} to {stored_id} "
+                "after this process read it"
+            )
+        return stored_id, await self._system_actor_rekey_blocker(stored_id, new_id)
 
     async def _rekey_system_actor(self, new_id: str) -> SystemActorRekey:
         """Give the system actor ``new_id`` while no row refers to it.
 
-        One transaction reads the stored ID again, checks
-        :meth:`_system_actor_rekey_blocker`, drops
+        One transaction reads the stored ID again, checks it with
+        :meth:`_decide_system_actor_rekey`, drops
         ``system_actor_id_cannot_change``, changes the ID, and creates the
         trigger again with :data:`SYSTEM_ACTOR_ID_TRIGGER_SQL`. A failure rolls
         back all of it, so no other transaction sees the table without the
@@ -313,31 +366,23 @@ class AccountStore:
         it. The cached :attr:`system_actor` is read again in all cases.
         """
         async with self._atomic():
-            async with self.db.execute(
-                "SELECT id FROM actor_refs WHERE kind = 'system'"
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row is None:
-                from nerve.db.base import IdentityInvariantError
-
-                raise IdentityInvariantError(
-                    "actor identity is corrupt: there is no system actor"
+            previous_id, blocker = await self._decide_system_actor_rekey(new_id)
+            if previous_id != new_id and blocker is None:
+                await self.db.execute(f"DROP TRIGGER IF EXISTS {SYSTEM_ACTOR_ID_TRIGGER}")
+                await self.db.execute(
+                    "UPDATE actor_refs SET id = ? WHERE id = ? AND kind = 'system'",
+                    (new_id, previous_id),
                 )
-            previous_id = row[0]
-            blocker = None
-            if previous_id != new_id:
-                blocker = await self._system_actor_rekey_blocker(previous_id, new_id)
-                if blocker is None:
-                    await self.db.execute(
-                        f"DROP TRIGGER IF EXISTS {SYSTEM_ACTOR_ID_TRIGGER}"
-                    )
-                    await self.db.execute(
-                        "UPDATE actor_refs SET id = ? WHERE id = ? AND kind = 'system'",
-                        (new_id, previous_id),
-                    )
-                    await self.db.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
+                await self.db.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
         await self._cache_system_actor()
         return SystemActorRekey(previous_id, self.system_actor_id, blocker)
+
+    async def _preview_system_actor_rekey(self, new_id: str) -> SystemActorRekey:
+        """What :meth:`_rekey_system_actor` would do, from one snapshot, with no write."""
+        async with self._read_snapshot():
+            previous_id, blocker = await self._decide_system_actor_rekey(new_id)
+        actor_id = new_id if blocker is None else previous_id
+        return SystemActorRekey(previous_id, actor_id, blocker)
 
     # -- accounts ------------------------------------------------------------
 
@@ -883,12 +928,14 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
     Returns ``(actor_id, blocker)``. ``blocker`` is ``None`` when the stored
     ID is ``wanted_id`` or when the identity bootstrap can change it (see
     ``AccountStore._system_actor_rekey_blocker``). Returns ``None`` when the
-    database does not exist, has no system actor yet, or cannot be read.
+    database does not exist, has no system actor yet, or cannot be read. All
+    reads use one snapshot, so a concurrent change gives a consistent answer.
     """
     conn = _read_only(db_path)
     if conn is None:
         return None
     try:
+        conn.execute("BEGIN")
         rows = conn.execute("SELECT id FROM actor_refs WHERE kind = 'system'").fetchall()
         if len(rows) != 1:
             return None
@@ -896,9 +943,13 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
         if current_id == wanted_id:
             return current_id, None
         columns = [(row[0], row[1]) for row in conn.execute(ACTOR_REF_COLUMNS_SQL)]
-        for sql, params, reason in _rekey_probes(columns, current_id, wanted_id):
-            if conn.execute(sql, params).fetchone() is not None:
-                return current_id, reason
+        for probe in _rekey_probes(columns, current_id, wanted_id):
+            try:
+                found = conn.execute(probe.sql, probe.params).fetchone() is not None
+            except sqlite3.Error as e:
+                return current_id, probe.failure(e)
+            if found:
+                return current_id, probe.reason
         return current_id, None
     except sqlite3.Error:
         return None

@@ -106,6 +106,19 @@ async def _refer_to_system_actor(database: Database, reference: str) -> str:
     return "later_story.caused_by_actor_id"
 
 
+def _rekey_from_another_connection(path, new_id: str) -> None:
+    """Change the system actor ID as another process would, and commit."""
+    other = sqlite3.connect(path)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(f"DROP TRIGGER {SYSTEM_ACTOR_ID_TRIGGER}")
+        other.execute("UPDATE actor_refs SET id = ? WHERE kind = 'system'", (new_id,))
+        other.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
+        other.commit()
+    finally:
+        other.close()
+
+
 def _warnings(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
 
@@ -262,6 +275,146 @@ class TestRekey:
             await first.close()
             await second.close()
 
+    async def test_a_connection_does_not_change_an_id_that_another_one_set(self, tmp_path):
+        """Both connections cached the local ID. The second one asks for another
+        ID after the first changed it: it keeps the first one's ID, so the ID
+        that each connection uses still exists."""
+        first = await _open(tmp_path / "nerve.db")
+        second = await _open(tmp_path / "nerve.db")
+        try:
+            local_id = first.system_actor_id
+            assert (await first._rekey_system_actor(PRINCIPAL)).changed
+
+            result = await second._rekey_system_actor(ALICE)
+
+            assert not result.changed
+            assert (result.previous_id, result.actor_id) == (PRINCIPAL, PRINCIPAL)
+            assert result.blocker == (
+                f"another process changed the ID from {local_id} to {PRINCIPAL} "
+                "after this process read it"
+            )
+            assert first.system_actor_id == second.system_actor_id == PRINCIPAL
+            assert await _system_rows(first) == [PRINCIPAL]
+            # Both connections can still write rows attributed to the system actor.
+            await first.create_session("s-first", actor=first.system_actor)
+            await second.create_session("s-second", actor=second.system_actor)
+        finally:
+            await first.close()
+            await second.close()
+
+    async def test_concurrent_changes_to_different_ids_leave_one_live_id(self, tmp_path):
+        first = await _open(tmp_path / "nerve.db")
+        second = await _open(tmp_path / "nerve.db")
+        try:
+            results = await asyncio.gather(
+                first._rekey_system_actor(PRINCIPAL),
+                second._rekey_system_actor(ALICE),
+            )
+            assert sorted(r.changed for r in results) == [False, True]
+            winner = next(r.actor_id for r in results if r.changed)
+            loser = next(r for r in results if not r.changed)
+            assert loser.blocker.startswith("another process changed the ID")
+            assert first.system_actor_id == second.system_actor_id == winner
+            assert await _system_rows(first) == [winner]
+            await first.create_session("s-first", actor=first.system_actor)
+            await second.create_session("s-second", actor=second.system_actor)
+        finally:
+            await first.close()
+            await second.close()
+
+    @pytest.mark.parametrize("referenced", [False, True])
+    async def test_a_column_collation_that_is_not_registered_does_not_stop_the_check(
+        self, database, referenced,
+    ):
+        """The probe compares with ``COLLATE BINARY``, so a column declared with
+        a collation that only another connection registers can be checked."""
+        local_id = database.system_actor_id
+        other = sqlite3.connect(database.db_path)
+        try:
+            other.create_collation("app_order", lambda a, b: (a > b) - (a < b))
+            other.execute(
+                "CREATE TABLE extension (who TEXT COLLATE app_order "
+                "REFERENCES actor_refs(id))"
+            )
+            if referenced:
+                other.execute("INSERT INTO extension (who) VALUES (?)", (local_id,))
+            other.commit()
+        finally:
+            other.close()
+
+        assert inspect_system_actor(database.db_path, PRINCIPAL) == (
+            local_id, "extension.who refers to the current ID" if referenced else None,
+        )
+        result = await database._rekey_system_actor(PRINCIPAL)
+        if referenced:
+            assert result.blocker == "extension.who refers to the current ID"
+            assert database.system_actor_id == local_id
+        else:
+            assert result.changed and database.system_actor_id == PRINCIPAL
+
+    async def test_a_check_that_cannot_run_keeps_the_id(self, database, monkeypatch):
+        import nerve.db.accounts as accounts
+
+        local_id = database.system_actor_id
+        real = accounts._rekey_probes
+
+        def with_a_broken_probe(columns, current_id, new_id):
+            broken = accounts._Probe(
+                "SELECT 1 FROM missing_table WHERE who = ?", (current_id,),
+                "missing_table.who", "unused",
+            )
+            return [*real(columns, current_id, new_id), broken]
+
+        monkeypatch.setattr(accounts, "_rekey_probes", with_a_broken_probe)
+
+        current, blocker = inspect_system_actor(database.db_path, PRINCIPAL)
+        assert current == local_id
+        assert blocker.startswith("the check of missing_table.who could not run (")
+        result = await database._rekey_system_actor(PRINCIPAL)
+        assert result.blocker.startswith("the check of missing_table.who could not run (")
+        assert database.system_actor_id == local_id
+        assert await _system_rows(database) == [local_id]
+
+    async def test_the_read_only_inspection_uses_one_snapshot(self, database, monkeypatch):
+        """Another process changes the ID while the inspection runs. The answer
+        is the state before that change, not a mix of the two states."""
+        import nerve.db.accounts as accounts
+
+        local_id = database.system_actor_id
+        real = accounts._rekey_probes
+
+        def probes_after_a_concurrent_change(columns, current_id, new_id):
+            _rekey_from_another_connection(database.db_path, new_id)
+            return real(columns, current_id, new_id)
+
+        monkeypatch.setattr(accounts, "_rekey_probes", probes_after_a_concurrent_change)
+
+        assert inspect_system_actor(database.db_path, PRINCIPAL) == (local_id, None)
+
+    async def test_the_preview_uses_one_snapshot_and_writes_nothing(
+        self, database, monkeypatch,
+    ):
+        import nerve.db.accounts as accounts
+
+        local_id = database.system_actor_id
+        real = accounts._rekey_probes
+
+        def probes_after_a_concurrent_change(columns, current_id, new_id):
+            _rekey_from_another_connection(database.db_path, new_id)
+            return real(columns, current_id, new_id)
+
+        monkeypatch.setattr(accounts, "_rekey_probes", probes_after_a_concurrent_change)
+
+        result = await database._preview_system_actor_rekey(PRINCIPAL)
+
+        assert (result.previous_id, result.actor_id, result.blocker) == (
+            local_id, PRINCIPAL, None,
+        )
+        assert not database.db.in_transaction
+        # The ID that the other connection set, not one that the preview wrote.
+        assert await _system_rows(database) == [PRINCIPAL]
+        assert database.system_actor_id == local_id
+
     async def test_the_checked_columns_come_from_the_schema(self, database):
         found = set(await database._actor_ref_columns())
         assert {
@@ -340,7 +493,7 @@ class TestBootstrap:
         assert not report.rekeyed_system_actor
         assert len(report.warnings) == 1
         warning = report.warnings[0]
-        assert f"keeps its local ID {local_id}" in warning
+        assert f"keeps its current ID {local_id}" in warning
         assert f"{SYSTEM_PRINCIPAL_ENV} names {PRINCIPAL}" in warning
         assert f"{column} refers to the current ID" in warning
         assert _warnings(caplog) == [f"Identity: {warning}"]
@@ -410,6 +563,30 @@ class TestBootstrap:
             assert sorted(r.rekeyed_system_actor for r in reports) == [False, True]
             assert not any(r.warnings for r in reports)
             assert first.system_actor_id == second.system_actor_id == PRINCIPAL
+        finally:
+            await first.close()
+            await second.close()
+
+    async def test_a_start_that_asks_for_another_id_keeps_the_one_already_set(
+        self, tmp_path, external, monkeypatch, caplog,
+    ):
+        first = await _open(tmp_path / "nerve.db")
+        second = await _open(tmp_path / "nerve.db")
+        try:
+            monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, PRINCIPAL)
+            assert (await bootstrap_identity(first, _config())).rekeyed_system_actor
+
+            monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, ALICE)
+            with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+                report = await bootstrap_identity(second, _config())
+
+            assert not report.rekeyed_system_actor
+            assert len(report.warnings) == 1
+            assert f"keeps its current ID {PRINCIPAL}" in report.warnings[0]
+            assert "another process changed the ID" in report.warnings[0]
+            assert len(_warnings(caplog)) == 1
+            assert first.system_actor_id == second.system_actor_id == PRINCIPAL
+            await second.create_session("s-second", actor=second.system_actor)
         finally:
             await first.close()
             await second.close()

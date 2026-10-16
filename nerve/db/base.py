@@ -588,6 +588,23 @@ class Database(
                 await self._rollback_quietly()
                 raise
 
+    @asynccontextmanager
+    async def _read_snapshot(self) -> AsyncIterator[None]:
+        """Run several reads against one snapshot of the database.
+
+        A deferred BEGIN takes no write lock: the snapshot starts at the first
+        read and lasts until the rollback at the end. The body must not write.
+        The write lock of this connection is held, so no write on this
+        connection can commit or end the transaction while the body runs.
+        """
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            try:
+                await self.db.execute("BEGIN")
+                yield
+            finally:
+                await self._rollback_quietly()
+
     async def _write(self, sql: str, params: tuple | list = ()) -> WriteResult:
         """Execute one write statement and commit, under the write lock.
 
