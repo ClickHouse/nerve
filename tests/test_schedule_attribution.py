@@ -29,7 +29,7 @@ from nerve.cron.jobs import CronJob
 from nerve.cron.service import CronService
 from nerve.db.actor_columns import ACTOR_COLUMNS
 from nerve.identity import Attribution
-from tests.test_cause_attribution import (  # noqa: F401 — fixtures
+from tests.test_cause_attribution import (  # noqa: F401 (fixtures)
     ALICE_PRINCIPAL,
     BOB_PRINCIPAL,
     _as,

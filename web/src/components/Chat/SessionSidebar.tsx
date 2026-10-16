@@ -922,7 +922,7 @@ function parkedTitle(session: Session, scheduledBy: string | null): string {
 /**
  * Parked: no turn in flight, but a wake-up is scheduled or a background job
  * is still running. Same pulsing dot as running (the session isn't done),
- * in violet — the one hue no other indicator uses — so "working right now"
+ * in violet (the one hue that no other indicator uses), so "working right now"
  * stays distinguishable from "will pick itself back up".
  */
 function ParkedIndicator({ session }: { session: Session }) {

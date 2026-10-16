@@ -1584,8 +1584,8 @@ class AgentEngine:
 
         ``ScheduleWakeup`` keeps at most one pending row per session (a new
         request supersedes the old one), so this is a single row rather
-        than a list. Never raises — a listing/indicator caller must not fail
-        on an enrichment read.
+        than a list. Never raises: a listing or indicator caller must not
+        fail on an enrichment read.
         """
         try:
             rows = await self.db.list_pending_wakeups(session_id)
