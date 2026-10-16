@@ -70,10 +70,11 @@ from nerve.agent.tools import init_tools
 from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import Actor
+from nerve.agent.managed_mcp import SessionCatalogs, UpdateOutcome
 from nerve.mcp_gateway import (
     BUILTIN_SERVER_NAME,
+    CatalogServers,
     GatewayCatalog,
-    GatewayServer,
     McpGatewayCatalog,
 )
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -173,6 +174,15 @@ def _model_family(model: str) -> str:
     # Trailing release date: "-20260601"
     m = re.sub(r"-20\d{6}$", "", m)
     return m
+
+
+@dataclass
+class DrainOutcome:
+    """What a drain of buffered autonomous output found at its end."""
+
+    # True when the drain ended with no turn open, nothing buffered, and the
+    # runtime alive: the runtime was between turns at that moment.
+    quiet: bool = False
 
 
 @dataclass
@@ -289,7 +299,11 @@ class AgentEngine:
         if self._managed_mcp and config.mcp_gateway_url:
             self._mcp_gateway = McpGatewayCatalog(
                 config.mcp_gateway_url, on_applied=self._on_mcp_catalog_applied,
+                refresh_interval=config.mcp_gateway_refresh_seconds,
             )
+        # The catalog generation of each running client in external mode,
+        # and the updates of running clients to a newer catalog.
+        self._session_catalogs = SessionCatalogs()
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -433,38 +447,50 @@ class AgentEngine:
         """Whether the organization manages the MCP servers (external mode)."""
         return self._managed_mcp
 
-    def managed_mcp_servers(self) -> tuple[GatewayServer, ...] | None:
+    def managed_mcp_servers(self) -> CatalogServers | None:
         """The MCP gateway servers for a new session.
 
         ``None`` in local mode. In external mode, the servers of the applied
-        catalog, which is empty without a gateway URL or before the first
-        catalog. A server that has the name of Nerve's own server is left out.
+        catalog with its generation and digest, which is empty without a
+        gateway URL or before the first catalog. A server that has the name of
+        Nerve's own server is left out.
         """
         if not self._managed_mcp:
             return None
         if self._mcp_gateway is None:
-            return ()
-        return tuple(
-            server for server in self._mcp_gateway.servers
-            if server.id != BUILTIN_SERVER_NAME
+            return CatalogServers()
+        applied = self._mcp_gateway.applied
+        if applied is None:
+            return CatalogServers()
+        return CatalogServers(
+            (server for server in applied.servers if server.id != BUILTIN_SERVER_NAME),
+            generation=applied.generation,
+            digest=applied.digest,
         )
 
     def mcp_gateway_status(self) -> dict | None:
         """The applied catalog for diagnostics. ``None`` in local mode.
 
         ``not_applied`` maps a catalog server ID to the backends that do not
-        give it to their sessions, each with the reason.
+        give it to their sessions, each with the reason. ``sessions`` lists
+        each running client with its catalog generation and the servers that
+        it does not follow (see :mod:`nerve.agent.managed_mcp`).
         """
         if not self._managed_mcp:
             return None
+        sessions = self._session_catalogs.status(self.sessions.get_client)
         if self._mcp_gateway is None:
             return {
                 "url": None, "generation": None, "digest": None, "servers": [],
                 "applied_at": None, "checked_at": None,
                 "error": "mcp_gateway_url is not set", "retrying": False,
-                "not_applied": {},
+                "refresh_seconds": None, "not_applied": {}, "sessions": sessions,
             }
-        return {**self._mcp_gateway.status(), "not_applied": self.managed_mcp_conflicts()}
+        return {
+            **self._mcp_gateway.status(),
+            "not_applied": self.managed_mcp_conflicts(),
+            "sessions": sessions,
+        }
 
     def managed_mcp_conflicts(self) -> dict[str, dict[str, str]]:
         """Catalog servers that a backend leaves out: ID -> backend -> reason.
@@ -501,6 +527,59 @@ class AgentEngine:
                 )
         if self.db is not None:
             await self._sync_mcp_servers_to_db()
+
+    async def _follow_mcp_catalog(
+        self,
+        session_id: str,
+        client: AgentClient,
+        source: str,
+        model: str | None,
+        effort_override: str | None,
+        *,
+        drained_quietly: bool,
+    ) -> AgentClient:
+        """Bring a running client to the applied catalog before a user turn.
+
+        Called by the turn after the drain of buffered autonomous output and
+        before the turn starts, under the session's run lock. Returns the
+        client for the turn: the same one, or a new one when the result of a
+        change is unknown (the old client could still apply it during the
+        turn).
+        """
+        backend = self._backend_for_live_session(session_id)
+
+        def between_turns() -> bool:
+            # The drain proved a quiet runtime, and nothing new arrived. A turn
+            # that the CLI starts on its own follows a background task (a
+            # background command, agent, or monitor) that settles; with none
+            # running, no such turn can start while the changes run, because
+            # this turn holds the session's run lock.
+            return (
+                drained_quietly
+                and client.buffer_used() <= 0
+                and not self._has_live_background_tasks(session_id)
+            )
+
+        outcome = await self._session_catalogs.update(
+            session_id, client, self.managed_mcp_servers(),
+            can_update=backend.capabilities.updates_mcp_servers,
+            between_turns=between_turns,
+        )
+        if outcome is not UpdateOutcome.REBUILD:
+            return client
+        logger.warning(
+            "Session %s: replacing the %s client, because the result of an "
+            "MCP gateway server change is unknown", session_id, backend.name,
+        )
+        self._stop_idle_watcher(session_id)
+        self.sessions.remove_client(session_id)
+        self._session_backends.pop(session_id, None)
+        self._session_models.pop(session_id, None)
+        unregister_handler(session_id)
+        await self._safe_disconnect(client)
+        return await self._get_or_create_client(
+            session_id, source, model, effort_override=effort_override,
+        )
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -1503,6 +1582,8 @@ class AgentEngine:
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
+            if self._managed_mcp:
+                self._session_catalogs.record(session_id, backend.name, client)
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):
@@ -2820,6 +2901,7 @@ class AgentEngine:
                                     "message: no native turn mapping is available."
                                 )
 
+            running_client = self.sessions.get_client(session_id)
             client = await self._get_or_create_client(
                 session_id, source, model, fork_from=fork_from,
                 fork_last_turn_id=fork_last_turn_id,
@@ -2841,10 +2923,11 @@ class AgentEngine:
             # the user's message for long; if its content arrives later it
             # interleaves into this turn's stream (still rendered) and the
             # idle watcher self-heals the remainder.
+            drained = DrainOutcome()
             try:
                 await self._drain_pending_messages(
                     session_id, client, source, channel,
-                    first_content_timeout=3.0,
+                    first_content_timeout=3.0, outcome=drained,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2852,6 +2935,16 @@ class AgentEngine:
                 logger.warning(
                     "Pre-query drain failed for session %s: %s",
                     session_id, drain_err,
+                )
+
+            # External mode: a newer catalog reaches a running client before
+            # this turn, but only when the drain proved that the client is
+            # between turns. A client built for this turn has the applied
+            # catalog already.
+            if self._managed_mcp and client is running_client:
+                client = await self._follow_mcp_catalog(
+                    session_id, client, source, model, effort_override,
+                    drained_quietly=drained.quiet,
                 )
             # The drain's broadcast_done (if it processed a turn) cleared
             # the open-turn flag set by run(); re-arm it so the synthetic-
@@ -3166,6 +3259,7 @@ class AgentEngine:
         channel: str | None,
         manage_framing: bool = False,
         first_content_timeout: float = 30.0,
+        outcome: DrainOutcome | None = None,
     ) -> int:
         """Drain agent events that arrived outside an active ``run()``.
 
@@ -3196,7 +3290,10 @@ class AgentEngine:
         buffering): the idle watcher passes True; ``run()`` passes False
         because its own framing is already open.
 
-        Returns the number of completed autonomous turns processed.
+        Returns the number of completed autonomous turns processed. When
+        ``outcome`` is given, ``outcome.quiet`` tells whether the drain ended
+        with no turn open and nothing buffered: the runtime was between
+        turns at that moment.
         """
         idle_timeout = self.config.agent.cli_idle_timeout_seconds
         turns = 0
@@ -3252,6 +3349,8 @@ class AgentEngine:
                     # No turn open — only consume what's already buffered.
                     batch = client.try_receive_idle_events()
                     if batch is None:
+                        if outcome is not None:
+                            outcome.quiet = client.is_alive()
                         break  # nothing buffered / stream closed
                 else:
                     # Turn in flight — the runtime is producing; park for

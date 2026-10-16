@@ -17,9 +17,12 @@ import pytest
 from nerve.mcp_gateway import (
     MAX_CATALOG_BYTES,
     CatalogError,
+    CatalogServers,
+    CatalogUpdate,
     GatewayServer,
     McpGatewayCatalog,
     parse_catalog,
+    plan_catalog_update,
 )
 from tests.fake_mcp_gateway import FakeMcpGateway, catalog_payload
 
@@ -136,6 +139,61 @@ class TestGatewayUrlSetting:
         assert restart_required(before, after) == [
             "mcp_gateway_url: '' → 'http://192.0.2.1:8080'",
         ]
+
+
+class TestRefreshSetting:
+    def test_default_is_thirty_seconds(self):
+        from nerve.config import NerveConfig
+
+        assert NerveConfig.from_dict({}).mcp_gateway_refresh_seconds == 30.0
+
+    @pytest.mark.parametrize("value, expected", [
+        (0, 0.0), (1, 1.0), (2.5, 2.5), (300, 300.0),
+        # A ${VAR} reference gives a string.
+        ("45", 45.0), ("0", 0.0),
+    ])
+    def test_accepted_values(self, value, expected):
+        from nerve.config import NerveConfig
+
+        cfg = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": value})
+        assert cfg.mcp_gateway_refresh_seconds == expected
+
+    @pytest.mark.parametrize("value", [
+        -1, 0.5, "0.5", "soon", True, float("nan"), float("inf"), [30],
+    ])
+    def test_a_bad_value_uses_the_default_and_is_logged(self, value, caplog):
+        from nerve.config import NerveConfig
+
+        with caplog.at_level("WARNING"):
+            cfg = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": value})
+        assert cfg.mcp_gateway_refresh_seconds == 30.0
+        assert "mcp_gateway_refresh_seconds" in caplog.text
+
+    def test_a_change_needs_a_restart(self):
+        from nerve.config import NerveConfig
+        from nerve.config_reload import restart_required
+
+        before = NerveConfig.from_dict({})
+        after = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": 60})
+        assert restart_required(before, after) == [
+            "mcp_gateway_refresh_seconds: 30.0 → 60.0",
+        ]
+
+    def test_the_engine_reader_uses_the_setting(self, tmp_path, monkeypatch):
+        from nerve.agent.engine import AgentEngine
+        from nerve.config import NerveConfig
+        from nerve.gateway.auth import AUTH_MODE_ENV
+
+        monkeypatch.setenv(AUTH_MODE_ENV, "external")
+        (tmp_path / "ws").mkdir()
+        cfg = NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"),
+            "mcp_gateway_url": BASE,
+            "mcp_gateway_refresh_seconds": 45,
+        })
+        engine = AgentEngine(cfg, None)
+        assert engine._mcp_gateway.status()["refresh_seconds"] == 45.0
+        assert engine.mcp_gateway_status()["refresh_seconds"] == 45.0
 
 
 class TestParseCatalog:
@@ -474,3 +532,137 @@ class TestCatalogReader:
         await reader.close()
         assert reader.retrying is False
         assert await reader.refresh() is None
+
+
+class TestPeriodicRead:
+    @pytest.mark.asyncio
+    async def test_a_new_generation_is_read_without_a_new_session(self, gateway):
+        applied: list[int] = []
+
+        async def on_applied(catalog):
+            applied.append(catalog.generation)
+
+        reader = McpGatewayCatalog(
+            gateway.url, on_applied=on_applied, refresh_interval=0.05,
+        )
+        try:
+            await reader.start()
+            assert reader.applied.generation == 7
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            await _until(lambda: reader.applied.generation == 8)
+            assert applied == [7, 8]
+            assert reader.status()["refresh_seconds"] == 0.05
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
+    async def test_a_slow_answer_adds_its_time_to_the_interval(self, gateway):
+        """The periodic read waits the interval, then the request: a new
+        generation applies after both, within the interval plus the request
+        deadline."""
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0.05, deadline=2.0)
+        try:
+            await reader.start()
+            gateway.delay = 0.4
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            loop = asyncio.get_running_loop()
+            changed = loop.time()
+            await _until(lambda: reader.applied.generation == 8)
+            elapsed = loop.time() - changed
+        finally:
+            gateway.delay = 0.0
+            await reader.close()
+        assert 0.4 <= elapsed < 0.05 + 2.0
+
+    @pytest.mark.asyncio
+    async def test_zero_turns_the_periodic_read_off(self, gateway):
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0)
+        try:
+            await reader.start()
+            requests = gateway.catalog_requests
+            await asyncio.sleep(0.2)
+            assert gateway.catalog_requests == requests
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
+    async def test_close_stops_the_periodic_read(self, gateway):
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0.02)
+        await reader.start()
+        await _until(lambda: gateway.catalog_requests >= 3)
+        await reader.close()
+        requests = gateway.catalog_requests
+        await asyncio.sleep(0.1)
+        assert gateway.catalog_requests == requests
+
+    @pytest.mark.asyncio
+    async def test_the_periodic_read_waits_while_the_retry_runs(self, gateway):
+        """During an outage only the retry reads the catalog, at its interval."""
+        gateway.stop()
+        sleeps: list[float] = []
+        block = asyncio.Event()
+
+        async def sleep(delay):
+            sleeps.append(delay)
+            if delay == 0.5:  # the retry: wait until the test lets it go on
+                await block.wait()
+            await asyncio.sleep(0.01)
+
+        reader = McpGatewayCatalog(
+            gateway.url, sleep=sleep, refresh_interval=0.25,
+            retry_initial=0.5, retry_max=0.5,
+        )
+        try:
+            await reader.start()
+            assert reader.retrying is True
+            checked = reader.status()["checked_at"]
+            await _until(lambda: sleeps.count(0.25) >= 5)
+            # The retry still waits, and the periodic read made no request.
+            assert reader.status()["checked_at"] == checked
+            gateway.start()
+            block.set()
+            await _until(lambda: reader.applied is not None)
+            assert reader.retrying is False
+        finally:
+            await reader.close()
+
+
+def _server(server_id: str, *tools: str) -> GatewayServer:
+    return GatewayServer(id=server_id, url=f"{BASE}/s/{server_id}/mcp", tools=tools)
+
+
+class TestCatalogUpdatePlan:
+    def test_the_snapshot_is_a_tuple_with_its_generation(self):
+        snapshot = CatalogServers([_server("docs", "search")], generation=7, digest="sha256:x")
+        assert snapshot == (_server("docs", "search"),)
+        assert (snapshot.generation, snapshot.digest) == (7, "sha256:x")
+        empty = CatalogServers()
+        assert empty == () and empty.generation is None and empty.digest is None
+
+    def test_an_equal_catalog_needs_nothing(self):
+        plan = plan_catalog_update(
+            {"docs"}, {"docs": ("search",)}, [_server("docs", "search")],
+        )
+        assert plan == CatalogUpdate()
+        assert plan.empty
+
+    def test_every_kind_of_change(self):
+        plan = plan_catalog_update(
+            configured={"docs", "github", "wiki"},
+            enabled={"docs": ("fetch_page", "search"), "github": ("get_issue",)},
+            catalog=[
+                _server("docs", "search"),      # tools changed
+                _server("jira", "create"),      # new
+                _server("wiki", "read"),        # turned off before, back now
+            ],
+        )
+        assert plan == CatalogUpdate(
+            disable=("github",), enable=("wiki",),
+            reconnect=("docs",), missing=("jira",),
+        )
+        assert plan.servers() == ("docs", "github", "jira", "wiki")
+        assert not plan.empty
+
+    def test_a_turned_off_server_that_stays_away_needs_nothing(self):
+        plan = plan_catalog_update({"docs", "github"}, {"docs": ("search",)}, [_server("docs", "search")])
+        assert plan.empty

@@ -292,7 +292,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
-| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
+| `mcp_gateway_url`, `mcp_gateway_refresh_seconds` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1806,16 +1806,20 @@ not change.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment, whitespace or control characters. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+| `mcp_gateway_refresh_seconds` | number | `30` | Seconds between two catalog reads after startup. `0` turns the periodic read off. For a value that is not a number, is negative, or is above `0` and below `1`, Nerve logs a warning and uses `30`. It has an effect only in external mode. A change needs a restart. |
 
-Nerve reads `GET <mcp_gateway_url>/catalog` when it starts and before each new
-session. The request has no credential, because the gateway knows the agent
-from the connection. It does not use the proxy environment variables, and for
-`https` it uses the system trust store.
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every `mcp_gateway_refresh_seconds`. The request has no
+credential, because the gateway knows the agent from the connection. It does
+not use the proxy environment variables, and for `https` it uses the system
+trust store.
 
 - Each server of the catalog is one HTTP MCP server at
   `<mcp_gateway_url>/s/<id>/mcp`.
-- When the catalog changes, new sessions get the new servers. A session that
-  is running keeps the servers that it started with.
+- When the catalog changes, new sessions get the new servers. A running
+  session follows the change at the start of its next turn after Nerve read
+  the new catalog, as far as its backend can change MCP servers in a running
+  client (see [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
 - One catalog request takes at most 5 seconds, from the connection to the
   checked catalog.
 - When the gateway gives no catalog (it is not reachable, it answers with an
@@ -1824,7 +1828,7 @@ from the connection. It does not use the proxy environment variables, and for
   start with the `nerve` server only. Nerve then tries again in the
   background: after 1 second, and after each failure with double the
   interval, up to 60 seconds. It stops at the first success. A new session
-  also tries once.
+  also tries once. While these retries run, the periodic read waits.
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
 
@@ -1882,9 +1886,82 @@ The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
 
 `GET /api/diagnostics` and the Diagnostics page show the applied catalog
-generation, its servers, and the result of the last catalog request (see
+generation, its servers, the result of the last catalog request, and the
+catalog generation of each running session (see
 [`GET /api/diagnostics`](api.md#get-apidiagnostics)). `nerve doctor` shows
 the configured `mcp_gateway_url`; it does not ask the running server.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns, until the client is idle for `sessions.client_idle_timeout_minutes`,
+its process ends, its model changes, or Nerve restarts. Each new client gets
+the servers of the applied catalog. For a running client, Nerve compares the
+applied catalog with the client's servers before each user turn, after it
+has read the client's buffered autonomous output (see below):
+
+| Change at the gateway | Claude session | Codex session |
+|-----------------------|----------------|---------------|
+| A server is removed | Nerve turns the server off in the CLI; its tools go away at this turn | The session keeps it; new sessions do not get it |
+| The allowed tools of a server change | Nerve reconnects the server; the CLI lists its tools again at this turn | The session keeps the old list; new sessions get the new one |
+| A removed server comes back | Nerve turns it on again; the CLI lists its tools | The session keeps what it has |
+| A server is added | New sessions only | New sessions only |
+
+The Claude CLI has no call in the Python SDK that adds a server to a running
+client, and the Codex app-server has none that changes the servers that Nerve
+gives it at launch (`config/mcpServer/reload` reads the configuration files
+again and keeps the connections of unchanged servers). So these changes reach
+a session only when Nerve builds a new client for it.
+
+Nerve changes a running Claude client only when the client is between
+turns: the read of its buffered autonomous output ended with no turn open and
+nothing more in the buffer, and the session runs no background task (a
+background command, agent, or monitor). The CLI starts a turn on its own only
+when such a task settles, and Nerve holds the session's run lock during the
+changes, so no turn can start while they run. Otherwise the change waits for
+a later user turn.
+All changes of one update share a budget of 10 seconds, and the servers that
+the catalog no longer names are turned off first, at the same time. When a
+change has no result at the end of the budget, the CLI could still apply it
+later, so Nerve stops that client and starts a new one (with the applied
+catalog) for the turn. A refused change leaves its server pending; each later
+user turn tries it again.
+
+How long a running Claude session takes to see a change at the gateway:
+
+- **Gateway available:** at most `mcp_gateway_refresh_seconds` plus the
+  catalog request (at most 5 seconds), plus the time until the session's next
+  user turn starts. The update adds to that turn normally a few milliseconds
+  and at most 10 seconds, plus the start of a new client when the budget
+  ends.
+- **After a gateway outage:** while the gateway gives no catalog, the
+  periodic read waits and the retry reads at its own interval (doubling up to
+  60 seconds). After the gateway is back, the next catalog read comes within
+  the retry interval at that time (at most 60 seconds) plus the request (at
+  most 5 seconds), or at once when a new session starts. Then the bound above
+  applies.
+- **While the client is not between turns:** the change waits for the first
+  user turn that finds the client between turns. A session that keeps a
+  background task running waits as long as the task runs.
+- **When the client refuses a change:** there is no time bound. Diagnostics
+  list the server as pending until a later turn succeeds, or until the client
+  is rebuilt (idle timeout, process end, model change, restart).
+
+A running turn keeps its tool list until it ends, and an autonomous turn does
+not start a check. A new session reads the catalog before its first turn and
+gets the change at once.
+
+A session that is behind is not a gap in the policy: the gateway checks each
+call against the current policy and refuses a server or a tool that the
+organization took away. The model can still see the old tool and gets the
+gateway's refusal when it calls it.
+
+Diagnostics list each running session in `mcp_gateway.sessions` with the
+generation that its client was built with, the last generation that it
+follows in full (apart from servers that it cannot add), and the servers that
+it does not follow: added servers, and servers whose change is refused, waits,
+or (for Codex) cannot be made. To give a session all of a new catalog, start a
+new session.
 
 ## Auth
 

@@ -64,3 +64,46 @@ describe('McpGatewayStatus with a server that a backend leaves out', () => {
     expect(group).toHaveTextContent('catalog generation 7, 2 servers');
   });
 });
+
+describe('McpGatewayStatus with running sessions', () => {
+  it('counts the sessions on the applied generation', () => {
+    render(<McpGatewayStatus status={status({
+      sessions: [
+        { session_id: 's-1', backend: 'claude', built_generation: 6, generation: 7, pending: [] },
+        { session_id: 's-2', backend: 'codex', built_generation: 7, generation: 7, pending: [] },
+      ],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).toHaveTextContent('2 of 2 running sessions on this generation');
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('names a session that lacks a part of the catalog', () => {
+    render(<McpGatewayStatus status={status({
+      generation: 8,
+      sessions: [
+        { session_id: 's-1', backend: 'claude', built_generation: 7, generation: 8, pending: ['jira'] },
+        { session_id: 's-2', backend: 'codex', built_generation: 7, generation: 7, pending: ['docs', 'github'] },
+        { session_id: 's-3', backend: 'claude', built_generation: 8, generation: 8, pending: [] },
+      ],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).toHaveTextContent('1 of 3 running sessions on this generation');
+    const lines = screen.getAllByRole('status').map((line) => line.textContent);
+    expect(lines).toEqual([
+      'Session s-1 (claude): generation 8; not followed: jira',
+      'Session s-2 (codex): generation 7; not followed: docs, github',
+    ]);
+  });
+
+  it('says nothing about sessions without a catalog', () => {
+    render(<McpGatewayStatus status={status({
+      generation: null, digest: null, servers: [], applied_at: null,
+      sessions: [
+        { session_id: 's-1', backend: 'claude', built_generation: null, generation: null, pending: [] },
+      ],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).not.toHaveTextContent('running session');
+  });
+});

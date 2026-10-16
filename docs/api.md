@@ -1318,9 +1318,18 @@ In external mode the response also has `mcp_gateway`: the catalog of the MCP
 gateway that new sessions use, and the result of the last catalog request.
 `generation`, `digest` and `applied_at` are `null` before the first catalog.
 `error` is the problem of the last request, or `null` after a success.
-`retrying` is true while the background retry runs. `not_applied` maps a
-catalog server ID to the backends that leave it out, each with the reason (see
-the MCP server routes above). The block is absent in local mode.
+`retrying` is true while the background retry runs. `refresh_seconds` is the
+interval of the periodic catalog read (`0` when it is off, `null` without a
+gateway URL). `not_applied` maps a catalog server ID to the backends that
+leave it out, each with the reason (see the MCP server routes above).
+`sessions` has one entry for each running session client, sorted by
+`session_id`: `built_generation` is the catalog generation that the client
+was built with, `generation` is the last generation that it follows in full
+(apart from servers that it cannot add), and `pending` lists the servers that
+it does not follow: added servers, and servers whose change is refused, waits,
+or cannot be made by its backend
+(see [Catalog changes in running sessions](config.md#catalog-changes-in-running-sessions)).
+The block is absent in local mode.
 
 ```json
 "mcp_gateway": {
@@ -1332,7 +1341,14 @@ the MCP server routes above). The block is absent in local mode.
   "checked_at": "2026-10-08T10:05:00+00:00",
   "error": null,
   "retrying": false,
-  "not_applied": {}
+  "refresh_seconds": 30.0,
+  "not_applied": {},
+  "sessions": [
+    {"session_id": "s-1", "backend": "claude", "built_generation": 6,
+     "generation": 7, "pending": ["jira"]},
+    {"session_id": "s-2", "backend": "codex", "built_generation": 7,
+     "generation": 7, "pending": []}
+  ]
 }
 ```
 

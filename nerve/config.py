@@ -3247,6 +3247,44 @@ def _normalize_mcp_gateway_url(value: Any) -> str:
     return url.rstrip("/")
 
 
+# Interval of the periodic MCP gateway catalog read (external mode), so that
+# a new generation reaches running sessions without a new session. 0 turns
+# the periodic read off. A shorter interval than the minimum is not used,
+# because each read is one request to the gateway.
+MCP_GATEWAY_REFRESH_SECONDS_DEFAULT = 30.0
+MCP_GATEWAY_REFRESH_SECONDS_MIN = 1.0
+
+
+def _parse_mcp_gateway_refresh_seconds(value: Any) -> float:
+    """Return ``mcp_gateway_refresh_seconds``: 0 (off) or at least the minimum.
+
+    Absent means the default. A numeric string (from a ``${VAR}`` reference)
+    is read as a number. Like the other numeric settings, a value that is not
+    a number, is negative, or is above 0 and below the minimum is logged and
+    replaced by the default; it does not stop startup.
+    """
+    from nerve.coerce import lenient_float
+
+    label = "mcp_gateway_refresh_seconds"
+    default = MCP_GATEWAY_REFRESH_SECONDS_DEFAULT
+    if isinstance(value, bool):
+        seconds = float("nan")
+    else:
+        seconds = lenient_float(value, default, label=label)
+    if (
+        seconds != seconds  # NaN
+        or seconds == float("inf")
+        or seconds < 0
+        or 0 < seconds < MCP_GATEWAY_REFRESH_SECONDS_MIN
+    ):
+        logger.warning(
+            "%s: %r is not 0 (off) or at least %g seconds, using %g",
+            label, value, MCP_GATEWAY_REFRESH_SECONDS_MIN, default,
+        )
+        return default
+    return seconds
+
+
 def _get_enabled_claude_code_plugins(
     claude_dir: Path | None = None,
 ) -> list[tuple[str, Path]]:
@@ -3480,6 +3518,10 @@ class NerveConfig:
     # servers only from the gateway's catalog, and mcp_servers has no effect.
     # In local mode this key has no effect. Stored without a trailing "/".
     mcp_gateway_url: str = ""
+    # Interval of the periodic catalog read in external mode, in seconds. A
+    # new generation reaches running sessions at their next turn after the
+    # read. 0 turns the periodic read off.
+    mcp_gateway_refresh_seconds: float = MCP_GATEWAY_REFRESH_SECONDS_DEFAULT
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
@@ -3831,6 +3873,9 @@ class NerveConfig:
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
             mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
+            mcp_gateway_refresh_seconds=_parse_mcp_gateway_refresh_seconds(
+                d.get("mcp_gateway_refresh_seconds"),
+            ),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),
