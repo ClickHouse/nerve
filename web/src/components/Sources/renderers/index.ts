@@ -22,6 +22,7 @@ export function getRendererType(source: string): RendererType {
     case 'gmail': return 'email';
     case 'github': return 'github';
     case 'github_repos': return 'github';
+    case 'github_repo_events': return 'github';
     default: return 'default';
   }
 }

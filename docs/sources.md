@@ -162,6 +162,21 @@ visible rather than failing the fetch.
 - **Note:** GitHub's Events API returns truncated payloads (e.g., PR titles and URLs may be missing). The source constructs URLs from repo name + number and handles missing fields gracefully
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
+### GitHub Repo Events
+- **Adapter:** `nerve/sources/github_repo_events.py` — uses `gh api /repos/{owner}/{repo}/issues/events` CLI
+- **Purpose:** One record per issue/PR **event**, naming the one login that acted: "alice requested a review from you on PR #7", "bob assigned you issue #9". The notification source cannot say this: a notification is one record per *thread*, carries no actor and no event id, merges every event between two polls into one update, and keeps its `reason` after later activity. So an actor guardrail there can only judge who is *involved* in a thread. On this source, `allow_actors` judges who *did* the thing.
+- **Event types:** `review_requested`, `review_request_removed`, `assigned`, `unassigned`. Default: `["review_requested", "assigned"]`. The API does not keep the account that acted in the same field for every type — an `assigned` event puts the *assignee* in `actor` and the account that acted in `assigner`, and a `mentioned` event names the user who was mentioned, not who wrote the mention. Each supported type therefore reads a fixed field (`review_requester` — for a removal, the account that removed the request — or `assigner`), never falls back to `actor`, and drops an event without it. Types that cannot be attributed this way (e.g. `mentioned`) are not supported — @-mentions stay on the notification source, which carries the comment and its author.
+- **Targets:** With `only_targeting_me: true` (the default), only events whose target is the authenticated account are emitted. A request to a *team* names the team, not its members, and never counts as targeting you — even when you are in the team. The account's own actions are never emitted — `github_events` covers those.
+- **Account:** Auto-detected from `gh auth` (`/user`). Set `username` when the token cannot read `/user` (a GitHub App installation token). Without a login the source fetches nothing and keeps its cursor.
+- **Metadata:** `repo_name`, `subject_type`, `subject_url`, `number`, `event` (also as `reason`), `actor`, `target`, `target_type` (`user` or `team`). `actor` is the login that acted, read from the event type's own field — not necessarily GitHub's `actor` field. Records hold no issue title, body, state or labels, and the URL is built from the repo and number: those change after the event (and would re-surface a stored record as "updated"), and leaving them out keeps the issue author's text away from a consuming agent.
+- **Cursor:** A JSON object mapping each repo to a position (a UTC timestamp); a run reads the events created after it, newest first, up to 10 pages of 100 per repo. A repo whose fetch fails keeps its own position.
+- **First run:** Nothing that exists yet is emitted: each repo starts at its newest event (an empty repo at the server's time minus 10 minutes). A repo added to `repos` later starts the same way.
+- **Subsequent runs:** The position becomes the newest event seen, but never later than the read's server time minus 10 minutes. So the last 10 minutes are read again next time and an event the API lists late is still caught (one already stored is skipped as unchanged), while a quiet repo settles on its newest event and reads nothing twice.
+- **Cost:** After a poll that emitted nothing for a repo, the next one sends `If-None-Match` with that first page's ETag; an unchanged page answers `304 Not Modified`, which does not count against the API rate limit. Each event embeds its issue, so on a busy repo the first page changes often and most polls are full requests. `batch_size` is not used for paging.
+- **Guardrail:** `allow_actors` / `deny_actors` on the `actor` metadata key. Same semantics as the [GitHub actor guardrail](#github-actor-guardrail) — case-insensitive globs, deny wins, a non-empty allowlist is fail-closed.
+- **With the `github` source:** A review request or an assignment can then reach the inbox twice — once as a notification (`reason` `review_requested` / `assign`) and once as an event. Give each consumer one of the two, or drop those reasons from the notification source with `deny_reasons: ["review_requested", "assign"]` (other reasons, such as mentions, keep arriving there).
+- **Default schedule:** `*/15 * * * *` (every 15 min)
+
 ### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
   This is the pull sync for your own Telegram account, and is separate from the
@@ -362,6 +377,16 @@ sync:
     username: ""                  # Auto-detect from gh auth
     batch_size: 50
     condense: false               # Events are naturally short
+
+  github_repo_events:
+    enabled: false
+    schedule: "*/15 * * * *"
+    repos: []                     # Required. Example: ["owner/repo"]
+    events: [review_requested, assigned]   # Also: review_request_removed, unassigned
+    only_targeting_me: true       # Only events aimed at the authenticated account
+    username: ""                  # Auto-detect from gh auth; set it if the token cannot read /user
+    allow_actors: []              # Guardrail allowlist of the login that acted — empty = all
+    deny_actors: []               # Guardrail denylist — always dropped (takes precedence)
 ```
 
 ### Config Fields
@@ -451,6 +476,12 @@ inbox account itself authored has no third-party login anywhere — every candid
 one account — and a non-empty `allow_actors` would drop it fail-closed. If you rely on
 "a maintainer assigns an issue to the bot" as a work signal, that login needs to be in
 `allow_actors`.
+
+This guardrail judges who is *involved* in a thread, not who caused a given update: the
+notifications API carries no actor and merges every event between two polls into one record.
+When the work signal is an assignment or a review request and it matters exactly who made it,
+use the [GitHub Repo Events](#github-repo-events) source, whose `actor` is the one login that
+acted.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -777,6 +808,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/gmail.py` | Gmail adapter (gog CLI) |
 | `nerve/sources/github.py` | GitHub notifications adapter (gh CLI) |
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
+| `nerve/sources/github_repo_events.py` | GitHub repo issue/PR events adapter — one record per event, with the login that acted (gh CLI) |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |
 | `web/src/components/Sources/` | Source message renderers (email, GitHub, default markdown) |
 

@@ -90,7 +90,8 @@ Run the commands below from the repository root (wherever you cloned it).
 │   ├── channels/           # web.py, telegram.py, slack*.py, router.py, access.py,
 │   │                       #   observation.py, archives.py, stream_adapter.py, base.py
 │   ├── sources/            # inbox sources: telegram, gmail, imap, github, github_events, github_repos,
-│   │                       #   channel (observed chats), codex_threads/; runner.py, filters.py, registry.py
+│   │                       #   github_repo_events, channel (observed chats), codex_threads/;
+│   │                       #   runner.py, filters.py, registry.py
 │   ├── cron/               # APScheduler service, jobs.py, gates.py, gate_plugins.py
 │   ├── memory/             # files.py, memu_bridge.py (memU), xmemory_bridge.py
 │   ├── skills/             # SkillManager — filesystem skills + DB index
