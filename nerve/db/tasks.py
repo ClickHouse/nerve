@@ -59,9 +59,9 @@ class TaskStore:
     async def upsert_task(
         self,
         task_id: str,
-        file_path: str,
+        file_path: str | _Keep,
         title: str,
-        status: str = "pending",
+        status: str | _Keep = "pending",
         source: str | None | _Keep = KEEP,
         source_url: str | None | _Keep = KEEP,
         deadline: str | None | _Keep = KEEP,
@@ -77,6 +77,11 @@ class TaskStore:
 
         ``file_path``, ``title``, ``status`` and ``content`` are a full
         replace. Every caller rebuilds them from the markdown file.
+        ``file_path`` and ``status`` also take :data:`KEEP`, which keeps the
+        stored value, read in the same transaction as the write. A caller that
+        edits only the content passes it, so that a status change that lands
+        between its read and this write is kept and is not recorded again.
+        :data:`KEEP` needs an existing row.
 
         ``source``, ``source_url``, ``deadline``, ``tags`` and ``position``
         are preserve-on-omit. An omitted column keeps its stored value. To
@@ -108,6 +113,10 @@ class TaskStore:
             # write. The statement below stays a plain full replace, and the
             # FTS text sees the tags that actually land in the row.
             stored = await self._stored_task_columns(task_id)
+            if stored is None and (file_path is KEEP or status is KEEP):
+                raise ValueError(f"task {task_id!r} has no row to keep values from")
+            file_path = _resolve_kept(file_path, stored, "file_path", None)
+            status = _resolve_kept(status, stored, "status", None)
             source = _resolve_kept(source, stored, "source", None)
             source_url = _resolve_kept(source_url, stored, "source_url", None)
             deadline = _resolve_kept(deadline, stored, "deadline", None)
@@ -343,7 +352,7 @@ class TaskStore:
     async def _stored_task_columns(self, task_id: str) -> dict | None:
         """The columns an upsert can preserve, or ``None`` for a new task."""
         async with self.db.execute(
-            "SELECT status, position, source, source_url, deadline, tags "
+            "SELECT status, file_path, position, source, source_url, deadline, tags "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ) as cursor:

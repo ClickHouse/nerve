@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from nerve.agent.streaming import emit_task_event
 from nerve.config import ensure_path_not_tracked_config, get_config
 from nerve.db.task_statuses import STATUS_NAME_RE, TERMINAL_STATUS, normalize_color
+from nerve.db.tasks import KEEP
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import (
     build_route_tool_context,
@@ -358,14 +359,15 @@ async def update_task(
                 edits["deadline"] = fields["deadline"]
             if fields.get("tags"):
                 edits["tags"] = tags_to_string(parse_tags_string(fields["tags"]))
-            # The stored status, not ``req.status``: a status change goes
-            # through task_update below, which moves the file into or out of
-            # done/ and records the transition once, for this person.
+            # KEEP, not ``req.status`` or the status read above: a status
+            # change goes through task_update below, which moves the file
+            # into or out of done/ and records the transition once, for this
+            # person. A move by somebody else after the read is kept.
             await deps.db.upsert_task(
                 task_id=task_id,
-                file_path=task["file_path"],
+                file_path=KEEP,
                 title=new_title,
-                status=task["status"],
+                status=KEEP,
                 content=req.content,
                 actor=_ROUTE_ORIGIN,
                 attribution=attribution_for(actor),

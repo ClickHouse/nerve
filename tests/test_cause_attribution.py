@@ -435,6 +435,49 @@ async def test_rest_patch_with_content_records_one_change_for_the_person(install
 
 
 @pytest.mark.asyncio
+async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
+    """A move that lands while PATCH writes the file is not undone.
+
+    Alice saves new content while Bob moves the card. The content save must
+    not write back the status that it read before Bob's move.
+    """
+    from nerve.gateway.routes import tasks as tasks_route
+
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    loop = asyncio.get_running_loop()
+    real_write = tasks_route.write_task_file
+
+    def write_while_bob_moves(path, content):
+        real_write(path, content)
+        asyncio.run_coroutine_threadsafe(
+            install.db.move_task(
+                task_id, status="deferred", actor="web",
+                attribution=attribution_for(bob),
+            ),
+            loop,
+        ).result(timeout=5)
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+        monkeypatch.setattr(tasks_route, "write_task_file", write_while_bob_moves)
+        response = await client.patch(
+            f"/api/tasks/{task_id}", headers=install.headers("alice"),
+            json={"content": "# Raced\n\nNew body.\n"},
+        )
+    assert response.status_code == 200
+
+    assert await install.events(task_id) == [
+        (None, "pending", "web", alice, alice),
+        ("pending", "deferred", "web", bob, bob),
+    ]
+    task = await install.db.get_task(task_id)
+    assert task["status"] == "deferred"
+    assert "New body." in (install.config.workspace / task["file_path"]).read_text()
+
+
+@pytest.mark.asyncio
 async def test_task_status_definition_changes_take_the_person(install, caplog):
     caplog.set_level("INFO", logger="nerve.gateway.routes.tasks")
     async with _client(install.app()) as client:
