@@ -16,6 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
+from nerve.identity import attribution_for
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -274,6 +275,12 @@ class CodexIngester:
             # archived must not hide the corresponding live chat.
             if existing.get("source") == "external":
                 await self.db.update_session_fields(session_id, {"status": "archived"})
+                # The sync archives the mirror of a thread that was archived
+                # outside Nerve: Nerve's own change.
+                await self.db.log_session_event(
+                    session_id, "archived", {"reason": "codex_thread_archived"},
+                    attribution=attribution_for(self.db.system_actor),
+                )
                 self.stats["threads_archived"] += 1
                 logger.info("Codex thread %s: archived", thread_id[:8])
         except Exception:

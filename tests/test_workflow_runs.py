@@ -34,6 +34,7 @@ from nerve.agent.tools.handlers.workflow_runs import (
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig
 from nerve.db.usage import estimate_turn_cost
+from nerve.identity import attribution_for
 from nerve.workflows.service import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -575,7 +576,9 @@ class TestKillRun:
         assert "user request" in out["error"]
 
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            session_id, attribution=attribution_for(db.system_actor),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )
@@ -619,7 +622,9 @@ class TestBudgetEnforcement:
         )
         # Enforcement is scoped to the run's own session.
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            session_id, attribution=attribution_for(db.system_actor),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )

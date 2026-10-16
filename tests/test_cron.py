@@ -19,7 +19,8 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
-from tests.actor_rows import mock_system_principal
+from nerve.identity import attribution_for
+from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +840,11 @@ class TestRotation:
         title_args = cron_service.db.update_session_title.call_args.args
         assert title_args[0] == "cron:pers"
         assert title_args[1].startswith("Cron: pers (until ")
+        # The retitle is Nerve's own change.
+        assert cron_service.db.update_session_title.call_args.kwargs == {
+            "attribution": attribution_for(FAKE_SYSTEM_ACTOR),
+            "reason": "cron_rotation",
+        }
 
     @pytest.mark.asyncio
     async def test_no_rotation_keeps_current_chat(self, cron_service):

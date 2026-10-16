@@ -19,4 +19,8 @@ ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "caused_by_actor_id"),
     ("task_status_events", "actor_id"),
     ("task_status_events", "caused_by_actor_id"),
+    ("session_events", "actor_id"),
+    ("session_events", "caused_by_actor_id"),
+    ("session_deletions", "actor_id"),
+    ("session_deletions", "caused_by_actor_id"),
 )

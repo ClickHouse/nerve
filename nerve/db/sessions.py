@@ -5,11 +5,44 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg, resolve_cause
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    resolve_cause,
+)
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
 _SYSTEM_SQL = "('" + "', '".join(SYSTEM_SOURCES) + "')"
+
+# Session fields whose change :meth:`SessionStore.change_session_fields`
+# records as a session event, with the event type and the details key of the
+# new value. ``starred`` records ``starred`` or ``unstarred`` instead.
+_TRACKED_FIELDS: dict[str, tuple[str, str]] = {
+    "title": ("title_changed", "title"),
+    "model": ("model_changed", "model"),
+    "parent_session_id": ("parent_changed", "parent_session_id"),
+}
+
+_SESSION_EVENT_SQL = (
+    "INSERT INTO session_events"
+    " (session_id, event_type, details, actor_id, caused_by_actor_id, created_at)"
+    " VALUES (?, ?, ?, ?, ?, ?)"
+)
+
+
+def _session_event_params(
+    session_id: str, event_type: str, details: dict | None,
+    attribution: Attribution,
+) -> tuple:
+    return (
+        session_id, event_type, json.dumps(details) if details else None,
+        attribution.actor_id, attribution.caused_by_actor_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
 
 
 class SessionStore:
@@ -277,20 +310,65 @@ class SessionStore:
             "UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id)
         )
 
-    async def update_session_title(self, session_id: str, title: str) -> None:
-        await self._write(
-            "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
+    async def update_session_title(
+        self, session_id: str, title: str, *,
+        attribution: Attribution = UNATTRIBUTED, reason: str | None = None,
+    ) -> None:
+        """Set the title and record a ``title_changed`` event when it changes.
+
+        See :meth:`change_session_fields` for ``attribution`` and ``reason``.
+        """
+        await self.change_session_fields(
+            session_id, {"title": title}, attribution=attribution, reason=reason,
         )
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Delete a session with its events, messages and other rows.
+
+        The delete also removes the session's events, so it is recorded in
+        ``session_deletions`` (the last title, the time, ``attribution``), in
+        the same transaction. A later delete of a session with the same ID
+        replaces that row. Returns ``False`` when no session row existed; then
+        nothing is recorded.
+        """
         async with self._atomic():
+            async with self.db.execute(
+                "SELECT title FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
             await self.db.execute("DELETE FROM session_file_snapshots WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            if row is not None:
+                await self.db.execute(
+                    """INSERT INTO session_deletions
+                           (session_id, title, deleted_at, actor_id, caused_by_actor_id)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(session_id) DO UPDATE SET
+                           title = excluded.title,
+                           deleted_at = excluded.deleted_at,
+                           actor_id = excluded.actor_id,
+                           caused_by_actor_id = excluded.caused_by_actor_id""",
+                    (
+                        session_id, row[0], datetime.now(timezone.utc).isoformat(),
+                        attribution.actor_id, attribution.caused_by_actor_id,
+                    ),
+                )
         self._session_causes.pop(session_id, None)
+        return row is not None
+
+    async def get_session_deletion(self, session_id: str) -> dict | None:
+        """The record of the last delete of ``session_id``, or ``None``."""
+        async with self.db.execute(
+            "SELECT * FROM session_deletions WHERE session_id = ?", (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
     async def update_session_metadata(self, session_id: str, metadata: dict) -> None:
         """Update the metadata JSON for a session.
@@ -357,6 +435,63 @@ class SessionStore:
             return
         await self._write(*built)
 
+    async def change_session_fields(
+        self,
+        session_id: str,
+        fields: dict,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
+        reason: str | None = None,
+    ) -> list[str]:
+        """Write session fields and record each tracked change as an event.
+
+        Like :meth:`update_session_fields`. In the same transaction, each
+        tracked field (``title``, ``starred``, ``model``,
+        ``parent_session_id``) whose stored value differs from the new value
+        gets one session event with ``attribution``: ``title_changed``,
+        ``starred`` or ``unstarred``, ``model_changed``, ``parent_changed``.
+        The details hold the new and the ``previous`` value, and ``reason``
+        when it is set (for example ``generated`` for a title that the agent
+        made). A field that keeps its value records nothing.
+
+        Returns the event types written, in the order of ``fields``.
+        """
+        built = self._build_session_fields_update(session_id, fields)
+        if built is None:
+            return []
+        written: list[str] = []
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return []
+            before = dict(row)
+            await self.db.execute(*built)
+            for field, value in fields.items():
+                previous = before.get(field)
+                if field == "starred":
+                    if bool(previous) == bool(value):
+                        continue
+                    event_type = "starred" if value else "unstarred"
+                    details: dict = {}
+                elif field in _TRACKED_FIELDS:
+                    if previous == value:
+                        continue
+                    event_type, key = _TRACKED_FIELDS[field]
+                    details = {key: value, "previous": previous}
+                else:
+                    continue
+                if reason:
+                    details["reason"] = reason
+                await self.db.execute(
+                    _SESSION_EVENT_SQL,
+                    _session_event_params(session_id, event_type, details, attribution),
+                )
+                written.append(event_type)
+        return written
+
     async def bind_native_thread(
         self, backend: str, native_thread_id: str, session_id: str,
     ) -> None:
@@ -421,12 +556,17 @@ class SessionStore:
 
     async def log_session_event(
         self, session_id: str, event_type: str, details: dict | None = None,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> int:
-        """Log a session lifecycle event."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Log a session lifecycle event.
+
+        ``attribution`` names who made the change that the event records and
+        on whose behalf. Events that record the state of the runtime keep it
+        unattributed.
+        """
         result = await self._write(
-            "INSERT INTO session_events (session_id, event_type, details, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, event_type, json.dumps(details) if details else None, now),
+            _SESSION_EVENT_SQL,
+            _session_event_params(session_id, event_type, details, attribution),
         )
         return result.lastrowid
 

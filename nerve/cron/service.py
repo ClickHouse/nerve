@@ -27,6 +27,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
+from nerve.identity import attribution_for
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -929,7 +930,8 @@ class CronService:
         - cancels the session's pending wakeups (a retired thread must not
           resurrect itself alongside the new generation),
         - stamps ``rotated_at`` in the session metadata (prevents legacy
-          re-adoption) and retitles the chat with its end date.
+          re-adoption) and retitles the chat with its end date (the system
+          actor's change).
         """
         # Scheduled, not awaited: memorization queues on a global lock and
         # awaiting it would delay the run start by the whole queue wait.
@@ -966,6 +968,8 @@ class CronService:
             title = session.get("title") or f"Cron: {job_id}"
             await self.db.update_session_title(
                 session_id, f"{title} (until {date_str})",
+                attribution=attribution_for(self.db.system_actor),
+                reason="cron_rotation",
             )
         except Exception as e:
             logger.warning(

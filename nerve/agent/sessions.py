@@ -19,7 +19,14 @@ from enum import StrEnum
 from typing import Any
 
 from nerve.db import Database
-from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +169,7 @@ class SessionManager:
         await self.db.log_session_event(session_id, "created", {
             "source": source,
             "parent": parent_session_id,
-        })
+        }, attribution=attribution_for(actor))
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
         )
@@ -175,14 +182,21 @@ class SessionManager:
     async def transition(
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> None:
-        """Atomically transition a session's status and log the event."""
+        """Atomically transition a session's status and log the event.
+
+        ``attribution`` is for a transition that a principal asks for (a
+        resume). A transition that records the state of the runtime keeps it
+        unattributed.
+        """
         async with self._transition_lock:
             await self.db.update_session_fields(
                 session_id, {"status": new_status.value},
             )
             await self.db.log_session_event(
                 session_id, new_status.value, details or {},
+                attribution=attribution,
             )
 
     async def mark_active(
@@ -705,34 +719,43 @@ class SessionManager:
             limit=limit, offset=offset, sources=sources, current_id=current_id,
         )
 
-    async def set_starred(self, session_id: str, starred: bool) -> bool:
+    async def set_starred(
+        self, session_id: str, starred: bool, *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Star or unstar a session.
 
         Starred sessions are exempt from every auto-archival path (the idle
         cutoff, the age backstop, and the overflow eviction), so they stay
         resumable until explicitly unstarred or deleted. Returns the new
         starred state; raises ``ValueError`` if the session does not exist.
+        A change records a ``starred`` or ``unstarred`` event with
+        ``attribution``.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if starred else 0},
+            attribution=attribution,
         )
         return starred
 
-    async def toggle_starred(self, session_id: str) -> bool:
+    async def toggle_starred(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Flip a session's starred flag.
 
         Returns the new starred state; raises ``ValueError`` if the session
-        does not exist.
+        does not exist. The change records an event, as :meth:`set_starred`.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         new_starred = not session.get("starred")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if new_starred else 0},
+            attribution=attribution,
         )
         return new_starred
 
@@ -740,8 +763,15 @@ class SessionManager:
     #  Archive & cleanup                                                   #
     # ------------------------------------------------------------------ #
 
-    async def archive_session(self, session_id: str) -> None:
-        """Archive a session: memorize, disconnect client, update status."""
+    async def archive_session(
+        self, session_id: str, *,
+        attribution: Attribution = UNATTRIBUTED,
+        details: dict | None = None,
+    ) -> None:
+        """Archive a session: memorize, disconnect client, update status.
+
+        The ``archived`` event takes ``attribution`` and ``details``.
+        """
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -765,7 +795,9 @@ class SessionManager:
             "connected_at": None,
             "sdk_session_id": None,
         })
-        await self.db.log_session_event(session_id, "archived", {})
+        await self.db.log_session_event(
+            session_id, "archived", details or {}, attribution=attribution,
+        )
         logger.info("Archived session %s", session_id)
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
@@ -791,7 +823,9 @@ class SessionManager:
                     queue.append(cid)
         return order
 
-    async def archive_session_cascade(self, session_id: str) -> dict:
+    async def archive_session_cascade(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
         """Archive a session and its ENTIRE descendant subtree, bottom-up.
 
         The default archive behavior. Resolves the full descendant set up front,
@@ -802,6 +836,9 @@ class SessionManager:
         active child. Fully-archivable sibling subtrees still complete.
 
         Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
+
+        Each ``archived`` event takes ``attribution``; the event of a
+        descendant names the root in ``cascade_root``.
         """
         # Compute the whole subtree BEFORE mutating anything.
         order = await self._resolve_descendants(session_id)
@@ -827,7 +864,10 @@ class SessionManager:
                 skipped[sid] = "session is running"
                 continue
             try:
-                await self.archive_session(sid)
+                await self.archive_session(
+                    sid, attribution=attribution,
+                    details={"cascade_root": session_id} if sid != session_id else None,
+                )
                 archived.append(sid)
             except Exception as e:  # keep going; sibling subtrees still complete
                 logger.warning("Cascade archive failed for %s: %s", sid, e)
@@ -837,8 +877,13 @@ class SessionManager:
             "skipped": [{"id": sid, "reason": reason} for sid, reason in skipped.items()],
         }
 
-    async def unarchive_session(self, session_id: str) -> None:
-        """Restore an archived session to ``idle`` so it's resumable again."""
+    async def unarchive_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> None:
+        """Restore an archived session to ``idle`` so it's resumable again.
+
+        The ``unarchived`` event takes ``attribution``.
+        """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
@@ -848,7 +893,9 @@ class SessionManager:
         })
         # Bump updated_at so the unarchived session sorts to the top of the feed.
         await self.db.touch_session(session_id)
-        await self.db.log_session_event(session_id, "unarchived", {})
+        await self.db.log_session_event(
+            session_id, "unarchived", {}, attribution=attribution,
+        )
         logger.info("Unarchived session %s", session_id)
 
     async def list_starred_sessions(self) -> list[dict]:
@@ -908,6 +955,8 @@ class SessionManager:
         cleanup statistics.
         """
         now = datetime.now(timezone.utc)
+        # Automatic archives are Nerve's own work.
+        system = attribution_for(self.db.system_actor)
 
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
         # when interactive_archive_after_hours == 0, so default behavior is unchanged.
@@ -924,7 +973,10 @@ class SessionManager:
                     logger.warning(
                         "Expire pending questions failed for %s: %s", s["id"], e,
                     )
-                await self.archive_session(s["id"])
+                await self.archive_session(
+                    s["id"], attribution=system,
+                    details={"reason": "idle_interactive"},
+                )
             archived_interactive = len(interactive)
 
         # Long backstop cutoff for everything (incl. non-interactive).
@@ -933,7 +985,9 @@ class SessionManager:
         # Archive idle/stopped sessions older than cutoff
         stale = await self.db.get_stale_sessions(cutoff)
         for s in stale:
-            await self.archive_session(s["id"])
+            await self.archive_session(
+                s["id"], attribution=system, details={"reason": "stale"},
+            )
 
         # Enforce max session count (archive oldest beyond limit). Starred
         # sessions are off-budget: excluded from the count and never evicted,
@@ -945,7 +999,9 @@ class SessionManager:
                 count - max_sessions,
             )
             for s in excess:
-                await self.archive_session(s["id"])
+                await self.archive_session(
+                    s["id"], attribution=system, details={"reason": "overflow"},
+                )
             overflow = len(excess)
 
         stats = {

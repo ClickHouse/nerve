@@ -69,7 +69,15 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
-from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg, resolve_cause
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+    resolve_cause,
+)
 from nerve.inference_principal import inference_principal
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
@@ -1512,8 +1520,14 @@ class AgentEngine:
         distinguish "stopped" from "completed"."""
         self._stop_listeners.append(callback)
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop a running session."""
+    async def stop_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Stop a running session.
+
+        A stop that reaches the session records a ``stop_requested`` event
+        with ``attribution``: who asked for the stop, and for whom.
+        """
         for cb in self._stop_listeners:
             try:
                 await cb(session_id)
@@ -1523,7 +1537,15 @@ class AgentEngine:
         handler = get_handler(session_id)
         if handler:
             handler.cancel_all()
-        return await self.sessions.stop_session(session_id)
+        stopped = await self.sessions.stop_session(session_id)
+        if stopped:
+            try:
+                await self.db.log_session_event(
+                    session_id, "stop_requested", attribution=attribution,
+                )
+            except Exception:  # noqa: BLE001 (the record never fails a stop)
+                logger.exception("stop event failed for %s", session_id)
+        return stopped
 
     def is_session_running(self, session_id: str) -> bool:
         return self.sessions.is_running(session_id)
@@ -1616,15 +1638,24 @@ class AgentEngine:
         )
         return fork
 
-    async def resume_session(self, session_id: str) -> dict:
-        """Resume a stopped/idle session."""
+    async def resume_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """Resume a stopped/idle session.
+
+        Records a ``created`` status event with reason ``resume`` and
+        ``attribution``.
+        """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
             raise ValueError(
                 f"Session {session_id} cannot be resumed (no SDK session)",
             )
         # Mark as created so the next message will reconnect the client
-        await self.sessions.transition(session_id, SessionStatus.CREATED)
+        await self.sessions.transition(
+            session_id, SessionStatus.CREATED, {"reason": "resume"},
+            attribution=attribution,
+        )
         session = await self.db.get_session(session_id)
         return session
 
@@ -2656,14 +2687,23 @@ class AgentEngine:
                         if ' ' in placeholder
                         else placeholder + '...'
                     )
-                await self.db.update_session_title(session_id, placeholder)
+                # Nerve sets the title for the turn's cause. The generated
+                # title gets the cause as an argument, because it is written
+                # after the turn can have ended.
+                await self.db.update_session_title(
+                    session_id, placeholder,
+                    attribution=attribution_for(self.db.system_actor, cause_id),
+                    reason="placeholder",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,
                     "title": placeholder,
                 })
                 asyncio.create_task(
-                    self._generate_session_title(session_id, user_message),
+                    self._generate_session_title(
+                        session_id, user_message, cause_id=cause_id,
+                    ),
                 )
 
             # Store user message in DB (note attached images for display)
@@ -3656,9 +3696,13 @@ class AgentEngine:
     # ------------------------------------------------------------------ #
 
     async def _generate_session_title(
-        self, session_id: str, first_message: str,
+        self, session_id: str, first_message: str, *, cause_id: str | None,
     ) -> None:
-        """Generate a meaningful short title for a session using a fast model."""
+        """Generate a meaningful short title for a session using a fast model.
+
+        The title is the system actor's change for ``cause_id``, the cause of
+        the turn whose first message it summarizes.
+        """
         try:
             # Skip if no credentials are configured. An OAuth-only credential
             # cannot drive the API directly either (it is not an API key).
@@ -3689,7 +3733,11 @@ class AgentEngine:
                 )
             title = response_text(response).strip().strip('"\'').lstrip('#').strip()
             if title and len(title) < 60:
-                await self.db.update_session_title(session_id, title)
+                await self.db.update_session_title(
+                    session_id, title,
+                    attribution=attribution_for(self.db.system_actor, cause_id),
+                    reason="generated",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,

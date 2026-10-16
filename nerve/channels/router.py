@@ -29,6 +29,7 @@ from nerve.channels.base import (
 )
 from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
+from nerve.identity import UNATTRIBUTED
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -507,17 +508,24 @@ class ChannelRouter:
             exclude_statuses=("archived", "stopped"),
         )
 
+    # Channel commands come from a channel user that names no person, so
+    # the session changes that they make are unattributed.
+
     async def stop_session(self, session_id: str) -> bool:
         """Stop a session through the engine lifecycle boundary."""
-        return await self.engine.stop_session(session_id)
+        return await self.engine.stop_session(session_id, attribution=UNATTRIBUTED)
 
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
-        return await self.engine.sessions.set_starred(session_id, starred)
+        return await self.engine.sessions.set_starred(
+            session_id, starred, attribution=UNATTRIBUTED,
+        )
 
     async def toggle_session_starred(self, session_id: str) -> bool:
         """Toggle a session's starred state."""
-        return await self.engine.sessions.toggle_starred(session_id)
+        return await self.engine.sessions.toggle_starred(
+            session_id, attribution=UNATTRIBUTED,
+        )
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""

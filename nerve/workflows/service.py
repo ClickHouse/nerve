@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
+from nerve.identity import attribution_for
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -966,7 +967,9 @@ class WorkflowRunService:
         # recorded it (kill racing the earliest phase of _execute).
         session_id = (run or {}).get("session_id") or self._session_id(run_id)
         try:
-            await self.engine.stop_session(session_id)
+            await self.engine.stop_session(
+                session_id, attribution=attribution_for(self.db.system_actor),
+            )
         except Exception:  # noqa: BLE001
             logger.exception("graceful stop failed for %s", session_id)
         grace = max(0, int(self.config.workflows.kill_grace_seconds))

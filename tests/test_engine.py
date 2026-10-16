@@ -1249,7 +1249,7 @@ async def test_title_generation_keeps_the_event_loop_running(db, tmp_path):
         with patch.object(
             base_client.BaseClient, "_calculate_retry_timeout", return_value=0.1,
         ):
-            await engine._generate_session_title("title-1", "hello")
+            await engine._generate_session_title("title-1", "hello", cause_id=None)
     finally:
         beat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1269,7 +1269,7 @@ async def test_title_generation_saves_the_title(db, tmp_path):
     upstream = RateLimitedUpstream(failures=0)
     try:
         engine = await _title_engine(db, tmp_path, upstream.port)
-        await engine._generate_session_title("title-1", "hello")
+        await engine._generate_session_title("title-1", "hello", cause_id=None)
     finally:
         upstream.close()
     assert (await db.get_session("title-1"))["title"] == "ok"
