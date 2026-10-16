@@ -3627,21 +3627,26 @@ class AgentEngine:
             ):
                 return
 
-            client = self.config.create_anthropic_client(timeout=10.0)
-            response = client.messages.create(
-                model=self.config.agent.title_model,
-                # Thinking counts toward max_tokens, and the 5.5 models think
-                # by default.
-                max_tokens=1024,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Generate a short title (3-5 words, no quotes)"
-                        " for a conversation that starts with:\n\n"
-                        f"{first_message[:200]}"
-                    ),
-                }],
-            )
+            # The async client: this runs on the gateway's event loop, and the
+            # sync client's retry backoff is a blocking time.sleep that would
+            # stop every stream and channel until the retries are done.
+            async with self.config.create_async_anthropic_client(
+                timeout=10.0,
+            ) as client:
+                response = await client.messages.create(
+                    model=self.config.agent.title_model,
+                    # Thinking counts toward max_tokens, and the 5.5 models
+                    # think by default.
+                    max_tokens=1024,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Generate a short title (3-5 words, no quotes)"
+                            " for a conversation that starts with:\n\n"
+                            f"{first_message[:200]}"
+                        ),
+                    }],
+                )
             title = response_text(response).strip().strip('"\'').lstrip('#').strip()
             if title and len(title) < 60:
                 await self.db.update_session_title(session_id, title)

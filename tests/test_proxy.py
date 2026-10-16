@@ -14,6 +14,7 @@ import yaml
 
 from nerve import paths
 from nerve.config import NerveConfig, ProxyConfig, load_config
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 
 # ------------------------------------------------------------------ #
@@ -147,52 +148,6 @@ class TestProxyConfigYAML:
 # ------------------------------------------------------------------ #
 
 
-class _RateLimitedUpstream:
-    """Local HTTP server answering 429 (no Retry-After) a fixed number of
-    times, then 200 -- what Nerve's clients see from the proxy during a short
-    upstream rate limit."""
-
-    def __init__(self, failures: int) -> None:
-        import json
-        import threading
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-        self.requests = 0
-        upstream = self
-        ok = json.dumps({
-            "id": "msg_1", "type": "message", "role": "assistant",
-            "model": "claude-haiku-4-5", "content": [{"type": "text", "text": "ok"}],
-            "stop_reason": "end_turn", "stop_sequence": None,
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-        }).encode()
-        limited = json.dumps({
-            "type": "error",
-            "error": {"type": "rate_limit_error", "message": "rate limited"},
-        }).encode()
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args: object) -> None:
-                pass
-
-            def do_POST(self) -> None:
-                self.rfile.read(int(self.headers.get("content-length", 0)))
-                upstream.requests += 1
-                body = limited if upstream.requests <= failures else ok
-                self.send_response(429 if body is limited else 200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.port = self._server.server_address[1]
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
-
-    def close(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-
-
 class TestProxyClientRetries:
     """Nerve's Anthropic clients ride out a short rate limit behind the proxy."""
 
@@ -220,7 +175,7 @@ class TestProxyClientRetries:
         slept, to keep the test fast)."""
         import anthropic._base_client as base_client
 
-        upstream = _RateLimitedUpstream(failures=5)
+        upstream = RateLimitedUpstream(failures=5)
         sleeps: list[float] = []
         try:
             client = self._config(upstream.port).create_anthropic_client(timeout=5.0)

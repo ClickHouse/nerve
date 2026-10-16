@@ -2,8 +2,11 @@
 helpers (no SDK subprocess)."""
 
 import asyncio
+import contextlib
 import json
+import math
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -16,6 +19,7 @@ from nerve.agent.backends.base import SessionSpec, TransportDiedError
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
 from nerve.config import DEFAULT_EFFORT, AgentConfig, NerveConfig
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 
 @pytest.mark.parametrize(
@@ -1198,3 +1202,74 @@ class TestServingModelTracking:
         assert st.ordered_blocks == []
         bc.broadcast_model_changed.assert_not_awaited()
         assert engine._observed_models["s1"] == "claude-opus-4-8-20260115"
+
+
+# ------------------------------------------------------------------ #
+#  Title generation                                                   #
+# ------------------------------------------------------------------ #
+
+
+async def _title_engine(db, tmp_path, port: int) -> AgentEngine:
+    """An engine whose Anthropic clients go through a proxy at ``port``."""
+    workspace = tmp_path / "ws-title"
+    workspace.mkdir(parents=True, exist_ok=True)
+    cfg = NerveConfig.from_dict({
+        "workspace": str(workspace),
+        "proxy": {"enabled": True, "port": port, "api_key": "sk-local"},
+    })
+    engine = AgentEngine(cfg, db)
+    await engine.sessions.get_or_create(
+        "title-1", source="web", backend="claude", actor=None,
+    )
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_title_generation_keeps_the_event_loop_running(db, tmp_path):
+    """Against an upstream that always answers 429 the title call uses the
+    whole proxy retry budget. The event loop must keep running through every
+    backoff: the heartbeat ticks between each two requests. The backoff is
+    shortened to keep the test fast; a blocking time.sleep would stop the
+    loop for it all the same."""
+    import anthropic._base_client as base_client
+
+    from nerve.config import PROXY_CLIENT_MAX_RETRIES
+
+    ticks: list[float] = []
+
+    async def heartbeat() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.005)
+
+    upstream = RateLimitedUpstream(failures=math.inf)
+    engine = await _title_engine(db, tmp_path, upstream.port)
+    beat = asyncio.create_task(heartbeat())
+    try:
+        with patch.object(
+            base_client.BaseClient, "_calculate_retry_timeout", return_value=0.1,
+        ):
+            await engine._generate_session_title("title-1", "hello")
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+        upstream.close()
+
+    requests = upstream.request_times
+    assert len(requests) == PROXY_CLIENT_MAX_RETRIES + 1
+    for before, after in zip(requests, requests[1:]):
+        assert any(before < t < after for t in ticks), (
+            "the event loop was blocked during a retry backoff"
+        )
+
+
+@pytest.mark.asyncio
+async def test_title_generation_saves_the_title(db, tmp_path):
+    upstream = RateLimitedUpstream(failures=0)
+    try:
+        engine = await _title_engine(db, tmp_path, upstream.port)
+        await engine._generate_session_title("title-1", "hello")
+    finally:
+        upstream.close()
+    assert (await db.get_session("title-1"))["title"] == "ok"
