@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from nerve.agent.backends import SystemEvent, TextDelta, TurnCompleted
 from nerve.agent.engine import AgentEngine
 from nerve.agent.tools.handlers.plans import plan_approve_handler
 from nerve.agent.tools.registry import ToolContext
@@ -112,14 +113,76 @@ class TestToolContextCause:
 # --------------------------------------------------------------------------- #
 
 
+class _FakeRuntime:
+    """A model runtime client that makes tool calls the way the agent does.
+
+    The engine uses it through the client API (``start_turn``,
+    ``receive_turn``, the idle-event calls). Each turn calls ``task_create``
+    through the session's own tool context, as the Claude CLI calls the
+    in-process MCP server, and then completes.
+
+    - ``turn_events``: events that the next turn emits before its tool call,
+      for example a background task that it starts.
+    - ``buffered``: autonomous output that arrived between runs; the engine
+      drains it before the next turn.
+    - ``in_flight``: for an autonomous turn in flight, pairs of (tool call
+      first?, next batch) that ``receive_idle_events`` returns.
+    - ``fail``: the next turn dies after its first output, like a runtime
+      that is killed mid-turn (a restart). The engine does not retry a turn
+      that has output.
+    """
+
+    native_session_id = None
+
+    def __init__(self, install: "_Install", session_id: str):
+        self.install = install
+        self.session_id = session_id
+        self.turn_events: list = []
+        self.buffered: list[list] = []
+        self.in_flight: list[tuple[bool, list]] = []
+        self.before_tool_call = None
+        self.fail = False
+
+    def try_receive_idle_events(self):
+        return self.buffered.pop(0) if self.buffered else None
+
+    async def receive_idle_events(self, timeout=None):
+        if not self.in_flight:
+            return None
+        tool_call, batch = self.in_flight.pop(0)
+        if tool_call:
+            await self.install.agent_tool_call(self.session_id)
+        return batch
+
+    async def start_turn(self, turn_input) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def receive_turn(self):
+        events, self.turn_events = self.turn_events, []
+        for event in events:
+            yield event
+        if self.fail:
+            self.fail = False
+            yield TextDelta(text="Working on it")
+            raise RuntimeError("the runtime died mid-turn")
+        if self.before_tool_call is not None:
+            await self.before_tool_call()
+        await self.install.agent_tool_call(self.session_id)
+        yield TurnCompleted()
+
+
 class _Install:
     def __init__(self, db: Database, engine: AgentEngine, config: NerveConfig):
         self.db = db
         self.engine = engine
         self.config = config
         self.people: dict[str, dict] = {}
-        # Records of the model runtime stand-in, one per turn.
+        # One record per tool call of the fake runtime.
         self.turns: list[dict] = []
+        self.runtimes: dict[str, _FakeRuntime] = {}
 
     @property
     def system_actor_id(self) -> str:
@@ -151,42 +214,45 @@ class _Install:
             if row["role"] == "user"
         ]
 
-    def agent_creates_a_task_in_each_turn(self, monkeypatch, barrier: int = 0) -> None:
-        """Replace the model runtime with an agent that calls ``task_create``.
-
-        The stand-in runs where the real client is fetched, inside the turn,
-        and calls the tool through the session's own tool context, like the
-        Claude backend's in-process MCP server. With ``barrier`` > 0, each
-        turn waits until that many turns are in flight before its tool call.
-        """
+    async def agent_tool_call(self, session_id: str) -> None:
+        """The agent calls ``task_create`` in the session's current turn."""
         engine = self.engine
-        arrived = 0
-        all_in = asyncio.Event()
+        cause = engine.session_cause(session_id)
+        result = await engine.registry.invoke(
+            "task_create", engine._build_tool_context(session_id),
+            {"title": f"Made in {session_id} #{len(self.turns)}",
+             "confirm_duplicate": True},
+        )
+        self.turns.append({
+            "session_id": session_id,
+            "cause": cause,
+            "task_id": (result.structured or {}).get("task_id"),
+        })
 
-        async def _agent(session_id, source, model, **kwargs):
-            nonlocal arrived
-            cause_at_start = engine.session_cause(session_id)
-            if barrier:
-                arrived += 1
-                if arrived >= barrier:
-                    all_in.set()
-                await asyncio.wait_for(all_in.wait(), timeout=5)
-            ctx = engine._build_tool_context(session_id)
-            result = await engine.registry.invoke(
-                "task_create", ctx,
-                {"title": f"Made in {session_id}", "confirm_duplicate": True},
-            )
-            self.turns.append({
-                "session_id": session_id,
-                "cause": cause_at_start,
-                "task_id": (result.structured or {}).get("task_id"),
-            })
-            raise RuntimeError("no model in this test")
+    def use_fake_runtime(self, monkeypatch) -> None:
+        """Serve every session's turns from a :class:`_FakeRuntime`."""
 
-        monkeypatch.setattr(engine, "_get_or_create_client", _agent)
+        async def _client(session_id, source, model, **kwargs):
+            if session_id not in self.runtimes:
+                self.runtimes[session_id] = _FakeRuntime(self, session_id)
+            return self.runtimes[session_id]
+
+        monkeypatch.setattr(self.engine, "_get_or_create_client", _client)
+
+    def runtime(self, session_id: str) -> _FakeRuntime:
+        if session_id not in self.runtimes:
+            self.runtimes[session_id] = _FakeRuntime(self, session_id)
+        return self.runtimes[session_id]
+
+    def turns_in(self, session_id: str) -> list[dict]:
+        return [turn for turn in self.turns if turn["session_id"] == session_id]
 
     def turn_in(self, session_id: str) -> dict:
-        return next(turn for turn in self.turns if turn["session_id"] == session_id)
+        (turn,) = self.turns_in(session_id)
+        return turn
+
+    async def turn_cause_of(self, session_id: str) -> str | None:
+        return (await self.db.get_session(session_id))["turn_caused_by_actor_id"]
 
 
 @pytest_asyncio.fixture
@@ -389,7 +455,7 @@ async def test_task_status_definition_changes_take_the_person(install, caplog):
 async def test_a_tool_change_inside_a_persons_turn_is_system_for_that_person(
     install, monkeypatch,
 ):
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     bob = install.actor_id("bob")
     async with _client(install.app()) as client:
         session_id = await _new_session(client, install.headers("bob"))
@@ -401,13 +467,14 @@ async def test_a_tool_change_inside_a_persons_turn_is_system_for_that_person(
     assert await install.events(turn["task_id"]) == [
         (None, "pending", session_id, install.system_actor_id, bob),
     ]
-    # Autonomous CLI turns between runs keep the last cause.
+    assert await install.turn_cause_of(session_id) == bob
+    # The value stays after the turn, for autonomous turns between runs.
     assert install.engine.session_cause(session_id) == bob
 
 
 @pytest.mark.asyncio
 async def test_a_cron_turns_tool_change_is_system_for_system(install, monkeypatch):
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     await install.engine.run_cron(job_id="nightly", prompt="tidy the board")
 
     turn = install.turns[0]
@@ -423,11 +490,18 @@ async def test_a_cron_turns_tool_change_is_system_for_system(install, monkeypatc
 
 @pytest.mark.asyncio
 async def test_concurrent_turns_of_two_people_keep_their_causes(install, monkeypatch):
-    install.agent_creates_a_task_in_each_turn(monkeypatch, barrier=2)
+    install.use_fake_runtime(monkeypatch)
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    both_in_flight = asyncio.Barrier(2)
+
+    async def _wait_for_the_other_turn():
+        await asyncio.wait_for(both_in_flight.wait(), timeout=5)
+
     async with _client(install.app()) as client:
         hers = await _new_session(client, install.headers("alice"))
         his = await _new_session(client, install.headers("bob"))
+        install.runtime(hers).before_tool_call = _wait_for_the_other_turn
+        install.runtime(his).before_tool_call = _wait_for_the_other_turn
         await asyncio.gather(
             _chat(client, install.headers("alice"), hers, "from Alice"),
             _chat(client, install.headers("bob"), his, "from Bob"),
@@ -442,8 +516,88 @@ async def test_concurrent_turns_of_two_people_keep_their_causes(install, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_autonomous_work_keeps_the_cause_of_the_turn_that_started_it(
+    install, monkeypatch,
+):
+    """Alice's background task settles while Bob starts a turn in her session.
+
+    The continuation that reports Alice's task drains before Bob's turn. It
+    runs for Alice; Bob's turn runs for Bob.
+    """
+    install.use_fake_runtime(monkeypatch)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        # Alice's turn starts a background task.
+        runtime.turn_events = [
+            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+        ]
+        await _chat(client, install.headers("alice"), session_id, "run the build")
+
+        # The task settles and the CLI starts a turn to report it, which
+        # buffers while no run is active. Its tool call comes mid-turn.
+        runtime.buffered = [[
+            SystemEvent(
+                subtype="task_notification",
+                data={"task_id": "bg-1", "status": "completed"},
+            ),
+            SystemEvent(subtype="init"),
+            TextDelta(text="The build passed."),
+        ]]
+        runtime.in_flight = [(True, [TurnCompleted()])]
+        await _chat(client, install.headers("bob"), session_id, "and now this")
+
+    hers, continuation, his = install.turns_in(session_id)
+    assert (hers["cause"], continuation["cause"], his["cause"]) == (alice, alice, bob)
+    assert await install.events(continuation["task_id"]) == [
+        (None, "pending", session_id, install.system_actor_id, alice),
+    ]
+    assert await install.events(his["task_id"]) == [
+        (None, "pending", session_id, install.system_actor_id, bob),
+    ]
+    assert await install.turn_cause_of(session_id) == bob
+
+
+@pytest.mark.asyncio
+async def test_an_autonomous_turn_after_a_later_turn_keeps_the_starters_cause(
+    install, monkeypatch,
+):
+    """A background task that Alice started settles after Bob's turn ended."""
+    install.use_fake_runtime(monkeypatch)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        runtime.turn_events = [
+            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+        ]
+        await _chat(client, install.headers("alice"), session_id, "start a long job")
+        await _chat(client, install.headers("bob"), session_id, "something else")
+
+    # The idle watcher drains the continuation between runs.
+    runtime.buffered = [[
+        SystemEvent(
+            subtype="task_updated",
+            data={"task_id": "bg-1", "patch": {"status": "completed"}},
+        ),
+        SystemEvent(subtype="init"),
+        TextDelta(text="The long job finished."),
+    ]]
+    runtime.in_flight = [(True, [TurnCompleted()])]
+    await install.engine._drain_pending_messages(
+        session_id, runtime, "web", "web", manage_framing=True,
+    )
+
+    assert [turn["cause"] for turn in install.turns_in(session_id)] == [
+        alice, bob, alice,
+    ]
+    assert install.engine.session_cause(session_id) == alice
+
+
+@pytest.mark.asyncio
 async def test_input_with_no_person_has_no_cause(install, monkeypatch):
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     await install.db.create_session("chat-app", source="telegram", actor=None)
     await install.engine.run(
         "chat-app", "hello from a chat app", source="telegram", actor=None,
@@ -461,7 +615,7 @@ async def test_input_with_no_person_has_no_cause(install, monkeypatch):
 async def test_an_explicit_unknown_cause_is_not_replaced_by_the_actor(
     install, monkeypatch,
 ):
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     await install.db.create_session("leg", source="workflow", actor=None)
     await install.engine.run(
         "leg", "continue", source="workflow",
@@ -471,27 +625,29 @@ async def test_an_explicit_unknown_cause_is_not_replaced_by_the_actor(
     assert await install.user_rows("leg") == [("continue", install.system_actor_id, None)]
 
 
-@pytest.mark.asyncio
-async def test_resume_after_restart_keeps_the_cause_of_the_interrupted_turn(
-    install, monkeypatch, tmp_path,
-):
-    alice = install.actor_id("alice")
-    async with _client(install.app()) as client:
-        session_id = await _new_session(client, install.headers("alice"))
-        monkeypatch.setattr(
-            install.engine, "_get_or_create_client",
-            _raise_no_model,
-        )
-        await _chat(client, install.headers("alice"), session_id, "long job")
+async def _restart_and_resume(install: _Install, session_id: str, tmp_path) -> None:
+    """Restart the process and resume ``session_id`` from the resume queue."""
     await install.db.update_session_fields(session_id, {"sdk_session_id": "native-1"})
-    # A restart: the new process has no turn cause in memory.
+    # The new process has no turn causes in memory.
     install.engine._turn_causes.clear()
-
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
     queue = tmp_path / "resume-after-restart"
     queue.write_text(f"{session_id}\n")
     with patch("nerve.agent.engine.RESUME_QUEUE_FILE", queue):
         assert await install.engine.resume_enrolled_sessions() == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_after_restart_keeps_the_cause_of_the_interrupted_turn(
+    install, monkeypatch, tmp_path,
+):
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        install.runtime(session_id).fail = True
+        await _chat(client, install.headers("alice"), session_id, "long job")
+
+    await _restart_and_resume(install, session_id, tmp_path)
 
     turn = install.turn_in(session_id)
     assert turn["cause"] == alice
@@ -500,8 +656,35 @@ async def test_resume_after_restart_keeps_the_cause_of_the_interrupted_turn(
     ]
 
 
-async def _raise_no_model(*args, **kwargs):
-    raise RuntimeError("no model in this test")
+@pytest.mark.asyncio
+async def test_resume_of_an_interrupted_internal_turn_is_not_a_persons(
+    install, monkeypatch, tmp_path,
+):
+    """The interrupted turn is internal, so it has no user row.
+
+    The newest user row is Alice's, from an earlier turn. The resumed work is
+    the system actor's own.
+    """
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+    system = install.system_actor_id
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        await _chat(client, install.headers("alice"), session_id, "hello")
+    install.runtime(session_id).fail = True
+    await install.engine.run(
+        session_id, "[system tick]", internal=True, actor=install.db.system_actor,
+    )
+    assert await install.user_rows(session_id) == [("hello", alice, alice)]
+    assert await install.turn_cause_of(session_id) == system
+
+    await _restart_and_resume(install, session_id, tmp_path)
+
+    resumed = install.turns_in(session_id)[-1]
+    assert resumed["cause"] == system
+    assert await install.events(resumed["task_id"]) == [
+        (None, "pending", session_id, system, system),
+    ]
 
 
 @pytest.mark.asyncio
@@ -521,7 +704,6 @@ async def test_run_later_and_fork_keep_the_cause_on_user_rows(install):
 
     assert await install.user_rows(session_id) == [("later", alice, alice)]
     assert await install.user_rows(fork.json()["id"]) == [("later", alice, alice)]
-    assert await install.db.latest_user_turn_cause(session_id) == alice
 
 
 # --------------------------------------------------------------------------- #
@@ -653,7 +835,7 @@ async def test_mcp_contexts_carry_the_system_actor_and_the_bound_turn_cause(
 async def test_the_actor_directory_names_every_id_in_every_registered_column(
     install, monkeypatch,
 ):
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     async with _client(install.app()) as client:
         session_id = await _new_session(client, install.headers("alice"))
         await _chat(client, install.headers("bob"), session_id, "make a task")
@@ -727,7 +909,7 @@ async def test_external_mode_records_principals_as_actor_and_cause(
     external_install, monkeypatch,
 ):
     install = external_install
-    install.agent_creates_a_task_in_each_turn(monkeypatch)
+    install.use_fake_runtime(monkeypatch)
     alice, bob = _as(ALICE_PRINCIPAL, "Alice"), _as(BOB_PRINCIPAL, "Bob")
     async with _client(install.app()) as client:
         task_id = (await client.post(

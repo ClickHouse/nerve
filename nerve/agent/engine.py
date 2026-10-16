@@ -255,12 +255,20 @@ class AgentEngine:
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
         self._active_channel: dict[str, str] = {}
-        # Cause actor ID of each session's current turn: the principal on
-        # whose behalf the turn runs (None = unknown). run() sets it under the
-        # session lock before it fetches the client, and keeps it when the
-        # turn ends, so autonomous CLI turns between runs keep the cause of
-        # the last turn. Read through session_cause().
+        # Cause actor ID of the agent turn each session's runtime runs now, or
+        # ran last: the principal on whose behalf the turn runs (None =
+        # unknown). Set by _begin_runtime_turn when a turn starts: a run()
+        # turn after the pre-query drain, an autonomous turn when the drain
+        # opens it. Read through session_cause().
         self._turn_causes: dict[str, str | None] = {}
+        # Cause of each live background task (Bash/Agent run_in_background,
+        # Monitor): the cause of the turn that started it. session_id ->
+        # task_id -> cause.
+        self._bg_task_causes: dict[str, dict[str, str | None]] = {}
+        # Cause for a session's next autonomous turn: the cause of the
+        # background task that settled last. The CLI starts that turn to
+        # report the settled task.
+        self._autonomous_causes: dict[str, str | None] = {}
         # Resolved model bound to each session's live SDK client. Used to
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
@@ -383,14 +391,38 @@ class AgentEngine:
         return self._active_channel.get(session_id)
 
     def session_cause(self, session_id: str) -> str | None:
-        """The cause actor ID of the session's current turn.
+        """The cause actor ID of the agent turn that the session's runtime runs.
 
-        While no turn runs, the cause of the session's last turn: autonomous
-        CLI turns between runs (a background task that settles) continue the
-        work of that turn. ``None`` when the cause is unknown, including a
-        session with no turn in this process.
+        A run() turn takes this value when its query starts, after the
+        autonomous output that buffered before it has drained under the cause
+        of the turn that produced it. An autonomous turn takes the cause of
+        the background task whose settlement started it. While no turn runs,
+        the value of the last turn stays. ``None`` when the cause is unknown,
+        including a session with no turn in this process.
         """
         return self._turn_causes.get(session_id)
+
+    async def _begin_runtime_turn(self, session_id: str, cause_id: str | None) -> None:
+        """Make ``cause_id`` the cause of the turn that the runtime starts now.
+
+        The value is also stored on the session row, so that a restart can
+        resume the interrupted turn for the same cause. A failed write only
+        costs that recovery, so it does not stop the turn.
+        """
+        if session_id in self._turn_causes and self._turn_causes[session_id] == cause_id:
+            return
+        self._turn_causes[session_id] = cause_id
+        try:
+            await self.db.set_session_turn_cause(session_id, cause_id)
+        except Exception as e:
+            logger.warning(
+                "Could not store the turn cause of session %s: %s", session_id, e,
+            )
+
+    def _forget_background_causes(self, session_id: str) -> None:
+        """Drop the causes of background tasks that died with their client."""
+        self._bg_task_causes.pop(session_id, None)
+        self._autonomous_causes.pop(session_id, None)
 
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
@@ -1472,6 +1504,7 @@ class AgentEngine:
                 subsequent fires) long after the agent turn had finished.
         """
         self._stop_idle_watcher(session_id)
+        self._forget_background_causes(session_id)
         if background_memorize:
             await self.schedule_memorize(session_id)
         else:
@@ -1695,13 +1728,10 @@ class AgentEngine:
             try:
                 logger.info("Resume-after-restart: continuing session %s", sid)
                 # The continuation finishes the interrupted turn, so it runs
-                # for the cause stored on that turn's user row. Without one
-                # (an old row, input with no known person) it is the
-                # instance's own work.
-                cause = (
-                    await self.db.latest_user_turn_cause(sid)
-                    or self.db.system_actor
-                )
+                # for the cause stored when that turn started. Without one
+                # (a row older than v053, input with no known person) it is
+                # the instance's own work.
+                cause = session.get("turn_caused_by_actor_id") or self.db.system_actor
                 await self.run(
                     session_id=sid,
                     user_message=_RESUME_AFTER_RESTART_PROMPT,
@@ -2072,6 +2102,8 @@ class AgentEngine:
         if not task_id:
             return
 
+        self._track_background_cause(session_id, subtype, task_id, data)
+
         registry = self._bg_task_registry.setdefault(session_id, {})
         entry = registry.get(task_id)
         if entry is None:
@@ -2144,6 +2176,26 @@ class AgentEngine:
                 "session_id": session_id,
                 "tasks": list(registry.values()),
             })
+
+    def _track_background_cause(
+        self, session_id: str, subtype: str, task_id: str, data: dict,
+    ) -> None:
+        """Bind a background task to the cause of the turn that started it.
+
+        When the task settles, its cause becomes the cause of the session's
+        next autonomous turn, which the runtime starts to report the result.
+        """
+        causes = self._bg_task_causes.setdefault(session_id, {})
+        if subtype == "task_started":
+            causes.setdefault(task_id, self._turn_causes.get(session_id))
+            return
+        settled = subtype == "task_notification" or (
+            subtype == "task_updated"
+            and str((data.get("patch") or {}).get("status") or "")
+            in self._BG_TERMINAL_STATUSES
+        )
+        if settled and task_id in causes:
+            self._autonomous_causes[session_id] = causes.pop(task_id)
 
     async def _emit_workflow_progress(
         self,
@@ -2546,10 +2598,10 @@ class AgentEngine:
                       The default is the actor: the person for a person, the
                       system actor for the system actor, unknown for no
                       actor. Pass the person whose request started work that
-                      the system actor does. The cause is stored on the
-                      turn's user row, given to the turn's tool calls, and
-                      readable through :meth:`session_cause` for the length
-                      of the turn and after it.
+                      the system actor does. The cause is fixed for the
+                      turn: it is stored on the turn's user row, becomes
+                      :meth:`session_cause` when the turn's query starts, and
+                      goes to the background tasks that the turn starts.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2585,10 +2637,6 @@ class AgentEngine:
                 self.sessions.mark_running(session_id)
                 if channel is not None:
                     self._active_channel[session_id] = channel
-                # Before _run_inner, so the cause is known when the client is
-                # fetched or built. Kept after the turn ends; see
-                # session_cause().
-                self._turn_causes[session_id] = cause_id
                 # Mark the turn as in flight so the finally below can
                 # detect "ended without sending done/stopped/error" and
                 # ship a synthetic done.  Clearing happens automatically
@@ -2772,6 +2820,10 @@ class AgentEngine:
             # the open-turn flag set by run(); re-arm it so the synthetic-
             # done backstop still covers THIS turn.
             broadcaster.mark_turn_open(session_id)
+
+            # This turn starts in the runtime now. The drain above ran under
+            # the cause of the work it drained.
+            await self._begin_runtime_turn(session_id, cause_id)
 
             # New user turn: settled background-task chips are stale now.
             self._prune_bg_tasks(session_id)
@@ -3123,6 +3175,12 @@ class AgentEngine:
             if st is not None:
                 return
             st = _TurnState()
+            # The runtime reports a settled background task, so the turn
+            # continues the work of the turn that started the task.
+            if session_id in self._autonomous_causes:
+                await self._begin_runtime_turn(
+                    session_id, self._autonomous_causes.pop(session_id),
+                )
             # Leading marker block → "background continuation" chip in the
             # UI, both live (auto_turn event) and after reload (persisted).
             st.ordered_blocks.append({"type": "auto"})

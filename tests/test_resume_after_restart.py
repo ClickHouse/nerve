@@ -21,22 +21,15 @@ from tests.actor_rows import FAKE_SYSTEM_ACTOR
 #  Daemon side: AgentEngine.resume_enrolled_sessions                          #
 # --------------------------------------------------------------------------- #
 
-def _engine_with(sessions_by_id: dict, causes: dict | None = None) -> AgentEngine:
-    """Bare AgentEngine stub exercising only resume_enrolled_sessions' deps.
-
-    ``causes`` maps a session ID to the cause stored on its newest user row.
-    """
+def _engine_with(sessions_by_id: dict) -> AgentEngine:
+    """Bare AgentEngine stub exercising only resume_enrolled_sessions' deps."""
     engine = AgentEngine.__new__(AgentEngine)
 
     async def _get_session(sid):
         return sessions_by_id.get(sid)
 
-    async def _latest_user_turn_cause(sid):
-        return (causes or {}).get(sid)
-
     engine.db = SimpleNamespace(
         get_session=AsyncMock(side_effect=_get_session),
-        latest_user_turn_cause=AsyncMock(side_effect=_latest_user_turn_cause),
         # The resume trigger is the instance's own, so the drainer passes the
         # system actor to run().
         system_actor=FAKE_SYSTEM_ACTOR,
@@ -87,7 +80,8 @@ ALICE_ACTOR_ID = "00000000-0000-4000-8000-0000000a11ce"
 async def test_resume_runs_for_the_cause_of_the_interrupted_turn(tmp_path):
     qf = tmp_path / "resume-after-restart"
     qf.write_text("S1\n")
-    engine = _engine_with({"S1": _session("S1")}, causes={"S1": ALICE_ACTOR_ID})
+    session = {**_session("S1"), "turn_caused_by_actor_id": ALICE_ACTOR_ID}
+    engine = _engine_with({"S1": session})
     with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
         assert await engine.resume_enrolled_sessions() == 1
     kwargs = engine.run.await_args.kwargs

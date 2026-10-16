@@ -41,6 +41,9 @@ def _make_engine() -> AgentEngine:
         ),
     )
     engine._bg_task_registry = {}
+    engine._bg_task_causes = {}
+    engine._autonomous_causes = {}
+    engine._turn_causes = {}
     engine._workflows = {}
     engine._idle_watchers = {}
     engine._session_locks = {}

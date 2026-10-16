@@ -369,21 +369,6 @@ class MessageStore:
                 return row["id"]
         return None
 
-    async def latest_user_turn_cause(self, session_id: str) -> str | None:
-        """The cause stored on the session's newest user row.
-
-        ``None`` when the session has no user row, or when that row has no
-        cause (input with no known person, or a row older than v053).
-        """
-        async with self.db.execute(
-            """SELECT caused_by_actor_id FROM messages
-               WHERE session_id = ? AND role = 'user'
-               ORDER BY id DESC LIMIT 1""",
-            (session_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row else None
-
     async def get_messages(
         self, session_id: str, limit: int = 500, offset: int = 0
     ) -> list[dict]:

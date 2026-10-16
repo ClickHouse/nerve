@@ -322,6 +322,17 @@ class SessionStore:
             return
         await self._write(*built)
 
+    async def set_session_turn_cause(self, session_id: str, cause_id: str | None) -> None:
+        """Store the cause of the agent turn that the session starts now.
+
+        Written when the turn starts, so after a restart the row names the
+        cause of the interrupted turn. ``None`` stores an unknown cause.
+        """
+        await self._write(
+            "UPDATE sessions SET turn_caused_by_actor_id = ? WHERE id = ?",
+            (cause_id, session_id),
+        )
+
     async def bind_native_thread(
         self, backend: str, native_thread_id: str, session_id: str,
     ) -> None:
