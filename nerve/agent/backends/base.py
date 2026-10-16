@@ -209,4 +209,10 @@ def config_excluded_tools(config: Any) -> set[str]:
     excluded: set[str] = set()
     if not config.outbound_channels:
         excluded.add("send_channel_message")
+    # External mode: the organization manages the MCP servers through the
+    # MCP gateway, so the agent has no MCP configuration to reload.
+    from nerve.gateway.auth import is_external_mode
+
+    if is_external_mode():
+        excluded.add("mcp_reload")
     return excluded
