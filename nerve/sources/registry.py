@@ -7,6 +7,7 @@ as APScheduler jobs. Centralizes all source construction and config extraction.
 from __future__ import annotations
 
 import logging
+import shutil
 from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.sources.runner import SourceRunner
@@ -171,7 +172,7 @@ def build_source_runners(
             FieldRule(field="reason", allow=gh.allow_reasons, deny=gh.deny_reasons),
             FieldRule(field="ci_branch", deny=gh.deny_ci_branches),
         ])
-        runners.append(SourceRunner(
+        gh_runner = SourceRunner(
             source=source,
             db=db,
             batch_size=gh.batch_size,
@@ -180,20 +181,36 @@ def build_source_runners(
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
             inbox_filter=gh_filter,
-        ))
+            drop_hook=gh.drop_hook,
+        )
+        runners.append(gh_runner)
+        # The runner's copy is validated (a wrong-shaped value turns it off).
+        hook = gh_runner.drop_hook
         if gh_filter.active:
             logger.info(
                 "Registered source: github (batch=%d, guardrail: "
                 "repos allow=%s deny=%s; actors allow=%s deny=%s; "
-                "reasons allow=%s deny=%s; ci_branches deny=%s)",
+                "reasons allow=%s deny=%s; ci_branches deny=%s; drop_hook=%s)",
                 gh.batch_size,
                 gh.allow_repos or "*", gh.deny_repos or [],
                 gh.allow_actors or "*", gh.deny_actors or [],
                 gh.allow_reasons or "*", gh.deny_reasons or [],
                 gh.deny_ci_branches or [],
+                hook[0] if hook else "off",
             )
+            if hook and shutil.which(hook[0]) is None:
+                logger.warning(
+                    "sync.github.drop_hook: %r is not an executable on PATH or "
+                    "a path to one, so the hook will fail to start",
+                    hook[0],
+                )
         else:
             logger.info("Registered source: github (batch=%d)", gh.batch_size)
+            if hook:
+                logger.warning(
+                    "sync.github.drop_hook is set but no guardrail is, so "
+                    "nothing is ever dropped and the hook never runs",
+                )
 
     # GitHub Events (user's own activity)
     gh_events = config.sync.github_events

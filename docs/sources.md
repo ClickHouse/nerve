@@ -22,6 +22,8 @@ PRODUCERS (sources):
       ↓
   SourceRunner._condense_long_content ← LLM condensation via Haiku (if condense: true)
       ↓
+  SourceRunner._run_drop_hook         ← dropped records to the drop hook (if drop_hook is set)
+      ↓
   Advance source cursor in SQLite     ← always, no processing dependency
 
 CONSUMERS (agent tools):
@@ -354,6 +356,7 @@ sync:
     allow_reasons: []             # Guardrail allowlist of GitHub reasons — empty = all. Example: ["mention"]
     deny_reasons: []              # Guardrail denylist of reasons. Example: ["comment", "subscribed"]
     deny_ci_branches: []          # Drop CI runs on these branches. Example: ["main", "master"]
+    drop_hook: []                 # Command (argv) that gets the dropped records. See "Drop hook"
 
   github_events:
     enabled: true
@@ -521,6 +524,80 @@ Source github: guardrail dropped 3/5 records (e.g. '[owner/repo] CI workflow run
 Source github: dropped 19542… on ci_branch='main' — [owner/repo] CI workflow run failed …
 ```
 
+### Drop hook
+
+A guardrail drop is silent by design: the agent never sees the record, and nothing
+answers the person who sent it. A drop hook lets you act on a drop without letting
+the content in front of the agent. Typical uses: acknowledge the dropped message
+(for example, react to a GitHub comment from an account that is not on
+`allow_actors`), or keep an audit trail of drops.
+
+```yaml
+sync:
+  github:
+    allow_actors: ["alice", "bob"]
+    drop_hook: ["/usr/local/bin/my-drop-hook", "--source", "github"]
+```
+
+`drop_hook` is an argv list. Nerve runs it directly, never through a shell. A bare
+string is one program path, not a command line. The hook runs once per batch that
+dropped at least one record, and reads one JSON object per dropped record on stdin:
+
+```json
+{"source": "github", "id": "1234", "record_type": "github_notification",
+ "summary": "[owner/repo] Some issue (mention)", "timestamp": "2026-01-01T00:00:00Z",
+ "metadata": {"reason": "mention", "repo_name": "owner/repo", "actors": ["mallory"], "...": "..."},
+ "dropped_on": "actors"}
+```
+
+`dropped_on` is the field of the rule that fired. The record's `content` is not
+sent: the guardrail exists to keep untrusted content away from automation, and the
+identifiers and metadata are enough to act on a drop. Do not use a hook to pass
+dropped records to an agent. That reopens the hole the guardrail closes.
+
+**Every field is untrusted input**, not only the content that is left out. A GitHub
+`summary` carries the issue or PR title, which whoever opened it chose. Never put a
+field into a shell command (`sh -c`, `eval`), a templated argument, or an LLM prompt.
+Read the JSON and pass values as data.
+
+For GitHub, `id` is the notification **thread** id. It stays the same when new activity
+arrives on the thread, so key idempotency on `id` + `timestamp`, not on `id` alone. The
+record does not name the comment that triggered it. A hook that needs it can look it up
+with `gh api notifications/threads/<id>` (`subject.latest_comment_url`) or by listing
+the thread's comments.
+
+Rules a hook can rely on:
+
+- **Best effort.** If the command is missing, cannot start, exits non-zero, or runs
+  longer than 60 seconds, Nerve logs a warning (with the tail of the hook's stderr) and
+  the sync continues. A hook never fails a sync and never holds back the cursor.
+- **At least one attempt, no retry.** The hook runs after the batch is persisted and
+  before the cursor advances. A batch whose persist fails is fetched again, and the hook
+  gets its drops on that run. A crash between the hook and the cursor advance runs it
+  again for the same records, so make the hook idempotent. A hook that *fails* is not
+  retried, because the cursor still advances. If every drop must be handled, spool the
+  records inside the hook and retry from there.
+- **Own process group.** The hook starts in a new session. On timeout, Nerve kills the
+  whole process group, so a child process (a `gh` or `curl` call from a shell script)
+  does not keep running. A process that leaves the group (`setsid`, a daemon) is out of
+  reach; Nerve then waits at most 5 more seconds. stdout is discarded and stderr goes to
+  a temporary file, so a background job the hook leaves behind does not hold the sync.
+  That job keeps running, and it is the hook's own business. Read all of stdin before
+  you exit, or start background jobs with stdin from `/dev/null`: a job that inherits
+  an unread stdin holds the batch until the timeout.
+- **Daemon context.** The hook inherits the daemon's environment (including any API
+  keys in it), working directory, and privileges. A `gh` call uses the daemon's GitHub
+  login, and its API quota: anyone who can trigger drops (for example, by @-mentioning
+  the account) can make the hook run, so rate-limit expensive work inside the hook.
+- **Validated at startup.** Without a guardrail nothing is dropped, so the hook never
+  runs, and Nerve logs a warning. A program that is not an executable (on `PATH` or by
+  path) also logs a warning. A value that is not a list of strings, or has an empty
+  program name, turns the hook off with a warning.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.drop_hook` | list | `[]` | argv of a command that gets each dropped record as a JSON line on stdin. Passed as is: no shell, nothing stripped. Empty = off |
+
 ### Extending to other sources
 
 Adding a guardrail to another source is a config field plus one registry line. In
@@ -534,6 +611,8 @@ from nerve.sources.filters import InboxFilter
 flt = InboxFilter.from_field("labels", allow=cfg.allow_labels, deny=cfg.deny_labels)
 runners.append(SourceRunner(..., inbox_filter=flt))
 ```
+
+A drop hook is one more argument: `SourceRunner(..., inbox_filter=flt, drop_hook=cfg.drop_hook)`.
 
 (Telegram already filters by folder/chat inside `fetch()` via `monitored_folders` /
 `exclude_chats`; those remain source-specific.)
@@ -769,7 +848,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 |------|---------|
 | `nerve/sources/models.py` | `SourceRecord`, `FetchResult`, `IngestResult` dataclasses |
 | `nerve/sources/base.py` | `Source` abstract base class |
-| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → advance) |
+| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → drop hook → advance) |
 | `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` — declarative allow/deny guardrails applied before persist |
 | `nerve/sources/processor.py` | Legacy agent prompt building (unused by runner, may be used by tools) |
 | `nerve/sources/registry.py` | Config → `list[SourceRunner]` factory |
