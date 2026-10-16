@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 
 import httpx
@@ -868,39 +869,31 @@ class TestEntryPoints:
         upgrade = maybe_migrate(config_dir)
         assert upgrade.rekeyed_system_actor
 
-    def test_a_foreground_start_reads_the_variable_once_and_warns_once(
-        self, tmp_path, monkeypatch, seeded,
-    ):
-        from click.testing import CliRunner
-
+    @staticmethod
+    def _watch_a_foreground_start(tmp_path, monkeypatch) -> tuple[list, list[str]]:
+        """Prepare ``nerve start -f``: the server stops right after its identity
+        bootstrap. Returns the list of env reads and the list of warnings of
+        ``nerve.migrate``, both filled while the command runs. HOME points
+        into ``tmp_path``, so a default path cannot reach a real install."""
         import nerve.identity as identity
         import nerve.migrate as migrate_module
-        import nerve.proxy.service as proxy_module
-        from nerve import cli
+        from nerve import cli, setup_token
         from nerve.gateway import server
-
-        config_dir = self._install(tmp_path)
-
-        async def refer_to_the_system_actor():
-            database = await _open(paths.db_path())
-            try:
-                await _refer_to_system_actor(database, "session")
-            finally:
-                await database.close()
-
-        asyncio.run(refer_to_the_system_actor())
 
         reads: list[str | None] = []
         read_env = identity.system_principal_id_from_env
 
         def counted_read():
-            reads.append(read_env())
-            return reads[-1]
+            reads.append(os.environ.get(SYSTEM_PRINCIPAL_ENV))
+            return read_env()
 
         warnings: list[str] = []
 
         def record_warning(msg, *args, **kwargs):
             warnings.append(msg % args if args else msg)
+
+        async def stop_after_the_identity_steps(*args, **kwargs):
+            raise RuntimeError("stop after the identity steps")
 
         def run_server(config):
             app = server.create_app()
@@ -912,13 +905,39 @@ class TestEntryPoints:
 
             asyncio.run(serve())
 
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
         monkeypatch.setattr(identity, "system_principal_id_from_env", counted_read)
         monkeypatch.setattr(migrate_module.logger, "warning", record_warning)
+        monkeypatch.setattr(setup_token, "ensure_setup_token", stop_after_the_identity_steps)
         monkeypatch.setattr(server, "run_server", run_server)
-        monkeypatch.setattr(proxy_module, "ProxyService", lambda cfg: _ProxyThatFails())
         monkeypatch.setattr(cli, "_get_daemon_status", lambda: (False, None))
+        monkeypatch.setattr(
+            cli, "_spawn_daemon", lambda *a, **k: pytest.fail("a foreground start spawns nothing"),
+        )
         monkeypatch.setattr(cli, "setup_logging", lambda verbose=False: None)
         monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+        return reads, warnings
+
+    def test_a_foreground_start_reads_the_variable_once_and_warns_once(
+        self, tmp_path, monkeypatch, seeded,
+    ):
+        from click.testing import CliRunner
+
+        from nerve import cli
+
+        config_dir = self._install(tmp_path)
+
+        async def refer_to_the_system_actor():
+            database = await _open(paths.db_path())
+            try:
+                await _refer_to_system_actor(database, "session")
+            finally:
+                await database.close()
+
+        asyncio.run(refer_to_the_system_actor())
+        reads, warnings = self._watch_a_foreground_start(tmp_path, monkeypatch)
         try:
             result = CliRunner().invoke(
                 cli.main, ["-c", str(config_dir), "start", "-f"], catch_exceptions=False,
@@ -931,6 +950,44 @@ class TestEntryPoints:
         system_warnings = [w for w in warnings if "system actor" in w]
         assert len(system_warnings) == 1
         assert system_warnings[0].startswith("Identity: the system actor keeps its current ID")
+
+    @pytest.mark.parametrize("value", [PRINCIPAL, "not-a-uuid"])
+    def test_a_fresh_foreground_start_reads_the_variable_once(
+        self, tmp_path, monkeypatch, value,
+    ):
+        """``nerve start -f`` on a fresh install runs the slim init and then
+        serves in the same process. Only the gateway's bootstrap reads the
+        variable: a valid value is applied once, an invalid one warns once."""
+        from click.testing import CliRunner
+
+        from nerve import bootstrap, cli
+
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, value)
+        monkeypatch.setattr(bootstrap, "_ensure_web_ui", lambda config_dir: "present")
+        monkeypatch.setattr(bootstrap, "port_is_free", lambda port, host="127.0.0.1": True)
+        monkeypatch.setattr(
+            bootstrap, "propose_port", lambda preferred, bind: (preferred, False),
+        )
+        reads, warnings = self._watch_a_foreground_start(tmp_path, monkeypatch)
+        config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+        try:
+            result = CliRunner().invoke(
+                cli.main, ["-c", str(config_dir), "start", "-f"],
+                input=f"server\n{workspace}\n8977\nlocalhost\n", catch_exceptions=False,
+            )
+        finally:
+            set_config(NerveConfig())
+
+        assert result.exit_code == 0, result.output
+        assert "Fresh install detected" in result.output
+        assert (config_dir / "config.local.yaml").exists()
+        assert reads == [value]
+        system_warnings = [w for w in warnings if "system actor" in w]
+        if value == PRINCIPAL:
+            assert system_warnings == []
+            assert inspect_system_actor(paths.db_path(), PRINCIPAL) == (PRINCIPAL, None)
+        else:
+            assert len(system_warnings) == 1 and "canonical" in system_warnings[0]
 
 
 # --------------------------------------------------------------------------- #
