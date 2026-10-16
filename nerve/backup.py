@@ -8,10 +8,11 @@ snapshot of everything that makes a Nerve instance *this* instance:
   accounts and actor identity. ``--no-secrets`` empties its two credentials in
   the snapshot: the JWT signing secret in ``instance_secrets`` and each
   account's password hash in ``accounts.credential``
-  (see :func:`_scrub_snapshot_secrets`). It also replaces secret values in the
-  staged workspace ``config/*.yaml`` with ``${VAR}`` placeholders, because a
-  tracked ``auth.password_hash`` is still a verifier
-  (see :func:`_sanitised_config`).
+  (see :func:`_scrub_snapshot_secrets`). The one ``instance_secrets`` row that
+  is not secret, the record of the system principal ID, stays. It also
+  replaces secret values in the staged workspace ``config/*.yaml`` with
+  ``${VAR}`` placeholders, because a tracked ``auth.password_hash`` is still a
+  verifier (see :func:`_sanitised_config`).
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -351,14 +352,21 @@ def _snapshot_db(src: Path, dst: Path) -> None:
 
 
 def _scrub_instance_secrets(snapshot: Path) -> None:
-    """Empty ``instance_secrets`` in a snapshot copy of nerve.db.
+    """Delete the secrets from ``instance_secrets`` in a snapshot copy of nerve.db.
 
     The table holds the generated JWT signing secret, which can mint tokens for
-    the live instance, so ``--no-secrets`` must not carry it. This edits the
-    snapshot before it is checksummed and never touches the live database.
-    ``secure_delete`` overwrites the freed pages. A snapshot without the table
-    is left as is. The restored instance generates a new secret on first start.
+    the live instance, so ``--no-secrets`` must not carry it. Every row is
+    deleted except the record of the system principal ID that the system
+    actor took (``nerve.db.accounts.SYSTEM_PRINCIPAL_CLAIM_NAME``): it is
+    instance state, not a secret, and the same ID is in ``actor_refs``. A
+    restored database that lost it could change its system actor ID again.
+    This edits the snapshot before it is checksummed and never touches the
+    live database. ``secure_delete`` overwrites the freed pages. A snapshot
+    without the table is left as is. The restored instance generates a new
+    secret on first start.
     """
+    from nerve.db.accounts import SYSTEM_PRINCIPAL_CLAIM_NAME
+
     conn = _connect(snapshot)
     try:
         exists = conn.execute(
@@ -367,7 +375,9 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         if not exists:
             return
         conn.execute("PRAGMA secure_delete=ON")
-        conn.execute("DELETE FROM instance_secrets")
+        conn.execute(
+            "DELETE FROM instance_secrets WHERE name != ?", (SYSTEM_PRINCIPAL_CLAIM_NAME,),
+        )
         conn.commit()
     finally:
         conn.close()

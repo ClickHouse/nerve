@@ -186,7 +186,8 @@ when these conditions are true:
 - The system actor did not take an ID from the variable before. Nerve records
   the ID it took in `nerve.db`, in the same transaction as the change, so the
   ID changes at most once, also when two processes start with different
-  values. A backup made with `--no-secrets` does not keep that record.
+  values. A backup made with `--no-secrets` keeps that record, because it is
+  not secret.
 
 Thus a new installation gets the ID before it attributes work to the system
 actor. After the change, system and MCP tokens act as the new ID, and
@@ -253,9 +254,12 @@ password hashes, and the generated signing secret. Treat the archive as a
 secret.
 
 `--no-secrets` removes account passwords, the signing secret and the setup
-completion record from the database snapshot, omits `config.local.yaml`, and
-replaces credential values in workspace configuration with environment-variable
-placeholders. It fails if a configuration file cannot be parsed safely.
+completion record from the database snapshot, and keeps the record of the
+system principal ID that the system actor took (see
+[The system actor in external mode](#the-system-actor-in-external-mode)). It
+omits `config.local.yaml`, and replaces credential values in workspace
+configuration with environment-variable placeholders. It fails if a
+configuration file cannot be parsed safely.
 
 After restoring a `--no-secrets` backup:
 
