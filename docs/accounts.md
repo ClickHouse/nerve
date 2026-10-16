@@ -262,15 +262,17 @@ system actor.
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
-| `stop_requested` | A stop reaches a running session | |
+| `stop_requested` | A stop request reaches a running turn; each request is one event | |
 | `external_tool_call` | An external MCP client calls a tool | The tool call |
 
 A change through the web UI, the REST API or the browser WebSocket records the
 person as actor and cause. A change that has no effect records no event: a
 field that keeps its value, an archive of an archived session (also in a
-cascade), a restore of a session that is not archived. Of two people who make
-the same change at the same time, only the one whose change has an effect is
-recorded.
+cascade), a restore of a session that is not archived, a resume of a session
+that is resumed already, a create of a session ID that exists, a stop when no
+turn runs. Of two people who make the same change at the same time, only the
+one whose change has an effect is recorded; the session event and the change
+are one transaction.
 Events that record the state of the runtime (`started`, `idle`, `error`, and a
 `stopped` status after a cancel) have no actor and no cause.
 
