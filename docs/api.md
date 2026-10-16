@@ -788,6 +788,10 @@ Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_b
 account id. It is `null` for legacy rows and sessions caused by an unidentified
 external person. Every session payload carries the field.
 
+Session payloads also carry `turn_caused_by_actor_id`: the cause of the agent
+turn that the session runs now, or ran last (an actor id, or `null` when
+unknown). See [Attribution](accounts.md#attribution).
+
 #### `GET /api/sessions/{id}`
 Get session details.
 

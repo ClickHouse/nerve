@@ -186,15 +186,21 @@ These columns store actor IDs:
 | `sessions.created_by_actor_id` | Who created the session |
 | `messages.actor_id` | Who supplied the content of a user message |
 | `messages.caused_by_actor_id` | The cause of the turn that a user message starts |
+| `sessions.turn_caused_by_actor_id` | The cause of the agent turn that the session runs now, or ran last |
 | `task_events.actor_id`, `task_events.caused_by_actor_id` | Actor and cause of a task status change |
+| `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
 can name: the display name, or the username when none is set. The web UI shows
 the system actor with a person as cause as "Nerve for <person>".
 
-Each agent turn has one cause. Tool calls in the turn record the system actor
-as actor and the turn's cause as cause.
+Each agent turn has one cause, fixed when the turn starts. Tool calls in the
+turn record the system actor as actor and the turn's cause as cause. A
+background task (a command or an agent that runs in the background) keeps the
+cause of the turn that started it, and so does the turn that the agent starts
+to report the result of the task. When a person sends a message while earlier
+background output waits, Nerve processes that output for its own cause first.
 
 | Work | Actor | Cause |
 |---|---|---|
@@ -204,8 +210,8 @@ as actor and the turn's cause as cause.
 | A plan implementation or a plan revision that a person started | The system actor | That person |
 | A plan approved or a revision requested by the agent in a turn | The system actor | The cause of that turn |
 | The hook turn that starring a session starts | The system actor | The person who starred it |
-| A turn resumed after a restart | The system actor | The cause on the interrupted turn's user message, else the system actor |
-| A turn that the agent starts between turns, when a background task finishes | The system actor | The cause of the session's last turn |
+| A turn resumed after a restart | The system actor | The cause stored when the interrupted turn started (`sessions.turn_caused_by_actor_id`), else the system actor |
+| A turn that the agent starts between turns, when a background task finishes | The system actor | The cause of the turn that started the task |
 | A tool call from an external MCP client | The system actor | None |
 | Workflow legs, wakeups, deferred messages when they run, and answers relayed into a session | The system actor | The system actor |
 | Telegram, Slack, or imported Codex input | None until a local identity mapping exists | None |

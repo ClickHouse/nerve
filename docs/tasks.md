@@ -152,6 +152,12 @@ columns. The `GET /api/tasks/{id}/events` rows include both columns, and the
 timeline shows "Nerve for <person>" when the agent changed the status for a
 person.
 
+Changes to the set of statuses (create, update, reorder, delete, through the
+HTTP API or the `task_status_create` tool) append a row to
+`task_status_events` (`change`, `status_name`, `detail`, `actor_id`,
+`caused_by_actor_id`, `created_at`), added in migration v053. `status_name` is
+NULL for a reorder, and `detail` is a JSON object with the new values.
+
 This powers the aging indicator on board cards and the timeline in the task
 detail view. Tasks whose last transition predates v044 report no entry time
 rather than a guessed one, so the UI stays silent instead of showing an age
