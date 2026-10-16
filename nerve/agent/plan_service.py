@@ -126,10 +126,15 @@ async def request_plan_revision(
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
     # 1. Store feedback on the plan (status stays pending until planner
-    #    supersedes it via plan_update). The request is a review decision.
-    await db.update_plan(
-        plan_id, feedback=feedback, attribution=attribution_for(actor, cause),
-    )
+    #    supersedes it via plan_update). The request is a review decision,
+    #    and it applies only while the plan is still pending.
+    if not await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        feedback=feedback, attribution=attribution_for(actor, cause),
+    ):
+        raise PlanNotPending(
+            f"Plan {plan_id} is no longer pending; another decision was made first."
+        )
 
     # 2. Write a task note so the revision request is visible in the
     #    task's history. Build a ``ToolContext`` from the legacy module

@@ -1,17 +1,24 @@
-"""V55: record who answers or dismisses a notification, creates a silence, or reviews a plan.
+"""V55: record who answers or dismisses a notification, creates a silence, or writes or reviews a plan.
 
-Adds six nullable columns that hold an ``actor_refs.id``:
+Adds eight nullable columns that hold an ``actor_refs.id``:
 
 - ``notifications.answered_by_actor_id``: the person who answered a question
   or decided an approval through the web UI or REST. An answer through a chat
   channel (Telegram, Slack, a hosted channel) names no person and keeps it
   ``NULL``; its provider user ID stays in ``metadata.answered_by_actor``.
+  On an approval that is snoozed and still pending, it names the person who
+  snoozed it, until a later decision replaces it.
 - ``notifications.dismissed_by_actor_id``: the person who dismissed the row.
 - ``notification_silences.created_by_actor_id``: who created the rule. A
   person through the web UI or REST, or the system actor for the
   ``notification_silence`` tool.
 - ``notification_silences.caused_by_actor_id``: on whose behalf the rule was
   created: the person, or the cause of the turn that called the tool.
+- ``plans.created_by_actor_id``: who wrote this plan version. The system
+  actor for ``plan_propose`` and ``plan_update``; each version written by
+  ``plan_update`` carries its own value.
+- ``plans.caused_by_actor_id``: on whose behalf the version was written: the
+  cause of the turn that called the tool.
 - ``plans.reviewed_by_actor_id``: who made the last review decision on the
   plan (approve, decline, a revision request, or a status or feedback change
   through REST). A person through the web UI or REST, or the system actor for
@@ -48,6 +55,8 @@ _COLUMNS = (
     ("notification_silences", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
     ("plans", "reviewed_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
     ("plans", "reviewed_caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
+    ("plans", "created_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
+    ("plans", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
 )
 
 

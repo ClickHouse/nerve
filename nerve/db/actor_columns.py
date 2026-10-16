@@ -29,4 +29,6 @@ ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("notification_silences", "caused_by_actor_id"),
     ("plans", "reviewed_by_actor_id"),
     ("plans", "reviewed_caused_by_actor_id"),
+    ("plans", "created_by_actor_id"),
+    ("plans", "caused_by_actor_id"),
 )

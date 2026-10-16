@@ -360,6 +360,7 @@ class NotificationStore:
 
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
         """Queue a pending notification for re-delivery.
 
@@ -376,6 +377,9 @@ class NotificationStore:
         :meth:`claim_pending_approval` took, so the card that resurfaces
         can be pressed again.
 
+        ``attribution.actor_id`` is who snoozed it, written to
+        ``answered_by_actor_id``. A later decision replaces it.
+
         Returns True on success, False if the row is not pending.
         """
         async with self._atomic():
@@ -387,9 +391,11 @@ class NotificationStore:
                     return False
             await self.db.execute(
                 """UPDATE notifications
-                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL
+                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL,
+                       answered_by_actor_id = ?
                    WHERE id = ?""",
-                (redeliver_at, new_expires_at, notification_id),
+                (redeliver_at, new_expires_at, attribution.actor_id,
+                 notification_id),
             )
         return True
 

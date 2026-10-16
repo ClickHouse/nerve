@@ -73,10 +73,17 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
         fields["feedback"] = req.feedback
 
     if fields:
-        # A status or feedback change is this person's review decision.
-        await deps.db.update_plan(
-            plan_id, attribution=attribution_for(actor), **fields,
-        )
+        # A status or feedback change is this person's review decision. It
+        # applies only while the plan still has the status read above, so a
+        # decision made in the meantime is not overwritten.
+        if not await deps.db.compare_and_update_plan(
+            plan_id, expect_status=plan["status"],
+            attribution=attribution_for(actor), **fields,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Plan is no longer '{plan['status']}'; another decision was made first",
+            )
 
     # On decline: mark the related task as done with a note explaining
     # the closure. The user-supplied feedback is optional — if absent,
@@ -151,11 +158,17 @@ async def approve_plan(
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
 
-    # Mark plan as implementing immediately (prevents double-approve)
-    await deps.db.update_plan(
-        plan_id, status="implementing", reviewed_at=now,
+    # Mark plan as implementing immediately. Only one of several concurrent
+    # decisions changes the row; the others start nothing.
+    if not await deps.db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        status="implementing", reviewed_at=now,
         attribution=attribution_for(actor),
-    )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Plan is no longer 'pending'; another decision was made first",
+        )
 
     # Create implementation session (visible in Chat UI)
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"

@@ -719,6 +719,7 @@ class NotificationService:
             ).isoformat()
             await self.db.snooze_notification(
                 notification_id, snooze_until, new_expires_at,
+                attribution=attribution_for(answerer),
             )
         elif not await self.db.answer_notification(
             notification_id, answer, answered_by, actor=actor,

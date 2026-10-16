@@ -28,7 +28,9 @@ from nerve.agent import streaming
 from nerve.agent.backends import TurnCompleted
 from nerve.agent.engine import AgentEngine
 from nerve.agent.tools.handlers.plans import (
+    plan_approve_handler,
     plan_decline_handler,
+    plan_propose_handler,
     plan_revise_handler,
     plan_update_handler,
 )
@@ -70,6 +72,8 @@ _NEW_COLUMNS = (
     ("notification_silences", "caused_by_actor_id"),
     ("plans", "reviewed_by_actor_id"),
     ("plans", "reviewed_caused_by_actor_id"),
+    ("plans", "created_by_actor_id"),
+    ("plans", "caused_by_actor_id"),
 )
 
 
@@ -193,9 +197,19 @@ class _Install:
             for row in await self.db.list_task_events(task_id)
         ]
 
+    async def plan_row(self, plan_id: str) -> dict:
+        # A direct read: some tests replace ``db.get_plan`` with a stale one.
+        async with self.db.db.execute(
+            "SELECT * FROM plans WHERE id = ?", (plan_id,),
+        ) as cursor:
+            return dict(await cursor.fetchone())
+
     async def plan_reviewer(self, plan_id: str) -> tuple:
-        plan = await self.db.get_plan(plan_id)
+        plan = await self.plan_row(plan_id)
         return (plan["reviewed_by_actor_id"], plan["reviewed_caused_by_actor_id"])
+
+    def impl_runs(self) -> list[dict]:
+        return [run for run in self.runs if str(run.get("session_id", "")).startswith("impl-")]
 
     async def pending_plan(self, suffix: str) -> tuple[str, str]:
         task_id, plan_id = f"task-{suffix}", f"plan-{suffix}"
@@ -485,6 +499,48 @@ async def test_the_mechanical_action_audit_names_the_person(install, audit_dir):
 
 
 @pytest.mark.asyncio
+async def test_a_web_snooze_records_who_deferred_the_approval(
+    install, monkeypatch, audit_dir,
+):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    seen: list = []
+
+    def dispatch(notification, target_id, decision, config, *, actor):
+        seen.append((decision, actor.actor_id if actor else None))
+        result = _acted(target_kind="a3-snooze", decision=decision)
+        if decision == "snooze_24h":
+            result.snooze_until = "2999-01-01T00:00:00+00:00"
+        return result
+
+    _register(monkeypatch, "a3-snooze", dispatch)
+    await install.db.create_session("proposer", source="web", actor=None)
+    nid = (await install.notifications.propose_action(
+        "proposer", target_kind="a3-snooze", target_id="item-3", title="Run it?",
+    ))["notification_id"]
+
+    async with _client(install.app()) as client:
+        snoozed = await client.post(
+            f"/api/notifications/{nid}/answer", headers=install.headers("bob"),
+            json={"answer": "snooze_24h"},
+        )
+        row = await install.db.get_notification(nid)
+        assert snoozed.status_code == 200
+        assert (row["status"], row["answered_by_actor_id"]) == ("pending", bob)
+        event = install.events_of("notification_answered")[-1]
+        assert (event["approval_status"], event["actor_id"]) == ("snoozed", bob)
+
+        # The card can still be decided; the decision names its own person.
+        approved = await client.post(
+            f"/api/notifications/{nid}/answer", headers=install.headers("alice"),
+            json={"answer": "approve"},
+        )
+    assert approved.status_code == 200
+    row = await install.db.get_notification(nid)
+    assert (row["status"], row["answered_by_actor_id"]) == ("answered", alice)
+    assert seen == [("snooze_24h", bob), ("approve", alice)]
+
+
+@pytest.mark.asyncio
 async def test_a_channel_approval_gives_the_dispatcher_no_actor(
     install, monkeypatch, audit_dir,
 ):
@@ -712,9 +768,29 @@ async def test_tool_decline_and_revision_are_system_for_the_turns_cause(install)
 
 
 @pytest.mark.asyncio
-async def test_superseding_a_plan_keeps_who_asked_for_the_revision(install):
+async def test_a_plan_proposed_in_alices_turn_is_written_by_system_for_alice(install):
+    alice = install.actor_id("alice")
+    task_id, _ = await install.pending_plan("authorship")
+    await install.db.update_plan("plan-authorship", status="declined")
+    results = install.agent_calls(
+        "alices-chat", "plan_propose", {"task_id": task_id, "content": "Do it this way"},
+    )
+    await install.db.create_session("alices-chat", source="web", actor=_actor(install, "alice"))
+    await install.engine.run("alices-chat", "plan that task", actor=_actor(install, "alice"))
+    assert results and "Plan proposed" in results[0].content[0]["text"]
+
+    (proposed,) = [p for p in await install.db.get_plans_for_task(task_id) if p["version"] == 2]
+    assert (proposed["created_by_actor_id"], proposed["caused_by_actor_id"]) == (
+        install.system_actor_id, alice,
+    )
+    assert await install.plan_reviewer(proposed["id"]) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_new_version_records_its_writer_and_the_old_keeps_its_reviewer(install):
     bob = install.actor_id("bob")
-    _, plan_id = await install.pending_plan("supersede")
+    system = install.system_actor_id
+    task_id, plan_id = await install.pending_plan("supersede")
     async with _client(install.app()) as client:
         await client.post(
             f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
@@ -726,8 +802,129 @@ async def test_superseding_a_plan_keeps_who_asked_for_the_revision(install):
     await plan_update_handler(
         _tool_ctx(install, "proposal", bob), {"plan_id": plan_id, "content": "Ship less"},
     )
-    assert (await install.db.get_plan(plan_id))["status"] == "superseded"
+    old = await install.plan_row(plan_id)
+    assert old["status"] == "superseded"
     assert await install.plan_reviewer(plan_id) == (bob, bob)
+    (new,) = [p for p in await install.db.get_plans_for_task(task_id) if p["parent_plan_id"] == plan_id]
+    assert (new["status"], new["created_by_actor_id"], new["caused_by_actor_id"]) == (
+        "pending", system, bob,
+    )
+    assert await install.plan_reviewer(new["id"]) == (None, None)
+
+
+# --------------------------------------------------------------------------- #
+#  Concurrent plan decisions                                                   #
+# --------------------------------------------------------------------------- #
+
+
+async def _stale_plan_reads(install: _Install, monkeypatch, plan_id: str) -> None:
+    """Every later ``get_plan(plan_id)`` returns the row as it is now.
+
+    A second decision that read the plan while it was still pending, before
+    the first decision wrote, sees exactly this.
+    """
+    stale = await install.db.get_plan(plan_id)
+    real = install.db.get_plan
+
+    async def _get_plan(pid):
+        return dict(stale) if pid == plan_id else await real(pid)
+
+    monkeypatch.setattr(install.db, "get_plan", _get_plan)
+
+
+@pytest.mark.asyncio
+async def test_a_second_approval_from_a_stale_read_changes_nothing(install, monkeypatch):
+    alice = install.actor_id("alice")
+    task_id, plan_id = await install.pending_plan("race-approve")
+    await _stale_plan_reads(install, monkeypatch, plan_id)
+    async with _client(install.app()) as client:
+        first = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
+        )
+        second = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.headers("bob"),
+        )
+    assert (first.status_code, second.status_code) == (200, 409)
+    impl_session_id = first.json()["impl_session_id"]
+    await install.turn_done(impl_session_id)
+
+    plan = await install.plan_row(plan_id)
+    assert (plan["status"], plan["impl_session_id"]) == ("implementing", impl_session_id)
+    assert await install.plan_reviewer(plan_id) == (alice, alice)
+    assert [run["session_id"] for run in install.impl_runs()] == [impl_session_id]
+    assert [e[0] for e in await install.task_events(task_id)] == ["pending", "in_progress"]
+
+
+@pytest.mark.asyncio
+async def test_a_decline_or_revision_after_an_approval_changes_nothing(install, monkeypatch):
+    alice = install.actor_id("alice")
+    task_id, plan_id = await install.pending_plan("race-decline")
+    await _stale_plan_reads(install, monkeypatch, plan_id)
+    async with _client(install.app()) as client:
+        approved = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
+        )
+        declined = await client.patch(
+            f"/api/plans/{plan_id}", headers=install.headers("bob"),
+            json={"status": "declined", "feedback": "too late"},
+        )
+        revised = await client.post(
+            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
+            json={"feedback": "too late"},
+        )
+    assert approved.status_code == 200
+    assert (declined.status_code, revised.status_code) == (409, 409)
+    await install.turn_done(approved.json()["impl_session_id"])
+
+    plan = await install.plan_row(plan_id)
+    assert (plan["status"], plan["feedback"]) == ("implementing", None)
+    assert await install.plan_reviewer(plan_id) == (alice, alice)
+    assert [e[0] for e in await install.task_events(task_id)] == ["pending", "in_progress"]
+    assert [run["session_id"] for run in install.runs if run["session_id"] == "proposal"] == []
+
+
+@pytest.mark.asyncio
+async def test_tool_decisions_after_an_approval_change_nothing(install, monkeypatch):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    task_id, plan_id = await install.pending_plan("race-tool")
+    await _stale_plan_reads(install, monkeypatch, plan_id)
+    async with _client(install.app()) as client:
+        approved = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
+        )
+    await install.turn_done(approved.json()["impl_session_id"])
+
+    ctx = _tool_ctx(install, "bobs-chat", bob)
+    for handler, args in (
+        (plan_approve_handler, {"plan_id": plan_id}),
+        (plan_decline_handler, {"plan_id": plan_id}),
+        (plan_revise_handler, {"plan_id": plan_id, "feedback": "again"}),
+        (plan_update_handler, {"plan_id": plan_id, "content": "Ship more"}),
+    ):
+        result = await handler(ctx, args)
+        assert "pending" in result.content[0]["text"], handler.__name__
+
+    plan = await install.plan_row(plan_id)
+    assert plan["status"] == "implementing"
+    assert await install.plan_reviewer(plan_id) == (alice, alice)
+    assert len(install.impl_runs()) == 1
+    assert [e[0] for e in await install.task_events(task_id)] == ["pending", "in_progress"]
+    assert [p["id"] for p in await install.db.get_plans_for_task(task_id)] == [plan_id]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approvals_start_one_implementation(install):
+    task_id, plan_id = await install.pending_plan("race-gather")
+    async with _client(install.app()) as client:
+        responses = await asyncio.gather(*(
+            client.post(f"/api/plans/{plan_id}/approve", headers=install.headers(name))
+            for name in ("alice", "bob", "alice", "bob")
+        ))
+    winners = [r for r in responses if r.status_code == 200]
+    assert len(winners) == 1
+    assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+    await install.turn_done(winners[0].json()["impl_session_id"])
+    assert len(install.impl_runs()) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -740,7 +937,16 @@ async def test_the_actor_directory_names_every_id_in_the_new_columns(install):
     await install.db.create_session("s", source="web", actor=None)
     question = (await install.notifications.ask_question("s", title="Q"))["notification_id"]
     note = await install.notifications.send_notification("s", title="N")
-    _, plan_id = await install.pending_plan("directory")
+    task_id, _ = await install.pending_plan("directory-old")
+    await install.db.update_plan("plan-directory-old", status="declined")
+    await plan_propose_handler(
+        _tool_ctx(install, "planner", install.actor_id("bob")),
+        {"task_id": task_id, "content": "Ship it"},
+    )
+    (plan_id,) = [
+        p["id"] for p in await install.db.get_plans_for_task(task_id)
+        if p["status"] == "pending"
+    ]
     async with _client(install.app()) as client:
         await client.post(
             f"/api/notifications/{question}/answer", headers=install.headers("alice"),
