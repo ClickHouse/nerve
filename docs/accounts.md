@@ -212,8 +212,28 @@ another cause that can act before it ends (an agent, a workflow or a
 watcher). A report turn for background tasks of different causes also has an
 unknown cause. Nerve records an unknown cause rather than the wrong person.
 
-Nerve stores the cause on the session before the turn reaches the agent. If
-that write fails, the turn does not start.
+Nerve stores a turn's cause on the session (`sessions.turn_caused_by_actor_id`)
+before the turn reaches the agent, and tries the write twice. If both writes
+fail, a turn that a message, a schedule or another Nerve caller started does
+not start. A turn that the agent starts on its own, to report background work,
+is already running in the agent: it continues with an unknown cause, and the
+session row keeps the previous cause until a later write succeeds. A restart
+in that window resumes the session for the previous cause.
+
+When Nerve sends the cause with model requests (external mode), the agent
+process gets one principal when it starts, and that process serves the whole
+session. Nerve does not stop background work (a background command, agent,
+workflow or watcher) to start the process again. So when a turn starts while
+background work that a turn of another principal started still runs, Nerve
+keeps the process:
+
+- The model requests of the new turn, and of the background work, carry the
+  principal that the process was started for. That principal is billed.
+- The new turn records an unknown cause if the background work can act while
+  it runs (an agent, a workflow or a watcher), and its own cause if the
+  background work is a command.
+- This lasts until a turn starts while no background work runs. The process
+  then starts again for that turn's cause.
 
 | Work | Actor | Cause |
 |---|---|---|
