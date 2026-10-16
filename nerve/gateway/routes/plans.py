@@ -111,6 +111,7 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, actor: Actor = Depen
             engine=deps.engine,
             plan_id=plan_id,
             feedback=req.feedback,
+            cause=actor,
         )
     except PlanNotFound:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -231,8 +232,9 @@ async def approve_plan(
                 # Nerve assembles the prompt from the task file and the
                 # approved plan, so the turn is the instance's own work even
                 # though a person's approval started it. The session above
-                # carries who approved.
+                # carries who approved, and the turn runs on their behalf.
                 actor=deps.db.system_actor,
+                cause=actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

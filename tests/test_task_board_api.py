@@ -22,6 +22,8 @@ import pytest
 import pytest_asyncio
 
 from nerve.db import Database
+from tests.actor_rows import ensure_actor_row
+from tests.conftest import TEST_ACTOR
 
 
 @pytest.mark.asyncio
@@ -55,6 +57,9 @@ class TestTaskBoardRoutes:
             _skill_manager=None,
         )
         init_deps(engine=engine, db=db)  # type: ignore[arg-type]
+        # The routes store the request's actor on task events, and the
+        # foreign key needs its row.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         app = FastAPI()
         app.include_router(tasks_router)

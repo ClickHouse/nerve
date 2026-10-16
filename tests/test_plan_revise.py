@@ -82,12 +82,14 @@ class FakeEngine:
         source: str = "web",
         *,
         actor: Actor | None,
+        cause=None,
     ) -> None:
         self.runs.append({
             "session_id": session_id,
             "user_message": user_message,
             "source": source,
             "actor": actor,
+            "cause": cause,
         })
         self.run_event.set()
 
@@ -124,6 +126,7 @@ class TestRequestPlanRevision:
         result = await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="be more specific about edge cases",
+            cause=None,
         )
 
         # Wait for the background dispatch task to actually call engine.run.
@@ -147,6 +150,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="needs more tests",
+            cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -169,6 +173,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="rev",
+            cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -191,6 +196,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="rev",
+            cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -206,6 +212,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                cause=None,
             )
         # Nothing should have been dispatched.
         assert engine.runs == []
@@ -219,6 +226,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                cause=None,
             )
 
     async def test_raises_plan_not_found(self, db: Database, tmp_path):
@@ -228,6 +236,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-does-not-exist", feedback="rev",
+                cause=None,
             )
         assert engine.runs == []
 
@@ -242,6 +251,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                cause=None,
             )
         assert engine.runs == []
 
@@ -252,6 +262,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="   ",
+                cause=None,
             )
 
 

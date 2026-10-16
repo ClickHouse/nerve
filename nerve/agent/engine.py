@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -69,7 +70,7 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
-from nerve.identity import Actor
+from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg, resolve_cause
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -254,6 +255,12 @@ class AgentEngine:
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
         self._active_channel: dict[str, str] = {}
+        # Cause actor ID of each session's current turn: the principal on
+        # whose behalf the turn runs (None = unknown). run() sets it under the
+        # session lock before it fetches the client, and keeps it when the
+        # turn ends, so autonomous CLI turns between runs keep the cause of
+        # the last turn. Read through session_cause().
+        self._turn_causes: dict[str, str | None] = {}
         # Resolved model bound to each session's live SDK client. Used to
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
@@ -375,12 +382,27 @@ class AgentEngine:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
 
+    def session_cause(self, session_id: str) -> str | None:
+        """The cause actor ID of the session's current turn.
+
+        While no turn runs, the cause of the session's last turn: autonomous
+        CLI turns between runs (a background task that settles) continue the
+        work of that turn. ``None`` when the cause is unknown, including a
+        session with no turn in this process.
+        """
+        return self._turn_causes.get(session_id)
+
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
     # ------------------------------------------------------------------ #
 
     def _build_tool_context(self, session_id: str) -> ToolContext:
-        """Fresh per-session ToolContext for backend MCP servers."""
+        """Fresh per-session ToolContext for backend MCP servers.
+
+        The agent's tool calls are the system actor's changes. The context
+        lives as long as the client, across turns, so the cause is read from
+        the session's current turn at the time of each call.
+        """
         return ToolContext(
             session_id=session_id,
             workspace=self.config.workspace,
@@ -391,6 +413,8 @@ class AgentEngine:
             skill_manager=self._skill_manager,
             engine=self,
             notification_service=self.notification_service,
+            actor=self.db.system_actor,
+            cause=functools.partial(self.session_cause, session_id),
         )
 
     def _gateway_port(self) -> int | None:
@@ -1670,6 +1694,14 @@ class AgentEngine:
                 continue
             try:
                 logger.info("Resume-after-restart: continuing session %s", sid)
+                # The continuation finishes the interrupted turn, so it runs
+                # for the cause stored on that turn's user row. Without one
+                # (an old row, input with no known person) it is the
+                # instance's own work.
+                cause = (
+                    await self.db.latest_user_turn_cause(sid)
+                    or self.db.system_actor
+                )
                 await self.run(
                     session_id=sid,
                     user_message=_RESUME_AFTER_RESTART_PROMPT,
@@ -1680,6 +1712,7 @@ class AgentEngine:
                     # the session keeps their messages; the continuation is
                     # the assistant's.
                     actor=self.db.system_actor,
+                    cause=cause,
                 )
                 resumed += 1
             except Exception as e:
@@ -2494,6 +2527,7 @@ class AgentEngine:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -2507,6 +2541,15 @@ class AgentEngine:
                       reply, whose authorship is its ``role``. Required
                       keyword-only: an autonomous caller must say so rather
                       than inherit a person's identity by omission.
+            cause: The principal on whose behalf the turn runs: an
+                      :class:`Actor`, an actor ID, or ``None`` for unknown.
+                      The default is the actor: the person for a person, the
+                      system actor for the system actor, unknown for no
+                      actor. Pass the person whose request started work that
+                      the system actor does. The cause is stored on the
+                      turn's user row, given to the turn's tool calls, and
+                      readable through :meth:`session_cause` for the length
+                      of the turn and after it.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2523,6 +2566,9 @@ class AgentEngine:
                       trigger message", and plenty of internal turns (a
                       run-later deferral, the star hook) are user-requested.
         """
+        # Resolved before the lock: an invalid cause fails here, before the
+        # session is marked as running.
+        cause_id = resolve_cause(actor, cause)
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -2539,6 +2585,10 @@ class AgentEngine:
                 self.sessions.mark_running(session_id)
                 if channel is not None:
                     self._active_channel[session_id] = channel
+                # Before _run_inner, so the cause is known when the client is
+                # fetched or built. Kept after the turn ends; see
+                # session_cause().
+                self._turn_causes[session_id] = cause_id
                 # Mark the turn as in flight so the finally below can
                 # detect "ended without sending done/stopped/error" and
                 # ship a synthetic done.  Clearing happens automatically
@@ -2554,6 +2604,7 @@ class AgentEngine:
                         image_refs=image_refs,
                         bump_updated_at=bump_updated_at,
                         actor=actor,
+                        cause_id=cause_id,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2600,6 +2651,7 @@ class AgentEngine:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        cause_id: str | None,
     ) -> str:
         # Ensure session exists in DB
         await self.sessions.get_or_create(session_id, source=source, actor=actor)
@@ -2638,6 +2690,7 @@ class AgentEngine:
                 session_id, "user", db_text, channel=channel,
                 blocks=image_refs,
                 actor=actor,
+                caused_by=cause_id,
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.

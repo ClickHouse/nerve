@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from nerve.identity import Actor
+from nerve.identity import Actor, ActorOrId, actor_id_of
 
 
 class MessageStore:
@@ -25,6 +25,7 @@ class MessageStore:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        caused_by: ActorOrId | None = None,
     ) -> int:
         """Insert a message row. ``external_id`` enables idempotent ingest
         from external sources (Codex thread sync, MCP server).
@@ -38,6 +39,10 @@ class MessageStore:
         the principal that prompted output is not stored. ``channel`` is
         transport provenance, never identity.
 
+        ``caused_by`` is the cause of the turn that a user row starts: the
+        principal on whose behalf the turn runs. Pass it on user rows that
+        start a turn; every other row keeps ``None``.
+
         ``created_at`` lets external ingesters preserve original Codex
         timestamps. Defaults to ``CURRENT_TIMESTAMP`` for native callers.
 
@@ -49,27 +54,32 @@ class MessageStore:
         left alone.
         """
         actor_id = actor.actor_id if actor else None
+        caused_by_actor_id = actor_id_of(caused_by)
         async with self._atomic():
             if created_at is not None:
                 async with self.db.execute(
                     """INSERT INTO messages
                          (session_id, role, content, thinking, blocks, channel,
-                          external_id, native_turn_id, actor_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          external_id, native_turn_id, actor_id,
+                          caused_by_actor_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id, native_turn_id, actor_id, created_at),
+                     channel, external_id, native_turn_id, actor_id,
+                     caused_by_actor_id, created_at),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             else:
                 async with self.db.execute(
                     """INSERT INTO messages
                          (session_id, role, content, thinking, blocks, channel,
-                          external_id, native_turn_id, actor_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          external_id, native_turn_id, actor_id,
+                          caused_by_actor_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (session_id, role, content, thinking,
                      json.dumps(blocks) if blocks else None,
-                     channel, external_id, native_turn_id, actor_id),
+                     channel, external_id, native_turn_id, actor_id,
+                     caused_by_actor_id),
                 ) as cursor:
                     msg_id = cursor.lastrowid
             # Update session timestamp and message counter
@@ -142,10 +152,11 @@ class MessageStore:
         the native context at, so display and context never disagree.
         Returns the number of rows copied.
 
-        ``actor_id`` is copied with the rest: a fork displays the same
-        conversation, so its copied turns keep the people who actually sent
-        them rather than being re-attributed to whoever forked. Who made the
-        *fork* is recorded on the new session's ``created_by_actor_id``.
+        ``actor_id`` and ``caused_by_actor_id`` are copied with the rest: a
+        fork displays the same conversation, so its copied turns keep the
+        people who actually sent them rather than being re-attributed to
+        whoever forked. Who made the *fork* is recorded on the new session's
+        ``created_by_actor_id``.
         """
         boundary_id: int | None = None
         if up_to_native_turn_id is not None:
@@ -173,9 +184,11 @@ class MessageStore:
             async with self.db.execute(
                 f"""INSERT INTO messages
                       (session_id, role, content, thinking, blocks, channel,
-                       external_id, native_turn_id, actor_id, created_at)
+                       external_id, native_turn_id, actor_id,
+                       caused_by_actor_id, created_at)
                     SELECT ?, role, content, thinking, blocks, channel,
-                           'forkcopy:' || id, native_turn_id, actor_id, created_at
+                           'forkcopy:' || id, native_turn_id, actor_id,
+                           caused_by_actor_id, created_at
                     FROM messages WHERE {where} ORDER BY id ASC""",
                 params,
             ) as cursor:
@@ -355,6 +368,21 @@ class MessageStore:
                 )
                 return row["id"]
         return None
+
+    async def latest_user_turn_cause(self, session_id: str) -> str | None:
+        """The cause stored on the session's newest user row.
+
+        ``None`` when the session has no user row, or when that row has no
+        cause (input with no known person, or a row older than v053).
+        """
+        async with self.db.execute(
+            """SELECT caused_by_actor_id FROM messages
+               WHERE session_id = ? AND role = 'user'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def get_messages(
         self, session_id: str, limit: int = 500, offset: int = 0

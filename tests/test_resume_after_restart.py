@@ -21,15 +21,22 @@ from tests.actor_rows import FAKE_SYSTEM_ACTOR
 #  Daemon side: AgentEngine.resume_enrolled_sessions                          #
 # --------------------------------------------------------------------------- #
 
-def _engine_with(sessions_by_id: dict) -> AgentEngine:
-    """Bare AgentEngine stub exercising only resume_enrolled_sessions' deps."""
+def _engine_with(sessions_by_id: dict, causes: dict | None = None) -> AgentEngine:
+    """Bare AgentEngine stub exercising only resume_enrolled_sessions' deps.
+
+    ``causes`` maps a session ID to the cause stored on its newest user row.
+    """
     engine = AgentEngine.__new__(AgentEngine)
 
     async def _get_session(sid):
         return sessions_by_id.get(sid)
 
+    async def _latest_user_turn_cause(sid):
+        return (causes or {}).get(sid)
+
     engine.db = SimpleNamespace(
         get_session=AsyncMock(side_effect=_get_session),
+        latest_user_turn_cause=AsyncMock(side_effect=_latest_user_turn_cause),
         # The resume trigger is the instance's own, so the drainer passes the
         # system actor to run().
         system_actor=FAKE_SYSTEM_ACTOR,
@@ -71,6 +78,33 @@ async def test_resumes_valid_session_and_drains_file(tmp_path):
     assert kwargs["internal"] is True
     assert kwargs["source"] == "web"
     assert kwargs["user_message"] == _RESUME_AFTER_RESTART_PROMPT
+
+
+ALICE_ACTOR_ID = "00000000-0000-4000-8000-0000000a11ce"
+
+
+@pytest.mark.asyncio
+async def test_resume_runs_for_the_cause_of_the_interrupted_turn(tmp_path):
+    qf = tmp_path / "resume-after-restart"
+    qf.write_text("S1\n")
+    engine = _engine_with({"S1": _session("S1")}, causes={"S1": ALICE_ACTOR_ID})
+    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
+        assert await engine.resume_enrolled_sessions() == 1
+    kwargs = engine.run.await_args.kwargs
+    assert kwargs["actor"] == FAKE_SYSTEM_ACTOR
+    assert kwargs["cause"] == ALICE_ACTOR_ID
+
+
+@pytest.mark.asyncio
+async def test_resume_without_a_stored_cause_runs_for_the_system_actor(tmp_path):
+    qf = tmp_path / "resume-after-restart"
+    qf.write_text("S1\n")
+    engine = _engine_with({"S1": _session("S1")})
+    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
+        assert await engine.resume_enrolled_sessions() == 1
+    kwargs = engine.run.await_args.kwargs
+    assert kwargs["actor"] == FAKE_SYSTEM_ACTOR
+    assert kwargs["cause"] == FAKE_SYSTEM_ACTOR
 
 
 @pytest.mark.asyncio

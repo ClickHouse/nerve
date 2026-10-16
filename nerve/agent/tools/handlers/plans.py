@@ -227,8 +227,10 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     plan_type = plan.get("plan_type", "generic")
 
     # The agent approved this plan through its own tool, so both the session
-    # and the run it dispatches are the instance's own work.
+    # and the run it dispatches are the instance's own work. The run is on
+    # behalf of the cause of the turn that approved it.
     impl_actor = ctx.db.system_actor
+    impl_cause = ctx.cause_id
 
     # Mark as implementing (prevents double-approve)
     await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
@@ -301,7 +303,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
-                actor=impl_actor,
+                actor=impl_actor, cause=impl_cause,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)
@@ -381,6 +383,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await request_plan_revision(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
+            cause=ctx.cause_id,
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")

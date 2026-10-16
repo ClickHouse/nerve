@@ -17,12 +17,20 @@ only for the checker — so ``nerve.db`` can import this module without a cycle.
 taken when the actor was resolved. Renaming an account changes what later
 requests carry and rewrites nothing stored before. Names are never identity or
 authorization keys.
+
+A write records two IDs. The *actor* made the change: a person through the UI,
+REST or the browser WebSocket, or the system actor for a tool call, a cron job
+or any other internal process. The *cause* is the principal on whose behalf
+the work happens: the person for a change that the person made, and for work
+by the system actor the person whose request started it, or the system actor
+for autonomous work. ``None`` in either position means unknown.
+:func:`attribution_for` builds the pair for one write.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
@@ -67,6 +75,72 @@ class Actor:
     @property
     def is_human(self) -> bool:
         return self.kind == ACTOR_KIND_HUMAN
+
+
+# An actor, or the ``actor_refs`` ID of one. A cause that comes from storage
+# (the user row of an interrupted turn, a wakeup row) is an ID; a cause that
+# comes from a request is the resolved :class:`Actor`.
+ActorOrId: TypeAlias = "Actor | str"
+
+
+class CauseFromActor:
+    """Type of the :data:`CAUSE_FROM_ACTOR` sentinel."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "CAUSE_FROM_ACTOR"
+
+
+# Default for a cause argument: the cause is the actor. A person acts for
+# themselves, the system actor acts for itself, and no actor gives no cause.
+# A separate sentinel is necessary because ``None`` is a real cause: unknown.
+CAUSE_FROM_ACTOR = CauseFromActor()
+
+CauseArg: TypeAlias = "ActorOrId | None | CauseFromActor"
+
+
+def actor_id_of(ref: ActorOrId | None) -> str | None:
+    """The actor ID that ``ref`` names, or ``None`` for no actor."""
+    if ref is None:
+        return None
+    if isinstance(ref, Actor):
+        return ref.actor_id
+    if isinstance(ref, str) and ref:
+        return ref
+    raise ValueError(f"an actor reference must be an Actor or an actor ID, got {ref!r}")
+
+
+def resolve_cause(actor: ActorOrId | None, cause: CauseArg = CAUSE_FROM_ACTOR) -> str | None:
+    """The cause actor ID for one write or one turn."""
+    if isinstance(cause, CauseFromActor):
+        return actor_id_of(actor)
+    return actor_id_of(cause)
+
+
+@dataclass(frozen=True, slots=True)
+class Attribution:
+    """The ``(actor_id, caused_by_actor_id)`` pair that one write records.
+
+    Every store method that records attribution takes one of these, so that
+    all writes get the two values from the same rule. The store maps the two
+    fields to its own column names.
+    """
+
+    actor_id: str | None = None
+    caused_by_actor_id: str | None = None
+
+
+# Nothing is known about who made the change.
+UNATTRIBUTED = Attribution()
+
+
+def attribution_for(actor: ActorOrId | None, cause: CauseArg = CAUSE_FROM_ACTOR) -> Attribution:
+    """Build the pair for a write by ``actor`` on behalf of ``cause``."""
+    return Attribution(
+        actor_id=actor_id_of(actor),
+        caused_by_actor_id=resolve_cause(actor, cause),
+    )
 
 
 def _actor_for_account_row(account: dict) -> Actor:

@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 
 from nerve.db import Database
-from nerve.identity import Actor
+from nerve.identity import Actor, ActorOrId
 
 logger = logging.getLogger(__name__)
 
@@ -645,11 +645,13 @@ class SessionManager:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        caused_by: ActorOrId | None = None,
     ) -> int:
         """Add a message to a session's history.
 
         ``actor`` is the principal whose input this row records, or ``None``
-        for assistant and tool output — see
+        for assistant and tool output, and ``caused_by`` is the cause of the
+        turn that a user row starts. See
         :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the
@@ -662,6 +664,7 @@ class SessionManager:
             native_turn_id=native_turn_id,
             bump_updated_at=bump_updated_at,
             actor=actor,
+            caused_by=caused_by,
         )
 
     async def get_conversation_history(

@@ -357,6 +357,7 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 tags=tags_to_string(tags),
                 content=content,
                 actor=ctx.session_id,
+                attribution=ctx.attribution,
             )
         except Exception:
             # A claimed ID is now sticky, so a half-done create would burn it:
@@ -541,7 +542,8 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 write = lambda: write_task_file(file_path, content)
                 kw = dict(
                     task_id=task_id, file_path=task["file_path"], title=final_title,
-                    status=final_status, content=content, actor=ctx.session_id, **edits,
+                    status=final_status, content=content, actor=ctx.session_id,
+                    attribution=ctx.attribution, **edits,
                 )
                 # Without a token the order stays file-then-row, as before. With
                 # one the row is written first, so a refused caller writes no file.
@@ -574,6 +576,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if status:
             applied = await ctx.db.transition_task(
                 task_id, status, expect_revision=expect_revision, actor=ctx.session_id,
+                attribution=ctx.attribution,
                 **({"tags": new_tags_str} if raw_tags is not None else {}),
             )
         elif raw_tags is not None:
@@ -668,6 +671,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
         status=task["status"],
         deadline=new_deadline or None,
         content=new_content,
+        attribution=ctx.attribution,
         **edits,
     )
 
@@ -711,19 +715,21 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if expect_revision is None:
                 await asyncio.to_thread(move_task_file, src, dst, content)
                 await ctx.db.transition_task(
-                    task_id, "done", actor=ctx.session_id,
+                    task_id, "done", actor=ctx.session_id, attribution=ctx.attribution,
                     file_path=rel_path, content=content,
                 )
             else:
                 if not await ctx.db.transition_task(
                     task_id, "done", expect_revision=expect_revision,
-                    actor=ctx.session_id, file_path=rel_path, content=content,
+                    actor=ctx.session_id, attribution=ctx.attribution,
+                    file_path=rel_path, content=content,
                 ):
                     return _revision_conflict(task_id, expect_revision)
                 await asyncio.to_thread(move_task_file, src, dst, content)
         else:
             done = await ctx.db.transition_task(
                 task_id, "done", expect_revision=expect_revision, actor=ctx.session_id,
+                attribution=ctx.attribution,
             )
             if not done and expect_revision is not None:
                 return _revision_conflict(task_id, expect_revision)
@@ -803,6 +809,7 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     kw: dict = dict(
         expect=(TERMINAL_STATUS,), expect_revision=expect_revision, actor=ctx.session_id,
+        attribution=ctx.attribution,
     )
     if src is not None:
         content = await asyncio.to_thread(src.read_text, encoding="utf-8")

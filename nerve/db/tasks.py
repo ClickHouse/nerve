@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from nerve.identity import UNATTRIBUTED, Attribution
+
 
 # Spacing between task ranks (``tasks.position``). Wide enough that a
 # midpoint insert has ~50 levels of headroom before float precision runs
@@ -69,6 +71,7 @@ class TaskStore:
         actor: str = "system",
         *,
         expect_revision: int | None = None,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
         """Insert or update a task row and its FTS entry.
 
@@ -95,6 +98,9 @@ class TaskStore:
         ``revision`` still equals it, and otherwise writes nothing and returns
         ``False``. Without it the call inserts or updates unconditionally and
         returns ``True``.
+
+        ``actor`` and ``attribution`` go to the status event that a status
+        change records; see :meth:`_record_status_event`.
         """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
@@ -139,7 +145,9 @@ class TaskStore:
             await cursor.close()
             if expect_revision is not None and (rowcount or 0) != 1:
                 return False
-            await self._record_status_event(task_id, previous_status, status, actor)
+            await self._record_status_event(
+                task_id, previous_status, status, actor, attribution,
+            )
             await self._sync_task_fts(task_id, title, content, tags)
         return True
 
@@ -151,6 +159,7 @@ class TaskStore:
         expect: tuple[str, ...] = (),
         expect_revision: int | None = None,
         actor: str = "system",
+        attribution: Attribution = UNATTRIBUTED,
         content: str | None = None,
         **fields,
     ) -> bool:
@@ -206,7 +215,9 @@ class TaskStore:
             await cursor.close()
             if not applied:
                 return False
-            await self._record_status_event(task_id, row["status"], to_status, actor)
+            await self._record_status_event(
+                task_id, row["status"], to_status, actor, attribution,
+            )
             if content is not None:
                 await self._sync_task_fts(
                     task_id, fields.get("title", row["title"]), content,
@@ -241,6 +252,7 @@ class TaskStore:
         from_status: str | None,
         to_status: str,
         actor: str,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> None:
         """Append a transition to ``task_events``, if it is one.
 
@@ -254,14 +266,20 @@ class TaskStore:
         is recorded. The single case where reindex *does* change a status —
         resetting an orphaned row to match its directory — is a real
         correction and worth a row.
+
+        ``actor`` is the free-text origin of the change (``web``, a session
+        ID, ``system``). ``attribution`` names the actor that made the change
+        and the principal it was made for, as ``actor_refs`` IDs.
         """
         if from_status == to_status:
             return
         await self.db.execute(
-            "INSERT INTO task_events (task_id, from_status, to_status, actor, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO task_events (task_id, from_status, to_status, actor, "
+            "actor_id, caused_by_actor_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id, from_status, to_status, actor or "system",
+                attribution.actor_id, attribution.caused_by_actor_id,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -425,6 +443,7 @@ class TaskStore:
         before_id: str | None = None,
         after_id: str | None = None,
         actor: str = "system",
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict | None:
         """Place a task at an explicit slot in a lane; return the new row.
 
@@ -466,7 +485,7 @@ class TaskStore:
             # A pure reorder leaves status alone, and _record_status_event
             # drops the no-op — so dragging within a lane doesn't pollute
             # the history with rows that say nothing changed.
-            await self._record_status_event(task_id, row[0], lane, actor)
+            await self._record_status_event(task_id, row[0], lane, actor, attribution)
             async with self.db.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,),
             ) as cursor:
@@ -561,9 +580,10 @@ class TaskStore:
 
     async def update_task_status(
         self, task_id: str, status: str, actor: str = "system",
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> None:
         """An unconditional :meth:`transition_task`; a missing row is a no-op."""
-        await self.transition_task(task_id, status, actor=actor)
+        await self.transition_task(task_id, status, actor=actor, attribution=attribution)
 
     async def update_task_tags(
         self, task_id: str, tags: str, *, expect_revision: int | None = None,

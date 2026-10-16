@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
+    from nerve.identity import ActorOrId
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ async def request_plan_revision(
     engine: "AgentEngine",
     plan_id: str,
     feedback: str,
+    *,
+    cause: "ActorOrId | None",
 ) -> dict:
     """Persist revision feedback and dispatch a revision prompt to the planner.
 
@@ -65,6 +68,9 @@ async def request_plan_revision(
         engine: AgentEngine instance (used to ensure session + dispatch run).
         plan_id: The pending plan to revise.
         feedback: Free-text feedback explaining what should change.
+        cause: Who asked for the revision: the person for the HTTP route,
+            the cause of the calling turn for the tool. The revision turn
+            runs as the system actor on behalf of this principal.
 
     Returns:
         ``{"plan_id", "task_id", "session_id", "status"}`` on success.
@@ -154,6 +160,7 @@ async def request_plan_revision(
             # The revision prompt is built from a template here, not typed by
             # the person who asked for the revision.
             actor=engine.db.system_actor,
+            cause=cause,
         )
     )
 
