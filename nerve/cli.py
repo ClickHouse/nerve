@@ -222,12 +222,16 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--keep-env", is_flag=True,
     help="Slim setup: pass ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from this shell to the daemon",
 )
+@click.option(
+    "--serve-next", is_flag=True, hidden=True,
+    help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool,
+    keep_env: bool, serve_next: bool = False,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
@@ -248,6 +252,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
+            system_principal=not serve_next,
         )
         return
 
@@ -738,6 +743,7 @@ def _slim_init(
     clipboard: bool,
     yes: bool,
     keep_env: bool = False,
+    system_principal: bool = True,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -761,11 +767,16 @@ def _slim_init(
 
         # The owner account exists before the daemon answers, so the setup
         # token is available the moment /health is green. No name: the setup
-        # page asks.
+        # page asks. ``system_principal`` is false when this process serves
+        # next (``nerve start -f``): the gateway's bootstrap reads
+        # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, once.
         from nerve.migrate import bootstrap_identity_sync
 
         try:
-            bootstrap_identity_sync(config, display_name=None, passwordless=False)
+            bootstrap_identity_sync(
+                config, display_name=None, passwordless=False,
+                system_principal=system_principal,
+            )
         except Exception as e:  # noqa: BLE001 — the files are written; say what is missing
             raise click.ClickException(
                 f"Setup wrote the configuration, but the local owner account could not "
@@ -874,11 +885,13 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
-    # The gateway runs the identity bootstrap when it starts.
+    # The gateway runs the identity bootstrap when it starts. It also reads
+    # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, so the preview here does not.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
             config_dir, workspace=getattr(config, "workspace", None), config=config,
+            preview_system_principal=False,
         )
         if report is not None and report.did_anything:
             # The config in hand was loaded from the old locations, and migration
@@ -903,7 +916,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
             # `start --foreground` would otherwise exit 1 and leave an
             # unsupervised daemon holding the port).
             click.echo("Fresh install detected — running setup...")
-            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True)
+            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True, serve_next=True)
             config = ctx.obj.get("config")
             if config is None:
                 raise click.ClickException(
@@ -1553,6 +1566,44 @@ def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
+def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
+    """Doctor lines about ``NERVE_SYSTEM_PRINCIPAL_ID``: ``(lines, warnings)``.
+
+    Like the auth mode, the value comes from this shell, not from the running
+    server. Nothing is reported when the variable is unset here.
+    """
+    from nerve.db.accounts import inspect_system_actor
+    from nerve.identity import (
+        SYSTEM_PRINCIPAL_ENV,
+        InvalidSystemPrincipalId,
+        system_principal_id_from_env,
+    )
+
+    label = f"System actor ({SYSTEM_PRINCIPAL_ENV} from this shell)"
+    if not external:
+        if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
+            return [f"[--] {label}: set, but it has no effect in local mode"], []
+        return [], []
+    try:
+        wanted = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        return [], [f"[WARN] {label}: {e}. The server keeps the current system actor ID."]
+    if wanted is None:
+        return [], []
+    state = inspect_system_actor(paths.db_path(), wanted)
+    if state is None:
+        return [f"[--] {label}: no system actor yet; the next start gives it {wanted}"], []
+    current, blocker = state
+    if current == wanted:
+        return [f"[OK] {label}: {current}"], []
+    if blocker is None:
+        return [f"[--] {label}: {current}; the next start changes it to {wanted}"], []
+    return [], [
+        f"[WARN] {label}: keeps the current ID {current}, not {wanted}: {blocker}. "
+        "Autonomous work is attributed to that ID."
+    ]
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -1991,6 +2042,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "[WARN] auth.password_hash is set but no account uses it — every "
                 "account has its own password now; the configured value does nothing"
             )
+    if mode is not None:
+        ok, warn = _system_principal_report(external=external)
+        lines.extend(ok)
+        warnings.extend(warn)
 
     # The setup checklist: the same derivation the setup page uses, over the
     # facts this process can read. Never prints the token — `nerve status`
