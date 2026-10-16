@@ -512,6 +512,13 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
 - `status` — `success`, `error`, or `missed` (see [Late runs](#late-runs))
 - `output` — First 2000 chars of response / summary
 - `error` — Error message if failed
+- `actor_id` / `caused_by_actor_id` — Who started the run, and on whose
+  behalf: the system actor for a scheduled, catch-up or missed run, or for
+  `nerve cron <id>`; the person who triggered the run through the web UI or
+  `POST /api/cron/jobs/{job_id}/trigger`. A session that a person's run
+  creates has that person as its cause, so the agent's work in it is the
+  system actor's for that person. See
+  [Attribution](accounts.md#attribution).
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 

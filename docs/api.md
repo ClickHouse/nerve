@@ -795,6 +795,13 @@ whose behalf all agent work in the session runs. Nerve sets it when it creates
 the session and never changes it (an actor id, or `null` when unknown). See
 [Attribution](accounts.md#attribution).
 
+Session list rows carry `pending_wakeup_at`, the fire time of the session's
+pending wakeup or deferred message (`null` when there is none), with
+`pending_wakeup_created_by_actor_id` (who scheduled it: a person, or the
+system actor when the agent did) and `pending_wakeup_caused_by_actor_id` (on
+whose behalf it was scheduled; the turn that it fires runs for the session's
+cause). The `session_running` WebSocket event carries the same three fields.
+
 #### `GET /api/sessions/{id}`
 Get session details.
 
@@ -1321,13 +1328,30 @@ combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
 runners and missed runs).
 
+Each log row also carries `actor_id` (who started the run) and
+`caused_by_actor_id` (on whose behalf). Both are the system actor for a
+scheduled run, and the person for a run that a person started with
+`POST /api/cron/jobs/{job_id}/trigger`. Both are `null` on older rows. See
+[Attribution](accounts.md#attribution).
+
 ```json
 Response: {
-  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", ... } ],
+  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "actor_id": "…", "caused_by_actor_id": "…", ... } ],
   "total": 234,
   "limit": 50,
   "offset": 0
 }
+```
+
+#### `POST /api/cron/jobs/{job_id}/trigger`
+Run a cron job or a source runner now, and wait until the run ends. The run
+log records the signed-in person as actor and cause. A session that the run
+creates (an isolated run, or a new generation of a persistent job) has the
+person as its cause; a persistent job's current session keeps its cause.
+Returns 404 for an unknown job.
+
+```json
+Response: { "job_id": "morning-briefing", "triggered": true }
 ```
 
 ### Health

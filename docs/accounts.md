@@ -203,6 +203,8 @@ These columns store actor IDs:
 | `review_loops.created_by_actor_id`, `review_loops.caused_by_actor_id` | Actor and cause of a review loop. Each leg session of the loop is created with this cause |
 | `review_loops.killed_by_actor_id`, `review_loops.killed_caused_by_actor_id` | Actor and cause of the kill of a review loop |
 | `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
+| `session_wakeups.created_by_actor_id`, `session_wakeups.caused_by_actor_id` | Who scheduled a wakeup or a deferred message, and on whose behalf. The turn that it fires runs in its session, for the session's cause |
+| `cron_logs.actor_id`, `cron_logs.caused_by_actor_id` | Who started a cron or source run, and on whose behalf |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -218,6 +220,7 @@ never changes it:
 |---|---|
 | A person creates or forks a session (web UI, REST API, browser WebSocket) | That person |
 | A cron job or a hook session | The system actor |
+| A cron job session that a person's "Run now" creates (an isolated run, or a new generation of a persistent job) | That person. A persistent job's current generation keeps its cause |
 | A plan implementation session after an approval through the REST API | The person who approved |
 | A plan implementation session after the agent approved the plan | The cause of the session in which the agent approved it |
 | A planner session that a revision request creates | The person who asked for the revision |
@@ -237,7 +240,11 @@ This is an approximation in two places:
   attributed to the person who started the session, also in turns that
   another person sent.
 - A deferred message ("run later") or a wakeup that runs in an existing session
-  is attributed to that session's cause.
+  is attributed to that session's cause, also when another person deferred
+  the message.
+- A persistent cron job reuses its current session. When a person's "Run
+  now" started that session, the later scheduled runs in it are attributed
+  to that person until the session rotates.
 
 In external mode, the model requests of a session name the session's cause
 in the same way, so the same approximation applies to model usage. See
@@ -254,6 +261,10 @@ in the same way, so the same approximation applies to model usage. See
 | A person starts or kills a workflow run or a review loop through the web UI or the REST API, or decides on a parked loop through the REST API or its decision card in the web UI | The person | The person |
 | The agent starts or kills a workflow run or a review loop | The system actor | The session's cause |
 | The message that relays a web answer into the session that asked | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
+| A scheduled cron or source run (also a catch-up or missed run, and `nerve cron <id>`) | The system actor on the run log | The system actor |
+| A person starts a cron or source run from the web UI or with `POST /api/cron/jobs/{job_id}/trigger` | The person on the run log | The person |
+| A person defers a message with "Run later" | The person on the wakeup row | The person |
+| The agent schedules a wakeup (`ScheduleWakeup`, `schedule_wakeup`) | The system actor | The session's cause |
 | Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
 | An answer through Telegram, Slack, or a hosted channel (also a decision on a review-loop card), and the message that relays it | None | None |
 | Assistant and tool output | None | None |
