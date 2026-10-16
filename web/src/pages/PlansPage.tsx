@@ -7,6 +7,8 @@ import { Badge, type BadgeTone, Button, PageHeader } from '../components/ui';
 /** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
 const STATUS_TONES: Record<string, BadgeTone> = {
   pending: 'warning',
+  // A revision request won; the planner writes a new version.
+  revising: 'warning',
   approved: 'success',
   implementing: 'info',
   declined: 'danger',
@@ -23,6 +25,7 @@ const TYPE_LABELS: Record<string, string> = {
 const FILTERS = [
   { label: 'All', value: '' },
   { label: 'Pending', value: 'pending' },
+  { label: 'Revising', value: 'revising' },
   { label: 'Approved', value: 'approved' },
   { label: 'Implementing', value: 'implementing' },
   { label: 'Declined', value: 'declined' },
