@@ -37,6 +37,7 @@ function sourceIcon(source: string) {
     case 'gmail': return <Mail size={14} className="text-hue-red" />;
     case 'github': return <Github size={14} className="text-hue-purple" />;
     case 'github_repos': return <Github size={14} className="text-hue-purple" />;
+    case 'github_repo_events': return <Github size={14} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={14} className="text-hue-blue" />;
     case 'slack': return <Slack size={14} className="text-hue-emerald" />;
     default: return <Inbox size={14} className="text-text-dim" />;
@@ -53,6 +54,7 @@ function sourceBadgeTone(source: string): BadgeTone {
     case 'gmail': return 'danger';
     case 'github': return 'purple';
     case 'github_repos': return 'purple';
+    case 'github_repo_events': return 'purple';
     case 'telegram': return 'info';
     // `accent` rather than `success`: the tone has to say "Slack", and a
     // status token would say the row went well.
