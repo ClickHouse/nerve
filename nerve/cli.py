@@ -1587,7 +1587,7 @@ def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
     try:
         wanted = system_principal_id_from_env()
     except InvalidSystemPrincipalId as e:
-        return [], [f"[WARN] {label}: {e}. The server keeps the local system actor ID."]
+        return [], [f"[WARN] {label}: {e}. The server keeps the current system actor ID."]
     if wanted is None:
         return [], []
     state = inspect_system_actor(paths.db_path(), wanted)
@@ -1599,8 +1599,8 @@ def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
     if blocker is None:
         return [f"[--] {label}: {current}; the next start changes it to {wanted}"], []
     return [], [
-        f"[WARN] {label}: keeps the local ID {current}, not {wanted}: {blocker}. "
-        "Autonomous work is attributed to the local ID."
+        f"[WARN] {label}: keeps the current ID {current}, not {wanted}: {blocker}. "
+        "Autonomous work is attributed to that ID."
     ]
 
 

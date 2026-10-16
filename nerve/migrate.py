@@ -1547,7 +1547,7 @@ def _note_ignored_system_principal() -> None:
     if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
         logger.info(
             "Identity: %s is set, but it has no effect in local mode; the system "
-            "actor keeps its local ID", SYSTEM_PRINCIPAL_ENV,
+            "actor keeps its current ID", SYSTEM_PRINCIPAL_ENV,
         )
 
 
@@ -1729,7 +1729,7 @@ def _inspect_system_principal(db_path: Path, report: MigrationReport) -> None:
     try:
         new_id = system_principal_id_from_env()
     except InvalidSystemPrincipalId as e:
-        report.warnings.append(f"the system actor keeps its local ID: {e}")
+        report.warnings.append(f"the system actor keeps its current ID: {e}")
         return
     if new_id is None:
         return
