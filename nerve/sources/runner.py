@@ -5,7 +5,8 @@ source_messages inbox, optionally condenses long content via LLM,
 and advances the cursor. No processing (agent/memorize/notify) —
 consumption is handled separately by consumer tools.
 
-Pipeline: fetch → source.preprocess → persist → LLM condense → advance cursor
+Pipeline: fetch → source.preprocess → guardrail → persist → LLM condense
+→ drop hook → advance cursor
 
 A run repeats that pipeline while the source reports ``has_more``, so a backlog
 deeper than ``batch_size`` drains in one run rather than one batch per tick.
@@ -14,7 +15,12 @@ deeper than ``batch_size`` drains in one run rather than one batch per tick.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
+import os
+import signal
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
@@ -95,6 +101,18 @@ _CONDENSE_THRESHOLD = 800  # chars
 # otherwise drop hundreds at once).
 _MAX_DROP_LOG_LINES = 10
 
+# Wall-clock cap on one drop-hook run. The hook runs inside the sync, under
+# the runner's lock, so a hung command must not stall the source.
+_DROP_HOOK_TIMEOUT_SECS = 60
+
+# After the timeout kill: how long to wait for the hook to be reaped. Bounds
+# the case of a process that left the hook's process group (setsid) and so
+# survived the group kill.
+_DROP_HOOK_REAP_SECS = 5
+
+# Tail of a drop hook's stderr kept in the log line.
+_DROP_HOOK_STDERR_CHARS = 500
+
 # Batches one run drains before leaving the rest for the next tick. Bounds a
 # very deep backlog, and a source whose has_more never goes false.
 _MAX_PASSES = 20
@@ -111,6 +129,17 @@ _CONDENSE_PROMPT = (
     "- Return ONLY the cleaned content, no preamble or commentary\n"
     "- If the message is mostly noise, return just the 1-2 core facts"
 )
+
+
+def _file_tail(f: Any, max_chars: int) -> str:
+    """The last *max_chars* of a binary file, decoded and stripped."""
+    try:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_chars * 4))
+        return f.read().decode(errors="replace").strip()[-max_chars:]
+    except (OSError, ValueError):
+        return ""
 
 
 @dataclass
@@ -145,6 +174,10 @@ class SourceRunner:
             persist. Records that don't pass are dropped — never written to
             the inbox, never seen by the agent. An inactive/None filter is a
             no-op. See :mod:`nerve.sources.filters`.
+        drop_hook: Optional argv of a command run when the guardrail drops
+            records. It reads one JSON object per dropped record on stdin.
+            Best effort: a failure is logged and never fails the sync. See
+            :meth:`_run_drop_hook`.
         schedule: Crontab or interval this runner asks to be scheduled on.
             Empty means "look me up in ``config.sync.<name>``", which is how
             every pull source works. A source configured somewhere else —
@@ -165,6 +198,7 @@ class SourceRunner:
         condense_client_factory: Callable[[], Any] | None = None,
         ttl_days: int = 7,
         inbox_filter: InboxFilter | None = None,
+        drop_hook: list[str] | None = None,
         schedule: str = "",
     ):
         self.source = source
@@ -180,6 +214,7 @@ class SourceRunner:
         self._client_factory = condense_client_factory
         self.ttl_days = ttl_days
         self.inbox_filter = inbox_filter
+        self.drop_hook = self._valid_drop_hook(drop_hook)
         self.schedule = schedule
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
@@ -213,7 +248,7 @@ class SourceRunner:
             logger.warning("Failed to send health notification: %s", e)
 
     async def run(self) -> IngestResult:
-        """Full ingestion cycle: fetch → preprocess → persist → condense → advance cursor.
+        """Full ingestion cycle: fetch → preprocess → guardrail → persist → condense → drop hook → advance cursor.
 
         Uses a per-runner lock to prevent concurrent execution (e.g. cron
         firing while a manual sync is in progress).  If the lock is already
@@ -308,7 +343,7 @@ class SourceRunner:
         )
 
     async def _ingest_batch(self, cursor: str | None) -> _BatchResult:
-        """One fetch → preprocess → persist → condense → advance cycle."""
+        """One fetch → preprocess → guardrail → persist → condense → drop hook → advance cycle."""
         logger.info(
             "Source %s: fetching (cursor=%s, batch_size=%d)",
             self.source.source_name, cursor, self.batch_size,
@@ -342,14 +377,13 @@ class SourceRunner:
         # the choke point — dropped records are never persisted, so the agent
         # can never see them (worker-mode safety). The cursor still advances
         # below, so dropped records are not re-fetched.
-        dropped_count = 0
+        dropped: list[SourceRecord] = []
         if self.inbox_filter is not None and self.inbox_filter.active:
             kept, dropped = self.inbox_filter.partition(records)
-            dropped_count = len(dropped)
             if dropped:
                 logger.info(
                     "Source %s: guardrail dropped %d/%d records (e.g. %r)",
-                    self.source.source_name, dropped_count, len(records),
+                    self.source.source_name, len(dropped), len(records),
                     dropped[0].summary,
                 )
                 # Name the rule that fired — the summary alone can't tell a
@@ -364,6 +398,7 @@ class SourceRunner:
                         (record.metadata or {}).get(field), record.summary,
                     )
             records = kept
+        dropped_count = len(dropped)
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
         try:
@@ -394,6 +429,19 @@ class SourceRunner:
             if processed_map:
                 await self._update_processed_content(processed_map)
 
+        # 3b. Hand the dropped records to the drop hook. After persist, so a
+        # failed persist (which returns above without advancing the cursor)
+        # re-fetches the batch and the hook sees its drops then. Before the
+        # cursor advances, so a crash in between runs the hook again rather
+        # than never: at-least-once, which is why a hook must be idempotent.
+        if dropped and self.drop_hook:
+            try:
+                await self._run_drop_hook(dropped)
+            except Exception:  # noqa: BLE001 — a hook must never hold back the cursor
+                logger.warning(
+                    "Source %s: drop hook failed", self.source.source_name, exc_info=True,
+                )
+
         # 4. Advance source cursor (ingestion complete)
         if result.next_cursor is not None:
             await self.db.set_sync_cursor(self.source.source_name, result.next_cursor)
@@ -408,6 +456,154 @@ class SourceRunner:
             next_cursor=result.next_cursor,
             has_more=result.has_more,
         )
+
+    # ------------------------------------------------------------------
+    # Drop hook
+    # ------------------------------------------------------------------
+
+    def _valid_drop_hook(self, drop_hook: object) -> list[str]:
+        """The hook argv, or ``[]`` (off) when the configured value is unusable.
+
+        Config coercion turns list entries into strings, but leaves a value of
+        the wrong shape (a mapping, say) as it is.
+        """
+        if not drop_hook:
+            return []
+        # Types only in these messages: the value can carry arguments such as
+        # tokens, and only argv[0] is ever logged.
+        if not isinstance(drop_hook, (list, tuple)):
+            logger.warning(
+                "Source %s: drop hook must be a list of strings, got a %s — hook disabled",
+                self.source.source_name, type(drop_hook).__name__,
+            )
+            return []
+        bad = sorted({type(arg).__name__ for arg in drop_hook if not isinstance(arg, str)})
+        if bad:
+            logger.warning(
+                "Source %s: drop hook entries must be strings, got %s — hook disabled",
+                self.source.source_name, ", ".join(bad),
+            )
+            return []
+        if not drop_hook[0].strip():
+            logger.warning(
+                "Source %s: drop hook has an empty program name — hook disabled",
+                self.source.source_name,
+            )
+            return []
+        return list(drop_hook)
+
+    @staticmethod
+    def _drop_hook_payload(
+        dropped: list[SourceRecord], inbox_filter: InboxFilter | None,
+    ) -> bytes:
+        """One JSON line per dropped record — identifiers and metadata, no content."""
+        lines = []
+        for record in dropped:
+            rule = inbox_filter.rejects(record) if inbox_filter else None
+            lines.append(json.dumps({
+                "source": record.source,
+                "id": record.id,
+                "record_type": record.record_type,
+                "summary": record.summary,
+                "timestamp": record.timestamp,
+                "metadata": record.metadata or {},
+                "dropped_on": rule.field if rule else None,
+            }, default=str))
+        return ("\n".join(lines) + "\n").encode()
+
+    async def _run_drop_hook(self, dropped: list[SourceRecord]) -> None:
+        """Pipe the records the guardrail dropped to the ``drop_hook`` command.
+
+        Dropped records are never persisted, so this is the only point where
+        anything can act on a drop — for example, acknowledge the person whose
+        message the agent will never see.
+
+        stdin carries one JSON object per line: ``source``, ``id``,
+        ``record_type``, ``summary``, ``timestamp``, ``metadata``, and
+        ``dropped_on`` (the field of the rule that fired). The content is left
+        out on purpose. The guardrail exists to keep it away from automation,
+        and identifiers plus metadata are enough to act on a drop. The other
+        fields are untrusted too (a GitHub summary carries the issue title).
+
+        The command runs with the daemon's environment and privileges, in its
+        own process group. stdout is discarded; stderr goes to a temporary
+        file, so a background job the hook leaves behind cannot hold a pipe
+        open and stall the sync. Past ``_DROP_HOOK_TIMEOUT_SECS`` the whole
+        group is killed. Best effort: a hook that is missing, fails, or times
+        out is logged, never raised.
+        """
+        name = self.source.source_name
+        program = self.drop_hook[0]
+        payload = self._drop_hook_payload(dropped, self.inbox_filter)
+
+        with tempfile.TemporaryFile() as stderr_file:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *self.drop_hook,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+            except Exception as e:  # noqa: BLE001 — OSError, or ValueError on a NUL in argv
+                logger.warning("Source %s: drop hook %r did not start: %s", name, program, e)
+                return
+
+            completed = timed_out = False
+            try:
+                await asyncio.wait_for(
+                    proc.communicate(payload), timeout=_DROP_HOOK_TIMEOUT_SECS,
+                )
+                completed = True
+            except asyncio.TimeoutError:
+                timed_out = True
+            finally:
+                # Keyed on communicate() finishing, not on the hook's exit: a
+                # hook can exit while a child it started still holds stdin.
+                # Also runs on cancellation (daemon shutdown), so no part of
+                # the hook is left running unattended.
+                if not completed:
+                    await self._kill_drop_hook(proc)
+
+            tail = _file_tail(stderr_file, _DROP_HOOK_STDERR_CHARS)
+
+        if timed_out:
+            logger.warning(
+                "Source %s: drop hook %r did not finish within %ss; its process "
+                "group was killed. stderr: %r",
+                name, program, _DROP_HOOK_TIMEOUT_SECS, tail,
+            )
+        elif proc.returncode != 0:
+            logger.warning(
+                "Source %s: drop hook %r exited %d for %d dropped record(s). stderr: %r",
+                name, program, proc.returncode, len(dropped), tail,
+            )
+        else:
+            logger.info(
+                "Source %s: drop hook %r exited 0 for %d dropped record(s)",
+                name, program, len(dropped),
+            )
+
+    async def _kill_drop_hook(self, proc: asyncio.subprocess.Process) -> None:
+        """Kill the hook's process group and reap it, waiting a bounded time."""
+        # The group id outlives the leader while any member is alive, so this
+        # also reaches children of a hook that already exited.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        # wait() also waits for the stdin pipe to close. Abort rather than
+        # close: close() waits for buffered data, which a process outside the
+        # group (setsid) may never read.
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.transport.abort()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_DROP_HOOK_REAP_SECS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Source %s: drop hook %r (pid %d) not reaped within %ss after "
+                "SIGKILL; a process outside its group may hold its stdin",
+                self.source.source_name, self.drop_hook[0], proc.pid, _DROP_HOOK_REAP_SECS,
+            )
 
     # ------------------------------------------------------------------
     # Inbox persistence
