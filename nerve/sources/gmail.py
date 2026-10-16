@@ -8,8 +8,11 @@ Two-step fetch: search for message IDs, then get each message body.
 - `gog gmail messages search <query>` → list of {id, subject, from, date, labels}
 - `gog gmail get <id>` → {body, headers, message} with full HTML body
 
-Cursor semantics: epoch timestamp (seconds) from Gmail's internalDate
-(the timestamp Gmail uses for `after:` search filtering).
+Cursor semantics: JSON state containing the newest successfully fetched
+Gmail `internalDate` epoch timestamp and any messages whose bodies still need
+to be fetched. Failed message metadata is kept in the cursor so retries can
+continue even after a message falls out of the search result window. Legacy
+epoch-only cursors are still accepted.
 On first run (no cursor), uses `newer_than:1d`.
 
 Note: gog always returns HTML email bodies.  We extract clean text for
@@ -37,6 +40,122 @@ logger = logging.getLogger(__name__)
 
 # Max concurrent message fetches to avoid overwhelming gog
 _MAX_CONCURRENT_GETS = 5
+
+
+def _decode_cursor(
+    cursor: str | None,
+) -> tuple[int | None, dict[str, dict[str, Any]]]:
+    """Decode a Gmail cursor, accepting the legacy epoch-only format."""
+    if cursor is None:
+        return None, {}
+
+    try:
+        raw_state = json.loads(cursor)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            return int(cursor), {}
+        except (TypeError, ValueError):
+            logger.warning("Invalid Gmail cursor %r — starting from the lookback window", cursor)
+            return None, {}
+
+    # ``json.loads("123")`` returns an int, which is the old cursor format.
+    if isinstance(raw_state, int):
+        return raw_state, {}
+    if not isinstance(raw_state, dict):
+        logger.warning("Invalid Gmail cursor %r — starting from the lookback window", cursor)
+        return None, {}
+
+    raw_epoch = raw_state.get("epoch")
+    try:
+        epoch = int(raw_epoch) if raw_epoch is not None else None
+    except (TypeError, ValueError):
+        epoch = None
+
+    pending: dict[str, dict[str, Any]] = {}
+    raw_pending = raw_state.get("pending", {})
+    if isinstance(raw_pending, dict):
+        for message_id, raw_entry in raw_pending.items():
+            if not isinstance(message_id, str) or not message_id:
+                continue
+            if not isinstance(raw_entry, dict):
+                continue
+
+            message = raw_entry.get("message", {"id": message_id})
+            if not isinstance(message, dict):
+                message = {"id": message_id}
+            else:
+                message = dict(message)
+            message.setdefault("id", message_id)
+
+            try:
+                attempts = max(1, int(raw_entry.get("attempts", 1)))
+            except (TypeError, ValueError):
+                attempts = 1
+            pending[message_id] = {
+                "status": raw_entry.get("status", "failed"),
+                "attempts": attempts,
+                "message": message,
+            }
+
+    return epoch, pending
+
+
+def _encode_cursor(
+    epoch: int | None,
+    pending: dict[str, dict[str, Any]],
+) -> str:
+    """Encode the Gmail cursor and its durable per-message retry state."""
+    return json.dumps({"epoch": epoch, "pending": pending}, sort_keys=True)
+
+
+def _message_snapshot(message: dict[str, Any]) -> dict[str, Any]:
+    """Keep the search metadata needed to build a record on a later retry."""
+    fields = ("id", "threadId", "subject", "from", "date", "labels")
+    return {field: message[field] for field in fields if field in message}
+
+
+def _mark_pending(
+    pending: dict[str, dict[str, Any]],
+    message: dict[str, Any],
+) -> None:
+    """Record a body-fetch failure without blocking newer messages."""
+    message_id = str(message.get("id", ""))
+    if not message_id:
+        return
+
+    previous = pending.get(message_id, {})
+    try:
+        attempts = int(previous.get("attempts", 0)) + 1
+    except (AttributeError, TypeError, ValueError):
+        attempts = 1
+    pending[message_id] = {
+        "status": "failed",
+        "attempts": attempts,
+        "message": _message_snapshot(message),
+    }
+
+
+def _candidate_messages(
+    messages: list[dict],
+    pending: dict[str, dict[str, Any]],
+) -> list[dict]:
+    """Merge pending retries with fresh search results, deduplicated by ID."""
+    candidates: dict[str, dict] = {}
+    for message_id, entry in pending.items():
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            message = {}
+        message = dict(message)
+        message.setdefault("id", message_id)
+        candidates[message_id] = message
+
+    for message in messages:
+        message_id = message.get("id")
+        if message_id:
+            # Fresh search metadata wins if a pending message is returned again.
+            candidates[str(message_id)] = message
+
+    return list(candidates.values())
 
 # ---------------------------------------------------------------------------
 # Email boilerplate detection
@@ -86,21 +205,25 @@ class GmailSource(Source):
         self._config = config
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
-        """Fetch new emails since cursor (epoch timestamp string).
+        """Fetch new emails since cursor.
 
         On first run (cursor=None): uses `newer_than:1d`.
-        On subsequent runs: uses `after:<epoch+1>`.
+        On subsequent runs: uses `after:<epoch+1>` and retries pending
+        message IDs independently of the search window.
 
-        The cursor stores Gmail's internalDate (second precision) which is the
-        same clock that `after:` filters on.  Using +1 is sufficient because
-        both values are on the same timescale.
+        The cursor stores Gmail's internalDate (second precision), plus search
+        metadata for body fetches that need retrying. Using +1 is sufficient
+        because the cursor and Gmail's `after:` filter use the same timescale.
         """
+        cursor_epoch, pending = _decode_cursor(cursor)
+        had_pending = bool(pending)
+
         # Build query filter from cursor.
         # The cursor is derived from Gmail's internalDate (epoch seconds) —
         # the same timestamp that `after:` filters on.  +1 ensures we skip
         # the message the cursor was set from.
-        if cursor:
-            after_epoch = int(cursor) + 1
+        if cursor_epoch is not None:
+            after_epoch = cursor_epoch + 1
             query_filter = f"after:{after_epoch} -in:spam -in:trash"
         else:
             query_filter = "newer_than:1d -in:spam -in:trash"
@@ -111,24 +234,28 @@ class GmailSource(Source):
             env["GOG_KEYRING_PASSWORD"] = keyring_password
 
         records: list[SourceRecord] = []
-        newest_epoch: int | None = int(cursor) if cursor else None
+        newest_epoch = cursor_epoch
 
         try:
             # Step 1: Search for message IDs + metadata
             messages = await self._search_messages(query_filter, limit, env)
+            candidates = _candidate_messages(messages, pending)
 
-            if not messages:
+            # Pending messages are retried by ID even if they no longer appear
+            # in the bounded search result window.
+            if not candidates:
                 return FetchResult(records=[], next_cursor=cursor, has_more=False)
 
             # Step 2: Fetch body + internalDate for each message
             sem = asyncio.Semaphore(_MAX_CONCURRENT_GETS)
             tasks = [
                 self._fetch_message_body(msg["id"], env, sem)
-                for msg in messages
+                for msg in candidates
             ]
             bodies = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for msg, body_result in zip(messages, bodies):
+            for msg, body_result in zip(candidates, bodies):
+                message_id = msg["id"]
                 date_str = msg.get("date", "")
 
                 # Extract body text, HTML, and internalDate from the fetch result
@@ -138,7 +265,18 @@ class GmailSource(Source):
                 if isinstance(body_result, tuple):
                     body, html_body, internal_date = body_result
                 elif isinstance(body_result, Exception):
-                    logger.warning("Failed to fetch body for %s: %s", msg["id"], body_result)
+                    logger.warning("Failed to fetch body for %s: %s", message_id, body_result)
+                    _mark_pending(pending, msg)
+                    continue
+                else:
+                    logger.warning("Failed to fetch body for %s", message_id)
+                    _mark_pending(pending, msg)
+                    continue
+
+                # A successful retry removes the message from the durable
+                # pending set before the record is returned.
+                was_pending = message_id in pending
+                pending.pop(message_id, None)
 
                 # Use internalDate for cursor tracking (matches Gmail's `after:`
                 # filter).  Fall back to the Date header only if internalDate
@@ -148,10 +286,15 @@ class GmailSource(Source):
                 # Client-side dedup: skip messages at or before the cursor.
                 # Gmail's `after:` has a small tolerance window (~2s) so a
                 # message right at the boundary can slip through.
-                if cursor and msg_epoch and msg_epoch <= int(cursor):
+                if (
+                    not was_pending
+                    and cursor_epoch is not None
+                    and msg_epoch
+                    and msg_epoch <= cursor_epoch
+                ):
                     logger.debug(
                         "Gmail %s: skipping already-seen message %s (epoch=%d, cursor=%s)",
-                        self.account, msg.get("id", "?"), msg_epoch, cursor,
+                        self.account, message_id, msg_epoch, cursor_epoch,
                     )
                     continue
 
@@ -205,7 +348,14 @@ class GmailSource(Source):
         except Exception as e:
             logger.error("Gmail error for %s: %s", self.account, e)
 
-        next_cursor = str(newest_epoch) if newest_epoch else cursor
+        # The timestamp can move past a failed message because its search
+        # metadata is retained in ``pending`` and the body is retried by ID.
+        # This prevents one permanently failing message from pinning the whole
+        # Gmail stream or disappearing when it falls out of the search window.
+        if pending or newest_epoch != cursor_epoch or had_pending:
+            next_cursor = _encode_cursor(newest_epoch, pending)
+        else:
+            next_cursor = cursor
         return FetchResult(records=records, next_cursor=next_cursor, has_more=False)
 
     async def preprocess(self, records: list[SourceRecord]) -> list[SourceRecord]:
@@ -240,11 +390,12 @@ class GmailSource(Source):
 
     async def _fetch_message_body(
         self, message_id: str, env: dict, sem: asyncio.Semaphore,
-    ) -> tuple[str, str | None, int | None]:
+    ) -> tuple[str, str | None, int | None] | None:
         """Fetch the body text, HTML body, and internalDate of a single message.
 
         Returns:
             (text_body, html_body_or_none, internal_date_epoch_seconds).
+            ``None`` when the message could not be retrieved.
 
         ``gog gmail get`` puts one body variant in its top-level ``body``
         field.  For multipart/alternative messages it picks text/plain,
@@ -264,10 +415,13 @@ class GmailSource(Source):
 
             if proc.returncode != 0:
                 logger.warning("gog gmail get %s failed: %s", message_id, stderr.decode()[:200])
-                return "", None, None
+                return None
 
             stdout_text = stdout.decode()
-            data = json.loads(stdout_text) if stdout_text.strip() else {}
+            if not stdout_text.strip():
+                logger.warning("gog gmail get %s returned no data", message_id)
+                return None
+            data = json.loads(stdout_text)
             body = data.get("body", "")
 
             # Extract internalDate from the raw Gmail API message object.
