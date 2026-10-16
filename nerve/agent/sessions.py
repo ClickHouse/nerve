@@ -625,6 +625,7 @@ class SessionManager:
 
     async def create_cron_session(
         self, job_id: str, run_id: str | None = None, *, actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create an isolated session for a single cron run.
 
@@ -633,7 +634,8 @@ class SessionManager:
 
         ``actor`` is the agent's system principal in production because a
         scheduled run is the instance's own work, regardless of who wrote the
-        schedule.
+        schedule. ``cause`` is the session's cause: by default the actor; the
+        person for a run that a person started.
         """
         if run_id:
             session_id = f"cron:{job_id}:{run_id}"
@@ -641,6 +643,7 @@ class SessionManager:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
 
     async def create_hook_session(

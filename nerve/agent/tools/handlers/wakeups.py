@@ -81,7 +81,10 @@ async def schedule_wakeup_handler(ctx: ToolContext, args: dict) -> ToolResult:
             is_error=True,
         )
 
-    wakeup_id = await ctx.engine._record_wakeup(ctx.db, ctx.session_id, args)
+    # The wakeup turn runs for the cause of the turn that schedules it.
+    wakeup_id = await ctx.engine._record_wakeup(
+        ctx.db, ctx.session_id, args, attribution=ctx.attribution,
+    )
     if wakeup_id is None:
         return ToolResult.text(
             "No wakeup scheduled: a non-empty `prompt` is required.",

@@ -161,8 +161,8 @@ def _page_size() -> int | None:
     return size if size and size > 0 else None
 
 
-async def _pending_wakeup_map(deps) -> dict[str, str]:
-    """``session_id -> fire_at`` for every pending wakeup, in one query.
+async def _pending_wakeup_map(deps) -> dict[str, dict]:
+    """``session_id -> wakeup row`` for every pending wakeup, in one query.
 
     ``ScheduleWakeup`` keeps at most one pending row per session, so a plain
     map is enough. Enrichment: a failure dims the indicator, it must never
@@ -172,7 +172,7 @@ async def _pending_wakeup_map(deps) -> dict[str, str]:
         rows = await deps.db.list_pending_wakeups()
     except Exception:  # noqa: BLE001 — enrichment must never break listing
         return {}
-    return {r["session_id"]: r["fire_at"] for r in rows if r.get("session_id")}
+    return {r["session_id"]: r for r in rows if r.get("session_id")}
 
 
 async def _decorate(deps, sessions: list[dict]) -> list[dict]:
@@ -183,11 +183,16 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
     # a wakeup is scheduled, or a background task is still running inside its
     # CLI. The sidebar keeps those parked sessions in the "Running" group
     # (with their own dot colour) instead of dropping them to idle.
-    wakeup_at = await _pending_wakeup_map(deps)
+    wakeups = await _pending_wakeup_map(deps)
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
-        s["pending_wakeup_at"] = wakeup_at.get(s["id"])
+        wakeup = wakeups.get(s["id"]) or {}
+        s["pending_wakeup_at"] = wakeup.get("fire_at")
+        # Who scheduled the wakeup (a person, or the system actor for the
+        # agent) and on whose behalf it runs.
+        s["pending_wakeup_created_by_actor_id"] = wakeup.get("created_by_actor_id")
+        s["pending_wakeup_caused_by_actor_id"] = wakeup.get("caused_by_actor_id")
         s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
     await _attach_review_loops(deps, sessions)
     return sessions
@@ -717,8 +722,11 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
         fire_at = (
             datetime.now(timezone.utc) + timedelta(seconds=seconds)
         ).isoformat()
+        # The person schedules the deferred turn, and it runs on their
+        # behalf when it fires.
         await deps.db.add_wakeup(
             req.session_id, prompt=message, fire_at=fire_at, reason="run-later",
+            attribution=attribution_for(actor),
         )
     else:
         ack = _RUN_LATER_MANUAL_ACK

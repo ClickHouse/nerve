@@ -57,7 +57,8 @@ def _make_cron_service() -> CronService:
     db.get_channel_session = AsyncMock(return_value=None)
     db.get_session = AsyncMock(return_value=None)
     db.set_channel_session = AsyncMock()
-    # A scheduled workflow run is attributed to the agent's system actor.
+    # A scheduled workflow run and its run log are attributed to the
+    # agent's system actor.
     mock_system_principal(db)
 
     return CronService(config, engine, db)

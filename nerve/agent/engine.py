@@ -1064,8 +1064,13 @@ class AgentEngine:
     @classmethod
     async def _record_wakeup(
         cls, db: Any, session_id: str, tool_input: dict,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> int | None:
         """Persist a ScheduleWakeup request from its tool input.
+
+        ``attribution`` is that of the tool call: the system actor, and the
+        cause of the turn that made the call. The wakeup turn runs for that
+        cause.
 
         Returns the new wakeup id, or ``None`` when there's no prompt to
         re-inject (in which case nothing is scheduled).
@@ -1077,6 +1082,7 @@ class AgentEngine:
         fire_at = cls._wakeup_fire_at(tool_input.get("delaySeconds"))
         wakeup_id = await db.add_wakeup(
             session_id, prompt=prompt, fire_at=fire_at, reason=reason,
+            attribution=attribution,
         )
         logger.info(
             "Recorded wakeup %s for session %s at %s",
@@ -1352,7 +1358,14 @@ class AgentEngine:
                     )
 
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
-                return await self._record_wakeup(self.db, sid, tool_input)
+                # The CLI runs the hook inside the turn that called the tool,
+                # so the session's turn cause is the cause of that call.
+                return await self._record_wakeup(
+                    self.db, sid, tool_input,
+                    attribution=attribution_for(
+                        self.db.system_actor, self.session_cause(sid),
+                    ),
+                )
 
             spec = SessionSpec(
                 session_id=session_id,
@@ -1566,13 +1579,13 @@ class AgentEngine:
         runs to defer the terminal 'done' until spend-relevant work ends."""
         return self._has_live_background_tasks(session_id)
 
-    async def pending_wakeup_at(self, session_id: str) -> str | None:
-        """``fire_at`` of the session's pending wakeup, or ``None``.
+    async def pending_wakeup(self, session_id: str) -> dict | None:
+        """The session's pending wakeup row, or ``None``.
 
         ``ScheduleWakeup`` keeps at most one pending row per session (a new
-        request supersedes the old one), so this is a single timestamp
-        rather than a list. Never raises — a listing/indicator caller must
-        not fail on an enrichment read.
+        request supersedes the old one), so this is a single row rather
+        than a list. Never raises — a listing/indicator caller must not fail
+        on an enrichment read.
         """
         try:
             rows = await self.db.list_pending_wakeups(session_id)
@@ -1581,7 +1594,12 @@ class AgentEngine:
                 "pending wakeup lookup failed for %s", session_id, exc_info=True,
             )
             return None
-        return rows[0].get("fire_at") if rows else None
+        return rows[0] if rows else None
+
+    async def pending_wakeup_at(self, session_id: str) -> str | None:
+        """``fire_at`` of the session's pending wakeup, or ``None``."""
+        wakeup = await self.pending_wakeup(session_id)
+        return wakeup.get("fire_at") if wakeup else None
 
     async def _broadcast_session_running(
         self, session_id: str, is_running: bool,
@@ -1595,11 +1613,15 @@ class AgentEngine:
         with the transition means the client can redraw the row without a
         follow-up list fetch — which it skips for the active session.
         """
+        wakeup = await self.pending_wakeup(session_id) or {}
         await broadcaster.broadcast("__global__", {
             "type": "session_running",
             "session_id": session_id,
             "is_running": is_running,
-            "pending_wakeup_at": await self.pending_wakeup_at(session_id),
+            "pending_wakeup_at": wakeup.get("fire_at"),
+            # Who scheduled the wakeup, and for whom; see GET /api/sessions.
+            "pending_wakeup_created_by_actor_id": wakeup.get("created_by_actor_id"),
+            "pending_wakeup_caused_by_actor_id": wakeup.get("caused_by_actor_id"),
             "has_background_tasks": self._has_live_background_tasks(session_id),
         })
 
@@ -3537,6 +3559,8 @@ class AgentEngine:
         run_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run an agent turn for a cron job in an isolated session.
 
@@ -3545,14 +3569,19 @@ class AgentEngine:
         unless the run yielded with a live ``run_in_background`` task, in which
         case it is kept alive so the agent can resume when the task completes
         (see ``_teardown_oneshot_client``).
+
+        ``cause``: the cause of the run's session: the system actor (the
+        default) for a scheduled run; the person who asked for the run when
+        a person started it.
         """
         if run_id is None:
             run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        # A scheduled run is the instance's own work, regardless of who wrote
-        # the schedule. Human attribution belongs to the schedule mutation.
+        # A cron run is the instance's own work, regardless of who wrote the
+        # schedule or who started the run. A person who started it is the
+        # cause of the run's session.
         actor = self.db.system_actor
         session = await self.sessions.create_cron_session(
-            job_id, run_id=run_id, actor=actor,
+            job_id, run_id=run_id, actor=actor, cause=cause,
         )
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
@@ -3576,6 +3605,8 @@ class AgentEngine:
         session_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run a persistent cron job that maintains context across runs.
 
@@ -3591,11 +3622,15 @@ class AgentEngine:
         which would collide with the parked task — so a persistent-cron
         background task that outlives its run is not resumed (use an
         isolated cron for long background work).
+
+        ``cause`` is as for :meth:`run_cron`. It applies only when this call
+        creates the session; a session of earlier runs keeps its cause.
         """
         session_id = session_id or f"cron:{job_id}"
         actor = self.db.system_actor
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:

@@ -502,7 +502,10 @@ class TestCatchupMissedJobs:
 
         await cron_service._catchup_missed_jobs()
 
-        cron_service.db.log_cron_start.assert_called_once_with("overdue-job")
+        # A catch-up run is the instance's own work.
+        cron_service.db.log_cron_start.assert_called_once_with(
+            "overdue-job", attribution=attribution_for(FAKE_SYSTEM_ACTOR),
+        )
         cron_service.engine.run_cron.assert_called_once()
 
     @pytest.mark.asyncio
@@ -791,9 +794,10 @@ class TestRotation:
         # New chat is created and becomes the job's current session.
         cron_service.engine.sessions.get_or_create.assert_awaited_once_with(
             session_id, title="Cron: pers", source="cron",
-            # Who a cron generation belongs to has its own test
-            # (test_attribution.py); this one is about rotation.
-            actor=ANY,
+            # Who a cron generation belongs to, and its cause, have their
+            # own tests (test_attribution.py, test_schedule_attribution.py);
+            # this one is about rotation.
+            actor=ANY, cause=ANY,
         )
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", session_id,
@@ -1061,7 +1065,9 @@ class TestRunGates:
 
         await cron_service._run_job_inner(job)
 
-        cron_service.db.log_cron_start.assert_called_once_with("planner")
+        cron_service.db.log_cron_start.assert_called_once_with(
+            "planner", attribution=attribution_for(FAKE_SYSTEM_ACTOR),
+        )
         cron_service.engine.run_cron.assert_called_once()
 
     @pytest.mark.asyncio

@@ -4,9 +4,15 @@ A *wakeup* is a one-shot, self-scheduled prompt the model requested via
 the ``ScheduleWakeup`` tool. Rows are written by the PostToolUse capture
 hook and consumed by the cron-service sweep, which fires the prompt
 through ``engine.run(..., source="wakeup")`` at ``fire_at``.
+
+Each row records who scheduled it (``created_by_actor_id``) and on whose
+behalf it runs (``caused_by_actor_id``). The turn that the wakeup fires runs
+for that cause.
 """
 
 from __future__ import annotations
+
+from nerve.identity import UNATTRIBUTED, Attribution
 
 
 class WakeupStore:
@@ -18,12 +24,17 @@ class WakeupStore:
         prompt: str,
         fire_at: str,
         reason: str = "",
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> int:
         """Record a pending wakeup, replacing any prior pending one.
 
         ``ScheduleWakeup`` keeps a single active wakeup per session (the
         ``/loop`` self-pacing model re-calls the tool each turn). So a new
         request supersedes any earlier pending wakeup for the session.
+
+        ``attribution`` names who scheduled the wakeup and the cause that
+        its turn runs for.
 
         Returns the new wakeup id.
         """
@@ -34,9 +45,14 @@ class WakeupStore:
                 (session_id,),
             )
             cursor = await self.db.execute(
-                """INSERT INTO session_wakeups (session_id, prompt, reason, fire_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, prompt, reason, fire_at),
+                """INSERT INTO session_wakeups
+                       (session_id, prompt, reason, fire_at,
+                        created_by_actor_id, caused_by_actor_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id, prompt, reason, fire_at,
+                    attribution.actor_id, attribution.caused_by_actor_id,
+                ),
             )
             wakeup_id = cursor.lastrowid
             await cursor.close()
