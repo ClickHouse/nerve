@@ -1013,6 +1013,14 @@ class PromptRewriteConfig:
         )
 
 
+# SDK retries for Anthropic clients that go through the local proxy. The proxy
+# does not forward Retry-After on Claude errors, so the SDK falls back to its
+# own exponential backoff (0.5 s doubling, capped at 8 s); six retries wait
+# roughly 18-24 s in total, long enough to outlast a short rate limit. The
+# SDK default of two gives up after about 1.5 s.
+PROXY_CLIENT_MAX_RETRIES = 6
+
+
 # The default model ids live in the constants block at the top of this file
 # (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
 
@@ -3580,6 +3588,9 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        kwargs = {}
+        if self.proxy.enabled:
+            kwargs["max_retries"] = PROXY_CLIENT_MAX_RETRIES
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
         # environment itself, so the environment-only install the checks call
@@ -3588,6 +3599,7 @@ class NerveConfig:
             api_key=self.resolve_anthropic_api_key(),
             base_url=base_url,
             timeout=timeout,
+            **kwargs,
         )
 
     def create_async_anthropic_client(self, timeout: float = 60.0) -> Any:
@@ -3613,10 +3625,14 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        kwargs = {}
+        if self.proxy.enabled:
+            kwargs["max_retries"] = PROXY_CLIENT_MAX_RETRIES
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
             timeout=timeout,
+            **kwargs,
         )
 
     _KNOWN_BACKENDS = ("claude", "codex")
