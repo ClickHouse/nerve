@@ -319,13 +319,15 @@ export function handleAnswerInjected(
   get: Get,
   set: Set,
 ): void {
-  // Show the injected answer as a user message in the chat
+  // Show the injected answer as a user message in the chat, labelled with
+  // the person who answered, as the stored row is.
   if (msg.session_id === get().activeSession) {
     set(s => ({
       messages: [...s.messages, {
         role: 'user' as const,
         blocks: [{ type: 'text' as const, content: msg.content }],
         created_at: new Date().toISOString(),
+        actor_id: msg.actor_id ?? null,
       }],
     }));
   }

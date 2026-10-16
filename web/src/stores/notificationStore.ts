@@ -12,7 +12,13 @@ export interface Notification {
   status: string;
   options: string[] | null;
   answer: string | null;
+  // The transport the answer came through (`web`, `telegram`, `slack`).
   answered_by: string | null;
+  // The person who answered. Null for a chat-channel answer, which names no
+  // person, and on rows from before it was recorded.
+  answered_by_actor_id?: string | null;
+  // The person who dismissed the row.
+  dismissed_by_actor_id?: string | null;
   answered_at: string | null;
   created_at: string;
   expires_at: string | null;
@@ -36,7 +42,11 @@ export interface Silence {
   pattern: string;
   action: string;
   reason: string;
+  // Origin of the rule: `web` or the session id of the tool call.
   created_by: string;
+  // Who created the rule and on whose behalf. Null on older rows.
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
   created_at: string;
   expires_at: string | null;
   hit_count: number;
@@ -146,6 +156,8 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       options: data.options,
       answer: null,
       answered_by: null,
+      answered_by_actor_id: null,
+      dismissed_by_actor_id: null,
       answered_at: null,
       created_at: new Date().toISOString(),
       expires_at: null,
@@ -205,7 +217,13 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     set(s => ({
       notifications: s.notifications.map(n =>
         n.id === data.notification_id
-          ? { ...n, status: 'answered', answer: data.answer, answered_by: data.answered_by }
+          ? {
+              ...n,
+              status: 'answered',
+              answer: data.answer,
+              answered_by: data.answered_by,
+              answered_by_actor_id: data.actor_id ?? null,
+            }
           : n
       ),
       pendingCount: Math.max(0, s.pendingCount - 1),

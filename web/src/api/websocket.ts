@@ -25,9 +25,12 @@ export type WSMessage =
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
   | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string; redelivered?: boolean; redelivery_count?: number }
-  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
+  // `actor_id` is the person who answered; null for a chat-channel answer.
+  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
-  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
+  // The answer becomes a user message written by the person who answered, on
+  // their own behalf; both ids are null for a chat-channel answer.
+  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string; actor_id?: string | null; caused_by_actor_id?: string | null }
   // `actor_id` is the sender, so a second tab can label the bubble the moment
   // it arrives rather than waiting for the stored row to be readable. Null
   // whenever the ingress recorded nobody, which renders exactly as before.

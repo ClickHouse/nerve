@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
 
-import { handleSessionRunning, handleUserMessage } from './sessionHandlers';
+import { handleAnswerInjected, handleSessionRunning, handleUserMessage } from './sessionHandlers';
 import type { ChatState } from '../chatStore';
 import type { Get, Set } from './types';
 import type { Session } from '../../types/chat';
@@ -135,5 +135,41 @@ describe('handleUserMessage — the sender on a live echo', () => {
     handleUserMessage(echo({ actor_id: 'actor-bob' }), store.get, store.set);
 
     expect(store.current().messages).toHaveLength(0);
+  });
+});
+
+/**
+ * An answer to a notification enters the chat as a user message written by
+ * the person who answered. The live bubble carries that id, as the stored row
+ * does, so it is labelled the same before and after a reload.
+ */
+describe('handleAnswerInjected: the person who answered', () => {
+  const injected = (
+    extra: Partial<Extract<WSMessage, { type: 'answer_injected' }>> = {},
+  ): Extract<WSMessage, { type: 'answer_injected' }> => ({
+    type: 'answer_injected', session_id: 's1', notification_id: 'ask-1',
+    title: 'Pick one', answer: 'yes', answered_by: 'web',
+    content: '[Answer to: Pick one]\n\nyes', ...extra,
+  });
+
+  it('carries the answerer onto the appended message', () => {
+    const store = fakeStore([row('s1')], 's1');
+
+    handleAnswerInjected(
+      injected({ actor_id: 'actor-alice', caused_by_actor_id: 'actor-alice' }),
+      store.get, store.set,
+    );
+
+    const [msg] = store.current().messages;
+    expect(msg.role).toBe('user');
+    expect(msg.actor_id).toBe('actor-alice');
+  });
+
+  it('records no sender for a chat-channel answer', () => {
+    const store = fakeStore([row('s1')], 's1');
+
+    handleAnswerInjected(injected({ answered_by: 'telegram' }), store.get, store.set);
+
+    expect(store.current().messages[0].actor_id).toBeNull();
   });
 });

@@ -16,6 +16,10 @@ export interface Plan {
   plan_type: string;
   created_at: string;
   reviewed_at: string | null;
+  // Who made the last review decision (approve, decline, revision request)
+  // and on whose behalf. Null when nobody reviewed it or on older rows.
+  reviewed_by_actor_id?: string | null;
+  reviewed_caused_by_actor_id?: string | null;
 }
 
 interface PlanState {
