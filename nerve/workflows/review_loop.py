@@ -532,9 +532,9 @@ class ReviewLoopService:
         ``applied`` true; ``ok`` can still be false when the leg that it
         resumes does not start. A decision on a loop that is not parked is
         recorded with ``applied`` false. An unknown decision string is not
-        recorded. ``remind_4h`` changes no loop column: it is applied when the
-        loop is parked, and the notification service then snoozes the
-        decision card."""
+        recorded. ``remind_4h`` is refused and not recorded: a reminder
+        snoozes the decision card, so it is an answer on the card (see
+        :meth:`_card_reminder`)."""
         decision = (decision or "").strip()
         iterate = _ITERATE_RE.match(decision)
         budget_grant = _BUDGET_RE.match(decision)
@@ -542,6 +542,11 @@ class ReviewLoopService:
             return {
                 "ok": False, "applied": False,
                 "message": f"unknown decision: {decision!r}",
+            }
+        if decision == "remind_4h":
+            return {
+                "ok": False, "applied": False,
+                "message": "remind_4h is an answer on the decision card",
             }
         loop = await self.db.get_review_loop(loop_id)
         if loop is None:
@@ -556,20 +561,6 @@ class ReviewLoopService:
                 return await self._decision_not_applied(
                     loop_id, decision, decided_by, attribution,
                 )
-
-            if decision == "remind_4h":
-                if not await self.db.apply_review_loop_decision(
-                    loop_id, decision, message="snoozed 4h",
-                    decided_by=decided_by, attribution=attribution,
-                ):
-                    return await self._decision_not_applied(
-                        loop_id, decision, decided_by, attribution,
-                    )
-                snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-                return {
-                    "ok": True, "applied": True, "message": "snoozed 4h",
-                    "snooze_until": snooze,
-                }
 
             if decision == "accept":
                 if not await self.db.apply_review_loop_decision(
@@ -679,12 +670,15 @@ class ReviewLoopService:
         decision: str,
         decided_by: str,
         attribution: Attribution,
+        *,
+        reason: str = "",
     ) -> dict:
         """Record a decision that found the loop in a state it does not
-        apply to, and return the result. Caller holds the loop lock."""
+        apply to, or that ``reason`` says did not apply, and return the
+        result. Caller holds the loop lock."""
         loop = await self.db.get_review_loop(loop_id)
         status = (loop or {}).get("status", "gone")
-        message = (
+        message = reason or (
             f"review loop {loop_id} is {status}; decision recorded but "
             "not applied"
         )
@@ -757,10 +751,15 @@ class ReviewLoopService:
         channel answer (see :class:`nerve.notifications.handlers.Dispatcher`).
         The decision records that person as actor and cause.
         """
-        result = await self.handle_decision(
-            target_id, decision, decided_by="approval-card",
-            attribution=attribution_for(actor),
-        )
+        attribution = attribution_for(actor)
+        after_snooze = None
+        if (decision or "").strip() == "remind_4h":
+            result, after_snooze = await self._card_reminder(target_id, attribution)
+        else:
+            result = await self.handle_decision(
+                target_id, decision, decided_by="approval-card",
+                attribution=attribution,
+            )
         return _handlers.DispatchResult(
             ok=bool(result.get("ok")),
             audit_event={
@@ -772,7 +771,57 @@ class ReviewLoopService:
                 "message": str(result.get("message") or ""),
             },
             snooze_until=result.get("snooze_until"),
+            after_snooze=after_snooze,
         )
+
+    async def _card_reminder(
+        self, loop_id: str, attribution: Attribution,
+    ) -> tuple[dict, Callable[[bool], Any] | None]:
+        """A "Remind me in 4h" answer on the loop's decision card.
+
+        A reminder changes no loop column; the notification service snoozes
+        the card after the dispatcher returns. So the decision row waits for
+        that write: the returned callback (``DispatchResult.after_snooze``)
+        records the reminder as applied when the card was snoozed, and as not
+        applied, with the reason, when the card was no longer pending. A
+        reminder on a loop that is not parked is recorded as not applied at
+        once and asks for no snooze.
+        """
+        decided_by = "approval-card"
+        if await self.db.get_review_loop(loop_id) is None:
+            return {
+                "ok": False, "applied": False,
+                "message": f"no such review loop: {loop_id}",
+            }, None
+        async with self._lock(loop_id):
+            loop = await self.db.get_review_loop(loop_id)
+            if loop is None or loop["status"] != "awaiting_user":
+                result = await self._decision_not_applied(
+                    loop_id, "remind_4h", decided_by, attribution,
+                )
+                return result, None
+
+        async def record(snoozed: bool) -> None:
+            async with self._lock(loop_id):
+                if not snoozed:
+                    await self._decision_not_applied(
+                        loop_id, "remind_4h", decided_by, attribution,
+                        reason="the decision card was no longer pending, so "
+                        "it was not snoozed",
+                    )
+                elif not await self.db.apply_review_loop_decision(
+                    loop_id, "remind_4h", message="snoozed 4h",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    await self._decision_not_applied(
+                        loop_id, "remind_4h", decided_by, attribution,
+                    )
+
+        snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+        return {
+            "ok": True, "applied": False, "message": "snooze for 4h requested",
+            "snooze_until": snooze,
+        }, record
 
     # ------------------------------------------------------------------ #
     #  Leg dispatch                                                       #

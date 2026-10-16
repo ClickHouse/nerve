@@ -722,6 +722,8 @@ class NotificationService:
                 notification_id, snooze_until, new_expires_at,
                 attribution=attribution_for(answerer),
             )
+            if result.after_snooze is not None:
+                await result.after_snooze(settled)
         else:
             settled = await self.db.answer_notification(
                 notification_id, answer, answered_by, actor=actor,

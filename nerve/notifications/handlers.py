@@ -38,7 +38,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Protocol
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
@@ -72,11 +72,18 @@ class DispatchResult:
       the row's ``redeliver_at`` (and pushes ``expires_at`` past it) so
       the periodic maintenance tick re-surfaces the card. None for
       approve / decline.
+    - ``after_snooze``: for a result that asks for a snooze, an async
+      callable that the service awaits with the result of its snooze write:
+      True when the row was snoozed, False when it was no longer pending
+      (for example, the expiry sweep took it during the dispatch). A
+      dispatcher that records the snooze uses it, because the snooze is the
+      service's write and comes after the dispatcher returns.
     """
 
     ok: bool
     audit_event: dict[str, Any] = field(default_factory=dict)
     snooze_until: str | None = None
+    after_snooze: Callable[[bool], Awaitable[None]] | None = None
 
 
 # ----------------------------------------------------------------------

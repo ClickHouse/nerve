@@ -723,6 +723,49 @@ async def test_a_card_reminder_then_a_rest_decision_name_each_person(install):
 
 
 @pytest.mark.asyncio
+async def test_a_reminder_that_loses_to_the_expiry_sweep_is_not_applied(
+    install, monkeypatch,
+):
+    alice = install.actor_id("alice")
+    loop_id, card_id = await install.parked_loop("alice", "loop-chat")
+    real_snooze = install.db.snooze_notification
+    rows_before_snooze: list = []
+
+    async def sweep_first(notification_id, *args, **kwargs):
+        # The barrier: the dispatcher has returned and the snooze write has
+        # not run yet. The expiry sweep takes the claimed card here.
+        rows_before_snooze.append(await install.db.list_review_loop_decisions(loop_id))
+        await install.db.db.execute(
+            "UPDATE notifications SET expires_at = '2000-01-01T00:00:00+00:00'"
+            " WHERE id = ?", (notification_id,),
+        )
+        await install.db.db.commit()
+        assert await install.notifications.expire_stale() == 1
+        return await real_snooze(notification_id, *args, **kwargs)
+
+    monkeypatch.setattr(install.db, "snooze_notification", sweep_first)
+    async with _client(install.app()) as client:
+        answered = await client.post(
+            f"/api/notifications/{card_id}/answer", headers=install.headers("alice"),
+            json={"answer": "remind_4h"},
+        )
+    assert answered.status_code == 200
+
+    # Nothing is recorded before the snooze write, and the snooze that found
+    # no pending card is recorded as not applied, with the reason.
+    assert rows_before_snooze == [[]]
+    assert (await install.db.get_notification(card_id))["status"] == "expired"
+    assert await install.decisions(loop_id) == [
+        ("remind_4h", False, "approval-card", alice, alice),
+    ]
+    (row,) = await install.db.list_review_loop_decisions(loop_id)
+    assert row["message"] == (
+        "the decision card was no longer pending, so it was not snoozed"
+    )
+    assert (await install.db.get_review_loop(loop_id))["status"] == "awaiting_user"
+
+
+@pytest.mark.asyncio
 async def test_a_channel_card_decision_records_no_person(install):
     loop_id, card_id = await install.parked_loop("alice", "loop-chat")
     await install.db.record_notification_delivery(

@@ -600,9 +600,13 @@ class TestReviewLoopService:
             goal="g", verifier="- a", session_id=obs, budget_usd=0.04,
         )
         await _wait_status(db, loop["id"], ("awaiting_user",))
-        result = await rls.handle_decision(loop["id"], "remind_4h")
-        assert result["ok"] and result.get("snooze_until")
+        # A reminder is an answer on the decision card; the card dispatcher
+        # asks the notification service for the snooze.
+        result = await rls._dispatch_decision({}, loop["id"], "remind_4h", None)
+        assert result.ok and result.snooze_until and result.after_snooze
         assert (await db.get_review_loop(loop["id"]))["status"] == "awaiting_user"
+        direct = await rls.handle_decision(loop["id"], "remind_4h")
+        assert not direct["ok"] and "decision card" in direct["message"]
 
     async def test_kill_loop_kills_current_leg(self, db, engine, services):
         runs, rls = services
