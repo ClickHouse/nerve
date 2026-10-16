@@ -8,6 +8,10 @@ import { TaskDetailBody } from './TaskDetailBody';
 
 vi.mock('../../api/client', () => ({
   api: { updateTask: vi.fn() },
+  // The timeline's actor labels read the viewer through the auth store,
+  // which wires these on import.
+  setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
+  setUnauthorizedHandler: vi.fn(),
 }));
 
 /**

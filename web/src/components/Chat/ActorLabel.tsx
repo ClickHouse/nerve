@@ -41,6 +41,40 @@ function tooltip(verb: string, actorId: string, attribution: Attribution): strin
   return `${verb} ${name}`;
 }
 
+/**
+ * Who made a change, and for whom: the actor's name, followed by
+ * "for <person>" when the change was made on behalf of another person. That
+ * is the system actor (Nerve) doing work that a person started. A cause that
+ * is the actor itself, or the system actor, adds nothing. Without an actor id
+ * nothing renders, so a caller can show its own fallback for older rows.
+ */
+export function ActorAttribution({ actorId, causeId, verb = 'By' }: {
+  actorId: string | null | undefined;
+  causeId: string | null | undefined;
+  /** Leads the tooltip, for example "Changed by". */
+  verb?: string;
+}) {
+  const actor = useAttribution(actorId);
+  const otherCauseId = actorId && causeId && causeId !== actorId ? causeId : null;
+  const cause = useAttribution(otherCauseId);
+  if (!actorId) return null;
+  const forPerson = otherCauseId && !cause.system ? cause.name : null;
+  const label = forPerson ? `${actor.name} for ${forPerson}` : actor.name;
+  const title = forPerson
+    ? `${verb} ${actor.name} on behalf of ${forPerson}`
+    : tooltip(verb, actorId, actor);
+  return (
+    <span
+      data-attribution="actor"
+      title={title}
+      className="inline-flex items-center gap-1 min-w-0 align-bottom"
+    >
+      {actor.system && <Bot size={11} className="shrink-0" aria-hidden="true" />}
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
 export function ActorLabel({ actorId }: { actorId: string | null | undefined }) {
   const attribution = useAttribution(actorId);
   if (!actorId) return null;

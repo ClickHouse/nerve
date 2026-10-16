@@ -545,7 +545,12 @@ export interface TaskEvent {
   /** null on the row recording the task's creation. */
   from_status: string | null;
   to_status: string;
+  /** Origin of the change: `web`, a session id, `system` or `backfill`. */
   actor: string;
+  /** Who made the change. `null` on rows written before it was recorded. */
+  actor_id: string | null;
+  /** On whose behalf the change was made. `null` when unknown. */
+  caused_by_actor_id: string | null;
   created_at: string;
 }
 
