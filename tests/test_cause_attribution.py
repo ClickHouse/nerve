@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -125,8 +126,10 @@ class _FakeRuntime:
       for example a background task that it starts.
     - ``buffered``: autonomous output that arrived between runs; the engine
       drains it before the next turn.
-    - ``in_flight``: for an autonomous turn in flight, pairs of (tool call
-      first?, next batch) that ``receive_idle_events`` returns.
+    - ``in_flight``: for an autonomous turn in flight, the steps that
+      ``receive_idle_events`` takes: (seconds to wait first, tool call
+      first?, next batch). With no step left it waits out the timeout and
+      raises ``TimeoutError``, like a runtime that has not produced output.
     - ``fail``: the next turn dies after its first output, like a runtime
       that is killed mid-turn (a restart). The engine does not retry a turn
       that has output.
@@ -148,8 +151,14 @@ class _FakeRuntime:
 
     async def receive_idle_events(self, timeout=None):
         if not self.in_flight:
-            return None
-        tool_call, batch = self.in_flight.pop(0)
+            await asyncio.sleep(timeout or 0)
+            raise asyncio.TimeoutError
+        delay, tool_call, batch = self.in_flight.pop(0)
+        if timeout is not None and delay > timeout:
+            await asyncio.sleep(timeout)
+            self.in_flight.insert(0, (delay - timeout, tool_call, batch))
+            raise asyncio.TimeoutError
+        await asyncio.sleep(delay)
         if tool_call:
             await self.install.agent_tool_call(self.session_id)
         return batch
@@ -434,6 +443,33 @@ async def test_rest_patch_with_content_records_one_change_for_the_person(install
     assert (install.config.workspace / task["file_path"]).is_file()
 
 
+def _bob_moves_during_the_file_write(install, monkeypatch, module, task_id: str) -> None:
+    """Bob moves the task to deferred while ``module`` writes the task file."""
+    loop = asyncio.get_running_loop()
+    real_write = module.write_task_file
+
+    def write_while_bob_moves(path, content):
+        real_write(path, content)
+        asyncio.run_coroutine_threadsafe(
+            install.db.move_task(
+                task_id, status="deferred", actor="web",
+                attribution=attribution_for(install.actor_id("bob")),
+            ),
+            loop,
+        ).result(timeout=5)
+
+    monkeypatch.setattr(module, "write_task_file", write_while_bob_moves)
+
+
+async def _assert_bobs_move_stays(install, task_id: str) -> None:
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    assert await install.events(task_id) == [
+        (None, "pending", "web", alice, alice),
+        ("pending", "deferred", "web", bob, bob),
+    ]
+    assert (await install.db.get_task(task_id))["status"] == "deferred"
+
+
 @pytest.mark.asyncio
 async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
     """A move that lands while PATCH writes the file is not undone.
@@ -443,37 +479,18 @@ async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
     """
     from nerve.gateway.routes import tasks as tasks_route
 
-    alice, bob = install.actor_id("alice"), install.actor_id("bob")
-    loop = asyncio.get_running_loop()
-    real_write = tasks_route.write_task_file
-
-    def write_while_bob_moves(path, content):
-        real_write(path, content)
-        asyncio.run_coroutine_threadsafe(
-            install.db.move_task(
-                task_id, status="deferred", actor="web",
-                attribution=attribution_for(bob),
-            ),
-            loop,
-        ).result(timeout=5)
-
     async with _client(install.app()) as client:
         task_id = (await client.post(
             "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
         )).json()["task"]["id"]
-        monkeypatch.setattr(tasks_route, "write_task_file", write_while_bob_moves)
+        _bob_moves_during_the_file_write(install, monkeypatch, tasks_route, task_id)
         response = await client.patch(
             f"/api/tasks/{task_id}", headers=install.headers("alice"),
             json={"content": "# Raced\n\nNew body.\n"},
         )
     assert response.status_code == 200
-
-    assert await install.events(task_id) == [
-        (None, "pending", "web", alice, alice),
-        ("pending", "deferred", "web", bob, bob),
-    ]
+    await _assert_bobs_move_stays(install, task_id)
     task = await install.db.get_task(task_id)
-    assert task["status"] == "deferred"
     assert "New body." in (install.config.workspace / task["file_path"]).read_text()
 
 
@@ -624,7 +641,7 @@ async def test_autonomous_work_keeps_the_cause_of_the_turn_that_started_it(
             SystemEvent(subtype="init"),
             TextDelta(text="The build passed."),
         ]]
-        runtime.in_flight = [(True, [TurnCompleted()])]
+        runtime.in_flight = [(0, True, [TurnCompleted()])]
         await _chat(client, install.headers("bob"), session_id, "and now this")
 
     hers, continuation, his = install.turns_in(session_id)
@@ -663,7 +680,7 @@ async def test_an_autonomous_turn_after_a_later_turn_keeps_the_starters_cause(
         SystemEvent(subtype="init"),
         TextDelta(text="The long job finished."),
     ]]
-    runtime.in_flight = [(True, [TurnCompleted()])]
+    runtime.in_flight = [(0, True, [TurnCompleted()])]
     await install.engine._drain_pending_messages(
         session_id, runtime, "web", "web", manage_framing=True,
     )
@@ -672,6 +689,134 @@ async def test_an_autonomous_turn_after_a_later_turn_keeps_the_starters_cause(
         alice, bob, alice,
     ]
     assert install.engine.session_cause(session_id) == alice
+
+
+@pytest.mark.asyncio
+async def test_late_autonomous_output_is_not_given_the_next_persons_cause(
+    install, monkeypatch,
+):
+    """Alice's continuation has started but shows no output in time.
+
+    Bob's turn cannot tell her late output from his own, so it runs with an
+    unknown cause, not Bob's. His next turn is his again.
+    """
+    install.use_fake_runtime(monkeypatch)
+    monkeypatch.setattr(AgentEngine, "_PRE_QUERY_FIRST_CONTENT_SECONDS", 0.05)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        runtime.turn_events = [
+            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+        ]
+        await _chat(client, install.headers("alice"), session_id, "run the build")
+        runtime.buffered = [[
+            SystemEvent(
+                subtype="task_notification",
+                data={"task_id": "bg-1", "status": "completed"},
+            ),
+            SystemEvent(subtype="init"),
+        ]]
+        await _chat(client, install.headers("bob"), session_id, "and now this")
+        assert await install.turn_cause_of(session_id) is None
+        await _chat(client, install.headers("bob"), session_id, "one more")
+
+    hers, unknown, his = install.turns_in(session_id)
+    assert (hers["cause"], unknown["cause"], his["cause"]) == (alice, None, bob)
+    assert await install.events(unknown["task_id"]) == [
+        (None, "pending", session_id, install.system_actor_id, None),
+    ]
+    # Bob's message still records him as the cause of the turn it started.
+    assert (await install.user_rows(session_id))[1] == ("and now this", bob, bob)
+
+
+@pytest.mark.asyncio
+async def test_the_next_turn_waits_for_a_slow_autonomous_turn(install, monkeypatch):
+    """Alice's continuation shows its first output after more than 3 s."""
+    install.use_fake_runtime(monkeypatch)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        runtime.turn_events = [
+            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+        ]
+        await _chat(client, install.headers("alice"), session_id, "run the build")
+        runtime.buffered = [[
+            SystemEvent(
+                subtype="task_notification",
+                data={"task_id": "bg-1", "status": "completed"},
+            ),
+            SystemEvent(subtype="init"),
+        ]]
+        runtime.in_flight = [
+            (3.2, False, [TextDelta(text="The build passed.")]),
+            (0, True, [TurnCompleted()]),
+        ]
+        await _chat(client, install.headers("bob"), session_id, "and now this")
+
+    hers, continuation, his = install.turns_in(session_id)
+    assert (hers["cause"], continuation["cause"], his["cause"]) == (alice, alice, bob)
+
+
+@pytest.mark.asyncio
+async def test_a_running_background_agent_of_another_person_leaves_the_cause_unknown(
+    install, monkeypatch,
+):
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        install.runtime(session_id).turn_events = [
+            SystemEvent(
+                subtype="task_started",
+                data={"task_id": "agent-1", "task_type": "local_agent"},
+            ),
+        ]
+        await _chat(client, install.headers("alice"), session_id, "research this")
+        # Alice's background agent can still call tools during Bob's turn.
+        await _chat(client, install.headers("bob"), session_id, "meanwhile")
+        await _chat(client, install.headers("alice"), session_id, "and this")
+
+    assert [turn["cause"] for turn in install.turns_in(session_id)] == [
+        alice, None, alice,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_does_not_start_until_its_cause_is_stored(
+    install, monkeypatch, tmp_path,
+):
+    install.use_fake_runtime(monkeypatch)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        await _chat(client, install.headers("alice"), session_id, "first")
+
+        real_setter = install.db.set_session_turn_cause
+        failures = {"left": 2}
+
+        async def flaky_setter(sid, cause_id):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise sqlite3.OperationalError("disk I/O error")
+            await real_setter(sid, cause_id)
+
+        monkeypatch.setattr(install.db, "set_session_turn_cause", flaky_setter)
+        await _chat(client, install.headers("bob"), session_id, "second")
+        # Both writes failed: the turn did not reach the runtime, and nothing
+        # runs for an earlier cause.
+        assert [turn["cause"] for turn in install.turns_in(session_id)] == [alice]
+        assert install.engine.session_cause(session_id) is None
+        assert await install.turn_cause_of(session_id) == alice
+
+        await _chat(client, install.headers("bob"), session_id, "third")
+        assert await install.turn_cause_of(session_id) == bob
+
+    await _restart_and_resume(install, session_id, tmp_path)
+    assert [turn["cause"] for turn in install.turns_in(session_id)] == [
+        alice, bob, bob,
+    ]
 
 
 @pytest.mark.asyncio

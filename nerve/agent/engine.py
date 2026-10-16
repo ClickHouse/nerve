@@ -86,6 +86,16 @@ from nerve.workspace import read_worker_guide
 logger = logging.getLogger(__name__)
 
 
+class TurnCauseNotStored(RuntimeError):
+    """The cause of a turn could not be written to the session row."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"could not store the turn cause of session {session_id}")
+
+
+# ``_persisted_turn_causes`` value for a session whose row has no known write.
+_NOT_STORED = object()
+
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 # Injected as an internal turn when a session is resumed after a
@@ -269,6 +279,13 @@ class AgentEngine:
         # background task that settled last. The CLI starts that turn to
         # report the settled task.
         self._autonomous_causes: dict[str, str | None] = {}
+        # The turn cause last written to each session row. It differs from
+        # _turn_causes only after a failed write, which the next turn retries.
+        self._persisted_turn_causes: dict[str, str | None] = {}
+        # Sessions whose runtime can still emit output of an autonomous turn
+        # that a drain gave up on (no content in time, or no result in time).
+        # The next run() turn of the session runs with an unknown cause.
+        self._unfinished_autonomous: set[str] = set()
         # Resolved model bound to each session's live SDK client. Used to
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
@@ -402,27 +419,97 @@ class AgentEngine:
         """
         return self._turn_causes.get(session_id)
 
-    async def _begin_runtime_turn(self, session_id: str, cause_id: str | None) -> None:
+    async def _begin_runtime_turn(
+        self, session_id: str, cause_id: str | None, *, must_persist: bool,
+    ) -> None:
         """Make ``cause_id`` the cause of the turn that the runtime starts now.
 
-        The value is also stored on the session row, so that a restart can
-        resume the interrupted turn for the same cause. A failed write only
-        costs that recovery, so it does not stop the turn.
+        The value is stored on the session row first, so that a restart
+        resumes the interrupted turn for the same cause. A write that fails
+        twice gives the session an unknown cause in memory: tool calls then
+        record no cause, not the cause of an earlier turn. With
+        ``must_persist`` (a run() turn, before its query) the failure also
+        raises :class:`TurnCauseNotStored`, so the turn does not start. The
+        next turn retries the write.
         """
-        if session_id in self._turn_causes and self._turn_causes[session_id] == cause_id:
-            return
+        if self._persisted_turn_causes.get(session_id, _NOT_STORED) != cause_id:
+            error: Exception | None = None
+            for _ in range(2):
+                try:
+                    await self.db.set_session_turn_cause(session_id, cause_id)
+                except Exception as e:  # noqa: BLE001 - retried, then reported
+                    error = e
+                    continue
+                self._persisted_turn_causes[session_id] = cause_id
+                error = None
+                break
+            if error is not None:
+                self._persisted_turn_causes.pop(session_id, None)
+                self._turn_causes[session_id] = None
+                logger.error(
+                    "Could not store the turn cause of session %s: %s",
+                    session_id, error,
+                )
+                if must_persist:
+                    raise TurnCauseNotStored(session_id) from error
+                return
         self._turn_causes[session_id] = cause_id
-        try:
-            await self.db.set_session_turn_cause(session_id, cause_id)
-        except Exception as e:
-            logger.warning(
-                "Could not store the turn cause of session %s: %s", session_id, e,
+
+    def _cause_for_new_turn(self, session_id: str, cause_id: str | None) -> str | None:
+        """The cause that a run() turn can claim when its query starts.
+
+        One runtime process serves the session, and its tool calls carry no
+        turn. While output of another cause can still arrive, a tool call
+        cannot be told apart. The turn then runs with an unknown cause (None)
+        and does not claim that output for this turn's person:
+
+        - an autonomous turn that the pre-query drain gave up on can still
+          emit;
+        - a background agent or workflow of another cause can still make tool
+          calls.
+        """
+        if session_id in self._unfinished_autonomous:
+            self._unfinished_autonomous.discard(session_id)
+            logger.info(
+                "Session %s: earlier autonomous output can still arrive; "
+                "the new turn runs with an unknown cause", session_id,
             )
+            return None
+        if self._live_agent_cause_differs(session_id, cause_id):
+            logger.info(
+                "Session %s: a background agent of another cause is running; "
+                "the new turn runs with an unknown cause", session_id,
+            )
+            return None
+        return cause_id
+
+    def _live_agent_cause_differs(self, session_id: str, cause_id: str | None) -> bool:
+        """Whether a running background agent or workflow has another cause.
+
+        Background commands are left out: they do not call the session's
+        tools.
+        """
+        registry = self._bg_task_registry.get(session_id) or {}
+        for task_id, task_cause in (self._bg_task_causes.get(session_id) or {}).items():
+            entry = registry.get(task_id) or {}
+            if (
+                entry.get("status") == "running"
+                and entry.get("tool") in ("Agent", "Workflow")
+                and task_cause != cause_id
+            ):
+                return True
+        return False
 
     def _forget_background_causes(self, session_id: str) -> None:
-        """Drop the causes of background tasks that died with their client."""
+        """Drop the causes of runtime work that died with its client.
+
+        Every path that tears down a session's client calls this: discard,
+        a dead client, a model change, a crash retry, a stop and a turn
+        error.
+        """
         self._bg_task_causes.pop(session_id, None)
         self._autonomous_causes.pop(session_id, None)
+        self._unfinished_autonomous.discard(session_id)
 
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
@@ -1167,6 +1254,7 @@ class AgentEngine:
                         session_id,
                     )
                     self._stop_idle_watcher(session_id)
+                    self._forget_background_causes(session_id)
                     self.sessions.remove_client(session_id)
                     self._session_backends.pop(session_id, None)
                     self._session_models.pop(session_id, None)
@@ -1182,6 +1270,7 @@ class AgentEngine:
                         session_id, bound_model, requested_model,
                     )
                     self._stop_idle_watcher(session_id)
+                    self._forget_background_causes(session_id)
                     self.sessions.remove_client(session_id)
                     self._session_backends.pop(session_id, None)
                     self._session_models.pop(session_id, None)
@@ -2799,15 +2888,17 @@ class AgentEngine:
             # idle watcher claimed it).  Without this, receive_response()
             # below would consume the stale turn and terminate on ITS
             # ResultMessage — answering this message with the previous
-            # turn's output (off-by-one desync).  The short first-content
-            # timeout keeps a just-started autonomous turn from delaying
-            # the user's message for long; if its content arrives later it
-            # interleaves into this turn's stream (still rendered) and the
-            # idle watcher self-heals the remainder.
+            # turn's output (off-by-one desync).  A started autonomous turn
+            # is drained to its result: the runtime answers this message
+            # only after that turn anyway, and its output belongs to its own
+            # cause. If no content comes within the first-content timeout,
+            # the drain gives up; late content then interleaves into this
+            # turn's stream (still rendered), the idle watcher self-heals
+            # the remainder, and this turn runs with an unknown cause.
             try:
                 await self._drain_pending_messages(
                     session_id, client, source, channel,
-                    first_content_timeout=3.0,
+                    first_content_timeout=self._PRE_QUERY_FIRST_CONTENT_SECONDS,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2823,7 +2914,10 @@ class AgentEngine:
 
             # This turn starts in the runtime now. The drain above ran under
             # the cause of the work it drained.
-            await self._begin_runtime_turn(session_id, cause_id)
+            await self._begin_runtime_turn(
+                session_id, self._cause_for_new_turn(session_id, cause_id),
+                must_persist=True,
+            )
 
             # New user turn: settled background-task chips are stale now.
             self._prune_bg_tasks(session_id)
@@ -2915,6 +3009,7 @@ class AgentEngine:
                             session_id, _qerr,
                         )
                         self._stop_idle_watcher(session_id)
+                        self._forget_background_causes(session_id)
                         self.sessions.remove_client(session_id)
                         unregister_handler(session_id)
                         await self._safe_disconnect(client)
@@ -2952,6 +3047,7 @@ class AgentEngine:
                             session_id, _recv_err,
                         )
                         self._stop_idle_watcher(session_id)
+                        self._forget_background_causes(session_id)
                         self.sessions.remove_client(session_id)
                         unregister_handler(session_id)
                         await self._safe_disconnect(client)
@@ -2988,6 +3084,7 @@ class AgentEngine:
                 )
             await self.sessions.mark_stopped(session_id)
             self._stop_idle_watcher(session_id)
+            self._forget_background_causes(session_id)
             unregister_handler(session_id)
             client = self.sessions.remove_client(session_id)
             if client:
@@ -3084,6 +3181,7 @@ class AgentEngine:
             await self.schedule_memorize(session_id)
             # Clear resume — CLI state may be corrupted after error
             self._stop_idle_watcher(session_id)
+            self._forget_background_causes(session_id)
             unregister_handler(session_id)
             client = self.sessions.remove_client(session_id)
             await self.sessions.mark_error(session_id, error_msg)
@@ -3124,6 +3222,9 @@ class AgentEngine:
 
     # How often the idle watcher probes the SDK buffer (seconds).
     _IDLE_STREAM_POLL_SECONDS = 0.5
+    # How long the pre-query drain waits for the first content of an
+    # autonomous turn that has started. The same as the idle watcher's wait.
+    _PRE_QUERY_FIRST_CONTENT_SECONDS = 30.0
 
     async def _drain_pending_messages(
         self,
@@ -3178,8 +3279,11 @@ class AgentEngine:
             # The runtime reports a settled background task, so the turn
             # continues the work of the turn that started the task.
             if session_id in self._autonomous_causes:
+                cause_id = self._autonomous_causes.pop(session_id)
+                if self._live_agent_cause_differs(session_id, cause_id):
+                    cause_id = None
                 await self._begin_runtime_turn(
-                    session_id, self._autonomous_causes.pop(session_id),
+                    session_id, cause_id, must_persist=False,
                 )
             # Leading marker block → "background continuation" chip in the
             # UI, both live (auto_turn event) and after reload (persisted).
@@ -3252,6 +3356,8 @@ class AgentEngine:
                                 session_id, first_content_timeout,
                             )
                             await _close_turn()  # empty — dropped
+                            # The runtime can still emit this turn.
+                            self._unfinished_autonomous.add(session_id)
                             break
                         logger.warning(
                             "Autonomous turn idle timeout (%ss) for session %s "
@@ -3264,6 +3370,7 @@ class AgentEngine:
                             else "[Background turn interrupted: runtime went silent]"
                         )
                         await _close_turn()
+                        self._unfinished_autonomous.add(session_id)
                         raise
                     if batch is None:
                         logger.warning(
@@ -3326,6 +3433,7 @@ class AgentEngine:
                         )
                         if turn_done:
                             await _close_turn()
+                            self._unfinished_autonomous.discard(session_id)
                     # A ModelObserved whose batch never produced content is
                     # dropped with it — an empty assistant message carries
                     # nothing worth persisting.

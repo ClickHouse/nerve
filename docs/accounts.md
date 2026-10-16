@@ -200,7 +200,19 @@ turn record the system actor as actor and the turn's cause as cause. A
 background task (a command or an agent that runs in the background) keeps the
 cause of the turn that started it, and so does the turn that the agent starts
 to report the result of the task. When a person sends a message while earlier
-background output waits, Nerve processes that output for its own cause first.
+background output waits, Nerve processes that output for its own cause first:
+it waits up to 30 seconds for the first output of a report turn that has
+started, and then to the end of that turn.
+
+One agent process serves a session, and its tool calls do not say which turn
+they belong to. So a turn runs with an unknown cause, not with its person's
+cause, when output of another cause can still arrive during it: a report turn
+that showed no output within the 30 seconds, or a background agent that
+another person's turn started and that still runs. Nerve records an unknown
+cause rather than the wrong person.
+
+Nerve stores the cause on the session before the turn reaches the agent. If
+that write fails, the turn does not start.
 
 | Work | Actor | Cause |
 |---|---|---|
