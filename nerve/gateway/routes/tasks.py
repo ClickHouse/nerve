@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -20,8 +19,6 @@ from nerve.gateway.routes._deps import (
 )
 from nerve.identity import Actor, attribution_for
 from nerve.tasks.files import write_task_file
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
@@ -440,8 +437,8 @@ async def create_task_status(
     created = await deps.db.create_task_status(
         name=name, label=label, color=color,
         description=(req.description or "").strip(),
+        attribution=attribution_for(actor),
     )
-    _log_status_change("created", name, actor)
     return created
 
 
@@ -460,8 +457,9 @@ async def reorder_task_statuses(
     Declared above /{name} so "reorder" isn't captured as a status name.
     """
     deps = get_deps()
-    statuses = await deps.db.reorder_task_statuses(req.names)
-    _log_status_change("reordered", ",".join(req.names), actor)
+    statuses = await deps.db.reorder_task_statuses(
+        req.names, attribution=attribution_for(actor),
+    )
     return {"statuses": statuses}
 
 
@@ -480,8 +478,8 @@ async def update_task_status(
         color=req.color if req.color is not None else None,
         description=req.description if req.description is not None else None,
         sort_order=req.sort_order,
+        attribution=attribution_for(actor),
     )
-    _log_status_change("updated", name, actor)
     return await deps.db.get_task_status_def(name)
 
 
@@ -503,15 +501,5 @@ async def delete_task_status(name: str, actor: Actor = Depends(require_auth)):
             detail=f"{in_use} task(s) use the '{name}' status. "
                    "Reassign them before deleting it.",
         )
-    await deps.db.delete_task_status_def(name)
-    _log_status_change("deleted", name, actor)
+    await deps.db.delete_task_status_def(name, attribution=attribution_for(actor))
     return {"name": name, "deleted": True}
-
-
-def _log_status_change(change: str, names: str, actor: Actor) -> None:
-    """Log who changed a status definition.
-
-    ``task_statuses`` has no attribution column, so the log is the only
-    record of the person.
-    """
-    logger.info("Task status %s %s by actor %s", names, change, actor.actor_id)

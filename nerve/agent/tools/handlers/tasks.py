@@ -872,6 +872,7 @@ async def task_status_create_handler(ctx: ToolContext, args: dict) -> ToolResult
 
     created = await ctx.db.create_task_status(
         name=name, label=label, color=color, description=description,
+        attribution=ctx.attribution,
     )
     return ToolResult.text(
         f"Created task status '{created['name']}' "

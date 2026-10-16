@@ -478,15 +478,51 @@ async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_task_status_definition_changes_take_the_person(install, caplog):
-    caplog.set_level("INFO", logger="nerve.gateway.routes.tasks")
+async def test_task_status_definition_changes_record_actor_and_cause(install):
+    from nerve.agent.tools.handlers.tasks import task_status_create_handler
+
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
     async with _client(install.app()) as client:
-        response = await client.post(
+        created = await client.post(
             "/api/task-statuses", headers=install.headers("bob"),
-            json={"name": "review"},
+            json={"name": "review", "label": "Review", "color": "#123456"},
         )
-    assert response.status_code == 200
-    assert f"by actor {install.actor_id('bob')}" in caplog.text
+        assert created.status_code == 200
+        updated = await client.patch(
+            "/api/task-statuses/review", headers=install.headers("alice"),
+            json={"label": "In review"},
+        )
+        assert updated.status_code == 200
+        reordered = await client.post(
+            "/api/task-statuses/reorder", headers=install.headers("bob"),
+            json={"names": ["review", "pending"]},
+        )
+        assert reordered.status_code == 200
+        deleted = await client.delete(
+            "/api/task-statuses/review", headers=install.headers("alice"),
+        )
+        assert deleted.status_code == 200
+
+    # The agent adds a status in a turn that Alice started.
+    ctx = ToolContext(
+        session_id="alices-turn", db=install.db,
+        actor=install.db.system_actor, cause=alice,
+    )
+    await task_status_create_handler(ctx, {"name": "blocked"})
+
+    events = await install.db.list_task_status_events()
+    assert [
+        (e["change"], e["status_name"], e["actor_id"], e["caused_by_actor_id"])
+        for e in events
+    ] == [
+        ("created", "review", bob, bob),
+        ("updated", "review", alice, alice),
+        ("reordered", None, bob, bob),
+        ("deleted", "review", alice, alice),
+        ("created", "blocked", install.system_actor_id, alice),
+    ]
+    assert json.loads(events[1]["detail"]) == {"label": "In review"}
+    assert json.loads(events[2]["detail"])["order"][:2] == ["review", "pending"]
 
 
 # --------------------------------------------------------------------------- #

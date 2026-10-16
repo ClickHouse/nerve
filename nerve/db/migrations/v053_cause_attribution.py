@@ -1,4 +1,4 @@
-"""V53: record the cause of a turn and who changed a task's status.
+"""V53: record the cause of a turn and who changes tasks and task statuses.
 
 Adds four nullable columns that hold an ``actor_refs.id``:
 
@@ -18,6 +18,11 @@ Adds four nullable columns that hold an ``actor_refs.id``:
 
 ``task_events.actor`` stays. It is the origin of the change (``web``, a
 session ID, ``system``, ``backfill``), not an identity.
+
+Adds the table ``task_status_events``: one append-only row for each change to
+the set of task statuses (``created``, ``updated``, ``reordered``,
+``deleted``), with its actor and cause. A status definition row can be
+deleted, so its history cannot live on the row.
 
 **Existing rows stay NULL and nothing is backfilled.** NULL reads as "not
 recorded". The free-text origin of an old task event does not name a person,
@@ -44,6 +49,23 @@ _COLUMNS = (
     ("task_events", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
 )
 
+# ``status_name`` is NULL for ``reordered``, which changes the order of all
+# statuses; ``detail`` is a JSON object with the changed values.
+_STATUS_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS task_status_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    change             TEXT NOT NULL,
+    status_name        TEXT,
+    detail             TEXT,
+    actor_id           TEXT REFERENCES actor_refs(id),
+    caused_by_actor_id TEXT REFERENCES actor_refs(id),
+    created_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_status_events_created
+    ON task_status_events(created_at);
+"""
+
 
 async def _has_column(db: aiosqlite.Connection, table: str, column: str) -> bool:
     async with db.execute(f"PRAGMA table_info({table})") as cursor:
@@ -60,7 +82,8 @@ async def up(db: aiosqlite.Connection) -> None:
         # NULL, so the table is not rebuilt and every existing row is NULL.
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         added.append(f"{table}.{column}")
+    await db.executescript(_STATUS_EVENTS_SQL)
     logger.info(
-        "v053: cause and task attribution columns %s",
+        "v053: cause and task attribution columns %s; task_status_events ready",
         ", ".join(added) if added else "already present",
     )
