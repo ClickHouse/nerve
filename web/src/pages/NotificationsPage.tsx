@@ -311,6 +311,16 @@ function NotificationCard({ notif }: { notif: Notification }) {
           </span>
         </div>
       )}
+      {notif.status === 'pending' && notif.redeliver_at && notif.answered_by_actor_id && (
+        <div className="mt-1 ml-[18px] text-xs text-text-faint">
+          Snoozed by{' '}
+          <ActorAttribution
+            actorId={notif.answered_by_actor_id}
+            causeId={null}
+            verb="Snoozed by"
+          />
+        </div>
+      )}
 
       {/* Show answer if answered. The person is known for a web answer; a
           chat-channel answer names only its transport. */}

@@ -103,6 +103,16 @@ export function PlanDetailPage() {
         </div>
         <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
           <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
+          {plan.created_by_actor_id && (
+            <span data-testid="plan-author" className="inline-flex items-center gap-1 min-w-0">
+              Proposed by{' '}
+              <ActorAttribution
+                actorId={plan.created_by_actor_id}
+                causeId={plan.caused_by_actor_id}
+                verb="Proposed by"
+              />
+            </span>
+          )}
           {plan.model && <span>{plan.model}</span>}
           {plan.reviewed_by_actor_id && (
             <span data-testid="plan-reviewer" className="inline-flex items-center gap-1 min-w-0">

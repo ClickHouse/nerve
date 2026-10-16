@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -168,9 +168,45 @@ describe('NotificationsPage attribution', () => {
     });
     renderPage();
     await screen.findByText('Pick one');
-    useNotificationStore.getState().handleWSNotificationAnswered({
-      notification_id: 'notif-live', answer: 'yes', answered_by: 'web', actor_id: BOB,
+    act(() => {
+      useNotificationStore.getState().handleWSNotificationAnswered({
+        notification_id: 'notif-live', answer: 'yes', answered_by: 'web', actor_id: BOB,
+      });
     });
     await waitFor(() => expect(attributions()).toEqual(['Bob']));
+  });
+
+  it('names who snoozed an approval that is still pending', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({
+        type: 'approval', status: 'pending', answer: null, answered_by: null,
+        answered_at: null, options: ['approve', 'decline', 'snooze_24h'],
+        redeliver_at: '2999-01-01T00:00:00+00:00', answered_by_actor_id: BOB,
+      })],
+      pending_count: 1,
+    });
+    renderPage();
+    await waitFor(() => expect(attributions()).toEqual(['Bob']));
+    expect(screen.getByText(/Snoozed by/)).toBeInTheDocument();
+  });
+
+  it('updates the snoozer from the snooze broadcast', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({
+        id: 'notif-snooze', type: 'approval', status: 'pending', answer: null,
+        answered_by: null, answered_at: null, options: ['approve', 'snooze_24h'],
+      })],
+      pending_count: 1,
+    });
+    renderPage();
+    await screen.findByText('Pick one');
+    act(() => {
+      useNotificationStore.getState().handleWSNotificationAnswered({
+        notification_id: 'notif-snooze', answer: 'snooze_24h', answered_by: 'web',
+        approval_status: 'snoozed', snooze_until: '2999-01-01T00:00:00+00:00',
+        actor_id: ALICE,
+      });
+    });
+    await waitFor(() => expect(attributions()).toEqual(['Alice']));
   });
 });

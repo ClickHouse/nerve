@@ -48,6 +48,8 @@ function plan(overrides: Partial<Plan>): Plan {
     reviewed_at: null,
     reviewed_by_actor_id: null,
     reviewed_caused_by_actor_id: null,
+    created_by_actor_id: null,
+    caused_by_actor_id: null,
     ...overrides,
   };
 }
@@ -97,10 +99,20 @@ describe('PlanDetailPage reviewer', () => {
     await waitFor(() => expect(reviewer).toHaveTextContent('Nerve for Alice'));
   });
 
+  it('names who proposed the plan, and for whom', async () => {
+    getPlan.mockResolvedValue(plan({
+      created_by_actor_id: SYSTEM, caused_by_actor_id: ALICE,
+    }));
+    renderPage();
+    const author = await screen.findByTestId('plan-author');
+    await waitFor(() => expect(author).toHaveTextContent('Proposed by Nerve for Alice'));
+  });
+
   it('shows no reviewer for a plan that nobody reviewed', async () => {
     getPlan.mockResolvedValue(plan({}));
     renderPage();
     await screen.findByText('Ship it');
     expect(screen.queryByTestId('plan-reviewer')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('plan-author')).not.toBeInTheDocument();
   });
 });

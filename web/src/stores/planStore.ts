@@ -20,6 +20,9 @@ export interface Plan {
   // and on whose behalf. Null when nobody reviewed it or on older rows.
   reviewed_by_actor_id?: string | null;
   reviewed_caused_by_actor_id?: string | null;
+  // Who wrote this version and on whose behalf. Null on older rows.
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
 }
 
 interface PlanState {

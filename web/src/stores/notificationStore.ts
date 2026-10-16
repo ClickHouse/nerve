@@ -15,7 +15,8 @@ export interface Notification {
   // The transport the answer came through (`web`, `telegram`, `slack`).
   answered_by: string | null;
   // The person who answered. Null for a chat-channel answer, which names no
-  // person, and on rows from before it was recorded.
+  // person, and on rows from before it was recorded. On a snoozed approval
+  // that is still pending: the person who snoozed it.
   answered_by_actor_id?: string | null;
   // The person who dismissed the row.
   dismissed_by_actor_id?: string | null;
@@ -208,7 +209,12 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       set(s => ({
         notifications: s.notifications.map(n =>
           n.id === data.notification_id
-            ? { ...n, status: 'pending', redeliver_at: data.snooze_until ?? null }
+            ? {
+                ...n,
+                status: 'pending',
+                redeliver_at: data.snooze_until ?? null,
+                answered_by_actor_id: data.actor_id ?? null,
+              }
             : n
         ),
       }));
