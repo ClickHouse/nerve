@@ -27,6 +27,7 @@ from nerve.db.accounts import (
     SYSTEM_ACTOR_ID_TAKEN,
     SYSTEM_ACTOR_ID_TRIGGER,
     SYSTEM_ACTOR_ID_TRIGGER_SQL,
+    SYSTEM_PRINCIPAL_CLAIM_NAME,
     inspect_system_actor,
 )
 from nerve.db.migrations import v047_accounts
@@ -104,6 +105,17 @@ async def _refer_to_system_actor(database: Database, reference: str) -> str:
         "INSERT INTO later_story (caused_by_actor_id) VALUES (?)", (system.actor_id,),
     )
     return "later_story.caused_by_actor_id"
+
+
+def _claimed(claimed_id: str) -> str:
+    return (
+        f"the system actor already took the ID {claimed_id} once, and its ID "
+        "changes only once"
+    )
+
+
+async def _claim(database: Database) -> str | None:
+    return await database._get_instance_secret(SYSTEM_PRINCIPAL_CLAIM_NAME)
 
 
 def _rekey_from_another_connection(path, new_id: str) -> None:
@@ -259,6 +271,12 @@ class TestRekey:
         assert await _system_rows(database) == [local_id]
         assert await _trigger_sql(database) == fresh
         assert database.system_actor_id == local_id
+        assert await _claim(database) is None
+
+    async def test_the_change_records_the_claim(self, database):
+        assert await _claim(database) is None
+        await database._rekey_system_actor(PRINCIPAL)
+        assert await _claim(database) == PRINCIPAL
 
     async def test_two_connections_agree_on_the_new_id(self, tmp_path):
         first = await _open(tmp_path / "nerve.db")
@@ -282,17 +300,13 @@ class TestRekey:
         first = await _open(tmp_path / "nerve.db")
         second = await _open(tmp_path / "nerve.db")
         try:
-            local_id = first.system_actor_id
             assert (await first._rekey_system_actor(PRINCIPAL)).changed
 
             result = await second._rekey_system_actor(ALICE)
 
             assert not result.changed
             assert (result.previous_id, result.actor_id) == (PRINCIPAL, PRINCIPAL)
-            assert result.blocker == (
-                f"another process changed the ID from {local_id} to {PRINCIPAL} "
-                "after this process read it"
-            )
+            assert result.blocker == _claimed(PRINCIPAL)
             assert first.system_actor_id == second.system_actor_id == PRINCIPAL
             assert await _system_rows(first) == [PRINCIPAL]
             # Both connections can still write rows attributed to the system actor.
@@ -313,7 +327,7 @@ class TestRekey:
             assert sorted(r.changed for r in results) == [False, True]
             winner = next(r.actor_id for r in results if r.changed)
             loser = next(r for r in results if not r.changed)
-            assert loser.blocker.startswith("another process changed the ID")
+            assert loser.blocker == _claimed(winner)
             assert first.system_actor_id == second.system_actor_id == winner
             assert await _system_rows(first) == [winner]
             await first.create_session("s-first", actor=first.system_actor)
@@ -321,6 +335,80 @@ class TestRekey:
         finally:
             await first.close()
             await second.close()
+
+    async def test_a_connection_that_opens_later_cannot_change_the_id_again(self, tmp_path):
+        """The second connection opens after the change, so it caches the new
+        ID. The claim still refuses a different ID, and the first connection
+        keeps an ID that exists."""
+        path = tmp_path / "nerve.db"
+        first = await _open(path)
+        try:
+            assert (await first._rekey_system_actor(PRINCIPAL)).changed
+            second = await _open(path)
+            try:
+                assert second.system_actor_id == PRINCIPAL
+
+                result = await second._rekey_system_actor(ALICE)
+
+                assert not result.changed and result.blocker == _claimed(PRINCIPAL)
+                assert inspect_system_actor(path, ALICE) == (PRINCIPAL, _claimed(PRINCIPAL))
+                assert first.system_actor_id == second.system_actor_id == PRINCIPAL
+                assert await _system_rows(first) == [PRINCIPAL]
+                await first.create_session("s-first", actor=first.system_actor)
+                await second.create_session("s-second", actor=second.system_actor)
+            finally:
+                await second.close()
+        finally:
+            await first.close()
+
+    async def test_the_result_gives_the_ids_of_its_own_transaction(
+        self, tmp_path, monkeypatch,
+    ):
+        """Another connection opens between the commit and the cache refresh
+        of the first one, and asks for a different ID. It is refused, and the
+        first connection reports and caches the ID it set."""
+        path = tmp_path / "nerve.db"
+        first = await _open(path)
+        late: list = []
+        refresh = first._cache_system_actor
+
+        async def refresh_after_a_late_change():
+            second = await _open(path)
+            try:
+                late.append(await second._rekey_system_actor(ALICE))
+            finally:
+                await second.close()
+            await refresh()
+
+        try:
+            monkeypatch.setattr(first, "_cache_system_actor", refresh_after_a_late_change)
+            result = await first._rekey_system_actor(PRINCIPAL)
+
+            assert result.changed and result.actor_id == PRINCIPAL
+            assert late[0].blocker == _claimed(PRINCIPAL)
+            assert first.system_actor_id == PRINCIPAL
+            assert await _system_rows(first) == [PRINCIPAL]
+        finally:
+            await first.close()
+
+    async def test_without_a_claim_a_connection_keeps_an_id_that_another_one_set(
+        self, database,
+    ):
+        """A database without the claim row (for example from a backup made
+        with --no-secrets): the compare with the cached ID still refuses to
+        change an ID that another connection set."""
+        local_id = database.system_actor_id
+        _rekey_from_another_connection(database.db_path, PRINCIPAL)
+        assert await _claim(database) is None
+
+        result = await database._rekey_system_actor(ALICE)
+
+        assert not result.changed
+        assert result.blocker == (
+            f"another process changed the ID from {local_id} to {PRINCIPAL} "
+            "after this process read it"
+        )
+        assert database.system_actor_id == PRINCIPAL
 
     @pytest.mark.parametrize("referenced", [False, True])
     async def test_a_column_collation_that_is_not_registered_does_not_stop_the_check(
@@ -583,13 +671,42 @@ class TestBootstrap:
             assert not report.rekeyed_system_actor
             assert len(report.warnings) == 1
             assert f"keeps its current ID {PRINCIPAL}" in report.warnings[0]
-            assert "another process changed the ID" in report.warnings[0]
+            assert _claimed(PRINCIPAL) in report.warnings[0]
             assert len(_warnings(caplog)) == 1
             assert first.system_actor_id == second.system_actor_id == PRINCIPAL
             await second.create_session("s-second", actor=second.system_actor)
         finally:
             await first.close()
             await second.close()
+
+    async def test_a_later_start_with_another_value_keeps_the_id(
+        self, tmp_path, external, monkeypatch, caplog,
+    ):
+        """The first process keeps running. A process that starts later, with
+        another value, keeps the first ID and logs one warning."""
+        path = tmp_path / "nerve.db"
+        first = await _open(path)
+        try:
+            monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, PRINCIPAL)
+            assert (await bootstrap_identity(first, _config())).rekeyed_system_actor
+
+            monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, ALICE)
+            second = await _open(path)
+            try:
+                with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+                    report = await bootstrap_identity(second, _config())
+                assert not report.rekeyed_system_actor
+                assert len(report.warnings) == 1
+                assert f"keeps its current ID {PRINCIPAL}" in report.warnings[0]
+                assert _claimed(PRINCIPAL) in report.warnings[0]
+                assert len(_warnings(caplog)) == 1
+                assert second.system_actor_id == PRINCIPAL
+            finally:
+                await second.close()
+            assert first.system_actor_id == PRINCIPAL
+            await first.create_session("s-first", actor=first.system_actor)
+        finally:
+            await first.close()
 
 
 # --------------------------------------------------------------------------- #

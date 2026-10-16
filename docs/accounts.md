@@ -187,9 +187,10 @@ when these conditions are true:
   `sessions.created_by_actor_id` and `messages.actor_id`, and checks all of
   them. A check that cannot run counts as a row.
 - No other actor has the new ID.
-- No other process changed the ID after this process opened the database.
-  When two processes start at the same time with different values, the first
-  change stays.
+- The system actor did not take an ID from the variable before. Nerve records
+  the ID it took in `nerve.db`, in the same transaction as the change, so the
+  ID changes at most once, also when two processes start with different
+  values. A backup made with `--no-secrets` does not keep that record.
 
 Thus a new installation gets the ID before it attributes work to the system
 actor. After the change, system and MCP tokens act as the new ID, and
