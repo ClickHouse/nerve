@@ -1,37 +1,9 @@
 import {
-  actorDiscriminators, actorName, isSystemActor, useActorStore,
-} from '../../stores/actorStore';
+  type Attribution, useActorAndCause, useAttribution,
+} from '../../hooks/useActorAttribution';
 import { useAuthStore } from '../../stores/authStore';
-import { useEffect } from 'react';
 import { Badge } from '../ui';
 import { Bot, User } from '../ui/icons';
-
-interface Attribution {
-  name: string;
-  system: boolean;
-  anonymous: boolean;
-  ambiguous: boolean;
-}
-
-/** Resolve an actor id to its current display label. */
-function useAttribution(actorId: string | null | undefined): Attribution {
-  const actors = useActorStore((s) => s.actors);
-  const resolve = useActorStore((s) => s.resolve);
-  useEffect(() => {
-    if (actorId) resolve([actorId]);
-  }, [actorId, resolve]);
-
-  const actor = actorId ? actors[actorId] : undefined;
-  const base = actorName(actor, actorId ?? null);
-  const system = isSystemActor(actor);
-  const discriminator = actorId ? actorDiscriminators(actors).get(actorId) : undefined;
-  return {
-    name: discriminator ? `${base} (${discriminator})` : base,
-    system,
-    anonymous: !system && !actor?.display_name?.trim() && !actor?.username?.trim(),
-    ambiguous: !!discriminator,
-  };
-}
 
 function tooltip(verb: string, actorId: string, attribution: Attribution): string {
   const { name, system, anonymous, ambiguous } = attribution;
@@ -54,12 +26,8 @@ export function ActorAttribution({ actorId, causeId, verb = 'By' }: {
   /** Leads the tooltip, for example "Changed by". */
   verb?: string;
 }) {
-  const actor = useAttribution(actorId);
-  const otherCauseId = actorId && causeId && causeId !== actorId ? causeId : null;
-  const cause = useAttribution(otherCauseId);
+  const { actor, forPerson, label } = useActorAndCause(actorId, causeId);
   if (!actorId) return null;
-  const forPerson = otherCauseId && !cause.system ? cause.name : null;
-  const label = forPerson ? `${actor.name} for ${forPerson}` : actor.name;
   const title = forPerson
     ? `${verb} ${actor.name} on behalf of ${forPerson}`
     : tooltip(verb, actorId, actor);

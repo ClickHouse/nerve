@@ -230,6 +230,8 @@ export function handleSessionRunning(
     ...sess,
     is_running: msg.is_running,
     pending_wakeup_at: msg.pending_wakeup_at ?? null,
+    pending_wakeup_created_by_actor_id: msg.pending_wakeup_created_by_actor_id ?? null,
+    pending_wakeup_caused_by_actor_id: msg.pending_wakeup_caused_by_actor_id ?? null,
     has_background_tasks: !!msg.has_background_tasks,
   });
   set(s => {
