@@ -440,7 +440,11 @@ class Database(
             raise
 
     async def _cache_system_actor(self) -> None:
-        """Validate and cache the one system actor created by migrations."""
+        """Validate and cache the one system actor created by migrations.
+
+        Called at connect, and again after the identity bootstrap changes the
+        ID (:meth:`AccountStore._rekey_system_actor`).
+        """
         async with self.db.execute(
             "SELECT id, display_name FROM actor_refs WHERE kind = 'system'"
         ) as cursor:
@@ -465,8 +469,11 @@ class Database(
     def system_actor(self) -> Actor:
         """The actor for autonomous work, validated and cached at connect.
 
-        Schema triggers prevent a change to its id or kind, so no caller has to
-        read the row again.
+        Schema triggers prevent a change to its id or kind. The one exception
+        is the identity bootstrap at startup, which can give the system actor
+        the ID of the agent's system principal before anything refers to it,
+        and which then refreshes this cache. So no other caller has to read
+        the row again.
         """
         if self._system_actor is None:
             raise RuntimeError("Database not connected. Call connect() first.")
