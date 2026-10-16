@@ -13,7 +13,9 @@ import base64
 import errno
 import json
 import logging
+import math
 import os
+import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +43,7 @@ from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
 from nerve.setup_writer import SetupChoices, apply_mode, write_slim_install
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 _PASSWORD = "correct horse battery staple"
 _API_KEY = "sk-ant-REPLACE0000000000"
@@ -3440,3 +3443,36 @@ class TestNoLocalSecrets:
         assert state["steps_left"] == 0
         assert state["finished"] is True
         assert {s["id"] for s in state["steps"] if s["blocked_kind"] == "policy"} == {"memory", "sources", "agents"}
+
+
+@pytest.mark.asyncio
+class TestProviderProbeBehindTheProxy:
+    """Proxy clients back off for about 20 s by default, longer than the
+    probe's time limit. The probe uses its own small retry budget, so each
+    failure keeps its own result instead of "No answer in 20 s."."""
+
+    @staticmethod
+    def _candidate(port: int) -> NerveConfig:
+        return NerveConfig.from_dict({
+            "proxy": {"enabled": True, "port": port, "api_key": "sk-local"},
+        })
+
+    async def test_rate_limit_and_unreachable_proxy_keep_their_own_result(self):
+        """Real SDK backoff, real time limit."""
+        upstream = RateLimitedUpstream(failures=math.inf)
+        with socket.socket() as probe_socket:
+            probe_socket.bind(("127.0.0.1", 0))
+            closed_port = probe_socket.getsockname()[1]
+        try:
+            limited, refused = await asyncio.gather(
+                setup_checks.provider_test(self._candidate(upstream.port)),
+                setup_checks.provider_test(self._candidate(closed_port)),
+            )
+        finally:
+            upstream.close()
+
+        assert limited["code"] == "unknown", limited
+        assert limited["detail"].startswith("RateLimitError:"), limited
+        assert upstream.requests == setup_checks.PROVIDER_TEST_MAX_RETRIES + 1
+        assert refused["code"] == "network", refused
+        assert "could not reach" in refused["detail"], refused

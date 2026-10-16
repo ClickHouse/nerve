@@ -3564,17 +3564,37 @@ class NerveConfig:
         """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
         return self.selectable_claude_models()
 
-    def create_anthropic_client(self, timeout: float = 60.0) -> Any:
+    def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
+        """The ``max_retries`` argument for an Anthropic client, if any.
+
+        An explicit value wins. Otherwise proxy clients get
+        ``PROXY_CLIENT_MAX_RETRIES`` and the others keep the SDK default.
+        """
+        if max_retries is not None:
+            return {"max_retries": max_retries}
+        if self.proxy.enabled and not self.provider.is_bedrock:
+            return {"max_retries": PROXY_CLIENT_MAX_RETRIES}
+        return {}
+
+    def create_anthropic_client(
+        self, timeout: float = 60.0, *, max_retries: int | None = None,
+    ) -> Any:
         """Create an Anthropic client based on the configured provider.
 
         Returns AnthropicBedrock when provider is "bedrock", otherwise
         a standard Anthropic client using the effective API key and base URL.
+
+        ``max_retries`` replaces the default retry budget (see
+        :meth:`_client_retry_kwargs`). A caller with a hard time limit must
+        set it: the proxy budget backs off for about 20 s.
         """
         import anthropic
 
         if self.provider.is_bedrock:
             from anthropic import AnthropicBedrock
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {
+                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+            }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
             if self.provider.aws_profile:
@@ -3588,9 +3608,7 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
-        kwargs = {}
-        if self.proxy.enabled:
-            kwargs["max_retries"] = PROXY_CLIENT_MAX_RETRIES
+        kwargs = self._client_retry_kwargs(max_retries)
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
         # environment itself, so the environment-only install the checks call
@@ -3602,17 +3620,22 @@ class NerveConfig:
             **kwargs,
         )
 
-    def create_async_anthropic_client(self, timeout: float = 60.0) -> Any:
+    def create_async_anthropic_client(
+        self, timeout: float = 60.0, *, max_retries: int | None = None,
+    ) -> Any:
         """Create an async Anthropic client based on the configured provider.
 
         Returns AsyncAnthropicBedrock when provider is "bedrock", otherwise
-        a standard AsyncAnthropic client.
+        a standard AsyncAnthropic client. ``max_retries`` as in
+        :meth:`create_anthropic_client`.
         """
         import anthropic
 
         if self.provider.is_bedrock:
             from anthropic import AsyncAnthropicBedrock
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {
+                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+            }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
             if self.provider.aws_profile:
@@ -3625,9 +3648,7 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
-        kwargs = {}
-        if self.proxy.enabled:
-            kwargs["max_retries"] = PROXY_CLIENT_MAX_RETRIES
+        kwargs = self._client_retry_kwargs(max_retries)
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
