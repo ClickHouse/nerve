@@ -193,6 +193,10 @@ These columns store actor IDs:
 | `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
 | `session_events.actor_id`, `session_events.caused_by_actor_id` | Actor and cause of a session change (see [Session changes](#session-changes)) |
 | `session_deletions.actor_id`, `session_deletions.caused_by_actor_id` | Actor and cause of a session delete |
+| `notifications.answered_by_actor_id` | Who answered a question or decided an approval |
+| `notifications.dismissed_by_actor_id` | Who dismissed a notification |
+| `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
+| `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -237,18 +241,24 @@ in the same way, so the same approximation applies to model usage. See
 |---|---|---|
 | A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
 | The agent works in a session (tool calls, task changes, sessions it starts) | The system actor | The session's cause |
+| The agent reviews a plan or creates a silence | The system actor | The session's cause |
 | Nerve sets a session title (the placeholder and the generated title) | The system actor | The session's cause |
 | An automatic archive, the archive of a Codex session by the sync | The system actor | The system actor |
+| A person answers, dismisses, or silences notifications, or reviews a plan, through the web UI or the REST API | The person | The person |
+| The message that relays a web answer into the session that asked | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
 | Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
+| An answer through Telegram, Slack, or a hosted channel, and the message that relays it | None | None |
 | Assistant and tool output | None | None |
 
 Existing records remain unattributed: Nerve does not backfill these columns.
 Nerve does not infer identity from channel or source metadata. The free-text
-origin fields, such as `task_events.actor`, stay as they are; they record where
-a change came from, not who made it. Account administration actions are not
-yet recorded as audit events. Missing attribution means legacy history,
-unidentified external input, or assistant/tool output; autonomous work uses the
-system actor.
+origin fields, such as `task_events.actor`, `notifications.answered_by` and
+`notification_silences.created_by`, stay as they are; they record where a
+change came from, not who made it. A chat-channel answer keeps the provider
+user ID in the notification's `metadata.answered_by_actor`; it is not an actor
+ID. Account administration actions are not yet recorded as audit events.
+Missing attribution means legacy history, unidentified external input, or
+assistant/tool output; autonomous work uses the system actor.
 
 ### Session changes
 

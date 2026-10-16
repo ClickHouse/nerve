@@ -713,8 +713,9 @@ writes no configuration.
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
-principal. Sessions, messages and task events store an actor id, never a
-name, so this is where a name is looked up at render time. A rename changes
+principal. Sessions, messages, task events, notifications, silences and plans
+store an actor id, never a name, so this is where a name is looked up at
+render time. A rename changes
 every label and moves no stored row.
 
 ```json

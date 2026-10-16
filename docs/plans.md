@@ -163,6 +163,16 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `version` | INTEGER | Version number (increments on revision) |
 | `parent_plan_id` | TEXT | Previous version's ID |
 | `model` | TEXT | Model used to generate |
+| `reviewed_at` | TIMESTAMP | Time of the approve or decline decision |
+| `reviewed_by_actor_id` | TEXT | Who made the last review decision (approve, decline, revision request, or a status or feedback change through `PATCH`) |
+| `reviewed_caused_by_actor_id` | TEXT | On whose behalf that decision was made |
+
+A review through the web UI or the REST API records the signed-in person in
+both reviewer columns. A review through a plan tool records the system actor
+and the cause of the turn that called the tool, so a plan that the agent
+approves in Alice's turn shows "Nerve for Alice". `plan_update` replaces the
+planner's own plan and records no reviewer. Both columns are actor IDs; see
+[Accounts and identity](accounts.md#attribution).
 
 ## Web UI
 
@@ -176,6 +186,7 @@ Plans are stored in the `plans` SQLite table (schema v12):
 
 - Rendered markdown plan content
 - Task link + implementation session link (when applicable)
+- Who reviewed the plan, from the reviewer columns
 - Action bar for pending plans:
   - **Approve & Implement** — spawns implementation session, redirects to Chat
   - **Decline** — marks plan as declined
@@ -192,3 +203,8 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | POST | `/api/plans/:id/approve` | Approve + spawn implementation |
 | POST | `/api/plans/:id/revise` | Send revision feedback to planner |
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
+
+Plan rows include `reviewed_by_actor_id` and `reviewed_caused_by_actor_id`.
+Approve, `PATCH` and revise record the signed-in person as the reviewer. The
+task status change of an approval or a decline records the person too, with
+origin `web`.
