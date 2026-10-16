@@ -222,12 +222,16 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--keep-env", is_flag=True,
     help="Slim setup: pass ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from this shell to the daemon",
 )
+@click.option(
+    "--serve-next", is_flag=True, hidden=True,
+    help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool,
+    keep_env: bool, serve_next: bool = False,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
@@ -248,6 +252,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
+            system_principal=not serve_next,
         )
         return
 
@@ -738,6 +743,7 @@ def _slim_init(
     clipboard: bool,
     yes: bool,
     keep_env: bool = False,
+    system_principal: bool = True,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -761,11 +767,16 @@ def _slim_init(
 
         # The owner account exists before the daemon answers, so the setup
         # token is available the moment /health is green. No name: the setup
-        # page asks.
+        # page asks. ``system_principal`` is false when this process serves
+        # next (``nerve start -f``): the gateway's bootstrap reads
+        # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, once.
         from nerve.migrate import bootstrap_identity_sync
 
         try:
-            bootstrap_identity_sync(config, display_name=None, passwordless=False)
+            bootstrap_identity_sync(
+                config, display_name=None, passwordless=False,
+                system_principal=system_principal,
+            )
         except Exception as e:  # noqa: BLE001 — the files are written; say what is missing
             raise click.ClickException(
                 f"Setup wrote the configuration, but the local owner account could not "
@@ -905,7 +916,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
             # `start --foreground` would otherwise exit 1 and leave an
             # unsupervised daemon holding the port).
             click.echo("Fresh install detected — running setup...")
-            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True)
+            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True, serve_next=True)
             config = ctx.obj.get("config")
             if config is None:
                 raise click.ClickException(

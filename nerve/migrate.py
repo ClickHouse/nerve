@@ -1412,6 +1412,7 @@ async def bootstrap_identity(
     report: MigrationReport | None = None,
     dry_run: bool = False,
     display_name: str | None = None,
+    system_principal: bool = True,
 ) -> MigrationReport:
     """Create the local owner account and signing secret if they do not exist.
 
@@ -1431,15 +1432,22 @@ async def bootstrap_identity(
     changed. The system actor gets the ID in ``NERVE_SYSTEM_PRINCIPAL_ID``
     when it can (:func:`_apply_system_principal`). The signing secret is
     still made, because system and MCP tokens need it.
+
+    ``system_principal`` false leaves the system actor step, and the read of
+    ``NERVE_SYSTEM_PRINCIPAL_ID``, to a later bootstrap in the same process:
+    ``nerve start --foreground`` on a fresh install runs ``nerve init`` and
+    then the gateway, and only the gateway does the step.
     """
     from nerve.gateway.auth import is_external_mode
 
     report = MigrationReport(dry_run=dry_run) if report is None else report
     if is_external_mode():
-        await _apply_system_principal(db, report, dry_run=dry_run)
+        if system_principal:
+            await _apply_system_principal(db, report, dry_run=dry_run)
         await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
         return report
-    _note_ignored_system_principal()
+    if system_principal:
+        _note_ignored_system_principal()
 
     source = _credential_source_for(config)
     # Include accounts a dry run would create with the transitional source so
@@ -1783,6 +1791,7 @@ def bootstrap_identity_sync(
     *,
     display_name: str | None = None,
     passwordless: bool = False,
+    system_principal: bool = True,
 ) -> MigrationReport:
     """Run the identity bootstrap on a new connection, for the installer.
 
@@ -1796,7 +1805,9 @@ def bootstrap_identity_sync(
     has a password.
 
     In external mode, no account is created and ``display_name`` and
-    ``passwordless`` have no effect. Only the signing secret is made.
+    ``passwordless`` have no effect. The signing secret is made, and the
+    system actor gets the ID in ``NERVE_SYSTEM_PRINCIPAL_ID`` unless
+    ``system_principal`` is false (see :func:`bootstrap_identity`).
     """
     try:
         asyncio.get_running_loop()
@@ -1811,6 +1822,7 @@ def bootstrap_identity_sync(
     asyncio.run(
         _bootstrap_with_own_connection(
             config, paths.db_path(), report, display_name, passwordless,
+            system_principal=system_principal,
         )
     )
     return report
@@ -1822,6 +1834,8 @@ async def _bootstrap_with_own_connection(
     report: MigrationReport,
     display_name: str | None = None,
     passwordless: bool = False,
+    *,
+    system_principal: bool = True,
 ) -> None:
     from nerve.db import Database
     from nerve.gateway.auth import is_external_mode
@@ -1829,7 +1843,10 @@ async def _bootstrap_with_own_connection(
     db = Database(db_path, workspace=config.workspace)
     await db.connect()
     try:
-        await bootstrap_identity(db, config, report=report, display_name=display_name)
+        await bootstrap_identity(
+            db, config, report=report, display_name=display_name,
+            system_principal=system_principal,
+        )
         if passwordless and not is_external_mode():
             await _confirm_passwordless(db, config, report)
     finally:
