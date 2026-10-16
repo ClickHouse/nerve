@@ -124,19 +124,6 @@ class PlanStore:
         )
         return result.rowcount == 1
 
-    async def reopen_revising_plans(self) -> int:
-        """Move every ``revising`` plan back to ``pending``; return the count.
-
-        A plan is ``revising`` while the turn that asks its planner for a new
-        version runs. At startup no such turn runs in this process, so a
-        plan left ``revising`` by a stop would otherwise never be open for a
-        decision again.
-        """
-        result = await self._write(
-            "UPDATE plans SET status = 'pending' WHERE status = 'revising'",
-        )
-        return result.rowcount
-
     async def get_plans_for_task(self, task_id: str) -> list[dict]:
         async with self.db.execute(
             "SELECT * FROM plans WHERE task_id = ? ORDER BY version DESC",

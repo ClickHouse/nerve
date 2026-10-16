@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable
 
 from nerve.identity import attribution_for
 
@@ -233,6 +233,60 @@ async def _run_revision_turn(
         logger.exception("Revision turn for plan %s failed", plan_id)
     finally:
         await _reopen_after_revision(db, plan_id)
+
+
+def _resume_enrolled_sessions() -> set[str]:
+    """The session IDs that resume-after-restart will continue at startup.
+
+    Reads the queue file without consuming it; the engine reads and deletes
+    it when it resumes the sessions.
+    """
+    from nerve.agent import engine as engine_module
+
+    try:
+        raw = engine_module.RESUME_QUEUE_FILE.read_text()
+    except OSError:
+        return set()
+    return {line.strip() for line in raw.splitlines() if line.strip()}
+
+
+async def recover_revising_plans(db: "Database") -> list[str]:
+    """At startup, reopen the plans whose revision turn no longer exists.
+
+    Call it before the engine resumes sessions. A plan is ``revising`` only
+    while its revision turn runs. A stop ends that turn, unless
+    resume-after-restart continues its session: such a plan stays
+    ``revising`` and :func:`finish_revisions_after_resume` reopens it
+    when the resume ends, if it is still ``revising`` then. Every other
+    ``revising`` plan is ``pending`` again.
+
+    Returns the IDs of the plans that stay ``revising``.
+    """
+    resumed = _resume_enrolled_sessions()
+    held: list[str] = []
+    for plan in await db.list_plans(status="revising", limit=1_000_000):
+        if (plan.get("session_id") or _FALLBACK_PLANNER_SESSION) in resumed:
+            held.append(plan["id"])
+        else:
+            await _reopen_after_revision(db, plan["id"])
+    return held
+
+
+async def finish_revisions_after_resume(
+    resume: "Awaitable[int]", db: "Database", held_plan_ids: list[str],
+) -> int:
+    """Await the resume of the enrolled sessions, then reopen the held plans.
+
+    ``resume`` is ``engine.resume_enrolled_sessions()``; ``held_plan_ids``
+    comes from :func:`recover_revising_plans`. The resume ends after every
+    resumed turn ends, so a held plan that is still ``revising`` then got no
+    new version and is ``pending`` again.
+    """
+    try:
+        return await resume
+    finally:
+        for plan_id in held_plan_ids:
+            await _reopen_after_revision(db, plan_id)
 
 
 async def _reopen_after_revision(db: "Database", plan_id: str) -> None:
