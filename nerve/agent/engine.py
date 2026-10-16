@@ -477,9 +477,10 @@ class AgentEngine:
           emit;
         - a running background task of another cause can call tools or
           start a turn before it settles (see :meth:`_acting_task_causes`).
+
+        Reads state only, so it can be asked at any point of a turn.
         """
         if session_id in self._unfinished_autonomous:
-            self._unfinished_autonomous.discard(session_id)
             logger.info(
                 "Session %s: earlier autonomous output can still arrive; "
                 "the new turn runs with an unknown cause", session_id,
@@ -2946,10 +2947,12 @@ class AgentEngine:
             broadcaster.mark_turn_open(session_id)
 
             # This turn starts in the runtime now. The drain above ran under
-            # the cause of the work it drained.
+            # the cause of the work it drained. An unfinished autonomous turn
+            # makes only this turn unknown; its late output arrives in it.
+            runtime_cause = self._cause_for_new_turn(session_id, cause_id)
+            self._unfinished_autonomous.discard(session_id)
             await self._begin_runtime_turn(
-                session_id, self._cause_for_new_turn(session_id, cause_id),
-                must_persist=True,
+                session_id, runtime_cause, must_persist=True,
             )
 
             # New user turn: settled background-task chips are stale now.
