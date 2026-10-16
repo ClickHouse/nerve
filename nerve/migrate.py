@@ -63,9 +63,11 @@ migration that reads configuration. The v047 schema migration creates the
 tables; this step creates the first account, moves ``auth.password_hash`` onto
 the account row and out of the configuration files
 (:func:`_migrate_config_credentials`), and, if ``auth.jwt_secret`` is unset,
-creates a signing secret. Only the gateway, at every start, and ``nerve init``
-run it. :func:`migrate` reports what the gateway will do and writes nothing to
-``nerve.db``. Other CLI commands open the database with
+creates a signing secret. In external mode it creates no account, and it gives
+the system actor the ID in ``NERVE_SYSTEM_PRINCIPAL_ID``
+(:func:`_apply_system_principal`). Only the gateway, at every start, and
+``nerve init`` run it. :func:`migrate` reports what the gateway will do and
+writes nothing to ``nerve.db``. Other CLI commands open the database with
 :func:`open_production_db`, which loads the signing secret and creates no
 account.
 """
@@ -303,6 +305,9 @@ class MigrationReport:
     # `auth.password_hash` was (or would be) removed from the machine-local
     # configuration afterwards, because nothing reads it any more.
     scrubbed_config_password: bool = False
+    # The system actor got (or would get) the ID in NERVE_SYSTEM_PRINCIPAL_ID
+    # (see :func:`_apply_system_principal`).
+    rekeyed_system_actor: bool = False
 
     @property
     def did_anything(self) -> bool:
@@ -319,6 +324,7 @@ class MigrationReport:
             or self.retired_stored_secret
             or self.migrated_config_credential
             or self.scrubbed_config_password
+            or self.rekeyed_system_actor
         )
 
 
@@ -1410,15 +1416,18 @@ async def bootstrap_identity(
     Results go to ``report``. With ``dry_run``, nothing is written.
 
     In external mode, the gateway names people, so no account is created or
-    changed. The signing secret is still made, because system and MCP tokens
-    need it.
+    changed. The system actor gets the ID in ``NERVE_SYSTEM_PRINCIPAL_ID``
+    when it can (:func:`_apply_system_principal`). The signing secret is
+    still made, because system and MCP tokens need it.
     """
     from nerve.gateway.auth import is_external_mode
 
     report = MigrationReport(dry_run=dry_run) if report is None else report
     if is_external_mode():
+        await _apply_system_principal(db, report, dry_run=dry_run)
         await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
         return report
+    _note_ignored_system_principal()
 
     source = _credential_source_for(config)
     # Include accounts a dry run would create with the transitional source so
@@ -1478,6 +1487,106 @@ async def bootstrap_identity(
 
     await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
     return report
+
+
+def _rekey_action(previous_id: str | None, new_id: str, *, dry_run: bool) -> str:
+    """``previous_id`` is ``None`` when the system actor does not exist yet."""
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    if previous_id is None:
+        return f"give the new system actor the ID {new_id}, the ID in {SYSTEM_PRINCIPAL_ENV}"
+    verb = "change" if dry_run else "changed"
+    return (
+        f"{verb} the system actor ID from {previous_id} to {new_id}, the ID in "
+        f"{SYSTEM_PRINCIPAL_ENV}"
+    )
+
+
+def _warn_kept_system_actor(
+    report: MigrationReport, current_id: str, reason: str, *, dry_run: bool,
+) -> None:
+    warning = (
+        f"the system actor keeps its local ID {current_id}: {reason}. Autonomous "
+        "work is attributed to the local ID. 'nerve doctor' shows this."
+    )
+    report.warnings.append(warning)
+    if not dry_run:
+        logger.warning("Identity: %s", warning)
+
+
+def _rekey_blocked_reason(new_id: str, blocker: str) -> str:
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    return f"{SYSTEM_PRINCIPAL_ENV} names {new_id}, but {blocker}"
+
+
+def _note_ignored_system_principal() -> None:
+    """Log that ``NERVE_SYSTEM_PRINCIPAL_ID`` has no effect in local mode."""
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
+        logger.info(
+            "Identity: %s is set, but it has no effect in local mode; the system "
+            "actor keeps its local ID", SYSTEM_PRINCIPAL_ENV,
+        )
+
+
+async def _apply_system_principal(
+    db: "Database", report: MigrationReport, *, dry_run: bool,
+) -> None:
+    """Give the system actor the ID of the agent's system principal.
+
+    External mode only. The environment names the ID in
+    ``NERVE_SYSTEM_PRINCIPAL_ID``, which this reads once per bootstrap, so
+    once per start. When the value differs from the stored ID, the ID changes
+    only while no row refers to the system actor and no other actor has the
+    new ID (:meth:`~nerve.db.accounts.AccountStore._rekey_system_actor`). A
+    new installation therefore takes the ID at ``nerve init`` or at its first
+    start, before any work is attributed to it.
+
+    In all other cases the local ID stays: an unset value says nothing, and
+    an invalid value, a referenced system actor, or a new ID that another
+    actor has gives one warning. ``nerve doctor`` reports the difference.
+    """
+    from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
+
+    current_id = db.system_actor_id
+    try:
+        new_id = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        _warn_kept_system_actor(report, current_id, str(e), dry_run=dry_run)
+        return
+    if new_id is None or new_id == current_id:
+        return
+
+    if dry_run:
+        blocker = await db._system_actor_rekey_blocker(current_id, new_id)
+        if blocker is None:
+            report.rekeyed_system_actor = True
+            report.identity_actions.append(_rekey_action(current_id, new_id, dry_run=True))
+        else:
+            _warn_kept_system_actor(
+                report, current_id, _rekey_blocked_reason(new_id, blocker), dry_run=True,
+            )
+        return
+
+    result = await db._rekey_system_actor(new_id)
+    if result.changed:
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(
+            _rekey_action(result.previous_id, result.actor_id, dry_run=False)
+        )
+        logger.info(
+            "Identity: the system actor ID changed from %s to %s",
+            result.previous_id, result.actor_id,
+        )
+    elif result.blocker is not None:
+        _warn_kept_system_actor(
+            report, result.actor_id, _rekey_blocked_reason(new_id, result.blocker),
+            dry_run=False,
+        )
+    # Otherwise the stored ID was already the new ID: another process changed
+    # it after this connection cached the system actor.
 
 
 async def ensure_jwt_secret(
@@ -1570,7 +1679,9 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
 
     state = inspect_bootstrap_state(db_path)
     sources, stored = state if state is not None else ([], False)
-    if not is_external_mode():
+    if is_external_mode():
+        _inspect_system_principal(db_path, report)
+    else:
         _inspect_accounts(config, sources, report)
     if config.auth.jwt_secret:
         if stored:
@@ -1579,6 +1690,36 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
     elif not stored:
         report.generated_jwt_secret = True
         report.identity_actions.append(_secret_action(dry_run=True))
+
+
+def _inspect_system_principal(db_path: Path, report: MigrationReport) -> None:
+    """Report the system actor step of :func:`bootstrap_identity`, read-only."""
+    from nerve.db.accounts import inspect_system_actor
+    from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
+
+    try:
+        new_id = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        report.warnings.append(f"the system actor keeps its local ID: {e}")
+        return
+    if new_id is None:
+        return
+    state = inspect_system_actor(db_path, new_id)
+    if state is None:
+        # No system actor yet: the next start creates one and gives it the ID.
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(_rekey_action(None, new_id, dry_run=True))
+        return
+    current_id, blocker = state
+    if current_id == new_id:
+        return
+    if blocker is None:
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(_rekey_action(current_id, new_id, dry_run=True))
+    else:
+        _warn_kept_system_actor(
+            report, current_id, _rekey_blocked_reason(new_id, blocker), dry_run=True,
+        )
 
 
 def _inspect_accounts(
