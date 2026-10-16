@@ -169,6 +169,19 @@ class TestProxyClientRetries:
         cfg = NerveConfig.from_dict({"anthropic_api_key": "sk-ant-real"})
         assert cfg.create_anthropic_client().max_retries == anthropic.DEFAULT_MAX_RETRIES
 
+    def test_explicit_max_retries_wins(self) -> None:
+        """A caller with a hard time limit sets its own budget, for every
+        provider and both factories."""
+        configs = [
+            self._config(),
+            NerveConfig.from_dict({"anthropic_api_key": "sk-ant-real"}),
+            NerveConfig.from_dict({"provider": {"type": "bedrock", "aws_region": "us-east-1"}}),
+        ]
+        for cfg in configs:
+            assert cfg.create_anthropic_client(max_retries=1).max_retries == 1
+            assert cfg.create_async_anthropic_client(max_retries=1).max_retries == 1
+            assert cfg.create_anthropic_client(max_retries=0).max_retries == 0
+
     def test_rate_limit_then_recovery_succeeds(self) -> None:
         """Five 429s without Retry-After, then 200: the client succeeds after
         backing off for longer than a short limit lasts (sleeps recorded, not
