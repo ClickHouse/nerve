@@ -40,6 +40,18 @@ SELECT m.name, p."from"
 
 SYSTEM_ACTOR_ID_TAKEN = "another actor already has the new ID"
 
+# The ``instance_secrets`` row that records the system principal ID the
+# system actor took. It is not a secret: ``instance_secrets`` is the existing
+# name/value table for instance state. AccountStore._rekey_system_actor writes
+# it in the same transaction as the change of the ID, and refuses every later
+# different ID while it exists, so a database takes a system principal ID at
+# most once. A backup made with ``--no-secrets`` does not keep it.
+SYSTEM_PRINCIPAL_CLAIM_NAME = "system_principal_id"
+
+
+def _already_claimed(claimed_id: str) -> str:
+    return f"the system actor already took the ID {claimed_id} once, and its ID changes only once"
+
 # Sentinel for "leave this field alone" in partial updates, distinct from None
 # (which clears a nullable field).
 _UNSET = object()
@@ -330,10 +342,13 @@ class AccountStore:
     async def _decide_system_actor_rekey(self, new_id: str) -> tuple[str, str | None]:
         """Read the stored system actor ID and decide whether it can become ``new_id``.
 
-        Call inside a transaction. Returns ``(stored_id, blocker)``. The stored
-        ID must still be the ID that this connection has cached: when another
-        connection changed it, this one does not change it again, because the
-        other connection uses the ID it set.
+        Call inside a transaction. Returns ``(stored_id, blocker)``. The ID
+        changes at most once: a recorded claim
+        (:data:`SYSTEM_PRINCIPAL_CLAIM_NAME`) refuses every different ID, also
+        from a process that opened the database after the change. Without a
+        claim, the stored ID must still be the ID that this connection has
+        cached: when another connection changed it, this one does not change
+        it again, because the other connection uses the ID it set.
         """
         async with self.db.execute(
             "SELECT id FROM actor_refs WHERE kind = 'system'"
@@ -346,6 +361,9 @@ class AccountStore:
         stored_id = row[0]
         if stored_id == new_id:
             return stored_id, None
+        claimed_id = await self._get_instance_secret(SYSTEM_PRINCIPAL_CLAIM_NAME)
+        if claimed_id is not None:
+            return stored_id, _already_claimed(claimed_id)
         cached_id = self.system_actor_id
         if stored_id != cached_id:
             return stored_id, (
@@ -359,23 +377,30 @@ class AccountStore:
 
         One transaction reads the stored ID again, checks it with
         :meth:`_decide_system_actor_rekey`, drops
-        ``system_actor_id_cannot_change``, changes the ID, and creates the
-        trigger again with :data:`SYSTEM_ACTOR_ID_TRIGGER_SQL`. A failure rolls
-        back all of it, so no other transaction sees the table without the
-        trigger. When a blocker exists, nothing changes and the result names
-        it. The cached :attr:`system_actor` is read again in all cases.
+        ``system_actor_id_cannot_change``, changes the ID, creates the trigger
+        again with :data:`SYSTEM_ACTOR_ID_TRIGGER_SQL`, and records the claim
+        (:data:`SYSTEM_PRINCIPAL_CLAIM_NAME`). A failure rolls back all of it,
+        so no other transaction sees the table without the trigger, or the new
+        ID without the claim. When a blocker exists, nothing changes and the
+        result names it. The result gives the IDs of this transaction. The
+        cached :attr:`system_actor` is read again in all cases.
         """
         async with self._atomic():
             previous_id, blocker = await self._decide_system_actor_rekey(new_id)
-            if previous_id != new_id and blocker is None:
+            changed = previous_id != new_id and blocker is None
+            if changed:
                 await self.db.execute(f"DROP TRIGGER IF EXISTS {SYSTEM_ACTOR_ID_TRIGGER}")
                 await self.db.execute(
                     "UPDATE actor_refs SET id = ? WHERE id = ? AND kind = 'system'",
                     (new_id, previous_id),
                 )
                 await self.db.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
+                await self.db.execute(
+                    "INSERT INTO instance_secrets (name, value) VALUES (?, ?)",
+                    (SYSTEM_PRINCIPAL_CLAIM_NAME, new_id),
+                )
         await self._cache_system_actor()
-        return SystemActorRekey(previous_id, self.system_actor_id, blocker)
+        return SystemActorRekey(previous_id, new_id if changed else previous_id, blocker)
 
     async def _preview_system_actor_rekey(self, new_id: str) -> SystemActorRekey:
         """What :meth:`_rekey_system_actor` would do, from one snapshot, with no write."""
@@ -920,6 +945,11 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
         current_id = str(rows[0][0])
         if current_id == wanted_id:
             return current_id, None
+        claimed = conn.execute(
+            "SELECT value FROM instance_secrets WHERE name = ?", (SYSTEM_PRINCIPAL_CLAIM_NAME,),
+        ).fetchone()
+        if claimed is not None:
+            return current_id, _already_claimed(str(claimed[0]))
         columns = [(row[0], row[1]) for row in conn.execute(ACTOR_REF_COLUMNS_SQL)]
         for probe in _rekey_probes(columns, current_id, wanted_id):
             try:
