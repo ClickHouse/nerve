@@ -12,6 +12,7 @@ comments attached to specific code lines.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -37,6 +38,18 @@ _MAX_CONCURRENT_FETCHES = 5
 # A run on the default branch is an upstream sync or a schedule, never a PR.
 _CI_BRANCH_RE = re.compile(r"\bfor (?P<branch>\S+) branch$")
 
+# The trailing ``/pulls/{n}`` of a PR API URL. Anchored, so an owner or repo
+# that happens to be named "pulls" is left alone.
+_PULLS_PATH_RE = re.compile(r"/pulls/(\d+)$")
+
+
+def _login_of(user: object) -> str:
+    """``user["login"]`` of a GitHub user object, or ``""`` (null-safe)."""
+    if not isinstance(user, dict):
+        return ""
+    login = user.get("login")
+    return login if isinstance(login, str) else ""
+
 
 def _ci_branch(subject_type: str, title: str) -> str:
     """Branch of a CI run, or ``""`` for anything else.
@@ -60,6 +73,7 @@ def _collect_actors(
     inline_comments: list[dict[str, Any]],
     recent_comments: list[dict[str, Any]],
     assigner: str = "",
+    review_requester: str = "",
 ) -> list[str]:
     """Every GitHub login involved in a notification, de-duplicated.
 
@@ -79,8 +93,14 @@ def _collect_actors(
     hands it back), every other candidate below is that same account. Without
     this, the notification has no third-party login at all and a non-empty
     ``allow_actors`` allowlist can never pass it.
+
+    ``review_requester`` is the same for a ``reason=review_requested``
+    notification (see :meth:`GitHubSource._enrich_review_request`): the login
+    that requested the review. A review request carries no comment either, so
+    on a PR whose author and commenters are all outside the allowlist (e.g. a
+    dependency-update bot's PR), it is the only login that can pass it.
     """
-    candidates: list[str] = [subject_user, *assignees, assigner]
+    candidates: list[str] = [subject_user, *assignees, assigner, review_requester]
     if comment:
         candidates.append(comment.get("user", ""))
     if latest_review:
@@ -104,6 +124,11 @@ class GitHubSource(Source):
     """GitHub notification source using the gh CLI."""
 
     source_name = "github"
+
+    # Login of the account gh is authenticated as — the account the
+    # notifications are for. Resolved on first need, see _viewer_login(). A
+    # class-level default, so an instance never lacks the attribute.
+    _viewer_login_cache: str | None = None
 
     def __init__(self, config: dict[str, Any] | None = None):
         self._config = config or {}
@@ -177,6 +202,7 @@ class GitHubSource(Source):
                 labels = extra.get("labels", [])
                 comment = extra.get("latest_comment")
                 assigner = extra.get("assigner", "")
+                review_requester = extra.get("review_requester", "")
 
                 content_parts = [
                     f"Repository: {repo_name}",
@@ -189,6 +215,8 @@ class GitHubSource(Source):
                     # An assignment carries no comment text, so without this the
                     # record never says who asked for the work.
                     f"Assigned by: {assigner}" if assigner else None,
+                    # Same for a review request.
+                    f"Review requested by: {review_requester}" if review_requester else None,
                     f"Labels: {', '.join(labels)}" if labels else None,
                     f"Updated: {updated_at}",
                     f"URL: {html_url}",
@@ -259,7 +287,7 @@ class GitHubSource(Source):
                 # allow/deny by actor (the raw notification carries no actor).
                 actors = _collect_actors(
                     subject_user, assignees, comment, latest_review,
-                    inline_comments, recent_comments, assigner,
+                    inline_comments, recent_comments, assigner, review_requester,
                 )
 
                 records.append(SourceRecord(
@@ -374,7 +402,106 @@ class GitHubSource(Source):
             if reason == "assign" and s_type in ("PullRequest", "Issue"):
                 await self._enrich_assignment(subject_url, s_type, result)
 
+            # For review requests: fetch who requested the review. Same gap as
+            # an assignment — no comment, and the requester is not in the
+            # notification or the PR payload.
+            if reason == "review_requested" and s_type == "PullRequest":
+                await self._enrich_review_request(subject_url, result)
+
         return result
+
+    async def _viewer_login(self) -> str:
+        """Login of the authenticated account, or ``""`` when it can't be read.
+
+        Cached after the first success. A failure is not cached, so the next
+        review request retries it.
+        """
+        if self._viewer_login_cache is None:
+            data = await self._gh_api_get("user")
+            login = _login_of(data)
+            if not login:
+                return ""
+            self._viewer_login_cache = login
+        return self._viewer_login_cache
+
+    async def _enrich_review_request(
+        self, subject_url: str, result: dict[str, Any],
+    ) -> None:
+        """Resolve who requested the review on a ``reason=review_requested`` thread.
+
+        Mutates *result* in place, adding ``review_requester`` when found.
+
+        Reads the *last* ``review_requested`` event that names the inbox
+        account as the reviewer — the one that triggered the notification. The
+        PR's other review requests (e.g. the reviewers a bot requests when it
+        opens a PR) are skipped: their requester did not ask *this* account for
+        anything. The requester is not assumed to be trusted — a PR author can
+        re-request a review from a past reviewer without write access. It only
+        becomes an actor, and the allowlist decides.
+
+        Credits nobody when:
+
+        * the request has no identifiable requester (an older request is never
+          used instead — its requester did not make this one);
+        * the request was withdrawn (a newer ``review_request_removed`` names
+          the account);
+        * the requester is the inbox account itself;
+        * a *different* login made a newer request to a team (or to a reviewer
+          that can no longer be identified). The account may be in that team,
+          and then the team request is the trigger and the login found here did
+          not make it. A team request by the same login (one action that asks
+          the account and a team) does not block.
+
+        Unlike :meth:`_enrich_assignment`, this reads every page of the event
+        history. A re-review request on a long-lived PR is the newest event on a
+        busy history, so it is exactly the entry that a single first page
+        drops.
+        """
+        login = await self._viewer_login()
+        if not login:
+            return
+        me = login.lower()
+
+        # A PR's event history lives under /issues/{n}/, never /pulls/{n}/.
+        base, rewritten = _PULLS_PATH_RE.subn(r"/issues/\1", subject_url)
+        if not rewritten:
+            return
+        events = await self._gh_api_get_all(f"{base}/events?per_page=100")
+        if not events:
+            return
+
+        # Requesters of team review requests newer than the scan position.
+        newer_team_requesters: set[str] = set()
+        for ev in reversed(events):
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("event")
+            if kind not in ("review_requested", "review_request_removed"):
+                continue
+            # /events carries the requester in `review_requester`; `actor` is
+            # the same login there and is the fallback should it be absent.
+            requester = (
+                _login_of(ev.get("review_requester")) or _login_of(ev.get("actor"))
+            )
+            reviewer = _login_of(ev.get("requested_reviewer"))
+            if reviewer.lower() != me:
+                # No identifiable reviewer: a team request (or a deleted
+                # target), which may include the account.
+                if kind == "review_requested" and not reviewer:
+                    newer_team_requesters.add(requester.lower())
+                continue
+            # This is the newest event about the account's own review request.
+            # Stop here whatever it resolves to: falling back to an older
+            # request would admit the notification on the authority of a login
+            # that did not make this one. Fail closed instead.
+            if kind == "review_request_removed":
+                return
+            if not requester or requester.lower() == me:
+                return
+            if newer_team_requesters - {requester.lower()}:
+                return
+            result["review_requester"] = requester
+            return
 
     async def _enrich_assignment(
         self, subject_url: str, subject_type: str, result: dict[str, Any],
@@ -569,4 +696,50 @@ class GitHubSource(Source):
             return json.loads(text) if text.strip() else None
         except Exception as e:
             logger.debug("gh api %s error: %s", url, e)
+            return None
+
+    @staticmethod
+    async def _gh_api_get_all(url: str, timeout: float = 60) -> list | None:
+        """Every page of a list endpoint, concatenated; ``None`` on failure.
+
+        ``--slurp`` wraps the pages in one outer JSON array; plain
+        ``--paginate`` would print the pages back to back, which is not one
+        JSON document. ``--slurp`` needs gh 2.48 or later. Failures log at
+        warning level: the caller drops back to fail-closed behaviour, which is
+        otherwise invisible.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gh", "api", "--paginate", "--slurp", url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                # A --paginate process left running keeps making API calls.
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+                logger.warning("gh api %s timed out after %ss", url, timeout)
+                return None
+            if proc.returncode != 0:
+                logger.warning(
+                    "gh api %s failed: %s", url,
+                    stderr.decode(errors="replace")[:200],
+                )
+                return None
+            text = stdout.decode()
+            pages = json.loads(text) if text.strip() else []
+            if not isinstance(pages, list):
+                return None
+            items: list = []
+            for page in pages:
+                if isinstance(page, list):
+                    items.extend(page)
+            return items
+        except Exception as e:
+            logger.warning("gh api %s error: %s", url, e)
             return None
