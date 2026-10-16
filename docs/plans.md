@@ -166,13 +166,23 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `reviewed_at` | TIMESTAMP | Time of the approve or decline decision |
 | `reviewed_by_actor_id` | TEXT | Who made the last review decision (approve, decline, revision request, or a status or feedback change through `PATCH`) |
 | `reviewed_caused_by_actor_id` | TEXT | On whose behalf that decision was made |
+| `created_by_actor_id` | TEXT | Who wrote this version |
+| `caused_by_actor_id` | TEXT | On whose behalf this version was written |
 
 A review through the web UI or the REST API records the signed-in person in
 both reviewer columns. A review through a plan tool records the system actor
 and the cause of the turn that called the tool, so a plan that the agent
-approves in Alice's turn shows "Nerve for Alice". `plan_update` replaces the
-planner's own plan and records no reviewer. Both columns are actor IDs; see
-[Accounts and identity](accounts.md#attribution).
+approves in Alice's turn shows "Nerve for Alice". `plan_propose` and
+`plan_update` record the system actor and the turn's cause as the writer of
+the version they create. `plan_update` records no reviewer on the version it
+replaces, because the planner replacing its own plan is not a review. All
+four columns are actor IDs; see [Accounts and identity](accounts.md#attribution).
+
+A decision on a plan (approve, decline, revise, `PATCH`, and `plan_update`
+superseding the old version) applies only while the plan still has the
+status that the decision read. Of two concurrent decisions, one wins; the
+other changes nothing and gets HTTP 409 (REST) or a "no longer pending"
+answer (tools). Only the winner starts an implementation or a revision turn.
 
 ## Web UI
 
@@ -186,7 +196,8 @@ planner's own plan and records no reviewer. Both columns are actor IDs; see
 
 - Rendered markdown plan content
 - Task link + implementation session link (when applicable)
-- Who reviewed the plan, from the reviewer columns
+- Who proposed this version and who reviewed the plan, from the writer and
+  reviewer columns
 - Action bar for pending plans:
   - **Approve & Implement** — spawns implementation session, redirects to Chat
   - **Decline** — marks plan as declined
@@ -204,7 +215,9 @@ planner's own plan and records no reviewer. Both columns are actor IDs; see
 | POST | `/api/plans/:id/revise` | Send revision feedback to planner |
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
 
-Plan rows include `reviewed_by_actor_id` and `reviewed_caused_by_actor_id`.
-Approve, `PATCH` and revise record the signed-in person as the reviewer. The
+Plan rows include `reviewed_by_actor_id`, `reviewed_caused_by_actor_id`,
+`created_by_actor_id` and `caused_by_actor_id`. Approve, `PATCH` and revise
+record the signed-in person as the reviewer, and return 409 when another
+decision changed the plan first. The
 task status change of an approval or a decline records the person too, with
 origin `web`.

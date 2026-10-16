@@ -193,10 +193,11 @@ These columns store actor IDs:
 | `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
 | `session_events.actor_id`, `session_events.caused_by_actor_id` | Actor and cause of a session change (see [Session changes](#session-changes)) |
 | `session_deletions.actor_id`, `session_deletions.caused_by_actor_id` | Actor and cause of a session delete |
-| `notifications.answered_by_actor_id` | Who answered a question or decided an approval |
+| `notifications.answered_by_actor_id` | Who answered a question or decided an approval; on a snoozed approval that is still pending, who snoozed it |
 | `notifications.dismissed_by_actor_id` | Who dismissed a notification |
 | `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
 | `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |
+| `plans.created_by_actor_id`, `plans.caused_by_actor_id` | Actor and cause of the plan version: who wrote it |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -241,7 +242,7 @@ in the same way, so the same approximation applies to model usage. See
 |---|---|---|
 | A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
 | The agent works in a session (tool calls, task changes, sessions it starts) | The system actor | The session's cause |
-| The agent reviews a plan or creates a silence | The system actor | The session's cause |
+| The agent writes or reviews a plan, or creates a silence | The system actor | The session's cause |
 | Nerve sets a session title (the placeholder and the generated title) | The system actor | The session's cause |
 | An automatic archive, the archive of a Codex session by the sync | The system actor | The system actor |
 | A person answers, dismisses, or silences notifications, or reviews a plan, through the web UI or the REST API | The person | The person |
