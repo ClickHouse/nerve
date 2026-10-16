@@ -1876,7 +1876,7 @@ occurs before Nerve attributes work to the system actor. See
 
 `nerve doctor` reads the variable in its own shell, as it does for
 `NERVE_AUTH_MODE`. It shows one of these: the system actor has the ID, the
-next start gives it the ID, or the system actor keeps its local ID, with the
+next start gives it the ID, or the system actor keeps its current ID, with the
 reason.
 
 ## Setup

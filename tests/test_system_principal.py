@@ -1031,7 +1031,7 @@ class TestDoctor:
         lines, warnings = self._report(external=True)
         assert lines == []
         assert len(warnings) == 1 and warnings[0].startswith("[WARN]")
-        assert "canonical" in warnings[0] and "keeps the local system actor ID" in warnings[0]
+        assert "canonical" in warnings[0] and "keeps the current system actor ID" in warnings[0]
 
     def test_no_database_yet(self, seeded):
         lines, warnings = self._report(external=True)
@@ -1042,7 +1042,7 @@ class TestDoctor:
         ]
 
     @pytest.mark.asyncio
-    async def test_a_pending_change_and_a_kept_local_id(self, seeded):
+    async def test_a_pending_change_and_a_kept_id(self, seeded):
         database = await _open(paths.db_path())
         try:
             local_id = database.system_actor_id
@@ -1057,10 +1057,37 @@ class TestDoctor:
             lines, warnings = self._report(external=True)
             assert lines == []
             assert len(warnings) == 1 and warnings[0].startswith("[WARN]")
-            assert f"keeps the local ID {local_id}, not {PRINCIPAL}" in warnings[0]
+            assert f"keeps the current ID {local_id}, not {PRINCIPAL}" in warnings[0]
             assert f"{column} refers to the current ID" in warnings[0]
         finally:
             await database.close()
+
+    @pytest.mark.asyncio
+    async def test_after_a_seed_a_different_or_invalid_value_names_the_current_id(
+        self, external, monkeypatch,
+    ):
+        """The current ID is the seeded principal here, not a local ID."""
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, PRINCIPAL)
+        database = await _open(paths.db_path())
+        try:
+            await bootstrap_identity(database, _config())
+        finally:
+            await database.close()
+
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, ALICE)
+        lines, warnings = self._report(external=True)
+        assert lines == []
+        assert warnings == [
+            f"[WARN] System actor ({SYSTEM_PRINCIPAL_ENV} from this shell): keeps the "
+            f"current ID {PRINCIPAL}, not {ALICE}: {_claimed(PRINCIPAL)}. Autonomous "
+            "work is attributed to that ID."
+        ]
+
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, "not-a-uuid")
+        lines, warnings = self._report(external=True)
+        assert lines == []
+        assert len(warnings) == 1 and "keeps the current system actor ID" in warnings[0]
+        assert "local" not in warnings[0]
 
     @pytest.mark.asyncio
     async def test_the_doctor_report_shows_the_id_in_force(
