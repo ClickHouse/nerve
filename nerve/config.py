@@ -21,6 +21,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
+from nerve.inference_principal import system_principal_headers
 
 import yaml
 
@@ -3576,6 +3577,16 @@ class NerveConfig:
             return {"max_retries": PROXY_CLIENT_MAX_RETRIES}
         return {}
 
+    @staticmethod
+    def _client_header_kwargs() -> dict[str, Any]:
+        """The ``default_headers`` argument for an Anthropic client, if any.
+
+        In external mode, Nerve's own model calls name the system actor as
+        the principal of the request (see :mod:`nerve.inference_principal`).
+        """
+        headers = system_principal_headers()
+        return {"default_headers": headers} if headers else {}
+
     def create_anthropic_client(
         self, timeout: float = 60.0, *, max_retries: int | None = None,
     ) -> Any:
@@ -3594,6 +3605,7 @@ class NerveConfig:
             from anthropic import AnthropicBedrock
             kwargs: dict[str, Any] = {
                 "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                **self._client_header_kwargs(),
             }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
@@ -3608,7 +3620,10 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
-        kwargs = self._client_retry_kwargs(max_retries)
+        kwargs = {
+            **self._client_retry_kwargs(max_retries),
+            **self._client_header_kwargs(),
+        }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
         # environment itself, so the environment-only install the checks call
@@ -3635,6 +3650,7 @@ class NerveConfig:
             from anthropic import AsyncAnthropicBedrock
             kwargs: dict[str, Any] = {
                 "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                **self._client_header_kwargs(),
             }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
@@ -3648,7 +3664,10 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
-        kwargs = self._client_retry_kwargs(max_retries)
+        kwargs = {
+            **self._client_retry_kwargs(max_retries),
+            **self._client_header_kwargs(),
+        }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,

@@ -369,3 +369,81 @@ async def test_local_mode_sends_no_header(engine, cli):
     assert CUSTOM_HEADERS_ENV not in process.env
     assert process.spec.inference_principal is None
     assert process.turns == 2
+
+
+# --------------------------------------------------------------------------- #
+#  Nerve's own model clients name the system actor                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def global_db(db, monkeypatch):
+    """The database as the server opens it (``init_db``)."""
+    import nerve.db
+
+    monkeypatch.setattr(nerve.db, "_db", db)
+    return db
+
+
+def _direct_clients(config: NerveConfig) -> list:
+    return [config.create_anthropic_client(), config.create_async_anthropic_client()]
+
+
+def _bedrock_config() -> NerveConfig:
+    return NerveConfig.from_dict({
+        "provider": {"type": "bedrock", "aws_region": "us-east-1"},
+    })
+
+
+def test_the_global_system_actor_id(db, monkeypatch):
+    import nerve.db
+
+    monkeypatch.setattr(nerve.db, "_db", None)
+    assert nerve.db.global_system_actor_id() is None
+    monkeypatch.setattr(nerve.db, "_db", db)
+    assert nerve.db.global_system_actor_id() == db.system_actor_id
+
+
+@pytest.mark.asyncio
+async def test_a_closed_global_database_has_no_system_actor_id(tmp_path, monkeypatch):
+    import nerve.db
+    from nerve.db import Database
+
+    closed = Database(tmp_path / "closed.db")
+    await closed.connect()
+    await closed.close()
+    monkeypatch.setattr(nerve.db, "_db", closed)
+    assert nerve.db.global_system_actor_id() is None
+
+
+def test_direct_clients_name_the_system_actor(external, global_db):
+    for config in (NerveConfig(), _bedrock_config()):
+        for client in _direct_clients(config):
+            assert client.default_headers[INFERENCE_PRINCIPAL_HEADER] == (
+                global_db.system_actor_id
+            ), type(client).__name__
+
+
+def test_direct_clients_name_no_principal_in_local_mode(global_db):
+    for config in (NerveConfig(), _bedrock_config()):
+        for client in _direct_clients(config):
+            assert INFERENCE_PRINCIPAL_HEADER not in client.default_headers
+
+
+def test_direct_clients_without_a_database_name_no_principal(external, monkeypatch):
+    import nerve.db
+
+    monkeypatch.setattr(nerve.db, "_db", None)
+    for client in _direct_clients(NerveConfig()):
+        assert INFERENCE_PRINCIPAL_HEADER not in client.default_headers
+
+
+def test_memory_bedrock_clients_name_the_system_actor(external, global_db):
+    from nerve.memory.memu_bridge import MemUBridge
+
+    bridge = MemUBridge.__new__(MemUBridge)
+    bridge.config = _bedrock_config()
+    client = bridge._make_bedrock_client("claude-test")
+    assert client._bedrock.default_headers[INFERENCE_PRINCIPAL_HEADER] == (
+        global_db.system_actor_id
+    )

@@ -5,8 +5,9 @@ to a person. Nerve gives it the principal that caused the work: one
 ``X-Nerve-Inference-Principal`` header with the actor ID, a canonical
 lower-case UUID. The model requests of a session name the session's cause,
 the person who started it (or the system actor for a session that Nerve
-started for itself). Nerve does not prove the claim; the proxy decides what to
-accept.
+started for itself). Nerve's own model calls (session titles, prompt rewrite,
+source condensing, memory, setup checks, the model catalogue) name the system
+actor. Nerve does not prove the claim; the proxy decides what to accept.
 
 Local mode sends no header. A NULL cause sends no header.
 
@@ -35,8 +36,8 @@ _LINE_END = re.compile(r"\r?\n")
 
 
 def _is_external_mode() -> bool:
-    # Imported at call time, so that importing this module does not import
-    # the gateway.
+    # Imported at call time: nerve.gateway.auth imports nerve.config, which
+    # imports this module.
     from nerve.gateway.auth import is_external_mode
 
     return is_external_mode()
@@ -74,6 +75,22 @@ def principal_headers(actor_id: str | None) -> dict[str, str]:
     """
     principal = inference_principal(actor_id)
     return {INFERENCE_PRINCIPAL_HEADER: principal} if principal else {}
+
+
+def system_principal_headers() -> dict[str, str]:
+    """Default headers for Nerve's own model clients: the system actor.
+
+    The system actor comes from the database that the server opened
+    (:func:`nerve.db.init_db`). A process that opened none (for example a CLI
+    command) names no principal.
+    """
+    if not _is_external_mode():
+        return {}
+    # Imported at call time: nerve.config imports this module, and must not
+    # load the database package with it.
+    from nerve.db import global_system_actor_id
+
+    return principal_headers(global_system_actor_id())
 
 
 def _header_name(line: str) -> str:

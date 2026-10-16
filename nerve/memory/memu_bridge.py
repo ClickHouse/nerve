@@ -32,6 +32,7 @@ import numpy as np
 
 from nerve import paths
 from nerve.config import NerveConfig
+from nerve.inference_principal import system_principal_headers
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
 
@@ -478,10 +479,13 @@ class _BedrockLLMClient:
 
     def __init__(self, *, chat_model: str, aws_region: str = "", aws_profile: str = "",
                  aws_access_key_id: str = "", aws_secret_access_key: str = "",
-                 timeout: float = 120.0):
+                 timeout: float = 120.0,
+                 default_headers: dict[str, str] | None = None):
         from anthropic import AsyncAnthropicBedrock
 
         kwargs: dict[str, Any] = {"timeout": timeout}
+        if default_headers:
+            kwargs["default_headers"] = default_headers
         if aws_region:
             kwargs["aws_region"] = aws_region
         if aws_profile:
@@ -2217,13 +2221,17 @@ class MemUBridge:
     _DATE_SWEEP_COMMIT_EVERY = 500
 
     def _make_bedrock_client(self, chat_model: str) -> _BedrockLLMClient:
-        """Create a _BedrockLLMClient using Nerve's provider config."""
+        """Create a _BedrockLLMClient using Nerve's provider config.
+
+        In external mode its requests name the system actor as principal.
+        """
         return _BedrockLLMClient(
             chat_model=chat_model,
             aws_region=self.config.provider.aws_region,
             aws_profile=self.config.provider.aws_profile,
             aws_access_key_id=self.config.provider.aws_access_key_id,
             aws_secret_access_key=self.config.provider.aws_secret_access_key,
+            default_headers=system_principal_headers(),
         )
 
     def _inject_bedrock_clients(self) -> None:
