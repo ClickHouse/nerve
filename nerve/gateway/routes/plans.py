@@ -23,7 +23,7 @@ from nerve.gateway.routes._deps import (
     get_deps,
     get_tool_registry,
 )
-from nerve.identity import Actor
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,10 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
         fields["feedback"] = req.feedback
 
     if fields:
-        await deps.db.update_plan(plan_id, **fields)
+        # A status or feedback change is this person's review decision.
+        await deps.db.update_plan(
+            plan_id, attribution=attribution_for(actor), **fields,
+        )
 
     # On decline: mark the related task as done with a note explaining
     # the closure. The user-supplied feedback is optional — if absent,
@@ -85,7 +88,7 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
             note = f"Related plan {plan_id} was closed without a specified reason"
         await get_tool_registry().invoke(
             "task_done",
-            build_route_tool_context(),
+            build_route_tool_context("web", actor=actor),
             {"task_id": plan["task_id"], "note": note},
         )
 
@@ -111,6 +114,7 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, actor: Actor = Depen
             engine=deps.engine,
             plan_id=plan_id,
             feedback=req.feedback,
+            actor=actor,
             cause=actor,
         )
     except PlanNotFound:
@@ -148,7 +152,10 @@ async def approve_plan(
     plan_type = plan.get("plan_type", "generic")
 
     # Mark plan as implementing immediately (prevents double-approve)
-    await deps.db.update_plan(plan_id, status="implementing", reviewed_at=now)
+    await deps.db.update_plan(
+        plan_id, status="implementing", reviewed_at=now,
+        attribution=attribution_for(actor),
+    )
 
     # Create implementation session (visible in Chat UI)
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
@@ -162,7 +169,7 @@ async def approve_plan(
     # Update task status + note
     await get_tool_registry().invoke(
         "task_update",
-        build_route_tool_context(),
+        build_route_tool_context("web", actor=actor),
         {
             "task_id": plan["task_id"],
             "status": "in_progress",

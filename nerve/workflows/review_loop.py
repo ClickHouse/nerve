@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig, ReviewLoopConfig
     from nerve.db import Database
+    from nerve.identity import Actor
     from nerve.workflows.service import WorkflowRunService
 
 logger = logging.getLogger(__name__)
@@ -652,8 +653,13 @@ class ReviewLoopService:
 
     async def _dispatch_decision(
         self, notif: dict, target_id: str, decision: str, config: Any,
+        *, actor: Actor | None = None,
     ) -> _handlers.DispatchResult:
-        """Async approval dispatcher (registered as 'review-loop')."""
+        """Async approval dispatcher (registered as 'review-loop').
+
+        ``actor`` is the person who answered the card, ``None`` for a
+        channel answer (see :class:`nerve.notifications.handlers.Dispatcher`).
+        """
         result = await self.handle_decision(
             target_id, decision, decided_by="approval-card",
         )

@@ -120,6 +120,8 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
             f"Plan is '{old_plan['status']}' — only pending plans can be updated."
         )
 
+    # The planner replaces its own plan. That is not a review decision, so
+    # the reviewer columns keep who asked for the revision, if anyone did.
     update_fields: dict = {"status": "superseded"}
     if feedback:
         update_fields["feedback"] = feedback
@@ -232,8 +234,12 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     impl_actor = ctx.db.system_actor
     impl_cause = ctx.cause_id
 
-    # Mark as implementing (prevents double-approve)
-    await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
+    # Mark as implementing (prevents double-approve). The approval is the
+    # system actor's review decision, made for the cause of the turn.
+    await ctx.db.update_plan(
+        plan_id, status="implementing", reviewed_at=now,
+        attribution=ctx.attribution,
+    )
 
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
     await ctx.engine.sessions.get_or_create(
@@ -339,7 +345,7 @@ async def plan_decline_handler(ctx: ToolContext, args: dict) -> ToolResult:
     fields: dict = {"status": "declined", "reviewed_at": now}
     if feedback:
         fields["feedback"] = feedback
-    await ctx.db.update_plan(plan_id, **fields)
+    await ctx.db.update_plan(plan_id, attribution=ctx.attribution, **fields)
 
     if feedback:
         note = f"Plan {plan_id} declined — {feedback}"
@@ -383,7 +389,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await request_plan_revision(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
-            cause=ctx.cause_id,
+            actor=ctx.actor, cause=ctx.cause_id,
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")

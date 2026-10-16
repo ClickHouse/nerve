@@ -299,6 +299,7 @@ async def _silence_add(ctx: ToolContext, args: dict) -> ToolResult:
         reason=reason,
         created_by=ctx.session_id,
         expires_at=expires_at,
+        attribution=ctx.attribution,
     )
     # Take effect immediately for the running service.
     if ctx.notification_service:
@@ -356,6 +357,12 @@ async def _silence_remove(ctx: ToolContext, args: dict) -> ToolResult:
     ok = await ctx.db.delete_silence(silence_id)
     if not ok:
         return ToolResult.text(f"No silence found with id {silence_id}.")
+    # The row is deleted, so no column can hold who removed it.
+    attribution = ctx.attribution
+    logger.info(
+        "Silence %s removed by actor %s for %s",
+        silence_id, attribution.actor_id, attribution.caused_by_actor_id,
+    )
     if ctx.notification_service:
         ctx.notification_service.invalidate_silence_cache()
     return ToolResult.text(f"Silence removed: {silence_id}.")

@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig
     from nerve.db import Database
+    from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -471,11 +473,19 @@ class NotificationService:
         answer: str,
         answered_by: str,
         actor: str | None = None,
+        *,
+        answerer: Actor | None = None,
     ) -> bool:
         """Process a user's answer to a question or approval.
 
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
+        ``answerer`` is the person who answered: the signed-in actor of the
+        web answer route. A channel answer names a provider user and no
+        person, so it passes ``None``. The row records the answerer in
+        ``answered_by_actor_id``; an injected answer turn runs as the
+        answerer, on the answerer's behalf; an approval dispatcher receives
+        the answerer as its ``actor``.
 
         - For ``type=approval`` rows: claim the row, look up the
           dispatcher in the handler registry, run it, audit-log the
@@ -494,16 +504,18 @@ class NotificationService:
 
         if notif.get("type") == "approval":
             return await self._handle_approval_answer(
-                notif, answer, answered_by, actor,
+                notif, answer, answered_by, actor, answerer=answerer,
             )
 
         success = await self.db.answer_notification(
             notification_id, answer, answered_by, actor=actor,
+            attribution=attribution_for(answerer),
         )
         if not success:
             return False
 
         session_id = notif["session_id"]
+        answerer_id = actor_id_of(answerer)
         attribution = {"answered_by_actor": actor} if actor else {}
 
         from nerve.agent.streaming import broadcaster
@@ -525,6 +537,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "actor_id": answerer_id,
                 **attribution,
             })
             return True
@@ -541,6 +554,10 @@ class NotificationService:
             "answer": answer,
             "answered_by": answered_by,
             "content": injected_message,
+            # The injected turn's user row: written by the answerer, on the
+            # answerer's behalf.
+            "actor_id": answerer_id,
+            "caused_by_actor_id": answerer_id,
             **attribution,
         })
 
@@ -555,6 +572,7 @@ class NotificationService:
                 injected_message,
                 source=f"notification:{answered_by}",
                 channel=answered_by,
+                actor=answerer,
             )
         except Exception as e:
             logger.error(
@@ -569,6 +587,7 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "actor_id": answerer_id,
             **attribution,
         })
 
@@ -580,6 +599,8 @@ class NotificationService:
         answer: str,
         answered_by: str,
         actor: str | None = None,
+        *,
+        answerer: Actor | None = None,
     ) -> bool:
         """Route an approval answer through the dispatcher registry.
 
@@ -632,10 +653,12 @@ class NotificationService:
                     # the event loop — they need the loop-bound DB/services.
                     result = await dispatcher(
                         notif, target_id, answer, self.config,
+                        actor=answerer,
                     )
                 else:
                     result = await asyncio.to_thread(
                         dispatcher, notif, target_id, answer, self.config,
+                        actor=answerer,
                     )
             except Exception as exc:  # defensive: never crash the route
                 logger.exception(
@@ -656,10 +679,16 @@ class NotificationService:
                     },
                 )
 
+        answerer_id = actor_id_of(answerer)
         attribution: dict[str, Any] = {"answered_by": answered_by}
         if actor:
             attribution["answered_by_actor"] = actor
-        await self._append_approval_audit({**result.audit_event, **attribution})
+        audit_attribution = dict(attribution)
+        if answerer_id:
+            audit_attribution["answered_by_actor_id"] = answerer_id
+        await self._append_approval_audit(
+            {**result.audit_event, **audit_attribution},
+        )
 
         # Snooze keeps the row pending and stamps ``redeliver_at`` so
         # the periodic maintenance tick (:meth:`redeliver_due`) fans it
@@ -693,6 +722,7 @@ class NotificationService:
             )
         elif not await self.db.answer_notification(
             notification_id, answer, answered_by, actor=actor,
+            attribution=attribution_for(answerer),
         ):
             # The expiry sweep can take a claimed row while its dispatcher
             # runs, which leaves the action done and the row expired.
@@ -710,6 +740,7 @@ class NotificationService:
             "answer": answer,
             "approval_status": "snoozed" if snoozed else "answered",
             "dispatch_ok": result.ok,
+            "actor_id": answerer_id,
             **attribution,
         }
         if snoozed:
@@ -771,6 +802,7 @@ class NotificationService:
         message: str,
         *,
         source: str,
+        actor: Actor | None,
         channel: str | None = None,
         internal: bool = False,
     ) -> None:
@@ -781,11 +813,13 @@ class NotificationService:
         any in-flight turn and runs when it finishes (FIFO) — the
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
+
+        ``actor`` writes the turn's user row and is also its cause. For a
+        relayed answer it is the person who answered, or ``None`` when the
+        answer came through a channel that names no person. For a notice
+        that this service writes itself (an expiry note) it is the system
+        actor.
         """
-        # The text is this service's — an answer relayed into the session, or
-        # a redelivery notice. The person who answered is recorded on the
-        # notification itself. This service generates the prompt, so assigning
-        # the responder as its author would be incorrect.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -793,7 +827,7 @@ class NotificationService:
                 source=source,
                 channel=channel,
                 internal=internal,
-                actor=self.db.system_actor,
+                actor=actor,
             )
         )
         task.add_done_callback(self._on_answer_task_done)
@@ -810,13 +844,21 @@ class NotificationService:
         if exc:
             logger.error("Answer injection task failed: %s", exc)
 
-    async def handle_dismiss(self, notification_id: str) -> bool:
-        """Dismiss a notification (no answer routing needed)."""
+    async def handle_dismiss(
+        self, notification_id: str, *, actor: Actor | None = None,
+    ) -> bool:
+        """Dismiss a notification (no answer routing needed).
+
+        ``actor`` is the person who dismissed it, recorded in
+        ``dismissed_by_actor_id``.
+        """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
             return False
 
-        await self.db.dismiss_notification(notification_id)
+        await self.db.dismiss_notification(
+            notification_id, attribution=attribution_for(actor),
+        )
         return True
 
     # ------------------------------------------------------------------ #
@@ -1493,6 +1535,7 @@ class NotificationService:
             session_id,
             message,
             source="notification:expiry",
+            actor=self.db.system_actor,
             internal=True,
         )
 

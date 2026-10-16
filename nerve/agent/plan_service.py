@@ -19,6 +19,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from nerve.identity import attribution_for
+
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
@@ -59,6 +61,7 @@ async def request_plan_revision(
     plan_id: str,
     feedback: str,
     *,
+    actor: "ActorOrId | None",
     cause: "ActorOrId | None",
 ) -> dict:
     """Persist revision feedback and dispatch a revision prompt to the planner.
@@ -68,10 +71,14 @@ async def request_plan_revision(
         engine: AgentEngine instance (used to ensure session + dispatch run).
         plan_id: The pending plan to revise.
         feedback: Free-text feedback explaining what should change.
-        cause: Who asked for the revision: the person for the HTTP route,
-            the calling session's cause for the tool. It becomes the cause of
-            the planner session if this call creates it; an existing planner
-            session keeps its own cause.
+        actor: Who asks for the revision: the person for the HTTP route,
+            the system actor for the tool. Recorded with ``cause`` as the
+            plan's reviewer.
+        cause: On whose behalf the revision is asked for: the person for
+            the HTTP route, the calling session's cause for the tool. It is
+            the reviewer's cause, and the cause of the planner session if
+            this call creates it; an existing planner session keeps its own
+            cause.
 
     Returns:
         ``{"plan_id", "task_id", "session_id", "status"}`` on success.
@@ -83,7 +90,8 @@ async def request_plan_revision(
 
     Behavior contract:
         - Stores ``feedback`` on the plan (status untouched — old plan
-          stays ``pending`` until the planner calls ``plan_update``).
+          stays ``pending`` until the planner calls ``plan_update``), and
+          ``actor`` + ``cause`` as its reviewer.
         - Writes a ``Revision requested for {plan_id}`` note to the task.
         - Dispatches ``engine.run()`` on the original proposer session
           (``plan.session_id``), falling back to ``cron:task-planner``
@@ -118,8 +126,10 @@ async def request_plan_revision(
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
     # 1. Store feedback on the plan (status stays pending until planner
-    #    supersedes it via plan_update).
-    await db.update_plan(plan_id, feedback=feedback)
+    #    supersedes it via plan_update). The request is a review decision.
+    await db.update_plan(
+        plan_id, feedback=feedback, attribution=attribution_for(actor, cause),
+    )
 
     # 2. Write a task note so the revision request is visible in the
     #    task's history. Build a ``ToolContext`` from the legacy module

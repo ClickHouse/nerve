@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from nerve.identity import Attribution
+
 
 class PlanStore:
     """Mixin providing plan CRUD operations."""
@@ -59,7 +61,20 @@ class PlanStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
-    async def update_plan(self, plan_id: str, **fields) -> None:
+    async def update_plan(
+        self, plan_id: str, *, attribution: Attribution | None = None, **fields,
+    ) -> None:
+        """Write ``fields`` to the plan row.
+
+        ``attribution`` marks the update as a review decision (approve,
+        decline, a revision request, a status or feedback change through
+        REST). Its pair goes to ``reviewed_by_actor_id`` and
+        ``reviewed_caused_by_actor_id`` in the same statement. ``None`` (an
+        update that is not a review) leaves those columns as they are.
+        """
+        if attribution is not None:
+            fields["reviewed_by_actor_id"] = attribution.actor_id
+            fields["reviewed_caused_by_actor_id"] = attribution.caused_by_actor_id
         if not fields:
             return
         sets = ", ".join(f"{k} = ?" for k in fields)
