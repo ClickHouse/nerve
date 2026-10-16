@@ -89,6 +89,32 @@ nerve restart"), journals the interruption, and sends a high-priority
 notification. Nothing resumes on its own — restart runs explicitly if still
 needed. This is deliberate: a paid job can never burn unmetered.
 
+## Attribution
+
+A run records who created it and on whose behalf
+(`created_by_actor_id`, `caused_by_actor_id`), and who killed it
+(`killed_by_actor_id`, `killed_caused_by_actor_id`). See
+[accounts.md](accounts.md#attribution).
+
+- Through REST, the signed-in person is the actor and the cause.
+  `nerve workflow start` and `kill` call REST with the instance's own token,
+  so they record the system actor.
+- Through `workflow_run_start` or `workflow_run_kill`, the actor is the
+  system actor and the cause is the cause of the turn that called the tool.
+- A cron job's run is the system actor's, for itself. A review-loop leg is
+  the system actor's, for the cause of the loop.
+- The run's turns run as the system actor for the run's cause. A run with
+  no cause (one started by input that names no person) runs its turns with
+  no cause.
+- A kill records the kill attribution only when it ends the run. A stop of
+  the run's session, a budget stop and a restart record no kill actor.
+
+`created_by` stays the origin text (`api`, `session:<id>`,
+`review-loop:<id>`, `cron:<job>`); the sidebar reads it to show the run's
+session under the session that started it. The web UI shows the person
+("created by Alice", or "Nerve for Alice" for a run that the agent started),
+and the origin text for older runs.
+
 ## Budget
 
 Budgets are **metered dollars**, not advisory token counts. Every
@@ -139,8 +165,9 @@ falls (see the template below).
 ```
 <workflows.runs_dir>/<run-id>/
   run.json        # current run row, atomically rewritten on every change
-  events.ndjson   # append-only lifecycle log: created, started, budget_warning,
-                  # done/failed/killed/budget_exhausted, interrupted, enforced_stop
+  events.ndjson   # append-only lifecycle log: created (with the actor IDs),
+                  # started, budget_warning, done/failed/killed/budget_exhausted,
+                  # interrupted, enforced_stop
   result.md       # full final message (written on 'done' only)
 ```
 

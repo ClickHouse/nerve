@@ -87,9 +87,30 @@ bounded number of times, then the loop closes as failed with a
 notification: nothing parks silently, and paid-for work is never
 discarded without telling you.
 
+Each decision on an existing loop is recorded in `review_loop_decisions`:
+the decision, whether it changed the loop (`applied`), the result message,
+the origin (`decided_by`: `api` or `approval-card`) and who decided
+(`actor_id`, `caused_by_actor_id`). A decision that arrives after the loop
+left `awaiting_user` is recorded with `applied` false. A decision through
+REST or a card answered on the web records the person; a card answered
+through Telegram or Slack records no person. The decision card that a
+decision closes records the same person in `answered_by_actor_id`.
+`GET /api/review-loops/{id}` returns the decisions, oldest first, under
+`decisions`.
+
 Budgets are hard: each leg is a metered workflow run; a reserve fraction
 guarantees the final implementation attempt is always verified. Killing
 the loop (UI, REST, or `review_loop_kill`) kills its current leg only.
+
+**Attribution.** A loop records who created it and on whose behalf
+(`created_by_actor_id`, `caused_by_actor_id`): the person for
+`POST /api/sessions`, or the system actor and the cause of the turn for
+`review_loop_start`. Every leg is a workflow run created by the system
+actor for the loop's cause, so its turns run on behalf of the person who
+started the loop. A decision by another person does not change that cause.
+A kill records `killed_by_actor_id` and `killed_caused_by_actor_id` on the
+loop and on its current leg. A leg killed through its run kills the loop
+with the same attribution. See [accounts.md](accounts.md#attribution).
 
 ## When to use it
 

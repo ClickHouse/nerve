@@ -713,8 +713,9 @@ writes no configuration.
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
-principal. Sessions, messages, task events, notifications, silences and plans
-store an actor id, never a name, so this is where a name is looked up at
+principal. Sessions, messages, task events, notifications, silences, plans,
+workflow runs, review loops and review-loop decisions store an actor id,
+never a name, so this is where a name is looked up at
 render time. A rename changes
 every label and moves no stored row.
 
@@ -1054,15 +1055,26 @@ Response: {
     "spec": { "prompt": "Audit samples/batch-07/ for ..." },
     "status": "running", "budget_usd": 12.0, "spent_usd": 3.42, "warned_at": null,
     "session_id": "workflow:wfr-a1b2c3d4", "journal_dir": "/home/alice/.nerve/workflow-runs/wfr-a1b2c3d4",
-    "created_by": "session:main", "error": null, "result": null,
+    "created_by": "session:main",
+    "created_by_actor_id": "…", "caused_by_actor_id": "…",
+    "killed_by_actor_id": null, "killed_caused_by_actor_id": null,
+    "error": null, "result": null,
     "created_at": "...", "started_at": "...", "finished_at": null, "updated_at": "..."
   }],
   "total": 1
 }
 ```
 
+`created_by` is the origin text. `created_by_actor_id` and
+`caused_by_actor_id` name who created the run and on whose behalf; the run's
+turns run for that cause. `killed_by_actor_id` and
+`killed_caused_by_actor_id` name who killed it. All four are `null` on runs
+from before attribution, and the kill pair is `null` when the kill is not
+known (a stop of the run's session). See
+[accounts.md](accounts.md#attribution).
+
 #### `POST /api/workflow-runs`
-Start a run. `engine` is `claude-workflow` or `codex-ultracode`; `budget_usd` is required unless `workflows.allow_unbudgeted` is set. Optional: `title`, `model`, `effort`, `cwd` (must be an existing directory). Returns the created run immediately (`pending`, or `running` once dispatched); execution happens in the background.
+Start a run. `engine` is `claude-workflow` or `codex-ultracode`; `budget_usd` is required unless `workflows.allow_unbudgeted` is set. Optional: `title`, `model`, `effort`, `cwd` (must be an existing directory). Returns the created run immediately (`pending`, or `running` once dispatched); execution happens in the background. The signed-in person is recorded as the run's actor and cause.
 
 ```json
 Request:  { "engine": "claude-workflow", "prompt": "Audit samples/batch-07/ for ...", "budget_usd": 12, "title": "Sample batch audit" }
@@ -1073,7 +1085,7 @@ Response: { "id": "wfr-a1b2c3d4", "status": "pending", ... }
 Run detail (same shape as the list items).
 
 #### `POST /api/workflow-runs/{id}/kill`
-Terminate a run. Scoped strictly to the run's own session/subprocess; idempotent on already-terminal runs.
+Terminate a run. Scoped strictly to the run's own session/subprocess; idempotent on already-terminal runs. The kill that ends the run records the signed-in person in `killed_by_actor_id` and `killed_caused_by_actor_id`.
 
 ```json
 Request:  { "reason": "superseded" }

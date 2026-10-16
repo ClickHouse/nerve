@@ -198,6 +198,11 @@ These columns store actor IDs:
 | `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
 | `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |
 | `plans.created_by_actor_id`, `plans.caused_by_actor_id` | Actor and cause of the plan version: who wrote it |
+| `workflow_runs.created_by_actor_id`, `workflow_runs.caused_by_actor_id` | Actor and cause of a workflow run. The run's turns have this cause |
+| `workflow_runs.killed_by_actor_id`, `workflow_runs.killed_caused_by_actor_id` | Actor and cause of the kill of a workflow run |
+| `review_loops.created_by_actor_id`, `review_loops.caused_by_actor_id` | Actor and cause of a review loop. The turns of every leg of the loop have this cause |
+| `review_loops.killed_by_actor_id`, `review_loops.killed_caused_by_actor_id` | Actor and cause of the kill of a review loop |
+| `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -216,7 +221,7 @@ never changes it:
 | A plan implementation session after an approval through the REST API | The person who approved |
 | A plan implementation session after the agent approved the plan | The cause of the session in which the agent approved it |
 | A planner session that a revision request creates | The person who asked for the revision |
-| A workflow leg session | The system actor |
+| A workflow run's session, and each leg session of a review loop | The cause of the run or the loop: its creator, or the cause of the session whose tool call started it. A loop leg keeps the loop's cause, also after a decision by another person |
 | A Telegram, Slack or other channel session, or an imported Codex session | None until a local identity mapping exists |
 | An external MCP client's session | None |
 
@@ -246,20 +251,25 @@ in the same way, so the same approximation applies to model usage. See
 | Nerve sets a session title (the placeholder and the generated title) | The system actor | The session's cause |
 | An automatic archive, the archive of a Codex session by the sync | The system actor | The system actor |
 | A person answers, dismisses, or silences notifications, or reviews a plan, through the web UI or the REST API | The person | The person |
+| A person starts or kills a workflow run or a review loop through the web UI or the REST API, or decides on a parked loop through the REST API or its decision card in the web UI | The person | The person |
+| The agent starts or kills a workflow run or a review loop | The system actor | The session's cause |
 | The message that relays a web answer into the session that asked | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
 | Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
-| An answer through Telegram, Slack, or a hosted channel, and the message that relays it | None | None |
+| An answer through Telegram, Slack, or a hosted channel (also a decision on a review-loop card), and the message that relays it | None | None |
 | Assistant and tool output | None | None |
 
 Existing records remain unattributed: Nerve does not backfill these columns.
 Nerve does not infer identity from channel or source metadata. The free-text
-origin fields, such as `task_events.actor`, `notifications.answered_by` and
-`notification_silences.created_by`, stay as they are; they record where a
-change came from, not who made it. A chat-channel answer keeps the provider
-user ID in the notification's `metadata.answered_by_actor`; it is not an actor
-ID. Account administration actions are not yet recorded as audit events.
-Missing attribution means legacy history, unidentified external input, or
-assistant/tool output; autonomous work uses the system actor.
+origin fields, such as `task_events.actor`, `notifications.answered_by`,
+`notification_silences.created_by`, `workflow_runs.created_by`,
+`review_loops.created_by` and `review_loop_decisions.decided_by`, stay as they
+are; they record where a change came from, not who made it.
+`workflow_runs.created_by` also links a run to the session that started it.
+A chat-channel answer keeps the provider user ID in the notification's
+`metadata.answered_by_actor`; it is not an actor ID. Account administration
+actions are not yet recorded as audit events. Missing attribution means legacy
+history, unidentified external input, or assistant/tool output; autonomous
+work uses the system actor.
 
 ### Session changes
 
