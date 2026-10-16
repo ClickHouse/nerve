@@ -96,8 +96,11 @@ same transaction as its row, so an applied decision always has its record,
 and a failure to write the row leaves the loop unchanged. A decision stays
 applied when the leg that it resumes does not start. A decision that
 arrives when the loop is not in `awaiting_user` is recorded with `applied`
-false. **Remind me in 4h** changes no loop column: it is applied when the
-loop is parked, and the notification service then snoozes the card. A
+false. **Remind me in 4h** changes no loop column; the notification service
+snoozes the card after the loop has checked that it is parked. The reminder
+is recorded after that snooze write: applied when the card was snoozed, not
+applied (with the reason) when the card was no longer pending, for example
+because it expired during the answer. A
 decision through REST or a card answered on the web records the person; a
 card answered through Telegram or Slack records no person. The decision
 card that a decision closes records the same person in
