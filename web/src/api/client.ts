@@ -734,6 +734,17 @@ export interface ReviewLoop {
   ended_at: string | null;
 }
 
+/**
+ * Result of `POST /api/review-loops/{id}/decision`. `applied` is true when
+ * the decision changed the loop; `ok` is false when the leg that it resumes
+ * did not start.
+ */
+export interface ReviewLoopDecisionResult {
+  ok: boolean;
+  applied: boolean;
+  message: string;
+}
+
 /** One decision on a parked loop, oldest first in the loop detail. */
 export interface ReviewLoopDecision {
   id: number;
@@ -1208,7 +1219,7 @@ export const api = {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
   decideReviewLoop: (loopId: string, decision: string) =>
-    request<{ ok: boolean; message: string }>(`/review-loops/${loopId}/decision`, {
+    request<ReviewLoopDecisionResult>(`/review-loops/${loopId}/decision`, {
       method: 'POST', body: JSON.stringify({ decision }),
     }),
   getReviewLoopState: (loopId: string) =>
