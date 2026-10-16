@@ -31,6 +31,7 @@ from nerve.agent.tools.schemas import (
     TASK_WRITE_SCHEMA,
 )
 from nerve.config import ensure_path_not_tracked_config
+from nerve.db.tasks import KEEP
 from nerve.db.task_statuses import (
     DEFAULT_STATUS,
     STATUS_NAME_RE,
@@ -530,7 +531,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     content = re.sub(r"\*\*Tags:\*\* .*\n?", "", content, count=1)
 
                 final_title = new_title or task["title"]
-                final_status = status or task["status"]
                 # Presence carries through to the row the same way it does to
                 # the file above: an omitted column keeps its stored value, a
                 # present-but-empty one clears it.
@@ -540,9 +540,13 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 if raw_tags is not None:
                     edits["tags"] = new_tags_str
                 write = lambda: write_task_file(file_path, content)
+                # KEEP for what this call does not change: the path belongs to
+                # task_done / task_reopen, and a status that another writer
+                # set after the read above must stay. A requested status is
+                # applied in the write's transaction, from the stored one.
                 kw = dict(
-                    task_id=task_id, file_path=task["file_path"], title=final_title,
-                    status=final_status, content=content, actor=ctx.session_id,
+                    task_id=task_id, file_path=KEEP, title=final_title,
+                    status=status or KEEP, content=content, actor=ctx.session_id,
                     attribution=ctx.attribution, **edits,
                 )
                 # Without a token the order stays file-then-row, as before. With
@@ -664,11 +668,14 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if "tags" in frontmatter:
         edits["tags"] = tags_to_string(parse_tags_string(frontmatter["tags"]))
 
+    # task_write changes neither the path nor the status. KEEP reads both in
+    # the write's transaction, so a move by another writer since the read
+    # above stays.
     await ctx.db.upsert_task(
         task_id=task_id,
-        file_path=task["file_path"],
+        file_path=KEEP,
         title=new_title,
-        status=task["status"],
+        status=KEEP,
         deadline=new_deadline or None,
         content=new_content,
         attribution=ctx.attribution,

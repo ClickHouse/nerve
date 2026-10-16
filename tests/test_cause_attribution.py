@@ -471,6 +471,50 @@ async def _assert_bobs_move_stays(install, task_id: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edit", [
+    {"title": "Raced, renamed"},
+    {"note": "a note"},
+    {"deadline": "2026-12-01"},
+    {"tags": "alpha"},
+])
+async def test_rest_patch_fields_keep_a_concurrent_move(install, monkeypatch, edit):
+    from nerve.agent.tools.handlers import tasks as task_handlers
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+        _bob_moves_during_the_file_write(install, monkeypatch, task_handlers, task_id)
+        response = await client.patch(
+            f"/api/tasks/{task_id}", headers=install.headers("alice"), json=edit,
+        )
+    assert response.status_code == 200
+    await _assert_bobs_move_stays(install, task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_write_keeps_a_concurrent_move(install, monkeypatch):
+    from nerve.agent.tools.handlers import tasks as task_handlers
+
+    async with _client(install.app()) as client:
+        task_id = (await client.post(
+            "/api/tasks", headers=install.headers("alice"), json={"title": "Raced"},
+        )).json()["task"]["id"]
+    ctx = ToolContext(
+        session_id="alices-turn", workspace=install.config.workspace,
+        db=install.db, config=install.config, engine=install.engine,
+        actor=install.db.system_actor, cause=install.actor_id("alice"),
+    )
+    await task_handlers.task_read_handler(ctx, {"task_id": task_id})
+    _bob_moves_during_the_file_write(install, monkeypatch, task_handlers, task_id)
+    result = await task_handlers.task_write_handler(
+        ctx, {"task_id": task_id, "content": "# Raced\n\nWritten by the agent.\n"},
+    )
+    assert not result.is_error
+    await _assert_bobs_move_stays(install, task_id)
+
+
+@pytest.mark.asyncio
 async def test_rest_patch_content_keeps_a_concurrent_move(install, monkeypatch):
     """A move that lands while PATCH writes the file is not undone.
 
