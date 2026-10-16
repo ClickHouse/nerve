@@ -587,6 +587,8 @@ def migrate(
     legacy_cron_dir: Path | None = None,
     report: MigrationReport | None = None,
     config: NerveConfig | None = None,
+    *,
+    preview_system_principal: bool = True,
 ) -> MigrationReport:
     """Perform the migration for ``config_dir``. Idempotent; safe to re-run.
 
@@ -601,7 +603,8 @@ def migrate(
 
     ``config`` is what the identity preview reads (:func:`_preview_identity`).
     If it is omitted, or the layout half moved files, the preview loads it from
-    ``config_dir``.
+    ``config_dir``. ``preview_system_principal`` false leaves the system actor
+    step out of the preview (see :func:`maybe_migrate`).
     """
     config_dir = Path(config_dir)
     workspace = Path(workspace) if workspace is not None else _resolve_workspace(config_dir)
@@ -610,7 +613,9 @@ def migrate(
 
     _migrate_config_yaml(config_dir, workspace, legacy_cron, report)
     _migrate_cron(workspace, legacy_cron, report)
-    _preview_identity(config_dir, config, report)
+    _preview_identity(
+        config_dir, config, report, system_principal=preview_system_principal,
+    )
     return report
 
 
@@ -921,6 +926,8 @@ def maybe_migrate(
     workspace: Path | None = None,
     legacy_cron_dir: Path | None = None,
     config: NerveConfig | None = None,
+    *,
+    preview_system_principal: bool = True,
 ) -> MigrationReport | None:
     """Run migration if needed. Best-effort: never raises (called on startup).
 
@@ -931,6 +938,10 @@ def maybe_migrate(
     renamed away. Callers need that — ``nerve start`` has to reload the config it
     is holding, and ``nerve upgrade`` has to print the review prompt for a
     tracked file that now exists.
+
+    ``nerve start`` passes ``preview_system_principal=False``: the start that
+    follows reads ``NERVE_SYSTEM_PRINCIPAL_ID`` once and logs its result once,
+    so the preview leaves that step out.
     """
     report = MigrationReport(dry_run=False)
     try:
@@ -941,6 +952,7 @@ def maybe_migrate(
             legacy_cron_dir=legacy_cron_dir,
             report=report,
             config=config,
+            preview_system_principal=preview_system_principal,
         )
     except Exception as e:  # noqa: BLE001 — must never break upgrade/startup
         report.error = str(e)
@@ -1641,14 +1653,18 @@ async def ensure_jwt_secret(
 
 
 def _preview_identity(
-    config_dir: Path, config: NerveConfig | None, report: MigrationReport,
+    config_dir: Path,
+    config: NerveConfig | None,
+    report: MigrationReport,
+    *,
+    system_principal: bool = True,
 ) -> None:
     """Report what the gateway's identity bootstrap will do at its next start.
 
     Only the gateway and ``nerve init`` write identity state, so this reads
     ``nerve.db`` read-only and never creates it. Skipped on a fresh install
     (no ``config.local.yaml``): the wizard has not yet written the password
-    and secret.
+    and secret. ``system_principal`` is passed to :func:`_inspect_identity`.
     """
     from nerve.bootstrap import is_fresh_install
 
@@ -1663,18 +1679,29 @@ def _preview_identity(
                 f"identity bootstrap not shown: the config could not be loaded ({e})"
             )
             return
-    _inspect_identity(config, paths.db_path(), report)
+    _inspect_identity(config, paths.db_path(), report, system_principal=system_principal)
 
 
-def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationReport) -> None:
-    """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only."""
+def _inspect_identity(
+    config: NerveConfig,
+    db_path: Path,
+    report: MigrationReport,
+    *,
+    system_principal: bool = True,
+) -> None:
+    """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only.
+
+    With ``system_principal`` false, the system actor step is not reported and
+    ``NERVE_SYSTEM_PRINCIPAL_ID`` is not read.
+    """
     from nerve.db.accounts import inspect_bootstrap_state
     from nerve.gateway.auth import is_external_mode
 
     state = inspect_bootstrap_state(db_path)
     sources, stored = state if state is not None else ([], False)
     if is_external_mode():
-        _inspect_system_principal(db_path, report)
+        if system_principal:
+            _inspect_system_principal(db_path, report)
     else:
         _inspect_accounts(config, sources, report)
     if config.auth.jwt_secret:
