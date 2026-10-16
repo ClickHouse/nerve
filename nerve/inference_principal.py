@@ -101,16 +101,17 @@ def _header_name(line: str) -> str:
 
 
 def direct_client_headers(
-    environ: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None, *, principal_id: str | None = None,
 ) -> dict[str, object]:
     """Default headers for Nerve's own Anthropic SDK clients.
 
     The Anthropic SDK also adds the lines of ``ANTHROPIC_CUSTOM_HEADERS`` in
     the environment of Nerve to its default headers, with the name as written.
     Each such name of the principal header gets ``anthropic.omit``, which
-    removes it. Then, in external mode, the system actor's header is added
-    (:func:`system_principal_headers`). So a request names the system actor
-    once in external mode, and no principal in local mode.
+    removes it. Then, in external mode, the header for ``principal_id`` is
+    added, or for the system actor of the global database when it is
+    ``None`` (:func:`system_principal_headers`). So a request names one
+    principal in external mode, and no principal in local mode.
     """
     from anthropic import omit
 
@@ -121,7 +122,10 @@ def direct_client_headers(
         for line in env.get(CUSTOM_HEADERS_ENV, "").split("\n")
         if _header_name(line) == wanted
     }
-    headers.update(system_principal_headers())
+    headers.update(
+        principal_headers(principal_id) if principal_id is not None
+        else system_principal_headers()
+    )
     return headers
 
 

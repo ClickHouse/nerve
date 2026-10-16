@@ -3578,18 +3578,20 @@ class NerveConfig:
         return {}
 
     @staticmethod
-    def _client_header_kwargs() -> dict[str, Any]:
+    def _client_header_kwargs(principal_id: str | None = None) -> dict[str, Any]:
         """The ``default_headers`` argument for an Anthropic client, if any.
 
-        In external mode, Nerve's own model calls name the system actor as
-        the principal of the request, and never another principal from the
+        In external mode, Nerve's own model calls name ``principal_id``, or
+        the system actor of the server's database when it is ``None``, as the
+        principal of the request, and never another principal from the
         environment (see :func:`nerve.inference_principal.direct_client_headers`).
         """
-        headers = direct_client_headers()
+        headers = direct_client_headers(principal_id=principal_id)
         return {"default_headers": headers} if headers else {}
 
     def create_anthropic_client(
         self, timeout: float = 60.0, *, max_retries: int | None = None,
+        principal_id: str | None = None,
     ) -> Any:
         """Create an Anthropic client based on the configured provider.
 
@@ -3599,6 +3601,10 @@ class NerveConfig:
         ``max_retries`` replaces the default retry budget (see
         :meth:`_client_retry_kwargs`). A caller with a hard time limit must
         set it: the proxy budget backs off for about 20 s.
+
+        ``principal_id``: the actor that the requests name in external mode.
+        ``None`` means the system actor of the server's database; a process
+        that has not opened it (a CLI command) passes the ID it read.
         """
         import anthropic
 
@@ -3606,7 +3612,7 @@ class NerveConfig:
             from anthropic import AnthropicBedrock
             kwargs: dict[str, Any] = {
                 "timeout": timeout, **self._client_retry_kwargs(max_retries),
-                **self._client_header_kwargs(),
+                **self._client_header_kwargs(principal_id),
             }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
@@ -3623,7 +3629,7 @@ class NerveConfig:
             base_url = base_url[:-3]
         kwargs = {
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(),
+            **self._client_header_kwargs(principal_id),
         }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
@@ -3638,12 +3644,13 @@ class NerveConfig:
 
     def create_async_anthropic_client(
         self, timeout: float = 60.0, *, max_retries: int | None = None,
+        principal_id: str | None = None,
     ) -> Any:
         """Create an async Anthropic client based on the configured provider.
 
         Returns AsyncAnthropicBedrock when provider is "bedrock", otherwise
-        a standard AsyncAnthropic client. ``max_retries`` as in
-        :meth:`create_anthropic_client`.
+        a standard AsyncAnthropic client. ``max_retries`` and
+        ``principal_id`` as in :meth:`create_anthropic_client`.
         """
         import anthropic
 
@@ -3651,7 +3658,7 @@ class NerveConfig:
             from anthropic import AsyncAnthropicBedrock
             kwargs: dict[str, Any] = {
                 "timeout": timeout, **self._client_retry_kwargs(max_retries),
-                **self._client_header_kwargs(),
+                **self._client_header_kwargs(principal_id),
             }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
@@ -3667,7 +3674,7 @@ class NerveConfig:
             base_url = base_url[:-3]
         kwargs = {
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(),
+            **self._client_header_kwargs(principal_id),
         }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client

@@ -13,10 +13,14 @@ client that records the options it was started with.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import pytest_asyncio
@@ -548,3 +552,126 @@ def test_direct_requests_in_external_mode_name_the_system_actor_once(
         headers = _sent_headers(client)
         assert _principal_values(headers) == [global_db.system_actor_id]
         assert ("x-proxy-tag", "blue") in headers
+
+
+# --------------------------------------------------------------------------- #
+#  The model probe of `nerve doctor` names the stored system actor            #
+# --------------------------------------------------------------------------- #
+
+
+class _MessagesApi(BaseHTTPRequestHandler):
+    """A stand-in for the Messages API that records request headers."""
+
+    received: list[list[tuple[str, str]]] = []
+
+    def do_POST(self):  # noqa: N802 - http.server naming
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        type(self).received.append(list(self.headers.items()))
+        body = json.dumps({
+            "id": "msg_test", "type": "message", "role": "assistant",
+            "model": "claude-test", "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def messages_api(monkeypatch):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                 "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(_MessagesApi, "received", [])
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MessagesApi)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield NerveConfig.from_dict({
+            "anthropic_base_url": f"http://127.0.0.1:{server.server_port}",
+            "anthropic_api_key": "test-key-not-real",
+        })
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def _stored_system_actor_id() -> str:
+    """Create the server's database where the doctor reads it."""
+    from nerve import paths
+    from nerve.db import Database
+
+    database = Database(paths.db_path())
+    await database.connect()
+    try:
+        return database.system_actor_id
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_the_doctor_probe_names_the_stored_system_actor(
+    messages_api, monkeypatch,
+):
+    from nerve.cli import _check_api_connectivity
+
+    system_actor_id = await _stored_system_actor_id()
+    # The doctor reads the mode from its own shell; nothing is pinned.
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+
+    ok, _ = await asyncio.to_thread(_check_api_connectivity, messages_api)
+
+    assert ok
+    (headers,) = _MessagesApi.received
+    assert _principal_values(headers) == [system_actor_id]
+
+
+@pytest.mark.asyncio
+async def test_the_doctor_probe_names_no_principal_in_local_mode(
+    messages_api, monkeypatch,
+):
+    from nerve.cli import _check_api_connectivity
+
+    await _stored_system_actor_id()
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+
+    ok, _ = await asyncio.to_thread(_check_api_connectivity, messages_api)
+
+    assert ok
+    (headers,) = _MessagesApi.received
+    assert _principal_values(headers) == []
+
+
+def test_the_doctor_probe_without_a_database_names_no_principal(
+    messages_api, monkeypatch,
+):
+    from nerve.cli import _check_api_connectivity
+
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+
+    ok, _ = _check_api_connectivity(messages_api)
+
+    assert ok
+    (headers,) = _MessagesApi.received
+    assert _principal_values(headers) == []
+
+
+@pytest.mark.asyncio
+async def test_the_stored_system_actor_is_read_only_when_there_is_exactly_one(tmp_path):
+    from nerve.db import Database
+    from nerve.db.accounts import read_system_actor_id
+
+    assert read_system_actor_id(tmp_path / "missing.db") is None
+    database = Database(tmp_path / "nerve.db")
+    await database.connect()
+    try:
+        assert read_system_actor_id(tmp_path / "nerve.db") == database.system_actor_id
+    finally:
+        await database.close()
