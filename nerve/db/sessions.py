@@ -63,6 +63,7 @@ class SessionStore:
         *,
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
+        created_event: Attribution | None = None,
     ) -> dict:
         """Insert a session row, recording who caused it to exist.
 
@@ -87,21 +88,38 @@ class SessionStore:
         collision — and there it is the difference between the caller being
         told who owns the session and being told who asked to. Everything the
         old shape returned is a column, so the row is a superset of it.
+
+        With ``created_event``, the same transaction appends the ``created``
+        session event with that attribution, only when this call's insert
+        made the row. Of two callers that create one ID at the same time,
+        only the one that the row names is recorded.
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
         caused_by = resolve_cause(actor, cause)
-        await self._write(
-            """INSERT OR IGNORE INTO sessions
-               (id, title, source, metadata, status, parent_session_id,
-                forked_from_message, backend, model, cwd, created_by_actor_id,
-                caused_by_actor_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, title or session_id, source,
-             json.dumps(metadata or {}), status,
-             parent_session_id, forked_from_message, backend, model, cwd,
-             created_by, caused_by, now, now),
-        )
+        async with self._atomic():
+            cursor = await self.db.execute(
+                """INSERT OR IGNORE INTO sessions
+                   (id, title, source, metadata, status, parent_session_id,
+                    forked_from_message, backend, model, cwd, created_by_actor_id,
+                    caused_by_actor_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, title or session_id, source,
+                 json.dumps(metadata or {}), status,
+                 parent_session_id, forked_from_message, backend, model, cwd,
+                 created_by, caused_by, now, now),
+            )
+            inserted = cursor.rowcount == 1
+            await cursor.close()
+            if inserted and created_event is not None:
+                await self.db.execute(
+                    _SESSION_EVENT_SQL,
+                    _session_event_params(
+                        session_id, "created",
+                        {"source": source, "parent": parent_session_id},
+                        created_event,
+                    ),
+                )
         stored = await self.get_session(session_id)
         if stored is not None:
             return stored

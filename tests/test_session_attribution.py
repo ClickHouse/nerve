@@ -30,7 +30,7 @@ from nerve.db.actor_columns import ACTOR_COLUMNS
 from nerve.gateway.auth import create_session_token, hash_password, pin_jwt_secret
 from nerve.gateway.routes import init_deps, register_all_routes
 from nerve.gateway.server import create_app
-from nerve.identity import Attribution
+from nerve.identity import Actor, Attribution
 from nerve.mcp_server.audit import build_audit_writer
 
 _SECRET = "test-secret-for-session-attribution-32b"
@@ -329,19 +329,19 @@ async def test_an_archive_or_restore_that_changes_nothing_records_nothing(instal
     assert (await install.db.get_session(stopped))["status"] == "stopped"
 
 
-def _hold_status_changes(install: _Install, monkeypatch, parties: int) -> None:
-    """Let a status change run only when ``parties`` callers have reached it.
+def _hold_until_all_arrive(monkeypatch, owner, name: str, parties: int = 2) -> None:
+    """Let ``owner.name`` run only when ``parties`` callers have reached it.
 
     Each caller has then read the session before any of them changes it.
     """
     barrier = asyncio.Barrier(parties)
-    change = install.db.change_session_status
+    method = getattr(owner, name)
 
     async def _after_all_arrive(*args, **kwargs):
         await asyncio.wait_for(barrier.wait(), timeout=5)
-        return await change(*args, **kwargs)
+        return await method(*args, **kwargs)
 
-    monkeypatch.setattr(install.db, "change_session_status", _after_all_arrive)
+    monkeypatch.setattr(owner, name, _after_all_arrive)
 
 
 @pytest.mark.asyncio
@@ -349,7 +349,7 @@ async def test_concurrent_archives_and_restores_record_one_change(install, monke
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     async with _client(install.app()) as client:
         session_id = await _new_session(client, install.headers("alice"))
-        _hold_status_changes(install, monkeypatch, 2)
+        _hold_until_all_arrive(monkeypatch, install.db, "change_session_status")
 
         async def both(action: str) -> None:
             responses = await asyncio.gather(*(
@@ -368,6 +368,80 @@ async def test_concurrent_archives_and_restores_record_one_change(install, monke
     for _, actor, cause, _ in events:
         assert actor == cause and actor in (alice, bob)
     assert (await install.db.get_session(session_id))["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rest_resumes_record_one_change(install, monkeypatch):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        await install.started(session_id)
+        _hold_until_all_arrive(monkeypatch, install.engine.sessions, "transition")
+        responses = await asyncio.gather(*(
+            client.post(
+                f"/api/sessions/{session_id}/resume", headers=install.headers(name),
+            )
+            for name in ("alice", "bob")
+        ))
+        assert [r.status_code for r in responses] == [200, 200]
+        monkeypatch.delattr(install.engine.sessions, "transition")
+        # The session is resumed already: a later resume changes nothing.
+        response = await client.post(
+            f"/api/sessions/{session_id}/resume", headers=install.headers("bob"),
+        )
+        assert response.status_code == 200
+
+    resumes = [
+        event for event in await install.events(session_id, "created")
+        if event[3] == {"reason": "resume"}
+    ]
+    assert len(resumes) == 1
+    _, actor, cause, _ = resumes[0]
+    assert actor == cause and actor in (alice, bob)
+    assert (await install.db.get_session(session_id))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_websocket_resumes_record_one_change(install, monkeypatch):
+    monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    await install.db.create_session("ws-chat", source="web", actor=None)
+    await install.started("ws-chat")
+    _hold_until_all_arrive(monkeypatch, install.engine.sessions, "transition")
+
+    endpoint = _ws_endpoint()
+    sockets = [
+        _Socket(install.token(name), [{"type": "resume", "session_id": "ws-chat"}])
+        for name in ("alice", "bob")
+    ]
+    await asyncio.gather(*(endpoint(socket) for socket in sockets))
+
+    assert not [m for s in sockets for m in s.sent if m.get("type") == "error"]
+    resumes = await install.events("ws-chat", "created")
+    assert len(resumes) == 1
+    _, actor, cause, details = resumes[0]
+    assert details == {"reason": "resume"}
+    assert actor == cause and actor in (alice, bob)
+
+
+@pytest.mark.asyncio
+async def test_a_creation_race_records_the_stored_creator_only(install, monkeypatch):
+    """Two people reach one new session ID at the same time; one insert wins."""
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    _hold_until_all_arrive(monkeypatch, install.db, "create_session")
+    rows = await asyncio.gather(*(
+        install.engine.sessions.get_or_create(
+            "shared", source="web", actor=Actor(actor_id=person, kind="human"),
+        )
+        for person in (alice, bob)
+    ))
+
+    creator = (await install.db.get_session("shared"))["created_by_actor_id"]
+    assert creator in (alice, bob)
+    assert [row["created_by_actor_id"] for row in rows] == [creator, creator]
+    assert await install.events("shared", "created") == [
+        ("created", creator, creator, {"source": "web", "parent": None}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -466,8 +540,9 @@ async def test_websocket_stop_and_resume_record_the_connections_person(
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     await install.db.create_session("ws-chat", source="web", actor=None)
     await install.started("ws-chat")
-    # A live client, so the stop reaches the session.
+    # A live client and a running turn, so the stop has work to stop.
     install.engine.sessions.set_client("ws-chat", _Runtime())
+    install.engine.sessions.mark_running("ws-chat")
 
     endpoint = _ws_endpoint()
     alices = _Socket(install.token("alice"), [{"type": "stop", "session_id": "ws-chat"}])
@@ -492,6 +567,17 @@ async def test_a_stop_that_reaches_no_session_records_nothing(install, monkeypat
     assert await install.events("idle-chat", "stop_requested") == []
 
 
+@pytest.mark.asyncio
+async def test_a_stop_of_an_idle_client_records_nothing(install, monkeypatch):
+    """The client gets the interrupt, but no turn runs, so nothing stops."""
+    monkeypatch.setattr("nerve.gateway.server._engine", install.engine)
+    await install.db.create_session("idle-chat", source="web", actor=None)
+    install.engine.sessions.set_client("idle-chat", _Runtime())
+    socket = _Socket(install.token("alice"), [{"type": "stop", "session_id": "idle-chat"}])
+    await _ws_endpoint()(socket)
+    assert await install.events("idle-chat", "stop_requested") == []
+
+
 # --------------------------------------------------------------------------- #
 #  Channel commands                                                            #
 # --------------------------------------------------------------------------- #
@@ -503,6 +589,7 @@ async def test_channel_session_commands_are_unattributed(install):
     # /new
     session_id = await router.create_session("telegram:1", source="telegram")
     install.engine.sessions.set_client(session_id, _Runtime())
+    install.engine.sessions.mark_running(session_id)
     # /stop, /star, and the star toggle
     assert await router.stop_session(session_id)
     await router.set_session_starred(session_id, True)

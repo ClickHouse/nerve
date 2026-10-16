@@ -165,11 +165,10 @@ class SessionManager:
             cwd=cwd,
             actor=actor,
             cause=cause,
+            # The event names the creator and the session's cause only when
+            # this insert made the row.
+            created_event=attribution_for(actor, cause),
         )
-        await self.db.log_session_event(session_id, "created", {
-            "source": source,
-            "parent": parent_session_id,
-        }, attribution=attribution_for(actor))
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
         )
@@ -183,19 +182,20 @@ class SessionManager:
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
         *, attribution: Attribution = UNATTRIBUTED,
-    ) -> None:
+    ) -> bool:
         """Atomically transition a session's status and log the event.
 
         ``attribution`` is for a transition that a principal asks for (a
         resume). A transition that records the state of the runtime keeps it
-        unattributed.
+        unattributed. A session that has ``new_status`` already stays as it
+        is and records nothing, so of two callers that make the same
+        transition at the same time only one is recorded. Returns ``True``
+        when the status changed.
         """
         async with self._transition_lock:
-            await self.db.update_session_fields(
-                session_id, {"status": new_status.value},
-            )
-            await self.db.log_session_event(
-                session_id, new_status.value, details or {},
+            return await self.db.change_session_status(
+                session_id, new_status.value,
+                event_type=new_status.value, details=details,
                 attribution=attribution,
             )
 
@@ -452,6 +452,11 @@ class SessionManager:
     def is_running(self, session_id: str) -> bool:
         """Check if a session has a running agent task."""
         return session_id in self._running_sessions
+
+    def has_running_work(self, session_id: str) -> bool:
+        """True while a turn of the session runs or its registered task lives."""
+        task = self._running_tasks.get(session_id)
+        return self.is_running(session_id) or (task is not None and not task.done())
 
     def get_running_ids(self) -> set[str]:
         """Return the set of currently running session IDs."""

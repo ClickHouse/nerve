@@ -1525,9 +1525,13 @@ class AgentEngine:
     ) -> bool:
         """Stop a running session.
 
-        A stop that reaches the session records a ``stop_requested`` event
-        with ``attribution``: who asked for the stop, and for whom.
+        A stop that reaches a running turn or task records a
+        ``stop_requested`` event with ``attribution``: who asked for the
+        stop, and for whom. A stop with nothing to stop records nothing. The
+        event records a request, so two people who ask at the same time are
+        two events.
         """
+        had_work = self.sessions.has_running_work(session_id)
         for cb in self._stop_listeners:
             try:
                 await cb(session_id)
@@ -1538,7 +1542,7 @@ class AgentEngine:
         if handler:
             handler.cancel_all()
         stopped = await self.sessions.stop_session(session_id)
-        if stopped:
+        if stopped and had_work:
             try:
                 await self.db.log_session_event(
                     session_id, "stop_requested", attribution=attribution,
@@ -1644,7 +1648,9 @@ class AgentEngine:
         """Resume a stopped/idle session.
 
         Records a ``created`` status event with reason ``resume`` and
-        ``attribution``.
+        ``attribution``, only when the status changes: a session that is
+        resumed already stays as it is, so of two resumes at the same time
+        only one is recorded.
         """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
