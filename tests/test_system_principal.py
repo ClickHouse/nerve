@@ -12,11 +12,16 @@ the same transaction. Otherwise the local ID stays, a warning is logged, and
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 
+import httpx
 import pytest
 import pytest_asyncio
+from fastapi import Depends, FastAPI
 
+from nerve import paths
+from nerve.config import NerveConfig, set_config
 from nerve.db import Database
 from nerve.db.accounts import (
     SYSTEM_ACTOR_ID_TAKEN,
@@ -25,16 +30,34 @@ from nerve.db.accounts import (
     inspect_system_actor,
 )
 from nerve.db.migrations import v047_accounts
+from nerve.gateway.auth import (
+    AUTH_MODE_ENV,
+    AUTH_MODE_EXTERNAL,
+    MCP_AUDIENCE,
+    create_external_mcp_token,
+    create_mcp_session_token,
+    create_system_token,
+    decode_token,
+    pin_auth_mode,
+    require_auth,
+    resolve_actor_from_claims,
+)
 from nerve.identity import (
     SYSTEM_PRINCIPAL_ENV,
     Actor,
     InvalidSystemPrincipalId,
     parse_system_principal_id,
 )
+from nerve.migrate import MigrationReport, _inspect_identity, bootstrap_identity
 
+_SECRET = "test-secret-for-system-principal-pad32"
 # Obviously fake IDs.
 PRINCIPAL = "00000000-0000-4000-8000-00000000c2c2"
 ALICE = "00000000-0000-4000-8000-0000000a11ce"
+
+
+def _config() -> NerveConfig:
+    return NerveConfig.from_dict({"auth": {"jwt_secret": _SECRET}})
 
 
 async def _open(path) -> Database:
@@ -81,6 +104,17 @@ async def _refer_to_system_actor(database: Database, reference: str) -> str:
         "INSERT INTO later_story (caused_by_actor_id) VALUES (?)", (system.actor_id,),
     )
     return "later_story.caused_by_actor_id"
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.fixture
+def external(monkeypatch):
+    """External mode, as ``create_app()`` pins it."""
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+    pin_auth_mode(AUTH_MODE_EXTERNAL)
 
 
 @pytest.fixture
@@ -262,3 +296,254 @@ class TestRekey:
             assert inspect_system_actor(path, ALICE) == (local_id, SYSTEM_ACTOR_ID_TAKEN)
         finally:
             await database.close()
+
+
+# --------------------------------------------------------------------------- #
+#  The identity bootstrap                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestBootstrap:
+    async def test_a_fresh_database_takes_the_id(self, database, external, seeded):
+        local_id = database.system_actor_id
+        report = await bootstrap_identity(database, _config())
+
+        assert report.rekeyed_system_actor and report.did_bootstrap
+        assert report.identity_actions[0] == (
+            f"changed the system actor ID from {local_id} to {PRINCIPAL}, the ID in "
+            f"{SYSTEM_PRINCIPAL_ENV}"
+        )
+        assert not report.warnings
+        assert database.system_actor_id == PRINCIPAL
+        assert await database.count_accounts() == 0
+
+    async def test_a_second_start_changes_nothing(self, database, external, seeded, caplog):
+        await bootstrap_identity(database, _config())
+        with caplog.at_level(logging.INFO, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+        assert not report.rekeyed_system_actor and not report.warnings
+        assert database.system_actor_id == PRINCIPAL
+        assert "system actor" not in caplog.text
+
+    @pytest.mark.parametrize("reference", ["session", "cause", "message", "new_column"])
+    async def test_a_referenced_system_actor_keeps_its_local_id(
+        self, database, external, seeded, caplog, reference,
+    ):
+        local_id = database.system_actor_id
+        column = await _refer_to_system_actor(database, reference)
+
+        with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+
+        assert database.system_actor_id == local_id
+        assert not report.rekeyed_system_actor
+        assert len(report.warnings) == 1
+        warning = report.warnings[0]
+        assert f"keeps its local ID {local_id}" in warning
+        assert f"{SYSTEM_PRINCIPAL_ENV} names {PRINCIPAL}" in warning
+        assert f"{column} refers to the current ID" in warning
+        assert _warnings(caplog) == [f"Identity: {warning}"]
+
+    async def test_an_id_that_another_actor_has_keeps_the_local_id(
+        self, database, external, seeded, caplog,
+    ):
+        local_id = database.system_actor_id
+        await database.upsert_external_actor(PRINCIPAL, "Alice Example")
+
+        with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+
+        assert database.system_actor_id == local_id
+        assert len(report.warnings) == 1 and SYSTEM_ACTOR_ID_TAKEN in report.warnings[0]
+        assert len(_warnings(caplog)) == 1
+
+    async def test_local_mode_ignores_the_variable(self, database, seeded, caplog):
+        local_id = database.system_actor_id
+        with caplog.at_level(logging.INFO, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+        assert database.system_actor_id == local_id
+        assert not report.rekeyed_system_actor and not report.warnings
+        assert report.bootstrapped_account
+        assert "no effect in local mode" in caplog.text
+        assert _warnings(caplog) == []
+
+    @pytest.mark.parametrize("value", [PRINCIPAL.upper(), "not-a-uuid"])
+    async def test_an_invalid_value_keeps_the_local_id(
+        self, database, external, monkeypatch, caplog, value,
+    ):
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, value)
+        local_id = database.system_actor_id
+        with caplog.at_level(logging.WARNING, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+        assert database.system_actor_id == local_id
+        assert not report.rekeyed_system_actor
+        assert len(report.warnings) == 1 and "canonical" in report.warnings[0]
+        assert len(_warnings(caplog)) == 1 and local_id in _warnings(caplog)[0]
+
+    async def test_no_variable_changes_nothing(self, database, external):
+        local_id = database.system_actor_id
+        report = await bootstrap_identity(database, _config())
+        assert database.system_actor_id == local_id
+        assert not report.rekeyed_system_actor and not report.warnings
+
+    async def test_a_dry_run_reports_and_writes_nothing(self, database, external, seeded):
+        local_id = database.system_actor_id
+        report = await bootstrap_identity(database, _config(), dry_run=True)
+        assert report.rekeyed_system_actor
+        assert report.identity_actions[0].startswith(
+            f"change the system actor ID from {local_id} to {PRINCIPAL}"
+        )
+        assert database.system_actor_id == local_id
+        assert await _system_rows(database) == [local_id]
+
+    async def test_two_starts_at_once_agree_and_warn_about_nothing(
+        self, tmp_path, external, seeded,
+    ):
+        first = await _open(tmp_path / "nerve.db")
+        second = await _open(tmp_path / "nerve.db")
+        try:
+            reports = await asyncio.gather(
+                bootstrap_identity(first, _config()),
+                bootstrap_identity(second, _config()),
+            )
+            assert sorted(r.rekeyed_system_actor for r in reports) == [False, True]
+            assert not any(r.warnings for r in reports)
+            assert first.system_actor_id == second.system_actor_id == PRINCIPAL
+        finally:
+            await first.close()
+            await second.close()
+
+
+# --------------------------------------------------------------------------- #
+#  Tokens                                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestTokens:
+    async def test_system_and_mcp_tokens_resolve_to_the_new_id(
+        self, database, external, seeded,
+    ):
+        await bootstrap_identity(database, _config())
+        claims = [
+            decode_token(create_system_token(_SECRET), _SECRET),
+            decode_token(
+                create_mcp_session_token(_SECRET, "engine-sess-1"), _SECRET,
+                audience=MCP_AUDIENCE,
+            ),
+            decode_token(create_external_mcp_token(_SECRET), _SECRET, audience=MCP_AUDIENCE),
+        ]
+        for claim in claims:
+            actor = await resolve_actor_from_claims(database, claim)
+            assert actor.actor_id == PRINCIPAL and actor.is_system
+
+    async def test_a_request_with_a_system_token_acts_as_the_new_id(
+        self, database, external, seeded, wire_identity_store,
+    ):
+        set_config(_config())
+        try:
+            await bootstrap_identity(database, _config())
+            wire_identity_store(database)
+            app = FastAPI()
+
+            @app.get("/whoami")
+            async def whoami(actor: Actor = Depends(require_auth)):
+                return {"actor_id": actor.actor_id, "kind": actor.kind}
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://nerve-test",
+            ) as client:
+                res = await client.get(
+                    "/whoami",
+                    headers={"Authorization": f"Bearer {create_system_token(_SECRET)}"},
+                )
+            assert res.status_code == 200
+            assert res.json() == {"actor_id": PRINCIPAL, "kind": "system"}
+        finally:
+            set_config(NerveConfig())
+
+
+# --------------------------------------------------------------------------- #
+#  Entry points: nerve init, server start, the preview                         #
+# --------------------------------------------------------------------------- #
+
+
+class _ProxyThatFails:
+    """Stops the lifespan right after the identity and setup-token steps."""
+
+    async def start(self):
+        raise RuntimeError("stop after the identity steps")
+
+    async def stop(self):
+        return None
+
+
+class TestEntryPoints:
+    def test_nerve_init_takes_the_id(self, monkeypatch, seeded):
+        """``nerve init`` reads the mode and the ID from the environment."""
+        from nerve.migrate import bootstrap_identity_sync
+
+        monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+        report = bootstrap_identity_sync(NerveConfig())
+        assert report.rekeyed_system_actor
+        assert inspect_system_actor(paths.db_path(), PRINCIPAL) == (PRINCIPAL, None)
+
+    @pytest.mark.asyncio
+    async def test_the_server_start_takes_the_id_before_it_serves(
+        self, tmp_path, monkeypatch, seeded,
+    ):
+        import nerve.proxy.service as proxy_module
+        from nerve.gateway import server
+
+        config = NerveConfig()
+        config.workspace = tmp_path / "ws"
+        config.workspace.mkdir()
+        config.proxy.enabled = True
+        config.mcp_endpoint.enabled = False
+        set_config(config)
+        try:
+            monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+            app = server.create_app()
+            monkeypatch.setattr(proxy_module, "ProxyService", lambda cfg: _ProxyThatFails())
+            with pytest.raises(RuntimeError, match="stop after the identity steps"):
+                async with server.lifespan(app):
+                    pass
+        finally:
+            set_config(NerveConfig())
+
+        assert inspect_system_actor(paths.db_path(), PRINCIPAL) == (PRINCIPAL, None)
+
+    @pytest.mark.asyncio
+    async def test_the_preview_reports_what_the_next_start_does(self, external, seeded):
+        report = MigrationReport(dry_run=True)
+        _inspect_identity(NerveConfig(), paths.db_path(), report)
+        assert report.rekeyed_system_actor
+        assert report.identity_actions[0] == (
+            f"give the new system actor the ID {PRINCIPAL}, the ID in {SYSTEM_PRINCIPAL_ENV}"
+        )
+
+        database = await _open(paths.db_path())
+        try:
+            local_id = database.system_actor_id
+            report = MigrationReport(dry_run=True)
+            _inspect_identity(NerveConfig(), paths.db_path(), report)
+            assert report.rekeyed_system_actor
+            assert report.identity_actions[0].startswith(
+                f"change the system actor ID from {local_id} to {PRINCIPAL}"
+            )
+
+            column = await _refer_to_system_actor(database, "session")
+            report = MigrationReport(dry_run=True)
+            _inspect_identity(NerveConfig(), paths.db_path(), report)
+            assert not report.rekeyed_system_actor
+            assert len(report.warnings) == 1 and column in report.warnings[0]
+        finally:
+            await database.close()
+
+    def test_the_preview_reports_an_invalid_value(self, external, monkeypatch):
+        monkeypatch.setenv(SYSTEM_PRINCIPAL_ENV, "not-a-uuid")
+        report = MigrationReport(dry_run=True)
+        _inspect_identity(NerveConfig(), paths.db_path(), report)
+        assert not report.rekeyed_system_actor
+        assert len(report.warnings) == 1 and "canonical" in report.warnings[0]

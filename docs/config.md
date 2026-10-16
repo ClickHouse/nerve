@@ -1857,6 +1857,23 @@ These requests have no header: memory model calls through the
 OpenAI-compatible client (the memory library makes that client and takes no
 headers), and Codex sessions.
 
+### System principal ID
+
+The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the
+agent's system principal. It has an effect only in external mode. It is not a
+configuration key. `nerve init` and the server read it once, in the identity
+bootstrap.
+
+| Value | Behavior |
+|---|---|
+| Unset or empty | The system actor keeps its ID. |
+| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor and no other actor has the ID. Otherwise the system actor keeps its local ID and Nerve logs a warning. |
+| Any other value, also a UUID in upper case | The system actor keeps its ID and Nerve logs a warning. The server starts. |
+
+Set the variable before the first `nerve init` or start, so that the change
+occurs before Nerve attributes work to the system actor. See
+[The system actor in external mode](accounts.md#the-system-actor-in-external-mode).
+
 ## Setup
 
 | Key | Type | Default | Description |
