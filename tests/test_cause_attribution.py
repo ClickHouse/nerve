@@ -671,7 +671,10 @@ async def test_autonomous_work_keeps_the_cause_of_the_turn_that_started_it(
         runtime = install.runtime(session_id)
         # Alice's turn starts a background task.
         runtime.turn_events = [
-            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+            SystemEvent(
+                subtype="task_started",
+                data={"task_id": "bg-1", "task_type": "local_bash"},
+            ),
         ]
         await _chat(client, install.headers("alice"), session_id, "run the build")
 
@@ -710,7 +713,10 @@ async def test_an_autonomous_turn_after_a_later_turn_keeps_the_starters_cause(
         session_id = await _new_session(client, install.headers("alice"))
         runtime = install.runtime(session_id)
         runtime.turn_events = [
-            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+            SystemEvent(
+                subtype="task_started",
+                data={"task_id": "bg-1", "task_type": "local_bash"},
+            ),
         ]
         await _chat(client, install.headers("alice"), session_id, "start a long job")
         await _chat(client, install.headers("bob"), session_id, "something else")
@@ -751,7 +757,10 @@ async def test_late_autonomous_output_is_not_given_the_next_persons_cause(
         session_id = await _new_session(client, install.headers("alice"))
         runtime = install.runtime(session_id)
         runtime.turn_events = [
-            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+            SystemEvent(
+                subtype="task_started",
+                data={"task_id": "bg-1", "task_type": "local_bash"},
+            ),
         ]
         await _chat(client, install.headers("alice"), session_id, "run the build")
         runtime.buffered = [[
@@ -783,7 +792,10 @@ async def test_the_next_turn_waits_for_a_slow_autonomous_turn(install, monkeypat
         session_id = await _new_session(client, install.headers("alice"))
         runtime = install.runtime(session_id)
         runtime.turn_events = [
-            SystemEvent(subtype="task_started", data={"task_id": "bg-1"}),
+            SystemEvent(
+                subtype="task_started",
+                data={"task_id": "bg-1", "task_type": "local_bash"},
+            ),
         ]
         await _chat(client, install.headers("alice"), session_id, "run the build")
         runtime.buffered = [[
@@ -824,6 +836,75 @@ async def test_a_running_background_agent_of_another_person_leaves_the_cause_unk
 
     assert [turn["cause"] for turn in install.turns_in(session_id)] == [
         alice, None, alice,
+    ]
+
+
+def _report_turn(*events) -> list:
+    """Buffered output: settle events, then an autonomous turn that starts."""
+    return [*events, SystemEvent(subtype="init"), TextDelta(text="Report.")]
+
+
+def _settled(task_id: str) -> SystemEvent:
+    return SystemEvent(
+        subtype="task_notification", data={"task_id": task_id, "status": "completed"},
+    )
+
+
+def _started(task_id: str, task_type: str) -> SystemEvent:
+    return SystemEvent(
+        subtype="task_started", data={"task_id": task_id, "task_type": task_type},
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_report_of_tasks_of_two_people_has_no_cause(install, monkeypatch):
+    install.use_fake_runtime(monkeypatch)
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        runtime.turn_events = [_started("bg-a", "local_bash")]
+        await _chat(client, install.headers("alice"), session_id, "build A")
+        runtime.turn_events = [_started("bg-b", "local_bash")]
+        await _chat(client, install.headers("bob"), session_id, "build B")
+
+    # Both tasks settle and the runtime reports them in one turn.
+    runtime.buffered = [_report_turn(_settled("bg-a"), _settled("bg-b"))]
+    runtime.in_flight = [(0, True, [TurnCompleted()])]
+    await install.engine._drain_pending_messages(
+        session_id, runtime, "web", "web", manage_framing=True,
+    )
+    assert [turn["cause"] for turn in install.turns_in(session_id)] == [
+        alice, bob, None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_watcher_turn_takes_the_watchers_cause_or_none(install, monkeypatch):
+    """A watcher starts turns while it runs, without settling."""
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+
+    async def watcher_event_turn():
+        runtime.buffered = [_report_turn()]
+        runtime.in_flight = [(0, True, [TurnCompleted()])]
+        await install.engine._drain_pending_messages(
+            session_id, runtime, "web", "web", manage_framing=True,
+        )
+
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        runtime = install.runtime(session_id)
+        runtime.turn_events = [_started("watch-1", "monitor")]
+        await _chat(client, install.headers("alice"), session_id, "watch the log")
+        await watcher_event_turn()
+        await _chat(client, install.headers("bob"), session_id, "something else")
+        await watcher_event_turn()
+
+    # Alice's watcher turn is hers. Bob's turn and the watcher turn after it
+    # cannot tell Alice's watcher apart from Bob's work: unknown, never Bob.
+    assert [turn["cause"] for turn in install.turns_in(session_id)] == [
+        alice, alice, None, None,
     ]
 
 

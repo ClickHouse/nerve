@@ -96,6 +96,16 @@ class TurnCauseNotStored(RuntimeError):
 # ``_persisted_turn_causes`` value for a session whose row has no known write.
 _NOT_STORED = object()
 
+
+@dataclass(frozen=True, slots=True)
+class _BackgroundTask:
+    """A live background task and the cause of the turn that started it."""
+
+    cause_id: str | None
+    # An agent, a workflow or a watcher: it can call tools or start a turn
+    # before it settles. A shell command cannot.
+    acts_while_running: bool
+
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 # Injected as an internal turn when a session is resumed after a
@@ -271,13 +281,13 @@ class AgentEngine:
         # turn after the pre-query drain, an autonomous turn when the drain
         # opens it. Read through session_cause().
         self._turn_causes: dict[str, str | None] = {}
-        # Cause of each live background task (Bash/Agent run_in_background,
-        # Monitor): the cause of the turn that started it. session_id ->
-        # task_id -> cause.
-        self._bg_task_causes: dict[str, dict[str, str | None]] = {}
+        # Each live background task (Bash/Agent run_in_background, Monitor)
+        # with the cause of the turn that started it. session_id -> task_id
+        # -> _BackgroundTask. A task leaves the map when it settles.
+        self._bg_task_causes: dict[str, dict[str, _BackgroundTask]] = {}
         # Cause for a session's next autonomous turn: the cause of the
-        # background task that settled last. The CLI starts that turn to
-        # report the settled task.
+        # background tasks that settled since the last one (None when they
+        # differ). The CLI starts that turn to report the settled tasks.
         self._autonomous_causes: dict[str, str | None] = {}
         # The turn cause last written to each session row. It differs from
         # _turn_causes only after a failed write, which the next turn retries.
@@ -465,8 +475,8 @@ class AgentEngine:
 
         - an autonomous turn that the pre-query drain gave up on can still
           emit;
-        - a background agent or workflow of another cause can still make tool
-          calls.
+        - a running background task of another cause can call tools or
+          start a turn before it settles (see :meth:`_acting_task_causes`).
         """
         if session_id in self._unfinished_autonomous:
             self._unfinished_autonomous.discard(session_id)
@@ -475,30 +485,43 @@ class AgentEngine:
                 "the new turn runs with an unknown cause", session_id,
             )
             return None
-        if self._live_agent_cause_differs(session_id, cause_id):
+        if self._acting_task_causes(session_id) - {cause_id}:
             logger.info(
-                "Session %s: a background agent of another cause is running; "
+                "Session %s: a background task of another cause is running; "
                 "the new turn runs with an unknown cause", session_id,
             )
             return None
         return cause_id
 
-    def _live_agent_cause_differs(self, session_id: str, cause_id: str | None) -> bool:
-        """Whether a running background agent or workflow has another cause.
+    def _cause_for_autonomous_turn(self, session_id: str) -> str | None:
+        """The cause of an autonomous turn that the runtime starts.
 
-        Background commands are left out: they do not call the session's
-        tools.
+        The turn reports the background tasks that settled since the last
+        one, so it takes their cause. Without one it continues the last turn
+        (late output of a turn that a drain gave up on, for example). A
+        running background task of another cause could also be the reason
+        for the turn, or call tools in it; then the cause is unknown (None).
         """
-        registry = self._bg_task_registry.get(session_id) or {}
-        for task_id, task_cause in (self._bg_task_causes.get(session_id) or {}).items():
-            entry = registry.get(task_id) or {}
-            if (
-                entry.get("status") == "running"
-                and entry.get("tool") in ("Agent", "Workflow")
-                and task_cause != cause_id
-            ):
-                return True
-        return False
+        if session_id in self._autonomous_causes:
+            cause_id = self._autonomous_causes.pop(session_id)
+        else:
+            cause_id = self._turn_causes.get(session_id)
+        if self._acting_task_causes(session_id) - {cause_id}:
+            return None
+        return cause_id
+
+    def _acting_task_causes(self, session_id: str) -> set[str | None]:
+        """Causes of the running background tasks that act before they settle.
+
+        A background agent or workflow calls tools, and a watcher starts
+        turns, while it runs. A background shell command does neither until
+        it settles, so it is left out. A task of an unknown kind counts.
+        """
+        return {
+            task.cause_id
+            for task in (self._bg_task_causes.get(session_id) or {}).values()
+            if task.acts_while_running
+        }
 
     def _forget_background_causes(self, session_id: str) -> None:
         """Drop the causes of runtime work that died with its client.
@@ -2274,17 +2297,27 @@ class AgentEngine:
         When the task settles, its cause becomes the cause of the session's
         next autonomous turn, which the runtime starts to report the result.
         """
-        causes = self._bg_task_causes.setdefault(session_id, {})
+        tasks = self._bg_task_causes.setdefault(session_id, {})
         if subtype == "task_started":
-            causes.setdefault(task_id, self._turn_causes.get(session_id))
+            if task_id not in tasks:
+                task_type = str(data.get("task_type") or "")
+                tasks[task_id] = _BackgroundTask(
+                    cause_id=self._turn_causes.get(session_id),
+                    acts_while_running="bash" not in task_type,
+                )
             return
         settled = subtype == "task_notification" or (
             subtype == "task_updated"
             and str((data.get("patch") or {}).get("status") or "")
             in self._BG_TERMINAL_STATUSES
         )
-        if settled and task_id in causes:
-            self._autonomous_causes[session_id] = causes.pop(task_id)
+        if settled and task_id in tasks:
+            cause_id = tasks.pop(task_id).cause_id
+            pending = self._autonomous_causes
+            # Tasks of different causes settled for one report: unknown.
+            if session_id in pending and pending[session_id] != cause_id:
+                cause_id = None
+            pending[session_id] = cause_id
 
     async def _emit_workflow_progress(
         self,
@@ -3276,15 +3309,12 @@ class AgentEngine:
             if st is not None:
                 return
             st = _TurnState()
-            # The runtime reports a settled background task, so the turn
-            # continues the work of the turn that started the task.
-            if session_id in self._autonomous_causes:
-                cause_id = self._autonomous_causes.pop(session_id)
-                if self._live_agent_cause_differs(session_id, cause_id):
-                    cause_id = None
-                await self._begin_runtime_turn(
-                    session_id, cause_id, must_persist=False,
-                )
+            # The turn continues the work of the turn that started the
+            # background tasks it reports; see _cause_for_autonomous_turn.
+            await self._begin_runtime_turn(
+                session_id, self._cause_for_autonomous_turn(session_id),
+                must_persist=False,
+            )
             # Leading marker block → "background continuation" chip in the
             # UI, both live (auto_turn event) and after reload (persisted).
             st.ordered_blocks.append({"type": "auto"})

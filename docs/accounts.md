@@ -207,9 +207,10 @@ started, and then to the end of that turn.
 One agent process serves a session, and its tool calls do not say which turn
 they belong to. So a turn runs with an unknown cause, not with its person's
 cause, when output of another cause can still arrive during it: a report turn
-that showed no output within the 30 seconds, or a background agent that
-another person's turn started and that still runs. Nerve records an unknown
-cause rather than the wrong person.
+that showed no output within the 30 seconds, or a running background task of
+another cause that can act before it ends (an agent, a workflow or a
+watcher). A report turn for background tasks of different causes also has an
+unknown cause. Nerve records an unknown cause rather than the wrong person.
 
 Nerve stores the cause on the session before the turn reaches the agent. If
 that write fails, the turn does not start.
