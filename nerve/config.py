@@ -1898,6 +1898,14 @@ class GitHubSyncConfig:
     # allow list is fail-closed and would drop every non-CI notification, since
     # their ci_branch is empty.
     deny_ci_branches: list[str] = field(default_factory=list)
+    # Command run when the guardrail drops records — an argv list, never a
+    # shell string (a bare string is one program path). Entries are passed as
+    # they are: nothing is stripped or dropped, so argument positions hold. It
+    # gets one JSON object per dropped record on stdin, so an operator can act
+    # on a drop the agent never sees: log it, or acknowledge the person whose
+    # message was dropped. Best effort; empty = off. See
+    # SourceRunner._run_drop_hook.
+    drop_hook: list[str] = field(default_factory=list)
 
     @classmethod
     @_coerced
@@ -1917,6 +1925,7 @@ class GitHubSyncConfig:
             allow_reasons=d.get("allow_reasons", []),
             deny_reasons=d.get("deny_reasons", []),
             deny_ci_branches=d.get("deny_ci_branches", []),
+            drop_hook=_str_list(d.get("drop_hook") or []),
         )
 
 
