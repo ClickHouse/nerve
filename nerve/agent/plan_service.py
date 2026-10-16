@@ -89,9 +89,12 @@ async def request_plan_revision(
         PlanNotPending: The plan is declined/superseded/implementing/etc.
 
     Behavior contract:
-        - Stores ``feedback`` on the plan (status untouched — old plan
-          stays ``pending`` until the planner calls ``plan_update``), and
-          ``actor`` + ``cause`` as its reviewer.
+        - Stores ``feedback`` on the plan, ``actor`` + ``cause`` as its
+          reviewer, and moves it from ``pending`` to ``revising`` in one
+          compare-and-update. While it is ``revising``, approve, decline
+          and another revision refuse. The planner's ``plan_update``
+          supersedes it; if the revision turn ends without that, the plan
+          is ``pending`` again.
         - Writes a ``Revision requested for {plan_id}`` note to the task.
         - Dispatches ``engine.run()`` on the original proposer session
           (``plan.session_id``), falling back to ``cron:task-planner``
@@ -100,12 +103,6 @@ async def request_plan_revision(
           ``plan_update(plan_id=..., content=..., feedback=<summary>)``
           so version history stays linked.
     """
-    # Import here to avoid a circular import: tool handlers import
-    # plan_service indirectly via the engine wiring.
-    from dataclasses import replace
-    from nerve.agent.tools import _legacy_ctx
-    from nerve.agent.tools.handlers.tasks import task_update_handler
-
     feedback = feedback.strip()
     if not feedback:
         # Treat empty feedback as a programmer error — both callers
@@ -125,16 +122,59 @@ async def request_plan_revision(
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
-    # 1. Store feedback on the plan (status stays pending until planner
-    #    supersedes it via plan_update). The request is a review decision,
-    #    and it applies only while the plan is still pending.
+    # 1. Store feedback on the plan and move it to ``revising``. The request
+    #    is a review decision: it applies only while the plan is pending, and
+    #    while the plan is ``revising`` no approval, decline or second
+    #    revision applies. The planner's plan_update supersedes it; the end
+    #    of the revision turn makes a plan that it did not replace pending
+    #    again.
     if not await db.compare_and_update_plan(
-        plan_id, expect_status="pending",
+        plan_id, expect_status="pending", status="revising",
         feedback=feedback, attribution=attribution_for(actor, cause),
     ):
         raise PlanNotPending(
             f"Plan {plan_id} is no longer pending; another decision was made first."
         )
+    try:
+        session_id, prompt = await _prepare_revision(
+            db, engine, plan, task, feedback, cause,
+        )
+    except BaseException:
+        await _reopen_after_revision(db, plan_id)
+        raise
+    asyncio.create_task(
+        _run_revision_turn(db, engine, plan_id, session_id, prompt, cause),
+    )
+
+    logger.info(
+        "Revision dispatched: plan=%s task=%s session=%s",
+        plan_id, plan["task_id"], session_id,
+    )
+
+    return {
+        "plan_id": plan_id,
+        "task_id": plan["task_id"],
+        "session_id": session_id,
+        "status": "revision_requested",
+    }
+
+
+async def _prepare_revision(
+    db: "Database",
+    engine: "AgentEngine",
+    plan: dict,
+    task: dict,
+    feedback: str,
+    cause: "ActorOrId | None",
+) -> tuple[str, str]:
+    """Write the task note and return the planner session and the prompt."""
+    # Import here to avoid a circular import: tool handlers import
+    # plan_service indirectly via the engine wiring.
+    from dataclasses import replace
+    from nerve.agent.tools import _legacy_ctx
+    from nerve.agent.tools.handlers.tasks import task_update_handler
+
+    plan_id = plan["id"]
 
     # 2. Write a task note so the revision request is visible in the
     #    task's history. Build a ``ToolContext`` from the legacy module
@@ -170,23 +210,40 @@ async def request_plan_revision(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,
     )
-    asyncio.create_task(
-        engine.run(
+    return session_id, prompt
+
+
+async def _run_revision_turn(
+    db: "Database",
+    engine: "AgentEngine",
+    plan_id: str,
+    session_id: str,
+    prompt: str,
+    cause: "ActorOrId | None",
+) -> None:
+    """Run the revision turn, then reopen the plan if it was not replaced."""
+    try:
+        await engine.run(
             session_id=session_id, user_message=prompt, source="cron",
             # The revision prompt is built from a template here, not typed by
             # the person who asked for the revision.
             actor=engine.db.system_actor,
         )
-    )
+    except Exception:
+        logger.exception("Revision turn for plan %s failed", plan_id)
+    finally:
+        await _reopen_after_revision(db, plan_id)
 
-    logger.info(
-        "Revision dispatched: plan=%s task=%s session=%s",
-        plan_id, plan["task_id"], session_id,
-    )
 
-    return {
-        "plan_id": plan_id,
-        "task_id": plan["task_id"],
-        "session_id": session_id,
-        "status": "revision_requested",
-    }
+async def _reopen_after_revision(db: "Database", plan_id: str) -> None:
+    """Make a plan that is still ``revising`` pending, so it can be decided."""
+    try:
+        if await db.compare_and_update_plan(
+            plan_id, expect_status="revising", status="pending",
+        ):
+            logger.info(
+                "Plan %s is pending again: the revision ended without a new version",
+                plan_id,
+            )
+    except Exception:
+        logger.exception("Could not reopen plan %s after its revision", plan_id)

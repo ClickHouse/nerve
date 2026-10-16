@@ -104,6 +104,9 @@ class _FakeRuntime:
         return None
 
     async def receive_turn(self):
+        gate = self.install.holds.get(self.session_id)
+        if gate is not None:
+            await gate.wait()
         call = self.install.tool_calls.pop(self.session_id, None)
         if call is not None:
             tool, args = call
@@ -130,6 +133,8 @@ class _Install:
         self.runtimes: dict[str, _FakeRuntime] = {}
         self.tool_calls: dict[str, tuple[str, dict]] = {}
         self.tool_results: dict[str, list] = {}
+        # A session whose turns wait for this event before they complete.
+        self.holds: dict[str, asyncio.Event] = {}
 
     @property
     def system_actor_id(self) -> str:
@@ -910,6 +915,197 @@ async def test_tool_decisions_after_an_approval_change_nothing(install, monkeypa
     assert len(install.impl_runs()) == 1
     assert [e[0] for e in await install.task_events(task_id)] == ["pending", "in_progress"]
     assert [p["id"] for p in await install.db.get_plans_for_task(task_id)] == [plan_id]
+
+
+@pytest.mark.asyncio
+async def test_a_revision_excludes_every_other_decision_while_it_runs(
+    install, monkeypatch,
+):
+    bob = install.actor_id("bob")
+    task_id, plan_id = await install.pending_plan("race-revise")
+    install.holds["proposal"] = asyncio.Event()
+    await _stale_plan_reads(install, monkeypatch, plan_id)
+    async with _client(install.app()) as client:
+        revised = await client.post(
+            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
+            json={"feedback": "add tests"},
+        )
+        assert revised.status_code == 200
+        assert (await install.plan_row(plan_id))["status"] == "revising"
+        # Each of these read the plan while it was still pending.
+        approved = await client.post(
+            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
+        )
+        declined = await client.patch(
+            f"/api/plans/{plan_id}", headers=install.headers("alice"),
+            json={"status": "declined"},
+        )
+        revised_again = await client.post(
+            f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
+            json={"feedback": "no, remove tests"},
+        )
+    assert (approved.status_code, declined.status_code, revised_again.status_code) == (
+        409, 409, 409,
+    )
+    ctx = _tool_ctx(install, "alices-chat", install.actor_id("alice"))
+    for handler, args in (
+        (plan_approve_handler, {"plan_id": plan_id}),
+        (plan_decline_handler, {"plan_id": plan_id}),
+        (plan_revise_handler, {"plan_id": plan_id, "feedback": "again"}),
+    ):
+        result = await handler(ctx, args)
+        assert "pending" in result.content[0]["text"], handler.__name__
+
+    plan = await install.plan_row(plan_id)
+    assert (plan["status"], plan["feedback"]) == ("revising", "add tests")
+    assert await install.plan_reviewer(plan_id) == (bob, bob)
+    assert install.impl_runs() == []
+    assert [e[0] for e in await install.task_events(task_id)] == ["pending"]
+    assert [r["session_id"] for r in install.runs].count("proposal") == 1
+
+    # The revision turn ends without a new version: the plan is open again.
+    install.holds["proposal"].set()
+    await install.turn_done("proposal")
+    assert (await install.plan_row(plan_id))["status"] == "pending"
+
+
+def _read_together(install: _Install, monkeypatch, plan_id: str, count: int) -> None:
+    """The first ``count`` reads of ``plan_id`` return only when all have read.
+
+    So every request sees the plan pending before any of them decides.
+    """
+    real = install.db.get_plan
+    arrived = 0
+    all_in = asyncio.Event()
+
+    async def _get_plan(pid):
+        nonlocal arrived
+        row = await real(pid)
+        if pid == plan_id and not all_in.is_set():
+            arrived += 1
+            if arrived >= count:
+                all_in.set()
+            await asyncio.wait_for(all_in.wait(), timeout=5)
+        return row
+
+    monkeypatch.setattr(install.db, "get_plan", _get_plan)
+
+
+@pytest.mark.parametrize("other", ["approve", "decline", "revise"])
+@pytest.mark.asyncio
+async def test_a_revision_and_a_concurrent_decision_apply_once(install, monkeypatch, other):
+    task_id, plan_id = await install.pending_plan(f"race-pair-{other}")
+    install.holds["proposal"] = asyncio.Event()
+    _read_together(install, monkeypatch, plan_id, 2)
+    async with _client(install.app()) as client:
+        if other == "approve":
+            second = client.post(f"/api/plans/{plan_id}/approve", headers=install.headers("alice"))
+        elif other == "decline":
+            second = client.patch(
+                f"/api/plans/{plan_id}", headers=install.headers("alice"),
+                json={"status": "declined"},
+            )
+        else:
+            second = client.post(
+                f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
+                json={"feedback": "longer"},
+            )
+        first = client.post(
+            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
+            json={"feedback": "shorter"},
+        )
+        # The revision reads last, so it is the first to write after the
+        # reads; the other decision then writes from the same pending read.
+        responses = await asyncio.gather(second, first)
+    codes = [r.status_code for r in responses]
+    assert sorted(codes) == [200, 409], codes
+    revision_turns = [r for r in install.runs if r["session_id"] == "proposal"]
+    implementations = install.impl_runs()
+    # One decision, so at most one kind of work started.
+    assert len(revision_turns) + len(implementations) <= 1
+    install.holds["proposal"].set()
+    if revision_turns:
+        await install.turn_done("proposal")
+    for run in implementations:
+        await install.turn_done(run["session_id"])
+
+
+@pytest.mark.asyncio
+async def test_concurrent_revisions_and_decisions_apply_once(install, monkeypatch):
+    task_id, plan_id = await install.pending_plan("race-mixed")
+    install.holds["proposal"] = asyncio.Event()
+    _read_together(install, monkeypatch, plan_id, 4)
+    async with _client(install.app()) as client:
+        responses = await asyncio.gather(
+            client.post(
+                f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
+                json={"feedback": "shorter"},
+            ),
+            client.post(f"/api/plans/{plan_id}/approve", headers=install.headers("alice")),
+            client.patch(
+                f"/api/plans/{plan_id}", headers=install.headers("alice"),
+                json={"status": "declined"},
+            ),
+            client.post(
+                f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
+                json={"feedback": "longer"},
+            ),
+        )
+    codes = [r.status_code for r in responses]
+    assert sorted(codes) == [200, 409, 409, 409], codes
+    status = (await install.plan_row(plan_id))["status"]
+    winner = codes.index(200)
+    assert status == ("revising", "implementing", "declined", "revising")[winner]
+    revision_turns = [r for r in install.runs if r["session_id"] == "proposal"]
+    assert len(revision_turns) == (1 if winner in (0, 3) else 0)
+    assert len(install.impl_runs()) == (1 if winner == 1 else 0)
+    install.holds["proposal"].set()
+    if revision_turns:
+        await install.turn_done("proposal")
+    if winner == 1:
+        await install.turn_done(responses[1].json()["impl_session_id"])
+
+
+@pytest.mark.asyncio
+async def test_the_planner_replaces_a_revising_plan_and_it_stays_replaced(install):
+    bob = install.actor_id("bob")
+    task_id, plan_id = await install.pending_plan("revise-update")
+    install.agent_calls("proposal", "plan_update", {"plan_id": plan_id, "content": "Ship less"})
+    async with _client(install.app()) as client:
+        revised = await client.post(
+            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
+            json={"feedback": "shorter"},
+        )
+    assert revised.status_code == 200
+    await install.turn_done("proposal")
+
+    assert (await install.plan_row(plan_id))["status"] == "superseded"
+    (new,) = [p for p in await install.db.get_plans_for_task(task_id) if p["parent_plan_id"] == plan_id]
+    assert (new["status"], new["created_by_actor_id"], new["caused_by_actor_id"]) == (
+        "pending", install.system_actor_id, bob,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_task_with_a_revising_plan_takes_no_new_proposal(install):
+    task_id, plan_id = await install.pending_plan("revising-propose")
+    await install.db.update_plan(plan_id, status="revising")
+    result = await plan_propose_handler(
+        _tool_ctx(install, "planner", None), {"task_id": task_id, "content": "Another"},
+    )
+    assert "already has a pending" in result.content[0]["text"]
+    assert [p["id"] for p in await install.db.get_plans_for_task(task_id)] == [plan_id]
+
+
+@pytest.mark.asyncio
+async def test_startup_reopens_plans_left_revising(install):
+    _, revising = await install.pending_plan("left-revising")
+    _, declined = await install.pending_plan("left-declined")
+    await install.db.update_plan(revising, status="revising")
+    await install.db.update_plan(declined, status="declined")
+    assert await install.db.reopen_revising_plans() == 1
+    assert (await install.plan_row(revising))["status"] == "pending"
+    assert (await install.plan_row(declined))["status"] == "declined"
 
 
 @pytest.mark.asyncio

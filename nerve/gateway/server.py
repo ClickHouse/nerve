@@ -373,6 +373,16 @@ async def lifespan(app: FastAPI):
         startup_cleanups.append(("database", close_db))
         logger.info("Database initialized at %s", db_path)
 
+        # A plan is 'revising' only while its revision turn runs, and no turn
+        # runs before startup ends. Reopen plans that a stop left revising,
+        # so a person can decide them again.
+        try:
+            reopened = await db.reopen_revising_plans()
+            if reopened:
+                logger.info("Reopened %d plan(s) left revising by a stop", reopened)
+        except Exception as e:
+            logger.error("Failed to reopen revising plans: %s", e)
+
         # Create the owner account and signing secret if they do not exist.
         # This must run before anything mints or checks a token. A failure
         # stops startup: without a signing secret, authentication cannot work.

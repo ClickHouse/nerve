@@ -84,17 +84,20 @@ class PlanStore:
         self,
         plan_id: str,
         *,
-        expect_status: str,
+        expect_status: str | tuple[str, ...],
         attribution: Attribution | None = None,
         **fields,
     ) -> bool:
         """Write ``fields`` only while the plan's status is ``expect_status``.
 
-        A decision reads the plan, checks its status and then acts, and a
-        second decision can read the same status before the first one
-        writes. This one statement decides: of several decisions made from
-        the same status, only one changes the row, and only that caller may
-        start the work that the decision causes.
+        ``expect_status`` is one status or a tuple of statuses. A decision
+        reads the plan, checks its status and then acts, and a second
+        decision can read the same status before the first one writes. This
+        one statement decides: of several decisions made from the same
+        status, only one changes the row, and only that caller may start the
+        work that the decision causes. Each decision must therefore change
+        the status (a revision request moves the plan to ``revising``), or a
+        second decision from the same status still matches.
 
         ``attribution`` marks a review decision (approve, decline, a
         revision request, a status or feedback change through REST). Its
@@ -110,12 +113,29 @@ class PlanStore:
             fields["reviewed_caused_by_actor_id"] = attribution.caused_by_actor_id
         if not fields:
             raise ValueError("compare_and_update_plan needs at least one field")
+        expected = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
+        if not expected:
+            raise ValueError("compare_and_update_plan needs an expected status")
         sets = ", ".join(f"{k} = ?" for k in fields)
+        placeholders = ", ".join("?" for _ in expected)
         result = await self._write(
-            f"UPDATE plans SET {sets} WHERE id = ? AND status = ?",
-            (*fields.values(), plan_id, expect_status),
+            f"UPDATE plans SET {sets} WHERE id = ? AND status IN ({placeholders})",
+            (*fields.values(), plan_id, *expected),
         )
         return result.rowcount == 1
+
+    async def reopen_revising_plans(self) -> int:
+        """Move every ``revising`` plan back to ``pending``; return the count.
+
+        A plan is ``revising`` while the turn that asks its planner for a new
+        version runs. At startup no such turn runs in this process, so a
+        plan left ``revising`` by a stop would otherwise never be open for a
+        decision again.
+        """
+        result = await self._write(
+            "UPDATE plans SET status = 'pending' WHERE status = 'revising'",
+        )
+        return result.rowcount
 
     async def get_plans_for_task(self, task_id: str) -> list[dict]:
         async with self.db.execute(
@@ -125,8 +145,9 @@ class PlanStore:
             return [dict(row) async for row in cursor]
 
     async def get_pending_plan_task_ids(self) -> list[str]:
-        """Get task IDs that have a pending or implementing plan."""
+        """Get task IDs that have a pending, revising or implementing plan."""
         async with self.db.execute(
-            "SELECT DISTINCT task_id FROM plans WHERE status IN ('pending', 'implementing')"
+            "SELECT DISTINCT task_id FROM plans"
+            " WHERE status IN ('pending', 'revising', 'implementing')"
         ) as cursor:
             return [row[0] async for row in cursor]

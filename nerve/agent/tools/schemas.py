@@ -503,7 +503,7 @@ PLAN_LIST_SCHEMA = {
     "properties": {
         "status": {
             "type": "string",
-            "description": "Filter by status: 'pending', 'approved', 'declined', 'implementing', 'superseded', or empty for pending+implementing",
+            "description": "Filter by status: 'pending', 'revising', 'approved', 'declined', 'implementing', 'superseded', or empty for pending+revising+implementing",
             "default": "",
         },
     },
