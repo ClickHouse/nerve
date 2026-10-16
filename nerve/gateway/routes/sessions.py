@@ -315,7 +315,7 @@ async def _attach_review_loop(
     actor: Actor,
 ) -> dict:
     """Create the review loop for a freshly created observer session. A
-    rejected loop config rolls the session back — no stray empty sessions.
+    rejected loop config rolls the session back, so no empty session stays.
     The rollback is a delete by the person who asked for the session."""
     from nerve.workflows import get_review_loop_service
     from nerve.workflows.review_loop import ReviewLoopError

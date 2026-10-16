@@ -266,7 +266,11 @@ system actor.
 | `external_tool_call` | An external MCP client calls a tool | The tool call |
 
 A change through the web UI, the REST API or the browser WebSocket records the
-person as actor and cause. A field that keeps its value records no event.
+person as actor and cause. A change that has no effect records no event: a
+field that keeps its value, an archive of an archived session (also in a
+cascade), a restore of a session that is not archived. Of two people who make
+the same change at the same time, only the one whose change has an effect is
+recorded.
 Events that record the state of the runtime (`started`, `idle`, `error`, and a
 `stopped` status after a cancel) have no actor and no cause.
 
