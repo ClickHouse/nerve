@@ -268,7 +268,11 @@ async def test_rest_archive_unarchive_star_and_resume_record_the_person(install)
             f"/api/sessions/{root}/unarchive", headers=install.headers("alice"),
         )
         assert response.status_code == 200
-        await client.post(f"/api/sessions/{root}/archive", headers=install.headers("alice"))
+        response = await client.post(
+            f"/api/sessions/{root}/archive", headers=install.headers("alice"),
+        )
+        # The child stays archived: the cascade counts it, and records nothing.
+        assert sorted(response.json()["archived_ids"]) == sorted([root, "child"])
         # Starring an archived session restores it first.
         await client.patch(
             f"/api/sessions/{root}", headers=install.headers("bob"), json={"starred": 1},
@@ -291,8 +295,79 @@ async def test_rest_archive_unarchive_star_and_resume_record_the_person(install)
     ]
     assert await install.events("child", "archived") == [
         ("archived", bob, bob, {"cascade_root": root}),
-        ("archived", alice, alice, {"cascade_root": root}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_archive_or_restore_that_changes_nothing_records_nothing(install):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        stopped = await _new_session(client, install.headers("alice"))
+        await install.db.update_session_fields(stopped, {"status": "stopped"})
+
+        async def post(name: str, action: str, target: str = session_id):
+            response = await client.post(
+                f"/api/sessions/{target}/{action}", headers=install.headers(name),
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        await post("alice", "archive")
+        # Bob's archive finds the session archived already.
+        assert (await post("bob", "archive"))["archived_ids"] == [session_id]
+        await post("bob", "unarchive")
+        await post("alice", "unarchive")
+        # A session that is not archived stays as it is.
+        await post("bob", "unarchive", stopped)
+
+    assert await install.events(session_id, "archived", "unarchived") == [
+        ("archived", alice, alice, None),
+        ("unarchived", bob, bob, None),
+    ]
+    assert await install.events(stopped, "unarchived") == []
+    assert (await install.db.get_session(stopped))["status"] == "stopped"
+
+
+def _hold_status_changes(install: _Install, monkeypatch, parties: int) -> None:
+    """Let a status change run only when ``parties`` callers have reached it.
+
+    Each caller has then read the session before any of them changes it.
+    """
+    barrier = asyncio.Barrier(parties)
+    change = install.db.change_session_status
+
+    async def _after_all_arrive(*args, **kwargs):
+        await asyncio.wait_for(barrier.wait(), timeout=5)
+        return await change(*args, **kwargs)
+
+    monkeypatch.setattr(install.db, "change_session_status", _after_all_arrive)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_archives_and_restores_record_one_change(install, monkeypatch):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        _hold_status_changes(install, monkeypatch, 2)
+
+        async def both(action: str) -> None:
+            responses = await asyncio.gather(*(
+                client.post(
+                    f"/api/sessions/{session_id}/{action}", headers=install.headers(name),
+                )
+                for name in ("alice", "bob")
+            ))
+            assert [r.status_code for r in responses] == [200, 200]
+
+        await both("archive")
+        await both("unarchive")
+
+    events = await install.events(session_id, "archived", "unarchived")
+    assert [event[0] for event in events] == ["archived", "unarchived"]
+    for _, actor, cause, _ in events:
+        assert actor == cause and actor in (alice, bob)
+    assert (await install.db.get_session(session_id))["status"] == "idle"
 
 
 @pytest.mark.asyncio
@@ -596,8 +671,10 @@ async def test_a_codex_sync_archive_is_the_system_actors_own_work(install):
         broadcaster=_SilentBroadcaster(),
     )
     now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
+    # The second archive event is a replay after a restart.
     for sequence, (type_, payload) in enumerate((
         ("thread_in_scope", {"id": "thread-aaa", "cwd": workspace, "source": "exec"}),
+        ("thread_archived", {}),
         ("thread_archived", {}),
     )):
         await ingester.ingest(ThreadEvent(
@@ -663,4 +740,3 @@ async def test_the_actor_directory_names_every_id_in_the_session_columns(install
             referenced = {row[0] async for row in cursor}
         assert referenced, (table, column)
         assert referenced <= directory, (table, column)
-

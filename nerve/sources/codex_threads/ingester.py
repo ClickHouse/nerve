@@ -274,11 +274,12 @@ class CodexIngester:
             # Native Nerve sessions own their own lifecycle.  A rollout being
             # archived must not hide the corresponding live chat.
             if existing.get("source") == "external":
-                await self.db.update_session_fields(session_id, {"status": "archived"})
                 # The sync archives the mirror of a thread that was archived
-                # outside Nerve: Nerve's own change.
-                await self.db.log_session_event(
-                    session_id, "archived", {"reason": "codex_thread_archived"},
+                # outside Nerve: Nerve's own change. A replayed event finds
+                # the session archived and records nothing.
+                await self.db.change_session_status(
+                    session_id, "archived", event_type="archived",
+                    details={"reason": "codex_thread_archived"},
                     attribution=attribution_for(self.db.system_actor),
                 )
                 self.stats["threads_archived"] += 1

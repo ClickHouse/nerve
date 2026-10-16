@@ -767,11 +767,20 @@ class SessionManager:
         self, session_id: str, *,
         attribution: Attribution = UNATTRIBUTED,
         details: dict | None = None,
-    ) -> None:
+    ) -> bool:
         """Archive a session: memorize, disconnect client, update status.
 
-        The ``archived`` event takes ``attribution`` and ``details``.
+        The ``archived`` event takes ``attribution`` and ``details``. A
+        session that is archived already stays as it is and records nothing;
+        of two archives at the same time, only the one that changes the
+        status is recorded. Returns ``True`` when this call archived the
+        session; raises ``ValueError`` if the session does not exist.
         """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session.get("status") == SessionStatus.ARCHIVED.value:
+            return False
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -789,16 +798,18 @@ class SessionManager:
             except Exception:
                 pass
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.ARCHIVED.value,
-            "archived_at": now,
-            "connected_at": None,
-            "sdk_session_id": None,
-        })
-        await self.db.log_session_event(
-            session_id, "archived", details or {}, attribution=attribution,
+        archived = await self.db.change_session_status(
+            session_id, SessionStatus.ARCHIVED.value,
+            fields={
+                "archived_at": now,
+                "connected_at": None,
+                "sdk_session_id": None,
+            },
+            event_type="archived", details=details, attribution=attribution,
         )
-        logger.info("Archived session %s", session_id)
+        if archived:
+            logger.info("Archived session %s", session_id)
+        return archived
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
         """Every session in ``root_id``'s subtree, discovery order (root first).
@@ -838,7 +849,8 @@ class SessionManager:
         Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
 
         Each ``archived`` event takes ``attribution``; the event of a
-        descendant names the root in ``cascade_root``.
+        descendant names the root in ``cascade_root``. A session that is
+        archived already counts as archived and records no event.
         """
         # Compute the whole subtree BEFORE mutating anything.
         order = await self._resolve_descendants(session_id)
@@ -879,24 +891,28 @@ class SessionManager:
 
     async def unarchive_session(
         self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
-    ) -> None:
+    ) -> bool:
         """Restore an archived session to ``idle`` so it's resumable again.
 
-        The ``unarchived`` event takes ``attribution``.
+        The ``unarchived`` event takes ``attribution``. A session that is not
+        archived stays as it is and records nothing. Returns ``True`` when
+        this call restored the session; raises ``ValueError`` if the session
+        does not exist.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.IDLE.value,
-            "archived_at": None,
-        })
-        # Bump updated_at so the unarchived session sorts to the top of the feed.
-        await self.db.touch_session(session_id)
-        await self.db.log_session_event(
-            session_id, "unarchived", {}, attribution=attribution,
+        # touch: updated_at moves, so the session sorts to the top of the feed.
+        restored = await self.db.change_session_status(
+            session_id, SessionStatus.IDLE.value,
+            fields={"archived_at": None},
+            only_from=(SessionStatus.ARCHIVED.value,),
+            touch=True,
+            event_type="unarchived", attribution=attribution,
         )
-        logger.info("Unarchived session %s", session_id)
+        if restored:
+            logger.info("Unarchived session %s", session_id)
+        return restored
 
     async def list_starred_sessions(self) -> list[dict]:
         """Starred, non-archived sessions — always returned, never truncated."""

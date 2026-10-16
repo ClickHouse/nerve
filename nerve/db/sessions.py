@@ -492,6 +492,54 @@ class SessionStore:
                 written.append(event_type)
         return written
 
+    async def change_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        event_type: str,
+        fields: dict | None = None,
+        only_from: tuple[str, ...] | None = None,
+        touch: bool = False,
+        details: dict | None = None,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Change the status of a session and record the change as an event.
+
+        One transaction reads the status, writes ``status`` and ``fields``,
+        and appends the ``event_type`` event with ``details`` and
+        ``attribution``. Nothing is written when the session does not exist,
+        when it has ``status`` already, or when ``only_from`` is set and the
+        status is not in it. So of two people who make the same change at the
+        same time, only the one whose change has an effect is recorded.
+        ``touch`` also sets ``updated_at``. Returns ``True`` when the status
+        changed.
+        """
+        built = self._build_session_fields_update(
+            session_id, {**(fields or {}), "status": status},
+        )
+        assert built is not None  # ``status`` is an allowed field
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or row[0] == status:
+                return False
+            if only_from is not None and row[0] not in only_from:
+                return False
+            await self.db.execute(*built)
+            if touch:
+                await self.db.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), session_id),
+                )
+            await self.db.execute(
+                _SESSION_EVENT_SQL,
+                _session_event_params(session_id, event_type, details, attribution),
+            )
+        return True
+
     async def bind_native_thread(
         self, backend: str, native_thread_id: str, session_id: str,
     ) -> None:
