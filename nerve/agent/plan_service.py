@@ -206,6 +206,8 @@ async def _prepare_revision(
         if session_id.startswith("cron:")
         else session_id
     )
+    # A planner session that does not exist yet is created by the system
+    # actor for the person who asked for the revision.
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,

@@ -58,6 +58,9 @@ from nerve.migrate import bootstrap_identity
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.service import NotificationService
 
+from nerve.inference_principal import CUSTOM_HEADERS_ENV
+from tests.test_inference_principal import _principals, cli  # noqa: F401 - fixture
+from tests.actor_rows import ensure_actor_row
 from tests.test_notifications_actionable import (
     _MINIMAL_HELPER_SRC,
     read_audit_jsonl,
@@ -68,6 +71,7 @@ _PASSWORD_HASH = hash_password("correct-horse-battery-staple")
 
 # External-mode principal (synthetic).
 CAROL_PRINCIPAL = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"
+DAVE_PRINCIPAL = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a"
 
 _NEW_COLUMNS = (
     ("notifications", "answered_by_actor_id"),
@@ -156,8 +160,12 @@ class _Install:
         app.include_router(register_all_routes())
         return app
 
-    def watch(self, monkeypatch) -> None:
-        """Record broadcasts and turns; a fake runtime serves the turns."""
+    def watch(self, monkeypatch, *, fake_runtime: bool = True) -> None:
+        """Record broadcasts and turns; a fake runtime serves the turns.
+
+        With ``fake_runtime=False`` the engine builds its real clients (a test
+        replaces the CLI underneath).
+        """
         real_broadcast = streaming.broadcaster.broadcast
 
         async def _broadcast(channel: str, message: dict) -> None:
@@ -178,6 +186,8 @@ class _Install:
                 done.set()
 
         monkeypatch.setattr(self.engine, "run", _run)
+        if not fake_runtime:
+            return
 
         async def _client(session_id, source, model, **kwargs):
             if session_id not in self.runtimes:
@@ -216,6 +226,14 @@ class _Install:
     async def plan_reviewer(self, plan_id: str) -> tuple:
         plan = await self.plan_row(plan_id)
         return (plan["reviewed_by_actor_id"], plan["reviewed_caused_by_actor_id"])
+
+    async def created_event(self, session_id: str) -> tuple:
+        events = [
+            e for e in await self.db.get_session_events(session_id)
+            if e["event_type"] == "created"
+        ]
+        assert len(events) == 1, events
+        return (events[0]["actor_id"], events[0]["caused_by_actor_id"])
 
     def impl_runs(self) -> list[dict]:
         return [run for run in self.runs if str(run.get("session_id", "")).startswith("impl-")]
@@ -675,6 +693,7 @@ async def test_rest_approval_records_the_approver_on_the_plan_and_the_task(insta
 
     assert await install.plan_reviewer(plan_id) == (bob, bob)
     assert (shown["reviewed_by_actor_id"], shown["reviewed_caused_by_actor_id"]) == (bob, bob)
+    assert await install.created_event(response.json()["impl_session_id"]) == (bob, bob)
     assert await install.task_events(task_id) == [
         ("pending", "system", None, None),
         ("in_progress", "web", bob, bob),
@@ -715,6 +734,8 @@ async def test_rest_revision_and_feedback_record_the_person(install):
 
     assert await install.plan_reviewer(revised) == (bob, bob)
     assert await install.plan_reviewer(commented) == (alice, alice)
+    # The planner session did not exist: the system actor made it for Bob.
+    assert await install.created_event("proposal") == (install.system_actor_id, bob)
 
 
 # --------------------------------------------------------------------------- #
@@ -740,6 +761,7 @@ async def test_a_plan_approved_by_the_tool_in_alices_turn_is_system_for_alice(in
     assert (await install.task_events(task_id))[-1] == (
         "in_progress", "alices-chat", system, alice,
     )
+    assert await install.created_event(impl_session_id) == (system, alice)
     # The implementation turn runs as the system actor for Alice.
     assert install.runs[-1]["actor"] == install.db.system_actor
     assert await install.session_cause_of(impl_session_id) == alice
@@ -1355,3 +1377,94 @@ async def test_external_mode_records_the_principal(external_install):
     ]
     assert await install.session_cause_of(approved.json()["impl_session_id"]) == CAROL_PRINCIPAL
     assert await install.plan_reviewer(plan_id) == (CAROL_PRINCIPAL, CAROL_PRINCIPAL)
+
+
+@pytest_asyncio.fixture
+async def external_cli_install(tmp_path, monkeypatch, wire_identity_store, cli):  # noqa: F811
+    """External mode with the real engine clients over a recording CLI."""
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
+    pin_auth_mode(AUTH_MODE_EXTERNAL)
+    config = NerveConfig.from_dict({
+        "workspace": str(tmp_path / "ws"),
+        "agent": {"backend": "claude"},
+        "codex": {"home_dir": str(tmp_path / "codex-home")},
+        "auth": {"jwt_secret": _SECRET},
+        "notifications": {"channels": ["web"]},
+    })
+    (config.workspace / "memory" / "tasks" / "active").mkdir(parents=True)
+    set_config(config)
+    database = Database(tmp_path / "nerve.db")
+    await database.connect()
+    try:
+        await bootstrap_identity(database, config)
+        wire_identity_store(database)
+        engine = AgentEngine(config, database)
+        init_deps(engine, database)
+        installed = _Install(database, engine, config)
+        installed.watch(monkeypatch, fake_runtime=False)
+        yield installed, cli
+    finally:
+        for session_id in list(engine._idle_watchers):
+            engine._stop_idle_watcher(session_id)
+        await database.close()
+        set_config(NerveConfig())
+
+
+@pytest.mark.asyncio
+async def test_model_requests_name_the_cause_of_each_session(external_cli_install):
+    install, processes = external_cli_install
+    carol = _as(CAROL_PRINCIPAL, "Carol")
+    # Dave started the session that asks; Carol answers, approves and revises.
+    dave = Actor(actor_id=DAVE_PRINCIPAL, kind="human")
+    await ensure_actor_row(install.db, dave)
+    await install.db.create_session("asker", source="web", actor=dave)
+    nid = (await install.notifications.ask_question("asker", title="Go?"))["notification_id"]
+    _, approved_plan = await install.pending_plan("header-approve")
+    _, revised_plan = await install.pending_plan("header-revise")
+    async with _client(install.app()) as client:
+        answered = await client.post(
+            f"/api/notifications/{nid}/answer", headers=carol, json={"answer": "go"},
+        )
+        approved = await client.post(f"/api/plans/{approved_plan}/approve", headers=carol)
+        revised = await client.post(
+            f"/api/plans/{revised_plan}/revise", headers=carol,
+            json={"feedback": "shorter"},
+        )
+    assert [r.status_code for r in (answered, approved, revised)] == [200, 200, 200]
+    impl_session_id = approved.json()["impl_session_id"]
+    for session_id in ("asker", impl_session_id, "proposal"):
+        await install.turn_done(session_id)
+
+    by_session = {process.spec.session_id: process for process in processes}
+    expected = {
+        # The relayed answer runs in Dave's session, for Dave.
+        "asker": DAVE_PRINCIPAL,
+        # Carol's approval and revision created these sessions for her.
+        impl_session_id: CAROL_PRINCIPAL,
+        "proposal": CAROL_PRINCIPAL,
+    }
+    for session_id, principal in expected.items():
+        process = by_session[session_id]
+        assert process.spec.inference_principal == principal, session_id
+        assert _principals(process.env) == [principal], session_id
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_channel_answer_names_no_principal_to_the_model(
+    external_cli_install,
+):
+    install, processes = external_cli_install
+    await install.db.create_session("asker-tg", source="web", actor=None)
+    nid = (await install.notifications.ask_question("asker-tg", title="Go?"))["notification_id"]
+    await install.db.record_notification_delivery(
+        nid, "telegram", target="1001", message_id="7",
+    )
+    assert await install.notifications.answer_delivered_notification(
+        nid, "go", channel="telegram", target="1001", actor="4242",
+    )
+    await install.turn_done("asker-tg")
+
+    (process,) = [p for p in processes if p.spec.session_id == "asker-tg"]
+    assert process.spec.inference_principal is None
+    assert _principals(process.env) == []
