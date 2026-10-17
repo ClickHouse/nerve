@@ -545,7 +545,12 @@ export interface TaskEvent {
   /** null on the row recording the task's creation. */
   from_status: string | null;
   to_status: string;
+  /** Origin of the change: `web`, a session id, `system` or `backfill`. */
   actor: string;
+  /** Who made the change. `null` on rows written before it was recorded. */
+  actor_id: string | null;
+  /** On whose behalf the change was made. `null` when unknown. */
+  caused_by_actor_id: string | null;
   created_at: string;
 }
 
@@ -660,7 +665,14 @@ export interface WorkflowRun {
   warned_at: string | null;
   session_id: string | null;
   journal_dir: string | null;
+  /** Origin text: `api`, `session:<id>`, `review-loop:<id>`, `cron:<job>`. */
   created_by: string;
+  /** Who created the run, and on whose behalf; null on older runs. */
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  /** Who killed the run, and on whose behalf; null when not known. */
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   error: string | null;
   result: string | null;
   created_at: string;
@@ -713,9 +725,38 @@ export interface ReviewLoop {
   spent_usd: number;
   iteration: number;
   current_run_id: string | null;
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   created_at: string;
   updated_at: string;
   ended_at: string | null;
+}
+
+/**
+ * Result of `POST /api/review-loops/{id}/decision`. `applied` is true when
+ * the decision changed the loop; `ok` is false when the leg that it resumes
+ * did not start.
+ */
+export interface ReviewLoopDecisionResult {
+  ok: boolean;
+  applied: boolean;
+  message: string;
+}
+
+/** One decision on a parked loop, oldest first in the loop detail. */
+export interface ReviewLoopDecision {
+  id: number;
+  loop_id: string;
+  decision: string;
+  applied: boolean;
+  message: string;
+  /** Origin text: `api` or `approval-card`. */
+  decided_by: string;
+  actor_id: string | null;
+  caused_by_actor_id: string | null;
+  created_at: string;
 }
 
 export interface ReviewLoopAttempt {
@@ -1170,13 +1211,15 @@ export const api = {
   listReviewLoops: (status?: string) =>
     request<{ loops: ReviewLoop[] }>(`/review-loops${status ? `?status=${status}` : ''}`),
   getReviewLoop: (loopId: string) =>
-    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[] }>(`/review-loops/${loopId}`),
+    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[]; decisions: ReviewLoopDecision[] }>(
+      `/review-loops/${loopId}`,
+    ),
   killReviewLoop: (loopId: string, reason = '') =>
     request<ReviewLoop>(`/review-loops/${loopId}/kill`, {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
   decideReviewLoop: (loopId: string, decision: string) =>
-    request<{ ok: boolean; message: string }>(`/review-loops/${loopId}/decision`, {
+    request<ReviewLoopDecisionResult>(`/review-loops/${loopId}/decision`, {
       method: 'POST', body: JSON.stringify({ decision }),
     }),
   getReviewLoopState: (loopId: string) =>

@@ -122,7 +122,7 @@ def _iso(delta_hours: float) -> str:
 
 def _snooze_dispatcher(snooze_until: str):
     """A dispatcher that always answers "snooze until <ts>"."""
-    def dispatch(notification, target_id, decision, config):
+    def dispatch(notification, target_id, decision, config, *, actor):
         return _handlers.DispatchResult(
             ok=True,
             audit_event={
@@ -739,7 +739,7 @@ class TestConcurrentPresses:
     ):
         decisions: list[str] = []
 
-        async def dispatch(notification, target_id, decision, config):
+        async def dispatch(notification, target_id, decision, config, *, actor):
             decisions.append(decision)
             # Hold the dispatch open, which is where the second press
             # arrives: a real one runs a shell script.
@@ -780,7 +780,7 @@ class TestConcurrentPresses:
     ):
         # A snooze releases the claim, so the claim refuses a press for one
         # round only, not for the life of the card.
-        def dispatch(notification, target_id, decision, config):
+        def dispatch(notification, target_id, decision, config, *, actor):
             return _handlers.DispatchResult(
                 ok=True,
                 audit_event={
@@ -902,7 +902,7 @@ class TestAnswerAttribution:
         audit_workspace,
     ):
         await db.create_session("s1", actor=None)
-        _handlers.register("attribution-test", lambda *a: _handlers.DispatchResult(
+        _handlers.register("attribution-test", lambda *a, **k: _handlers.DispatchResult(
             ok=True,
             audit_event={
                 "event": "approval-acted",

@@ -10,15 +10,22 @@ from pydantic import BaseModel
 from nerve.agent.streaming import emit_task_event
 from nerve.config import ensure_path_not_tracked_config, get_config
 from nerve.db.task_statuses import STATUS_NAME_RE, TERMINAL_STATUS, normalize_color
+from nerve.db.tasks import KEEP
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import (
     build_route_tool_context,
     get_deps,
     get_tool_registry,
 )
+from nerve.identity import Actor, attribution_for
 from nerve.tasks.files import write_task_file
+from nerve.tasks.locks import task_mutation
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+# ``task_events.actor`` for a change made through these routes: the origin of
+# the change. The person who made it is in ``task_events.actor_id``.
+_ROUTE_ORIGIN = "web"
 
 
 class TaskCreateRequest(BaseModel):
@@ -203,12 +210,12 @@ async def list_task_tags(include_done: bool = False):
 
 
 @router.post("/api/tasks")
-async def create_task(req: TaskCreateRequest):
+async def create_task(req: TaskCreateRequest, actor: Actor = Depends(require_auth)):
     # Route into the unified handler surface via the live registry — no
     # behavior duplication between the REST and MCP paths.
     result = await get_tool_registry().invoke(
         "task_create",
-        build_route_tool_context(),
+        build_route_tool_context(_ROUTE_ORIGIN, actor=actor),
         {
             "title": req.title,
             "content": req.content,
@@ -250,8 +257,17 @@ async def create_task(req: TaskCreateRequest):
 
 
 @router.post("/api/tasks/{task_id}/move")
-async def move_task(task_id: str, req: TaskMoveRequest):
+async def move_task(
+    task_id: str, req: TaskMoveRequest, actor: Actor = Depends(require_auth),
+):
     """Reorder a task within a lane, or move it to another one."""
+    # One lock for the status change and the rank: a change that lands
+    # between them could move the file while the rank write keeps a status.
+    async with task_mutation(task_id):
+        return await _move_task(task_id, req, actor)
+
+
+async def _move_task(task_id: str, req: TaskMoveRequest, actor: Actor) -> dict:
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:
@@ -271,7 +287,7 @@ async def move_task(task_id: str, req: TaskMoveRequest):
             # "web" rather than the default "system" sentinel: this string
             # lands in task_events.actor, and the point of that column is
             # telling a person dragging a card from the agent moving it.
-            build_route_tool_context("web"),
+            build_route_tool_context(_ROUTE_ORIGIN, actor=actor),
             {"task_id": task_id, "status": target},
         )
         if result.is_error:
@@ -279,7 +295,7 @@ async def move_task(task_id: str, req: TaskMoveRequest):
 
     moved = await deps.db.move_task(
         task_id, status=target, before_id=req.before_id, after_id=req.after_id,
-        actor="web",
+        actor=_ROUTE_ORIGIN, attribution=attribution_for(actor),
     )
     if not moved:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -312,7 +328,17 @@ async def get_task(task_id: str):
 
 
 @router.patch("/api/tasks/{task_id}")
-async def update_task(task_id: str, req: TaskUpdateRequest):
+async def update_task(
+    task_id: str, req: TaskUpdateRequest, actor: Actor = Depends(require_auth),
+):
+    # One lock for the content save and the field and status changes, from
+    # the first read of the row: the file this request writes is the file
+    # that the row names when the request ends.
+    async with task_mutation(task_id):
+        return await _update_task(task_id, req, actor)
+
+
+async def _update_task(task_id: str, req: TaskUpdateRequest, actor: Actor) -> dict:
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if not task:
@@ -346,12 +372,18 @@ async def update_task(task_id: str, req: TaskUpdateRequest):
                 edits["deadline"] = fields["deadline"]
             if fields.get("tags"):
                 edits["tags"] = tags_to_string(parse_tags_string(fields["tags"]))
+            # KEEP, not ``req.status`` or the status read above: a status
+            # change goes through task_update below, which moves the file
+            # into or out of done/ and records the transition once, for this
+            # person. A move by somebody else after the read is kept.
             await deps.db.upsert_task(
                 task_id=task_id,
-                file_path=task["file_path"],
+                file_path=KEEP,
                 title=new_title,
-                status=req.status or task["status"],
+                status=KEEP,
                 content=req.content,
+                actor=_ROUTE_ORIGIN,
+                attribution=attribution_for(actor),
                 **edits,
             )
 
@@ -377,7 +409,7 @@ async def update_task(task_id: str, req: TaskUpdateRequest):
 
     if len(payload) > 1:
         result = await get_tool_registry().invoke(
-            "task_update", build_route_tool_context("web"), payload,
+            "task_update", build_route_tool_context(_ROUTE_ORIGIN, actor=actor), payload,
         )
         # Previously swallowed: an unknown status returned {"updated": true}
         # while nothing had changed. Surface the handler's own message.
@@ -402,7 +434,9 @@ async def list_task_statuses():
 
 
 @router.post("/api/task-statuses")
-async def create_task_status(req: TaskStatusCreateRequest):
+async def create_task_status(
+    req: TaskStatusCreateRequest, actor: Actor = Depends(require_auth),
+):
     deps = get_deps()
     name = (req.name or "").strip().lower()
     if not STATUS_NAME_RE.match(name):
@@ -419,6 +453,7 @@ async def create_task_status(req: TaskStatusCreateRequest):
     created = await deps.db.create_task_status(
         name=name, label=label, color=color,
         description=(req.description or "").strip(),
+        attribution=attribution_for(actor),
     )
     return created
 
@@ -430,17 +465,24 @@ class TaskStatusReorderRequest(BaseModel):
 
 
 @router.post("/api/task-statuses/reorder")
-async def reorder_task_statuses(req: TaskStatusReorderRequest):
+async def reorder_task_statuses(
+    req: TaskStatusReorderRequest, actor: Actor = Depends(require_auth),
+):
     """Set board column order in one write.
 
     Declared above /{name} so "reorder" isn't captured as a status name.
     """
     deps = get_deps()
-    return {"statuses": await deps.db.reorder_task_statuses(req.names)}
+    statuses = await deps.db.reorder_task_statuses(
+        req.names, attribution=attribution_for(actor),
+    )
+    return {"statuses": statuses}
 
 
 @router.patch("/api/task-statuses/{name}")
-async def update_task_status(name: str, req: TaskStatusUpdateRequest):
+async def update_task_status(
+    name: str, req: TaskStatusUpdateRequest, actor: Actor = Depends(require_auth),
+):
     deps = get_deps()
     existing = await deps.db.get_task_status_def(name)
     if not existing:
@@ -452,12 +494,13 @@ async def update_task_status(name: str, req: TaskStatusUpdateRequest):
         color=req.color if req.color is not None else None,
         description=req.description if req.description is not None else None,
         sort_order=req.sort_order,
+        attribution=attribution_for(actor),
     )
     return await deps.db.get_task_status_def(name)
 
 
 @router.delete("/api/task-statuses/{name}")
-async def delete_task_status(name: str):
+async def delete_task_status(name: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     existing = await deps.db.get_task_status_def(name)
     if not existing:
@@ -474,5 +517,5 @@ async def delete_task_status(name: str):
             detail=f"{in_use} task(s) use the '{name}' status. "
                    "Reassign them before deleting it.",
         )
-    await deps.db.delete_task_status_def(name)
+    await deps.db.delete_task_status_def(name, attribution=attribution_for(actor))
     return {"name": name, "deleted": True}

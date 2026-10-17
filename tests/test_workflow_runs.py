@@ -34,6 +34,7 @@ from nerve.agent.tools.handlers.workflow_runs import (
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig
 from nerve.db.usage import estimate_turn_cost
+from nerve.identity import Actor, attribution_for
 from nerve.workflows.service import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
@@ -41,7 +42,13 @@ from nerve.workflows.service import (
     WorkflowRunService,
 )
 
-from tests.actor_rows import ensure_system_principal
+from tests.actor_rows import ensure_actor_row, ensure_system_principal
+
+# The person who started the seeded runs (synthetic).
+_RUN_STARTER = Actor(
+    actor_id="00000000-0000-4000-8000-0000000a11ce", kind="human",
+    display_name="Alice",
+)
 
 
 @pytest_asyncio.fixture
@@ -153,11 +160,23 @@ async def test_background_run_result_taken_from_final_auto_turn(db, engine, serv
 
 
 async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUDE) -> str:
-    """Insert a running run wired to a real session row; returns session id."""
+    """Insert a running run wired to a real session row; returns session id.
+
+    A person started the run, so the run's cause is that person, and the
+    session is created as ``_execute`` creates it: by the system actor, with
+    the run's cause.
+    """
     session_id = f"workflow:{run_id}"
-    await db.create_workflow_run(run_id, engine_kind, {"prompt": "p"}, budget)
+    await ensure_actor_row(db, _RUN_STARTER)
+    await db.create_workflow_run(
+        run_id, engine_kind, {"prompt": "p"}, budget,
+        attribution=attribution_for(_RUN_STARTER),
+    )
     await db.transition_workflow_run(run_id, "running", expect=("pending",))
-    await db.create_session(session_id, source="workflow", actor=None)
+    await db.create_session(
+        session_id, source="workflow", actor=db.system_actor,
+        cause=_RUN_STARTER.actor_id,
+    )
     await db.update_workflow_run(run_id, {"session_id": session_id})
     return session_id
 
@@ -575,7 +594,11 @@ class TestKillRun:
         assert "user request" in out["error"]
 
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            # Nerve's stop, for the session's cause: the run's starter.
+            session_id,
+            attribution=attribution_for(db.system_actor, _RUN_STARTER.actor_id),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )
@@ -619,7 +642,11 @@ class TestBudgetEnforcement:
         )
         # Enforcement is scoped to the run's own session.
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            # Nerve's stop, for the session's cause: the run's starter.
+            session_id,
+            attribution=attribution_for(db.system_actor, _RUN_STARTER.actor_id),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )

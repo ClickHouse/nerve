@@ -4,6 +4,7 @@ import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/
 import { Badge, type BadgeTone, Button, IconButton, TextArea } from '../components/ui';
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
+import { ActorAttribution } from '../components/Chat/ActorLabel';
 
 /** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -102,7 +103,30 @@ export function PlanDetailPage() {
         </div>
         <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
           <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
+          {plan.created_by_actor_id && (
+            <span data-testid="plan-author" className="inline-flex items-center gap-1 min-w-0">
+              Proposed by{' '}
+              <ActorAttribution
+                actorId={plan.created_by_actor_id}
+                causeId={plan.caused_by_actor_id}
+                verb="Proposed by"
+              />
+            </span>
+          )}
           {plan.model && <span>{plan.model}</span>}
+          {plan.reviewed_by_actor_id && (
+            <span data-testid="plan-reviewer" className="inline-flex items-center gap-1 min-w-0">
+              Reviewed by{' '}
+              <ActorAttribution
+                actorId={plan.reviewed_by_actor_id}
+                causeId={plan.reviewed_caused_by_actor_id}
+                verb="Reviewed by"
+              />
+              {plan.reviewed_at && (
+                <span>{plan.reviewed_at.slice(0, 16).replace('T', ' ')}</span>
+              )}
+            </span>
+          )}
           <Button variant="link" size="xs" onClick={() => navigate(`/tasks/${plan.task_id}`)}>
             <ExternalLink size={11} /> View task
           </Button>

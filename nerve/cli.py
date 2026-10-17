@@ -1430,6 +1430,25 @@ def _config_source_label(source: str) -> str:
     }.get(source, source)
 
 
+def _probe_principal_id() -> str | None:
+    """The principal that the doctor's model probe names: the system actor.
+
+    External mode only (``NERVE_AUTH_MODE`` in this shell). The doctor opens
+    no server database, so it reads the stored system actor read-only.
+    ``None`` in local mode, with an invalid mode, or without a database.
+    """
+    from nerve.config import ConfigError
+    from nerve.db.accounts import read_system_actor_id
+    from nerve.gateway.auth import is_external_mode
+
+    try:
+        if not is_external_mode():
+            return None
+    except ConfigError:
+        return None
+    return read_system_actor_id(paths.db_path())
+
+
 def _check_api_connectivity(config) -> tuple[bool, str]:
     """Make a 1-token API call through the configured provider.
 
@@ -1438,7 +1457,9 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
     """
     model = config.agent.title_model
     try:
-        client = config.create_anthropic_client(timeout=15.0)
+        client = config.create_anthropic_client(
+            timeout=15.0, principal_id=_probe_principal_id(),
+        )
         client.messages.create(
             model=model,
             max_tokens=1,

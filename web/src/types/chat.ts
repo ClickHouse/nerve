@@ -140,6 +140,10 @@ export interface Session {
   // most one per session); `has_background_tasks` covers run_in_background
   // Bash/Agent work still live inside the session's CLI.
   pending_wakeup_at?: string | null;
+  // Who scheduled the pending wake-up (a person, or the system actor when
+  // the agent did) and on whose behalf it runs. Null when not recorded.
+  pending_wakeup_created_by_actor_id?: string | null;
+  pending_wakeup_caused_by_actor_id?: string | null;
   has_background_tasks?: boolean;
   starred?: boolean;
   // Live review-loop state for this observer session (rehydrated from

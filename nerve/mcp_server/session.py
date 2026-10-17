@@ -152,6 +152,8 @@ class SatelliteSessionResolver:
                     metadata=metadata,
                     status="active",
                     actor=self.db.system_actor,
+                    # The agent behind it runs outside this instance.
+                    cause=None,
                 )
                 logger.info(
                     "Created Codex satellite session %s via MCP (mcp=%s)",
@@ -183,6 +185,8 @@ class SatelliteSessionResolver:
                 metadata=metadata,
                 status="active",
                 actor=self.db.system_actor,
+                # The agent behind it runs outside this instance.
+                cause=None,
             )
             logger.info(
                 "Created satellite session %s (client=%s, mcp=%s)",

@@ -38,7 +38,12 @@ from nerve.gateway.auth import (
     is_external_mode,
     pin_auth_mode,
 )
-from nerve.identity import Actor, ActorResolutionError, actor_for_account
+from nerve.identity import (
+    Actor,
+    ActorResolutionError,
+    actor_for_account,
+    attribution_for,
+)
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
@@ -1218,7 +1223,10 @@ def create_app() -> FastAPI:
                 elif msg_type == "stop":
                     # User wants to stop the running agent
                     session_id = data.get("session_id", active_session)
-                    stopped = await _engine.stop_session(session_id)
+                    stopped = await _engine.stop_session(
+                        session_id,
+                        attribution=attribution_for(connection.actor),
+                    )
                     if not stopped:
                         await websocket.send_json({
                             "type": "error",
@@ -1275,7 +1283,10 @@ def create_app() -> FastAPI:
                 elif msg_type == "resume":
                     session_id = data.get("session_id", active_session)
                     try:
-                        await _engine.resume_session(session_id)
+                        await _engine.resume_session(
+                            session_id,
+                            attribution=attribution_for(connection.actor),
+                        )
                         await websocket.send_json({
                             "type": "session_resumed",
                             "session_id": session_id,

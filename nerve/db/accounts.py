@@ -700,6 +700,28 @@ def read_instance_secret(db_path: Path, name: str) -> str:
         conn.close()
 
 
+def read_system_actor_id(db_path: Path) -> str | None:
+    """Read the system actor ID from another process, or return ``None``.
+
+    ``None`` when the database does not exist, cannot be read, or does not
+    hold exactly one system actor.
+    """
+    conn = _read_only(db_path)
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT id FROM actor_refs WHERE kind = 'system'"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
+        return None
+    return rows[0][0]
+
+
 def read_setup_required(db_path: Path, *, configured_password: bool) -> bool:
     """Read from another process whether setup is required; ``False`` if unknown.
 

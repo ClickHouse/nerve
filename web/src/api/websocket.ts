@@ -25,9 +25,12 @@ export type WSMessage =
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
   | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string; redelivered?: boolean; redelivery_count?: number }
-  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
+  // `actor_id` is the person who answered; null for a chat-channel answer.
+  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
-  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string }
+  // The answer becomes a user message written by the person who answered;
+  // `actor_id` is null for a chat-channel answer.
+  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string; actor_id?: string | null }
   // `actor_id` is the sender, so a second tab can label the bubble the moment
   // it arrives rather than waiting for the stored row to be readable. Null
   // whenever the ingress recorded nobody, which renders exactly as before.
@@ -36,7 +39,7 @@ export type WSMessage =
   // a turn can end with the session still parked on scheduled or background
   // work, and the sidebar redraws that row straight from the event (it skips
   // the list refetch for the active session).
-  | { type: 'session_running'; session_id: string; is_running: boolean; pending_wakeup_at?: string | null; has_background_tasks?: boolean }
+  | { type: 'session_running'; session_id: string; is_running: boolean; pending_wakeup_at?: string | null; pending_wakeup_created_by_actor_id?: string | null; pending_wakeup_caused_by_actor_id?: string | null; has_background_tasks?: boolean }
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }

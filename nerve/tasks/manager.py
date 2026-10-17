@@ -9,7 +9,9 @@ from pathlib import Path
 
 from nerve.config import ensure_path_not_tracked_config
 from nerve.db import Database
+from nerve.identity import Attribution, attribution_for
 from nerve.tasks.files import move_task_file
+from nerve.tasks.locks import task_mutation
 from nerve.tasks.models import (
     Task,
     TaskStatus,
@@ -32,6 +34,10 @@ class TaskManager:
         self.done_dir = workspace / "memory" / "tasks" / "done"
         self.active_dir.mkdir(parents=True, exist_ok=True)
         self.done_dir.mkdir(parents=True, exist_ok=True)
+
+    def _own_attribution(self) -> Attribution:
+        """This manager's writes are Nerve's own work: system for system."""
+        return attribution_for(self.db.system_actor)
 
     async def reindex(self) -> int:
         """Scan task files and rebuild the SQLite + FTS index.
@@ -94,6 +100,7 @@ class TaskManager:
                         title=title,
                         status=status,
                         content=content,
+                        attribution=self._own_attribution(),
                         **edits,
                     )
                     count += 1
@@ -123,6 +130,11 @@ class TaskManager:
         return task
 
     async def mark_done(self, task_id: str, expect_revision: int | None = None) -> bool:
+        """Mark a task as done and move its file, under the task's lock."""
+        async with task_mutation(task_id):
+            return await self._mark_done(task_id, expect_revision)
+
+    async def _mark_done(self, task_id: str, expect_revision: int | None) -> bool:
         """Mark a task as done and move its file.
 
         Returns ``False`` when the task is missing, or when ``expect_revision``
@@ -155,10 +167,12 @@ class TaskManager:
                 await asyncio.to_thread(move)
                 return await self.db.transition_task(
                     task_id, "done", file_path=rel_path, content=content,
+                    attribution=self._own_attribution(),
                 )
             if not await self.db.transition_task(
                 task_id, "done", expect_revision=expect_revision,
                 file_path=rel_path, content=content,
+                attribution=self._own_attribution(),
             ):
                 return False
             await asyncio.to_thread(move)
@@ -166,6 +180,7 @@ class TaskManager:
 
         return await self.db.transition_task(
             task_id, "done", expect_revision=expect_revision,
+            attribution=self._own_attribution(),
         )
 
     async def get_overdue_tasks(self) -> list[Task]:

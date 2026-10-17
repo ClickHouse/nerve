@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,10 @@ from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor, attribution_for
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
@@ -63,6 +68,7 @@ async def list_silences(
 @router.post("/api/notifications/silences")
 async def create_silence(
     req: SilenceCreateRequest,
+    actor: Actor = Depends(require_auth),
 ):
     pattern = (req.pattern or "").strip()
     if not pattern:
@@ -86,6 +92,7 @@ async def create_silence(
         reason=(req.reason or "").strip(),
         created_by="web",
         expires_at=expires_at,
+        attribution=attribution_for(actor),
     )
     if deps.notification_service:
         deps.notification_service.invalidate_silence_cache()
@@ -93,11 +100,13 @@ async def create_silence(
 
 
 @router.delete("/api/notifications/silences/{silence_id}")
-async def delete_silence(silence_id: str):
+async def delete_silence(silence_id: str, actor: Actor = Depends(require_auth)):
     deps = get_deps()
     ok = await deps.db.delete_silence(silence_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Silence not found")
+    # The row is deleted, so no column can hold who removed it.
+    logger.info("Silence %s removed by actor %s", silence_id, actor.actor_id)
     if deps.notification_service:
         deps.notification_service.invalidate_silence_cache()
     return {"silence_id": silence_id, "deleted": True}
@@ -116,6 +125,7 @@ async def get_notification(notification_id: str):
 async def answer_notification(
     notification_id: str,
     req: NotificationAnswerRequest,
+    actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     if not deps.notification_service:
@@ -124,6 +134,7 @@ async def answer_notification(
         notification_id=notification_id,
         answer=req.answer,
         answered_by="web",
+        answerer=actor,
     )
     if not success:
         raise HTTPException(status_code=409, detail="Notification already answered or not found")
@@ -133,18 +144,23 @@ async def answer_notification(
 @router.post("/api/notifications/{notification_id}/dismiss")
 async def dismiss_notification(
     notification_id: str,
+    actor: Actor = Depends(require_auth),
 ):
     deps = get_deps()
     if not deps.notification_service:
         raise HTTPException(status_code=503, detail="Notification service not available")
-    success = await deps.notification_service.handle_dismiss(notification_id)
+    success = await deps.notification_service.handle_dismiss(
+        notification_id, actor=actor,
+    )
     if not success:
         raise HTTPException(status_code=409, detail="Notification not pending")
     return {"notification_id": notification_id, "dismissed": True}
 
 
 @router.post("/api/notifications/dismiss-all")
-async def dismiss_all_notifications():
+async def dismiss_all_notifications(actor: Actor = Depends(require_auth)):
     deps = get_deps()
-    count = await deps.db.dismiss_all_notifications()
+    count = await deps.db.dismiss_all_notifications(
+        attribution=attribution_for(actor),
+    )
     return {"dismissed": count}

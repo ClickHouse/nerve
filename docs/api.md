@@ -713,9 +713,11 @@ writes no configuration.
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
-principal. Sessions and messages store an actor id, never a name, so this is
-where a name is looked up at render time — a rename changes every label and
-moves no stored row.
+principal. Sessions, messages, task events, notifications, silences, plans,
+workflow runs, review loops, review-loop decisions, wakeups and cron run logs
+store an actor id, never a name, so this is where a name is looked up at
+render time. A rename changes
+every label and moves no stored row.
 
 ```json
 { "id": "…", "kind": "human", "display_name": "Alice", "username": "alice" }
@@ -781,12 +783,24 @@ Create a new session.
 
 ```json
 Request:  { "title": "My Session" }
-Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…" }
+Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…", "caused_by_actor_id": "…" }
 ```
 
 `created_by_actor_id` is an actor id for [`GET /api/actors`](#actors), not an
 account id. It is `null` for legacy rows and sessions caused by an unidentified
 external person. Every session payload carries the field.
+
+Session payloads also carry `caused_by_actor_id`: the session's cause, on
+whose behalf all agent work in the session runs. Nerve sets it when it creates
+the session and never changes it (an actor id, or `null` when unknown). See
+[Attribution](accounts.md#attribution).
+
+Session list rows carry `pending_wakeup_at`, the fire time of the session's
+pending wakeup or deferred message (`null` when there is none), with
+`pending_wakeup_created_by_actor_id` (who scheduled it: a person, or the
+system actor when the agent did) and `pending_wakeup_caused_by_actor_id` (on
+whose behalf it was scheduled; the turn that it fires runs for the session's
+cause). The `session_running` WebSocket event carries the same three fields.
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -807,6 +821,9 @@ provenance and is never identity. See
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
+The delete removes the session's events. Nerve records the delete in
+`session_deletions` with the signed-in person as actor and cause (see
+[Session changes](accounts.md#session-changes)).
 
 #### `GET /api/sessions/{id}/status`
 Session status with lifecycle info.
@@ -862,12 +879,19 @@ Get session lifecycle event log (newest first).
 ```json
 Response: {
   "events": [
-    { "id": 3, "session_id": "abc", "event_type": "idle", "details": { "resumable": true }, "created_at": "..." },
-    { "id": 2, "session_id": "abc", "event_type": "started", "details": { "sdk_session_id": "..." }, "created_at": "..." },
-    { "id": 1, "session_id": "abc", "event_type": "created", "details": { "source": "web" }, "created_at": "..." }
+    { "id": 4, "session_id": "abc", "event_type": "title_changed", "details": { "title": "Launch plan", "previous": "abc" }, "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." },
+    { "id": 3, "session_id": "abc", "event_type": "idle", "details": { "resumable": true }, "actor_id": null, "caused_by_actor_id": null, "created_at": "..." },
+    { "id": 2, "session_id": "abc", "event_type": "started", "details": { "sdk_session_id": "..." }, "actor_id": null, "caused_by_actor_id": null, "created_at": "..." },
+    { "id": 1, "session_id": "abc", "event_type": "created", "details": { "source": "web" }, "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
   ]
 }
 ```
+
+`actor_id` is who made the change and `caused_by_actor_id` is on whose behalf
+(actor ids for [`GET /api/actors`](#actors)). Both are `null` for an event that
+records the state of the runtime, for a change with no known person, and for
+legacy rows. The event types and their details are in
+[Session changes](accounts.md#session-changes).
 
 ### Modified Files
 
@@ -996,10 +1020,16 @@ A task's status history, oldest first.
 
 ```json
 Response: { "events": [
-  { "id": 1, "task_id": "...", "from_status": null, "to_status": "pending", "actor": "system", "created_at": "..." },
-  { "id": 2, "task_id": "...", "from_status": "pending", "to_status": "in_progress", "actor": "impl-abc123", "created_at": "..." }
+  { "id": 1, "task_id": "...", "from_status": null, "to_status": "pending", "actor": "web", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." },
+  { "id": 2, "task_id": "...", "from_status": "pending", "to_status": "in_progress", "actor": "impl-abc123", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
 ] }
 ```
+
+`actor` is the origin of the change (`web`, a session id, `system`,
+`backfill`). `actor_id` is who made the change and `caused_by_actor_id` on
+whose behalf, both actor ids for [`GET /api/actors`](#actors) and `null` on
+rows from before they were recorded. See
+[Status History](tasks.md#status-history).
 
 #### `POST /api/tasks/{id}/move`
 Place a task in a lane — the board's drag-and-drop write. Send *intent*
@@ -1032,15 +1062,26 @@ Response: {
     "spec": { "prompt": "Audit samples/batch-07/ for ..." },
     "status": "running", "budget_usd": 12.0, "spent_usd": 3.42, "warned_at": null,
     "session_id": "workflow:wfr-a1b2c3d4", "journal_dir": "/home/alice/.nerve/workflow-runs/wfr-a1b2c3d4",
-    "created_by": "session:main", "error": null, "result": null,
+    "created_by": "session:main",
+    "created_by_actor_id": "…", "caused_by_actor_id": "…",
+    "killed_by_actor_id": null, "killed_caused_by_actor_id": null,
+    "error": null, "result": null,
     "created_at": "...", "started_at": "...", "finished_at": null, "updated_at": "..."
   }],
   "total": 1
 }
 ```
 
+`created_by` is the origin text. `created_by_actor_id` and
+`caused_by_actor_id` name who created the run and on whose behalf; the run's
+session is created with that cause. `killed_by_actor_id` and
+`killed_caused_by_actor_id` name who killed it. All four are `null` on runs
+from before attribution, and the kill pair is `null` when the kill names no
+person (for example a `/stop` from a chat channel). See
+[accounts.md](accounts.md#attribution).
+
 #### `POST /api/workflow-runs`
-Start a run. `engine` is `claude-workflow` or `codex-ultracode`; `budget_usd` is required unless `workflows.allow_unbudgeted` is set. Optional: `title`, `model`, `effort`, `cwd` (must be an existing directory). Returns the created run immediately (`pending`, or `running` once dispatched); execution happens in the background.
+Start a run. `engine` is `claude-workflow` or `codex-ultracode`; `budget_usd` is required unless `workflows.allow_unbudgeted` is set. Optional: `title`, `model`, `effort`, `cwd` (must be an existing directory). Returns the created run immediately (`pending`, or `running` once dispatched); execution happens in the background. The signed-in person is recorded as the run's actor and cause.
 
 ```json
 Request:  { "engine": "claude-workflow", "prompt": "Audit samples/batch-07/ for ...", "budget_usd": 12, "title": "Sample batch audit" }
@@ -1051,7 +1092,7 @@ Response: { "id": "wfr-a1b2c3d4", "status": "pending", ... }
 Run detail (same shape as the list items).
 
 #### `POST /api/workflow-runs/{id}/kill`
-Terminate a run. Scoped strictly to the run's own session/subprocess; idempotent on already-terminal runs.
+Terminate a run. Scoped strictly to the run's own session/subprocess; idempotent on already-terminal runs. The kill that ends the run records the signed-in person in `killed_by_actor_id` and `killed_caused_by_actor_id`.
 
 ```json
 Request:  { "reason": "superseded" }
@@ -1287,13 +1328,31 @@ combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
 runners and missed runs).
 
+Each log row also carries `actor_id` (who started the run) and
+`caused_by_actor_id` (on whose behalf). Both are the system actor for a
+scheduled run, and the person for a run that a person started with
+`POST /api/cron/jobs/{job_id}/trigger`. Both are `null` on older rows. See
+[Attribution](accounts.md#attribution).
+
 ```json
 Response: {
-  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", ... } ],
+  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "actor_id": "…", "caused_by_actor_id": "…", ... } ],
   "total": 234,
   "limit": 50,
   "offset": 0
 }
+```
+
+#### `POST /api/cron/jobs/{job_id}/trigger`
+Run a cron job or a source runner now, and wait until the run ends. The run
+log records the signed-in person as actor and cause. A session that the run
+creates (an isolated run, or a new generation of a persistent job) has the
+person as its cause; a persistent job's current session keeps its cause. The
+workflow run that a workflow-run job starts is the system actor's, for the
+person. Returns 404 for an unknown job.
+
+```json
+Response: { "job_id": "morning-briefing", "triggered": true }
 ```
 
 ### Health
@@ -1328,7 +1387,8 @@ fresh.
 // Send a chat message
 { type: "message", content: "Hello", session_id: "main" }
 
-// Stop the running agent
+// Stop the running agent (records a stop_requested session event for the
+// connection's person)
 { type: "stop", session_id: "main" }
 
 // Switch active session
@@ -1337,7 +1397,8 @@ fresh.
 // Fork a session
 { type: "fork", session_id: "main", at_message_id: "msg-42", title: "My Fork" }
 
-// Resume a stopped/idle session
+// Resume a stopped/idle session (records a created session event with
+// reason "resume" for the connection's person)
 { type: "resume", session_id: "abc123" }
 
 // Keep-alive

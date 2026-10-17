@@ -54,7 +54,7 @@ from nerve.agent.prompts import (
     set_skill_manager,
     worker_onboarding_prompt,
 )
-from nerve.agent.sessions import SessionManager, SessionStatus
+from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import (
     ToolContext,
@@ -69,7 +69,16 @@ from nerve.agent.tools import (
 from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
-from nerve.identity import Actor
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+    resolve_cause,
+)
+from nerve.inference_principal import inference_principal
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -375,12 +384,33 @@ class AgentEngine:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
 
+    def session_cause(self, session_id: str) -> str | None:
+        """The session's stored cause: who all agent work in it runs for.
+
+        That is the person who started the session, the system actor for a
+        session the instance started for itself, or ``None`` when unknown
+        (channel input with no known person, an imported or MCP satellite
+        session). The value is set once when the session is created and never
+        changes. See :meth:`nerve.db.sessions.SessionStore.session_cause`.
+        """
+        return self.db.session_cause(session_id)
+
+    def _agent_attribution(self, session_id: str) -> Attribution:
+        """The attribution of a change that the agent or Nerve makes in a
+        session: the system actor, for the session's cause."""
+        return attribution_for(self.db.system_actor, self.session_cause(session_id))
+
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
     # ------------------------------------------------------------------ #
 
     def _build_tool_context(self, session_id: str) -> ToolContext:
-        """Fresh per-session ToolContext for backend MCP servers."""
+        """Fresh per-session ToolContext for backend MCP servers.
+
+        The agent's tool calls are the system actor's changes, made for the
+        session's stored cause. The value never changes, so the context
+        keeps the one read here (the client build has just read the row).
+        """
         return ToolContext(
             session_id=session_id,
             workspace=self.config.workspace,
@@ -391,6 +421,8 @@ class AgentEngine:
             skill_manager=self._skill_manager,
             engine=self,
             notification_service=self.notification_service,
+            actor=self.db.system_actor,
+            cause=self.session_cause(session_id),
         )
 
     def _gateway_port(self) -> int | None:
@@ -1032,8 +1064,12 @@ class AgentEngine:
     @classmethod
     async def _record_wakeup(
         cls, db: Any, session_id: str, tool_input: dict,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> int | None:
         """Persist a ScheduleWakeup request from its tool input.
+
+        ``attribution`` is that of the tool call: the system actor and the
+        session's cause.
 
         Returns the new wakeup id, or ``None`` when there's no prompt to
         re-inject (in which case nothing is scheduled).
@@ -1045,6 +1081,7 @@ class AgentEngine:
         fire_at = cls._wakeup_fire_at(tool_input.get("delaySeconds"))
         wakeup_id = await db.add_wakeup(
             session_id, prompt=prompt, fire_at=fire_at, reason=reason,
+            attribution=attribution,
         )
         logger.info(
             "Recorded wakeup %s for session %s at %s",
@@ -1320,7 +1357,14 @@ class AgentEngine:
                     )
 
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
-                return await self._record_wakeup(self.db, sid, tool_input)
+                # An agent action in a session: the system actor, for the
+                # session's cause.
+                return await self._record_wakeup(
+                    self.db, sid, tool_input,
+                    attribution=attribution_for(
+                        self.db.system_actor, self.session_cause(sid),
+                    ),
+                )
 
             spec = SessionSpec(
                 session_id=session_id,
@@ -1341,6 +1385,13 @@ class AgentEngine:
                 cache_ttl=cache_ttl,
                 max_turns=self.config.agent.max_turns,
                 idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
+                # The session's cause, fixed for the session, so every client
+                # of the session (also after a model change or a crash)
+                # names the same principal. Read from the row, which a fresh
+                # engine has just loaded.
+                inference_principal=inference_principal(
+                    (session or {}).get("caused_by_actor_id"),
+                ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
@@ -1483,21 +1534,40 @@ class AgentEngine:
         anything. Lets run-lifecycle owners (workflow runs) CAS their state
         terminal *before* the stop lands — ``engine.run`` swallows both the
         graceful interrupt and the hard cancel, so callers cannot otherwise
-        distinguish "stopped" from "completed"."""
+        distinguish "stopped" from "completed". The callback also receives
+        the stop's ``attribution``: who asked for the stop, and for whom."""
         self._stop_listeners.append(callback)
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop a running session."""
+    async def stop_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Stop a running session.
+
+        A stop that reaches a running turn or task records a
+        ``stop_requested`` event with ``attribution``: who asked for the
+        stop, and for whom. A stop with nothing to stop records nothing. The
+        event records a request, so two people who ask at the same time are
+        two events.
+        """
+        had_work = self.sessions.has_running_work(session_id)
         for cb in self._stop_listeners:
             try:
-                await cb(session_id)
+                await cb(session_id, attribution)
             except Exception:  # noqa: BLE001 — listeners never block a stop
                 logger.exception("stop listener failed for %s", session_id)
         # Cancel any pending interactive tool prompts so the handler unblocks
         handler = get_handler(session_id)
         if handler:
             handler.cancel_all()
-        return await self.sessions.stop_session(session_id)
+        stopped = await self.sessions.stop_session(session_id)
+        if stopped and had_work:
+            try:
+                await self.db.log_session_event(
+                    session_id, "stop_requested", attribution=attribution,
+                )
+            except Exception:  # noqa: BLE001 (the record never fails a stop)
+                logger.exception("stop event failed for %s", session_id)
+        return stopped
 
     def is_session_running(self, session_id: str) -> bool:
         return self.sessions.is_running(session_id)
@@ -1508,13 +1578,13 @@ class AgentEngine:
         runs to defer the terminal 'done' until spend-relevant work ends."""
         return self._has_live_background_tasks(session_id)
 
-    async def pending_wakeup_at(self, session_id: str) -> str | None:
-        """``fire_at`` of the session's pending wakeup, or ``None``.
+    async def pending_wakeup(self, session_id: str) -> dict | None:
+        """The session's pending wakeup row, or ``None``.
 
         ``ScheduleWakeup`` keeps at most one pending row per session (a new
-        request supersedes the old one), so this is a single timestamp
-        rather than a list. Never raises — a listing/indicator caller must
-        not fail on an enrichment read.
+        request supersedes the old one), so this is a single row rather
+        than a list. Never raises: a listing or indicator caller must not
+        fail on an enrichment read.
         """
         try:
             rows = await self.db.list_pending_wakeups(session_id)
@@ -1523,7 +1593,12 @@ class AgentEngine:
                 "pending wakeup lookup failed for %s", session_id, exc_info=True,
             )
             return None
-        return rows[0].get("fire_at") if rows else None
+        return rows[0] if rows else None
+
+    async def pending_wakeup_at(self, session_id: str) -> str | None:
+        """``fire_at`` of the session's pending wakeup, or ``None``."""
+        wakeup = await self.pending_wakeup(session_id)
+        return wakeup.get("fire_at") if wakeup else None
 
     async def _broadcast_session_running(
         self, session_id: str, is_running: bool,
@@ -1537,11 +1612,15 @@ class AgentEngine:
         with the transition means the client can redraw the row without a
         follow-up list fetch — which it skips for the active session.
         """
+        wakeup = await self.pending_wakeup(session_id) or {}
         await broadcaster.broadcast("__global__", {
             "type": "session_running",
             "session_id": session_id,
             "is_running": is_running,
-            "pending_wakeup_at": await self.pending_wakeup_at(session_id),
+            "pending_wakeup_at": wakeup.get("fire_at"),
+            # Who scheduled the wakeup, and for whom; see GET /api/sessions.
+            "pending_wakeup_created_by_actor_id": wakeup.get("created_by_actor_id"),
+            "pending_wakeup_caused_by_actor_id": wakeup.get("caused_by_actor_id"),
             "has_background_tasks": self._has_live_background_tasks(session_id),
         })
 
@@ -1590,15 +1669,26 @@ class AgentEngine:
         )
         return fork
 
-    async def resume_session(self, session_id: str) -> dict:
-        """Resume a stopped/idle session."""
+    async def resume_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """Resume a stopped/idle session.
+
+        Records a ``created`` status event with reason ``resume`` and
+        ``attribution``, only when the status changes: a session that is
+        resumed already stays as it is, so of two resumes at the same time
+        only one is recorded.
+        """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
             raise ValueError(
                 f"Session {session_id} cannot be resumed (no SDK session)",
             )
         # Mark as created so the next message will reconnect the client
-        await self.sessions.transition(session_id, SessionStatus.CREATED)
+        await self.sessions.transition(
+            session_id, SessionStatus.CREATED, {"reason": "resume"},
+            attribution=attribution,
+        )
         session = await self.db.get_session(session_id)
         return session
 
@@ -2494,6 +2584,7 @@ class AgentEngine:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -2507,6 +2598,11 @@ class AgentEngine:
                       reply, whose authorship is its ``role``. Required
                       keyword-only: an autonomous caller must say so rather
                       than inherit a person's identity by omission.
+            cause: The session's cause, used only when this run creates the
+                      session: an :class:`Actor`, an actor ID, or ``None``
+                      for unknown. The default is the actor. An existing
+                      session keeps its stored cause (see
+                      :meth:`session_cause`), whoever sends the message.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2523,6 +2619,9 @@ class AgentEngine:
                       trigger message", and plenty of internal turns (a
                       run-later deferral, the star hook) are user-requested.
         """
+        # Resolved before the lock: an invalid cause fails here, before the
+        # session is marked as running.
+        cause_id = resolve_cause(actor, cause)
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running".
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -2554,6 +2653,7 @@ class AgentEngine:
                         image_refs=image_refs,
                         bump_updated_at=bump_updated_at,
                         actor=actor,
+                        cause_id=cause_id,
                     )
                 finally:
                     self.sessions.mark_not_running(session_id)
@@ -2600,9 +2700,13 @@ class AgentEngine:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
+        cause_id: str | None,
     ) -> str:
-        # Ensure session exists in DB
-        await self.sessions.get_or_create(session_id, source=source, actor=actor)
+        # Ensure session exists in DB. ``cause_id`` applies only if the row
+        # is created here.
+        await self.sessions.get_or_create(
+            session_id, source=source, actor=actor, cause=cause_id,
+        )
 
         session = await self.db.get_session(session_id)
 
@@ -2616,7 +2720,13 @@ class AgentEngine:
                         if ' ' in placeholder
                         else placeholder + '...'
                     )
-                await self.db.update_session_title(session_id, placeholder)
+                # Nerve sets the title: the system actor's change for the
+                # session's cause, whoever sent the message.
+                await self.db.update_session_title(
+                    session_id, placeholder,
+                    attribution=self._agent_attribution(session_id),
+                    reason="placeholder",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,
@@ -3448,6 +3558,8 @@ class AgentEngine:
         run_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run an agent turn for a cron job in an isolated session.
 
@@ -3456,14 +3568,19 @@ class AgentEngine:
         unless the run yielded with a live ``run_in_background`` task, in which
         case it is kept alive so the agent can resume when the task completes
         (see ``_teardown_oneshot_client``).
+
+        ``cause``: the cause of the run's session: the system actor (the
+        default) for a scheduled run; the person who asked for the run when
+        a person started it.
         """
         if run_id is None:
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        # A scheduled run is the instance's own work, regardless of who wrote
-        # the schedule. Human attribution belongs to the schedule mutation.
+            run_id = new_cron_run_id()
+        # A cron run is the instance's own work, regardless of who wrote the
+        # schedule or who started the run. A person who started it is the
+        # cause of the run's session.
         actor = self.db.system_actor
         session = await self.sessions.create_cron_session(
-            job_id, run_id=run_id, actor=actor,
+            job_id, run_id=run_id, actor=actor, cause=cause,
         )
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
@@ -3487,6 +3604,8 @@ class AgentEngine:
         session_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> str:
         """Run a persistent cron job that maintains context across runs.
 
@@ -3502,11 +3621,15 @@ class AgentEngine:
         which would collide with the parked task — so a persistent-cron
         background task that outlives its run is not resumed (use an
         isolated cron for long background work).
+
+        ``cause`` is as for :meth:`run_cron`. It applies only when this call
+        creates the session; a session of earlier runs keeps its cause.
         """
         session_id = session_id or f"cron:{job_id}"
         actor = self.db.system_actor
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
@@ -3618,7 +3741,10 @@ class AgentEngine:
     async def _generate_session_title(
         self, session_id: str, first_message: str,
     ) -> None:
-        """Generate a meaningful short title for a session using a fast model."""
+        """Generate a meaningful short title for a session using a fast model.
+
+        The title is the system actor's change for the session's cause.
+        """
         try:
             # Skip if no credentials are configured. An OAuth-only credential
             # cannot drive the API directly either (it is not an API key).
@@ -3649,7 +3775,11 @@ class AgentEngine:
                 )
             title = response_text(response).strip().strip('"\'').lstrip('#').strip()
             if title and len(title) < 60:
-                await self.db.update_session_title(session_id, title)
+                await self.db.update_session_title(
+                    session_id, title,
+                    attribution=self._agent_attribution(session_id),
+                    reason="generated",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,

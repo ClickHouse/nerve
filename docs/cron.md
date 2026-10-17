@@ -375,13 +375,13 @@ that name its gate, see below):
 
 ### Isolated (default)
 
-Each run creates a fresh session (`cron:{job_id}:{timestamp}`). The agent has no in-context memory of previous runs. This is best for self-contained jobs like daily briefings or cleanup tasks.
+Each run creates a fresh session (`cron:{job_id}:{run_id}`; the run ID is the UTC start time `YYYYmmdd-HHMMSS` and eight random hex digits, so two runs that start in the same second get two sessions). The agent has no in-context memory of previous runs. This is best for self-contained jobs like daily briefings or cleanup tasks.
 
 ### Persistent
 
 Jobs with `session_mode: persistent` maintain SDK conversation context across runs. Each job owns a **generation chat** — one session that is reused run after run until rotation:
 
-- **First trigger**: Creates a fresh generation session (`cron:{job_id}:{timestamp}`) and runs the prompt.
+- **First trigger**: Creates a fresh generation session (`cron:{job_id}:{run_id}`, the same ID form as an isolated run) and runs the prompt.
 - **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs of this generation in-context.
 - **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memU, cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
 
@@ -512,6 +512,13 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
 - `status` — `success`, `error`, or `missed` (see [Late runs](#late-runs))
 - `output` — First 2000 chars of response / summary
 - `error` — Error message if failed
+- `actor_id` / `caused_by_actor_id`: who started the run, and on whose
+  behalf: the system actor for a scheduled, catch-up or missed run, or for
+  `nerve cron <id>`; the person who triggered the run through the web UI or
+  `POST /api/cron/jobs/{job_id}/trigger`. A session that a person's run
+  creates has that person as its cause, so the agent's work in it is the
+  system actor's for that person. See
+  [Attribution](accounts.md#attribution).
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 

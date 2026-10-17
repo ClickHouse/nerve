@@ -119,8 +119,9 @@ Two rules keep ranks meaningful:
 ### Status History
 
 Every status transition is appended to `task_events` (`task_id`,
-`from_status`, `to_status`, `actor`, `created_at`), added in migration v044
-and seeded with one origin row per existing task. `from_status` is NULL on
+`from_status`, `to_status`, `actor`, `actor_id`, `caused_by_actor_id`,
+`created_at`), added in migration v044 and seeded with one origin row per
+existing task. `from_status` is NULL on
 the row recording a task's creation, so an aging calculation can tell
 "created here" from "moved here".
 
@@ -134,11 +135,28 @@ rewrites every row with the status it already had. The one case where
 reindex *does* change a status, resetting an orphaned row to match its
 directory, is a real correction and gets a row.
 
-`actor` is the session id for agent-driven changes, `web` for the HTTP API,
-`backfill` on the origin rows v044 seeded for tasks that predate the table,
-and `system` otherwise. `backfill` is load-bearing rather than cosmetic: a
-real creation also records a NULL `from_status`, so the actor is the only
-thing distinguishing a synthesized origin from one that actually happened.
+`actor` is the origin of the change, not an identity: the session id for
+agent-driven changes, `web` for the HTTP API, `backfill` on the origin rows
+v044 seeded for tasks that predate the table, and `system` otherwise.
+`backfill` is load-bearing rather than cosmetic: a real creation also records
+a NULL `from_status`, so the actor is the only thing distinguishing a
+synthesized origin from one that actually happened.
+
+`actor_id` and `caused_by_actor_id` (migration v053) name who made the change
+and on whose behalf, as actor IDs (see
+[Attribution](accounts.md#attribution)). A change through the HTTP API records
+the person as both. A change by an agent tool call records the system actor
+and the cause of its session: the person who started the session, or the
+system actor for a cron job. Rows written before v053 have NULL in both
+columns. The `GET /api/tasks/{id}/events` rows include both columns, and the
+timeline shows "Nerve for <person>" when the agent changed the status in a
+session that the person started.
+
+Changes to the set of statuses (create, update, reorder, delete, through the
+HTTP API or the `task_status_create` tool) append a row to
+`task_status_events` (`change`, `status_name`, `detail`, `actor_id`,
+`caused_by_actor_id`, `created_at`), added in migration v053. `status_name` is
+NULL for a reorder, and `detail` is a JSON object with the new values.
 
 This powers the aging indicator on board cards and the timeline in the task
 detail view. Tasks whose last transition predates v044 report no entry time
@@ -150,6 +168,14 @@ that isn't true.
 Every write to a task row advances `tasks.revision` by one, added in
 migration v052. The row routes return it, and `task_read` ends with a
 `<!-- nerve: revision=N ... -->` line that `task_write` strips again.
+
+Changes of one task that write its file and its row run one at a time: the
+`PATCH` and `move` routes, `task_update`, `task_write`, `task_done` and the
+reopen path hold a lock per task from their first read of the row to their
+last write (`nerve/tasks/locks.py`). So an edit always lands in the file that
+the row names, also when another change moves the file into or out of
+`done/` at the same time. Changes of different tasks do not wait for each
+other.
 
 Pass the value you read as `expect_revision` to `task_update` or `task_done`
 to make the write conditional: if the row has changed since, nothing is

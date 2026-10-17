@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ReviewLoopDecisionResult } from './client';
 
 // Node can expose a non-jsdom localStorage. Install the storage the client
 // reads at module initialization before importing it.
@@ -144,6 +145,24 @@ describe('local requests', () => {
 
     expect(useHostedStore.getState().mode).toBe('local');
     expect(useHostedStore.getState().problem).toBeNull();
+  });
+});
+
+describe('review-loop decisions', () => {
+  it('return whether the decision was applied apart from the resume result', async () => {
+    setToken('session-one');
+    fetchMock.mockResolvedValue(new Response(
+      JSON.stringify({ ok: false, applied: true, message: 'resume dispatch lost a race' }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+
+    const result: ReviewLoopDecisionResult = await api.decideReviewLoop('rvl-1', 'budget:5');
+
+    expect(result).toEqual({ ok: false, applied: true, message: 'resume dispatch lost a race' });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('/api/review-loops/rvl-1/decision');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body)).toEqual({ decision: 'budget:5' });
   });
 });
 

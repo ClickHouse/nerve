@@ -19,6 +19,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
 from nerve.agent.engine import AgentEngine
+from nerve.agent.sessions import new_cron_run_id
 from nerve.config import ConfigError, NerveConfig
 from nerve.cron.jobs import (
     CronJob,
@@ -27,6 +28,7 @@ from nerve.cron.jobs import (
     load_jobs,
 )
 from nerve.db import Database
+from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
 
 if TYPE_CHECKING:
     from nerve.cron.gates import CronGate
@@ -278,6 +280,11 @@ class CronService:
         # interleave scheduler mutations.
         self._reload_lock = asyncio.Lock()
 
+    def _own_attribution(self) -> Attribution:
+        """Attribution of a run that the instance starts itself: a scheduled
+        run, a catch-up run, a missed run, or ``nerve cron <id>``."""
+        return attribution_for(self.db.system_actor)
+
     async def start(self) -> None:
         """Load jobs and start the scheduler."""
         # Register drop-in custom gate plugins BEFORE jobs are parsed, so their
@@ -393,6 +400,7 @@ class CronService:
                     f"run dropped: not started within "
                     f"{_MISFIRE_GRACE_SECONDS}s of its scheduled time"
                 ),
+                attribution=self._own_attribution(),
             )
         except Exception as e:
             logger.warning("Failed to log missed run for %s: %s", job_id, e)
@@ -902,13 +910,18 @@ class CronService:
                 return key
         return None
 
-    async def _start_new_generation(self, job_id: str) -> str:
-        """Create a fresh chat session for a persistent job and map it."""
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        session_id = f"cron:{job_id}:{ts}"
+    async def _start_new_generation(
+        self, job_id: str, *, cause: CauseArg = CAUSE_FROM_ACTOR,
+    ) -> str:
+        """Create a fresh chat session for a persistent job and map it.
+
+        ``cause`` is the session's cause: by default the system actor; the
+        person whose "Run now" creates the generation.
+        """
+        session_id = f"cron:{job_id}:{new_cron_run_id()}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=self.db.system_actor,
+            actor=self.db.system_actor, cause=cause,
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -929,7 +942,8 @@ class CronService:
         - cancels the session's pending wakeups (a retired thread must not
           resurrect itself alongside the new generation),
         - stamps ``rotated_at`` in the session metadata (prevents legacy
-          re-adoption) and retitles the chat with its end date.
+          re-adoption) and retitles the chat with its end date (the system
+          actor's change for the session's cause).
         """
         # Scheduled, not awaited: memorization queues on a global lock and
         # awaiting it would delay the run start by the whole queue wait.
@@ -964,8 +978,13 @@ class CronService:
 
             date_str = datetime.now(self.timezone).strftime("%Y-%m-%d")
             title = session.get("title") or f"Cron: {job_id}"
+            # Nerve's change in the session, for the session's cause.
             await self.db.update_session_title(
                 session_id, f"{title} (until {date_str})",
+                attribution=attribution_for(
+                    self.db.system_actor, session.get("caused_by_actor_id"),
+                ),
+                reason="cron_rotation",
             )
         except Exception as e:
             logger.warning(
@@ -1030,12 +1049,15 @@ class CronService:
                 return f"age {age_hours:.1f}h >= {rotate_hours}h"
         return None
 
-    async def _resolve_persistent_session(self, job: CronJob) -> tuple[str, bool]:
+    async def _resolve_persistent_session(
+        self, job: CronJob, *, cause: CauseArg = CAUSE_FROM_ACTOR,
+    ) -> tuple[str, bool]:
         """Pick the chat session for a persistent run, rotating if due.
 
         Returns ``(session_id, rotated)``. When rotation is due, the current
         generation is retired (chat + history preserved as its own session)
-        and a brand-new chat is minted for this and subsequent runs.
+        and a brand-new chat is minted for this and subsequent runs, with
+        ``cause`` as its cause. A current generation keeps its cause.
         """
         current = await self._current_persistent_session_id(job.id)
         rotated = False
@@ -1052,7 +1074,7 @@ class CronService:
                     rotated = True
 
         if current is None:
-            current = await self._start_new_generation(job.id)
+            current = await self._start_new_generation(job.id, cause=cause)
         return current, rotated
 
     # -- End persistent session generations ----------------------------------
@@ -1110,16 +1132,24 @@ class CronService:
         kept, self._rejected_job_ids = _drop_reserved(list(jobs_by_id.values()))
         return kept
 
-    async def _run_job_wrapper(self, job: CronJob) -> None:
-        """Wrapper to run a cron job with logging and optional lock."""
+    async def _run_job_wrapper(
+        self, job: CronJob, attribution: Attribution | None = None,
+    ) -> None:
+        """Wrapper to run a cron job with logging and optional lock.
+
+        ``attribution`` names who started the run and its cause. ``None``
+        (the scheduler's call) is the instance's own run.
+        """
         if job.lock:
             lock = self._job_locks.setdefault(job.id, asyncio.Lock())
             async with lock:
-                await self._run_job_inner(job)
+                await self._run_job_inner(job, attribution)
         else:
-            await self._run_job_inner(job)
+            await self._run_job_inner(job, attribution)
 
-    async def _run_job_inner(self, job: CronJob) -> None:
+    async def _run_job_inner(
+        self, job: CronJob, attribution: Attribution | None = None,
+    ) -> None:
         """Inner implementation of job execution."""
         # Pre-check: skip if any configured run gate is unsatisfied.
         if job.gates:
@@ -1132,14 +1162,15 @@ class CronService:
                 logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
 
-        log_id = await self.db.log_cron_start(job.id)
+        attribution = attribution or self._own_attribution()
+        log_id = await self.db.log_cron_start(job.id, attribution=attribution)
         logger.info("Running cron job: %s (mode=%s)", job.id, job.session_mode)
 
         if job.workflow is not None:
             # Workflow-run job: launch a budget-capped workflow run and
             # return — the run executes and notifies on its own, so none
             # of the cron session machinery below applies.
-            await self._start_workflow_run(job, log_id)
+            await self._start_workflow_run(job, log_id, attribution)
             return
 
         session_id: str | None = None
@@ -1157,13 +1188,14 @@ class CronService:
             if job.session_mode == "persistent":
                 # Resolve the current generation chat, rotating to a fresh
                 # one first when due (the old chat is preserved).
-                session_id, rotated = await self._resolve_persistent_session(job)
+                session_id, rotated = await self._resolve_persistent_session(
+                    job, cause=attribution.caused_by_actor_id,
+                )
             else:
                 # Isolated mode: per-run session. The run_id is generated
-                # here (the engine would otherwise generate an identical
-                # timestamp-based one) so the session id is known for the
-                # run log.
-                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                # here (the engine would otherwise generate one of the same
+                # shape) so the session id is known for the run log.
+                run_id = new_cron_run_id()
                 session_id = f"cron:{job.id}:{run_id}"
             try:
                 await self.db.set_cron_log_session(log_id, session_id)
@@ -1204,6 +1236,7 @@ class CronService:
                     session_id=session_id,
                     cache_ttl=job.cache_ttl,
                     effort=effort,
+                    cause=attribution.caused_by_actor_id,
                 )
             else:
                 response = await self.engine.run_cron(
@@ -1213,6 +1246,7 @@ class CronService:
                     run_id=run_id,
                     cache_ttl=job.cache_ttl,
                     effort=effort,
+                    cause=attribution.caused_by_actor_id,
                 )
 
             # Keep the tail of the response — for multi-message runs the
@@ -1231,15 +1265,24 @@ class CronService:
                 log_id, "error", error=str(e), session_id=session_id,
             )
 
-    async def _start_workflow_run(self, job: CronJob, log_id: int) -> None:
+    async def _start_workflow_run(
+        self, job: CronJob, log_id: int, attribution: Attribution | None = None,
+    ) -> None:
         """Start the workflow run a job declares instead of a prompt.
 
         Fire-and-forget: the cron log records only the launch. The run
         owns its ``workflow:<run-id>`` session and sends its own budget /
         completion / failure notifications — no cron session is created
         and the job does not wait for the run to finish.
+
+        ``attribution`` is the run log's (see :meth:`_run_job_wrapper`).
+        The cron service starts the run, so its actor is the system actor;
+        its cause is the cause of the cron run, and the run's turns run for
+        it.
         """
         from nerve.workflows import get_workflow_run_service
+
+        cause_id = (attribution or self._own_attribution()).caused_by_actor_id
 
         service = get_workflow_run_service()
         if service is None:
@@ -1287,6 +1330,9 @@ class CronService:
                 budget_usd=w["budget_usd"],
                 title=w.get("title") or job.id,
                 created_by=f"cron:{job.id}",
+                # A scheduled job is autonomous work: system for system. A
+                # run that a person started is the system's, for that person.
+                attribution=attribution_for(self.db.system_actor, cause_id),
             )
             session_id = run.get("session_id") or ("workflow:" + run["id"])
             await self.db.set_cron_log_session(log_id, session_id)
@@ -1307,9 +1353,16 @@ class CronService:
             )
             await self.db.log_cron_finish(log_id, "error", error=str(e))
 
-    async def _run_source_wrapper(self, runner: SourceRunner) -> None:
-        """Wrapper to run a source ingestion with cron and source logging."""
-        log_id = await self.db.log_cron_start(runner.job_id)
+    async def _run_source_wrapper(
+        self, runner: SourceRunner, attribution: Attribution | None = None,
+    ) -> None:
+        """Wrapper to run a source ingestion with cron and source logging.
+
+        ``attribution`` is as for :meth:`_run_job_wrapper`.
+        """
+        log_id = await self.db.log_cron_start(
+            runner.job_id, attribution=attribution or self._own_attribution(),
+        )
         logger.info("Running source: %s", runner.source.source_name)
 
         try:
@@ -1401,7 +1454,9 @@ class CronService:
         # The actor is the instance's own: a model-scheduled wakeup, or a
         # deferral this service is delivering. Who wrote a run-later message
         # is already recorded on the row the route persisted when they
-        # composed it.
+        # composed it. The turn runs in the wakeup's session, so its cause
+        # is the session's cause; the wakeup row keeps who scheduled it and
+        # for whom.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -1427,8 +1482,15 @@ class CronService:
 
         task.add_done_callback(_done)
 
-    async def run_job(self, job_id: str) -> None:
-        """Run a specific job manually (used by CLI)."""
+    async def run_job(
+        self, job_id: str, *, attribution: Attribution | None = None,
+    ) -> None:
+        """Run a specific job manually (the CLI and the REST trigger).
+
+        ``attribution``: the person who asked for the run through the API, as
+        actor and cause. The run's turn has the system actor as actor and
+        this cause. ``None`` is the instance's own run (``nerve cron <id>``).
+        """
         job = next((j for j in self._jobs if j.id == job_id), None)
         if not job:
             # Try loading fresh from both files
@@ -1438,7 +1500,7 @@ class CronService:
         if not job:
             raise ValueError(f"Job not found: {job_id}")
 
-        await self._run_job_wrapper(job)
+        await self._run_job_wrapper(job, attribution)
 
     async def rotate_session(self, job_id: str) -> dict:
         """Force-rotate a persistent cron to a fresh chat session.

@@ -230,6 +230,8 @@ export function handleSessionRunning(
     ...sess,
     is_running: msg.is_running,
     pending_wakeup_at: msg.pending_wakeup_at ?? null,
+    pending_wakeup_created_by_actor_id: msg.pending_wakeup_created_by_actor_id ?? null,
+    pending_wakeup_caused_by_actor_id: msg.pending_wakeup_caused_by_actor_id ?? null,
     has_background_tasks: !!msg.has_background_tasks,
   });
   set(s => {
@@ -319,13 +321,15 @@ export function handleAnswerInjected(
   get: Get,
   set: Set,
 ): void {
-  // Show the injected answer as a user message in the chat
+  // Show the injected answer as a user message in the chat, labelled with
+  // the person who answered, as the stored row is.
   if (msg.session_id === get().activeSession) {
     set(s => ({
       messages: [...s.messages, {
         role: 'user' as const,
         blocks: [{ type: 'text' as const, content: msg.content }],
         created_at: new Date().toISOString(),
+        actor_id: msg.actor_id ?? null,
       }],
     }));
   }

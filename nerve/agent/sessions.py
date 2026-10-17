@@ -13,15 +13,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
 from nerve.db import Database
-from nerve.identity import Actor
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def new_cron_run_id() -> str:
+    """A unique run ID for a cron session ID ``cron:<job>:<run ID>``.
+
+    The UTC start time (``YYYYmmdd-HHMMSS``) keeps the IDs in time order;
+    eight random hex digits make two runs that start in the same second
+    (for example two people who use "Run now") get two sessions, each with
+    its own cause. ``nerve/db/usage.py`` matches this shape.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{secrets.token_hex(4)}"
+
 
 # Cleanup defaults
 DEFAULT_ARCHIVE_AFTER_DAYS = 30
@@ -101,19 +122,21 @@ class SessionManager:
         cwd: str | None = None,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Get an existing session or create a new one.
 
-        ``actor`` is only used when a row is actually created — an existing
-        session keeps the creator it was stamped with, so re-resolving a
-        session someone else started never re-attributes it. Required
-        keyword-only, like the store method underneath it.
+        ``actor`` and ``cause`` are only used when a row is actually created.
+        An existing session keeps the creator and the cause it was stamped
+        with, so re-resolving a session someone else started never
+        re-attributes it. ``actor`` is required keyword-only, like the store
+        method underneath it; ``cause`` defaults to the actor.
         """
         session = await self.db.get_session(session_id)
         if not session:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
-                backend=backend, model=model, cwd=cwd, actor=actor,
+                backend=backend, model=model, cwd=cwd, actor=actor, cause=cause,
             )
         return session
 
@@ -130,6 +153,7 @@ class SessionManager:
         cwd: str | None = None,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -154,11 +178,11 @@ class SessionManager:
             model=model,
             cwd=cwd,
             actor=actor,
+            cause=cause,
+            # The event names the creator and the session's cause only when
+            # this insert made the row.
+            created_event=attribution_for(actor, cause),
         )
-        await self.db.log_session_event(session_id, "created", {
-            "source": source,
-            "parent": parent_session_id,
-        })
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
         )
@@ -171,14 +195,22 @@ class SessionManager:
     async def transition(
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
-    ) -> None:
-        """Atomically transition a session's status and log the event."""
+        *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Atomically transition a session's status and log the event.
+
+        ``attribution`` is for a transition that a principal asks for (a
+        resume). A transition that records the state of the runtime keeps it
+        unattributed. A session that has ``new_status`` already stays as it
+        is and records nothing, so of two callers that make the same
+        transition at the same time only one is recorded. Returns ``True``
+        when the status changed.
+        """
         async with self._transition_lock:
-            await self.db.update_session_fields(
-                session_id, {"status": new_status.value},
-            )
-            await self.db.log_session_event(
-                session_id, new_status.value, details or {},
+            return await self.db.change_session_status(
+                session_id, new_status.value,
+                event_type=new_status.value, details=details,
+                attribution=attribution,
             )
 
     async def mark_active(
@@ -435,6 +467,11 @@ class SessionManager:
         """Check if a session has a running agent task."""
         return session_id in self._running_sessions
 
+    def has_running_work(self, session_id: str) -> bool:
+        """True while a turn of the session runs or its registered task lives."""
+        task = self._running_tasks.get(session_id)
+        return self.is_running(session_id) or (task is not None and not task.done())
+
     def get_running_ids(self) -> set[str]:
         """Return the set of currently running session IDs."""
         return set(self._running_sessions)
@@ -602,6 +639,7 @@ class SessionManager:
 
     async def create_cron_session(
         self, job_id: str, run_id: str | None = None, *, actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create an isolated session for a single cron run.
 
@@ -610,7 +648,8 @@ class SessionManager:
 
         ``actor`` is the agent's system principal in production because a
         scheduled run is the instance's own work, regardless of who wrote the
-        schedule.
+        schedule. ``cause`` is the session's cause: by default the actor; the
+        person for a run that a person started.
         """
         if run_id:
             session_id = f"cron:{job_id}:{run_id}"
@@ -618,6 +657,7 @@ class SessionManager:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
 
     async def create_hook_session(
@@ -649,7 +689,7 @@ class SessionManager:
         """Add a message to a session's history.
 
         ``actor`` is the principal whose input this row records, or ``None``
-        for assistant and tool output — see
+        for assistant and tool output. See
         :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the
@@ -701,34 +741,43 @@ class SessionManager:
             limit=limit, offset=offset, sources=sources, current_id=current_id,
         )
 
-    async def set_starred(self, session_id: str, starred: bool) -> bool:
+    async def set_starred(
+        self, session_id: str, starred: bool, *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Star or unstar a session.
 
         Starred sessions are exempt from every auto-archival path (the idle
         cutoff, the age backstop, and the overflow eviction), so they stay
         resumable until explicitly unstarred or deleted. Returns the new
         starred state; raises ``ValueError`` if the session does not exist.
+        A change records a ``starred`` or ``unstarred`` event with
+        ``attribution``.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if starred else 0},
+            attribution=attribution,
         )
         return starred
 
-    async def toggle_starred(self, session_id: str) -> bool:
+    async def toggle_starred(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Flip a session's starred flag.
 
         Returns the new starred state; raises ``ValueError`` if the session
-        does not exist.
+        does not exist. The change records an event, as :meth:`set_starred`.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         new_starred = not session.get("starred")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if new_starred else 0},
+            attribution=attribution,
         )
         return new_starred
 
@@ -736,8 +785,24 @@ class SessionManager:
     #  Archive & cleanup                                                   #
     # ------------------------------------------------------------------ #
 
-    async def archive_session(self, session_id: str) -> None:
-        """Archive a session: memorize, disconnect client, update status."""
+    async def archive_session(
+        self, session_id: str, *,
+        attribution: Attribution = UNATTRIBUTED,
+        details: dict | None = None,
+    ) -> bool:
+        """Archive a session: memorize, disconnect client, update status.
+
+        The ``archived`` event takes ``attribution`` and ``details``. A
+        session that is archived already stays as it is and records nothing;
+        of two archives at the same time, only the one that changes the
+        status is recorded. Returns ``True`` when this call archived the
+        session; raises ``ValueError`` if the session does not exist.
+        """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session.get("status") == SessionStatus.ARCHIVED.value:
+            return False
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -755,14 +820,18 @@ class SessionManager:
             except Exception:
                 pass
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.ARCHIVED.value,
-            "archived_at": now,
-            "connected_at": None,
-            "sdk_session_id": None,
-        })
-        await self.db.log_session_event(session_id, "archived", {})
-        logger.info("Archived session %s", session_id)
+        archived = await self.db.change_session_status(
+            session_id, SessionStatus.ARCHIVED.value,
+            fields={
+                "archived_at": now,
+                "connected_at": None,
+                "sdk_session_id": None,
+            },
+            event_type="archived", details=details, attribution=attribution,
+        )
+        if archived:
+            logger.info("Archived session %s", session_id)
+        return archived
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
         """Every session in ``root_id``'s subtree, discovery order (root first).
@@ -787,7 +856,9 @@ class SessionManager:
                     queue.append(cid)
         return order
 
-    async def archive_session_cascade(self, session_id: str) -> dict:
+    async def archive_session_cascade(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
         """Archive a session and its ENTIRE descendant subtree, bottom-up.
 
         The default archive behavior. Resolves the full descendant set up front,
@@ -798,6 +869,10 @@ class SessionManager:
         active child. Fully-archivable sibling subtrees still complete.
 
         Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
+
+        Each ``archived`` event takes ``attribution``; the event of a
+        descendant names the root in ``cascade_root``. A session that is
+        archived already counts as archived and records no event.
         """
         # Compute the whole subtree BEFORE mutating anything.
         order = await self._resolve_descendants(session_id)
@@ -823,7 +898,10 @@ class SessionManager:
                 skipped[sid] = "session is running"
                 continue
             try:
-                await self.archive_session(sid)
+                await self.archive_session(
+                    sid, attribution=attribution,
+                    details={"cascade_root": session_id} if sid != session_id else None,
+                )
                 archived.append(sid)
             except Exception as e:  # keep going; sibling subtrees still complete
                 logger.warning("Cascade archive failed for %s: %s", sid, e)
@@ -833,19 +911,30 @@ class SessionManager:
             "skipped": [{"id": sid, "reason": reason} for sid, reason in skipped.items()],
         }
 
-    async def unarchive_session(self, session_id: str) -> None:
-        """Restore an archived session to ``idle`` so it's resumable again."""
+    async def unarchive_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Restore an archived session to ``idle`` so it's resumable again.
+
+        The ``unarchived`` event takes ``attribution``. A session that is not
+        archived stays as it is and records nothing. Returns ``True`` when
+        this call restored the session; raises ``ValueError`` if the session
+        does not exist.
+        """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.IDLE.value,
-            "archived_at": None,
-        })
-        # Bump updated_at so the unarchived session sorts to the top of the feed.
-        await self.db.touch_session(session_id)
-        await self.db.log_session_event(session_id, "unarchived", {})
-        logger.info("Unarchived session %s", session_id)
+        # touch: updated_at moves, so the session sorts to the top of the feed.
+        restored = await self.db.change_session_status(
+            session_id, SessionStatus.IDLE.value,
+            fields={"archived_at": None},
+            only_from=(SessionStatus.ARCHIVED.value,),
+            touch=True,
+            event_type="unarchived", attribution=attribution,
+        )
+        if restored:
+            logger.info("Unarchived session %s", session_id)
+        return restored
 
     async def list_starred_sessions(self) -> list[dict]:
         """Starred, non-archived sessions — always returned, never truncated."""
@@ -904,6 +993,8 @@ class SessionManager:
         cleanup statistics.
         """
         now = datetime.now(timezone.utc)
+        # Automatic archives are Nerve's own work.
+        system = attribution_for(self.db.system_actor)
 
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
         # when interactive_archive_after_hours == 0, so default behavior is unchanged.
@@ -920,7 +1011,10 @@ class SessionManager:
                     logger.warning(
                         "Expire pending questions failed for %s: %s", s["id"], e,
                     )
-                await self.archive_session(s["id"])
+                await self.archive_session(
+                    s["id"], attribution=system,
+                    details={"reason": "idle_interactive"},
+                )
             archived_interactive = len(interactive)
 
         # Long backstop cutoff for everything (incl. non-interactive).
@@ -929,7 +1023,9 @@ class SessionManager:
         # Archive idle/stopped sessions older than cutoff
         stale = await self.db.get_stale_sessions(cutoff)
         for s in stale:
-            await self.archive_session(s["id"])
+            await self.archive_session(
+                s["id"], attribution=system, details={"reason": "stale"},
+            )
 
         # Enforce max session count (archive oldest beyond limit). Starred
         # sessions are off-budget: excluded from the count and never evicted,
@@ -941,7 +1037,9 @@ class SessionManager:
                 count - max_sessions,
             )
             for s in excess:
-                await self.archive_session(s["id"])
+                await self.archive_session(
+                    s["id"], attribution=system, details={"reason": "overflow"},
+                )
             overflow = len(excess)
 
         stats = {

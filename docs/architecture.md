@@ -71,7 +71,7 @@ Claude Agent SDK wrapper providing:
 - **Persistent channel mappings** — channel-to-session mapping stored in `channel_sessions` table (survives restarts)
 - **Orphan recovery** — on startup, sessions marked `active` in DB but with no live client are transitioned to `idle` (resumable) or `stopped`
 - **Automatic cleanup** — periodic task (every 6h) archives stale sessions (default 30 days) and enforces max session count (default 500)
-- **Per-run cron sessions** — each cron run gets a unique session ID (`cron:{job_id}:{timestamp}`) to prevent unbounded message accumulation
+- **Per-run cron sessions**: each cron run gets a unique session ID (`cron:{job_id}:{run_id}`, the start time and a random suffix) to prevent unbounded message accumulation
 - AI-generated session titles via lightweight Haiku API call
 - Custom MCP tools (tasks, memory recall, conversation history, sync status, skills CRUD, notifications)
 - API calls routed through configurable base URL (direct Anthropic API or local CLIProxyAPI proxy)
@@ -99,7 +99,8 @@ Async notification system for agent→user communication:
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
 - **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Answer routing**: answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session. A web answer records the person in `answered_by_actor_id`, and the relayed message is written by that person; the agent's work in that turn has the session's cause. A channel answer keeps the provider user ID in metadata and records no actor. An approval dispatcher (`nerve/notifications/handlers.py`) receives the person who answered as its `actor` keyword argument, `None` for a channel answer
+  A dispatcher that asks for a snooze can return an `after_snooze` callback; the service awaits it with the result of its snooze write (False when the card was no longer pending)
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
@@ -189,7 +190,7 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 
 ### Cron Job
 1. APScheduler triggers at schedule
-2. Isolated per-run session created (`cron:{job_id}:{timestamp}`)
+2. Isolated per-run session created (`cron:{job_id}:{run_id}`)
 3. Agent runs with job prompt and cron model, acting as the system principal — the session and the prompt are attributed to it, not to whoever wrote the schedule
 4. Agent uses `notify`/`ask_user` tools to communicate with user
 5. Run logged in `cron_logs` table
@@ -234,7 +235,8 @@ To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with a
 SQLite with WAL mode (schema version 16):
 - `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
 - `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
-- `session_events` — Append-only lifecycle audit log (created, started, idle, stopped, archived, error)
+- `session_events`: append-only lifecycle audit log (created, started, idle, stopped, archived, error, and the changes listed in [Session changes](accounts.md#session-changes)), with `actor_id` and `caused_by_actor_id` → `actor_refs`
+- `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
 - `tasks` — Task index (mirrors markdown files)

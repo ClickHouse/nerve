@@ -12,6 +12,7 @@ all sessions).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from nerve.agent.tools.schemas import (
     TASK_WRITE_SCHEMA,
 )
 from nerve.config import ensure_path_not_tracked_config
+from nerve.db.tasks import KEEP
 from nerve.db.task_statuses import (
     DEFAULT_STATUS,
     STATUS_NAME_RE,
@@ -39,8 +41,24 @@ from nerve.db.task_statuses import (
     random_status_color,
 )
 from nerve.tasks.files import move_task_file, write_task_file
+from nerve.tasks.locks import task_mutation
 
 logger = logging.getLogger(__name__)
+
+
+def _one_change_per_task(handler):
+    """Run a handler that writes a task file and its row under the task's lock.
+
+    See :mod:`nerve.tasks.locks`. The lock covers the handler's first read
+    of the row, so the path that it writes is the path the row names.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(ctx: ToolContext, args: dict) -> ToolResult:
+        async with task_mutation(args["task_id"]):
+            return await handler(ctx, args)
+
+    return wrapper
 
 
 async def _format_status_reminder(ctx: ToolContext, header: str) -> str:
@@ -357,6 +375,7 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 tags=tags_to_string(tags),
                 content=content,
                 actor=ctx.session_id,
+                attribution=ctx.attribution,
             )
         except Exception:
             # A claimed ID is now sticky, so a half-done create would burn it:
@@ -410,6 +429,7 @@ async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text("\n".join(lines))
 
 
+@_one_change_per_task
 async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     from nerve.tasks.models import parse_tags_string, tags_to_string
 
@@ -529,7 +549,6 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     content = re.sub(r"\*\*Tags:\*\* .*\n?", "", content, count=1)
 
                 final_title = new_title or task["title"]
-                final_status = status or task["status"]
                 # Presence carries through to the row the same way it does to
                 # the file above: an omitted column keeps its stored value, a
                 # present-but-empty one clears it.
@@ -539,9 +558,14 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 if raw_tags is not None:
                     edits["tags"] = new_tags_str
                 write = lambda: write_task_file(file_path, content)
+                # KEEP for what this call does not change: the path belongs to
+                # task_done / task_reopen, and a status that another writer
+                # set after the read above must stay. A requested status is
+                # applied in the write's transaction, from the stored one.
                 kw = dict(
-                    task_id=task_id, file_path=task["file_path"], title=final_title,
-                    status=final_status, content=content, actor=ctx.session_id, **edits,
+                    task_id=task_id, file_path=KEEP, title=final_title,
+                    status=status or KEEP, content=content, actor=ctx.session_id,
+                    attribution=ctx.attribution, **edits,
                 )
                 # Without a token the order stays file-then-row, as before. With
                 # one the row is written first, so a refused caller writes no file.
@@ -574,6 +598,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if status:
             applied = await ctx.db.transition_task(
                 task_id, status, expect_revision=expect_revision, actor=ctx.session_id,
+                attribution=ctx.attribution,
                 **({"tags": new_tags_str} if raw_tags is not None else {}),
             )
         elif raw_tags is not None:
@@ -618,6 +643,7 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task file not found for: {task_id}")
 
 
+@_one_change_per_task
 async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     new_content = _REVISION_TRAILER_RE.sub("", args.get("content", ""))
@@ -661,13 +687,17 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if "tags" in frontmatter:
         edits["tags"] = tags_to_string(parse_tags_string(frontmatter["tags"]))
 
+    # task_write changes neither the path nor the status. KEEP reads both in
+    # the write's transaction, so a move by another writer since the read
+    # above stays.
     await ctx.db.upsert_task(
         task_id=task_id,
-        file_path=task["file_path"],
+        file_path=KEEP,
         title=new_title,
-        status=task["status"],
+        status=KEEP,
         deadline=new_deadline or None,
         content=new_content,
+        attribution=ctx.attribution,
         **edits,
     )
 
@@ -675,6 +705,7 @@ async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task {task_id} written ({len(new_content)} chars).")
 
 
+@_one_change_per_task
 async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     note = args.get("note", "")
@@ -711,19 +742,21 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if expect_revision is None:
                 await asyncio.to_thread(move_task_file, src, dst, content)
                 await ctx.db.transition_task(
-                    task_id, "done", actor=ctx.session_id,
+                    task_id, "done", actor=ctx.session_id, attribution=ctx.attribution,
                     file_path=rel_path, content=content,
                 )
             else:
                 if not await ctx.db.transition_task(
                     task_id, "done", expect_revision=expect_revision,
-                    actor=ctx.session_id, file_path=rel_path, content=content,
+                    actor=ctx.session_id, attribution=ctx.attribution,
+                    file_path=rel_path, content=content,
                 ):
                     return _revision_conflict(task_id, expect_revision)
                 await asyncio.to_thread(move_task_file, src, dst, content)
         else:
             done = await ctx.db.transition_task(
                 task_id, "done", expect_revision=expect_revision, actor=ctx.session_id,
+                attribution=ctx.attribution,
             )
             if not done and expect_revision is not None:
                 return _revision_conflict(task_id, expect_revision)
@@ -739,6 +772,7 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task {task_id} marked as done.")
 
 
+@_one_change_per_task
 async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
     """Mirror of ``task_done``: bring a completed task back to life.
 
@@ -803,6 +837,7 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     kw: dict = dict(
         expect=(TERMINAL_STATUS,), expect_revision=expect_revision, actor=ctx.session_id,
+        attribution=ctx.attribution,
     )
     if src is not None:
         content = await asyncio.to_thread(src.read_text, encoding="utf-8")
@@ -865,6 +900,7 @@ async def task_status_create_handler(ctx: ToolContext, args: dict) -> ToolResult
 
     created = await ctx.db.create_task_status(
         name=name, label=label, color=color, description=description,
+        attribution=ctx.attribution,
     )
     return ToolResult.text(
         f"Created task status '{created['name']}' "

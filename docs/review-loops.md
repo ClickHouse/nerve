@@ -80,16 +80,52 @@ A loop ends `passed`, or parks in `awaiting_user` on: iteration cap,
 budget exhaustion, no-progress (same unmet criteria twice with an
 unchanged workspace), repeated leg failures, verifier errors, gaming, or a
 restart that interrupted an implementer leg. Parked loops raise an
-actionable card — **Accept as-is / Grant +2 iterations / Abandon / Remind
-me in 4h** — and the same decisions are available via
+actionable card (**Accept as-is / Grant +2 iterations / Abandon / Remind
+me in 4h**). The same decisions, except the reminder, are available through
 `POST /api/review-loops/{id}/decision`. Expired cards are re-proposed a
 bounded number of times, then the loop closes as failed with a
 notification: nothing parks silently, and paid-for work is never
 discarded without telling you.
 
+Each decision on an existing loop is recorded in `review_loop_decisions`:
+the decision, whether it changed the loop (`applied`), a message (what the
+decision changed, or why it was not applied), the origin (`decided_by`:
+`api` or `approval-card`) and who decided (`actor_id`,
+`caused_by_actor_id`). A decision that changes the loop is written in the
+same transaction as its row, so an applied decision always has its record,
+and a failure to write the row leaves the loop unchanged. A decision stays
+applied when the leg that it resumes does not start. A decision that
+arrives when the loop is not in `awaiting_user` is recorded with `applied`
+false. **Remind me in 4h** changes no loop column; the notification service
+snoozes the card after the loop has checked that it is parked. The reminder
+is recorded after that snooze write: applied when the card was snoozed, not
+applied (with the reason) when the card was no longer pending, for example
+because it expired during the answer. A
+decision through REST or a card answered on the web records the person; a
+card answered through Telegram or Slack records no person. The decision
+card that a decision closes records the same person in
+`answered_by_actor_id`. `GET /api/review-loops/{id}` returns the
+decisions, oldest first, under `decisions`.
+
+`POST /api/review-loops/{id}/decision` refuses `remind_4h` with 400 (only
+the card can be snoozed) and returns 409 for a decision that was not
+applied. An applied decision returns 200 with `applied: true`; `ok` is
+false when the resumed leg did not start.
+
 Budgets are hard: each leg is a metered workflow run; a reserve fraction
 guarantees the final implementation attempt is always verified. Killing
 the loop (UI, REST, or `review_loop_kill`) kills its current leg only.
+
+**Attribution.** A loop records who created it and on whose behalf
+(`created_by_actor_id`, `caused_by_actor_id`): the person for
+`POST /api/sessions`, or the system actor and the calling session's cause
+for `review_loop_start`. Every leg is a workflow run created by the system
+actor for the loop's cause, and its session is created with that cause, so
+the agent work in each leg is for the person who started the loop. A
+decision by another person does not change that cause.
+A kill records `killed_by_actor_id` and `killed_caused_by_actor_id` on the
+loop and on its current leg. A leg killed through its run kills the loop
+with the same attribution. See [accounts.md](accounts.md#attribution).
 
 ## When to use it
 

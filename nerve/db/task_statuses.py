@@ -8,9 +8,12 @@ rows of the ``task_statuses`` table — which is distinct from a task's
 
 from __future__ import annotations
 
+import json
 import random
 import re
 from datetime import datetime, timezone
+
+from nerve.identity import UNATTRIBUTED, Attribution
 
 # Status names are slug-like so they're safe to store on tasks.status and
 # render without escaping: lowercase alphanumerics + underscores, starting
@@ -59,7 +62,39 @@ def normalize_color(color: str | None) -> str:
 
 
 class TaskStatusStore:
-    """Mixin providing CRUD for the configurable ``task_statuses`` table."""
+    """Mixin providing CRUD for the configurable ``task_statuses`` table.
+
+    Every change also appends a row to ``task_status_events`` in the same
+    transaction, with the ``attribution`` that the caller passes.
+    """
+
+    async def _record_status_def_event(
+        self,
+        change: str,
+        status_name: str | None,
+        detail: dict | None,
+        attribution: Attribution,
+    ) -> None:
+        """Append a status definition change. Caller must hold ``_atomic()``."""
+        await self.db.execute(
+            """INSERT INTO task_status_events
+                   (change, status_name, detail, actor_id, caused_by_actor_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                change, status_name,
+                json.dumps(detail, sort_keys=True) if detail else None,
+                attribution.actor_id, attribution.caused_by_actor_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    async def list_task_status_events(self, limit: int = 200) -> list[dict]:
+        """Status definition changes, oldest first."""
+        async with self.db.execute(
+            "SELECT * FROM task_status_events ORDER BY created_at ASC, id ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
 
     async def list_task_statuses(self) -> list[dict]:
         """Return all status definitions ordered by sort_order then name."""
@@ -68,7 +103,9 @@ class TaskStatusStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
-    async def reorder_task_statuses(self, names: list[str]) -> list[dict]:
+    async def reorder_task_statuses(
+        self, names: list[str], *, attribution: Attribution = UNATTRIBUTED,
+    ) -> list[dict]:
         """Rewrite ``sort_order`` to match the given sequence of names.
 
         Takes the whole desired order rather than one status's new index:
@@ -92,6 +129,9 @@ class TaskStatusStore:
             await self.db.executemany(
                 "UPDATE task_statuses SET sort_order = ? WHERE name = ?",
                 [(i, name) for i, name in enumerate(ordered)],
+            )
+            await self._record_status_def_event(
+                "reordered", None, {"order": ordered}, attribution,
             )
 
         return await self.list_task_statuses()
@@ -117,6 +157,8 @@ class TaskStatusStore:
         color: str | None = None,
         description: str = "",
         is_system: int = 0,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Insert a new status definition. Caller validates name uniqueness."""
         now = datetime.now(timezone.utc).isoformat()
@@ -124,13 +166,19 @@ class TaskStatusStore:
             "SELECT COALESCE(MAX(sort_order), -1) FROM task_statuses"
         ) as cur:
             next_order = (await cur.fetchone())[0] + 1
+        color = normalize_color(color)
         async with self._atomic():
             await self.db.execute(
                 """INSERT INTO task_statuses
                        (name, label, color, description, is_system, sort_order, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (name, label, normalize_color(color), description,
+                (name, label, color, description,
                  1 if is_system else 0, next_order, now),
+            )
+            await self._record_status_def_event(
+                "created", name,
+                {"label": label, "color": color, "description": description},
+                attribution,
             )
         return await self.get_task_status_def(name)  # type: ignore[return-value]
 
@@ -142,33 +190,43 @@ class TaskStatusStore:
         color: str | None = None,
         description: str | None = None,
         sort_order: int | None = None,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> None:
         """Patch mutable fields of a status definition (never the name)."""
-        sets: list[str] = []
-        params: list = []
+        changes: dict = {}
         if label is not None:
-            sets.append("label = ?")
-            params.append(label)
+            changes["label"] = label
         if color is not None:
-            sets.append("color = ?")
-            params.append(normalize_color(color))
+            changes["color"] = normalize_color(color)
         if description is not None:
-            sets.append("description = ?")
-            params.append(description)
+            changes["description"] = description
         if sort_order is not None:
-            sets.append("sort_order = ?")
-            params.append(sort_order)
-        if not sets:
+            changes["sort_order"] = sort_order
+        if not changes:
             return
-        params.append(name)
-        await self._write(
-            f"UPDATE task_statuses SET {', '.join(sets)} WHERE name = ?",
-            tuple(params),
-        )
+        async with self._atomic():
+            cursor = await self.db.execute(
+                f"UPDATE task_statuses SET {', '.join(f'{c} = ?' for c in changes)} "
+                "WHERE name = ?",
+                (*changes.values(), name),
+            )
+            updated = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if updated:
+                await self._record_status_def_event("updated", name, changes, attribution)
 
-    async def delete_task_status_def(self, name: str) -> None:
+    async def delete_task_status_def(
+        self, name: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> None:
         """Delete a status definition. Caller enforces protection rules."""
-        await self._write("DELETE FROM task_statuses WHERE name = ?", (name,))
+        async with self._atomic():
+            cursor = await self.db.execute(
+                "DELETE FROM task_statuses WHERE name = ?", (name,),
+            )
+            deleted = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if deleted:
+                await self._record_status_def_event("deleted", name, None, attribution)
 
     async def count_tasks_with_status(self, name: str) -> int:
         """Count tasks currently set to the given status."""
