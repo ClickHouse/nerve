@@ -63,7 +63,7 @@ User reviews (via /plans UI or chat tools)
 
 ### `plan_update(plan_id, content, feedback?)`
 
-- Guards: only pending or revising plans can be updated
+- Guards: only pending plans can be updated
 - Marks the old plan as `superseded` (and stores optional `feedback` on it explaining the change)
 - Creates a new plan record: `version = old.version + 1`, `parent_plan_id = old.id`, same `task_id`/`plan_type`, fresh `session_id` from the updating agent
 - Writes a "Plan updated: …" note to task history
@@ -86,19 +86,17 @@ User reviews (via /plans UI or chat tools)
 ### `plan_revise(plan_id, feedback)`
 
 - Guards: only pending plans can be revised; feedback is required
-- Stores feedback on the plan record and sets its status to `revising`
+- Stores feedback on the plan record
 - Writes revision note to task history
 - Sends feedback as a message to the session that proposed the plan (`cron:task-planner` for the planner's own plans)
 - Planner agent sees prior context + feedback, calls `plan_update` to produce v+1 linked to the existing plan
-- The current plan is automatically superseded by the update
-- If the revision turn ends without `plan_update`, the plan is `pending` again
+- The current pending plan is automatically superseded by the update
 
 ## Plan Statuses
 
 | Status | Meaning |
 |--------|---------|
 | `pending` | Awaiting human review |
-| `revising` | A revision was requested; the planner writes a new version. No approve, decline, second revision or `PATCH` applies. Only the revision ends it: `plan_update` supersedes the plan, or the revision turn ends without a new version and the plan is `pending` again. At startup a revising plan is `pending` again, unless resume-after-restart continues its revision session; then it is `pending` again when that resume ends without a new version |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
 | `declined` | Rejected by user |
@@ -159,7 +157,7 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `task_id` | TEXT | Linked task |
 | `session_id` | TEXT | Planner session that created it |
 | `impl_session_id` | TEXT | Implementation session (after approval) |
-| `status` | TEXT | pending/revising/approved/declined/superseded/implementing |
+| `status` | TEXT | pending/approved/declined/superseded/implementing |
 | `content` | TEXT | Plan markdown |
 | `feedback` | TEXT | User revision feedback |
 | `version` | INTEGER | Version number (increments on revision) |
@@ -180,20 +178,19 @@ the version they create. `plan_update` records no reviewer on the version it
 replaces, because the planner replacing its own plan is not a review. All
 four columns are actor IDs; see [Accounts and identity](accounts.md#attribution).
 
-A decision on a plan (approve, decline, revise, `PATCH`, and `plan_update`
+A decision on a plan (approve, decline, `PATCH`, and `plan_update`
 superseding the old version) applies only while the plan still has the
-status that the decision read, and each decision changes the status. Of two
-concurrent decisions, one wins; the other changes nothing and gets HTTP 409
-(REST) or a "no longer pending" answer (tools). Only the winner starts an
-implementation or a revision turn. A revision request moves the plan to
-`revising`, so a revision and an approval or a decline never both apply.
-`PATCH` cannot set `revising` (400) or change a revising plan (409).
+status that the decision read. Of two concurrent decisions, one wins; the
+other changes nothing and gets HTTP 409 (REST) or a "no longer pending"
+answer (tools). Only the winner starts an implementation or changes the
+task. A revision request leaves the plan `pending`, so a revision and an
+approval of the same plan can both proceed.
 
 ## Web UI
 
 ### Plan List (`/plans`)
 
-- Status filter tabs: All, Pending, Revising, Approved, Implementing, Declined
+- Status filter tabs: All, Pending, Approved, Implementing, Declined
 - Cards show: task title, plan version, status badge, creation date
 - Click → navigate to plan detail
 
@@ -203,7 +200,6 @@ implementation or a revision turn. A revision request moves the plan to
 - Task link + implementation session link (when applicable)
 - Who proposed this version and who reviewed the plan, from the writer and
   reviewer columns
-- A revising plan shows that a revision runs and offers no decision
 - Action bar for pending plans:
   - **Approve & Implement** — spawns implementation session, redirects to Chat
   - **Decline** — marks plan as declined
