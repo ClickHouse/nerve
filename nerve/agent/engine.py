@@ -39,6 +39,13 @@ from nerve.agent.backends import (
     TurnInput,
     build_backends,
 )
+from nerve.agent.backends.base import (
+    BLOCKER_AUTONOMOUS_TURN,
+    BLOCKER_BACKGROUND_TASK,
+    BLOCKER_BUFFERED_OUTPUT,
+    BLOCKER_STATE_UNKNOWN,
+    ResumeRequiredError,
+)
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
@@ -79,10 +86,11 @@ from nerve.identity import (
     resolve_cause,
 )
 from nerve.inference_principal import inference_principal
+from nerve.agent.managed_mcp import SessionCatalogs, UpdateOutcome
 from nerve.mcp_gateway import (
     BUILTIN_SERVER_NAME,
+    CatalogServers,
     GatewayCatalog,
-    GatewayServer,
     McpGatewayCatalog,
 )
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -182,6 +190,24 @@ def _model_family(model: str) -> str:
     # Trailing release date: "-20260601"
     m = re.sub(r"-20\d{6}$", "", m)
     return m
+
+
+class McpCatalogApplyError(Exception):
+    """A catalog change stopped a session's client, and its replacement
+    could not continue the conversation.
+
+    The session keeps its native conversation; the next user turn tries
+    again with a client that must resume it.
+    """
+
+
+@dataclass
+class DrainOutcome:
+    """What a drain of buffered autonomous output found at its end."""
+
+    # True when the drain ended with no turn open, nothing buffered, and the
+    # runtime alive: the runtime was between turns at that moment.
+    quiet: bool = False
 
 
 @dataclass
@@ -300,6 +326,12 @@ class AgentEngine:
                 config.mcp_gateway_url, on_change=self._on_mcp_catalog_change,
                 refresh_interval=config.mcp_gateway_refresh_seconds,
             )
+        # The applied catalog of each running client in external mode, and
+        # the updates of running clients to a newer catalog.
+        self._session_catalogs = SessionCatalogs()
+        # Sessions whose client was stopped for a catalog change: their next
+        # client build must continue the native conversation.
+        self._resume_required: set[str] = set()
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -466,22 +498,28 @@ class AgentEngine:
         """Whether the organization manages the MCP servers (external mode)."""
         return self._managed_mcp
 
-    def managed_mcp_servers(self) -> tuple[GatewayServer, ...] | None:
+    def managed_mcp_servers(self) -> CatalogServers | None:
         """The MCP gateway servers for a new session.
 
         ``None`` in local mode. In external mode, the servers of the last
-        catalog read, which is empty without a gateway URL or before the first
-        catalog. Each desired server is in it, also one whose tools the gateway
-        has not observed. A server that has the name of Nerve's own server is
-        left out.
+        catalog read with its generation, digest and desired revision, which
+        is empty without a gateway URL or before the first catalog. Each
+        desired server is in it, also one whose tools the gateway has not
+        observed. A server that has the name of Nerve's own server is left
+        out.
         """
         if not self._managed_mcp:
             return None
         if self._mcp_gateway is None:
-            return ()
-        return tuple(
-            server for server in self._mcp_gateway.servers
-            if server.id != BUILTIN_SERVER_NAME
+            return CatalogServers()
+        latest = self._mcp_gateway.latest
+        if latest is None:
+            return CatalogServers()
+        return CatalogServers(
+            (server for server in latest.servers if server.id != BUILTIN_SERVER_NAME),
+            generation=latest.generation,
+            digest=latest.digest,
+            desired_revision=latest.desired_revision,
         )
 
     def mcp_gateway_status(self) -> dict | None:
@@ -489,19 +527,30 @@ class AgentEngine:
 
         It tells what new sessions get, not what a running session loaded.
         ``not_applied`` maps a catalog server ID to the backends that do not
-        give it to their sessions, each with the reason.
+        give it to their sessions, each with the reason. ``sessions`` lists
+        each running client with the desired revision that it was built
+        with and the one that it applied in full, its last update, and why
+        it does not have the last catalog read yet (see
+        :mod:`nerve.agent.managed_mcp`).
         """
         if not self._managed_mcp:
             return None
+        sessions = self._session_catalogs.status(
+            self.sessions.get_client, self.managed_mcp_servers(),
+        )
         if self._mcp_gateway is None:
             return {
                 "url": None, "generation": None, "digest": None,
                 "desired_revision": None, "servers": [],
                 "fetched_at": None, "checked_at": None,
                 "error": "mcp_gateway_url is not set", "retrying": False,
-                "refresh_seconds": None, "not_applied": {},
+                "refresh_seconds": None, "not_applied": {}, "sessions": sessions,
             }
-        return {**self._mcp_gateway.status(), "not_applied": self.managed_mcp_conflicts()}
+        return {
+            **self._mcp_gateway.status(),
+            "not_applied": self.managed_mcp_conflicts(),
+            "sessions": sessions,
+        }
 
     def managed_mcp_conflicts(self) -> dict[str, dict[str, str]]:
         """Catalog servers that a backend leaves out: ID -> backend -> reason.
@@ -538,6 +587,182 @@ class AgentEngine:
                 )
         if self.db is not None:
             await self._sync_mcp_servers_to_db()
+
+    async def _follow_mcp_catalog(
+        self,
+        session_id: str,
+        client: AgentClient,
+        source: str,
+        model: str | None,
+        effort_override: str | None,
+        *,
+        drained_quietly: bool,
+    ) -> AgentClient:
+        """Bring a running client to the last catalog read before a user turn.
+
+        Called by the turn after the drain of buffered autonomous output and
+        before the turn starts, under the session's run lock. Returns the
+        client for the turn: the same one, or a replacement that continues
+        the same native conversation (see :mod:`nerve.agent.managed_mcp`).
+        Raises :class:`McpCatalogApplyError` when the old client is stopped
+        and its replacement cannot continue the conversation.
+        """
+        backend = self._backend_for_live_session(session_id)
+
+        async def blockers() -> tuple[str, ...]:
+            return await self._replacement_blockers(
+                session_id, client, drained_quietly=drained_quietly,
+            )
+
+        outcome = await self._session_catalogs.update(
+            session_id, client, self.managed_mcp_servers(),
+            in_place=backend.capabilities.updates_mcp_servers,
+            blockers=blockers,
+        )
+        if outcome is not UpdateOutcome.REPLACE:
+            return client
+        return await self._replace_client_for_catalog(
+            session_id, client, backend, source, model, effort_override,
+        )
+
+    async def _replacement_blockers(
+        self, session_id: str, client: AgentClient, *, drained_quietly: bool,
+    ) -> tuple[str, ...]:
+        """Live work that a change or a replacement of ``client`` now would
+        disrupt; empty at a safe boundary.
+
+        A turn that the CLI starts on its own follows a background task (a
+        background command, agent, or monitor) that settles. With none
+        running, after a quiet drain and with nothing buffered, no turn can
+        start while the change runs, because this turn holds the session's
+        run lock. The backend adds the work that only its runtime knows
+        (``AgentClient.replacement_blockers``); a client that cannot tell
+        is not changed.
+        """
+        found: list[str] = []
+        if not drained_quietly:
+            found.append(BLOCKER_AUTONOMOUS_TURN)
+        if client.buffer_used() > 0:
+            found.append(BLOCKER_BUFFERED_OUTPUT)
+        if self._has_live_background_tasks(session_id):
+            found.append(BLOCKER_BACKGROUND_TASK)
+        check = getattr(client, "replacement_blockers", None)
+        if check is None:
+            found.append(BLOCKER_STATE_UNKNOWN)
+        else:
+            try:
+                found.extend(await check())
+            except Exception as e:  # noqa: BLE001 - unknown state blocks
+                logger.warning(
+                    "Session %s: the client did not report its live work: %s",
+                    session_id, e,
+                )
+                found.append(BLOCKER_STATE_UNKNOWN)
+        return tuple(dict.fromkeys(found))
+
+    async def _replace_client_for_catalog(
+        self,
+        session_id: str,
+        client: AgentClient,
+        backend: AgentBackend,
+        source: str,
+        model: str | None,
+        effort_override: str | None,
+    ) -> AgentClient:
+        """Replace a running client with one that has the last catalog read
+        and continues the same native conversation.
+
+        The resume target is checked while the old client still runs; when
+        the check fails, the old client stays for the turn and the session
+        shows an apply error. Otherwise the old process is stopped first, so
+        that two processes never write one transcript, and the new client
+        must resume (``SessionSpec.resume_required``). Until a client is
+        built again, every build of the session must resume.
+        """
+        session = await self.db.get_session(session_id)
+        native_id = (
+            client.native_session_id or (session or {}).get("sdk_session_id")
+        )
+        try:
+            session_meta = json.loads((session or {}).get("metadata") or "{}")
+        except (TypeError, ValueError):
+            session_meta = {}
+        cwd = str(
+            (session or {}).get("cwd") or session_meta.get("codex_cwd")
+            or self.config.workspace
+        )
+        problem: str | None = None
+        if native_id:
+            if not backend.validate_resume_target(native_id, cwd):
+                problem = "the conversation to resume is missing on this host"
+            else:
+                check = getattr(client, "resume_problem", None)
+                if check is not None:
+                    try:
+                        problem = await check()
+                    except Exception as e:  # noqa: BLE001 - reported below
+                        problem = f"the resume check failed ({type(e).__name__})"
+        if problem:
+            logger.warning(
+                "Session %s: the %s client keeps the earlier MCP gateway "
+                "catalog; a new client could not resume it: %s",
+                session_id, backend.name, problem,
+            )
+            self._session_catalogs.apply_failed(
+                session_id, client, problem, stopped=False,
+            )
+            return client
+
+        logger.info(
+            "Session %s: replacing the %s client for the MCP gateway catalog, "
+            "resuming native conversation %s",
+            session_id, backend.name, (native_id or "none")[:12],
+        )
+        if native_id and (session or {}).get("sdk_session_id") != native_id:
+            await self.db.update_session_fields(
+                session_id, {"sdk_session_id": native_id},
+            )
+        self._resume_required.add(session_id)
+        self._stop_idle_watcher(session_id)
+        self.sessions.remove_client(session_id)
+        self._session_backends.pop(session_id, None)
+        self._session_models.pop(session_id, None)
+        unregister_handler(session_id)
+        try:
+            await self._safe_disconnect(client)
+            if not await self._wait_runtime_stopped(client):
+                raise McpCatalogApplyError(
+                    "the earlier client process did not stop",
+                )
+            replacement = await self._get_or_create_client(
+                session_id, source, model, effort_override=effort_override,
+            )
+        except BaseException as e:
+            error = (
+                str(e) if isinstance(e, McpCatalogApplyError)
+                else f"{type(e).__name__}: {e}"
+            )
+            self._session_catalogs.apply_failed(
+                session_id, client, error[:300], stopped=True,
+            )
+            if isinstance(e, Exception) and not isinstance(e, McpCatalogApplyError):
+                raise McpCatalogApplyError(error) from e
+            raise
+        return replacement
+
+    @staticmethod
+    async def _wait_runtime_stopped(client: Any, timeout: float = 5.0) -> bool:
+        """Wait until the process of a disconnected client has exited."""
+        stopped = getattr(client, "runtime_stopped", None)
+        if stopped is None:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not stopped():
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -1338,6 +1563,18 @@ class AgentEngine:
             if fork_from and not sdk_resume_id:
                 sdk_resume_id = fork_from
 
+            # A client that replaces another one for a catalog change must
+            # continue its conversation: no check here clears the resume
+            # target, and the backend never starts a new conversation.
+            replacing = session_id in self._resume_required
+            resume_required = replacing and bool(sdk_resume_id) and not fork_from
+            if resume_required and not backend.validate_resume_target(
+                sdk_resume_id, session_cwd,
+            ):
+                raise ResumeRequiredError(
+                    "the conversation to resume is missing on this host"
+                )
+
             # Defensive: let the backend verify the resume target is still
             # materialized (claude: the conversation .jsonl under
             # ~/.claude/projects; codex: no cheap check — create_client
@@ -1540,9 +1777,19 @@ class AgentEngine:
                     {"sandbox": str(session_meta.get("codex_sandbox"))}
                     if session_meta.get("codex_sandbox") else {}
                 ),
+                resume_required=resume_required,
             )
 
             client = await backend.create_client(spec)
+            if resume_required and (
+                getattr(client, "resume_dropped", False)
+                or client.native_session_id not in (None, sdk_resume_id)
+            ):
+                await self._safe_disconnect(client)
+                raise ResumeRequiredError(
+                    "the new client did not continue the conversation"
+                )
+            self._resume_required.discard(session_id)
             if getattr(client, "resume_dropped", False):
                 # The backend had to discard the stale native id (codex
                 # resume-miss recovery) — clear the persisted column AND
@@ -1560,6 +1807,10 @@ class AgentEngine:
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
+            if self._managed_mcp:
+                self._session_catalogs.record(session_id, backend.name, client)
+                if replacing:
+                    self._session_catalogs.replaced(session_id, client)
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):
@@ -2936,6 +3187,7 @@ class AgentEngine:
                                     "message: no native turn mapping is available."
                                 )
 
+            running_client = self.sessions.get_client(session_id)
             client = await self._get_or_create_client(
                 session_id, source, model, fork_from=fork_from,
                 fork_last_turn_id=fork_last_turn_id,
@@ -2957,10 +3209,11 @@ class AgentEngine:
             # the user's message for long; if its content arrives later it
             # interleaves into this turn's stream (still rendered) and the
             # idle watcher self-heals the remainder.
+            drained = DrainOutcome()
             try:
                 await self._drain_pending_messages(
                     session_id, client, source, channel,
-                    first_content_timeout=3.0,
+                    first_content_timeout=3.0, outcome=drained,
                 )
             except asyncio.CancelledError:
                 raise
@@ -2968,6 +3221,16 @@ class AgentEngine:
                 logger.warning(
                     "Pre-query drain failed for session %s: %s",
                     session_id, drain_err,
+                )
+
+            # External mode: a newer catalog reaches a running client before
+            # this turn, but only when the drain proved that the client is
+            # between turns. A client built for this turn has the last catalog
+            # read already.
+            if self._managed_mcp and client is running_client:
+                client = await self._follow_mcp_catalog(
+                    session_id, client, source, model, effort_override,
+                    drained_quietly=drained.quiet,
                 )
             # The drain's broadcast_done (if it processed a turn) cleared
             # the open-turn flag set by run(); re-arm it so the synthetic-
@@ -3225,17 +3488,35 @@ class AgentEngine:
                     "agent.cli_max_message_bytes."
                 )
 
+            # No client could continue the conversation after a catalog
+            # change. The user message was not sent; the session keeps its
+            # native conversation for the next turn.
+            keep_conversation = (
+                isinstance(e, (McpCatalogApplyError, ResumeRequiredError))
+                or session_id in self._resume_required
+            )
+            if keep_conversation:
+                error_msg = (
+                    "Agent error: the MCP servers of this agent changed, and "
+                    f"a new client could not continue this conversation ({e}). "
+                    "The conversation is kept; send the message again to try "
+                    "again."
+                )
+
             await broadcaster.broadcast_error(session_id, error_msg)
             # Schedule memorization BEFORE mark_error clears connected_at —
             # the frozen bound keeps coverage intact.  Scheduled, not
             # awaited: an inline memorize would hold the session lock for
             # the whole memorize-queue wait, stalling queued user messages.
             await self.schedule_memorize(session_id)
-            # Clear resume — CLI state may be corrupted after error
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
             client = self.sessions.remove_client(session_id)
-            await self.sessions.mark_error(session_id, error_msg)
+            if keep_conversation:
+                await self.sessions.mark_idle(session_id, preserve_sdk_id=True)
+            else:
+                # Clear resume — CLI state may be corrupted after error
+                await self.sessions.mark_error(session_id, error_msg)
             if client:
                 await self._safe_disconnect(client)
             st.full_response_text = error_msg
@@ -3282,6 +3563,7 @@ class AgentEngine:
         channel: str | None,
         manage_framing: bool = False,
         first_content_timeout: float = 30.0,
+        outcome: DrainOutcome | None = None,
     ) -> int:
         """Drain agent events that arrived outside an active ``run()``.
 
@@ -3312,7 +3594,10 @@ class AgentEngine:
         buffering): the idle watcher passes True; ``run()`` passes False
         because its own framing is already open.
 
-        Returns the number of completed autonomous turns processed.
+        Returns the number of completed autonomous turns processed. When
+        ``outcome`` is given, ``outcome.quiet`` tells whether the drain ended
+        with no turn open and nothing buffered: the runtime was between
+        turns at that moment.
         """
         idle_timeout = self.config.agent.cli_idle_timeout_seconds
         turns = 0
@@ -3368,6 +3653,8 @@ class AgentEngine:
                     # No turn open — only consume what's already buffered.
                     batch = client.try_receive_idle_events()
                     if batch is None:
+                        if outcome is not None:
+                            outcome.quiet = client.is_alive()
                         break  # nothing buffered / stream closed
                 else:
                     # Turn in flight — the runtime is producing; park for

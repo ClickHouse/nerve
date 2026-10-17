@@ -198,9 +198,10 @@ class _FakeCli:
 
     started: list[_FakeCli] = []
 
-    def __init__(self, spec, options):
+    def __init__(self, spec, options, managed_mcp_servers=None):
         self.spec = spec
         self.options = options
+        self.managed_mcp_servers = managed_mcp_servers
         self.env = dict(options.env)
         self.model = options.model or ""
         self.index = len(self.started)

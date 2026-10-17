@@ -23,6 +23,8 @@ from nerve.mcp_gateway import (
     FETCH_DEADLINE_SECONDS,
     MAX_CATALOG_BYTES,
     CatalogError,
+    CatalogServers,
+    CatalogUpdate,
     GatewayHealth,
     GatewayInventory,
     GatewayServer,
@@ -30,8 +32,9 @@ from nerve.mcp_gateway import (
     desired_revision,
     follow_inventory,
     parse_catalog,
+    plan_catalog_update,
 )
-from tests.fake_mcp_gateway import FakeMcpGateway, catalog_payload
+from tests.fake_mcp_gateway import FakeMcpGateway, catalog_payload, fake_revision
 
 BASE = "http://192.0.2.1:8080"
 
@@ -908,6 +911,25 @@ class TestPeriodicRead:
             await reader.close()
 
     @pytest.mark.asyncio
+    async def test_a_slow_answer_adds_its_time_to_the_interval(self, gateway):
+        """The periodic read waits the interval, then the request: a new
+        catalog is read after both, within the interval plus the request
+        deadline."""
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0.05, deadline=2.0)
+        try:
+            await reader.start()
+            gateway.delay = 0.4
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            loop = asyncio.get_running_loop()
+            changed = loop.time()
+            await _until(lambda: reader.latest.generation == 8)
+            elapsed = loop.time() - changed
+        finally:
+            gateway.delay = 0.0
+            await reader.close()
+        assert 0.4 <= elapsed < 0.05 + 2.0
+
+    @pytest.mark.asyncio
     async def test_zero_turns_the_periodic_read_off(self, gateway):
         reader = McpGatewayCatalog(gateway.url, refresh_interval=0)
         try:
@@ -958,3 +980,71 @@ class TestPeriodicRead:
             assert reader.retrying is False
         finally:
             await reader.close()
+
+
+def _revision(server_id: str, *tools: str) -> str:
+    """The desired revision of a server with these allowed tools."""
+    return fake_revision("server", server_id, sorted(tools))
+
+
+def _server(server_id: str, *tools: str) -> GatewayServer:
+    return GatewayServer(
+        id=server_id, url=f"{BASE}/s/{server_id}/mcp", tools=tools,
+        desired_revision=_revision(server_id, *tools),
+    )
+
+
+class TestCatalogUpdatePlan:
+    def test_the_snapshot_is_a_tuple_with_its_generation(self):
+        snapshot = CatalogServers(
+            [_server("docs", "search")], generation=7, digest="sha256:x",
+            desired_revision="sha256:d",
+        )
+        assert snapshot == (_server("docs", "search"),)
+        assert (snapshot.generation, snapshot.digest) == (7, "sha256:x")
+        assert snapshot.desired_revision == "sha256:d"
+        empty = CatalogServers()
+        assert empty == () and empty.generation is None and empty.digest is None
+        assert empty.desired_revision is None
+
+    def test_an_equal_catalog_needs_nothing(self):
+        plan = plan_catalog_update(
+            {"docs"}, {"docs": _revision("docs", "search")}, [_server("docs", "search")],
+        )
+        assert plan == CatalogUpdate()
+        assert plan.empty
+
+    def test_every_kind_of_change(self):
+        plan = plan_catalog_update(
+            configured={"docs", "github", "wiki"},
+            enabled={
+                "docs": _revision("docs", "fetch_page", "search"),
+                "github": _revision("github", "get_issue"),
+            },
+            catalog=[
+                _server("docs", "search"),      # tools changed
+                _server("jira", "create"),      # new
+                _server("wiki", "read"),        # turned off before, back now
+            ],
+        )
+        assert plan == CatalogUpdate(
+            disable=("github",), enable=("wiki",),
+            reconnect=("docs",), missing=("jira",),
+        )
+        assert plan.servers() == ("docs", "github", "jira", "wiki")
+        assert not plan.empty
+
+    def test_a_turned_off_server_that_stays_away_needs_nothing(self):
+        plan = plan_catalog_update(
+            {"docs", "github"}, {"docs": _revision("docs", "search")}, [_server("docs", "search")],
+        )
+        assert plan.empty
+
+    def test_a_server_whose_tools_must_be_listed_again_reconnects(self):
+        plan = plan_catalog_update(
+            {"docs", "github"}, {"docs": _revision("docs", "search")},
+            [_server("docs", "search"), _server("github", "get_issue")],
+            relist=("docs", "github"),
+        )
+        # Only a server that is on can list its tools again.
+        assert plan == CatalogUpdate(enable=("github",), reconnect=("docs",))

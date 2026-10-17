@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import {
-  McpGatewayStatus, type McpGatewayDiagnostics, type McpGatewayServer,
+  McpGatewayStatus, type McpGatewayDiagnostics, type McpGatewayServer, type McpGatewaySession,
 } from './McpGatewayStatus';
 
 const DESIRED = `sha256:0c6e3487${'1'.repeat(56)}`;
@@ -144,5 +144,73 @@ describe('McpGatewayStatus with a server that a backend leaves out', () => {
       'docs: Not applied to Codex: name used by the system configuration (/etc/codex/config.toml)',
     );
     expect(group).toHaveTextContent('catalog generation 7, 2 servers');
+  });
+});
+
+function session(
+  id: string, backend: string, pending: McpGatewaySession['pending'] = null,
+): McpGatewaySession {
+  return {
+    session_id: id,
+    backend,
+    built_revision: DESIRED,
+    applied_revision: DESIRED,
+    inventory: { docs: `sha256:${'a'.repeat(64)}` },
+    last_update: null,
+    pending,
+  };
+}
+
+function pending(overrides: Partial<NonNullable<McpGatewaySession['pending']>> = {}) {
+  return {
+    reason: 'waiting_for_turn', target_revision: DESIRED, servers: [], blocked_by: [], error: null,
+    ...overrides,
+  };
+}
+
+describe('McpGatewayStatus with running sessions', () => {
+  it('counts the sessions that have the catalog', () => {
+    render(<McpGatewayStatus status={status({
+      sessions: [session('s-1', 'claude'), session('s-2', 'codex')],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).toHaveTextContent('2 of 2 running sessions with this catalog');
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('says why a session does not have the catalog yet', () => {
+    render(<McpGatewayStatus status={status({
+      sessions: [
+        session('s-1', 'claude', pending({ servers: ['jira'] })),
+        session('s-2', 'codex', pending({
+          reason: 'waiting_for_safe_boundary', servers: ['docs'],
+          blocked_by: ['command', 'child_agent'],
+        })),
+        session('s-3', 'claude', pending({
+          reason: 'apply_error', servers: ['jira'],
+          error: 'the conversation to resume is missing on this host',
+        })),
+        session('s-4', 'claude'),
+      ],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).toHaveTextContent('1 of 4 running sessions with this catalog');
+    const lines = screen.getAllByRole('status').map((line) => line.textContent);
+    expect(lines).toEqual([
+      'Session s-1 (claude): changes before its next turn; servers: jira',
+      'Session s-2 (codex): waits for a running command and a child agent to end; servers: docs',
+      'Session s-3 (claude): could not take the catalog (the conversation to resume is '
+        + 'missing on this host); the next turn tries again; servers: jira',
+    ]);
+  });
+
+  it('says nothing about sessions without a catalog', () => {
+    render(<McpGatewayStatus status={status({
+      generation: null, digest: null, desired_revision: null, servers: [], fetched_at: null,
+      sessions: [session('s-1', 'claude', pending())],
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(group).not.toHaveTextContent('running session');
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });

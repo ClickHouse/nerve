@@ -918,7 +918,9 @@ class CodexClient(AgentClient):
         self._backend = backend
         self._spec = spec
         # The catalog snapshot of this build (see CodexBackend.create_client).
+        # The engine reads it to know the session's catalog generation.
         managed = backend._resolve_managed(managed)
+        self.managed_mcp_servers = managed
         config_overrides = backend.build_config_overrides(spec, managed)
         env = backend.build_env(spec, managed)
         if backend._ultracode_on(managed):

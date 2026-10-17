@@ -7,6 +7,7 @@ does not change. The gateway is a fake HTTP server on loopback.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ import pytest
 import pytest_asyncio
 
 from nerve.agent.backends import SessionSpec
+from nerve.agent.backends import events as ev
 from nerve.agent.engine import AgentEngine
 from nerve.config import NerveConfig
 from nerve.gateway.auth import AUTH_MODE_ENV
@@ -215,6 +217,25 @@ class TestClaudeSnapshot:
         assert len(reads) == 1
         assert set(options.mcp_servers) == {"nerve", "docs"}
         assert options.allowed_tools == ["mcp__docs"]
+
+    @pytest.mark.asyncio
+    async def test_the_client_keeps_the_snapshot_of_its_options(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A client names the catalog generation that its options come from."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        _claude_without_cli(monkeypatch, engine)
+        await engine._mcp_gateway.start()
+        try:
+            claude = engine._backends["claude"]
+            with patch.object(claude, "_build_hooks", return_value={}):
+                client = await claude.create_client(_spec(engine.config))
+        finally:
+            await engine._mcp_gateway.close()
+        snapshot = client.managed_mcp_servers
+        assert (snapshot.generation, snapshot.digest) == (7, catalog_payload(7, {})["digest"])
+        assert [server.id for server in snapshot] == ["docs", "github"]
+        assert set(client._options.mcp_servers) == {"nerve", "docs", "github"}
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "mcp_gateway"
@@ -914,6 +935,1106 @@ class TestNewSessions:
         assert rows["docs"]["type"] == "http"
         usage = await db.get_mcp_server_usage("docs")
         assert [(u["tool_name"], u["error"]) for u in usage] == [("search", message)]
+
+
+def _claude_without_cli(monkeypatch, engine: AgentEngine, fail: dict | None = None) -> list[tuple]:
+    """Real Claude clients that start no CLI; their MCP server calls are recorded.
+
+    ``fail`` maps a server name to the number of calls that raise first.
+    """
+    from claude_agent_sdk import ClaudeSDKClient
+
+    from nerve.agent.backends import claude as claude_module
+
+    calls: list[tuple] = []
+    failures = dict(fail or {})
+
+    async def connect(self, prompt=None):
+        pass
+
+    def maybe_fail(name):
+        if failures.get(name):
+            failures[name] -= 1
+            raise RuntimeError("MCP server change refused")
+
+    async def toggle(self, name, enabled):
+        calls.append(("toggle", name, enabled))
+        maybe_fail(name)
+
+    async def reconnect(self, name):
+        calls.append(("reconnect", name))
+        maybe_fail(name)
+
+    monkeypatch.setattr(ClaudeSDKClient, "connect", connect)
+    monkeypatch.setattr(ClaudeSDKClient, "toggle_mcp_server", toggle)
+    monkeypatch.setattr(ClaudeSDKClient, "reconnect_mcp_server", reconnect)
+    monkeypatch.setattr(claude_module.ClaudeClient, "is_alive", lambda self: True)
+    # The idle watcher reads the CLI's stream, which these clients do not have.
+    monkeypatch.setattr(engine, "_start_idle_watcher", lambda *args: None)
+    return calls
+
+
+def _sessions_of(engine: AgentEngine) -> dict[str, dict]:
+    return {
+        entry["session_id"]: entry
+        for entry in engine.mcp_gateway_status()["sessions"]
+    }
+
+
+class _ScriptedClient:
+    """An agent client with a scripted idle stream and recorded MCP changes.
+
+    ``idle`` holds event batches that are buffered between turns; ``later``
+    holds batches that arrive while the drain waits. Every step goes to the
+    shared ``log`` in order. ``hang`` maps a server name to the seconds that
+    a change of it takes; ``refuse`` names servers whose change fails.
+    ``blockers`` is what ``replacement_blockers`` reports (live work of the
+    runtime, as a Codex app-server reports it). ``turn_events`` replaces the
+    events of the next turns; ``turn_gate``, when set, holds a turn open
+    until it is set.
+    """
+
+    def __init__(
+        self, number, managed, log, *, native_id, mcp_changes=True, hang=None,
+        refuse=(), model="claude-sonnet-4-5",
+    ):
+        self.number = number
+        self.managed_mcp_servers = managed
+        self.log = log
+        self.model = model
+        self.native_session_id = native_id
+        self.idle: list[list] = []
+        self.later: asyncio.Queue = asyncio.Queue()
+        self.arriving = False
+        self.hang = dict(hang or {})
+        self.refuse = set(refuse)
+        self.blockers: tuple[str, ...] = ()
+        self.stopped = False
+        self.turn_events: list | None = None
+        self.turn_gate: asyncio.Event | None = None
+        if mcp_changes:
+            self.set_mcp_server_enabled = self._set_enabled
+            self.reconnect_mcp_server = self._reconnect
+
+    async def connect(self):
+        pass
+
+    def is_alive(self):
+        return not self.stopped
+
+    async def disconnect(self):
+        self.stopped = True
+        self.log.append(("disconnect", self.number))
+
+    def runtime_stopped(self):
+        return self.stopped
+
+    async def interrupt(self):
+        self.log.append(("interrupt", self.number))
+
+    async def replacement_blockers(self):
+        return self.blockers
+
+    def buffer_used(self):
+        return len(self.idle) + (1 if self.arriving else 0)
+
+    def try_receive_idle_events(self):
+        if not self.idle:
+            return None
+        batch = self.idle.pop(0)
+        self.log.append(("drained", self.number, [type(e).__name__ for e in batch]))
+        return batch
+
+    async def receive_idle_events(self, timeout):
+        batch = await asyncio.wait_for(self.later.get(), timeout)
+        self.log.append(("drained", self.number, [type(e).__name__ for e in batch]))
+        return batch
+
+    async def start_turn(self, turn):
+        # The user's text, without the session preamble and the time note.
+        text = turn.text.rsplit("</session-context>", 1)[-1].strip()
+        self.log.append(("start_turn", self.number, text.split("\n")[0]))
+
+    async def receive_turn(self):
+        if self.turn_gate is not None:
+            await self.turn_gate.wait()
+        for event in self.turn_events or [ev.TextDelta(text="done")]:
+            yield event
+        yield ev.TurnCompleted(native_session_id=self.native_session_id)
+
+    async def _change(self, *entry):
+        name = entry[1]
+        self.log.append(("begin", self.number, *entry))
+        await asyncio.sleep(self.hang.get(name, 0))
+        if name in self.refuse:
+            self.log.append(("refused", self.number, *entry))
+            raise RuntimeError("MCP server change refused")
+        self.log.append(("end", self.number, *entry))
+
+    async def _set_enabled(self, name, enabled):
+        await self._change("toggle", name, enabled)
+
+    async def _reconnect(self, name):
+        await self._change("reconnect", name)
+
+
+class _Scripted:
+    """Makes a backend build scripted clients, with the catalog snapshot
+    that the real backend reads.
+
+    A client built with a resume target continues that native conversation,
+    as the real backends do; a new conversation gets ``native-<number>``.
+    ``resume_failures`` makes the next builds that must resume fail.
+    ``transcripts`` is None (every resume target exists) or the set of
+    native IDs whose conversation exists on this host.
+    """
+
+    def __init__(self, engine, monkeypatch, backend="claude", **client_options):
+        from nerve.agent.backends.base import ResumeRequiredError
+
+        self.engine = engine
+        self.log: list[tuple] = []
+        self.clients: list[_ScriptedClient] = []
+        self.specs: list[SessionSpec] = []
+        self.client_options = dict(client_options)
+        self.resume_failures = 0
+        self.transcripts: set[str] | None = None
+        if backend == "codex":
+            self.client_options["mcp_changes"] = False
+            self.client_options["model"] = engine.config.codex.model
+
+        async def create_client(spec):
+            number = len(self.clients) + 1
+            self.specs.append(spec)
+            if spec.resume_required and self.resume_failures:
+                self.resume_failures -= 1
+                self.log.append(("resume_failed", number))
+                raise ResumeRequiredError("the scripted runtime did not resume")
+            client = _ScriptedClient(
+                number, engine.managed_mcp_servers(), self.log,
+                native_id=spec.resume_native_id or f"native-{number}",
+                **self.client_options,
+            )
+            self.clients.append(client)
+            self.log.append(("built", number, spec.resume_native_id, spec.resume_required))
+            return client
+
+        def validate_resume_target(native_id, cwd):
+            return self.transcripts is None or native_id in self.transcripts
+
+        monkeypatch.setattr(engine._backends[backend], "create_client", create_client)
+        monkeypatch.setattr(
+            engine._backends[backend], "validate_resume_target", validate_resume_target,
+        )
+        # The idle watcher would drain the buffered batches before a turn;
+        # these tests leave them to the turn's own drain.
+        monkeypatch.setattr(engine, "_start_idle_watcher", lambda *args: None)
+
+    @property
+    def client(self) -> _ScriptedClient:
+        return self.clients[-1]
+
+    def changes(self) -> list[tuple]:
+        return [entry[2:] for entry in self.log if entry[0] == "end"]
+
+    def begun(self) -> list[tuple]:
+        return [entry[2:] for entry in self.log if entry[0] == "begin"]
+
+    def builds(self) -> list[tuple]:
+        return [entry[1:] for entry in self.log if entry[0] == "built"]
+
+    def turns(self, number: int | None = None) -> list[tuple]:
+        return [
+            entry for entry in self.log
+            if entry[0] == "start_turn" and number in (None, entry[1])
+        ]
+
+    def index(self, entry: tuple) -> int:
+        return self.log.index(entry)
+
+
+async def _turn(
+    engine: AgentEngine, db, session_id: str = "s-1", text: str = "hello",
+) -> str:
+    return await engine.run(session_id, text, source="web", actor=db.system_actor)
+
+
+async def _set_catalog(
+    engine: AgentEngine, gateway, generation: int, servers: dict, **options,
+) -> None:
+    gateway.catalog = catalog_payload(generation, servers, **options)
+    await engine._mcp_gateway.refresh()
+
+
+def _revision(gateway) -> str:
+    return gateway.catalog["desiredRevision"]
+
+
+async def _native_id(db, session_id: str = "s-1") -> str | None:
+    return (await db.get_session(session_id) or {}).get("sdk_session_id")
+
+
+async def _user_messages(db, session_id: str = "s-1") -> list[str]:
+    return [m["content"] for m in await db.get_messages(session_id) if m["role"] == "user"]
+
+
+class TestRunningSessions:
+    """A newer catalog reaches a running session before its next user turn."""
+
+    @pytest.fixture
+    def budget(self, monkeypatch):
+        import nerve.agent.managed_mcp as managed_mcp
+
+        monkeypatch.setattr(managed_mcp, "UPDATE_BUDGET_SECONDS", 0.3)
+        return 0.3
+
+    @pytest.mark.asyncio
+    async def test_a_claude_session_changes_its_servers_in_place(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db, text="first")
+            built = _revision(gateway)
+            assert _sessions_of(engine)["s-1"] == {
+                "session_id": "s-1", "backend": "claude",
+                "built_revision": built, "applied_revision": built,
+                "inventory": {
+                    "docs": gateway.catalog["servers"][0]["inventory"]["revision"],
+                    "github": gateway.catalog["servers"][1]["inventory"]["revision"],
+                },
+                "last_update": None, "pending": None,
+            }
+            # docs loses a tool, github goes away.
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"]})
+            assert scripted.changes() == []  # nothing happens before the next turn
+            waiting = _sessions_of(engine)["s-1"]["pending"]
+            await _turn(engine, db, text="second")
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert waiting == {
+            "reason": "waiting_for_turn", "target_revision": _revision(gateway),
+            "servers": ["docs", "github"], "blocked_by": [], "error": None,
+        }
+        assert len(scripted.clients) == 1
+        assert scripted.changes() == [("toggle", "github", False), ("reconnect", "docs")]
+        first, second = scripted.turns(1)
+        assert (
+            scripted.index(first)
+            < scripted.index(("begin", 1, "toggle", "github", False))
+            < scripted.index(("end", 1, "reconnect", "docs"))
+            < scripted.index(second)
+        )
+        assert entry["built_revision"] == built
+        assert entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+        assert entry["last_update"]["result"] == "applied"
+        assert entry["last_update"]["method"] == "in_place"
+
+    @pytest.mark.asyncio
+    async def test_a_returning_server_is_turned_on_again(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            await _set_catalog(
+                engine, gateway, 9, {"docs": ["fetch_page", "search"], "github": ["get_issue"]},
+            )
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert len(scripted.clients) == 1
+        assert scripted.changes() == [("toggle", "github", False), ("toggle", "github", True)]
+        assert entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_added_server_replaces_the_claude_client_on_the_same_conversation(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db, text="first")
+            await _set_catalog(
+                engine, gateway, 8,
+                {"docs": ["fetch_page", "search"], "github": ["get_issue"], "jira": ["create"]},
+            )
+            await _turn(engine, db, text="second")
+            entry = _sessions_of(engine)["s-1"]
+            native = await _native_id(db)
+            users = await _user_messages(db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.builds() == [(1, None, False), (2, "native-1", True)]
+        assert scripted.client.native_session_id == "native-1" == native
+        # The new client names the session's cause on its model requests.
+        assert [spec.inference_principal for spec in scripted.specs] == [
+            db.system_actor.actor_id, db.system_actor.actor_id,
+        ]
+        log = scripted.log
+        assert log.index(("disconnect", 1)) < log.index(("built", 2, "native-1", True))
+        assert scripted.turns() == [("start_turn", 1, "first"), ("start_turn", 2, "second")]
+        assert users == ["first", "second"]
+        assert [s.id for s in scripted.client.managed_mcp_servers] == ["docs", "github", "jira"]
+        assert scripted.changes() == []
+        assert entry["built_revision"] == entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+        assert entry["last_update"]["result"] == "replaced"
+        assert entry["last_update"]["method"] == "replacement"
+
+    @pytest.mark.asyncio
+    async def test_a_definition_change_at_unchanged_policy_lists_the_tools_again(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """Another served definition of docs (a schema or a description) has
+        another inventory revision; the desired revision is the same."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        servers = {"docs": ["fetch_page", "search"], "github": ["get_issue"]}
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            before = _revision(gateway)
+            await _set_catalog(
+                engine, gateway, 7, servers,
+                inventory={"docs": ["fetch_page", "search", "search-v2"]},
+            )
+            assert _revision(gateway) == before
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert len(scripted.clients) == 1
+        assert scripted.changes() == [("reconnect", "docs")]
+        assert entry["inventory"]["docs"] == gateway.catalog["servers"][0]["inventory"]["revision"]
+        assert entry["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_client_built_with_an_unknown_inventory_adopts_the_first_revision(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The client listed the tools when it connected, so the first
+        observed revision needs no new list; a later change does."""
+        servers = {"docs": ["fetch_page", "search"], "github": ["get_issue"]}
+        gateway.catalog = catalog_payload(7, servers, inventory={"docs": None})
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            assert "docs" not in _sessions_of(engine)["s-1"]["inventory"]
+            await _set_catalog(engine, gateway, 7, servers)
+            assert _sessions_of(engine)["s-1"]["pending"] is None
+            await _turn(engine, db)
+            adopted = _sessions_of(engine)["s-1"]
+            await _set_catalog(engine, gateway, 7, servers, inventory={"docs": ["search"]})
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert adopted["inventory"]["docs"] == catalog_payload(7, servers)["servers"][0]["inventory"]["revision"]
+        assert scripted.changes() == [("reconnect", "docs")]
+        assert len(scripted.clients) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_change_during_a_foreground_turn_waits_for_the_next_turn(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            scripted.client.turn_gate = gate = asyncio.Event()
+            turn = asyncio.ensure_future(_turn(engine, db, text="long"))
+            for _ in range(100):
+                if scripted.turns(1)[-1][2] == "long":
+                    break
+                await asyncio.sleep(0.01)
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"], "jira": ["create"]})
+            await asyncio.sleep(0.05)
+            during = (list(scripted.log), _sessions_of(engine)["s-1"]["pending"])
+            gate.set()
+            await turn
+            scripted.client.turn_gate = None
+            await _turn(engine, db, text="next")
+        finally:
+            await engine._mcp_gateway.close()
+        log, pending = during
+        assert ("disconnect", 1) not in log and ("interrupt", 1) not in log
+        assert [e for e in log if e[0] in ("begin", "built")] == [("built", 1, None, False)]
+        assert pending["reason"] == "waiting_for_turn"
+        assert scripted.builds()[-1] == (2, "native-1", True)
+        assert scripted.turns(2) == [("start_turn", 2, "next")]
+
+    @pytest.mark.asyncio
+    async def test_a_background_task_defers_the_change_without_stopping_anything(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            engine._bg_task_registry["s-1"] = {"task-1": {"status": "running"}}
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"], "jira": ["create"]})
+            await _turn(engine, db)
+            deferred = _sessions_of(engine)["s-1"]
+            deferred_log = list(scripted.log)
+            engine._bg_task_registry["s-1"]["task-1"]["status"] = "done"
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert not [e for e in deferred_log if e[0] in ("begin", "disconnect", "interrupt")]
+        assert len([e for e in deferred_log if e[0] == "built"]) == 1
+        assert deferred["applied_revision"] == deferred["built_revision"]
+        assert deferred["pending"] == {
+            "reason": "waiting_for_safe_boundary", "target_revision": _revision(gateway),
+            "servers": ["docs", "github", "jira"], "blocked_by": ["background_task"],
+            "error": None,
+        }
+        assert scripted.builds()[-1] == (2, "native-1", True)
+        assert _sessions_of(engine)["s-1"]["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_background_task_that_settles_during_a_change_defers_the_rest(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A background task that settles makes the CLI start a turn of its
+        own at any time, also after the drain found it quiet. While one
+        runs, the client gets no change."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            client = scripted.client
+            engine._bg_task_registry["s-1"] = {"task-1": {"status": "running"}}
+
+            async def settles_during_the_change(name, enabled):
+                client.idle.append([ev.SystemEvent(subtype="init")])
+                await client._set_enabled(name, enabled)
+
+            client.set_mcp_server_enabled = settles_during_the_change
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            assert scripted.begun() == []
+            behind = _sessions_of(engine)["s-1"]
+
+            # The task ended and its output is drained: the next turn changes.
+            engine._bg_task_registry["s-1"]["task-1"]["status"] = "completed"
+            client.idle.clear()
+            client.set_mcp_server_enabled = client._set_enabled
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert behind["pending"]["reason"] == "waiting_for_safe_boundary"
+        assert behind["pending"]["servers"] == ["github"]
+        assert scripted.changes() == [("toggle", "github", False)]
+        assert _sessions_of(engine)["s-1"]["applied_revision"] == _revision(gateway)
+
+    @pytest.mark.asyncio
+    async def test_codex_child_work_defers_the_replacement(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A running command or child agent of the app-server ends with its
+        process, so the client is not replaced while one runs."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, backend="codex")
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("c-1", source="web", backend="codex", actor=None)
+            await _turn(engine, db, "c-1")
+            scripted.client.blockers = ("child_agent", "command")
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"]})
+            await _turn(engine, db, "c-1")
+            deferred = _sessions_of(engine)["c-1"]["pending"]
+            deferred_log = list(scripted.log)
+            scripted.client.blockers = ()
+            await _turn(engine, db, "c-1")
+            native = await _native_id(db, "c-1")
+        finally:
+            await engine._mcp_gateway.close()
+        assert not [e for e in deferred_log if e[0] in ("disconnect", "interrupt")]
+        assert deferred["reason"] == "waiting_for_safe_boundary"
+        assert deferred["blocked_by"] == ["child_agent", "command"]
+        assert scripted.builds() == [(1, None, False), (2, "native-1", True)]
+        assert native == "native-1"
+        assert scripted.turns() == [
+            ("start_turn", 1, "hello"), ("start_turn", 1, "hello"), ("start_turn", 2, "hello"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_codex_session_is_replaced_on_the_same_thread(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """Codex has no in-place change: every catalog change that the client
+        does not have (a removal, a new definition, an added server) builds
+        a new app-server that resumes the same thread."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, backend="codex")
+        await engine._mcp_gateway.start()
+        try:
+            await db.create_session("c-1", source="web", backend="codex", actor=None)
+            await _turn(engine, db, "c-1")
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"], "jira": ["create"]})
+            await _turn(engine, db, "c-1")
+            # Another tenant generation with the same servers: no change.
+            await _set_catalog(engine, gateway, 9, {"docs": ["search"], "jira": ["create"]})
+            await _turn(engine, db, "c-1")
+            entry = _sessions_of(engine)["c-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.builds() == [(1, None, False), (2, "native-1", True)]
+        assert all(spec.cwd == scripted.specs[0].cwd for spec in scripted.specs)
+        assert scripted.specs[1].model == scripted.specs[0].model
+        assert scripted.specs[1].system_prompt == scripted.specs[0].system_prompt
+        assert [s.id for s in scripted.client.managed_mcp_servers] == ["docs", "jira"]
+        assert entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_rapid_successive_edits_are_coalesced(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            engine._bg_task_registry["s-1"] = {"task-1": {"status": "running"}}
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"]})
+            await _turn(engine, db)
+            await _set_catalog(engine, gateway, 9, {"docs": ["search"], "jira": ["create"]})
+            await _set_catalog(engine, gateway, 10, {"docs": ["fetch_page"], "linear": ["read"]})
+            await _turn(engine, db)
+            engine._bg_task_registry["s-1"]["task-1"]["status"] = "done"
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.begun() == []
+        assert scripted.builds() == [(1, None, False), (2, "native-1", True)]
+        assert [s.id for s in scripted.client.managed_mcp_servers] == ["docs", "linear"]
+        assert entry["applied_revision"] == _revision(gateway)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_resume_check_keeps_the_running_client(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The resume target is checked while the old client runs; when it is
+        missing, the turn runs on the old client and the session shows an
+        apply error."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db, text="first")
+            scripted.transcripts = set()
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"], "jira": ["create"]})
+            await _turn(engine, db, text="second")
+            entry = _sessions_of(engine)["s-1"]
+            native = await _native_id(db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert len(scripted.clients) == 1
+        assert ("disconnect", 1) not in scripted.log
+        assert scripted.turns() == [("start_turn", 1, "first"), ("start_turn", 1, "second")]
+        assert native == "native-1"
+        assert entry["applied_revision"] == entry["built_revision"]
+        assert entry["pending"]["reason"] == "apply_error"
+        assert "missing" in entry["pending"]["error"]
+        assert entry["last_update"]["result"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_replacement_keeps_the_conversation_and_sends_nothing(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The old client is stopped, and the new one cannot resume: the turn
+        ends with an error, the message reaches no model, the native ID
+        stays, and the next turn resumes the same conversation."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db, text="first")
+            scripted.resume_failures = 1
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"], "jira": ["create"]})
+            reply = await _turn(engine, db, text="second")
+            failed = _sessions_of(engine)["s-1"]
+            native_after_failure = await _native_id(db)
+            await _turn(engine, db, text="third")
+            entry = _sessions_of(engine)["s-1"]
+            native = await _native_id(db)
+            users = await _user_messages(db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert "could not continue this conversation" in reply
+        assert native_after_failure == native == "native-1"
+        assert failed["pending"]["reason"] == "apply_error"
+        assert failed["last_update"]["result"] == "failed"
+        assert [e for e in scripted.log if e[0] in ("built", "resume_failed", "disconnect")] == [
+            ("built", 1, None, False),
+            ("disconnect", 1),
+            ("resume_failed", 2),
+            ("built", 2, "native-1", True),
+        ]
+        # "second" was stored once and sent to no model; "third" went once.
+        assert scripted.turns() == [("start_turn", 1, "first"), ("start_turn", 2, "third")]
+        assert users == ["first", "second", "third"]
+        assert entry["pending"] is None
+        assert entry["built_revision"] == _revision(gateway)
+        assert entry["last_update"]["result"] == "replaced"
+
+    @pytest.mark.asyncio
+    async def test_a_change_without_a_result_replaces_the_client_before_the_turn(
+        self, tmp_path, db, gateway, external, monkeypatch, budget,
+    ):
+        """A disable that outlives the budget may still land in the old CLI,
+        so the turn runs on a new client that resumes the conversation."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, hang={"github": 5.0})
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        log = scripted.log
+        assert len(scripted.clients) == 2
+        assert log.index(("begin", 1, "toggle", "github", False)) < log.index(("disconnect", 1))
+        assert log.index(("disconnect", 1)) < log.index(("built", 2, "native-1", True))
+        assert scripted.turns(2) == [("start_turn", 2, "hello")]
+        assert ("end", 1, "toggle", "github", False) not in log
+        assert [s.id for s in scripted.client.managed_mcp_servers] == ["docs"]
+        assert entry["applied_revision"] == entry["built_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_hanging_changes_share_one_budget(
+        self, tmp_path, db, gateway, external, monkeypatch, budget,
+    ):
+        servers = {name: ["read"] for name in ("alpha", "beta", "gamma", "delta")}
+        gateway.catalog = catalog_payload(7, servers)
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, hang={n: 5.0 for n in ("alpha", "beta", "gamma")})
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            await _set_catalog(engine, gateway, 8, {"delta": ["read"]})
+            started = asyncio.get_running_loop().time()
+            await _turn(engine, db)
+            elapsed = asyncio.get_running_loop().time() - started
+        finally:
+            await engine._mcp_gateway.close()
+        assert sorted(e[1] for e in scripted.begun()) == ["alpha", "beta", "gamma"]
+        # The three disables ran at the same time, inside one budget.
+        assert elapsed < budget * 3
+        assert scripted.log[-1] == ("start_turn", 2, "hello")
+
+    @pytest.mark.asyncio
+    async def test_removed_servers_are_turned_off_first(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, hang={"github": 0.05})
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"]})
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        log = scripted.log
+        assert log.index(("end", 1, "toggle", "github", False)) < log.index(("begin", 1, "reconnect", "docs"))
+
+    @pytest.mark.asyncio
+    async def test_a_refused_change_is_pending_and_tried_again(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch, refuse={"github"})
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            built = _revision(gateway)
+            await _set_catalog(engine, gateway, 8, {"docs": ["search"]})
+            await _turn(engine, db)
+            refused = _sessions_of(engine)["s-1"]
+            scripted.client.refuse.clear()
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        # The turn goes on with the same client; the session is not current.
+        assert len(scripted.clients) == 1
+        assert refused["applied_revision"] == built
+        assert refused["pending"]["reason"] == "apply_error"
+        assert refused["pending"]["servers"] == ["github"]
+        assert "github" in refused["pending"]["error"]
+        assert entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+        assert [e for e in scripted.begun() if e[0] == "toggle"] == [
+            ("toggle", "github", False), ("toggle", "github", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_periodic_read_reaches_a_running_session(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        engine._mcp_gateway._refresh_interval = 0.05  # the setting's minimum is 1 s
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            gateway.catalog = catalog_payload(8, {"docs": ["fetch_page", "search"]})
+            for _ in range(100):
+                if engine.mcp_gateway_status()["generation"] == 8:
+                    break
+                await asyncio.sleep(0.02)
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.changes() == [("toggle", "github", False)]
+        assert _sessions_of(engine)["s-1"]["applied_revision"] == _revision(gateway)
+
+    @pytest.mark.asyncio
+    async def test_generation_and_health_changes_need_no_call(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        servers = {"docs": ["fetch_page", "search"], "github": ["get_issue"]}
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            # Another agent's change: a new generation, the same servers.
+            await _set_catalog(engine, gateway, 8, servers)
+            await _turn(engine, db)
+            # A failed check of github: health only.
+            payload = catalog_payload(8, servers)
+            payload["servers"][1]["health"] = {
+                "inventoryState": "stale", "checkedAt": "2026-10-17T12:05:00Z",
+                "failure": "upstream_timeout",
+            }
+            gateway.catalog = payload
+            await engine._mcp_gateway.refresh()
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.begun() == []
+        assert scripted.builds() == [(1, None, False)]
+        assert entry["pending"] is None and entry["last_update"] is None
+
+    @pytest.mark.asyncio
+    async def test_an_autonomous_turn_in_progress_defers_the_change(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The CLI started a turn of its own and gave no content within the
+        drain's wait: it is not between turns, so this turn changes nothing."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            scripted.client.idle = [[ev.SystemEvent(subtype="init")]]
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            assert scripted.changes() == []
+            assert scripted.log[-1] == ("start_turn", 1, "hello")
+            behind = _sessions_of(engine)["s-1"]
+            # The next turn finds the client between turns.
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert behind["pending"]["reason"] == "waiting_for_safe_boundary"
+        assert behind["pending"]["blocked_by"] == ["autonomous_turn"]
+        assert behind["pending"]["servers"] == ["github"]
+        assert scripted.changes() == [("toggle", "github", False)]
+        assert _sessions_of(engine)["s-1"]["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_buffered_autonomous_turn_is_drained_before_any_change(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            # A background task settled: the CLI runs a whole turn on its own.
+            # Its start is buffered; its content comes while the drain waits.
+            scripted.client.idle = [[ev.SystemEvent(subtype="init")]]
+            scripted.client.later.put_nowait([
+                ev.TextDelta(text="background result"),
+                ev.TurnCompleted(native_session_id="native-1"),
+            ])
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+            messages = await db.get_messages("s-1")
+        finally:
+            await engine._mcp_gateway.close()
+        drained = scripted.index(("drained", 1, ["TextDelta", "TurnCompleted"]))
+        changed = scripted.index(("begin", 1, "toggle", "github", False))
+        assert drained < changed < scripted.log.index(("start_turn", 1, "hello"), changed)
+        assert any("background result" in (m.get("content") or "") for m in messages)
+        assert _sessions_of(engine)["s-1"]["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_output_that_arrives_after_the_drain_defers_the_change(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            scripted.client.arriving = True  # buffered, not yet readable
+            await _set_catalog(engine, gateway, 8, {"docs": ["fetch_page", "search"]})
+            await _turn(engine, db)
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.changes() == []
+        pending = _sessions_of(engine)["s-1"]["pending"]
+        assert pending["servers"] == ["github"]
+        assert pending["blocked_by"] == ["buffered_output"]
+
+    @pytest.mark.asyncio
+    async def test_a_gateway_session_reset_reaches_the_model_and_changes_nothing(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """A -32002 error of the gateway (the upstream session was reset) is
+        a tool result like any other: no rebuild, no reload, no pending
+        state, and no new attempt of the call."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        message = (
+            "MCP error -32002: MCP server session was reset; state from earlier "
+            "calls is gone; this call was not sent."
+        )
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            requests = gateway.catalog_requests
+            scripted.client.turn_events = [
+                ev.ToolUse(tool_use_id="t1", name="mcp__docs__search", input={}),
+                ev.ToolResult(tool_use_id="t1", content=message, is_error=True),
+                ev.TextDelta(text="the session was reset"),
+            ]
+            await _turn(engine, db)
+            scripted.client.turn_events = None
+            await _turn(engine, db)
+            entry = _sessions_of(engine)["s-1"]
+            messages = await db.get_messages("s-1")
+        finally:
+            await engine._mcp_gateway.close()
+        assert scripted.builds() == [(1, None, False)]
+        assert scripted.begun() == []
+        assert len(scripted.turns()) == 3
+        assert gateway.catalog_requests == requests
+        assert entry["pending"] is None and entry["last_update"] is None
+        stored = json.dumps([m.get("blocks") for m in messages])
+        assert json.dumps(message)[1:-1] in stored
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_called_a_tool_is_never_tried_again(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        """The engine retries a turn only before any content, so a retry can
+        never send a tool call again."""
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        scripted = _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            await _turn(engine, db)
+            client = scripted.client
+
+            async def lost_after_a_tool_call():
+                yield ev.ToolUse(tool_use_id="t1", name="mcp__docs__search", input={})
+                raise RuntimeError("connection lost")
+
+            client.receive_turn = lost_after_a_tool_call
+            reply = await _turn(engine, db, text="again")
+        finally:
+            await engine._mcp_gateway.close()
+        assert "connection lost" in reply
+        assert scripted.turns() == [("start_turn", 1, "hello"), ("start_turn", 1, "again")]
+        assert scripted.builds() == [(1, None, False)]
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_list_running_clients_only(
+        self, tmp_path, db, gateway, external, monkeypatch,
+    ):
+        engine = AgentEngine(_config(tmp_path, mcp_gateway_url=gateway.url), db)
+        _Scripted(engine, monkeypatch)
+        await engine._mcp_gateway.start()
+        try:
+            for sid in ("s-1", "s-2"):
+                await _turn(engine, db, sid)
+            assert set(_sessions_of(engine)) == {"s-1", "s-2"}
+            engine.sessions.remove_client("s-1")
+            assert set(_sessions_of(engine)) == {"s-2"}
+            # A rebuilt client starts at the revision of the last catalog read.
+            await _set_catalog(engine, gateway, 8, {"jira": ["create"]})
+            await _turn(engine, db, "s-1")
+        finally:
+            await engine._mcp_gateway.close()
+        entry = _sessions_of(engine)["s-1"]
+        assert entry["built_revision"] == entry["applied_revision"] == _revision(gateway)
+        assert entry["pending"] is None
+
+    @pytest.mark.asyncio
+    async def test_local_mode_tracks_no_session(self, tmp_path, db, monkeypatch):
+        engine = AgentEngine(_config(tmp_path), db)
+        _claude_without_cli(monkeypatch, engine)
+        await db.create_session("s-1", source="web", actor=None)
+        client = await engine._get_or_create_client("s-1", "web", None)
+        assert client.managed_mcp_servers is None
+        assert engine.mcp_gateway_status() is None
+        assert engine._session_catalogs.status(engine.sessions.get_client, None) == []
+
+
+def _snapshot(generation, *ids, url="http://192.0.2.1:8080", inventory=None):
+    from nerve.mcp_gateway import CatalogServers, GatewayInventory, GatewayServer, desired_revision
+
+    servers = [
+        GatewayServer(
+            id=i, url=f"{url}/s/{i}/mcp", tools=("read",),
+            desired_revision=f"sha256:{i}",
+            inventory=None if inventory is None else GatewayInventory(
+                revision=inventory, tool_count=1,
+                observed_at="2026-10-17T12:00:00Z", desired_revision=f"sha256:{i}",
+            ),
+        )
+        for i in ids
+    ]
+    return CatalogServers(
+        servers, generation=generation, digest=f"sha256:{generation}",
+        desired_revision=desired_revision((s.id, s.desired_revision) for s in servers),
+    )
+
+
+async def _none() -> tuple:
+    return ()
+
+
+class TestSessionCatalogUpdates:
+    """The update step on its own."""
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_update_replaces_the_client_next_time(self):
+        from nerve.agent.managed_mcp import SessionCatalogs, UpdateOutcome
+
+        log: list[tuple] = []
+        client = _ScriptedClient(1, _snapshot(7, "docs", "github"), log, native_id="n", hang={"github": 5.0})
+        catalogs = SessionCatalogs()
+        catalogs.record("s-1", "claude", client)
+        task = asyncio.ensure_future(catalogs.update(
+            "s-1", client, _snapshot(8, "docs"), in_place=True, blockers=_none,
+        ))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        outcome = await catalogs.update(
+            "s-1", client, _snapshot(8, "docs"), in_place=True, blockers=_none,
+        )
+        assert outcome is UpdateOutcome.REPLACE
+        entry = catalogs.status(lambda sid: client, _snapshot(8, "docs"))[0]
+        assert entry["applied_revision"] == _snapshot(7, "docs", "github").desired_revision
+        assert entry["pending"]["servers"] == ["github"]
+
+    @pytest.mark.asyncio
+    async def test_a_changed_url_needs_a_new_client(self):
+        from nerve.agent.managed_mcp import SessionCatalogs, UpdateOutcome
+
+        client = _ScriptedClient(1, _snapshot(7, "docs"), [], native_id="n")
+        catalogs = SessionCatalogs()
+        catalogs.record("s-1", "claude", client)
+        moved = _snapshot(7, "docs", url="http://192.0.2.2:8080")
+        assert catalogs.status(lambda sid: client, moved)[0]["pending"]["servers"] == ["docs"]
+        outcome = await catalogs.update("s-1", client, moved, in_place=True, blockers=_none)
+        assert outcome is UpdateOutcome.REPLACE
+
+    @pytest.mark.asyncio
+    async def test_live_work_defers_and_unknown_state_is_live_work(self):
+        from nerve.agent.managed_mcp import SessionCatalogs, UpdateOutcome
+
+        client = _ScriptedClient(1, _snapshot(7, "docs"), [], native_id="n", mcp_changes=False)
+        catalogs = SessionCatalogs()
+        catalogs.record("s-1", "codex", client)
+
+        async def unknown():
+            return ("state_unknown",)
+
+        outcome = await catalogs.update(
+            "s-1", client, _snapshot(8, "docs", "jira"), in_place=False, blockers=unknown,
+        )
+        assert outcome is UpdateOutcome.DEFERRED
+        pending = catalogs.status(lambda sid: client, _snapshot(8, "docs", "jira"))[0]["pending"]
+        assert pending["reason"] == "waiting_for_safe_boundary"
+        assert pending["blocked_by"] == ["state_unknown"]
+
+    def test_a_client_built_from_an_older_catalog_keeps_its_revision(self):
+        """A newer catalog read during the build does not mark the client."""
+        from nerve.agent.managed_mcp import SessionCatalogs
+
+        older, newer = _snapshot(7, "docs"), _snapshot(8, "docs", "jira")
+        client = _ScriptedClient(1, older, [], native_id="n")
+        catalogs = SessionCatalogs()
+        catalogs.record("s-1", "claude", client)
+        entry = catalogs.status(lambda sid: client, newer)[0]
+        assert entry["built_revision"] == entry["applied_revision"] == older.desired_revision
+        assert entry["pending"]["reason"] == "waiting_for_turn"
+        assert entry["pending"]["target_revision"] == newer.desired_revision
+
+    @pytest.mark.asyncio
+    async def test_the_claude_client_uses_the_documented_sdk_calls(self, tmp_path, db, monkeypatch):
+        engine = AgentEngine(_config(tmp_path), db)
+        calls = _claude_without_cli(monkeypatch, engine)
+        claude = engine._backends["claude"]
+        with patch.object(claude, "_build_hooks", return_value={}):
+            client = await claude.create_client(_spec(engine.config))
+        await client.set_mcp_server_enabled("docs", False)
+        await client.reconnect_mcp_server("docs")
+        assert calls == [("toggle", "docs", False), ("reconnect", "docs")]
+        assert await client.replacement_blockers() == ()
+
+    @pytest.mark.asyncio
+    async def test_a_claude_client_that_must_resume_needs_its_transcript(self, tmp_path, db, monkeypatch):
+        from nerve.agent.backends.base import ResumeRequiredError
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        engine = AgentEngine(_config(tmp_path), db)
+        _claude_without_cli(monkeypatch, engine)
+        claude = engine._backends["claude"]
+        spec = _spec(engine.config)
+        spec.resume_native_id = "11111111-2222-3333-4444-555555555555"
+        spec.resume_required = True
+        with patch.object(claude, "_build_hooks", return_value={}):
+            with pytest.raises(ResumeRequiredError):
+                await claude.create_client(spec)
+            projects = Path(os.path.expanduser("~/.claude/projects"))
+            folder = projects / os.path.realpath(spec.cwd).replace("/", "-")
+            folder.mkdir(parents=True)
+            (folder / f"{spec.resume_native_id}.jsonl").write_text("{}\n")
+            client = await claude.create_client(spec)
+        assert client._options.resume == spec.resume_native_id
+        assert client.native_session_id == spec.resume_native_id
 
 
 class TestDenialMessage:

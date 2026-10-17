@@ -1378,8 +1378,25 @@ a failed last read). `checked_at` is the time of the last catalog request and
 background retry runs. `refresh_seconds` is the interval of the periodic
 catalog read (`0` when it is off, `null` without a gateway URL). `not_applied`
 maps a catalog server ID to the backends that leave it out, each with the
-reason (see the MCP server routes above). The
-block is absent in local mode.
+reason (see the MCP server routes above). `sessions` has one entry for each
+running session client, sorted by `session_id` (see
+[Catalog changes in running sessions](config.md#catalog-changes-in-running-sessions)):
+`built_revision` is the desired revision of the catalog that the client was
+built with, and `applied_revision` the desired revision of the last catalog
+that the client took in full (at its build, by an in-place update, or by the
+build of a replacement that resumed the conversation). `inventory` maps a
+server ID to the inventory revision that the client knows. `last_update` is
+the last update of the session's client, or `null`: `method` (`in_place` or
+`replacement`), `result` (`applied`, `replaced`, `partial` or `failed`),
+`target_revision`, `at` and `error`. `pending` is `null` when the client has
+the last catalog read; otherwise `reason` is `waiting_for_turn` (the change
+comes before the next user turn), `waiting_for_safe_boundary` (`blocked_by`
+names the live work: `autonomous_turn`, `buffered_output`,
+`background_task`, `active_turn`, `command`, `child_agent` or
+`state_unknown`) or `apply_error` (`error` says why; the next user turn tries
+again), `target_revision` is the desired revision of the last catalog read,
+and `servers` lists the servers that the change touches. The block is absent
+in local mode.
 
 ```json
 "mcp_gateway": {
@@ -1406,7 +1423,23 @@ block is absent in local mode.
   "error": null,
   "retrying": false,
   "refresh_seconds": 30.0,
-  "not_applied": {}
+  "not_applied": {},
+  "sessions": [
+    {"session_id": "s-1", "backend": "claude",
+     "built_revision": "sha256:5d1e…", "applied_revision": "sha256:5d1e…",
+     "inventory": {"docs": "sha256:0b7c…"},
+     "last_update": null,
+     "pending": {"reason": "waiting_for_safe_boundary",
+                 "target_revision": "sha256:0dc5…", "servers": ["docs"],
+                 "blocked_by": ["background_task"], "error": null}},
+    {"session_id": "s-2", "backend": "codex",
+     "built_revision": "sha256:5d1e…", "applied_revision": "sha256:0dc5…",
+     "inventory": {"docs": "sha256:a7d6…"},
+     "last_update": {"method": "replacement", "result": "replaced",
+                     "target_revision": "sha256:0dc5…",
+                     "at": "2026-10-17T12:06:10+00:00", "error": null},
+     "pending": null}
+  ]
 }
 ```
 

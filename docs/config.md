@@ -1831,10 +1831,14 @@ trust store.
   change behavior of a server (`accept`, or `review`: the gateway serves the
   tool definitions that a person approved) does not change the client
   configuration.
-- When the catalog changes, new sessions get the new servers. A session that
-  is running keeps the servers that it started with. Nerve compares the
-  agent's desired revision and the inventory revision of each server; the
-  tenant generation, times and health values never count as a change.
+- When the catalog changes, new sessions get the new servers. A running
+  session gets them before its next user turn after Nerve read the new
+  catalog, in the same conversation, when that turn finds no work that a
+  change would disrupt (see
+  [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
+  Nerve compares the agent's desired revision and, for each server, its URL
+  and inventory revision; the tenant generation, times and health values
+  never count as a change.
 - One catalog request takes at most 5 seconds, from the connection to the
   checked catalog.
 - When the gateway gives no catalog (it is not reachable, it answers with an
@@ -1895,7 +1899,8 @@ adds a server or a tool at the gateway.
 
 When the gateway refuses a server or a tool, it answers with the JSON-RPC
 error `-32001` and a fixed message. The clients connect to the gateway
-directly and give the message to the model unchanged.
+directly and give the message to the model unchanged. For other gateway
+errors, see [Gateway errors and upstream sessions](#gateway-errors-and-upstream-sessions).
 
 The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
@@ -1904,10 +1909,141 @@ service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
 read last: its desired revision and generation, and for each server what the
 gateway observed (tool count, whether the list is current or stale, and the
 reason of a failed last read). They also show the result of the last catalog
-request (see [`GET /api/diagnostics`](api.md#get-apidiagnostics)). A catalog
-that Nerve read is what new sessions get; it does not show what a running
-session loaded. `nerve doctor` shows the configured `mcp_gateway_url`; it does
-not ask the running server.
+request and the catalog state of each running session (see
+[`GET /api/diagnostics`](api.md#get-apidiagnostics) and
+[Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
+A catalog that Nerve read is what new sessions get; what a running session
+has is in its own entry. `nerve doctor` shows the configured
+`mcp_gateway_url`; it does not ask the running server.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns, until the client is idle for `sessions.client_idle_timeout_minutes`,
+its process ends, its model changes, or Nerve restarts. Each new client gets
+the servers of the last catalog read. Before each user turn of a running
+client, after Nerve has read the client's buffered autonomous output, Nerve
+compares the last catalog read with the catalog that the client has: the
+agent's desired revision, and for each server its URL, its desired revision
+and its inventory revision. A client that knew no inventory revision of a
+server takes the first one that it sees without a new tool list, because it
+listed the tools when it connected. The tenant generation, times and health
+values never count as a change, so they never change a client.
+
+| Change at the gateway | Claude session | Codex session |
+|-----------------------|----------------|---------------|
+| A server is removed | Nerve turns the server off in the running CLI; its tools go away | Nerve replaces the client |
+| The desired revision of a server changes, for example its allowed tools, or with `review` the approved definition of a tool | Nerve reconnects the server; the CLI lists its tools again | Nerve replaces the client |
+| The gateway observed other tools of a server (another inventory revision, or no inventory after a known one) | Nerve reconnects the server once; the CLI lists its tools again | Nerve replaces the client |
+| A removed server comes back | Nerve turns it on again; the CLI lists its tools | Nerve replaces the client |
+| A server is added, or the URL of a server changes | Nerve replaces the client | Nerve replaces the client |
+
+To replace a client, Nerve stops the old process and starts a new client
+with the last catalog read, which continues the same conversation: the
+Claude CLI resumes the same session ID, and the Codex app-server resumes the
+same thread (`thread/resume`). The Nerve session, its native ID, its
+history, model, working directory, recalled memories and cause stay the
+same. The Python SDK of Claude has no call that adds a server to a running
+CLI, and the Codex app-server has no request that changes the servers that
+Nerve gives it at launch (`config/mcpServer/reload` reads the configuration
+files again), so these changes need a new client.
+
+A catalog change never starts a new conversation:
+
+- Before Nerve stops the old client, it checks that a new process can resume
+  the conversation (Claude: the session's history file; Codex: the stored
+  thread). When it cannot, the old client stays and the turn runs on it, and
+  diagnostics show `apply_error`.
+- Nerve starts the new client only after the old process has exited, so two
+  processes never write one history.
+- The new client must resume the conversation; it never starts a new one
+  instead. When it cannot, the turn ends with an error, the message reaches
+  no model, and the session keeps its native ID and history. Diagnostics show
+  `apply_error`. The next user turn tries again with a client that must
+  resume; send the message again to try again.
+
+Nerve changes or replaces a client only at a safe boundary, so that the
+change disrupts no work. The read of the buffered autonomous output ended
+with no turn open and nothing more in the buffer, the session runs no
+background task (a background command, agent, or monitor of the Claude CLI),
+and the backend reports no live work. For Codex, live work is a running
+command, a child agent, or an active thread: Nerve follows the app-server's
+notifications, also those that arrive between turns, and asks the app-server
+for the status of each thread that it holds. When it cannot tell, the work
+counts as live. Otherwise the change waits (`waiting_for_safe_boundary`), and
+a later user turn tries again with the catalog that Nerve read last by then,
+so changes that come in the meantime are applied together. Nerve never
+cancels a turn, a tool call, a background task or a child agent to apply a
+catalog, and it never restarts Nerve or resets the conversation for it.
+
+The in-place changes of one Claude update share a budget of 10 seconds, and
+the servers that the catalog no longer names are turned off first, at the
+same time. When a change has no result at the end of the budget, the CLI
+could still apply it later, so Nerve replaces that client for the turn. A
+refused change leaves the session pending with `apply_error`; each later
+user turn tries again.
+
+How long a running session takes to see a change at the gateway:
+
+- **Gateway available:** at most `mcp_gateway_refresh_seconds` plus the
+  catalog request (at most 5 seconds), plus the time until the session's next
+  user turn starts. An in-place update adds to that turn normally a few
+  milliseconds and at most 10 seconds (and then the start of a new client);
+  a replacement adds the start of a new client.
+- **After a gateway outage:** while the gateway gives no catalog, the
+  periodic read waits and the retry reads at its own interval (doubling up to
+  60 seconds). After the gateway is back, the next catalog read comes within
+  the retry interval at that time (at most 60 seconds) plus the request (at
+  most 5 seconds), or at once when a new session starts. Then the bound above
+  applies.
+- **While the client is not at a safe boundary:** the change waits for the
+  first user turn that finds it at one. A session that keeps a background
+  task, a command or a child agent running waits as long as that work runs.
+- **When a change fails:** there is no time bound. Diagnostics show
+  `apply_error` until a later turn succeeds, or until the client is rebuilt
+  for another reason (idle timeout, process end, model change, restart).
+
+A running turn keeps its tool list until it ends, and an autonomous turn does
+not start a check. A new session reads the catalog before its first turn and
+gets the change at once.
+
+A session that is behind is not a gap in the policy: the gateway checks each
+call against the current policy and refuses a server or a tool that the
+organization took away. The model can still see the old tool and gets the
+gateway's refusal when it calls it.
+
+Diagnostics list each running session in `mcp_gateway.sessions`: the desired
+revision that its client was built with (`built_revision`), the last desired
+revision that the client took in full (`applied_revision`; a client that was
+built from an older catalog never shows a newer one), the inventory
+revisions that it knows, its last update (in place or by replacement, and
+the result), and, when the client does not have the last catalog read, the
+reason (`pending`): `waiting_for_turn`, `waiting_for_safe_boundary` with the
+live work that it waits for, or `apply_error` with the error.
+
+#### Gateway errors and upstream sessions
+
+The gateway keeps the state of a managed MCP server (its upstream session)
+for the agent, not for one conversation or one client. All conversations of
+the agent share it, and it stays when Nerve replaces or rebuilds a client.
+It ends when it was idle for the gateway's idle lease, when the gateway is
+rolled out, when the gateway process that holds it is lost, and when the
+organization changes the server's configuration, credential or access.
+
+When a call cannot use that state, the gateway answers with the JSON-RPC
+error `-32002` and a fixed message, with one of these reasons:
+
+- `upstream_session_reset`: the session was reset, the state from earlier
+  calls is gone, and the gateway did not send this call.
+- `upstream_outcome_unknown`: the gateway sent the call and lost its result;
+  the call may have run, and the gateway does not send it again.
+
+The clients give the message to the model unchanged, as for a refusal. Nerve
+does not rebuild or reload a client, does not mark it pending, and does not
+send the call again for these errors. The clients do not send a tool call
+again when its connection drops, and the engine retries a turn only when the
+client fails before any assistant content, so no retry sends a tool call
+again.
 
 ## Auth
 
@@ -1965,7 +2101,10 @@ environment. Nerve keeps the other lines of an `ANTHROPIC_CUSTOM_HEADERS` value
 in its own environment, and replaces a line for this header. The CLI reads its
 environment only when it starts. The session's cause never changes, so a CLI
 process keeps its header for its whole life, and a process that Nerve starts
-again for the session (after a model change or a crash) gets the same header.
+again for the session (after a model change, a crash, or an MCP gateway
+catalog change, see
+[Catalog changes in running sessions](#catalog-changes-in-running-sessions))
+gets the same header.
 
 These requests have no header: memory embedding requests to the OpenAI API,
 and Codex sessions.

@@ -23,6 +23,42 @@ export interface McpGatewayServer {
   };
 }
 
+/** The last update of a running client to a newer catalog. */
+export interface McpGatewaySessionUpdate {
+  method: 'in_place' | 'replacement';
+  result: 'applied' | 'replaced' | 'partial' | 'failed';
+  target_revision: string | null;
+  at: string;
+  error: string | null;
+}
+
+/** Why a running client does not have the last catalog read. */
+export interface McpGatewaySessionPending {
+  reason: 'waiting_for_turn' | 'waiting_for_safe_boundary' | 'apply_error' | string;
+  /** The desired revision of the last catalog read. */
+  target_revision: string | null;
+  /** The servers that the change touches. */
+  servers: string[];
+  /** The live work that the change waits for. */
+  blocked_by: string[];
+  error: string | null;
+}
+
+/** One running client and the catalog that it has. */
+export interface McpGatewaySession {
+  session_id: string;
+  backend: string;
+  /** The desired revision of the catalog that the client was built with. */
+  built_revision: string | null;
+  /** The desired revision of the last catalog that the client took in full. */
+  applied_revision: string | null;
+  /** Server ID -> the inventory revision that the client knows. */
+  inventory: Record<string, string>;
+  last_update: McpGatewaySessionUpdate | null;
+  /** Null when the client has the last catalog read. */
+  pending: McpGatewaySessionPending | null;
+}
+
 /** The `mcp_gateway` block of `GET /api/diagnostics` (external mode only). */
 export interface McpGatewayDiagnostics {
   url: string | null;
@@ -36,8 +72,42 @@ export interface McpGatewayDiagnostics {
   checked_at: string | null;
   error: string | null;
   retrying: boolean;
+  /** Seconds between two catalog reads; 0 when the periodic read is off. */
+  refresh_seconds?: number | null;
   /** Catalog server ID -> backend -> reason, for servers a backend leaves out. */
   not_applied?: Record<string, Record<string, string>>;
+  sessions?: McpGatewaySession[];
+}
+
+/** Text for the live work that a catalog change waits for. */
+const BLOCKER_TEXT: Record<string, string> = {
+  autonomous_turn: 'an autonomous turn',
+  buffered_output: 'unread output',
+  background_task: 'a background task',
+  active_turn: 'an active turn',
+  command: 'a running command',
+  child_agent: 'a child agent',
+  state_unknown: 'work of unknown state',
+};
+
+/** Why a running session does not have the last catalog read. */
+export function pendingText(pending: McpGatewaySessionPending): string {
+  let text: string;
+  if (pending.reason === 'waiting_for_turn') {
+    text = 'changes before its next turn';
+  } else if (pending.reason === 'waiting_for_safe_boundary') {
+    const work = pending.blocked_by.map((blocker) => BLOCKER_TEXT[blocker] ?? blocker);
+    const named = work.length > 1
+      ? `${work.slice(0, -1).join(', ')} and ${work[work.length - 1]}`
+      : work[0] ?? 'running work';
+    text = `waits for ${named} to end`;
+  } else if (pending.reason === 'apply_error') {
+    text = `could not take the catalog${pending.error ? ` (${pending.error})` : ''}; the next turn tries again`;
+  } else {
+    text = pending.reason;
+  }
+  if (pending.servers.length > 0) text += `; servers: ${pending.servers.join(', ')}`;
+  return text;
 }
 
 /** Text for the failure reasons of the catalog contract. */
@@ -85,6 +155,8 @@ export function observedText(server: McpGatewayServer): string {
  */
 export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) {
   const fetched = status.generation !== null;
+  const sessions = status.sessions ?? [];
+  const behind = sessions.filter((session) => session.pending !== null);
   const healthy = fetched && !status.error && Object.keys(status.not_applied ?? {}).length === 0;
   return (
     <div className="text-xs text-text-dim flex items-center gap-3 flex-wrap" role="group" aria-label="MCP gateway">
@@ -125,6 +197,22 @@ export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) 
           </span>
         ),
       )}
+      {fetched && sessions.length > 0 && (
+        <span className="text-text-faint">
+          {sessions.length - behind.length} of {sessions.length} running session
+          {sessions.length === 1 ? '' : 's'} with this catalog
+        </span>
+      )}
+      {fetched && behind.map((session) => session.pending && (
+        <span
+          key={session.session_id}
+          className={session.pending.reason === 'apply_error' ? 'text-hue-red' : 'text-hue-amber'}
+          role="status"
+          title={session.applied_revision ? `applied desired revision ${session.applied_revision}` : undefined}
+        >
+          Session {session.session_id} ({session.backend}): {pendingText(session.pending)}
+        </span>
+      ))}
       {status.retrying && <span className="text-text-faint">retrying</span>}
       {status.checked_at && (
         <span className="text-text-faint">

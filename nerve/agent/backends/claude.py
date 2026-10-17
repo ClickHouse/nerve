@@ -81,6 +81,10 @@ logger = logging.getLogger(__name__)
 _PROJECT_FOLDER_RE = re.compile(r"[^a-zA-Z0-9]")
 _PROJECT_FOLDER_MAX = 200
 
+# Default of the ``managed`` argument of ``_build_options``: read the last
+# MCP gateway catalog at the call.
+_LIVE_CATALOG = object()
+
 try:
     from claude_agent_sdk import ThinkingBlock
 except ImportError:  # pragma: no cover - depends on SDK version
@@ -428,6 +432,7 @@ class ClaudeBackend:
         supports_cache_ttl=True,
         interactive_builtins=True,
         reports_context_window=False,
+        updates_mcp_servers=True,
     )
 
     def __init__(self, deps: Any):
@@ -538,13 +543,22 @@ class ClaudeBackend:
                 "the Claude conversation to resume has no transcript on "
                 "this host"
             )
-        options = self._build_options(spec)
-        client = ClaudeClient(spec, options)
+        # One catalog read for the options, kept on the client, so the
+        # engine knows which catalog the session runs with.
+        managed = self._managed_mcp_servers()
+        options = self._build_options(spec, managed)
+        client = ClaudeClient(spec, options, managed_mcp_servers=managed)
         await client.connect()
         return client
 
-    def _build_options(self, spec: SessionSpec) -> ClaudeAgentOptions:
-        """Build SDK client options for a session (moved from engine)."""
+    def _build_options(
+        self, spec: SessionSpec, managed: Any = _LIVE_CATALOG,
+    ) -> ClaudeAgentOptions:
+        """Build SDK client options for a session (moved from engine).
+
+        ``managed`` is the catalog snapshot of the client build (the last
+        catalog read when not given).
+        """
         config = self.config
         session_id = spec.session_id
 
@@ -624,7 +638,8 @@ class ClaudeBackend:
         # External mode: the MCP gateway's servers only. The CLI reads no
         # other MCP configuration, loads no plugin, and runs the gateway's
         # tools without a prompt: the organization approved them there.
-        managed = self._managed_mcp_servers()
+        if managed is _LIVE_CATALOG:
+            managed = self._managed_mcp_servers()
         managed_options: dict[str, Any] = {}
         if managed is not None:
             managed_options = {
@@ -1150,10 +1165,16 @@ class ClaudeClient(AgentClient):
     # partially-initialized instance) read None instead of raising.
     _last_entry_uuid: str | None = None
 
-    def __init__(self, spec: SessionSpec, options: ClaudeAgentOptions):
+    def __init__(
+        self, spec: SessionSpec, options: ClaudeAgentOptions,
+        managed_mcp_servers: Any = None,
+    ):
         self._spec = spec
         self._options = options
         self._sdk = ClaudeSDKClient(options=options)
+        # External mode: the MCP gateway servers (a CatalogServers snapshot)
+        # that the options name. None in local mode.
+        self.managed_mcp_servers = managed_mcp_servers
         self._native_session_id: str | None = spec.resume_native_id
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
@@ -1335,6 +1356,19 @@ class ClaudeClient(AgentClient):
 
     async def interrupt(self) -> None:
         await self._sdk.interrupt()
+
+    async def set_mcp_server_enabled(self, name: str, enabled: bool) -> None:
+        """Turn one MCP server of the running CLI off or on.
+
+        Off disconnects it and removes its tools from the session; on
+        connects it again and lists its tools.
+        """
+        await self._sdk.toggle_mcp_server(name, enabled)
+
+    async def reconnect_mcp_server(self, name: str) -> None:
+        """Connect one MCP server of the running CLI again, which lists its
+        tools again."""
+        await self._sdk.reconnect_mcp_server(name)
 
     async def replacement_blockers(self) -> tuple[str, ...]:
         """Nothing beyond what the engine checks.

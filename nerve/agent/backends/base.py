@@ -123,6 +123,11 @@ class BackendCapabilities:
     supports_cache_ttl: bool = True
     interactive_builtins: bool = True
     reports_context_window: bool = False
+    # A running client can turn one of its MCP servers off and on and
+    # reconnect it, so that it lists the server's tools again: the client
+    # has ``async set_mcp_server_enabled(name, enabled)`` and
+    # ``async reconnect_mcp_server(name)``. It cannot add a server.
+    updates_mcp_servers: bool = False
 
 
 @runtime_checkable
