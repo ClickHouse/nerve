@@ -454,6 +454,49 @@ async def test_run_now_through_rest_runs_as_the_system_for_the_person(
 
 
 @pytest.mark.asyncio
+async def test_run_now_of_a_workflow_job_starts_the_run_for_the_person(
+    install, monkeypatch,
+):
+    """A job that declares a workflow run starts it for the person who used
+    "Run now"; a scheduled run of the same job starts it for the system."""
+    import nerve.workflows
+
+    alice = install.actor_id("alice")
+    system = install.system_actor_id
+    started: list[dict] = []
+
+    async def _start_run(**kwargs):
+        started.append(kwargs)
+        return {"id": f"wfr-{len(started)}", "budget_usd": 1.0}
+
+    monkeypatch.setattr(
+        nerve.workflows, "_service", SimpleNamespace(start_run=_start_run, db=install.db),
+    )
+    job = CronJob(
+        id="audit", schedule="1h",
+        workflow={"engine": "claude-workflow", "prompt": "audit", "budget_usd": 1.0},
+    )
+    service = _cron_service(install, job)
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+
+    async with _client(install.app()) as client:
+        response = await client.post(
+            "/api/cron/jobs/audit/trigger", headers=install.headers("alice"),
+        )
+    assert response.status_code == 200, response.text
+    await service._run_job_wrapper(job)
+
+    assert [run["attribution"] for run in started] == [
+        Attribution(system, alice),
+        Attribution(system, system),
+    ]
+    assert await _cron_logs(install) == [
+        ("audit", "success", alice, alice),
+        ("audit", "success", system, system),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_now_of_a_source_records_the_person(install, monkeypatch):
     bob = install.actor_id("bob")
 

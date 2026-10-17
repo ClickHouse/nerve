@@ -1170,7 +1170,7 @@ class CronService:
             # Workflow-run job: launch a budget-capped workflow run and
             # return — the run executes and notifies on its own, so none
             # of the cron session machinery below applies.
-            await self._start_workflow_run(job, log_id)
+            await self._start_workflow_run(job, log_id, attribution)
             return
 
         session_id: str | None = None
@@ -1266,15 +1266,24 @@ class CronService:
                 log_id, "error", error=str(e), session_id=session_id,
             )
 
-    async def _start_workflow_run(self, job: CronJob, log_id: int) -> None:
+    async def _start_workflow_run(
+        self, job: CronJob, log_id: int, attribution: Attribution | None = None,
+    ) -> None:
         """Start the workflow run a job declares instead of a prompt.
 
         Fire-and-forget: the cron log records only the launch. The run
         owns its ``workflow:<run-id>`` session and sends its own budget /
         completion / failure notifications — no cron session is created
         and the job does not wait for the run to finish.
+
+        ``attribution`` is the run log's (see :meth:`_run_job_wrapper`).
+        The cron service starts the run, so its actor is the system actor;
+        its cause is the cause of the cron run, and the run's turns run for
+        it.
         """
         from nerve.workflows import get_workflow_run_service
+
+        cause_id = (attribution or self._own_attribution()).caused_by_actor_id
 
         service = get_workflow_run_service()
         if service is None:
@@ -1322,8 +1331,9 @@ class CronService:
                 budget_usd=w["budget_usd"],
                 title=w.get("title") or job.id,
                 created_by=f"cron:{job.id}",
-                # A scheduled job is autonomous work: system for system.
-                attribution=attribution_for(self.db.system_actor),
+                # A scheduled job is autonomous work: system for system. A
+                # run that a person started is the system's, for that person.
+                attribution=attribution_for(self.db.system_actor, cause_id),
             )
             session_id = run.get("session_id") or ("workflow:" + run["id"])
             await self.db.set_cron_log_session(log_id, session_id)

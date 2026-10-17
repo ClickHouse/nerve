@@ -212,6 +212,20 @@ class TestRunWorkflowJob:
             ),
         )
 
+    async def test_a_run_that_a_person_started_runs_for_that_person(
+        self, cron_service, workflow_service,
+    ):
+        alice = "00000000-0000-4000-8000-0000000a11ce"
+
+        await cron_service._run_job_inner(
+            _workflow_job(), Attribution(actor_id=alice, caused_by_actor_id=alice),
+        )
+
+        # The cron service starts the run on Alice's behalf.
+        assert workflow_service.start_run.await_args.kwargs["attribution"] == (
+            Attribution(actor_id=FAKE_SYSTEM_ACTOR.actor_id, caused_by_actor_id=alice)
+        )
+
     async def test_links_run_session_and_logs_success(
         self, cron_service, workflow_service,
     ):

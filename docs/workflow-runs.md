@@ -102,8 +102,10 @@ A run records who created it and on whose behalf
 - Through `workflow_run_start` or `workflow_run_kill`, the actor is the
   system actor and the cause is the cause of the session that called the
   tool.
-- A cron job's run is the system actor's, for itself. A review-loop leg is
-  the system actor's, for the cause of the loop.
+- A cron job's run is the system actor's, for itself. When a person starts
+  the job with "Run now" (`POST /api/cron/jobs/{job_id}/trigger`), the run
+  is the system actor's, for that person. A review-loop leg is the system
+  actor's, for the cause of the loop.
 - The run's session is created with the run's cause, so everything the
   agent does in it (and, in external mode, its model requests) is for that
   cause. A run with no cause (one started by input that names no person)

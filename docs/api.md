@@ -714,8 +714,8 @@ writes no configuration.
 
 An actor is *who* something is attributed to: a person, or the agent's system
 principal. Sessions, messages, task events, notifications, silences, plans,
-workflow runs, review loops and review-loop decisions store an actor id,
-never a name, so this is where a name is looked up at
+workflow runs, review loops, review-loop decisions, wakeups and cron run logs
+store an actor id, never a name, so this is where a name is looked up at
 render time. A rename changes
 every label and moves no stored row.
 
@@ -1347,8 +1347,9 @@ Response: {
 Run a cron job or a source runner now, and wait until the run ends. The run
 log records the signed-in person as actor and cause. A session that the run
 creates (an isolated run, or a new generation of a persistent job) has the
-person as its cause; a persistent job's current session keeps its cause.
-Returns 404 for an unknown job.
+person as its cause; a persistent job's current session keeps its cause. The
+workflow run that a workflow-run job starts is the system actor's, for the
+person. Returns 404 for an unknown job.
 
 ```json
 Response: { "job_id": "morning-briefing", "triggered": true }

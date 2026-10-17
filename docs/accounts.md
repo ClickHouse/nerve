@@ -262,7 +262,7 @@ in the same way, so the same approximation applies to model usage. See
 | The agent starts or kills a workflow run or a review loop | The system actor | The session's cause |
 | The message that relays a web answer into the session that asked | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
 | A scheduled cron or source run (also a catch-up or missed run, and `nerve cron <id>`) | The system actor on the run log | The system actor |
-| A person starts a cron or source run from the web UI or with `POST /api/cron/jobs/{job_id}/trigger` | The person on the run log | The person |
+| A person starts a cron or source run from the web UI or with `POST /api/cron/jobs/{job_id}/trigger` | The person on the run log; the system actor for the workflow run that a workflow-run job starts | The person |
 | A person defers a message with "Run later" | The person on the wakeup row | The person |
 | The agent schedules a wakeup (`ScheduleWakeup`, `schedule_wakeup`) | The system actor | The session's cause |
 | Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
