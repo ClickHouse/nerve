@@ -70,6 +70,7 @@ from nerve.agent.tools import init_tools
 from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg, resolve_cause
+from nerve.inference_principal import inference_principal
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -1359,6 +1360,13 @@ class AgentEngine:
                 cache_ttl=cache_ttl,
                 max_turns=self.config.agent.max_turns,
                 idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
+                # The session's cause, fixed for the session, so every client
+                # of the session (also after a model change or a crash)
+                # names the same principal. Read from the row, which a fresh
+                # engine has just loaded.
+                inference_principal=inference_principal(
+                    (session or {}).get("caused_by_actor_id"),
+                ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).

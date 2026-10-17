@@ -67,6 +67,7 @@ from nerve.agent.interactive import (
     InteractiveToolHandler,
     _read_file_safe,
 )
+from nerve.inference_principal import custom_headers_env
 from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -596,7 +597,10 @@ class ClaudeBackend:
             # CLI's own autonomous firing is suppressed via the
             # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
             disallowed_tools=["CronCreate", "CronList", "CronDelete"],
-            env=self._build_env(cache_ttl=spec.cache_ttl),
+            env=self._build_env(
+                cache_ttl=spec.cache_ttl,
+                inference_principal=spec.inference_principal,
+            ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
             # prompt. It injects the full identity/memory bundle
@@ -688,8 +692,14 @@ class ClaudeBackend:
             except OSError:
                 pass
 
-    def _build_env(self, cache_ttl: str = "5m") -> dict[str, str]:
-        """Build environment variables for the SDK subprocess."""
+    def _build_env(
+        self, cache_ttl: str = "5m", inference_principal: str | None = None,
+    ) -> dict[str, str]:
+        """Build environment variables for the SDK subprocess.
+
+        ``inference_principal``: the principal that every model request of
+        the process names (external mode; see nerve.inference_principal).
+        """
         config = self.config
         env: dict[str, str] = {}
         # Prompt-cache TTL: the CLI natively supports the 1-hour TTL via
@@ -759,6 +769,9 @@ class ClaudeBackend:
                 continue
             if target:
                 env[env_name] = str(target)
+        # The SDK merges this dict over Nerve's own environment, so an
+        # inherited ANTHROPIC_CUSTOM_HEADERS is kept and extended here.
+        env.update(custom_headers_env(inference_principal))
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:

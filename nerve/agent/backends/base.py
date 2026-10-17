@@ -82,6 +82,11 @@ class SessionSpec:
     cache_ttl: str = "5m"
     max_turns: int = 100
     idle_timeout: float = 900.0
+    # Principal ID that each model request of the client names, for a proxy
+    # in front of the model API (nerve.inference_principal): the session's
+    # cause in external mode. None: no principal. A backend that cannot send
+    # it ignores it.
+    inference_principal: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
