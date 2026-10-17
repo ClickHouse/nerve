@@ -786,7 +786,9 @@ async def test_a_reminder_that_loses_to_the_expiry_sweep_is_not_applied(
     # Nothing is recorded before the snooze write, and the snooze that found
     # no pending card is recorded as not applied, with the reason.
     assert rows_before_snooze == [[]]
-    assert (await install.db.get_notification(card_id))["status"] == "expired"
+    # The claim stored who answered, so the expired card still names Alice.
+    card = await install.db.get_notification(card_id)
+    assert (card["status"], card["answered_by_actor_id"]) == ("expired", alice)
     assert await install.decisions(loop_id) == [
         ("remind_4h", False, "approval-card", alice, alice),
     ]
