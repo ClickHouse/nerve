@@ -63,96 +63,110 @@ function extractErrorMessage(err: unknown, fallback: string): string {
   return body || fallback;
 }
 
-export const usePlanStore = create<PlanState>((set, get) => ({
-  plans: [],
-  selectedPlan: null,
-  filter: 'pending',
-  loading: true,
-  detailLoading: false,
-  actionLoading: false,
-  actionError: null,
-
-  loadPlans: async () => {
-    try {
-      const { filter } = get();
-      const { plans } = await api.listPlans(filter || undefined);
-      set({ plans, loading: false });
-    } catch (e) {
-      console.error('Failed to load plans:', e);
-      set({ loading: false });
-    }
-  },
-
-  setFilter: (f: string) => {
-    set({ filter: f });
-    get().loadPlans();
-  },
-
-  loadPlan: async (id: string) => {
-    set({ detailLoading: true, selectedPlan: null });
+export const usePlanStore = create<PlanState>((set, get) => {
+  // After a decision, install the plan as the server stored it: the
+  // reviewer columns and a status that another decision set come from there.
+  async function reloadSelected(id: string): Promise<void> {
     try {
       const plan = await api.getPlan(id);
-      set({ selectedPlan: plan, detailLoading: false });
+      if (get().selectedPlan?.id === id) set({ selectedPlan: plan });
     } catch (e) {
-      console.error('Failed to load plan:', e);
-      set({ detailLoading: false });
+      console.error('Failed to reload plan:', e);
     }
-  },
+  }
 
-  updatePlan: async (id: string, status: string, feedback?: string) => {
-    set({ actionLoading: true });
-    try {
-      await api.updatePlan(id, { status, feedback });
-      // Refresh
-      const sel = get().selectedPlan;
-      if (sel && sel.id === id) {
-        set({ selectedPlan: { ...sel, status, ...(feedback ? { feedback } : {}) } });
+  return {
+    plans: [],
+    selectedPlan: null,
+    filter: 'pending',
+    loading: true,
+    detailLoading: false,
+    actionLoading: false,
+    actionError: null,
+
+    loadPlans: async () => {
+      try {
+        const { filter } = get();
+        const { plans } = await api.listPlans(filter || undefined);
+        set({ plans, loading: false });
+      } catch (e) {
+        console.error('Failed to load plans:', e);
+        set({ loading: false });
       }
+    },
+
+    setFilter: (f: string) => {
+      set({ filter: f });
       get().loadPlans();
-    } catch (e) {
-      console.error('Failed to update plan:', e);
-    } finally {
-      set({ actionLoading: false });
-    }
-  },
+    },
 
-  approvePlan: async (id: string) => {
-    set({ actionLoading: true });
-    try {
-      const result = await api.approvePlan(id);
-      // Refresh
-      const sel = get().selectedPlan;
-      if (sel && sel.id === id) {
-        set({ selectedPlan: { ...sel, status: 'implementing', impl_session_id: result.impl_session_id } });
+    loadPlan: async (id: string) => {
+      set({ detailLoading: true, selectedPlan: null });
+      try {
+        const plan = await api.getPlan(id);
+        set({ selectedPlan: plan, detailLoading: false });
+      } catch (e) {
+        console.error('Failed to load plan:', e);
+        set({ detailLoading: false });
       }
-      get().loadPlans();
-      return result;
-    } catch (e) {
-      console.error('Failed to approve plan:', e);
-      return null;
-    } finally {
-      set({ actionLoading: false });
-    }
-  },
+    },
 
-  revisePlan: async (id: string, feedback: string) => {
-    set({ actionLoading: true, actionError: null });
-    try {
-      await api.revisePlan(id, feedback);
-      const sel = get().selectedPlan;
-      if (sel && sel.id === id) {
-        set({ selectedPlan: { ...sel, feedback } });
+    updatePlan: async (id: string, status: string, feedback?: string) => {
+      set({ actionLoading: true });
+      try {
+        await api.updatePlan(id, { status, feedback });
+        const sel = get().selectedPlan;
+        if (sel && sel.id === id) {
+          set({ selectedPlan: { ...sel, status, ...(feedback ? { feedback } : {}) } });
+        }
+        await reloadSelected(id);
+        get().loadPlans();
+      } catch (e) {
+        console.error('Failed to update plan:', e);
+      } finally {
+        set({ actionLoading: false });
       }
-      return true;
-    } catch (e) {
-      console.error('Failed to request revision:', e);
-      set({ actionError: extractErrorMessage(e, 'Failed to request revision') });
-      return false;
-    } finally {
-      set({ actionLoading: false });
-    }
-  },
+    },
 
-  clearActionError: () => set({ actionError: null }),
-  clearSelectedPlan: () => set({ selectedPlan: null, actionError: null }),
-}));
+    approvePlan: async (id: string) => {
+      set({ actionLoading: true });
+      try {
+        const result = await api.approvePlan(id);
+        const sel = get().selectedPlan;
+        if (sel && sel.id === id) {
+          set({ selectedPlan: { ...sel, status: 'implementing', impl_session_id: result.impl_session_id } });
+        }
+        await reloadSelected(id);
+        get().loadPlans();
+        return result;
+      } catch (e) {
+        console.error('Failed to approve plan:', e);
+        return null;
+      } finally {
+        set({ actionLoading: false });
+      }
+    },
+
+    revisePlan: async (id: string, feedback: string) => {
+      set({ actionLoading: true, actionError: null });
+      try {
+        await api.revisePlan(id, feedback);
+        const sel = get().selectedPlan;
+        if (sel && sel.id === id) {
+          set({ selectedPlan: { ...sel, feedback } });
+        }
+        await reloadSelected(id);
+        return true;
+      } catch (e) {
+        console.error('Failed to request revision:', e);
+        set({ actionError: extractErrorMessage(e, 'Failed to request revision') });
+        return false;
+      } finally {
+        set({ actionLoading: false });
+      }
+    },
+
+    clearActionError: () => set({ actionError: null }),
+    clearSelectedPlan: () => set({ selectedPlan: null, actionError: null }),
+  };
+});

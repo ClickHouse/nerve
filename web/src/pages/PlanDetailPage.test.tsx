@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ActorRef } from '../api/client';
@@ -8,6 +9,9 @@ vi.mock('../api/client', () => ({
   api: {
     getPlan: vi.fn(),
     listActors: vi.fn(),
+    listPlans: vi.fn(),
+    updatePlan: vi.fn(),
+    revisePlan: vi.fn(),
   },
   // ActorLabel reads the viewer through the auth store, which wires these.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -26,6 +30,9 @@ const { PlanDetailPage } = await import('./PlanDetailPage');
 
 const getPlan = vi.mocked(api.getPlan);
 const listActors = vi.mocked(api.listActors);
+const listPlans = vi.mocked(api.listPlans);
+const updatePlan = vi.mocked(api.updatePlan);
+const revisePlan = vi.mocked(api.revisePlan);
 
 const ALICE = 'actor-alice';
 const SYSTEM = 'actor-system';
@@ -126,5 +133,43 @@ describe('PlanDetailPage reviewer', () => {
     await screen.findByText('Ship it');
     expect(screen.queryByTestId('plan-reviewer')).not.toBeInTheDocument();
     expect(screen.queryByTestId('plan-author')).not.toBeInTheDocument();
+  });
+
+  it('shows the reviewer right after a decline in this tab', async () => {
+    getPlan
+      .mockResolvedValueOnce(plan({}))
+      .mockResolvedValueOnce(plan({
+        status: 'declined', feedback: 'not now', reviewed_at: '2026-01-02T10:30:00+00:00',
+        reviewed_by_actor_id: ALICE, reviewed_caused_by_actor_id: ALICE,
+      }));
+    updatePlan.mockResolvedValue({ plan_id: 'plan-1', updated: true });
+    listPlans.mockResolvedValue({ plans: [] });
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: /^Decline$/ }));
+    await userEvent.type(screen.getByPlaceholderText(/why is this plan being declined/), 'not now');
+    await userEvent.click(screen.getByRole('button', { name: /Confirm Decline/ }));
+
+    const reviewer = await screen.findByTestId('plan-reviewer');
+    await waitFor(() => expect(reviewer).toHaveTextContent('Reviewed by Alice'));
+    expect(updatePlan).toHaveBeenCalledWith('plan-1', { status: 'declined', feedback: 'not now' });
+    expect(getPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the reviewer right after a revision request in this tab', async () => {
+    getPlan
+      .mockResolvedValueOnce(plan({}))
+      .mockResolvedValueOnce(plan({
+        feedback: 'add tests',
+        reviewed_by_actor_id: ALICE, reviewed_caused_by_actor_id: ALICE,
+      }));
+    revisePlan.mockResolvedValue({ plan_id: 'plan-1', status: 'revision_requested' });
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: /Request Revision/ }));
+    await userEvent.type(screen.getByPlaceholderText(/Describe what to change/), 'add tests');
+    await userEvent.click(screen.getByRole('button', { name: /Send Revision Request/ }));
+
+    const reviewer = await screen.findByTestId('plan-reviewer');
+    await waitFor(() => expect(reviewer).toHaveTextContent('Reviewed by Alice'));
+    expect(revisePlan).toHaveBeenCalledWith('plan-1', 'add tests');
   });
 });
