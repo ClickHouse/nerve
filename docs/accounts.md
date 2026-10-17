@@ -176,17 +176,15 @@ Nerve can record two actor IDs for a change:
   tool call, a cron job, any internal process).
 - The **cause** is the principal on whose behalf the change was made. For a
   change that a person made directly, the cause is that person. For work by
-  the system actor, the cause is the person whose request started the work,
-  or the system actor for autonomous work.
+  the agent, the cause is the cause of its session.
 
 These columns store actor IDs:
 
 | Column | What it records |
 |---|---|
 | `sessions.created_by_actor_id` | Who created the session |
+| `sessions.caused_by_actor_id` | The session's cause: on whose behalf all agent work in the session runs |
 | `messages.actor_id` | Who supplied the content of a user message |
-| `messages.caused_by_actor_id` | The cause of the turn that a user message starts |
-| `sessions.turn_caused_by_actor_id` | The cause of the agent turn that the session runs now, or ran last |
 | `task_events.actor_id`, `task_events.caused_by_actor_id` | Actor and cause of a task status change |
 | `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
 
@@ -195,58 +193,40 @@ names through `GET /api/actors`, which returns every actor that these columns
 can name: the display name, or the username when none is set. The web UI shows
 the system actor with a person as cause as "Nerve for <person>".
 
-Each agent turn has one cause, fixed when the turn starts. Tool calls in the
-turn record the system actor as actor and the turn's cause as cause. A
-background task (a command or an agent that runs in the background) keeps the
-cause of the turn that started it, and so does the turn that the agent starts
-to report the result of the task. When a person sends a message while earlier
-background output waits, Nerve processes that output for its own cause first:
-it waits up to 30 seconds for the first output of a report turn that has
-started, and then to the end of that turn.
+### The session's cause
 
-One agent process serves a session, and its tool calls do not say which turn
-they belong to. So a turn runs with an unknown cause, not with its person's
-cause, when output of another cause can still arrive during it: a report turn
-that showed no output within the 30 seconds, or a running background task of
-another cause that can act before it ends (an agent, a workflow or a
-watcher). A report turn for background tasks of different causes also has an
-unknown cause. Nerve records an unknown cause rather than the wrong person.
+Every session has one cause. Nerve stores it when it creates the session and
+never changes it:
 
-Nerve stores a turn's cause on the session (`sessions.turn_caused_by_actor_id`)
-before the turn reaches the agent, and tries the write twice. If both writes
-fail, a turn that a message, a schedule or another Nerve caller started does
-not start. A turn that the agent starts on its own, to report background work,
-is already running in the agent: it continues with an unknown cause, and the
-session row keeps the previous cause until a later write succeeds. A restart
-in that window resumes the session for the previous cause.
+| Session | Cause |
+|---|---|
+| A person creates or forks a session (web UI, REST API, browser WebSocket) | That person |
+| A cron job or a hook session | The system actor |
+| A plan implementation session after an approval through the REST API | The person who approved |
+| A plan implementation session after the agent approved the plan | The cause of the session in which the agent approved it |
+| A planner session that a revision request creates | The person who asked for the revision |
+| A workflow leg session | The system actor |
+| A Telegram, Slack or other channel session, or an imported Codex session | None until a local identity mapping exists |
+| An external MCP client's session | None |
 
-When Nerve sends the cause with model requests (external mode), the agent
-process gets one principal when it starts, and that process serves the whole
-session. Nerve does not stop background work (a background command, agent,
-workflow or watcher) to start the process again. So when a turn starts while
-background work that a turn of another principal started still runs, Nerve
-keeps the process:
+Everything the agent does in a session (a tool call, a task it changes, a plan
+it approves, a session it starts) records the system actor as actor and the
+session's cause as cause. A change that a person makes directly records that
+person as both. `messages.actor_id` keeps naming who wrote each message; there
+is no cause per message or per turn.
 
-- The model requests of the new turn, and of the background work, carry the
-  principal that the process was started for. That principal is billed.
-- The new turn records an unknown cause if the background work can act while
-  it runs (an agent, a workflow or a watcher), and its own cause if the
-  background work is a command.
-- This lasts until a turn starts while no background work runs. The process
-  then starts again for that turn's cause.
+This is an approximation in two places:
+
+- In a session that several people use, the agent's work in every turn is
+  attributed to the person who started the session, also in turns that
+  another person sent.
+- A deferred message ("run later") or a wakeup that runs in an existing session
+  is attributed to that session's cause.
 
 | Work | Actor | Cause |
 |---|---|---|
 | A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
-| Nerve creates a session, including MCP and Codex sessions | The system actor | Not recorded |
-| A cron job or a hook | The system actor | The system actor |
-| A plan implementation or a plan revision that a person started | The system actor | That person |
-| A plan approved or a revision requested by the agent in a turn | The system actor | The cause of that turn |
-| The hook turn that starring a session starts | The system actor | The person who starred it |
-| A turn resumed after a restart | The system actor | The cause stored when the interrupted turn started (`sessions.turn_caused_by_actor_id`), else the system actor |
-| A turn that the agent starts between turns, when a background task finishes | The system actor | The cause of the turn that started the task |
-| A tool call from an external MCP client | The system actor | None |
-| Workflow legs, wakeups, deferred messages when they run, and answers relayed into a session | The system actor | The system actor |
+| The agent works in a session (tool calls, task changes, sessions it starts) | The system actor | The session's cause |
 | Telegram, Slack, or imported Codex input | None until a local identity mapping exists | None |
 | Assistant and tool output | None | None |
 

@@ -781,16 +781,17 @@ Create a new session.
 
 ```json
 Request:  { "title": "My Session" }
-Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…" }
+Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…", "caused_by_actor_id": "…" }
 ```
 
 `created_by_actor_id` is an actor id for [`GET /api/actors`](#actors), not an
 account id. It is `null` for legacy rows and sessions caused by an unidentified
 external person. Every session payload carries the field.
 
-Session payloads also carry `turn_caused_by_actor_id`: the cause of the agent
-turn that the session runs now, or ran last (an actor id, or `null` when
-unknown). See [Attribution](accounts.md#attribution).
+Session payloads also carry `caused_by_actor_id`: the session's cause, on
+whose behalf all agent work in the session runs. Nerve sets it when it creates
+the session and never changes it (an actor id, or `null` when unknown). See
+[Attribution](accounts.md#attribution).
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -799,16 +800,14 @@ Get session details.
 Get messages for a session.
 
 ```json
-Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…", "caused_by_actor_id": "…" }] }
+Response: { "messages": [{ "id": 1, "role": "user", "content": "...", "channel": "web", "created_at": "...", "actor_id": "…" }] }
 ```
 
 `actor_id` is who supplied the message: the signed-in person who typed it, or
 the system principal for a prompt Nerve composed itself. It is `null` on
 Slack, Telegram, and imported Codex human input until identity mappings exist;
-on assistant/tool output; and on legacy history. `caused_by_actor_id` is set on
-a user message that starts a turn: the principal on whose behalf the turn runs.
-It is `null` on other rows, on input with no known person, and on legacy
-history. `channel` stays transport provenance and is never identity. See
+on assistant/tool output; and on legacy history. `channel` stays transport
+provenance and is never identity. See
 [Accounts and identity](accounts.md) for what is and is not attributed.
 
 #### `DELETE /api/sessions/{id}`
@@ -1387,9 +1386,8 @@ fresh.
 { type: "error", session_id: "main", error: "..." }
 
 // Another client of this session sent a message (the sender sees its own
-// optimistically; actor_id is who sent it and caused_by_actor_id the cause of
-// the turn it starts, matching the stored row)
-{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…", caused_by_actor_id: "…" }
+// optimistically; actor_id is who sent it, matching the stored row)
+{ type: "user_message", session_id: "main", content: "Hello", blocks: null, actor_id: "…" }
 
 // Session switch confirmed (includes running state, lifecycle status, buffered events for reconnect)
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events: [...] }

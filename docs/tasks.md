@@ -146,11 +146,11 @@ synthesized origin from one that actually happened.
 and on whose behalf, as actor IDs (see
 [Attribution](accounts.md#attribution)). A change through the HTTP API records
 the person as both. A change by an agent tool call records the system actor
-and the cause of the turn: the person whose message started the turn, or the
+and the cause of its session: the person who started the session, or the
 system actor for a cron job. Rows written before v053 have NULL in both
 columns. The `GET /api/tasks/{id}/events` rows include both columns, and the
-timeline shows "Nerve for <person>" when the agent changed the status for a
-person.
+timeline shows "Nerve for <person>" when the agent changed the status in a
+session that the person started.
 
 Changes to the set of statuses (create, update, reorder, delete, through the
 HTTP API or the `task_status_create` tool) append a row to
