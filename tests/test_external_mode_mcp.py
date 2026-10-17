@@ -896,6 +896,42 @@ class TestReadOnlyInExternalMode:
         yaml_servers.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_usage_of_a_hidden_server_is_refused(self, routes, db):
+        from fastapi import HTTPException
+
+        from nerve.gateway.routes.mcp_servers import get_mcp_server_usage
+
+        await db.record_mcp_tool_usage(server_name="local-files", tool_name="read")
+        await db.record_mcp_tool_usage(server_name="docs", tool_name="search")
+        with pytest.raises(HTTPException) as refused:
+            await get_mcp_server_usage("local-files")
+        assert refused.value.status_code == 404
+        usage = await get_mcp_server_usage("docs")
+        assert [row["tool_name"] for row in usage["usage"]] == ["search"]
+        assert (await get_mcp_server_usage("nerve"))["usage"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_server_without_a_row_is_still_listed(self, routes, db):
+        """The list follows the last catalog read also when a row write failed."""
+        from nerve.gateway.routes.mcp_servers import (
+            get_mcp_server_detail,
+            list_mcp_servers,
+        )
+
+        await db._write("DELETE FROM mcp_servers WHERE name = ?", ("github",))
+        servers = {row["name"]: row for row in (await list_mcp_servers())["servers"]}
+        assert list(servers) == ["docs", "github", "nerve"]
+        github = servers["github"]
+        assert github["managed_by"] == "organization"
+        assert github["type"] == "http"
+        assert github["tool_count"] == 1
+        assert github["total_invocations"] == 0
+        assert github["first_seen_at"] == routes.mcp_gateway_status()["fetched_at"]
+        detail = await get_mcp_server_detail("github")
+        assert detail["display_name"] == "Github"
+        assert detail["recent_usage"] == []
+
+    @pytest.mark.asyncio
     async def test_the_server_api_counts_only_observed_tools(
         self, tmp_path, db, gateway, external,
     ):
@@ -998,6 +1034,7 @@ class TestApiInLocalMode:
         from nerve.gateway.routes import _deps
         from nerve.gateway.routes.mcp_servers import (
             get_mcp_server_detail,
+            get_mcp_server_usage,
             list_mcp_servers,
             reload_mcp_servers,
         )
@@ -1007,6 +1044,9 @@ class TestApiInLocalMode:
         previous = _deps._deps
         _deps.init_deps(engine, db)
         try:
+            await db.record_mcp_tool_usage(server_name="local-files", tool_name="read")
+            assert len((await get_mcp_server_usage("local-files"))["usage"]) == 1
+            assert (await get_mcp_server_usage("never-seen"))["usage"] == []
             listed = await list_mcp_servers()
             assert set(listed) == {"servers"}
             assert all("managed_by" not in row for row in listed["servers"])
