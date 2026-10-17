@@ -154,7 +154,9 @@ class NotificationStore:
             )
         return True
 
-    async def claim_pending_approval(self, notification_id: str) -> bool:
+    async def claim_pending_approval(
+        self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Take a pending approval, so one presser acts on it.
 
         An approval runs its dispatcher before the row is settled, and that
@@ -170,12 +172,17 @@ class NotificationStore:
         can be pressed again. A claim left behind by a process that died
         mid-dispatch refuses later presses until the expiry sweep takes the
         row, which is what an approval nobody answers does in any case.
+
+        The same write stores ``attribution.actor_id`` (the person who
+        decides) in ``answered_by_actor_id``. The expiry sweep can take the
+        row while the dispatcher runs; the action then runs, the row is
+        expired, and it still names who decided.
         """
         now = datetime.now(timezone.utc).isoformat()
         result = await self._write(
-            """UPDATE notifications SET answered_at = ?
+            """UPDATE notifications SET answered_at = ?, answered_by_actor_id = ?
                WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
-            (now, notification_id),
+            (now, attribution.actor_id, notification_id),
         )
         return result.rowcount == 1
 

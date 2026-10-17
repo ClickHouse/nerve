@@ -7,7 +7,9 @@ Adds eight nullable columns that hold an ``actor_refs.id``:
   channel (Telegram, Slack, a hosted channel) names no person and keeps it
   ``NULL``; its provider user ID stays in ``metadata.answered_by_actor``.
   On an approval that is snoozed and still pending, it names the person who
-  snoozed it, until a later decision replaces it.
+  snoozed it, until a later decision replaces it. It is written when the
+  decision claims the approval, so an approval that expired while its
+  decision ran still names who decided.
 - ``notifications.dismissed_by_actor_id``: the person who dismissed the row.
 - ``notification_silences.created_by_actor_id``: who created the rule. A
   person through the web UI or REST, or the system actor for the

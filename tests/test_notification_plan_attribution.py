@@ -559,6 +559,50 @@ async def test_a_web_snooze_records_who_deferred_the_approval(
     assert seen == [("snooze_24h", bob), ("approve", alice)]
 
 
+@pytest.mark.parametrize("decision", ["approve", "snooze_24h"])
+@pytest.mark.asyncio
+async def test_an_expiry_during_the_dispatch_keeps_who_decided(
+    install, monkeypatch, audit_dir, caplog, decision,
+):
+    bob = install.actor_id("bob")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def dispatch(notification, target_id, decision, config, *, actor):
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
+        result = _acted(target_kind="a3-expiry", decision=decision)
+        if decision == "snooze_24h":
+            result.snooze_until = "2999-01-01T00:00:00+00:00"
+        return result
+
+    _register(monkeypatch, "a3-expiry", dispatch)
+    await install.db.create_session("proposer", source="web", actor=None)
+    nid = (await install.notifications.propose_action(
+        "proposer", target_kind="a3-expiry", target_id="item-4", title="Run it?",
+    ))["notification_id"]
+
+    answering = asyncio.create_task(install.notifications.handle_answer(
+        nid, decision, "web", answerer=_actor(install, "bob"),
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    # The expiry sweep takes the claimed row while the dispatcher runs.
+    await install.db.db.execute(
+        "UPDATE notifications SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+        (nid,),
+    )
+    await install.db.db.commit()
+    assert await install.notifications.expire_stale() == 1
+    release.set()
+    with caplog.at_level(logging.WARNING, logger="nerve.notifications.service"):
+        assert await asyncio.wait_for(answering, timeout=5) is True
+
+    row = await install.db.get_notification(nid)
+    assert (row["status"], row["answered_by_actor_id"]) == ("expired", bob)
+    assert "stopped being pending during its dispatch" in caplog.text
+    acted = [r for r in read_audit_jsonl(audit_dir) if r["event"] == "approval-acted"]
+    assert acted[-1]["answered_by_actor_id"] == bob
+
+
 @pytest.mark.asyncio
 async def test_a_channel_approval_gives_the_dispatcher_no_actor(
     install, monkeypatch, audit_dir,

@@ -193,7 +193,7 @@ These columns store actor IDs:
 | `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
 | `session_events.actor_id`, `session_events.caused_by_actor_id` | Actor and cause of a session change (see [Session changes](#session-changes)) |
 | `session_deletions.actor_id`, `session_deletions.caused_by_actor_id` | Actor and cause of a session delete |
-| `notifications.answered_by_actor_id` | Who answered a question or decided an approval; on a snoozed approval that is still pending, who snoozed it |
+| `notifications.answered_by_actor_id` | Who answered a question or decided an approval, also when the approval expired while the decision ran; on a snoozed approval that is still pending, who snoozed it |
 | `notifications.dismissed_by_actor_id` | Who dismissed a notification |
 | `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
 | `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |

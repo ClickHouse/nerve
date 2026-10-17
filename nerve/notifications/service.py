@@ -615,7 +615,9 @@ class NotificationService:
         target_kind = notif.get("target_kind") or ""
         target_id = notif.get("target_id") or ""
 
-        if not await self.db.claim_pending_approval(notification_id):
+        if not await self.db.claim_pending_approval(
+            notification_id, attribution=attribution_for(answerer),
+        ):
             logger.info(
                 "approval %s is already claimed; the %r press from %s is "
                 "ignored", notification_id, answer, actor or answered_by,
@@ -716,19 +718,23 @@ class NotificationService:
             new_expires_at = (
                 snooze_dt + timedelta(hours=expiry_hours)
             ).isoformat()
-            await self.db.snooze_notification(
+            settled = await self.db.snooze_notification(
                 notification_id, snooze_until, new_expires_at,
                 attribution=attribution_for(answerer),
             )
-        elif not await self.db.answer_notification(
-            notification_id, answer, answered_by, actor=actor,
-            attribution=attribution_for(answerer),
-        ):
+        else:
+            settled = await self.db.answer_notification(
+                notification_id, answer, answered_by, actor=actor,
+                attribution=attribution_for(answerer),
+            )
+        if not settled:
             # The expiry sweep can take a claimed row while its dispatcher
-            # runs, which leaves the action done and the row expired.
+            # runs, which leaves the action done and the row expired. The
+            # claim already stored who decided.
             logger.warning(
                 "approval %s stopped being pending during its dispatch; the "
-                "%r decision ran but the row does not record it",
+                "%r decision ran, and the expired row names who decided but "
+                "not the answer",
                 notification_id, answer,
             )
 
