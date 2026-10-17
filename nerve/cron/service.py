@@ -19,6 +19,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
 from nerve.agent.engine import AgentEngine
+from nerve.agent.sessions import new_cron_run_id
 from nerve.config import ConfigError, NerveConfig
 from nerve.cron.jobs import (
     CronJob,
@@ -917,8 +918,7 @@ class CronService:
         ``cause`` is the session's cause: by default the system actor; the
         person whose "Run now" creates the generation.
         """
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        session_id = f"cron:{job_id}:{ts}"
+        session_id = f"cron:{job_id}:{new_cron_run_id()}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
             actor=self.db.system_actor, cause=cause,
@@ -1193,10 +1193,9 @@ class CronService:
                 )
             else:
                 # Isolated mode: per-run session. The run_id is generated
-                # here (the engine would otherwise generate an identical
-                # timestamp-based one) so the session id is known for the
-                # run log.
-                run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                # here (the engine would otherwise generate one of the same
+                # shape) so the session id is known for the run log.
+                run_id = new_cron_run_id()
                 session_id = f"cron:{job.id}:{run_id}"
             try:
                 await self.db.set_cron_log_session(log_id, session_id)

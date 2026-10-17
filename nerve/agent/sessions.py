@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -29,6 +30,19 @@ from nerve.identity import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def new_cron_run_id() -> str:
+    """A unique run ID for a cron session ID ``cron:<job>:<run ID>``.
+
+    The UTC start time (``YYYYmmdd-HHMMSS``) keeps the IDs in time order;
+    eight random hex digits make two runs that start in the same second
+    (for example two people who use "Run now") get two sessions, each with
+    its own cause. ``nerve/db/usage.py`` matches this shape.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{secrets.token_hex(4)}"
+
 
 # Cleanup defaults
 DEFAULT_ARCHIVE_AFTER_DAYS = 30

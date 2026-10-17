@@ -54,7 +54,7 @@ from nerve.agent.prompts import (
     set_skill_manager,
     worker_onboarding_prompt,
 )
-from nerve.agent.sessions import SessionManager, SessionStatus
+from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import (
     ToolContext,
@@ -3574,7 +3574,7 @@ class AgentEngine:
         a person started it.
         """
         if run_id is None:
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            run_id = new_cron_run_id()
         # A cron run is the instance's own work, regardless of who wrote the
         # schedule or who started the run. A person who started it is the
         # cause of the run's session.

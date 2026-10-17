@@ -71,7 +71,7 @@ Claude Agent SDK wrapper providing:
 - **Persistent channel mappings** — channel-to-session mapping stored in `channel_sessions` table (survives restarts)
 - **Orphan recovery** — on startup, sessions marked `active` in DB but with no live client are transitioned to `idle` (resumable) or `stopped`
 - **Automatic cleanup** — periodic task (every 6h) archives stale sessions (default 30 days) and enforces max session count (default 500)
-- **Per-run cron sessions** — each cron run gets a unique session ID (`cron:{job_id}:{timestamp}`) to prevent unbounded message accumulation
+- **Per-run cron sessions**: each cron run gets a unique session ID (`cron:{job_id}:{run_id}`, the start time and a random suffix) to prevent unbounded message accumulation
 - AI-generated session titles via lightweight Haiku API call
 - Custom MCP tools (tasks, memory recall, conversation history, sync status, skills CRUD, notifications)
 - API calls routed through configurable base URL (direct Anthropic API or local CLIProxyAPI proxy)
@@ -190,7 +190,7 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 
 ### Cron Job
 1. APScheduler triggers at schedule
-2. Isolated per-run session created (`cron:{job_id}:{timestamp}`)
+2. Isolated per-run session created (`cron:{job_id}:{run_id}`)
 3. Agent runs with job prompt and cron model, acting as the system principal — the session and the prompt are attributed to it, not to whoever wrote the schedule
 4. Agent uses `notify`/`ask_user` tools to communicate with user
 5. Run logged in `cron_logs` table

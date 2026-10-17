@@ -55,6 +55,20 @@ def _past() -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
 
 
+class _OneSecond(datetime):
+    """Every cron run ID starts in the same second."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def same_second(monkeypatch):
+    """Cron runs and generations that start in one second."""
+    monkeypatch.setattr("nerve.agent.sessions.datetime", _OneSecond)
+
+
 async def _wakeups(install: _Install, session_id: str) -> list[tuple]:
     async with install.db.db.execute(
         "SELECT prompt, status, created_by_actor_id, caused_by_actor_id"
@@ -456,7 +470,7 @@ async def test_run_now_through_rest_runs_as_the_system_for_the_person(
 
 @pytest.mark.asyncio
 async def test_a_persistent_generation_that_a_run_now_creates_keeps_the_persons_cause(
-    install, monkeypatch,
+    install, monkeypatch, same_second,
 ):
     """Alice's "Run now" starts a persistent job's first session.
 
@@ -486,12 +500,11 @@ async def test_a_persistent_generation_that_a_run_now_creates_keeps_the_persons_
     await service._run_job_wrapper(job)
     assert (install.turns[1]["session_id"], install.turns[1]["cause"]) == (first, alice)
 
-    # The session ages past the rotation window. Generation IDs carry the
-    # time to the second, so the next one needs a new second.
+    # The session ages past the rotation window. The next generation starts
+    # in the same second as the first one, and still gets its own session.
     await install.db.update_session_fields(first, {
         "connected_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
     })
-    await asyncio.sleep(1.1)
     await service._run_job_wrapper(job)
 
     second = install.turns[2]["session_id"]
@@ -513,6 +526,37 @@ async def test_a_persistent_generation_that_a_run_now_creates_keeps_the_persons_
         ("digest", "success", system, system),
         ("digest", "success", system, system),
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_immediate_rotation_starts_a_new_session(
+    install, monkeypatch, same_second,
+):
+    """A manual rotation right after the first run, in the same second, starts
+    a new session for the system actor; the first one keeps Alice."""
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+    job = CronJob(
+        id="digest", schedule="1h", prompt="write the digest", session_mode="persistent",
+    )
+    service = _cron_service(install, job)
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+
+    async with _client(install.app()) as client:
+        await client.post("/api/cron/jobs/digest/trigger", headers=install.headers("alice"))
+        rotated = (await client.post(
+            "/api/cron/jobs/digest/rotate", headers=install.headers("alice"),
+        )).json()
+
+    first = install.turns[0]["session_id"]
+    assert rotated["rotated"] is True
+    assert rotated["old_session_id"] == first
+    assert rotated["new_session_id"] != first
+    assert rotated["new_session_id"].startswith("cron:digest:20260102-030405-")
+    assert await install.session_cause_of(first) == alice
+    assert await install.session_cause_of(rotated["new_session_id"]) == (
+        install.system_actor_id
+    )
 
 
 @pytest.mark.asyncio
@@ -801,5 +845,44 @@ async def test_external_mode_a_run_now_session_names_the_person(
         (process,) = cli
         assert process.spec.session_id.startswith("cron:nightly:")
         assert _named_principals(process) == [BOB_PRINCIPAL]
+    finally:
+        await _stop_idle_watchers(install)
+
+
+@pytest.mark.asyncio
+async def test_external_mode_concurrent_run_nows_get_their_own_sessions(
+    external_install, cli, monkeypatch, same_second,
+):
+    """Alice and Bob use "Run now" on one job at the same time.
+
+    Both runs start in the same second. Each gets its own session, with its
+    person as cause, and its CLI process names that person.
+    """
+    install = external_install
+    monkeypatch.setattr(_FakeCli, "install", install)
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
+    job = CronJob(id="nightly", schedule="1h", prompt="tidy the board")
+    monkeypatch.setattr("nerve.gateway.server._cron_service", _cron_service(install, job))
+    alice, bob = _as(ALICE_PRINCIPAL, "Alice"), _as(BOB_PRINCIPAL, "Bob")
+    try:
+        async with _client(install.app()) as client:
+            responses = await asyncio.gather(
+                client.post("/api/cron/jobs/nightly/trigger", headers=alice),
+                client.post("/api/cron/jobs/nightly/trigger", headers=bob),
+            )
+        assert [r.status_code for r in responses] == [200, 200]
+
+        sessions = {turn["cause"]: turn["session_id"] for turn in install.turns}
+        assert set(sessions) == {ALICE_PRINCIPAL, BOB_PRINCIPAL}
+        assert sessions[ALICE_PRINCIPAL] != sessions[BOB_PRINCIPAL]
+        for principal, session_id in sessions.items():
+            assert session_id.startswith("cron:nightly:20260102-030405-")
+            assert await install.session_cause_of(session_id) == principal
+            (process,) = [p for p in cli if p.spec.session_id == session_id]
+            assert _named_principals(process) == [principal]
+        assert sorted(await _cron_logs(install)) == sorted([
+            ("nightly", "success", ALICE_PRINCIPAL, ALICE_PRINCIPAL),
+            ("nightly", "success", BOB_PRINCIPAL, BOB_PRINCIPAL),
+        ])
     finally:
         await _stop_idle_watchers(install)

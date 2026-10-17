@@ -36,15 +36,20 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
 # Default fallback when model is unknown or None
 DEFAULT_PRICING = (5, 25, 0.50, 6.25, 10.00, 0.01)  # Opus 4.6 standard
 
-# Cron session ids (see ``SessionManager.create_cron_session`` and
-# ``CronService._start_new_generation``):
-#   cron:<job>                   — legacy stable persistent session
-#   cron:<job>:<YYYYmmdd-HHMMSS> — isolated run / persistent generation
-# The run glob matches the second form, so the job id can be cut out of it
-# even when the job id itself contains ``:``.
-_CRON_RUN_SESSION_GLOB = "cron:?*:" + "[0-9]" * 8 + "-" + "[0-9]" * 6
+# Cron session ids (see ``SessionManager.create_cron_session``,
+# ``CronService._start_new_generation`` and ``new_cron_run_id``):
+#   cron:<job>                            legacy stable persistent session
+#   cron:<job>:<YYYYmmdd-HHMMSS>-<8 hex>  isolated run / persistent generation
+#   cron:<job>:<YYYYmmdd-HHMMSS>          the same, from older versions
+# The run globs match the last two forms, so the job id can be cut out of
+# them even when the job id itself contains ``:``.
+_CRON_RUN_STAMP_GLOB = "[0-9]" * 8 + "-" + "[0-9]" * 6
+_CRON_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB + "-" + "[0-9a-f]" * 8
+# len("cron:") + len(":YYYYmmdd-HHMMSS-xxxxxxxx")
+_CRON_RUN_SESSION_OVERHEAD = 5 + 25
+_CRON_OLD_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB
 # len("cron:") + len(":YYYYmmdd-HHMMSS")
-_CRON_RUN_SESSION_OVERHEAD = 5 + 16
+_CRON_OLD_RUN_SESSION_OVERHEAD = 5 + 16
 
 
 def _get_pricing(
@@ -319,6 +324,8 @@ class UsageStore:
                     CASE WHEN origin_job IS NOT NULL THEN origin_job
                          WHEN origin_session GLOB ? THEN substr(
                              origin_session, 6, length(origin_session) - ?)
+                         WHEN origin_session GLOB ? THEN substr(
+                             origin_session, 6, length(origin_session) - ?)
                          ELSE substr(origin_session, 6) END AS job_id,
                     *
                 FROM usage_origin
@@ -362,6 +369,7 @@ class UsageStore:
             (
                 window,
                 _CRON_RUN_SESSION_GLOB, _CRON_RUN_SESSION_OVERHEAD,
+                _CRON_OLD_RUN_SESSION_GLOB, _CRON_OLD_RUN_SESSION_OVERHEAD,
                 window,
             ),
         ) as cursor:

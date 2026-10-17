@@ -106,6 +106,21 @@ class TestUsageByCronJob:
         assert row["cost_usd"] == pytest.approx(1.0)
         assert row["estimated_cost_usd"] == pytest.approx(1.0)
 
+    async def test_run_ids_with_a_random_suffix_roll_up_per_job(self, db: Database):
+        # Run IDs carry the start second and eight random hex digits; the
+        # older form has no suffix. Both belong to the job, also when the job
+        # id has colons.
+        await _turn(db, "cron:alpha:20260101-100000-0a1b2c3d", 0.25)
+        await _turn(db, "cron:alpha:20260101-100000-ffee0011", 0.50)
+        await _turn(db, "cron:alpha:20251231-235959", 0.25)
+        await _turn(db, "cron:team:deploy:20260103-120000-12ab34cd", 0.5)
+
+        rows = _by_job(await db.get_usage_by_cron_job())
+        assert set(rows) == {"alpha", "team:deploy"}
+        assert rows["alpha"]["sessions"] == 3
+        assert rows["alpha"]["cost_usd"] == pytest.approx(1.0)
+        assert rows["team:deploy"]["sessions"] == 1
+
     async def test_persistent_legacy_and_generation_sessions(self, db: Database):
         # Legacy stable id and a rotated generation chat both belong to "beta".
         await _turn(db, "cron:beta", 1.0)

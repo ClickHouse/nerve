@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -894,11 +895,13 @@ class TestRotation:
                     return fixed.replace(tzinfo=None)
                 return fixed.astimezone(tz)
 
-        with patch("nerve.cron.service.datetime", FixedDateTime):
+        with patch("nerve.cron.service.datetime", FixedDateTime), \
+                patch("nerve.agent.sessions.datetime", FixedDateTime):
             session_id, rotated = await svc._resolve_persistent_session(job)
 
         assert rotated is True
-        assert session_id == "cron:pers:20260101-150000"
+        # The run ID is the UTC start second and eight random hex digits.
+        assert re.fullmatch(r"cron:pers:20260101-150000-[0-9a-f]{8}", session_id)
         svc.engine.schedule_memorize.assert_awaited_once_with("cron:pers")
         svc.engine.sessions.mark_idle.assert_not_called()
 
