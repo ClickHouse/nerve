@@ -9,8 +9,6 @@ import { ActorAttribution } from '../components/Chat/ActorLabel';
 /** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
 const STATUS_TONES: Record<string, BadgeTone> = {
   pending: 'warning',
-  // A revision request won; the planner writes a new version.
-  revising: 'warning',
   approved: 'success',
   implementing: 'info',
   declined: 'danger',
@@ -58,7 +56,6 @@ export function PlanDetailPage() {
   }
 
   const isPending = plan.status === 'pending';
-  const isRevising = plan.status === 'revising';
   const isImplementing = plan.status === 'implementing';
 
   const handleApprove = async () => {
@@ -158,15 +155,6 @@ export function PlanDetailPage() {
                 <div className="text-xs text-accent/60 font-medium mb-1">Revision feedback</div>
                 <div className="text-sm text-text-muted leading-relaxed whitespace-pre-wrap">{plan.feedback}</div>
               </div>
-            </div>
-          )}
-
-          {/* A revision request won: no other decision applies until the
-              planner writes a new version or the revision turn ends. */}
-          {isRevising && (
-            <div data-testid="plan-revising" className="mt-4 text-sm text-text-muted">
-              Revision requested. The planner is writing a new version; this
-              plan can be decided again if no new version arrives.
             </div>
           )}
 
