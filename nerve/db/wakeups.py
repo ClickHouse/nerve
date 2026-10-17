@@ -6,8 +6,8 @@ hook and consumed by the cron-service sweep, which fires the prompt
 through ``engine.run(..., source="wakeup")`` at ``fire_at``.
 
 Each row records who scheduled it (``created_by_actor_id``) and on whose
-behalf it runs (``caused_by_actor_id``). The turn that the wakeup fires runs
-for that cause.
+behalf (``caused_by_actor_id``). The turn that the wakeup fires runs in its
+session, so it has the session's cause.
 """
 
 from __future__ import annotations
@@ -33,8 +33,7 @@ class WakeupStore:
         ``/loop`` self-pacing model re-calls the tool each turn). So a new
         request supersedes any earlier pending wakeup for the session.
 
-        ``attribution`` names who scheduled the wakeup and the cause that
-        its turn runs for.
+        ``attribution`` names who scheduled the wakeup and on whose behalf.
 
         Returns the new wakeup id.
         """

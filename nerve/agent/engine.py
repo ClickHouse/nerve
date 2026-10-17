@@ -1068,9 +1068,8 @@ class AgentEngine:
     ) -> int | None:
         """Persist a ScheduleWakeup request from its tool input.
 
-        ``attribution`` is that of the tool call: the system actor, and the
-        cause of the turn that made the call. The wakeup turn runs for that
-        cause.
+        ``attribution`` is that of the tool call: the system actor and the
+        session's cause.
 
         Returns the new wakeup id, or ``None`` when there's no prompt to
         re-inject (in which case nothing is scheduled).
@@ -1358,8 +1357,8 @@ class AgentEngine:
                     )
 
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
-                # The CLI runs the hook inside the turn that called the tool,
-                # so the session's turn cause is the cause of that call.
+                # An agent action in a session: the system actor, for the
+                # session's cause.
                 return await self._record_wakeup(
                     self.db, sid, tool_input,
                     attribution=attribution_for(

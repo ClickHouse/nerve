@@ -81,7 +81,7 @@ async def schedule_wakeup_handler(ctx: ToolContext, args: dict) -> ToolResult:
             is_error=True,
         )
 
-    # The wakeup turn runs for the cause of the turn that schedules it.
+    # An agent action in a session: the system actor, for the session's cause.
     wakeup_id = await ctx.engine._record_wakeup(
         ctx.db, ctx.session_id, args, attribution=ctx.attribution,
     )

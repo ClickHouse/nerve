@@ -1455,10 +1455,9 @@ class CronService:
         # The actor is the instance's own: a model-scheduled wakeup, or a
         # deferral this service is delivering. Who wrote a run-later message
         # is already recorded on the row the route persisted when they
-        # composed it. The cause is the one stored when the wakeup was
-        # scheduled: the person who deferred the message, or the cause of
-        # the turn that called ScheduleWakeup. A stored NULL (the cause was
-        # unknown, or the row is older than v057) stays unknown.
+        # composed it. The turn runs in the wakeup's session, so its cause
+        # is the session's cause; the wakeup row keeps who scheduled it and
+        # for whom.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -1466,7 +1465,6 @@ class CronService:
                 source=source,
                 internal=True,
                 actor=self.db.system_actor,
-                cause=wakeup.get("caused_by_actor_id"),
                 # A run-later deferral is a message the user wrote and asked
                 # to be delivered now, so it belongs back at the top of the
                 # sidebar. A model's own ScheduleWakeup tick is the session

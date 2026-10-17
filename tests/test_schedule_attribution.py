@@ -17,6 +17,7 @@ where the CLI's own ScheduleWakeup hook is under test.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -451,6 +452,67 @@ async def test_run_now_through_rest_runs_as_the_system_for_the_person(
         (None, "pending", turn["session_id"], system, alice),
     ]
     assert await install.session_cause_of(turn["session_id"]) == alice
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_generation_that_a_run_now_creates_keeps_the_persons_cause(
+    install, monkeypatch,
+):
+    """Alice's "Run now" starts a persistent job's first session.
+
+    The session's cause is Alice. A later scheduled run reuses the session
+    and keeps that cause (a documented approximation). When the session
+    rotates, its retitle is Nerve's change for Alice, and the next session
+    is the system actor's.
+    """
+    install.use_fake_runtime(monkeypatch)
+    alice = install.actor_id("alice")
+    system = install.system_actor_id
+    job = CronJob(
+        id="digest", schedule="1h", prompt="write the digest",
+        session_mode="persistent", context_rotate_hours=1,
+    )
+    service = _cron_service(install, job)
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+
+    async with _client(install.app()) as client:
+        response = await client.post(
+            "/api/cron/jobs/digest/trigger", headers=install.headers("alice"),
+        )
+    assert response.status_code == 200, response.text
+    first = install.turns[0]["session_id"]
+    assert await install.session_cause_of(first) == alice
+
+    await service._run_job_wrapper(job)
+    assert (install.turns[1]["session_id"], install.turns[1]["cause"]) == (first, alice)
+
+    # The session ages past the rotation window. Generation IDs carry the
+    # time to the second, so the next one needs a new second.
+    await install.db.update_session_fields(first, {
+        "connected_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+    })
+    await asyncio.sleep(1.1)
+    await service._run_job_wrapper(job)
+
+    second = install.turns[2]["session_id"]
+    assert second != first
+    assert await install.session_cause_of(second) == system
+    assert install.turns[2]["cause"] == system
+    async with install.db.db.execute(
+        "SELECT details, actor_id, caused_by_actor_id FROM session_events"
+        " WHERE session_id = ? AND event_type = 'title_changed'",
+        (first,),
+    ) as cursor:
+        retitles = [
+            (json.loads(row[0]).get("reason"), row[1], row[2])
+            async for row in cursor
+        ]
+    assert ("cron_rotation", system, alice) in retitles
+    assert await _cron_logs(install) == [
+        ("digest", "success", alice, alice),
+        ("digest", "success", system, system),
+        ("digest", "success", system, system),
+    ]
 
 
 @pytest.mark.asyncio

@@ -19,8 +19,11 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
-from nerve.identity import attribution_for
+from nerve.identity import Attribution, attribution_for
 from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
+
+# A person's actor ID (synthetic), distinct from the system actor.
+_ALICE_ID = "00000000-0000-4000-8000-0000000a11ce"
 
 
 # ---------------------------------------------------------------------------
@@ -824,13 +827,17 @@ class TestRotation:
 
     @pytest.mark.asyncio
     async def test_rotation_stamps_and_cancels_wakeups(self, cron_service):
-        """The retired chat is stamped rotated_at, retitled, wakeups cancelled."""
+        """The retired chat is stamped rotated_at, retitled, wakeups cancelled.
+
+        The generation has a person as its cause (a "Run now" created it), so
+        the retitle is Nerve's change for that person.
+        """
         _map_current(cron_service, "cron:pers", {
             "connected_at": _hours_ago(30),
             "status": "idle",
             "title": "Cron: pers",
             "metadata": "{}",
-            "caused_by_actor_id": FAKE_SYSTEM_ACTOR.actor_id,
+            "caused_by_actor_id": _ALICE_ID,
         })
         job = _pers_job(context_rotate_hours=24)
 
@@ -847,7 +854,7 @@ class TestRotation:
         assert title_args[1].startswith("Cron: pers (until ")
         # The retitle is Nerve's change for the session's cause.
         assert cron_service.db.update_session_title.call_args.kwargs == {
-            "attribution": attribution_for(FAKE_SYSTEM_ACTOR, FAKE_SYSTEM_ACTOR),
+            "attribution": Attribution(FAKE_SYSTEM_ACTOR.actor_id, _ALICE_ID),
             "reason": "cron_rotation",
         }
 

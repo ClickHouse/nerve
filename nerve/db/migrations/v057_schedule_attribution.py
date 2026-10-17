@@ -4,11 +4,10 @@ Adds four nullable columns that hold an ``actor_refs.id``:
 
 - ``session_wakeups.created_by_actor_id``: who scheduled the wakeup. A person
   who deferred a message with "Run later", or the system actor when the agent
-  called ``ScheduleWakeup`` / ``schedule_wakeup`` in a turn.
-- ``session_wakeups.caused_by_actor_id``: on whose behalf the wakeup turn
-  runs. The person for "Run later", the cause of the turn that called the
-  tool for an agent wakeup. The turn that the wakeup fires runs for this
-  cause.
+  called ``ScheduleWakeup`` / ``schedule_wakeup`` in a session.
+- ``session_wakeups.caused_by_actor_id``: on whose behalf it was scheduled.
+  The person for "Run later", the session's cause for an agent wakeup. The
+  turn that the wakeup fires runs in its session, for the session's cause.
 - ``cron_logs.actor_id``: who started the run. The system actor for a
   scheduled run, a catch-up run or a missed run; the person who used "Run
   now" through the REST API.
@@ -16,8 +15,7 @@ Adds four nullable columns that hold an ``actor_refs.id``:
   system actor for scheduled work, the person for "Run now".
 
 **Existing rows stay NULL and nothing is backfilled.** NULL reads as "not
-recorded". A wakeup row from before this migration fires with an unknown
-cause.
+recorded".
 
 The foreign keys follow v048: an ID that resolves to no actor can never be
 stored, and NULL is exempt from the check. Each column is added only when the
