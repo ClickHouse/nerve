@@ -29,6 +29,7 @@ from nerve.cron.jobs import CronJob
 from nerve.cron.service import CronService
 from nerve.db.actor_columns import ACTOR_COLUMNS
 from nerve.identity import Attribution
+from nerve.inference_principal import CUSTOM_HEADERS_ENV, INFERENCE_PRINCIPAL_HEADER
 from tests.test_cause_attribution import (  # noqa: F401 (fixtures)
     ALICE_PRINCIPAL,
     BOB_PRINCIPAL,
@@ -633,8 +634,6 @@ async def test_external_mode_run_later_and_run_now_name_the_principal(
 
 def _named_principals(process: _FakeCli) -> list[str]:
     """The principal headers that the CLI process sends on model requests."""
-    from nerve.inference_principal import CUSTOM_HEADERS_ENV, INFERENCE_PRINCIPAL_HEADER
-
     named = []
     for line in process.options.env.get(CUSTOM_HEADERS_ENV, "").splitlines():
         name, _, value = line.partition(":")
@@ -653,10 +652,9 @@ async def test_external_mode_wakeup_turns_name_the_session_cause_to_the_model_ap
     message in another of Alice's sessions. Both fire in Alice's sessions,
     whose CLI processes name Alice, the session cause.
     """
-    pytest.importorskip("nerve.inference_principal")
     install = external_install
     monkeypatch.setattr(_FakeCli, "install", install)
-    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
     alice, bob = _as(ALICE_PRINCIPAL, "Alice"), _as(BOB_PRINCIPAL, "Bob")
     try:
         async with _client(install.app()) as client:
@@ -683,10 +681,9 @@ async def test_external_mode_a_run_now_session_names_the_person(
 ):
     """Bob's "Run now" creates the run's session for Bob, so its CLI process
     names Bob on its model requests."""
-    pytest.importorskip("nerve.inference_principal")
     install = external_install
     monkeypatch.setattr(_FakeCli, "install", install)
-    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
     job = CronJob(id="nightly", schedule="1h", prompt="tidy the board")
     monkeypatch.setattr("nerve.gateway.server._cron_service", _cron_service(install, job))
     try:
