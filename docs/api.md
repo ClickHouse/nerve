@@ -1375,8 +1375,10 @@ when it observed none; `tool_count` is the size of that list, also with
 `unknown`, `current` or `stale`, the time of its last read, and the reason of
 a failed last read). `checked_at` is the time of the last catalog request and
 `error` its problem, or `null` after a success. `retrying` is true while the
-background retry runs. `not_applied` maps a catalog server ID to the backends
-that leave it out, each with the reason (see the MCP server routes above). The
+background retry runs. `refresh_seconds` is the interval of the periodic
+catalog read (`0` when it is off, `null` without a gateway URL). `not_applied`
+maps a catalog server ID to the backends that leave it out, each with the
+reason (see the MCP server routes above). The
 block is absent in local mode.
 
 ```json
@@ -1403,6 +1405,7 @@ block is absent in local mode.
   "checked_at": "2026-10-17T12:05:00+00:00",
   "error": null,
   "retrying": false,
+  "refresh_seconds": 30.0,
   "not_applied": {}
 }
 ```

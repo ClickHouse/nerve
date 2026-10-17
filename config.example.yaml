@@ -401,6 +401,9 @@ memory:
 # effect. A change needs a restart. See docs/config.md "MCP servers in
 # external mode".
 # mcp_gateway_url: "http://192.0.2.1:8080"
+# Seconds between two catalog reads, so that a catalog change reaches running
+# sessions. 0 turns the periodic read off. A change needs a restart.
+# mcp_gateway_refresh_seconds: 30
 
 # Observability (optional) — Langfuse tracing for the agent loop.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.

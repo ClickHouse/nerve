@@ -147,6 +147,61 @@ class TestGatewayUrlSetting:
         ]
 
 
+class TestRefreshSetting:
+    def test_default_is_thirty_seconds(self):
+        from nerve.config import NerveConfig
+
+        assert NerveConfig.from_dict({}).mcp_gateway_refresh_seconds == 30.0
+
+    @pytest.mark.parametrize("value, expected", [
+        (0, 0.0), (1, 1.0), (2.5, 2.5), (300, 300.0),
+        # A ${VAR} reference gives a string.
+        ("45", 45.0), ("0", 0.0),
+    ])
+    def test_accepted_values(self, value, expected):
+        from nerve.config import NerveConfig
+
+        cfg = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": value})
+        assert cfg.mcp_gateway_refresh_seconds == expected
+
+    @pytest.mark.parametrize("value", [
+        -1, 0.5, "0.5", "soon", True, float("nan"), float("inf"), [30],
+    ])
+    def test_a_bad_value_uses_the_default_and_is_logged(self, value, caplog):
+        from nerve.config import NerveConfig
+
+        with caplog.at_level("WARNING"):
+            cfg = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": value})
+        assert cfg.mcp_gateway_refresh_seconds == 30.0
+        assert "mcp_gateway_refresh_seconds" in caplog.text
+
+    def test_a_change_needs_a_restart(self):
+        from nerve.config import NerveConfig
+        from nerve.config_reload import restart_required
+
+        before = NerveConfig.from_dict({})
+        after = NerveConfig.from_dict({"mcp_gateway_refresh_seconds": 60})
+        assert restart_required(before, after) == [
+            "mcp_gateway_refresh_seconds: 30.0 → 60.0",
+        ]
+
+    def test_the_engine_reader_uses_the_setting(self, tmp_path, monkeypatch):
+        from nerve.agent.engine import AgentEngine
+        from nerve.config import NerveConfig
+        from nerve.gateway.auth import AUTH_MODE_ENV
+
+        monkeypatch.setenv(AUTH_MODE_ENV, "external")
+        (tmp_path / "ws").mkdir()
+        cfg = NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"),
+            "mcp_gateway_url": BASE,
+            "mcp_gateway_refresh_seconds": 45,
+        })
+        engine = AgentEngine(cfg, None)
+        assert engine._mcp_gateway.status()["refresh_seconds"] == 45.0
+        assert engine.mcp_gateway_status()["refresh_seconds"] == 45.0
+
+
 class TestParseCatalog:
     def test_contract_example(self):
         catalog = parse_catalog(EXAMPLE, BASE)
@@ -827,5 +882,79 @@ class TestBounds:
             assert reader._deadline == FETCH_DEADLINE_SECONDS
             assert reader.status()["error"] is None
             assert len(reader.servers) == 64
+        finally:
+            await reader.close()
+
+
+class TestPeriodicRead:
+    @pytest.mark.asyncio
+    async def test_a_new_generation_is_read_without_a_new_session(self, gateway):
+        changes: list[int] = []
+
+        async def on_change(catalog):
+            changes.append(catalog.generation)
+
+        reader = McpGatewayCatalog(
+            gateway.url, on_change=on_change, refresh_interval=0.05,
+        )
+        try:
+            await reader.start()
+            assert reader.latest.generation == 7
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            await _until(lambda: reader.latest.generation == 8)
+            assert changes == [7, 8]
+            assert reader.status()["refresh_seconds"] == 0.05
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
+    async def test_zero_turns_the_periodic_read_off(self, gateway):
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0)
+        try:
+            await reader.start()
+            requests = gateway.catalog_requests
+            await asyncio.sleep(0.2)
+            assert gateway.catalog_requests == requests
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
+    async def test_close_stops_the_periodic_read(self, gateway):
+        reader = McpGatewayCatalog(gateway.url, refresh_interval=0.02)
+        await reader.start()
+        await _until(lambda: gateway.catalog_requests >= 3)
+        await reader.close()
+        requests = gateway.catalog_requests
+        await asyncio.sleep(0.1)
+        assert gateway.catalog_requests == requests
+
+    @pytest.mark.asyncio
+    async def test_the_periodic_read_waits_while_the_retry_runs(self, gateway):
+        """During an outage only the retry reads the catalog, at its interval."""
+        gateway.stop()
+        sleeps: list[float] = []
+        block = asyncio.Event()
+
+        async def sleep(delay):
+            sleeps.append(delay)
+            if delay == 0.5:  # the retry: wait until the test lets it go on
+                await block.wait()
+            await asyncio.sleep(0.01)
+
+        reader = McpGatewayCatalog(
+            gateway.url, sleep=sleep, refresh_interval=0.25,
+            retry_initial=0.5, retry_max=0.5,
+        )
+        try:
+            await reader.start()
+            assert reader.retrying is True
+            checked = reader.status()["checked_at"]
+            await _until(lambda: sleeps.count(0.25) >= 5)
+            # The retry still waits, and the periodic read made no request.
+            assert reader.status()["checked_at"] == checked
+            gateway.start()
+            block.set()
+            await _until(lambda: reader.latest is not None)
+            assert reader.retrying is False
         finally:
             await reader.close()
