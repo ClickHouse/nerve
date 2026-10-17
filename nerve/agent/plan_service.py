@@ -143,8 +143,11 @@ async def request_plan_revision(
     #    handed to this helper — tests pass a FakeEngine that doesn't
     #    expose ``.config``, so we can't read workspace off ``engine``
     #    directly.
+    #    The note is written by whoever asks for the revision, for its cause.
     feedback_summary = feedback[:80] + "..." if len(feedback) > 80 else feedback
-    task_ctx = replace(_legacy_ctx("system"), db=db, engine=engine)
+    task_ctx = replace(
+        _legacy_ctx("system"), db=db, engine=engine, actor=actor, cause=cause,
+    )
     await task_update_handler(task_ctx, {
         "task_id": plan["task_id"],
         "note": f"Revision requested for {plan_id}: {feedback_summary}",

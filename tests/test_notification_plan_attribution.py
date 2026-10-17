@@ -790,6 +790,61 @@ async def test_tool_decline_and_revision_are_system_for_the_sessions_cause(insta
     assert await install.session_cause_of("proposal") == bob
 
 
+def _record_task_writes(install: _Install, monkeypatch) -> list[tuple]:
+    """Record the task ID and attribution of every task row write.
+
+    A note changes no status, so it records no task event; the row write
+    carries the attribution of whoever wrote the note.
+    """
+    writes: list[tuple] = []
+    real = install.db.upsert_task
+
+    async def _upsert_task(*args, **kwargs):
+        attribution = kwargs.get("attribution")
+        writes.append((
+            kwargs.get("task_id", args[0] if args else None),
+            attribution.actor_id if attribution else None,
+            attribution.caused_by_actor_id if attribution else None,
+        ))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(install.db, "upsert_task", _upsert_task)
+    return writes
+
+
+@pytest.mark.asyncio
+async def test_a_revision_note_is_written_by_who_asked_for_the_revision(
+    install, monkeypatch,
+):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    system = install.system_actor_id
+    rest_task, rest_plan = await install.pending_plan("note-rest")
+    tool_task, tool_plan = await install.pending_plan("note-tool")
+    # The revision writes its note through the tool module's workspace, which
+    # the engine sets when it starts.
+    monkeypatch.setattr("nerve.agent.tools._workspace", install.config.workspace)
+    writes = _record_task_writes(install, monkeypatch)
+
+    async with _client(install.app()) as client:
+        response = await client.post(
+            f"/api/plans/{rest_plan}/revise", headers=install.headers("bob"),
+            json={"feedback": "add tests"},
+        )
+    assert response.status_code == 200
+    await plan_revise_handler(
+        _tool_ctx(install, "alices-chat", alice),
+        {"plan_id": tool_plan, "feedback": "split it"},
+    )
+    await install.turn_done("proposal")
+
+    assert (rest_task, bob, bob) in writes
+    assert (tool_task, system, alice) in writes
+    assert not [w for w in writes if w[0] in (rest_task, tool_task) and w[1] is None]
+    for task_id in (rest_task, tool_task):
+        note = (install.config.workspace / f"{task_id}.md").read_text(encoding="utf-8")
+        assert "Revision requested for plan-note-" in note
+
+
 @pytest.mark.asyncio
 async def test_a_plan_proposed_in_alices_session_is_written_by_system_for_alice(install):
     alice = install.actor_id("alice")
