@@ -931,7 +931,7 @@ class CronService:
           resurrect itself alongside the new generation),
         - stamps ``rotated_at`` in the session metadata (prevents legacy
           re-adoption) and retitles the chat with its end date (the system
-          actor's change).
+          actor's change for the session's cause).
         """
         # Scheduled, not awaited: memorization queues on a global lock and
         # awaiting it would delay the run start by the whole queue wait.
@@ -966,9 +966,12 @@ class CronService:
 
             date_str = datetime.now(self.timezone).strftime("%Y-%m-%d")
             title = session.get("title") or f"Cron: {job_id}"
+            # Nerve's change in the session, for the session's cause.
             await self.db.update_session_title(
                 session_id, f"{title} (until {date_str})",
-                attribution=attribution_for(self.db.system_actor),
+                attribution=attribution_for(
+                    self.db.system_actor, session.get("caused_by_actor_id"),
+                ),
                 reason="cron_rotation",
             )
         except Exception as e:

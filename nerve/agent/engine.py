@@ -395,6 +395,11 @@ class AgentEngine:
         """
         return self.db.session_cause(session_id)
 
+    def _agent_attribution(self, session_id: str) -> Attribution:
+        """The attribution of a change that the agent or Nerve makes in a
+        session: the system actor, for the session's cause."""
+        return attribution_for(self.db.system_actor, self.session_cause(session_id))
+
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
     # ------------------------------------------------------------------ #
@@ -2693,12 +2698,11 @@ class AgentEngine:
                         if ' ' in placeholder
                         else placeholder + '...'
                     )
-                # Nerve sets the title for the turn's cause. The generated
-                # title gets the cause as an argument, because it is written
-                # after the turn can have ended.
+                # Nerve sets the title: the system actor's change for the
+                # session's cause, whoever sent the message.
                 await self.db.update_session_title(
                     session_id, placeholder,
-                    attribution=attribution_for(self.db.system_actor, cause_id),
+                    attribution=self._agent_attribution(session_id),
                     reason="placeholder",
                 )
                 await broadcaster.broadcast(session_id, {
@@ -2707,9 +2711,7 @@ class AgentEngine:
                     "title": placeholder,
                 })
                 asyncio.create_task(
-                    self._generate_session_title(
-                        session_id, user_message, cause_id=cause_id,
-                    ),
+                    self._generate_session_title(session_id, user_message),
                 )
 
             # Store user message in DB (note attached images for display)
@@ -3702,12 +3704,11 @@ class AgentEngine:
     # ------------------------------------------------------------------ #
 
     async def _generate_session_title(
-        self, session_id: str, first_message: str, *, cause_id: str | None,
+        self, session_id: str, first_message: str,
     ) -> None:
         """Generate a meaningful short title for a session using a fast model.
 
-        The title is the system actor's change for ``cause_id``, the cause of
-        the turn whose first message it summarizes.
+        The title is the system actor's change for the session's cause.
         """
         try:
             # Skip if no credentials are configured. An OAuth-only credential
@@ -3741,7 +3742,7 @@ class AgentEngine:
             if title and len(title) < 60:
                 await self.db.update_session_title(
                     session_id, title,
-                    attribution=attribution_for(self.db.system_actor, cause_id),
+                    attribution=self._agent_attribution(session_id),
                     reason="generated",
                 )
                 await broadcaster.broadcast(session_id, {

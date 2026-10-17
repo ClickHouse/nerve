@@ -256,8 +256,8 @@ system actor.
 
 | Event | Change | Details |
 |---|---|---|
-| `created` | The session is created; also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
-| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve sets for a turn, `cron_rotation` for a rotated cron session |
+| `created` | The session is created (actor: the creator; cause: the session's cause); also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
+| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `cron_rotation` for a rotated cron session |
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
@@ -273,8 +273,15 @@ that is resumed already, a create of a session ID that exists, a stop when no
 turn runs. Of two people who make the same change at the same time, only the
 one whose change has an effect is recorded; the session event and the change
 are one transaction.
-Events that record the state of the runtime (`started`, `idle`, `error`, and a
-`stopped` status after a cancel) have no actor and no cause.
+
+A change that the agent or Nerve makes in a session (a title, the title of a
+rotated cron session, the stop of a workflow run) records the system actor
+and the session's cause, also when another person sent the message. An
+automatic archive and the archive of a Codex session by the sync record the
+system actor as actor and cause: they are housekeeping across sessions, not
+work in one session. Events that record the state of the runtime (`started`,
+`idle`, `error`, and a `stopped` status after a cancel) have no actor and no
+cause.
 
 A delete removes the session's events. Nerve writes a row to
 `session_deletions` (the session ID, its last title, the time, the actor and

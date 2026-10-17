@@ -967,8 +967,12 @@ class WorkflowRunService:
         # recorded it (kill racing the earliest phase of _execute).
         session_id = (run or {}).get("session_id") or self._session_id(run_id)
         try:
+            # Nerve's change in the run's session, for the session's cause.
             await self.engine.stop_session(
-                session_id, attribution=attribution_for(self.db.system_actor),
+                session_id,
+                attribution=attribution_for(
+                    self.db.system_actor, self.db.session_cause(session_id),
+                ),
             )
         except Exception:  # noqa: BLE001
             logger.exception("graceful stop failed for %s", session_id)

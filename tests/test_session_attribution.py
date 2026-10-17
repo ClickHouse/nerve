@@ -2,11 +2,11 @@
 
 A session event records the actor (``actor_id``) and the cause
 (``caused_by_actor_id``) of the change. A person who changes a session through
-REST or the browser WebSocket is both. A change by the agent or by Nerve is
-the system actor's, for the cause of the turn that made it, or for the system
-actor when Nerve does it on its own. A delete removes the session's events, so
-``session_deletions`` records it. These tests drive the real routes, engine,
-session manager and database; only the model runtime is replaced.
+REST or the browser WebSocket is both. A change by the agent or by Nerve in a
+session is the system actor's, for the session's cause; housekeeping across
+sessions is the system actor's for itself. A delete removes the session's
+events, so ``session_deletions`` records it. These tests drive the real routes,
+engine, session manager and database; only the model runtime is replaced.
 """
 
 from __future__ import annotations
@@ -642,15 +642,15 @@ async def _wait_for_event(install: _Install, session_id: str, reason: str) -> No
 
 
 @pytest.mark.asyncio
-async def test_a_generated_title_takes_the_cause_of_the_turn_that_named_it(
-    install, monkeypatch,
-):
-    """Bob's turn starts before the title of Alice's first turn arrives.
+async def test_titles_that_nerve_sets_take_the_sessions_cause(install, monkeypatch):
+    """Alice starts the session and Bob sends its first message.
 
-    The title is still the system actor's change for Alice.
+    The placeholder and the generated title are the system actor's changes
+    for Alice, the session's cause.
     """
     install.use_fake_runtime(monkeypatch)
     model = _TitleModel("Launch plan review")
+    model.gate.set()
     monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "test-key")
     monkeypatch.setattr(
         install.config, "create_async_anthropic_client", lambda **kwargs: model,
@@ -659,21 +659,14 @@ async def test_a_generated_title_takes_the_cause_of_the_turn_that_named_it(
     async with _client(install.app()) as client:
         session_id = await _new_session(client, install.headers("alice"))
         response = await client.post(
-            "/api/chat", headers=install.headers("alice"),
+            "/api/chat", headers=install.headers("bob"),
             json={"session_id": session_id, "message": "Review the launch plan"},
         )
         assert response.status_code == 200
-        await asyncio.wait_for(model.asked.wait(), timeout=5)
-        response = await client.post(
-            "/api/chat", headers=install.headers("bob"),
-            json={"session_id": session_id, "message": "Add the budget"},
-        )
-        assert response.status_code == 200
-
-    model.gate.set()
     await _wait_for_event(install, session_id, "generated")
 
     system = install.system
+    assert install.engine.session_cause(session_id) == alice
     assert await install.events(session_id, "title_changed") == [
         ("title_changed", system, alice, {
             "title": "Review the launch plan", "previous": session_id,
@@ -687,7 +680,24 @@ async def test_a_generated_title_takes_the_cause_of_the_turn_that_named_it(
 
 
 @pytest.mark.asyncio
-async def test_a_title_in_a_turn_with_no_person_has_no_cause(install, monkeypatch):
+async def test_the_created_event_names_the_creator_and_the_sessions_cause(install):
+    """Nerve creates a session for Alice; a later call with another cause
+    finds the session and records nothing."""
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    sessions = install.engine.sessions
+    await sessions.get_or_create("for-alice", actor=install.db.system_actor, cause=alice)
+    await sessions.get_or_create("for-alice", actor=install.db.system_actor, cause=bob)
+
+    assert install.engine.session_cause("for-alice") == alice
+    assert await install.events("for-alice") == [
+        ("created", install.system, alice, {"source": "web", "parent": None}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_title_in_a_session_with_no_known_cause_has_no_cause(
+    install, monkeypatch,
+):
     install.use_fake_runtime(monkeypatch)
     # No model credential: the turn sets only the placeholder title.
     monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "")

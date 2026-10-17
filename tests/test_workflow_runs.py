@@ -577,7 +577,8 @@ class TestKillRun:
 
         await asyncio.gather(*list(service._kill_tasks))
         engine.stop_session.assert_awaited_once_with(
-            session_id, attribution=attribution_for(db.system_actor),
+            # Nerve's stop, for the session's cause (none for this session).
+            session_id, attribution=attribution_for(db.system_actor, None),
         )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
@@ -623,7 +624,8 @@ class TestBudgetEnforcement:
         # Enforcement is scoped to the run's own session.
         await asyncio.gather(*list(service._kill_tasks))
         engine.stop_session.assert_awaited_once_with(
-            session_id, attribution=attribution_for(db.system_actor),
+            # Nerve's stop, for the session's cause (none for this session).
+            session_id, attribution=attribution_for(db.system_actor, None),
         )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,

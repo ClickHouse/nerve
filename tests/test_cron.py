@@ -826,6 +826,7 @@ class TestRotation:
             "status": "idle",
             "title": "Cron: pers",
             "metadata": "{}",
+            "caused_by_actor_id": FAKE_SYSTEM_ACTOR.actor_id,
         })
         job = _pers_job(context_rotate_hours=24)
 
@@ -840,9 +841,9 @@ class TestRotation:
         title_args = cron_service.db.update_session_title.call_args.args
         assert title_args[0] == "cron:pers"
         assert title_args[1].startswith("Cron: pers (until ")
-        # The retitle is Nerve's own change.
+        # The retitle is Nerve's change for the session's cause.
         assert cron_service.db.update_session_title.call_args.kwargs == {
-            "attribution": attribution_for(FAKE_SYSTEM_ACTOR),
+            "attribution": attribution_for(FAKE_SYSTEM_ACTOR, FAKE_SYSTEM_ACTOR),
             "reason": "cron_rotation",
         }
 
