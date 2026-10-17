@@ -198,9 +198,9 @@ These columns store actor IDs:
 | `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
 | `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |
 | `plans.created_by_actor_id`, `plans.caused_by_actor_id` | Actor and cause of the plan version: who wrote it |
-| `workflow_runs.created_by_actor_id`, `workflow_runs.caused_by_actor_id` | Actor and cause of a workflow run. The run's turns have this cause |
+| `workflow_runs.created_by_actor_id`, `workflow_runs.caused_by_actor_id` | Actor and cause of a workflow run. The run's session is created with this cause |
 | `workflow_runs.killed_by_actor_id`, `workflow_runs.killed_caused_by_actor_id` | Actor and cause of the kill of a workflow run |
-| `review_loops.created_by_actor_id`, `review_loops.caused_by_actor_id` | Actor and cause of a review loop. The turns of every leg of the loop have this cause |
+| `review_loops.created_by_actor_id`, `review_loops.caused_by_actor_id` | Actor and cause of a review loop. Each leg session of the loop is created with this cause |
 | `review_loops.killed_by_actor_id`, `review_loops.killed_caused_by_actor_id` | Actor and cause of the kill of a review loop |
 | `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
 

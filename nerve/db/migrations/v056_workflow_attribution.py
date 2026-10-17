@@ -6,13 +6,15 @@ Adds nullable columns that hold an ``actor_refs.id``:
   who created the run or the loop. A person through the web UI or REST, or
   the system actor for a tool call, a cron job or a review-loop leg.
 - ``workflow_runs.caused_by_actor_id``, ``review_loops.caused_by_actor_id``:
-  on whose behalf. The turns of a run (its legs) run with this cause, so the
-  model requests of a run name the person who caused it.
+  on whose behalf. A run's session (and each leg session of a loop) is
+  created with this cause, so the agent work in it names the person who
+  caused it.
 - ``workflow_runs.killed_by_actor_id``, ``review_loops.killed_by_actor_id``:
   who killed the run or the loop.
 - ``workflow_runs.killed_caused_by_actor_id``,
   ``review_loops.killed_caused_by_actor_id``: on whose behalf it was killed.
-  A kill through a tool records the system actor and the cause of the turn.
+  A kill through a tool records the system actor and the calling session's
+  cause.
 
 Adds the table ``review_loop_decisions``. A decision on a parked loop (accept,
 abandon, more iterations, more budget, adopt and continue, remind later)

@@ -100,18 +100,22 @@ A run records who created it and on whose behalf
   `nerve workflow start` and `kill` call REST with the instance's own token,
   so they record the system actor.
 - Through `workflow_run_start` or `workflow_run_kill`, the actor is the
-  system actor and the cause is the cause of the turn that called the tool.
+  system actor and the cause is the cause of the session that called the
+  tool.
 - A cron job's run is the system actor's, for itself. A review-loop leg is
   the system actor's, for the cause of the loop.
-- The run's turns run as the system actor for the run's cause. A run with
-  no cause (one started by input that names no person) runs its turns with
-  no cause.
+- The run's session is created with the run's cause, so everything the
+  agent does in it (and, in external mode, its model requests) is for that
+  cause. A run with no cause (one started by input that names no person)
+  gets a session with no cause.
 - A kill records the kill attribution only when it ends the run. A stop of
   the run's session (the Stop button) is a kill by the person who asked for
   the stop; a `/stop` from a chat channel names no person. A budget stop and
   a restart are not kills and record no kill actor.
 - The run's session records its `created` event as the system actor for the
   run's cause.
+- Nerve's own stop of a run's session (after a kill or a budget stop) is the
+  system actor's, for the session's cause.
 
 `created_by` stays the origin text (`api`, `session:<id>`,
 `review-loop:<id>`, `cron:<job>`); the sidebar reads it to show the run's

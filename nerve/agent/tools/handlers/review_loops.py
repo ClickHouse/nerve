@@ -225,7 +225,7 @@ async def review_loop_start_handler(ctx: ToolContext, args: dict) -> ToolResult:
             implementer=_leg("implementer"),
             verifier_leg=_leg("verifier"),
             created_by=f"mcp:{ctx.session_id}",
-            # The system actor, for the cause of the turn that calls the tool.
+            # The system actor, for the calling session's cause.
             attribution=ctx.attribution,
         )
     except ReviewLoopError as e:

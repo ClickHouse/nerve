@@ -1,10 +1,11 @@
 """Who starts, kills and decides workflow runs and review loops, and for whom.
 
 A person who acts through REST is the actor and the cause. A workflow tool or
-review-loop tool that the agent calls inside a turn is the system actor's
-change, made for the cause of that turn. The turns of a run, and of every leg
-of a loop, run as the system actor for the cause of the run, so their model
-requests name the person who started the work. These tests drive the real
+review-loop tool that the agent calls in a session is the system actor's
+change, made for the session's cause. A run's session, and the session of
+every leg of a loop, is created with the cause of the run, so the agent work
+and the model requests in it name the person who started the work. These
+tests drive the real
 routes, workflow and review-loop services, notification service, engine, tool
 registry and database. Only the model runtime is replaced, by a client that
 completes each turn and makes a tool call where a test asks for one. Run
@@ -78,8 +79,8 @@ _NEW_COLUMNS = (
 class _FakeRuntime:
     """A model runtime client that completes every turn.
 
-    It records the session's turn cause while the turn runs, which is the
-    cause that the turn's tool calls record. When a test asked for a tool
+    It records the session's cause as the turn's tool calls see it. When a
+    test asked for a tool
     call in the session, the turn makes it through the session's own tool
     context, as the Claude CLI calls the in-process MCP server.
     """
@@ -107,7 +108,7 @@ class _FakeRuntime:
 
     async def receive_turn(self):
         engine = self.install.engine
-        self.install.turn_causes.setdefault(self.session_id, []).append(
+        self.install.tool_call_causes.setdefault(self.session_id, []).append(
             engine.session_cause(self.session_id),
         )
         call = self.install.tool_calls.pop(self.session_id, None)
@@ -133,8 +134,7 @@ class _Install:
         self.people: dict[str, dict] = {}
         self.broadcasts: list[tuple[str, dict]] = []
         self.turns: list[dict] = []
-        self.client_fetches: list[dict] = []
-        self.turn_causes: dict[str, list] = {}
+        self.tool_call_causes: dict[str, list] = {}
         self.runtimes: dict[str, _FakeRuntime] = {}
         self.tool_calls: dict[str, tuple[str, dict]] = {}
         self.tool_results: dict[str, list] = {}
@@ -182,7 +182,6 @@ class _Install:
         monkeypatch.setattr(self.engine, "run", _run)
 
         async def _client(session_id, source, model, **kwargs):
-            self.client_fetches.append({"session_id": session_id, **kwargs})
             if session_id not in self.runtimes:
                 self.runtimes[session_id] = _FakeRuntime(self, session_id)
             return self.runtimes[session_id]
@@ -238,12 +237,10 @@ class _Install:
     def events_of(self, kind: str) -> list[dict]:
         return [m for _, m in self.broadcasts if m.get("type") == kind]
 
-    async def user_rows(self, session_id: str) -> list[tuple]:
-        """Each user row's writer, with the session's stored cause: the
-        cause of all agent work in the session."""
-        cause = (await self.db.get_session(session_id))["caused_by_actor_id"]
+    async def message_writers(self, session_id: str) -> list[str | None]:
+        """Who wrote each user message of the session."""
         return [
-            (row["actor_id"], cause)
+            row["actor_id"]
             for row in await self.db.get_messages(session_id)
             if row["role"] == "user"
         ]
@@ -255,8 +252,8 @@ class _Install:
         ]
         return (row["actor_id"], row["caused_by_actor_id"])
 
-    async def turn_cause_of(self, session_id: str) -> str | None:
-        """The session's stored cause, which its turns run with."""
+    async def session_cause_of(self, session_id: str) -> str | None:
+        """The session's stored cause: the cause of all agent work in it."""
         return (await self.db.get_session(session_id))["caused_by_actor_id"]
 
     async def run_attribution(self, run_id: str) -> tuple:
@@ -423,7 +420,7 @@ async def test_v056_keeps_old_rows_null_and_is_idempotent(install):
 
 
 @pytest.mark.asyncio
-async def test_a_rest_run_records_the_person_and_its_turn_runs_for_them(install):
+async def test_a_rest_run_records_the_person_and_its_session_is_for_them(install):
     alice, system = install.actor_id("alice"), install.system_actor_id
     async with _client(install.app()) as client:
         created = await _rest_run(client, install.headers("alice"), title="Logs")
@@ -435,18 +432,14 @@ async def test_a_rest_run_records_the_person_and_its_turn_runs_for_them(install)
     assert await install.drain() == [run_id]
     run = await install.db.get_workflow_run(run_id)
     assert run["status"] == "done"
-    # The turn runs as the system actor, on Alice's behalf.
+    # The turn runs as the system actor in a session for Alice; the turn
+    # itself names no cause.
     assert install.turns[-1]["actor"] == install.db.system_actor
-    assert install.turns[-1]["cause"] == alice
-    assert await install.user_rows(session_id) == [(system, alice)]
-    assert install.turn_causes[session_id] == [alice]
-    assert await install.turn_cause_of(session_id) == alice
-    # When the engine gives the turn's cause to the client fetch, it is Alice.
-    assert all(
-        fetch["cause_id"] == alice
-        for fetch in install.client_fetches
-        if fetch["session_id"] == session_id and "cause_id" in fetch
-    )
+    assert "cause" not in install.turns[-1]
+    assert await install.message_writers(session_id) == [system]
+    assert await install.session_cause_of(session_id) == alice
+    assert install.tool_call_causes[session_id] == [alice]
+    assert await install.session_cause_of(session_id) == alice
     assert (await install.db.get_session(session_id))["created_by_actor_id"] == system
     # The session's created event: the system actor, for Alice.
     assert await install.created_event(session_id) == (system, alice)
@@ -461,14 +454,15 @@ async def test_a_rest_run_records_the_person_and_its_turn_runs_for_them(install)
 
 
 @pytest.mark.asyncio
-async def test_a_run_without_a_cause_keeps_its_turn_without_one(install):
+async def test_a_run_without_a_cause_gets_a_session_without_one(install):
     run = await install.runs.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
     await install.drain()
 
     session_id = f"workflow:{run['id']}"
-    assert install.turns[-1]["cause"] is None
-    assert await install.user_rows(session_id) == [(install.system_actor_id, None)]
-    assert await install.turn_cause_of(session_id) is None
+    assert "cause" not in install.turns[-1]
+    assert await install.message_writers(session_id) == [install.system_actor_id]
+    assert await install.session_cause_of(session_id) == None
+    assert await install.session_cause_of(session_id) is None
     assert await install.created_event(session_id) == (install.system_actor_id, None)
 
 
@@ -510,7 +504,7 @@ async def test_a_stop_of_the_runs_session_records_who_stopped_it(install):
 
 
 @pytest.mark.asyncio
-async def test_a_run_started_by_the_tool_in_alices_turn_runs_for_alice(install):
+async def test_a_run_started_by_the_tool_in_alices_session_is_for_alice(install):
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     system = install.system_actor_id
     await install.chat_session("alices-chat", "alice")
@@ -526,8 +520,9 @@ async def test_a_run_started_by_the_tool_in_alices_turn_runs_for_alice(install):
 
     await install.drain()
     session_id = f"workflow:{run['id']}"
-    assert await install.user_rows(session_id) == [(system, alice)]
-    assert install.turn_causes[session_id] == [alice]
+    assert await install.message_writers(session_id) == [system]
+    assert await install.session_cause_of(session_id) == alice
+    assert install.tool_call_causes[session_id] == [alice]
     # The origin pointer still nests the run's session under Alice's chat.
     assert (await install.db.get_session(session_id))["parent_session_id"] == "alices-chat"
 
@@ -570,8 +565,9 @@ async def test_a_loop_created_with_its_session_runs_every_leg_for_the_person(ins
     assert run["created_by"] == f"review-loop:{loop_id}"
     assert await install.run_attribution(implementer) == (system, alice, None, None)
     await install.drain(count=1)
-    assert await install.user_rows(f"workflow:{implementer}") == [(system, alice)]
-    assert install.turn_causes[f"workflow:{implementer}"] == [alice]
+    assert await install.message_writers(f"workflow:{implementer}") == [system]
+    assert await install.session_cause_of(f"workflow:{implementer}") == alice
+    assert install.tool_call_causes[f"workflow:{implementer}"] == [alice]
 
     # The verifier leg is for Alice too. Bob kills the loop while it runs.
     await install.wait_for(lambda: install.spawned)
@@ -591,7 +587,7 @@ async def test_a_loop_created_with_its_session_runs_every_leg_for_the_person(ins
 
 
 @pytest.mark.asyncio
-async def test_a_loop_started_by_the_tool_in_alices_turn_and_killed_in_bobs(install):
+async def test_a_loop_started_by_the_tool_in_alices_session_and_killed_in_bobs(install):
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     system = install.system_actor_id
     await install.chat_session("alices-chat", "alice")
@@ -657,7 +653,8 @@ async def test_a_leg_issued_again_after_a_restart_keeps_the_loops_cause(install)
 
     assert await install.run_attribution("wfr-again001") == (system, alice, None, None)
     await install.drain(count=1)
-    assert await install.user_rows("workflow:wfr-again001") == [(system, alice)]
+    assert await install.message_writers("workflow:wfr-again001") == [system]
+    assert await install.session_cause_of("workflow:wfr-again001") == alice
 
 
 async def _loop_if(install: _Install, loop_id: str, status: str) -> dict | None:
@@ -1060,7 +1057,7 @@ async def external_install(tmp_path, monkeypatch, wire_identity_store):
 
 
 @pytest.mark.asyncio
-async def test_external_mode_runs_the_turn_for_the_principal(external_install):
+async def test_external_mode_gives_the_session_the_principal(external_install):
     install = external_install
     carol = _as(CAROL_PRINCIPAL, "Carol")
     async with _client(install.app()) as client:
@@ -1074,10 +1071,8 @@ async def test_external_mode_runs_the_turn_for_the_principal(external_install):
     assert (created["created_by_actor_id"], created["caused_by_actor_id"]) == (
         CAROL_PRINCIPAL, CAROL_PRINCIPAL,
     )
-    assert await install.user_rows(session_id) == [
-        (install.system_actor_id, CAROL_PRINCIPAL),
-    ]
-    assert await install.turn_cause_of(session_id) == CAROL_PRINCIPAL
+    assert await install.message_writers(session_id) == [install.system_actor_id]
+    assert await install.session_cause_of(session_id) == CAROL_PRINCIPAL
     assert (await install.run_attribution(second["id"]))[2:] == (
         CAROL_PRINCIPAL, CAROL_PRINCIPAL,
     )
@@ -1113,7 +1108,7 @@ async def external_cli_install(tmp_path, monkeypatch, wire_identity_store, cli):
 
 
 @pytest.mark.asyncio
-async def test_leg_turns_name_the_cause_of_the_run_to_the_model(external_cli_install):
+async def test_leg_sessions_name_the_cause_of_the_run_to_the_model(external_cli_install):
     install, processes = external_cli_install
     carol = _as(CAROL_PRINCIPAL, "Carol")
     system = install.system_actor_id

@@ -65,7 +65,8 @@ class WorkflowRunStore:
 
         ``created_by`` is the origin text. ``attribution`` names who created
         the run (``created_by_actor_id``) and on whose behalf
-        (``caused_by_actor_id``); the turns of the run take that cause.
+        (``caused_by_actor_id``); the run's session is created with that
+        cause.
         """
         now = utc_now_iso()
         await self._write(

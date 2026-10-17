@@ -345,8 +345,8 @@ class ReviewLoopService:
 
         ``created_by`` is the origin text. ``attribution`` names who created
         the loop and on whose behalf: the person for a REST request, the
-        system actor and the turn's cause for a tool call. Every leg runs as
-        the system actor with that cause."""
+        system actor and the calling session's cause for a tool call. Every
+        leg is a run with that cause, so its session has that cause."""
         goal = (goal or "").strip()
         verifier = (verifier or "").strip()
         if not goal:

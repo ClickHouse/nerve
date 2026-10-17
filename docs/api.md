@@ -1067,7 +1067,7 @@ Response: {
 
 `created_by` is the origin text. `created_by_actor_id` and
 `caused_by_actor_id` name who created the run and on whose behalf; the run's
-turns run for that cause. `killed_by_actor_id` and
+session is created with that cause. `killed_by_actor_id` and
 `killed_caused_by_actor_id` name who killed it. All four are `null` on runs
 from before attribution, and the kill pair is `null` when the kill names no
 person (for example a `/stop` from a chat channel). See

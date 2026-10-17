@@ -221,9 +221,9 @@ class WorkflowRunService:
         ``created_by`` is the origin text, and also the pointer to the
         session that the run starts from (see :meth:`_origin_session_id`).
         ``attribution`` names who created the run and on whose behalf: the
-        person for a REST request, the system actor and the turn's cause for
-        a tool call. The run's turns run as the system actor with that
-        cause."""
+        person for a REST request, the system actor and the calling
+        session's cause for a tool call. The run's session is created with
+        that cause, so all agent work in it is for that cause."""
         if engine_kind not in ENGINE_BACKENDS:
             raise WorkflowRunError(
                 f"unknown engine {engine_kind!r} — expected one of: "
@@ -522,8 +522,9 @@ class WorkflowRunService:
                 else f"Workflow: {label}"
             )
             leg_actor = self.db.system_actor
-            # The session's ``created`` event: the system actor, for the
-            # run's cause.
+            # The leg session's cause is the run's cause, stored when the
+            # session is created: the agent work in it (and in external mode
+            # its model requests) names that cause. A NULL cause stays NULL.
             await self.engine.sessions.get_or_create(
                 session_id,
                 title=leg_title,
@@ -547,9 +548,6 @@ class WorkflowRunService:
             self._write_run_json(run)
             await self._broadcast(run)
 
-            # The turn runs as the system actor on behalf of the run's
-            # cause. A NULL cause stays NULL: the run was started by input
-            # that names no person.
             response = await self.engine.run(
                 session_id=session_id,
                 user_message=self._build_prompt(run),
@@ -557,7 +555,6 @@ class WorkflowRunService:
                 model=model,
                 effort_override=str(spec.get("effort") or "") or None,
                 actor=leg_actor,
-                cause=run.get("caused_by_actor_id"),
             )
 
             # engine.run returns normally even for interrupted, cancelled,

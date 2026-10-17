@@ -200,7 +200,7 @@ async def workflow_run_start_handler(ctx: ToolContext, args: dict) -> ToolResult
             budget_usd=args.get("budget_usd"),
             title=str(args.get("title") or ""),
             created_by=f"session:{ctx.session_id}",
-            # The system actor, for the cause of the turn that calls the tool.
+            # The system actor, for the calling session's cause.
             attribution=ctx.attribution,
         )
     except WorkflowRunError as e:
