@@ -155,19 +155,13 @@ class TestRequestPlanRevision:
             plan_id="plan-orig", feedback="needs more tests",
             actor=None, cause=None,
         )
-        # The plan is revising while the revision turn runs.
-        assert (await db.get_plan("plan-orig"))["status"] == "revising"
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
-        # Feedback persisted on the plan. This revision turn did not call
-        # plan_update, so the plan is pending again when the turn ends.
-        async def _reopened():
-            while (await db.get_plan("plan-orig"))["status"] != "pending":
-                await asyncio.sleep(0.01)
-
-        await asyncio.wait_for(_reopened(), timeout=1.0)
+        # Feedback persisted on the plan; plan stays pending until the
+        # planner supersedes it via plan_update.
         plan = await db.get_plan("plan-orig")
         assert plan["feedback"] == "needs more tests"
+        assert plan["status"] == "pending"
 
         # Task markdown got a revision note appended.
         task = await db.get_task(task_id)

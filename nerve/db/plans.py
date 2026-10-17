@@ -84,20 +84,19 @@ class PlanStore:
         self,
         plan_id: str,
         *,
-        expect_status: str | tuple[str, ...],
+        expect_status: str,
         attribution: Attribution | None = None,
         **fields,
     ) -> bool:
         """Write ``fields`` only while the plan's status is ``expect_status``.
 
-        ``expect_status`` is one status or a tuple of statuses. A decision
-        reads the plan, checks its status and then acts, and a second
-        decision can read the same status before the first one writes. This
-        one statement decides: of several decisions made from the same
-        status, only one changes the row, and only that caller may start the
-        work that the decision causes. Each decision must therefore change
-        the status (a revision request moves the plan to ``revising``), or a
-        second decision from the same status still matches.
+        A decision reads the plan, checks its status and then acts, and a
+        second decision can read the same status before the first one
+        writes. This one statement decides: of several decisions made from
+        the same status, only one changes the row, and only that caller may
+        start the work that the decision causes. A revision request keeps the
+        status ``pending``, so it does not stop a later decision from the same
+        status.
 
         ``attribution`` marks a review decision (approve, decline, a
         revision request, a status or feedback change through REST). Its
@@ -113,14 +112,10 @@ class PlanStore:
             fields["reviewed_caused_by_actor_id"] = attribution.caused_by_actor_id
         if not fields:
             raise ValueError("compare_and_update_plan needs at least one field")
-        expected = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
-        if not expected:
-            raise ValueError("compare_and_update_plan needs an expected status")
         sets = ", ".join(f"{k} = ?" for k in fields)
-        placeholders = ", ".join("?" for _ in expected)
         result = await self._write(
-            f"UPDATE plans SET {sets} WHERE id = ? AND status IN ({placeholders})",
-            (*fields.values(), plan_id, *expected),
+            f"UPDATE plans SET {sets} WHERE id = ? AND status = ?",
+            (*fields.values(), plan_id, expect_status),
         )
         return result.rowcount == 1
 
@@ -132,9 +127,8 @@ class PlanStore:
             return [dict(row) async for row in cursor]
 
     async def get_pending_plan_task_ids(self) -> list[str]:
-        """Get task IDs that have a pending, revising or implementing plan."""
+        """Get task IDs that have a pending or implementing plan."""
         async with self.db.execute(
-            "SELECT DISTINCT task_id FROM plans"
-            " WHERE status IN ('pending', 'revising', 'implementing')"
+            "SELECT DISTINCT task_id FROM plans WHERE status IN ('pending', 'implementing')"
         ) as cursor:
             return [row[0] async for row in cursor]

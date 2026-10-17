@@ -65,20 +65,6 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    # Only the revision itself leaves 'revising': the planner's new version,
-    # or the end of the revision turn. A PATCH that changed it here would let
-    # a second decision start work while the revision still runs.
-    if req.status == "revising":
-        raise HTTPException(
-            status_code=400,
-            detail="Status 'revising' is set only by a revision request",
-        )
-    if plan["status"] == "revising" and (req.status or req.feedback):
-        raise HTTPException(
-            status_code=409,
-            detail="Plan is 'revising'; it changes when its revision ends",
-        )
-
     fields = {}
     if req.status:
         fields["status"] = req.status

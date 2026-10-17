@@ -27,10 +27,6 @@ from fastapi import FastAPI
 from nerve.agent import streaming
 from nerve.agent.backends import TurnCompleted
 from nerve.agent.engine import AgentEngine
-from nerve.agent.plan_service import (
-    finish_revisions_after_resume,
-    recover_revising_plans,
-)
 from nerve.agent.tools.handlers.plans import (
     plan_approve_handler,
     plan_decline_handler,
@@ -112,9 +108,6 @@ class _FakeRuntime:
         return None
 
     async def receive_turn(self):
-        gate = self.install.holds.get(self.session_id)
-        if gate is not None:
-            await gate.wait()
         call = self.install.tool_calls.pop(self.session_id, None)
         if call is not None:
             tool, args = call
@@ -141,8 +134,6 @@ class _Install:
         self.runtimes: dict[str, _FakeRuntime] = {}
         self.tool_calls: dict[str, tuple[str, dict]] = {}
         self.tool_results: dict[str, list] = {}
-        # A session whose turns wait for this event before they complete.
-        self.holds: dict[str, asyncio.Event] = {}
 
     @property
     def system_actor_id(self) -> str:
@@ -944,156 +935,7 @@ async def test_tool_decisions_after_an_approval_change_nothing(install, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_revision_excludes_every_other_decision_while_it_runs(
-    install, monkeypatch,
-):
-    bob = install.actor_id("bob")
-    task_id, plan_id = await install.pending_plan("race-revise")
-    install.holds["proposal"] = asyncio.Event()
-    await _stale_plan_reads(install, monkeypatch, plan_id)
-    async with _client(install.app()) as client:
-        revised = await client.post(
-            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
-            json={"feedback": "add tests"},
-        )
-        assert revised.status_code == 200
-        assert (await install.plan_row(plan_id))["status"] == "revising"
-        # Each of these read the plan while it was still pending.
-        approved = await client.post(
-            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
-        )
-        declined = await client.patch(
-            f"/api/plans/{plan_id}", headers=install.headers("alice"),
-            json={"status": "declined"},
-        )
-        revised_again = await client.post(
-            f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
-            json={"feedback": "no, remove tests"},
-        )
-    assert (approved.status_code, declined.status_code, revised_again.status_code) == (
-        409, 409, 409,
-    )
-    ctx = _tool_ctx(install, "alices-chat", install.actor_id("alice"))
-    for handler, args in (
-        (plan_approve_handler, {"plan_id": plan_id}),
-        (plan_decline_handler, {"plan_id": plan_id}),
-        (plan_revise_handler, {"plan_id": plan_id, "feedback": "again"}),
-    ):
-        result = await handler(ctx, args)
-        assert "pending" in result.content[0]["text"], handler.__name__
-
-    plan = await install.plan_row(plan_id)
-    assert (plan["status"], plan["feedback"]) == ("revising", "add tests")
-    assert await install.plan_reviewer(plan_id) == (bob, bob)
-    assert install.impl_runs() == []
-    assert [e[0] for e in await install.task_events(task_id)] == ["pending"]
-    assert [r["session_id"] for r in install.runs].count("proposal") == 1
-
-    # The revision turn ends without a new version: the plan is open again.
-    install.holds["proposal"].set()
-    await install.turn_done("proposal")
-    assert (await install.plan_row(plan_id))["status"] == "pending"
-
-
-def _read_together(install: _Install, monkeypatch, plan_id: str, count: int) -> None:
-    """The first ``count`` reads of ``plan_id`` return only when all have read.
-
-    So every request sees the plan pending before any of them decides.
-    """
-    real = install.db.get_plan
-    arrived = 0
-    all_in = asyncio.Event()
-
-    async def _get_plan(pid):
-        nonlocal arrived
-        row = await real(pid)
-        if pid == plan_id and not all_in.is_set():
-            arrived += 1
-            if arrived >= count:
-                all_in.set()
-            await asyncio.wait_for(all_in.wait(), timeout=5)
-        return row
-
-    monkeypatch.setattr(install.db, "get_plan", _get_plan)
-
-
-@pytest.mark.parametrize("other", ["approve", "decline", "revise"])
-@pytest.mark.asyncio
-async def test_a_revision_and_a_concurrent_decision_apply_once(install, monkeypatch, other):
-    task_id, plan_id = await install.pending_plan(f"race-pair-{other}")
-    install.holds["proposal"] = asyncio.Event()
-    _read_together(install, monkeypatch, plan_id, 2)
-    async with _client(install.app()) as client:
-        if other == "approve":
-            second = client.post(f"/api/plans/{plan_id}/approve", headers=install.headers("alice"))
-        elif other == "decline":
-            second = client.patch(
-                f"/api/plans/{plan_id}", headers=install.headers("alice"),
-                json={"status": "declined"},
-            )
-        else:
-            second = client.post(
-                f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
-                json={"feedback": "longer"},
-            )
-        first = client.post(
-            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
-            json={"feedback": "shorter"},
-        )
-        # The revision reads last, so it is the first to write after the
-        # reads; the other decision then writes from the same pending read.
-        responses = await asyncio.gather(second, first)
-    codes = [r.status_code for r in responses]
-    assert sorted(codes) == [200, 409], codes
-    revision_turns = [r for r in install.runs if r["session_id"] == "proposal"]
-    implementations = install.impl_runs()
-    # One decision, so at most one kind of work started.
-    assert len(revision_turns) + len(implementations) <= 1
-    install.holds["proposal"].set()
-    if revision_turns:
-        await install.turn_done("proposal")
-    for run in implementations:
-        await install.turn_done(run["session_id"])
-
-
-@pytest.mark.asyncio
-async def test_concurrent_revisions_and_decisions_apply_once(install, monkeypatch):
-    task_id, plan_id = await install.pending_plan("race-mixed")
-    install.holds["proposal"] = asyncio.Event()
-    _read_together(install, monkeypatch, plan_id, 4)
-    async with _client(install.app()) as client:
-        responses = await asyncio.gather(
-            client.post(
-                f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
-                json={"feedback": "shorter"},
-            ),
-            client.post(f"/api/plans/{plan_id}/approve", headers=install.headers("alice")),
-            client.patch(
-                f"/api/plans/{plan_id}", headers=install.headers("alice"),
-                json={"status": "declined"},
-            ),
-            client.post(
-                f"/api/plans/{plan_id}/revise", headers=install.headers("alice"),
-                json={"feedback": "longer"},
-            ),
-        )
-    codes = [r.status_code for r in responses]
-    assert sorted(codes) == [200, 409, 409, 409], codes
-    status = (await install.plan_row(plan_id))["status"]
-    winner = codes.index(200)
-    assert status == ("revising", "implementing", "declined", "revising")[winner]
-    revision_turns = [r for r in install.runs if r["session_id"] == "proposal"]
-    assert len(revision_turns) == (1 if winner in (0, 3) else 0)
-    assert len(install.impl_runs()) == (1 if winner == 1 else 0)
-    install.holds["proposal"].set()
-    if revision_turns:
-        await install.turn_done("proposal")
-    if winner == 1:
-        await install.turn_done(responses[1].json()["impl_session_id"])
-
-
-@pytest.mark.asyncio
-async def test_the_planner_replaces_a_revising_plan_and_it_stays_replaced(install):
+async def test_the_revision_turns_new_version_supersedes_the_plan(install):
     bob = install.actor_id("bob")
     task_id, plan_id = await install.pending_plan("revise-update")
     install.agent_calls("proposal", "plan_update", {"plan_id": plan_id, "content": "Ship less"})
@@ -1110,139 +952,6 @@ async def test_the_planner_replaces_a_revising_plan_and_it_stays_replaced(instal
     assert (new["status"], new["created_by_actor_id"], new["caused_by_actor_id"]) == (
         "pending", install.system_actor_id, bob,
     )
-
-
-@pytest.mark.asyncio
-async def test_a_task_with_a_revising_plan_takes_no_new_proposal(install):
-    task_id, plan_id = await install.pending_plan("revising-propose")
-    await install.db.update_plan(plan_id, status="revising")
-    result = await plan_propose_handler(
-        _tool_ctx(install, "planner", None), {"task_id": task_id, "content": "Another"},
-    )
-    assert "already has a pending" in result.content[0]["text"]
-    assert [p["id"] for p in await install.db.get_plans_for_task(task_id)] == [plan_id]
-
-
-@pytest.mark.asyncio
-async def test_a_patch_cannot_take_a_plan_out_of_a_running_revision(install):
-    _, plan_id = await install.pending_plan("patch-revising")
-    install.holds["proposal"] = asyncio.Event()
-    async with _client(install.app()) as client:
-        revised = await client.post(
-            f"/api/plans/{plan_id}/revise", headers=install.headers("bob"),
-            json={"feedback": "shorter"},
-        )
-        assert revised.status_code == 200
-        # Fresh reads: each request sees the plan revising.
-        refused = [
-            await client.patch(
-                f"/api/plans/{plan_id}", headers=install.headers("alice"), json=body,
-            )
-            for body in (
-                {"status": "pending"}, {"status": "declined"}, {"feedback": "mine"},
-            )
-        ]
-        approved = await client.post(
-            f"/api/plans/{plan_id}/approve", headers=install.headers("alice"),
-        )
-    assert [r.status_code for r in refused] == [409, 409, 409]
-    assert approved.status_code == 409
-    plan = await install.plan_row(plan_id)
-    assert (plan["status"], plan["feedback"]) == ("revising", "shorter")
-    assert install.impl_runs() == []
-    install.holds["proposal"].set()
-    await install.turn_done("proposal")
-    assert (await install.plan_row(plan_id))["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_a_patch_cannot_set_revising(install):
-    _, plan_id = await install.pending_plan("patch-to-revising")
-    async with _client(install.app()) as client:
-        response = await client.patch(
-            f"/api/plans/{plan_id}", headers=install.headers("alice"),
-            json={"status": "revising"},
-        )
-    assert response.status_code == 400
-    assert (await install.plan_row(plan_id))["status"] == "pending"
-
-
-async def _plan_left_revising(install: _Install, suffix: str, session_id: str) -> str:
-    task_id = f"task-{suffix}"
-    task_file = install.config.workspace / f"{task_id}.md"
-    task_file.write_text("# Plan task\n", encoding="utf-8")
-    await install.db.upsert_task(
-        task_id=task_id, file_path=task_file.name, title="Plan task",
-        status="pending", content="# Plan task\n",
-    )
-    plan_id = f"plan-{suffix}"
-    await install.db.create_plan(
-        plan_id=plan_id, task_id=task_id, content="Ship it",
-        session_id=session_id, version=1,
-    )
-    await install.db.update_plan(plan_id, status="revising", feedback="shorter")
-    return plan_id
-
-
-@pytest.mark.asyncio
-async def test_restart_keeps_a_resumed_revision_revising_until_its_turn_ends(
-    install, monkeypatch, tmp_path,
-):
-    resumed = await _plan_left_revising(install, "restart-resumed", "planner-a")
-    lost = await _plan_left_revising(install, "restart-lost", "planner-b")
-    await install.db.create_session("planner-a", source="cron", actor=None)
-    await install.db.update_session_fields("planner-a", {"sdk_session_id": "native-1"})
-    queue = tmp_path / "resume-after-restart"
-    queue.write_text("planner-a\n")
-    monkeypatch.setattr("nerve.agent.engine.RESUME_QUEUE_FILE", queue)
-
-    # Startup, before the resume: only the plan whose revision is lost reopens.
-    assert await recover_revising_plans(install.db) == [resumed]
-    assert (await install.plan_row(lost))["status"] == "pending"
-    assert (await install.plan_row(resumed))["status"] == "revising"
-
-    install.holds["planner-a"] = asyncio.Event()
-    resume = asyncio.create_task(
-        finish_revisions_after_resume(
-            install.engine.resume_enrolled_sessions(), install.db, [resumed],
-        ),
-    )
-    while not any(run["session_id"] == "planner-a" for run in install.runs):
-        await asyncio.sleep(0.01)
-    async with _client(install.app()) as client:
-        approved = await client.post(
-            f"/api/plans/{resumed}/approve", headers=install.headers("alice"),
-        )
-        reopened = await client.patch(
-            f"/api/plans/{resumed}", headers=install.headers("alice"),
-            json={"status": "pending"},
-        )
-    assert (approved.status_code, reopened.status_code) == (409, 409)
-    assert (await install.plan_row(resumed))["status"] == "revising"
-
-    # The resumed revision turn ends without a new version.
-    install.holds["planner-a"].set()
-    assert await asyncio.wait_for(resume, timeout=5) == 1
-    assert (await install.plan_row(resumed))["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_a_resumed_revision_that_writes_a_new_version_stays_replaced(
-    install, monkeypatch, tmp_path,
-):
-    plan_id = await _plan_left_revising(install, "restart-update", "planner-a")
-    await install.db.create_session("planner-a", source="cron", actor=None)
-    await install.db.update_session_fields("planner-a", {"sdk_session_id": "native-1"})
-    queue = tmp_path / "resume-after-restart"
-    queue.write_text("planner-a\n")
-    monkeypatch.setattr("nerve.agent.engine.RESUME_QUEUE_FILE", queue)
-    install.agent_calls("planner-a", "plan_update", {"plan_id": plan_id, "content": "Ship less"})
-
-    held = await recover_revising_plans(install.db)
-    assert await finish_revisions_after_resume(
-        install.engine.resume_enrolled_sessions(), install.db, held,
-    ) == 1
-    assert (await install.plan_row(plan_id))["status"] == "superseded"
 
 
 @pytest.mark.asyncio

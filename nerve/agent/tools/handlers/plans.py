@@ -125,10 +125,9 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not old_plan:
         return ToolResult.text(f"Plan not found: {plan_id}")
 
-    # A revising plan waits for exactly this call: the planner's new version.
-    if old_plan["status"] not in ("pending", "revising"):
+    if old_plan["status"] != "pending":
         return ToolResult.text(
-            f"Plan is '{old_plan['status']}'; only pending or revising plans can be updated."
+            f"Plan is '{old_plan['status']}' — only pending plans can be updated."
         )
 
     # The planner replaces its own plan. That is not a review decision, so
@@ -138,7 +137,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if feedback:
         update_fields["feedback"] = feedback
     if not await ctx.db.compare_and_update_plan(
-        plan_id, expect_status=("pending", "revising"), **update_fields,
+        plan_id, expect_status="pending", **update_fields,
     ):
         return ToolResult.text(_NO_LONGER_PENDING.format(plan_id=plan_id))
 
@@ -179,9 +178,9 @@ async def plan_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if raw_status:
         plans = await ctx.db.list_plans(status=raw_status)
     else:
-        plans = []
-        for status in ("pending", "revising", "implementing"):
-            plans += await ctx.db.list_plans(status=status)
+        pending = await ctx.db.list_plans(status="pending")
+        implementing = await ctx.db.list_plans(status="implementing")
+        plans = pending + implementing
 
     if not plans:
         return ToolResult.text("No plans found.")

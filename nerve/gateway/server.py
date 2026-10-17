@@ -373,18 +373,6 @@ async def lifespan(app: FastAPI):
         startup_cleanups.append(("database", close_db))
         logger.info("Database initialized at %s", db_path)
 
-        # A plan is 'revising' only while its revision turn runs. A stop ended
-        # those turns, except where resume-after-restart continues the
-        # session below. Reopen the others now, before the resume reads its
-        # queue, so a person can decide them again.
-        from nerve.agent.plan_service import recover_revising_plans
-
-        held_revisions: list[str] = []
-        try:
-            held_revisions = await recover_revising_plans(db)
-        except Exception as e:
-            logger.error("Failed to reopen revising plans: %s", e)
-
         # Create the owner account and signing secret if they do not exist.
         # This must run before anything mints or checks a token. A failure
         # stops startup: without a signing secret, authentication cannot work.
@@ -896,12 +884,7 @@ async def lifespan(app: FastAPI):
         # Re-drive any sessions enrolled via `nerve restart --resume`. Runs as a
         # background task so a (possibly long) resumed turn never blocks startup;
         # the engine, notification service and channels are all wired by now.
-        # Plans held 'revising' for a resumed revision are reopened after it.
-        from nerve.agent.plan_service import finish_revisions_after_resume
-
-        asyncio.create_task(finish_revisions_after_resume(
-            _engine.resume_enrolled_sessions(), db, held_revisions,
-        ))
+        asyncio.create_task(_engine.resume_enrolled_sessions())
     except BaseException:
         # The shutdown code after the yield will not run, so stop what started
         # here, then re-raise the original error.
