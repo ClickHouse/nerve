@@ -118,6 +118,39 @@ _MODEL_ALIAS_ENV_VARS: dict[str, str] = {
     "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
 }
 
+# The CLI keeps a session's history in ~/.claude/projects/<name>/, where
+# <name> is the cwd with every character outside [a-zA-Z0-9] replaced by
+# '-'. When that name is longer than _PROJECT_DIR_MAX_LEN, the CLI cuts it
+# to that length and adds '-' plus a hash of the cwd.
+_PROJECT_DIR_MAX_LEN = 200
+_PROJECT_DIR_UNSAFE = re.compile(r"[^a-zA-Z0-9]")
+
+
+def _encode_project_dir(path: str) -> str:
+    """Return the CLI's project directory name for *path*, before the cut.
+
+    The CLI's regex works on UTF-16 code units, so a character outside
+    the Basic Multilingual Plane becomes two '-'.
+    """
+    return _PROJECT_DIR_UNSAFE.sub(
+        lambda m: "--" if ord(m.group()) > 0xFFFF else "-", path,
+    )
+
+
+def _long_project_dir_names(projects: str, encoded: str) -> list[str]:
+    """Return the entries of *projects* that can hold the history of a
+    cwd whose encoded name is longer than _PROJECT_DIR_MAX_LEN.
+
+    The CLI matches such directories on the cut name plus '-' when it
+    looks up a session, so do the same and do not compute the hash.
+    """
+    prefix = encoded[:_PROJECT_DIR_MAX_LEN] + "-"
+    try:
+        with os.scandir(projects) as entries:
+            return [e.name for e in entries if e.name.startswith(prefix)]
+    except FileNotFoundError:
+        return []
+
 
 # ------------------------------------------------------------------ #
 #  SDK message → normalized events                                     #
@@ -445,11 +478,13 @@ class ClaudeBackend:
 
             ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
 
-        where <encoded-cwd> is the absolute cwd path with every '/'
-        replaced by '-'.  The CLI resolves the cwd symlink before
-        encoding, so when the workspace is itself a symlink the history
-        lives under the *realpath*-encoded directory. Check the realpath
-        first and fall back to the unresolved path.
+        where <encoded-cwd> is the absolute cwd path with every character
+        outside [a-zA-Z0-9] replaced by '-'. A name over 200 characters
+        gets a hash suffix (see ``_PROJECT_DIR_MAX_LEN``).  The CLI
+        resolves the cwd symlink before encoding, so when the workspace
+        is itself a symlink the history lives under the
+        *realpath*-encoded directory. Check the realpath first and fall
+        back to the unresolved path.
 
         Best-effort: any unexpected error returns True so we still
         attempt the resume and let the CLI surface the real error.
@@ -460,10 +495,15 @@ class ClaudeBackend:
             if cwd not in bases:
                 bases.append(cwd)
             for base in bases:
-                encoded = base.replace("/", "-")
-                jsonl = projects + "/" + encoded + "/" + native_id + ".jsonl"
-                if os.path.isfile(jsonl):
-                    return True
+                encoded = _encode_project_dir(base)
+                if len(encoded) <= _PROJECT_DIR_MAX_LEN:
+                    names = [encoded]
+                else:
+                    names = _long_project_dir_names(projects, encoded)
+                for name in names:
+                    jsonl = projects + "/" + name + "/" + native_id + ".jsonl"
+                    if os.path.isfile(jsonl):
+                        return True
             return False
         except Exception as e:
             logger.debug(

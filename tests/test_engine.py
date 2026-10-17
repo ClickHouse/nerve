@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -774,6 +775,12 @@ def _make_backend() -> ClaudeBackend:
     return ClaudeBackend(SimpleNamespace(config=lambda: SimpleNamespace()))
 
 
+def _cli_project_dir(path: str) -> str:
+    """The CLI's project directory name for an ASCII *path* of up to 200
+    encoded characters."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
 class TestValidateResumeTarget:
     WORKSPACE = "/root/nerve-workspace"
 
@@ -856,7 +863,7 @@ class TestValidateResumeTarget:
         monkeypatch.setenv("HOME", str(fake_home))
 
         sid = "11111111-2222-3333-4444-555555555555"
-        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        encoded = _cli_project_dir(os.path.realpath(str(link_ws)))
         proj_dir = fake_home / ".claude" / "projects" / encoded
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
@@ -875,7 +882,7 @@ class TestValidateResumeTarget:
         fake_home = tmp_path / "home"
         monkeypatch.setenv("HOME", str(fake_home))
 
-        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        encoded = _cli_project_dir(os.path.realpath(str(link_ws)))
         (fake_home / ".claude" / "projects" / encoded).mkdir(parents=True)
 
         backend = _make_backend()
@@ -894,13 +901,106 @@ class TestValidateResumeTarget:
         monkeypatch.setenv("HOME", str(fake_home))
 
         sid = "abcd"
-        encoded_unresolved = str(link_ws).replace("/", "-")
+        encoded_unresolved = _cli_project_dir(str(link_ws))
         proj_dir = fake_home / ".claude" / "projects" / encoded_unresolved
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
 
         backend = _make_backend()
         assert backend.validate_resume_target(sid, str(link_ws)) is True
+
+    def test_path_encodes_non_alphanumerics(self):
+        """Every character outside [a-zA-Z0-9] becomes '-', as in the CLI."""
+        backend = _make_backend()
+        captured: dict = {}
+
+        def _capture(path: str) -> bool:
+            captured["path"] = path
+            return True
+
+        with patch("nerve.agent.backends.claude.os.path.realpath",
+                   side_effect=lambda p: p), \
+             patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("sid-abc", "/srv/my_agent/ws.v1")
+
+        assert captured["path"].endswith("/-srv-my-agent-ws-v1/sid-abc.jsonl")
+
+    def test_path_encodes_astral_character_as_two_dashes(self):
+        """The CLI replaces per UTF-16 code unit, so a character outside
+        the Basic Multilingual Plane becomes two '-'."""
+        backend = _make_backend()
+        captured: dict = {}
+
+        def _capture(path: str) -> bool:
+            captured["path"] = path
+            return True
+
+        with patch("nerve.agent.backends.claude.os.path.realpath",
+                   side_effect=lambda p: p), \
+             patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("sid-abc", "/srv/ws-\U0001F600")
+
+        assert captured["path"].endswith("/-srv-ws---/sid-abc.jsonl")
+
+    def test_workspace_with_underscore_and_dot(self, tmp_path, monkeypatch):
+        """A workspace path with '_' and '.' finds its history under the
+        directory name the CLI writes."""
+        ws = tmp_path / "my_agent" / "ws.v1"
+        ws.mkdir(parents=True)
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        sid = "11111111-2222-3333-4444-555555555555"
+        encoded = _cli_project_dir(os.path.realpath(str(ws)))
+        assert "-my-agent-ws-v1" in encoded
+        proj_dir = fake_home / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(ws)) is True
+        assert backend.validate_resume_target("does-not-exist", str(ws)) is False
+
+    def test_long_path_matches_cut_name_prefix(self, tmp_path, monkeypatch):
+        """An encoded name over 200 characters is cut to 200 and gets a
+        hash suffix. The lookup matches on the cut name plus '-'."""
+        ws = tmp_path / ("w" * 220)
+        ws.mkdir()
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+        projects = fake_home / ".claude" / "projects"
+
+        encoded = _cli_project_dir(os.path.realpath(str(ws)))
+        assert len(encoded) > 200
+        sid = "11111111-2222-3333-4444-555555555555"
+        (projects / (encoded[:200] + "-other")).mkdir(parents=True)
+        proj_dir = projects / (encoded[:200] + "-1a2b3c")
+        proj_dir.mkdir()
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+        # Differs from the cut name in its last character: not this cwd.
+        decoy = projects / (encoded[:199] + "x-1a2b3c")
+        decoy.mkdir()
+        (decoy / "decoy.jsonl").write_text("{}")
+
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(ws)) is True
+        assert backend.validate_resume_target("does-not-exist", str(ws)) is False
+        assert backend.validate_resume_target("decoy", str(ws)) is False
+
+    def test_long_path_without_projects_dir_returns_false(
+        self, tmp_path, monkeypatch,
+    ):
+        """No projects directory at all means no history, not an error."""
+        ws = tmp_path / ("w" * 220)
+        ws.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        backend = _make_backend()
+        assert backend.validate_resume_target("some-session-id", str(ws)) is False
 
 
 # ---------------------------------------------------------------------------
