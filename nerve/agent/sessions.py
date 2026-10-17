@@ -105,8 +105,8 @@ class SessionManager:
     ) -> dict:
         """Get an existing session or create a new one.
 
-        ``actor`` and ``cause`` are only used when a row is actually created
-        — an existing session keeps the creator and the cause it was stamped
+        ``actor`` and ``cause`` are only used when a row is actually created.
+        An existing session keeps the creator and the cause it was stamped
         with, so re-resolving a session someone else started never
         re-attributes it. ``actor`` is required keyword-only, like the store
         method underneath it; ``cause`` defaults to the actor.
@@ -653,7 +653,7 @@ class SessionManager:
         """Add a message to a session's history.
 
         ``actor`` is the principal whose input this row records, or ``None``
-        for assistant and tool output — see
+        for assistant and tool output. See
         :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the

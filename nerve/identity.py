@@ -79,8 +79,8 @@ class Actor:
 
 
 # An actor, or the ``actor_refs`` ID of one. A cause that comes from storage
-# (the user row of an interrupted turn, a wakeup row) is an ID; a cause that
-# comes from a request is the resolved :class:`Actor`.
+# (a session's stored cause, for example) is an ID; a cause that comes from a
+# request is the resolved :class:`Actor`.
 ActorOrId: TypeAlias = "Actor | str"
 
 
@@ -113,7 +113,7 @@ def actor_id_of(ref: ActorOrId | None) -> str | None:
 
 
 def resolve_cause(actor: ActorOrId | None, cause: CauseArg = CAUSE_FROM_ACTOR) -> str | None:
-    """The cause actor ID for one write or one turn."""
+    """The cause actor ID for one write, or for a session that is created."""
     if isinstance(cause, CauseFromActor):
         return actor_id_of(actor)
     return actor_id_of(cause)
