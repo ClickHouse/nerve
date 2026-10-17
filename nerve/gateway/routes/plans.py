@@ -232,9 +232,8 @@ async def approve_plan(
                 # Nerve assembles the prompt from the task file and the
                 # approved plan, so the turn is the instance's own work even
                 # though a person's approval started it. The session above
-                # carries who approved, and the turn runs on their behalf.
+                # carries who approved, and its cause is the approver.
                 actor=deps.db.system_actor,
-                cause=actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

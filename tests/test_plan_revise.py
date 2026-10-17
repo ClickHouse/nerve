@@ -52,12 +52,14 @@ class FakeSessionManager:
         metadata: dict | None = None,
         *,
         actor: Actor | None,
+        cause=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
             "title": title,
             "source": source,
             "actor": actor,
+            "cause": cause,
         })
         return {"id": session_id, "title": title or session_id, "source": source}
 

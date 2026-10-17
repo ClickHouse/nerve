@@ -69,8 +69,9 @@ async def request_plan_revision(
         plan_id: The pending plan to revise.
         feedback: Free-text feedback explaining what should change.
         cause: Who asked for the revision: the person for the HTTP route,
-            the cause of the calling turn for the tool. The revision turn
-            runs as the system actor on behalf of this principal.
+            the calling session's cause for the tool. It becomes the cause of
+            the planner session if this call creates it; an existing planner
+            session keeps its own cause.
 
     Returns:
         ``{"plan_id", "task_id", "session_id", "status"}`` on success.
@@ -152,7 +153,7 @@ async def request_plan_revision(
     )
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
-        actor=engine.db.system_actor,
+        actor=engine.db.system_actor, cause=cause,
     )
     asyncio.create_task(
         engine.run(
@@ -160,7 +161,6 @@ async def request_plan_revision(
             # The revision prompt is built from a template here, not typed by
             # the person who asked for the revision.
             actor=engine.db.system_actor,
-            cause=cause,
         )
     )
 

@@ -21,9 +21,10 @@ authorization keys.
 A write records two IDs. The *actor* made the change: a person through the UI,
 REST or the browser WebSocket, or the system actor for a tool call, a cron job
 or any other internal process. The *cause* is the principal on whose behalf
-the work happens: the person for a change that the person made, and for work
-by the system actor the person whose request started it, or the system actor
-for autonomous work. ``None`` in either position means unknown.
+the work happens: the person for a change that the person made, and for agent
+work the cause of its session (``sessions.caused_by_actor_id``), which is the
+person who started the session or the system actor for a session that the
+instance started for itself. ``None`` in either position means unknown.
 :func:`attribution_for` builds the pair for one write.
 """
 

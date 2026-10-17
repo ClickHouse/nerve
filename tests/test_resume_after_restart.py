@@ -73,34 +73,6 @@ async def test_resumes_valid_session_and_drains_file(tmp_path):
     assert kwargs["user_message"] == _RESUME_AFTER_RESTART_PROMPT
 
 
-ALICE_ACTOR_ID = "00000000-0000-4000-8000-0000000a11ce"
-
-
-@pytest.mark.asyncio
-async def test_resume_runs_for_the_cause_of_the_interrupted_turn(tmp_path):
-    qf = tmp_path / "resume-after-restart"
-    qf.write_text("S1\n")
-    session = {**_session("S1"), "turn_caused_by_actor_id": ALICE_ACTOR_ID}
-    engine = _engine_with({"S1": session})
-    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
-        assert await engine.resume_enrolled_sessions() == 1
-    kwargs = engine.run.await_args.kwargs
-    assert kwargs["actor"] == FAKE_SYSTEM_ACTOR
-    assert kwargs["cause"] == ALICE_ACTOR_ID
-
-
-@pytest.mark.asyncio
-async def test_resume_without_a_stored_cause_runs_for_the_system_actor(tmp_path):
-    qf = tmp_path / "resume-after-restart"
-    qf.write_text("S1\n")
-    engine = _engine_with({"S1": _session("S1")})
-    with patch("nerve.agent.engine.RESUME_QUEUE_FILE", qf):
-        assert await engine.resume_enrolled_sessions() == 1
-    kwargs = engine.run.await_args.kwargs
-    assert kwargs["actor"] == FAKE_SYSTEM_ACTOR
-    assert kwargs["cause"] == FAKE_SYSTEM_ACTOR
-
-
 @pytest.mark.asyncio
 async def test_skips_missing_archived_external_and_no_sdk(tmp_path):
     qf = tmp_path / "resume-after-restart"

@@ -44,11 +44,11 @@ class ToolContext:
 
     ``actor`` performs the tool call: the system actor when the agent calls a
     tool, the person when an HTTP route invokes a handler. ``cause`` is the
-    principal on whose behalf the call happens. It is a fixed value, or a
-    callable that returns the cause when a handler reads it: a context that
-    the engine builds lives as long as the session's client, across turns, so
-    it reads the cause of the turn that runs at the time of the call. Read it
-    through :attr:`cause_id` or :attr:`attribution`, never directly.
+    principal on whose behalf the call happens: for an agent tool call, the
+    session's stored cause (``sessions.caused_by_actor_id``); for a route, the
+    person. It is a fixed value, or a callable that returns the cause when a
+    handler reads it (the engine reads its cache of the session's cause). Read
+    it through :attr:`cause_id` or :attr:`attribution`, never directly.
     """
 
     session_id: str

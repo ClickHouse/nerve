@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from nerve.identity import Actor
+from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg, resolve_cause
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
@@ -29,6 +29,7 @@ class SessionStore:
         cwd: str | None = None,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Insert a session row, recording who caused it to exist.
 
@@ -39,8 +40,14 @@ class SessionStore:
         sessions the instance mints for itself, and ``None`` where attribution
         is unavailable. ``source`` is transport provenance, never identity.
 
-        The ``OR IGNORE`` insert makes creator attribution write-once;
-        re-resolving an existing session cannot replace it.
+        ``cause`` is the session's cause (``caused_by_actor_id``): the
+        principal on whose behalf all agent work in the session runs. The
+        default is the actor. Pass it when they differ, for example ``None``
+        for a session that the system actor creates for input from an unknown
+        person.
+
+        The ``OR IGNORE`` insert makes creator and cause attribution
+        write-once; re-resolving an existing session cannot replace them.
 
         Returns the **stored** row, not the arguments. The distinction only
         shows up when the insert was ignored — a same-id race, or a short-id
@@ -50,16 +57,17 @@ class SessionStore:
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
+        caused_by = resolve_cause(actor, cause)
         await self._write(
             """INSERT OR IGNORE INTO sessions
                (id, title, source, metadata, status, parent_session_id,
                 forked_from_message, backend, model, cwd, created_by_actor_id,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                caused_by_actor_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (session_id, title or session_id, source,
              json.dumps(metadata or {}), status,
              parent_session_id, forked_from_message, backend, model, cwd,
-             created_by, now, now),
+             created_by, caused_by, now, now),
         )
         stored = await self.get_session(session_id)
         if stored is not None:
@@ -72,6 +80,7 @@ class SessionStore:
             "parent_session_id": parent_session_id,
             "backend": backend, "model": model, "cwd": cwd,
             "created_by_actor_id": created_by,
+            "caused_by_actor_id": caused_by,
         }
 
     async def get_session(self, session_id: str) -> dict | None:
@@ -321,17 +330,6 @@ class SessionStore:
         if built is None:
             return
         await self._write(*built)
-
-    async def set_session_turn_cause(self, session_id: str, cause_id: str | None) -> None:
-        """Store the cause of the agent turn that the session starts now.
-
-        Written when the turn starts, so after a restart the row names the
-        cause of the interrupted turn. ``None`` stores an unknown cause.
-        """
-        await self._write(
-            "UPDATE sessions SET turn_caused_by_actor_id = ? WHERE id = ?",
-            (cause_id, session_id),
-        )
 
     async def bind_native_thread(
         self, backend: str, native_thread_id: str, session_id: str,

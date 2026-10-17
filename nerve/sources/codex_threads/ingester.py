@@ -203,8 +203,9 @@ class CodexIngester:
             backend="codex",
             cwd=meta.cwd,
             # The sync created this row, not a person — the Codex thread it
-            # mirrors was started outside Nerve entirely.
+            # mirrors was started outside Nerve entirely, by nobody known.
             actor=self.db.system_actor,
+            cause=None,
         )
         await self.db.bind_native_thread("codex", event.thread_id, session_id)
         self.stats["threads_in_scope"] += 1

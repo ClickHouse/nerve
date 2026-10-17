@@ -1,16 +1,13 @@
-"""V53: record the cause of a turn and who changes tasks and task statuses.
+"""V53: record the cause of a session and who changes tasks and task statuses.
 
-Adds four nullable columns that hold an ``actor_refs.id``:
+Adds three nullable columns that hold an ``actor_refs.id``:
 
-- ``messages.caused_by_actor_id``: on a user row that starts a turn, the
-  principal on whose behalf the turn runs. That is the person who sent the
-  message, or the person whose request started work by the system actor, or
-  the system actor for autonomous work. Assistant and tool output rows keep
-  it ``NULL``.
-- ``sessions.turn_caused_by_actor_id``: the cause of the agent turn that the
-  session runs now, or ran last. It is written when the turn starts, so after
-  a restart it names the cause of the interrupted turn, also of an internal
-  turn that has no user row.
+- ``sessions.caused_by_actor_id``: the session's cause, the principal on
+  whose behalf all agent work in the session runs. It is set once when the
+  session is created and never changes: the person who started the session,
+  the system actor for a session that the instance starts for itself, or
+  ``NULL`` when unknown (channel input with no known person, an imported or
+  MCP satellite session).
 - ``task_events.actor_id``: who changed the status. A person through the UI or
   REST, or the system actor for an agent tool call or another internal
   process.
@@ -25,8 +22,8 @@ the set of task statuses (``created``, ``updated``, ``reordered``,
 deleted, so its history cannot live on the row.
 
 **Existing rows stay NULL and nothing is backfilled.** NULL reads as "not
-recorded". The free-text origin of an old task event does not name a person,
-so a backfill would invent attribution.
+recorded". The free-text origin of an old task event or the creator of an old
+session does not prove a cause, so a backfill would invent attribution.
 
 The foreign keys follow v048: an ID that resolves to no actor can never be
 stored, and NULL is exempt from the check. Each column is added only when the
@@ -43,8 +40,7 @@ logger = logging.getLogger(__name__)
 
 # (table, column, DDL type + constraints)
 _COLUMNS = (
-    ("messages", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
-    ("sessions", "turn_caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
+    ("sessions", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
     ("task_events", "actor_id", "TEXT REFERENCES actor_refs(id)"),
     ("task_events", "caused_by_actor_id", "TEXT REFERENCES actor_refs(id)"),
 )

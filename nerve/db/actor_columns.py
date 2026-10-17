@@ -14,10 +14,9 @@ from __future__ import annotations
 ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("sessions", "created_by_actor_id"),
     ("messages", "actor_id"),
-    ("messages", "caused_by_actor_id"),
     ("task_events", "actor_id"),
     ("task_events", "caused_by_actor_id"),
-    ("sessions", "turn_caused_by_actor_id"),
+    ("sessions", "caused_by_actor_id"),
     ("task_status_events", "actor_id"),
     ("task_status_events", "caused_by_actor_id"),
 )

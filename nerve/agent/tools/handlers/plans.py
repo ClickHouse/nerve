@@ -227,8 +227,8 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     plan_type = plan.get("plan_type", "generic")
 
     # The agent approved this plan through its own tool, so both the session
-    # and the run it dispatches are the instance's own work. The run is on
-    # behalf of the cause of the turn that approved it.
+    # and the run it dispatches are the instance's own work. The session's
+    # cause is the cause of the session in which the agent approved it.
     impl_actor = ctx.db.system_actor
     impl_cause = ctx.cause_id
 
@@ -238,7 +238,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
     await ctx.engine.sessions.get_or_create(
         impl_session_id, title=f"Implement: {task['title']}", source="web",
-        actor=impl_actor,
+        actor=impl_actor, cause=impl_cause,
     )
     await ctx.db.update_plan(plan_id, impl_session_id=impl_session_id)
 
@@ -303,7 +303,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
-                actor=impl_actor, cause=impl_cause,
+                actor=impl_actor,
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

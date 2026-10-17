@@ -509,12 +509,11 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
         try:
             # Nerve generates this trigger, so it uses the system actor. The
             # person's star action is separate, and ``internal`` persists no
-            # user message. The turn runs on behalf of the person who starred.
+            # user message.
             asyncio.create_task(
                 deps.engine.run(
                     session_id=session_id, user_message=trigger,
                     source="web", internal=True, actor=deps.db.system_actor,
-                    cause=actor,
                 )
             )
         except Exception as e:  # a hook failure must never break the PATCH
@@ -690,9 +689,8 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
         req.session_id, role="user", content=message,
         blocks=blocks or None, channel="web",
         # The person composed this message; deferring when it runs does not
-        # change who wrote it. The deferred turn runs on their behalf.
+        # change who wrote it.
         actor=actor,
-        caused_by=actor,
     )
 
     scheduled = delay != "none"

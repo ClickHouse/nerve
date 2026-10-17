@@ -19,7 +19,7 @@ from enum import StrEnum
 from typing import Any
 
 from nerve.db import Database
-from nerve.identity import Actor, ActorOrId
+from nerve.identity import CAUSE_FROM_ACTOR, Actor, CauseArg
 
 logger = logging.getLogger(__name__)
 
@@ -101,19 +101,21 @@ class SessionManager:
         cwd: str | None = None,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Get an existing session or create a new one.
 
-        ``actor`` is only used when a row is actually created — an existing
-        session keeps the creator it was stamped with, so re-resolving a
-        session someone else started never re-attributes it. Required
-        keyword-only, like the store method underneath it.
+        ``actor`` and ``cause`` are only used when a row is actually created
+        — an existing session keeps the creator and the cause it was stamped
+        with, so re-resolving a session someone else started never
+        re-attributes it. ``actor`` is required keyword-only, like the store
+        method underneath it; ``cause`` defaults to the actor.
         """
         session = await self.db.get_session(session_id)
         if not session:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
-                backend=backend, model=model, cwd=cwd, actor=actor,
+                backend=backend, model=model, cwd=cwd, actor=actor, cause=cause,
             )
         return session
 
@@ -130,6 +132,7 @@ class SessionManager:
         cwd: str | None = None,
         *,
         actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -154,6 +157,7 @@ class SessionManager:
             model=model,
             cwd=cwd,
             actor=actor,
+            cause=cause,
         )
         await self.db.log_session_event(session_id, "created", {
             "source": source,
@@ -645,13 +649,11 @@ class SessionManager:
         bump_updated_at: bool = True,
         *,
         actor: Actor | None,
-        caused_by: ActorOrId | None = None,
     ) -> int:
         """Add a message to a session's history.
 
         ``actor`` is the principal whose input this row records, or ``None``
-        for assistant and tool output, and ``caused_by`` is the cause of the
-        turn that a user row starts. See
+        for assistant and tool output — see
         :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the
@@ -664,7 +666,6 @@ class SessionManager:
             native_turn_id=native_turn_id,
             bump_updated_at=bump_updated_at,
             actor=actor,
-            caused_by=caused_by,
         )
 
     async def get_conversation_history(

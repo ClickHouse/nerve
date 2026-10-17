@@ -1196,9 +1196,6 @@ def create_app() -> FastAPI:
                         "content": user_text,
                         "blocks": image_refs or None,
                         "actor_id": connection.actor.actor_id,
-                        # The person's own message starts a turn on their
-                        # behalf; see engine.run's default cause.
-                        "caused_by_actor_id": connection.actor.actor_id,
                     }, exclude=client_id)
 
                     # Run agent in background, store task for stop support.

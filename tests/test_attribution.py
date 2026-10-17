@@ -76,6 +76,9 @@ class _Install:
     async def creator_of(self, session_id: str) -> str | None:
         return (await self.db.get_session(session_id))["created_by_actor_id"]
 
+    async def cause_of(self, session_id: str) -> str | None:
+        return (await self.db.get_session(session_id))["caused_by_actor_id"]
+
     async def messages_in(self, session_id: str) -> list[dict]:
         return await self.db.get_messages(session_id)
 
@@ -325,6 +328,7 @@ async def test_websocket_created_session_belongs_to_the_connection(
     await _ws_endpoint()(socket)
     switched = next(msg for msg in socket.sent if msg["type"] == "session_switched")
     assert await install.creator_of(switched["session_id"]) == install.bob_actor
+    assert await install.cause_of(switched["session_id"]) == install.bob_actor
 
 
 async def _wait_for_user_messages(install, session_id: str, count: int) -> None:
@@ -345,6 +349,7 @@ async def test_autonomous_cron_uses_the_system_actor(install, monkeypatch):
         if row["source"] == "cron"
     )
     assert session["created_by_actor_id"] == install.system_actor_id
+    assert session["caused_by_actor_id"] == install.system_actor_id
     assert [(row["role"], row["actor_id"]) for row in await install.messages_in(session["id"])] == [
         ("user", install.system_actor_id),
         ("assistant", None),
@@ -379,6 +384,7 @@ async def test_unidentified_channel_human_stays_unattributed(
     ))
     session_id = await install.engine.sessions.get_last_session(key)
     assert await install.creator_of(session_id) is None
+    assert await install.cause_of(session_id) is None
     assert await install.said_in(session_id) == [("hello from a chat app", None)]
 
 
@@ -440,6 +446,8 @@ async def test_codex_sync_session_is_system_but_imported_human_is_unknown(instal
 
     session_id = "codex:thread-aaa"
     assert await install.creator_of(session_id) == install.system_actor_id
+    # Nobody known started the thread that the session imports.
+    assert await install.cause_of(session_id) is None
     assert [(row["role"], row["actor_id"]) for row in await install.messages_in(session_id)] == [
         ("user", None),
         ("assistant", None),
