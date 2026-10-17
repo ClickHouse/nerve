@@ -83,8 +83,10 @@ def system_principal_headers() -> dict[str, str]:
     """Default headers for Nerve's own model clients: the system actor.
 
     The system actor comes from the database that the server opened
-    (:func:`nerve.db.init_db`). A process that opened none (for example a CLI
-    command) names no principal.
+    (:func:`nerve.db.init_db`). A process that did not open it (a CLI command
+    such as ``nerve sync``, which opens its own connection, or none) reads the
+    stored system actor read-only from ``nerve.db``. No principal when neither
+    gives one.
     """
     if not _is_external_mode():
         return {}
@@ -92,7 +94,13 @@ def system_principal_headers() -> dict[str, str]:
     # load the database package with it.
     from nerve.db import global_system_actor_id
 
-    return principal_headers(global_system_actor_id())
+    actor_id = global_system_actor_id()
+    if actor_id is None:
+        from nerve import paths
+        from nerve.db.accounts import read_system_actor_id
+
+        actor_id = read_system_actor_id(paths.db_path())
+    return principal_headers(actor_id)
 
 
 def _header_name(line: str) -> str:

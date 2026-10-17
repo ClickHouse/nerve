@@ -164,6 +164,14 @@ class TestCliEnvironment:
         assert custom_headers_env(None, {}) == {}
         assert custom_headers_env(None, {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue"}) == {}
 
+    def test_an_inherited_line_that_already_names_the_principal_changes_nothing(
+        self, external,
+    ):
+        environ = {CUSTOM_HEADERS_ENV: (
+            f"X-Proxy-Tag: blue\n{INFERENCE_PRINCIPAL_HEADER}: {ALICE.actor_id}"
+        )}
+        assert custom_headers_env(ALICE.actor_id, environ) == {}
+
     def test_a_value_that_is_not_a_canonical_uuid_is_never_written(self, external):
         assert custom_headers_env(f"{ALICE.actor_id}\nX-Injected: 1", {}) == {}
 
@@ -675,3 +683,37 @@ async def test_the_stored_system_actor_is_read_only_when_there_is_exactly_one(tm
         assert read_system_actor_id(tmp_path / "nerve.db") == database.system_actor_id
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cli_command_with_its_own_connection_names_the_system_actor(
+    messages_api, monkeypatch, tmp_path,
+):
+    """`nerve sync`: its own database connection, no global one."""
+    import nerve.db
+    from nerve.migrate import open_production_db
+    from nerve.sources.registry import build_source_runners
+
+    assert nerve.db.global_system_actor_id() is None
+    config = NerveConfig.from_dict({
+        "workspace": str(tmp_path / "ws"),
+        "anthropic_base_url": messages_api.anthropic_base_url,
+        "anthropic_api_key": "test-key-not-real",
+        "memory": {"fast_model": "claude-test"},
+        "sync": {"github": {"enabled": True}},
+    })
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+    db = await open_production_db(config)
+    try:
+        (runner,) = build_source_runners(config, db)
+        client = runner._client_factory()
+        await client.messages.create(
+            model="claude-test", max_tokens=1,
+            messages=[{"role": "user", "content": "condense"}],
+        )
+        system_actor_id = db.system_actor_id
+    finally:
+        await db.close()
+
+    (headers,) = _MessagesApi.received
+    assert _principal_values(headers) == [system_actor_id]

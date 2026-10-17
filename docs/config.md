@@ -1833,7 +1833,7 @@ model request that it sends. The value is an actor ID, a lower-case UUID:
 | Requests | Principal |
 |---|---|
 | The model requests of an agent session, in every turn, also the turns that another person sends and the turns that the agent starts between turns | The session's cause: the person who started the session, or the system actor for a session that Nerve started (a cron job, a hook). See [Attribution](accounts.md#attribution) |
-| Session titles, prompt rewrite, source condensing, image description, memory on Bedrock, setup checks, the model catalogue, the model check of `nerve doctor` | The system actor (`nerve doctor` reads it from `nerve.db`, and checks `NERVE_AUTH_MODE` in its own shell) |
+| Session titles, prompt rewrite, source condensing, image description, memory on Bedrock, setup checks, the model catalogue, the model check of `nerve doctor` | The system actor (a CLI command such as `nerve sync` or `nerve doctor` reads it from `nerve.db`, and takes the mode from `NERVE_AUTH_MODE` in its own shell) |
 
 A session with no cause, for example a session of a channel without an
 identity mapping, sends no header. Local mode sends no header. In both modes,
