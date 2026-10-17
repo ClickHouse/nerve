@@ -2007,6 +2007,12 @@ A running turn keeps its tool list until it ends, and an autonomous turn does
 not start a check. A new session reads the catalog before its first turn and
 gets the change at once.
 
+The opt-in test `tests/test_managed_mcp_pinned_clients.py` runs these steps
+with the pinned Claude CLI and Codex versions, real model calls and a fake
+gateway, and checks the model requests: after a replacement the session has
+the same native ID, the model gets the new tools and the earlier
+conversation, and the in-place Claude changes reach the next request.
+
 A session that is behind is not a gap in the policy: the gateway checks each
 call against the current policy and refuses a server or a tool that the
 organization took away. The model can still see the old tool and gets the

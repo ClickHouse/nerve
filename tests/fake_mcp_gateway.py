@@ -3,13 +3,16 @@
 It serves ``GET /catalog`` in the shape of the gateway's catalog contract
 (schema version 2) and answers ``POST /s/<id>/mcp`` with JSON-RPC, including
 the policy denial ``-32001``. A test can change the catalog, return an error
-status, or stop the server to make the gateway unreachable.
+status, or stop the server to make the gateway unreachable. A tool can also
+end its call the way the gateway does when the upstream session is gone
+(``-32002``) or drop the connection without an answer.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +21,22 @@ from typing import Any, Mapping
 from nerve.mcp_gateway import desired_revision
 
 DENIAL_MESSAGE = "tool not allowed by tenant policy"
+
+# The gateway's -32002 answers (CodeUnavailable, with a fixed reason).
+CODE_UNAVAILABLE = -32002
+RESET_MESSAGE = (
+    "MCP server session was reset; state from earlier calls is gone; "
+    "this call was not sent."
+)
+OUTCOME_UNKNOWN_MESSAGE = (
+    "the call was sent and its result was lost; it may have run; the "
+    "gateway does not send it again."
+)
+
+# What a tool call does instead of its result (FakeMcpGateway.tool_behavior).
+BEHAVIOR_RESET = "reset"
+BEHAVIOR_OUTCOME_UNKNOWN = "outcome_unknown"
+BEHAVIOR_DROP = "drop"
 
 # The time of every observation in a fake catalog.
 OBSERVED_AT = "2026-10-17T12:00:00Z"
@@ -96,6 +115,13 @@ class FakeMcpGateway:
         # Seconds before the catalog answer starts.
         self.delay = 0.0
         self.mcp_requests: list[tuple[str, dict]] = []
+        # Every request to a server path: (HTTP method, server ID, JSON-RPC
+        # method or None).
+        self.http_log: list[tuple[str, str, str | None]] = []
+        # Tool name -> text of its result (default "ok").
+        self.tool_results: dict[str, str] = {}
+        # Tool name -> BEHAVIOR_* instead of a result.
+        self.tool_behavior: dict[str, str] = {}
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.port = 0
@@ -112,6 +138,11 @@ class FakeMcpGateway:
                 pass
 
             def do_GET(self) -> None:  # noqa: N802 - http.server API
+                if self._server_path():
+                    # No server-sent event stream at this path.
+                    gateway.http_log.append(("GET", self._server_path(), None))
+                    self._send(405, b"", "application/json")
+                    return
                 if self.path != "/catalog":
                     self._json(404, {"reason": "not_found", "requestId": _ZERO_ID})
                     return
@@ -149,18 +180,38 @@ class FakeMcpGateway:
                 except OSError:
                     pass  # the client gave up
 
-            def do_POST(self) -> None:  # noqa: N802 - http.server API
+            def do_DELETE(self) -> None:  # noqa: N802 - http.server API
+                gateway.http_log.append(("DELETE", self._server_path() or "", None))
+                self._send(405, b"", "application/json")
+
+            def _server_path(self) -> str | None:
                 parts = self.path.split("/")
                 if len(parts) != 4 or parts[1] != "s" or parts[3] != "mcp":
+                    return None
+                return parts[2]
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                server_id = self._server_path()
+                if server_id is None:
                     self._json(404, {"reason": "not_found", "requestId": _ZERO_ID})
                     return
                 length = int(self.headers.get("Content-Length") or 0)
                 message = json.loads(self.rfile.read(length) or b"{}")
-                gateway.mcp_requests.append((parts[2], message))
+                gateway.mcp_requests.append((server_id, message))
+                gateway.http_log.append(("POST", server_id, message.get("method")))
                 if "id" not in message:
                     self._send(202, b"", "application/json")
                     return
-                self._json(200, gateway._answer(parts[2], message))
+                if gateway._behavior(message) == BEHAVIOR_DROP:
+                    # The connection ends with no answer, as when the gateway
+                    # process is lost during the call.
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    return
+                self._json(200, gateway._answer(server_id, message))
 
             def _json(self, status: int, payload: dict) -> None:
                 self._send(status, json.dumps(payload).encode(), "application/json")
@@ -197,6 +248,19 @@ class FakeMcpGateway:
                 return list((server.get("toolPolicy") or {}).get("tools") or [])
         return []
 
+    def tool_calls(self, name: str) -> int:
+        """How many ``tools/call`` requests named the tool."""
+        return sum(
+            1 for _server, message in self.mcp_requests
+            if message.get("method") == "tools/call"
+            and (message.get("params") or {}).get("name") == name
+        )
+
+    def _behavior(self, message: dict) -> str | None:
+        if message.get("method") != "tools/call":
+            return None
+        return self.tool_behavior.get((message.get("params") or {}).get("name"))
+
     def _answer(self, server_id: str, message: dict) -> dict:
         method = message.get("method")
         reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"]}
@@ -208,15 +272,31 @@ class FakeMcpGateway:
             }
         elif method == "tools/list":
             reply["result"] = {"tools": [
-                {"name": name, "inputSchema": {"type": "object"}}
+                {
+                    "name": name,
+                    "description": f"The {name} tool of the {server_id} server.",
+                    "inputSchema": {"type": "object"},
+                }
                 for name in self._tools(server_id)
             ]}
         elif method == "tools/call":
             name = (message.get("params") or {}).get("name")
+            behavior = self._behavior(message)
             if name in self.denied_tools or name not in self._tools(server_id):
                 reply["error"] = {"code": -32001, "message": DENIAL_MESSAGE}
+            elif behavior == BEHAVIOR_RESET:
+                reply["error"] = {
+                    "code": CODE_UNAVAILABLE, "message": RESET_MESSAGE,
+                    "data": {"reason": "upstream_session_reset", "resetCause": "lease_expired"},
+                }
+            elif behavior == BEHAVIOR_OUTCOME_UNKNOWN:
+                reply["error"] = {
+                    "code": CODE_UNAVAILABLE, "message": OUTCOME_UNKNOWN_MESSAGE,
+                    "data": {"reason": "upstream_outcome_unknown"},
+                }
             else:
-                reply["result"] = {"content": [{"type": "text", "text": "ok"}]}
+                text = self.tool_results.get(name, "ok")
+                reply["result"] = {"content": [{"type": "text", "text": text}]}
         else:
             reply["error"] = {"code": -32601, "message": "method not available"}
         return reply
