@@ -487,6 +487,8 @@ class AgentEngine:
         """The last catalog read, for diagnostics. ``None`` in local mode.
 
         It tells what new sessions get, not what a running session loaded.
+        ``not_applied`` maps a catalog server ID to the backends that do not
+        give it to their sessions, each with the reason.
         """
         if not self._managed_mcp:
             return None
@@ -496,8 +498,27 @@ class AgentEngine:
                 "desired_revision": None, "servers": [],
                 "fetched_at": None, "checked_at": None,
                 "error": "mcp_gateway_url is not set", "retrying": False,
+                "not_applied": {},
             }
-        return self._mcp_gateway.status()
+        return {**self._mcp_gateway.status(), "not_applied": self.managed_mcp_conflicts()}
+
+    def managed_mcp_conflicts(self) -> dict[str, dict[str, str]]:
+        """Catalog servers that a backend leaves out: ID -> backend -> reason.
+
+        Read from the backends at each call, so a fixed system file shows at
+        once. Empty in local mode.
+        """
+        servers = self.managed_mcp_servers()
+        if not servers:
+            return {}
+        conflicts: dict[str, dict[str, str]] = {}
+        for name, backend in sorted(self._backends.items()):
+            report = getattr(backend, "managed_mcp_conflicts", None)
+            if report is None:
+                continue
+            for server_id, reason in report(servers).items():
+                conflicts.setdefault(server_id, {})[name] = reason
+        return conflicts
 
     async def _on_mcp_catalog_change(self, catalog: GatewayCatalog) -> None:
         if any(server.id == BUILTIN_SERVER_NAME for server in catalog.servers):
@@ -506,6 +527,14 @@ class AgentEngine:
                 "that name, so the catalog server is not used",
                 BUILTIN_SERVER_NAME,
             )
+        # One error for each catalog change, not one for each session.
+        for server_id, backends in self.managed_mcp_conflicts().items():
+            for name, reason in backends.items():
+                logger.error(
+                    "MCP gateway server %r (desired revision %s) is not "
+                    "applied to %s sessions: %s. Sessions start without it.",
+                    server_id, catalog.desired_revision, name, reason,
+                )
         if self.db is not None:
             await self._sync_mcp_servers_to_db()
 

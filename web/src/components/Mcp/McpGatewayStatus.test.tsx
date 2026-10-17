@@ -131,3 +131,18 @@ describe('McpGatewayStatus', () => {
     expect(group).not.toHaveTextContent('2 tools');
   });
 });
+
+describe('McpGatewayStatus with a server that a backend leaves out', () => {
+  it('names the server, the backend and the reason', () => {
+    render(<McpGatewayStatus status={status({
+      not_applied: {
+        docs: { codex: 'name used by the system configuration (/etc/codex/config.toml)' },
+      },
+    })} />);
+    const group = screen.getByRole('group', { name: 'MCP gateway' });
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'docs: Not applied to Codex: name used by the system configuration (/etc/codex/config.toml)',
+    );
+    expect(group).toHaveTextContent('catalog generation 7, 2 servers');
+  });
+});

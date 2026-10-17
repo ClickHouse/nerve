@@ -1,5 +1,5 @@
 import { CheckCircle2, XCircle } from '../ui/icons';
-import { TOOL_MODE_ALL, allToolsText } from '../../stores/mcpStore';
+import { TOOL_MODE_ALL, allToolsText, notAppliedLines } from '../../stores/mcpStore';
 
 /** One server of the catalog: its desired state and what the gateway observed. */
 export interface McpGatewayServer {
@@ -36,6 +36,8 @@ export interface McpGatewayDiagnostics {
   checked_at: string | null;
   error: string | null;
   retrying: boolean;
+  /** Catalog server ID -> backend -> reason, for servers a backend leaves out. */
+  not_applied?: Record<string, Record<string, string>>;
 }
 
 /** Text for the failure reasons of the catalog contract. */
@@ -83,10 +85,11 @@ export function observedText(server: McpGatewayServer): string {
  */
 export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) {
   const fetched = status.generation !== null;
+  const healthy = fetched && !status.error && Object.keys(status.not_applied ?? {}).length === 0;
   return (
     <div className="text-xs text-text-dim flex items-center gap-3 flex-wrap" role="group" aria-label="MCP gateway">
       <span className="flex items-center gap-1.5">
-        {fetched && !status.error ? (
+        {healthy ? (
           <CheckCircle2 size={12} className="text-hue-green" />
         ) : (
           <XCircle size={12} className="text-hue-amber" />
@@ -115,6 +118,13 @@ export function McpGatewayStatus({ status }: { status: McpGatewayDiagnostics }) 
         </span>
       ))}
       {status.error && <span className="text-hue-amber">{status.error}</span>}
+      {Object.entries(status.not_applied ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(
+        ([serverId, backends]) => (
+          <span key={serverId} className="text-hue-amber" role="alert">
+            {serverId}: {notAppliedLines({ not_applied: backends }).join('; ')}
+          </span>
+        ),
+      )}
       {status.retrying && <span className="text-text-faint">retrying</span>}
       {status.checked_at && (
         <span className="text-text-faint">

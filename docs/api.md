@@ -1217,9 +1217,12 @@ The routes above then change as follows:
   `null` for `nerve`. A catalog server also has `display_name` and
   `description` from the catalog, `tool_count`: the number of tools that the
   gateway observed (`null` when it observed no tool list, `0` for an empty
-  list), and `tool_mode` (`selected`, or `all`: the agent can call every tool
-  of the server, and `tool_count` is the size of the last list, not a limit).
-  These servers are read-only.
+  list), `tool_mode` (`selected`, or `all`: the agent can call every tool of
+  the server, and `tool_count` is the size of the last list, not a limit),
+  and `not_applied`: the agent backends whose
+  sessions do not get the server, each with the reason, for example
+  `{"codex": "name used by the system configuration (/etc/codex/config.toml)"}`;
+  `{}` when all do. These servers are read-only.
 - `GET /api/mcp-servers/{name}` and `GET /api/mcp-servers/{name}/usage`
   return `404` for a server that is not listed, for example one from an
   earlier local mode.
@@ -1231,7 +1234,7 @@ Response: {
   "servers": [{
     "name": "docs", "type": "http", "enabled": true, "tool_count": 2,
     "tool_mode": "selected", "managed_by": "organization", "display_name": "Docs",
-    "description": "Search the product documentation.", ...
+    "description": "Search the product documentation.", "not_applied": {}, ...
   }]
 }
 ```
@@ -1372,7 +1375,9 @@ when it observed none; `tool_count` is the size of that list, also with
 `unknown`, `current` or `stale`, the time of its last read, and the reason of
 a failed last read). `checked_at` is the time of the last catalog request and
 `error` its problem, or `null` after a success. `retrying` is true while the
-background retry runs. The block is absent in local mode.
+background retry runs. `not_applied` maps a catalog server ID to the backends
+that leave it out, each with the reason (see the MCP server routes above). The
+block is absent in local mode.
 
 ```json
 "mcp_gateway": {
@@ -1397,7 +1402,8 @@ background retry runs. The block is absent in local mode.
   "fetched_at": "2026-10-17T12:05:00+00:00",
   "checked_at": "2026-10-17T12:05:00+00:00",
   "error": null,
-  "retrying": false
+  "retrying": false,
+  "not_applied": {}
 }
 ```
 

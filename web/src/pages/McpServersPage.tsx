@@ -4,7 +4,7 @@ import { RefreshCw, Zap, CheckCircle, XCircle, Clock, Plug } from '../components
 import { Badge, Button } from '../components/ui';
 import { ManagedBadge } from '../components/Mcp/ManagedBadge';
 import {
-  isManaged, mcpServerTitle, toolCountText, useMcpStore, type McpServer,
+  isManaged, mcpServerTitle, notAppliedLines, toolCountText, useMcpStore, type McpServer,
 } from '../stores/mcpStore';
 
 /** Transport identity, not status — so `hue-*` rather than a feedback token. */
@@ -41,6 +41,9 @@ function ServerCard({ server }: { server: McpServer }) {
           {isManaged(server) && server.description && (
             <p className="text-xs text-text-dim mt-1 line-clamp-2">{server.description}</p>
           )}
+          {notAppliedLines(server).map(line => (
+            <p key={line} className="text-xs text-warning mt-1" role="alert">{line}</p>
+          ))}
         </div>
         {isManaged(server) && <ManagedBadge className="ml-2 shrink-0" />}
         {!server.enabled && (
