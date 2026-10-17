@@ -102,6 +102,13 @@ BUILTIN_SERVER_NAME = "nerve"
 # Who manages a server that comes from the catalog, in the API.
 MANAGED_BY_ORGANIZATION = "organization"
 
+# Why a reload of the MCP configuration does nothing in external mode.
+MANAGED_RELOAD_DETAIL = (
+    "The organization manages the MCP servers of this agent through the MCP "
+    "gateway. Nerve reads the gateway's catalog when it starts and before each "
+    "new session, so there is no configuration to reload."
+)
+
 # The largest catalog that the gateway sends (4 MiB, with the final newline).
 # It answers an error instead of a larger catalog.
 CONTRACT_MAX_CATALOG_BYTES = 4 * 1024 * 1024

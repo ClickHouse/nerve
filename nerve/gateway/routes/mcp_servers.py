@@ -1,4 +1,10 @@
-"""MCP server routes."""
+"""MCP server routes.
+
+In external mode the organization manages the MCP servers through the MCP
+gateway. The routes then list Nerve's own server and the servers of the
+last catalog read, mark the catalog servers ``managed_by: "organization"``,
+and refuse a reload of the configuration files.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,48 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.mcp_gateway import (
+    BUILTIN_SERVER_NAME,
+    MANAGED_BY_ORGANIZATION,
+    MANAGED_RELOAD_DETAIL,
+)
+
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+
+def _managed_servers() -> dict | None:
+    """Catalog servers by ID in external mode, ``None`` in local mode."""
+    engine = get_deps().engine
+    if engine is None or getattr(engine, "managed_mcp", False) is not True:
+        return None
+    return {server.id: server for server in engine.managed_mcp_servers() or ()}
+
+
+def _present(row: dict, managed: dict | None) -> dict:
+    """Add the organization fields to a server row in external mode.
+
+    ``tool_count`` is the number of tools that the gateway observed, or
+    ``None`` when it observed no tool list. ``tool_mode`` is the tool mode of
+    the catalog; with ``all`` the count is the size of the last list, not a
+    limit.
+    """
+    if managed is None:
+        return row
+    server = managed.get(row["name"])
+    if server is None:
+        return {**row, "managed_by": None}
+    return {
+        **row,
+        "managed_by": MANAGED_BY_ORGANIZATION,
+        "display_name": server.display_name,
+        "description": server.description,
+        "tool_count": server.inventory.tool_count if server.inventory else None,
+        "tool_mode": server.tool_mode,
+    }
+
+
+def _visible(name: str, managed: dict | None) -> bool:
+    return managed is None or name == BUILTIN_SERVER_NAME or name in managed
 
 
 @router.get("/api/mcp-servers")
@@ -14,22 +61,32 @@ async def list_mcp_servers():
     """List all MCP servers with aggregated usage stats."""
     deps = get_deps()
     servers = await deps.db.get_mcp_server_stats()
-    return {"servers": servers}
+    managed = _managed_servers()
+    if managed is None:
+        return {"servers": servers}
+    return {
+        "servers": [
+            _present(row, managed) for row in servers
+            if _visible(row["name"], managed)
+        ],
+        "managed_by": MANAGED_BY_ORGANIZATION,
+    }
 
 
 @router.get("/api/mcp-servers/{server_name}")
 async def get_mcp_server_detail(server_name: str):
     """Get detailed info for a specific MCP server."""
     deps = get_deps()
+    managed = _managed_servers()
     stats_list = await deps.db.get_mcp_server_stats()
     server = next((s for s in stats_list if s["name"] == server_name), None)
-    if not server:
+    if not server or not _visible(server_name, managed):
         raise HTTPException(status_code=404, detail="MCP server not found")
 
     tools = await deps.db.get_mcp_tool_breakdown(server_name)
     usage = await deps.db.get_mcp_server_usage(server_name, limit=30)
 
-    return {**server, "tools": tools, "recent_usage": usage}
+    return {**_present(server, managed), "tools": tools, "recent_usage": usage}
 
 
 @router.get("/api/mcp-servers/{server_name}/usage")
@@ -48,6 +105,8 @@ async def reload_mcp_servers():
     from nerve.config import ConfigError
 
     deps = get_deps()
+    if _managed_servers() is not None:
+        raise HTTPException(status_code=409, detail=MANAGED_RELOAD_DETAIL)
     try:
         servers = await deps.engine.reload_mcp_config()
     except ConfigError as e:

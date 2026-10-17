@@ -2,8 +2,10 @@ import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Zap, CheckCircle, XCircle, Clock, Plug } from '../components/ui/icons';
 import { Badge, IconButton } from '../components/ui';
-import { useMcpStore } from '../stores/mcpStore';
-import { formatMcpName } from '../utils/formatMcpName';
+import { ManagedBadge } from '../components/Mcp/ManagedBadge';
+import {
+  TOOL_MODE_ALL, allToolsText, isManaged, mcpServerTitle, useMcpStore,
+} from '../stores/mcpStore';
 
 /** Transport identity, not status — so `hue-*` rather than a feedback token. */
 const TYPE_COLORS: Record<string, string> = {
@@ -61,16 +63,27 @@ export function McpServerDetailPage() {
           <ArrowLeft size={16} />
         </IconButton>
         <div className="flex items-center gap-2 flex-1">
-          <h1 className="text-sm font-medium text-text">{formatMcpName(s.name)}</h1>
+          <h1 className="text-sm font-medium text-text">{mcpServerTitle(s)}</h1>
           <span className={`text-2xs px-1.5 py-0.5 rounded font-mono ${typeClass}`}>
             {s.type}
           </span>
+          {isManaged(s) && <ManagedBadge />}
           {!s.enabled && <Badge tone="warning">disabled</Badge>}
         </div>
       </div>
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto">
+        {isManaged(s) && (
+          <div className="px-4 pt-4 text-xs text-text-dim space-y-1" role="note">
+            {s.description && <p className="text-text-secondary">{s.description}</p>}
+            <p>
+              Your organization provides this server through the MCP gateway
+              and decides which of its tools the agent can call. It is
+              read-only here.
+            </p>
+          </div>
+        )}
         <div className="flex flex-col lg:flex-row gap-4 p-4">
           {/* Left: Tool breakdown */}
           <div className="flex-1 min-w-0">
@@ -189,7 +202,13 @@ export function McpServerDetailPage() {
                 </div>
                 <div className="flex justify-between">
                   <span className="text-text-muted flex items-center gap-1"><Plug size={10} /> Tools</span>
-                  <span className="text-text">{s.tool_count || s.tools.length}</span>
+                  <span className="text-text">
+                    {!isManaged(s)
+                      ? (s.tool_count || s.tools.length)
+                      : s.tool_mode === TOOL_MODE_ALL
+                        ? allToolsText(s.tool_count)
+                        : (s.tool_count ?? 'not observed')}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-text-muted">First Seen</span>

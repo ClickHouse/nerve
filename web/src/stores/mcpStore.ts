@@ -1,17 +1,71 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { formatMcpName } from '../utils/formatMcpName';
+
+/** The value of `managed_by` for a server from the MCP gateway's catalog. */
+export const MANAGED_BY_ORGANIZATION = 'organization';
+
+/**
+ * The tool mode of the MCP gateway's catalog that gives the agent every tool
+ * of a server, also a tool that the server adds later. It names no tool.
+ */
+export const TOOL_MODE_ALL = 'all';
 
 export interface McpServer {
   name: string;
   type: string;
   enabled: boolean;
-  tool_count: number;
+  /**
+   * For a managed server: the number of tools that the MCP gateway observed,
+   * `null` when it observed no tool list.
+   */
+  tool_count: number | null;
+  /** For a managed server: the tool mode of the catalog, `selected` or `all`. */
+  tool_mode?: string;
   total_invocations: number;
   success_count: number;
   avg_duration_ms: number | null;
   last_used: string | null;
   first_seen_at: string;
   last_seen_at: string;
+  /**
+   * External mode only. `organization` for a server from the MCP gateway's
+   * catalog, `null` for Nerve's own server. Absent in local mode.
+   */
+  managed_by?: string | null;
+  /** Text from the organization's catalog, for a managed server. */
+  display_name?: string;
+  description?: string;
+}
+
+/** Whether a server, or a server list, is managed by the organization. */
+export function isManaged(item: { managed_by?: string | null } | null | undefined): boolean {
+  return item?.managed_by === MANAGED_BY_ORGANIZATION;
+}
+
+/**
+ * The tools of a server with the tool mode `all`. The count is the size of
+ * the last tool list that the gateway observed, not a limit.
+ */
+export function allToolsText(observed: number | null): string {
+  return `all tools, ${observed === null ? 'not observed yet' : `${observed} observed`}`;
+}
+
+/**
+ * The tool count for the server list: "all tools, 2 observed" for a managed
+ * server with the tool mode `all`, otherwise "2 tools", or null when there is
+ * no tool to count or the count is unknown.
+ */
+export function toolCountText(server: McpServer): string | null {
+  if (isManaged(server) && server.tool_mode === TOOL_MODE_ALL) {
+    return allToolsText(server.tool_count);
+  }
+  return (server.tool_count ?? 0) > 0 ? `${server.tool_count} tools` : null;
+}
+
+/** The name to show: the catalog's display name for a managed server. */
+export function mcpServerTitle(server: McpServer): string {
+  return (isManaged(server) && server.display_name) || formatMcpName(server.name);
 }
 
 export interface McpToolBreakdown {
@@ -38,6 +92,8 @@ export interface McpServerDetail extends McpServer {
 
 interface McpState {
   servers: McpServer[];
+  /** True in external mode: the organization manages the servers. */
+  managedByOrganization: boolean;
   selectedServer: McpServerDetail | null;
   loading: boolean;
   detailLoading: boolean;
@@ -51,6 +107,7 @@ interface McpState {
 
 export const useMcpStore = create<McpState>((set, get) => ({
   servers: [],
+  managedByOrganization: false,
   selectedServer: null,
   loading: true,
   detailLoading: false,
@@ -58,8 +115,12 @@ export const useMcpStore = create<McpState>((set, get) => ({
 
   loadServers: async () => {
     try {
-      const { servers } = await api.listMcpServers();
-      set({ servers, loading: false });
+      const list = await api.listMcpServers();
+      set({
+        servers: list.servers,
+        managedByOrganization: isManaged(list),
+        loading: false,
+      });
     } catch (e) {
       console.error('Failed to load MCP servers:', e);
       set({ loading: false });
