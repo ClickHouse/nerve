@@ -234,7 +234,7 @@ session's cause as cause. A change that a person makes directly records that
 person as both. `messages.actor_id` keeps naming who wrote each message; there
 is no cause per message or per turn.
 
-This is an approximation in two places:
+This is an approximation in three places:
 
 - In a session that several people use, the agent's work in every turn is
   attributed to the person who started the session, also in turns that
