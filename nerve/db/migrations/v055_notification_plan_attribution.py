@@ -13,12 +13,12 @@ Adds eight nullable columns that hold an ``actor_refs.id``:
   person through the web UI or REST, or the system actor for the
   ``notification_silence`` tool.
 - ``notification_silences.caused_by_actor_id``: on whose behalf the rule was
-  created: the person, or the cause of the turn that called the tool.
+  created: the person, or the cause of the session that called the tool.
 - ``plans.created_by_actor_id``: who wrote this plan version. The system
   actor for ``plan_propose`` and ``plan_update``; each version written by
   ``plan_update`` carries its own value.
 - ``plans.caused_by_actor_id``: on whose behalf the version was written: the
-  cause of the turn that called the tool.
+  cause of the session that called the tool.
 - ``plans.reviewed_by_actor_id``: who made the last review decision on the
   plan (approve, decline, a revision request, or a status or feedback change
   through REST). A person through the web UI or REST, or the system actor for

@@ -171,10 +171,13 @@ Plans are stored in the `plans` SQLite table (schema v12):
 
 A review through the web UI or the REST API records the signed-in person in
 both reviewer columns. A review through a plan tool records the system actor
-and the cause of the turn that called the tool, so a plan that the agent
-approves in Alice's turn shows "Nerve for Alice". `plan_propose` and
-`plan_update` record the system actor and the turn's cause as the writer of
-the version they create. `plan_update` records no reviewer on the version it
+and the cause of the session that called the tool, so a plan that the agent
+approves in a session that Alice started shows "Nerve for Alice".
+`plan_propose` and `plan_update` record the system actor and the session's
+cause as the writer of the version they create. The implementation session
+of an approval gets the approver (REST) or the approving session's cause
+(tool) as its cause, and a planner session that a revision request creates
+gets the person who asked. `plan_update` records no reviewer on the version it
 replaces, because the planner replacing its own plan is not a review. All
 four columns are actor IDs; see [Accounts and identity](accounts.md#attribution).
 

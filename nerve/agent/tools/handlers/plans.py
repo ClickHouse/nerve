@@ -90,7 +90,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         model="",
         version=version,
         plan_type=plan_type,
-        # Written by the system actor for the cause of the turn.
+        # Written by the system actor for the session's cause.
         attribution=ctx.attribution,
     )
 
@@ -250,7 +250,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     impl_cause = ctx.cause_id
 
     # Mark as implementing. The approval is the system actor's review
-    # decision, made for the cause of the turn. Only one of several
+    # decision, made for the session's cause. Only one of several
     # concurrent decisions changes the row; the others start nothing.
     if not await ctx.db.compare_and_update_plan(
         plan_id, expect_status="pending",

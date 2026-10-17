@@ -156,7 +156,7 @@ describe('handleAnswerInjected: the person who answered', () => {
     const store = fakeStore([row('s1')], 's1');
 
     handleAnswerInjected(
-      injected({ actor_id: 'actor-alice', caused_by_actor_id: 'actor-alice' }),
+      injected({ actor_id: 'actor-alice' }),
       store.get, store.set,
     );
 

@@ -1,8 +1,8 @@
 """Who answers or dismisses a notification, creates a silence, or reviews a plan.
 
 A person who acts through the web UI or REST is the actor and the cause. A
-plan tool or the silence tool that the agent calls inside a turn is the system
-actor's change, made for the cause of that turn. An answer through a chat
+plan tool or the silence tool that the agent calls in a session is the system
+actor's change, made for the session's cause. An answer through a chat
 channel names a provider user and no person, so it records no actor. These
 tests drive the real routes, notification service, engine, tool registry and
 database; only the model runtime is replaced, by a client that completes
@@ -402,7 +402,8 @@ async def test_a_web_answer_records_the_person_and_relays_it_as_their_message(in
     assert await install.session_cause_of("asker") == bob
     assert install.events_of("notification_answered")[-1]["actor_id"] == alice
     injected = install.events_of("answer_injected")[-1]
-    assert (injected["actor_id"], injected["caused_by_actor_id"]) == (alice, alice)
+    assert injected["actor_id"] == alice
+    assert "caused_by_actor_id" not in injected
 
 
 @pytest.mark.asyncio
@@ -644,7 +645,7 @@ async def test_a_web_silence_records_the_person(install, caplog):
 
 
 @pytest.mark.asyncio
-async def test_the_silence_tool_in_a_persons_turn_is_system_for_that_person(install):
+async def test_the_silence_tool_in_bobs_session_is_system_for_bob(install):
     bob = install.actor_id("bob")
     results = install.agent_calls(
         "bobs-chat", "notification_silence",
@@ -735,7 +736,7 @@ async def test_rest_revision_and_feedback_record_the_person(install):
 
 
 @pytest.mark.asyncio
-async def test_a_plan_approved_by_the_tool_in_alices_turn_is_system_for_alice(install):
+async def test_a_plan_approved_by_the_tool_in_alices_session_is_system_for_alice(install):
     alice = install.actor_id("alice")
     system = install.system_actor_id
     task_id, plan_id = await install.pending_plan("tool-approve")
@@ -753,7 +754,7 @@ async def test_a_plan_approved_by_the_tool_in_alices_turn_is_system_for_alice(in
         "in_progress", "alices-chat", system, alice,
     )
     assert await install.created_event(impl_session_id) == (system, alice)
-    # The implementation turn runs as the system actor for Alice.
+    # The implementation session runs as the system actor for Alice.
     assert install.runs[-1]["actor"] == install.db.system_actor
     assert await install.session_cause_of(impl_session_id) == alice
     assert await install.user_rows(impl_session_id) == [
@@ -770,7 +771,7 @@ def _tool_ctx(install: _Install, session_id: str, cause: str | None) -> ToolCont
 
 
 @pytest.mark.asyncio
-async def test_tool_decline_and_revision_are_system_for_the_turns_cause(install):
+async def test_tool_decline_and_revision_are_system_for_the_sessions_cause(install):
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     system = install.system_actor_id
     task_id, declined = await install.pending_plan("tool-decline")
@@ -790,7 +791,7 @@ async def test_tool_decline_and_revision_are_system_for_the_turns_cause(install)
 
 
 @pytest.mark.asyncio
-async def test_a_plan_proposed_in_alices_turn_is_written_by_system_for_alice(install):
+async def test_a_plan_proposed_in_alices_session_is_written_by_system_for_alice(install):
     alice = install.actor_id("alice")
     task_id, _ = await install.pending_plan("authorship")
     await install.db.update_plan("plan-authorship", status="declined")
@@ -820,7 +821,8 @@ async def test_a_new_version_records_its_writer_and_the_old_keeps_its_reviewer(i
         )
     await install.turn_done("proposal")
 
-    # The planner's revision turn runs for Bob and replaces its own plan.
+    # The planner, in the session that the revision created for Bob, replaces
+    # its own plan.
     await plan_update_handler(
         _tool_ctx(install, "proposal", bob), {"plan_id": plan_id, "content": "Ship less"},
     )

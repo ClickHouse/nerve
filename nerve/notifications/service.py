@@ -483,9 +483,10 @@ class NotificationService:
         ``answerer`` is the person who answered: the signed-in actor of the
         web answer route. A channel answer names a provider user and no
         person, so it passes ``None``. The row records the answerer in
-        ``answered_by_actor_id``; an injected answer turn runs as the
-        answerer, on the answerer's behalf; an approval dispatcher receives
-        the answerer as its ``actor``.
+        ``answered_by_actor_id``; the answer relayed into the asking session
+        is a message written by the answerer, and the agent's work in that
+        turn has the session's cause; an approval dispatcher receives the
+        answerer as its ``actor``.
 
         - For ``type=approval`` rows: claim the row, look up the
           dispatcher in the handler registry, run it, audit-log the
@@ -554,10 +555,8 @@ class NotificationService:
             "answer": answer,
             "answered_by": answered_by,
             "content": injected_message,
-            # The injected turn's user row: written by the answerer, on the
-            # answerer's behalf.
+            # The relayed message is written by the answerer.
             "actor_id": answerer_id,
-            "caused_by_actor_id": answerer_id,
             **attribution,
         })
 
@@ -815,11 +814,12 @@ class NotificationService:
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
 
-        ``actor`` writes the turn's user row and is also its cause. For a
-        relayed answer it is the person who answered, or ``None`` when the
-        answer came through a channel that names no person. For a notice
-        that this service writes itself (an expiry note) it is the system
-        actor.
+        ``actor`` writes the turn's user row. For a relayed answer it is the
+        person who answered, or ``None`` when the answer came through a
+        channel that names no person. For a notice that this service writes
+        itself (an expiry note) it is the system actor. The turn runs in an
+        existing session, so the agent's work in it records that session's
+        cause.
         """
         task = asyncio.create_task(
             self.engine.run(

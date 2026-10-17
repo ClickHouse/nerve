@@ -28,9 +28,9 @@ export type WSMessage =
   // `actor_id` is the person who answered; null for a chat-channel answer.
   | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
-  // The answer becomes a user message written by the person who answered, on
-  // their own behalf; both ids are null for a chat-channel answer.
-  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string; actor_id?: string | null; caused_by_actor_id?: string | null }
+  // The answer becomes a user message written by the person who answered;
+  // `actor_id` is null for a chat-channel answer.
+  | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string; actor_id?: string | null }
   // `actor_id` is the sender, so a second tab can label the bubble the moment
   // it arrives rather than waiting for the stored row to be readable. Null
   // whenever the ingress recorded nobody, which renders exactly as before.
