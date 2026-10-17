@@ -30,6 +30,15 @@ FAKE_CODEX_MODE env var:
   close_stdout_mid_turn — closes stdout mid-turn but KEEPS RUNNING
                  (reader-death liveness: is_alive() must flip False even
                  though the process is still up)
+  child_work   — the turn leaves a command running and spawns a child
+                 agent thread that keeps running after turn/completed;
+                 the request ``fake/finish_work`` ends both
+  resume_other — thread/resume answers with another thread id
+  rollout_missing — thread/read names a rollout path that does not exist
+  ephemeral    — thread/read reports an ephemeral thread
+
+thread/loaded/list lists every started or resumed thread (and the child
+thread of child_work); thread/read reports each one's status.
 
 The process also mirrors received config overrides (argv --config k=v)
 back in the initialize response under _fake.configOverrides so tests can
@@ -55,6 +64,9 @@ _pending_approval_answer = threading.Event()
 _approval_decision: dict = {}
 _interrupted = threading.Event()
 _active_turn: dict = {"threadId": None, "turnId": None}
+# Thread id -> ThreadStatus type, for thread/loaded/list and thread/read.
+_threads: dict = {}
+CHILD_THREAD = "th_child"
 
 
 def send(payload: dict) -> None:
@@ -248,6 +260,33 @@ def run_turn(thread_id: str, turn_id: str) -> None:
         time.sleep(30)  # stay alive — this is the zombie window
         return
 
+    if MODE == "child_work":
+        notify("turn/started", {"threadId": thread_id,
+                                "turn": {"id": turn_id, "status": "inProgress", "items": []}})
+        _threads[thread_id] = "active"
+        notify("item/started", {
+            "threadId": thread_id, "turnId": turn_id,
+            "item": {"id": "c-bg", "type": "commandExecution",
+                     "command": "sleep 600", "cwd": "/tmp", "processId": "77",
+                     "status": "inProgress"},
+        })
+        spawn = {"id": "a1", "type": "collabAgentToolCall", "tool": "spawnAgent",
+                 "senderThreadId": thread_id, "receiverThreadIds": [CHILD_THREAD],
+                 "prompt": "work", "status": "inProgress", "agentsStates": {}}
+        notify("item/started", {"threadId": thread_id, "turnId": turn_id, "item": spawn})
+        _threads[CHILD_THREAD] = "active"
+        notify("item/completed", {
+            "threadId": thread_id, "turnId": turn_id,
+            "item": {**spawn, "status": "completed",
+                     "agentsStates": {CHILD_THREAD: {"status": "running"}}},
+        })
+        notify("turn/started", {"threadId": CHILD_THREAD,
+                                "turn": {"id": "child_turn", "status": "inProgress", "items": []}})
+        _usage(turn_id, thread_id)
+        _threads[thread_id] = "idle"
+        _completed(turn_id, thread_id)
+        return
+
     if MODE == "die_mid_turn":
         notify("turn/started", {"threadId": thread_id,
                                 "turn": {"id": turn_id, "status": "inProgress", "items": []}})
@@ -344,9 +383,29 @@ def main() -> None:
             elif MODE == "resume_fail":
                 respond_error(req_id, -32600, "no rollout found for thread")
             else:
-                respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
+                thread_id = msg["params"]["threadId"]
+                thread = {"id": thread_id,
+                          "status": {"type": _threads.get(thread_id, "notLoaded")}}
+                if MODE == "rollout_missing":
+                    thread["path"] = "/nonexistent/fake-rollout.jsonl"
+                if MODE == "ephemeral":
+                    thread["ephemeral"] = True
+                respond(req_id, {"thread": thread})
+        elif method == "thread/loaded/list":
+            respond(req_id, {"data": sorted(_threads), "nextCursor": None})
+        elif method == "fake/finish_work":
+            notify("item/completed", {
+                "threadId": _active_turn["threadId"], "turnId": _active_turn["turnId"],
+                "item": {"id": "c-bg", "type": "commandExecution",
+                         "command": "sleep 600", "cwd": "/tmp", "processId": "77",
+                         "exitCode": 0, "status": "completed"},
+            })
+            _threads[CHILD_THREAD] = "idle"
+            _completed("child_turn", CHILD_THREAD)
+            respond(req_id, {})
         elif method == "thread/start":
             threads_started += 1
+            _threads[f"th_fake_{threads_started}"] = "idle"
             respond(req_id, {"thread": {"id": f"th_fake_{threads_started}"}})
         elif method in ("thread/resume", "thread/fork"):
             if MODE == "resume_fail":
@@ -355,7 +414,10 @@ def main() -> None:
                 respond_error(req_id, 401, "authentication expired")
             elif method == "thread/fork" and msg["params"].get("lastTurnId"):
                 respond(req_id, {"thread": {"id": "fork:" + msg["params"]["lastTurnId"]}})
+            elif method == "thread/resume" and MODE == "resume_other":
+                respond(req_id, {"thread": {"id": "th_other"}})
             else:
+                _threads[msg["params"]["threadId"]] = "idle"
                 respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
         elif method == "turn/start":
             thread_id = msg["params"]["threadId"]

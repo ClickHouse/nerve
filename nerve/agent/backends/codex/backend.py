@@ -35,9 +35,11 @@ from typing import Any, AsyncIterator
 from nerve import paths
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
+    BLOCKER_STATE_UNKNOWN,
     AgentClient,
     BackendCapabilities,
     BackendError,
+    ResumeRequiredError,
     SessionSpec,
     TransportDiedError,
     TurnInput,
@@ -47,6 +49,7 @@ from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
     CodexRpcError,
 )
+from nerve.agent.backends.codex.live_work import LiveWork, thread_state
 from nerve.agent.backends.codex.diffs import reverse_apply_unified_diff
 from nerve.agent.backends.codex.mcp_stdio_wrapper import EXTERNAL_MCP_ENV_PREFIX
 from nerve.agent.backends.codex.pricing import compute_cost
@@ -88,6 +91,13 @@ You are running on Nerve's Codex backend.
   The persistent/asynchronous question tool is `mcp__nerve__ask_user`.
 </backend-notes>
 """
+
+
+# Bounds of the thread status check (replacement_blockers): seconds for
+# each request, pages of thread/loaded/list, threads read.
+_STATUS_TIMEOUT = 5.0
+_MAX_THREAD_PAGES = 8
+_MAX_STATUS_THREADS = 64
 
 
 class CodexTurnError(BackendError):
@@ -940,12 +950,16 @@ class CodexClient(AgentClient):
                 env["NERVE_MCP_WORKER_TOKEN_URL"] = (
                     f"http://127.0.0.1:{port}/api/codex/worker-token"
                 )
+        # Commands, child agents and turns of every thread, from every
+        # notification (see replacement_blockers).
+        self._live_work = LiveWork()
         self._transport = CodexAppServerClient(
             bin_path=backend.codex.bin_path,
             cwd=spec.cwd,
             env=env,
             server_request_handler=self._handle_server_request,
             config_overrides=config_overrides,
+            notification_observer=self._live_work.observe,
         )
         self._thread_id: str | None = None
         self._turn_id: str | None = None
@@ -1016,6 +1030,10 @@ class CodexClient(AgentClient):
                     raise BackendError(
                         f"Cannot fork missing Codex thread {spec.resume_native_id!r}"
                     ) from e
+                if spec.resume_required:
+                    raise ResumeRequiredError(
+                        "the Codex thread to resume is missing"
+                    ) from e
                 logger.warning(
                     "Codex resume target %s is confirmed missing for session %s; "
                     "starting a fresh thread",
@@ -1049,6 +1067,10 @@ class CodexClient(AgentClient):
             # the old id was dropped.
             if not spec.resume_native_id or spec.fork or not _is_missing_thread_error(e):
                 raise
+            if spec.resume_required:
+                raise ResumeRequiredError(
+                    "the app-server could not resume the Codex thread"
+                ) from e
             logger.warning(
                 "Codex %s of %s failed for session %s (%s) — starting a "
                 "fresh thread",
@@ -1063,6 +1085,10 @@ class CodexClient(AgentClient):
         if not thread_id:
             raise BackendError(
                 f"codex thread/start returned no thread id: {response!r}"
+            )
+        if spec.resume_required and str(thread_id) != spec.resume_native_id:
+            raise ResumeRequiredError(
+                "thread/resume returned another Codex thread"
             )
         self._thread_id = str(thread_id)
 
@@ -2183,6 +2209,84 @@ class CodexClient(AgentClient):
 
     def is_alive(self) -> bool:
         return self._transport.is_alive()
+
+    def runtime_stopped(self) -> bool:
+        return self._transport.exited()
+
+    async def replacement_blockers(self) -> tuple[str, ...]:
+        """Commands, child agents and turns that an end of the app-server
+        would stop (see :mod:`nerve.agent.backends.codex.live_work`).
+
+        Asks the app-server for the status of every thread that it holds,
+        then adds the open items that the notifications showed. When the
+        app-server does not answer, the state is unknown.
+        """
+        try:
+            self._live_work.take_status(await self._loaded_thread_states())
+        except (CodexRpcError, BackendError, asyncio.TimeoutError) as e:
+            logger.info(
+                "Codex session %s: no thread status from the app-server (%s)",
+                self._spec.session_id, type(e).__name__,
+            )
+            return tuple(sorted(
+                self._live_work.blockers(self._thread_id)
+                | {BLOCKER_STATE_UNKNOWN},
+            ))
+        return tuple(sorted(self._live_work.blockers(self._thread_id)))
+
+    async def _loaded_thread_states(self) -> dict[str, str]:
+        """Each thread that the app-server holds, with its state."""
+        ids: list[str] = []
+        cursor: str | None = None
+        for _page in range(_MAX_THREAD_PAGES):
+            params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+            page = await self._transport.request(
+                "thread/loaded/list", params, timeout=_STATUS_TIMEOUT,
+            )
+            ids.extend(str(i) for i in page.get("data") or [] if i)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        else:
+            raise BackendError("too many loaded Codex threads")
+        if len(ids) > _MAX_STATUS_THREADS:
+            raise BackendError("too many loaded Codex threads")
+        states: dict[str, str] = {}
+        for thread_id in ids:
+            response = await self._transport.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False},
+                timeout=_STATUS_TIMEOUT,
+            )
+            thread = response.get("thread")
+            states[thread_id] = thread_state(
+                thread.get("status") if isinstance(thread, dict) else None,
+            )
+        return states
+
+    async def resume_problem(self) -> str | None:
+        """Why a new app-server could not resume this thread, or None.
+
+        Checked before the engine stops this client for a replacement: the
+        thread must be stored on disk, where a new process finds it.
+        """
+        if not self._thread_id:
+            return None
+        try:
+            response = await self._transport.request(
+                "thread/read",
+                {"threadId": self._thread_id, "includeTurns": False},
+                timeout=_STATUS_TIMEOUT,
+            )
+        except (CodexRpcError, BackendError, asyncio.TimeoutError) as e:
+            return f"the app-server did not read the thread ({type(e).__name__})"
+        thread = response.get("thread")
+        thread = thread if isinstance(thread, dict) else {}
+        if thread.get("ephemeral"):
+            return "the thread is not stored on disk"
+        path = thread.get("path")
+        if isinstance(path, str) and os.path.isabs(path) and not os.path.isfile(path):
+            return "the stored thread is missing on disk"
+        return None
 
     # -- idle stream: not supported (no autonomous turns) ------------------ #
 

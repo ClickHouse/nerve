@@ -36,6 +36,26 @@ class TransportDiedError(BackendError):
     """The backend subprocess/stream died mid-operation."""
 
 
+class ResumeRequiredError(BackendError):
+    """A client must continue a native conversation and cannot.
+
+    Raised for a :class:`SessionSpec` with ``resume_required``. The backend
+    starts no new native conversation in its place.
+    """
+
+
+# Work that a change or a replacement of a running client could disrupt
+# (see ``AgentClient.replacement_blockers``). The engine reports the first
+# three itself; a backend reports what only its runtime knows.
+BLOCKER_AUTONOMOUS_TURN = "autonomous_turn"
+BLOCKER_BUFFERED_OUTPUT = "buffered_output"
+BLOCKER_BACKGROUND_TASK = "background_task"
+BLOCKER_ACTIVE_TURN = "active_turn"
+BLOCKER_COMMAND = "command"
+BLOCKER_CHILD_AGENT = "child_agent"
+BLOCKER_STATE_UNKNOWN = "state_unknown"
+
+
 @dataclass
 class TurnInput:
     """One user turn, engine-normalized.
@@ -88,6 +108,10 @@ class SessionSpec:
     # it ignores it.
     inference_principal: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # The client must continue ``resume_native_id``. A backend that cannot
+    # raises ResumeRequiredError; it never starts a new native conversation
+    # instead (the engine sets this when it replaces a running client).
+    resume_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +180,29 @@ class AgentClient(Protocol):
 
     def buffer_used(self) -> int:
         """Bytes buffered in the native stream (0 when N/A)."""
+        ...
+
+    # -- replacement of a running client (external mode) ----------------- #
+
+    async def replacement_blockers(self) -> "tuple[str, ...]":
+        """Work of the runtime that a change or an end of this client now
+        would disrupt, as ``BLOCKER_*`` values; empty when there is none.
+
+        Called between turns. The engine checks open turns, buffered output
+        and its background-task registry itself; this reports only what the
+        runtime alone knows. When the runtime cannot tell, the result holds
+        ``BLOCKER_STATE_UNKNOWN``. A client without this method is never
+        changed or replaced for a catalog change.
+        """
+        ...
+
+    def runtime_stopped(self) -> bool:
+        """Whether the runtime process has exited (after ``disconnect``).
+
+        The engine starts a replacement client on the same native
+        conversation only after the old process has exited, so that two
+        processes never write one transcript.
+        """
         ...
 
 

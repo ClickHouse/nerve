@@ -493,6 +493,119 @@ async def test_resume_auth_error_never_starts_fresh_thread(tmp_path, monkeypatch
         await backend.create_client(_spec(cfg, resume_native_id="th_existing"))
 
 
+# -- replacement of a running client (external mode catalog changes) ------ #
+
+
+@pytest.mark.asyncio
+async def test_required_resume_never_starts_a_fresh_thread(tmp_path, monkeypatch):
+    from nerve.agent.backends.base import ResumeRequiredError
+
+    _mode(monkeypatch, "resume_fail")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(ResumeRequiredError):
+        await backend.create_client(
+            _spec(cfg, resume_native_id="th_stale_123", resume_required=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_required_resume_refuses_another_thread(tmp_path, monkeypatch):
+    from nerve.agent.backends.base import ResumeRequiredError
+
+    _mode(monkeypatch, "resume_other")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(ResumeRequiredError, match="another Codex thread"):
+        await backend.create_client(
+            _spec(cfg, resume_native_id="th_existing", resume_required=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_required_resume_continues_the_same_thread(tmp_path, monkeypatch):
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(
+        _spec(cfg, resume_native_id="th_existing", resume_required=True),
+    )
+    try:
+        assert client.native_session_id == "th_existing"
+        assert client.resume_dropped is False
+        assert await client.resume_problem() is None
+    finally:
+        await client.disconnect()
+    assert client.runtime_stopped() is True
+
+
+@pytest.mark.asyncio
+async def test_an_idle_app_server_has_no_live_work(tmp_path, monkeypatch):
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="hello"))
+        await _collect_turn(client)
+        assert await client.replacement_blockers() == ()
+        assert client.runtime_stopped() is False
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_running_command_and_child_agent_block_a_replacement(tmp_path, monkeypatch):
+    """The turn ended, but its command and its child agent still run; the
+    notifications that say so are never read by a turn."""
+    _mode(monkeypatch, "child_work")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="start work"))
+        events = await _collect_turn(client)
+        assert isinstance(events[-1], ev.TurnCompleted)
+        assert client.buffer_used() == 0  # no proof of anything
+        assert await client.replacement_blockers() == ("child_agent", "command")
+        await client._transport.request("fake/finish_work", {})
+        for _ in range(100):
+            if not await client.replacement_blockers():
+                break
+            await asyncio.sleep(0.02)
+        assert await client.replacement_blockers() == ()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_status_check_is_live_work(tmp_path, monkeypatch):
+    _mode(monkeypatch, "resume_auth_fail")  # thread/read fails
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        assert await client.replacement_blockers() == ("state_unknown",)
+        assert "did not read" in await client.resume_problem()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["rollout_missing", "ephemeral"])
+async def test_a_thread_that_is_not_stored_cannot_be_resumed_elsewhere(
+    tmp_path, monkeypatch, mode,
+):
+    _mode(monkeypatch, mode)
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        assert await client.resume_problem() is not None
+    finally:
+        await client.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_fork_uses_selected_native_turn(tmp_path, monkeypatch):
     _mode(monkeypatch, "basic")

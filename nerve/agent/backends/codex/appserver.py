@@ -139,6 +139,7 @@ class CodexAppServerClient:
         client_name: str = "nerve",
         client_version: str = "1.0.0",
         request_timeout: float = 60.0,
+        notification_observer: Callable[[str, dict], None] | None = None,
     ) -> None:
         self._bin_path = bin_path
         self._cwd = cwd
@@ -148,8 +149,13 @@ class CodexAppServerClient:
         self._client_version = client_version
         self._request_timeout = request_timeout
         self._on_server_request = server_request_handler
+        # Sees every notification when it arrives, also between turns, when
+        # nothing reads the queue (see CodexClient.replacement_blockers).
+        self._observe = notification_observer
 
         self._proc: asyncio.subprocess.Process | None = None
+        # The spawned process, kept after close() for exited().
+        self._spawned: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
         self._server_request_tasks: set[asyncio.Task] = set()
@@ -193,6 +199,7 @@ class CodexAppServerClient:
             raise TransportDiedError(
                 f"Failed to spawn codex app-server ({self._bin_path}): {e}"
             ) from e
+        self._spawned = self._proc
 
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name=f"codex-reader:{self._proc.pid}",
@@ -226,6 +233,14 @@ class CodexAppServerClient:
             and self._proc is not None
             and self._proc.returncode is None
         )
+
+    def exited(self) -> bool:
+        """Whether the subprocess has exited, or was never started.
+
+        Unlike :meth:`is_alive`, which is False as soon as the transport is
+        closed, this tells whether the process itself is gone.
+        """
+        return self._spawned is None or self._spawned.returncode is not None
 
     async def close(self) -> None:
         """Terminate the subprocess and fail everything pending."""
@@ -393,6 +408,11 @@ class CodexAppServerClient:
                 "method": method if isinstance(method, str) else "",
                 "params": params if isinstance(params, dict) else {},
             }
+            if self._observe is not None:
+                try:
+                    self._observe(note["method"], note["params"])
+                except Exception:  # noqa: BLE001 - never stops the reader
+                    logger.exception("codex notification observer failed")
             if self.notifications.qsize() >= _MAX_NOTIFICATION_BACKLOG:
                 logger.error(
                     "codex notification backlog exceeded %d; failing "

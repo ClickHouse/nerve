@@ -1316,3 +1316,38 @@ class TestResumeTargetFolders:
         directory.mkdir(parents=True)
         (directory / f"{self.SID}.jsonl").write_text("{}")
         assert _make_backend().validate_resume_target(self.SID, str(workspace)) is True
+
+
+class TestRequiredResume:
+    """A Claude client that must resume never starts another conversation."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def _spec(self, cwd, native_id):
+        return SessionSpec(
+            session_id="s1", source="web", model=None, effort="high",
+            system_prompt="You are Nerve.", cwd=cwd,
+            resume_native_id=native_id, resume_required=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_missing_transcript_refuses_the_client(self, tmp_path, monkeypatch):
+        from nerve.agent.backends.base import ResumeRequiredError
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        with pytest.raises(ResumeRequiredError):
+            await _make_backend().create_client(self._spec(str(tmp_path), self.SID))
+
+    @pytest.mark.asyncio
+    async def test_no_resume_target_refuses_the_client(self, tmp_path):
+        from nerve.agent.backends.base import ResumeRequiredError
+
+        with pytest.raises(ResumeRequiredError):
+            await _make_backend().create_client(self._spec(str(tmp_path), None))
+
+    def test_the_client_reports_no_live_work_of_its_own(self):
+        """The engine's task registry follows the CLI's background work."""
+        client = ClaudeClient.__new__(ClaudeClient)
+        assert asyncio.run(client.replacement_blockers()) == ()
+        assert client.runtime_stopped() is True

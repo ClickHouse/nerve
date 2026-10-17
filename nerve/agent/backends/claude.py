@@ -56,6 +56,7 @@ from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
     AgentClient,
     BackendCapabilities,
+    ResumeRequiredError,
     SessionSpec,
     TransportDiedError,
     TurnInput,
@@ -527,6 +528,16 @@ class ClaudeBackend:
     # -- client construction ------------------------------------------- #
 
     async def create_client(self, spec: SessionSpec) -> "ClaudeClient":
+        if spec.resume_required and not (
+            spec.resume_native_id
+            and self.validate_resume_target(spec.resume_native_id, spec.cwd)
+        ):
+            # Without its transcript the CLI would start another
+            # conversation under the same session.
+            raise ResumeRequiredError(
+                "the Claude conversation to resume has no transcript on "
+                "this host"
+            )
         options = self._build_options(spec)
         client = ClaudeClient(spec, options)
         await client.connect()
@@ -1161,6 +1172,11 @@ class ClaudeClient(AgentClient):
 
     async def connect(self) -> None:
         await self._sdk.connect()
+        # Kept for runtime_stopped(): disconnect() clears the SDK's
+        # reference to the process.
+        self._process = getattr(
+            getattr(self._sdk, "_transport", None), "_process", None,
+        )
 
     async def start_turn(self, turn: TurnInput) -> None:
         # Per-turn fork anchor: a turn that yields no transcript entries
@@ -1319,6 +1335,20 @@ class ClaudeClient(AgentClient):
 
     async def interrupt(self) -> None:
         await self._sdk.interrupt()
+
+    async def replacement_blockers(self) -> tuple[str, ...]:
+        """Nothing beyond what the engine checks.
+
+        The CLI's background work (background commands, agents, monitors)
+        reports its life cycle in ``task_*`` system messages, which the
+        engine's background-task registry follows. Between turns the CLI
+        runs nothing else.
+        """
+        return ()
+
+    def runtime_stopped(self) -> bool:
+        process = getattr(self, "_process", None)
+        return process is None or process.returncode is not None
 
     def is_alive(self) -> bool:
         transport = getattr(self._sdk, "_transport", None)
