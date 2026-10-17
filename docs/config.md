@@ -1825,6 +1825,35 @@ daemon that started with a different environment can be different.
 > Nerve can act as any person. Use external mode only when the gateway is the
 > only caller that can reach Nerve.
 
+#### Inference principal header
+
+In external mode, Nerve adds one `X-Nerve-Inference-Principal` header to each
+model request that it sends. The value is an actor ID, a lower-case UUID:
+
+| Requests | Principal |
+|---|---|
+| The model requests of an agent session, in every turn, also the turns that another person sends and the turns that the agent starts between turns | The session's cause: the person who started the session, or the system actor for a session that Nerve started (a cron job, a hook). See [Attribution](accounts.md#attribution) |
+| Session titles, prompt rewrite, source condensing, image description, memory on Bedrock, setup checks, the model catalogue | The system actor |
+
+A session with no cause, for example a session of a channel without an
+identity mapping, sends no header. Local mode sends no header.
+
+A proxy in front of the model API can use the header to attribute model usage
+to a person. Nerve does not prove the claim. The proxy must check that the
+principal may be attributed for the agent, and remove the header before it
+forwards the request.
+
+The Claude CLI gets the header through `ANTHROPIC_CUSTOM_HEADERS` in its
+environment. Nerve keeps the other lines of an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, and replaces a line for this header. The CLI reads its
+environment only when it starts. The session's cause never changes, so a CLI
+process keeps its header for its whole life, and a process that Nerve starts
+again for the session (after a model change or a crash) gets the same header.
+
+These requests have no header: memory model calls through the
+OpenAI-compatible client (the memory library makes that client and takes no
+headers), Codex sessions, and the model check of `nerve doctor`.
+
 ## Setup
 
 | Key | Type | Default | Description |
@@ -1851,7 +1880,8 @@ When set, every model request goes to this endpoint: the Claude CLI (as
 source condensing, image description, `nerve doctor`), memU and model discovery.
 Nerve sends `anthropic_api_key` as the key, or `ANTHROPIC_API_KEY` from the
 daemon's environment when it is unset; the Claude CLI alone also takes
-`claude_oauth_token`.
+`claude_oauth_token`. In external mode, the requests name a principal; see
+[Inference principal header](#inference-principal-header).
 
 Setting `ANTHROPIC_BASE_URL` in Nerve's environment is not the same. The CLI
 inherits it, but the direct calls and memU still go to `api.anthropic.com`.

@@ -161,6 +161,10 @@ In external mode:
   mode. It still makes the signing secret, because system and MCP tokens need
   it.
 - Accounts and history from an earlier local mode stay in `nerve.db`.
+- Each model request names the principal that caused the work, in the
+  `X-Nerve-Inference-Principal` header: the session's cause, or the system
+  actor for Nerve's own model calls. See
+  [Inference principal header](config.md#inference-principal-header).
 
 > **Warning:** Nerve trusts the header. Use external mode only when the
 > gateway is the only caller that can reach Nerve. A caller that can send the
@@ -222,6 +226,10 @@ This is an approximation in two places:
   another person sent.
 - A deferred message ("run later") or a wakeup that runs in an existing session
   is attributed to that session's cause.
+
+In external mode, the model requests of a session name the session's cause
+in the same way, so the same approximation applies to model usage. See
+[Inference principal header](config.md#inference-principal-header).
 
 | Work | Actor | Cause |
 |---|---|---|
