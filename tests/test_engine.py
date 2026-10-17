@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1273,3 +1274,45 @@ async def test_title_generation_saves_the_title(db, tmp_path):
     finally:
         upstream.close()
     assert (await db.get_session("title-1"))["title"] == "ok"
+
+
+class TestResumeTargetFolders:
+    """The project folder names that the Claude CLI uses."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+
+    def _write(self, home, folder):
+        directory = home / ".claude" / "projects" / folder
+        directory.mkdir(parents=True)
+        (directory / f"{self.SID}.jsonl").write_text("{}")
+
+    def test_every_character_other_than_a_letter_or_digit_is_a_hyphen(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        workspace = tmp_path / "my_work.space"
+        workspace.mkdir()
+        real = os.path.realpath(workspace)
+        self._write(tmp_path / "home", re.sub(r"[^a-zA-Z0-9]", "-", real))
+        assert _make_backend().validate_resume_target(self.SID, str(workspace)) is True
+        assert _make_backend().validate_resume_target("other", str(workspace)) is False
+
+    def test_a_long_folder_name_is_found_by_its_prefix(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        workspace = tmp_path / ("w" * 240)
+        workspace.mkdir()
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(workspace))
+        self._write(tmp_path / "home", encoded[:200] + "-1a2b3c")
+        assert _make_backend().validate_resume_target(self.SID, str(workspace)) is True
+
+    def test_the_config_dir_variable_moves_the_history(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "config"))
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        directory = tmp_path / "config" / "projects" / re.sub(
+            r"[^a-zA-Z0-9]", "-", os.path.realpath(workspace),
+        )
+        directory.mkdir(parents=True)
+        (directory / f"{self.SID}.jsonl").write_text("{}")
+        assert _make_backend().validate_resume_target(self.SID, str(workspace)) is True

@@ -74,6 +74,12 @@ from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
+# The CLI's project folder name for a directory: each character other than a
+# letter or a digit becomes '-', and a longer name than the maximum is cut
+# and gets a hash suffix (see ClaudeBackend._project_folders).
+_PROJECT_FOLDER_RE = re.compile(r"[^a-zA-Z0-9]")
+_PROJECT_FOLDER_MAX = 200
+
 try:
     from claude_agent_sdk import ThinkingBlock
 except ImportError:  # pragma: no cover - depends on SDK version
@@ -459,8 +465,10 @@ class ClaudeBackend:
 
             ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
 
-        where <encoded-cwd> is the absolute cwd path with every '/'
-        replaced by '-'.  The CLI resolves the cwd symlink before
+        (``$CLAUDE_CONFIG_DIR/projects`` when that variable is set), where
+        <encoded-cwd> is the absolute cwd path with every character other
+        than a letter or a digit replaced by '-' (see
+        :meth:`_project_folders`). The CLI resolves the cwd symlink before
         encoding, so when the workspace is itself a symlink the history
         lives under the *realpath*-encoded directory. Check the realpath
         first and fall back to the unresolved path.
@@ -469,15 +477,19 @@ class ClaudeBackend:
         attempt the resume and let the CLI surface the real error.
         """
         try:
-            projects = os.path.expanduser("~/.claude/projects")
+            config_dir = (
+                os.environ.get("CLAUDE_CONFIG_DIR")
+                or os.path.expanduser("~/.claude")
+            )
+            projects = os.path.join(config_dir, "projects")
             bases = [os.path.realpath(cwd)]
             if cwd not in bases:
                 bases.append(cwd)
             for base in bases:
-                encoded = base.replace("/", "-")
-                jsonl = projects + "/" + encoded + "/" + native_id + ".jsonl"
-                if os.path.isfile(jsonl):
-                    return True
+                for folder in self._project_folders(projects, base):
+                    jsonl = projects + "/" + folder + "/" + native_id + ".jsonl"
+                    if os.path.isfile(jsonl):
+                        return True
             return False
         except Exception as e:
             logger.debug(
@@ -485,6 +497,32 @@ class ClaudeBackend:
                 native_id[:12], e,
             )
             return True
+
+    @staticmethod
+    def _project_folders(projects: str, base: str) -> list[str]:
+        """The folders under ``projects`` that can hold the history of the
+        directory ``base``.
+
+        The CLI replaces each character other than a letter or a digit with
+        '-'. A name longer than 200 characters is cut and gets a hash
+        suffix, so it is found by its prefix. The name with only '/'
+        replaced is checked last as well.
+        """
+        encoded = _PROJECT_FOLDER_RE.sub("-", base)
+        if len(encoded) <= _PROJECT_FOLDER_MAX:
+            folders = [encoded]
+        else:
+            prefix = encoded[:_PROJECT_FOLDER_MAX] + "-"
+            try:
+                folders = sorted(
+                    name for name in os.listdir(projects) if name.startswith(prefix)
+                )
+            except OSError:
+                folders = []
+        legacy = base.replace("/", "-")
+        if legacy not in folders:
+            folders.append(legacy)
+        return folders
 
     # -- client construction ------------------------------------------- #
 
