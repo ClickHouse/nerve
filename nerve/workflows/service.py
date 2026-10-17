@@ -713,16 +713,20 @@ class WorkflowRunService:
             # be interruptible mid-promotion.
             self._spawn_detached(self._maybe_dispatch(), f"workflow-dispatch-{run_id}")
 
-    async def _on_session_stop(self, session_id: str) -> None:
+    async def _on_session_stop(
+        self, session_id: str, attribution: Attribution = UNATTRIBUTED,
+    ) -> None:
         """Engine stop listener: a direct stop on a workflow session is a
         kill. CASes the run terminal BEFORE the stop lands so the swallowed
         interrupt/cancel can never be recorded as success. No-ops for
-        non-workflow sessions and for runs a terminator already owns."""
+        non-workflow sessions and for runs a terminator already owns.
+        ``attribution`` is who asked for the stop, recorded as the kill."""
         if not session_id.startswith(_SESSION_PREFIX):
             return
         run_id = session_id[len(_SESSION_PREFIX):]
         flipped = await self.db.transition_workflow_run(
             run_id, "killed", expect=("running",), error="session stopped",
+            kill_attribution=attribution,
         )
         if flipped:
             await self._finalize_terminal(run_id, "killed", {"reason": "session stopped"})

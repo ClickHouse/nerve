@@ -46,11 +46,14 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import init_deps, register_all_routes
 from nerve.gateway.routes._deps import set_notification_service
 from nerve.identity import Actor, Attribution, attribution_for
+from nerve.inference_principal import CUSTOM_HEADERS_ENV
 from nerve.migrate import bootstrap_identity
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.service import NotificationService
 from nerve.workflows.review_loop import ReviewLoopService
 from nerve.workflows.service import ENGINE_CLAUDE, WorkflowRunService
+
+from tests.test_inference_principal import _principals, cli  # noqa: F401 - fixture
 
 _SECRET = "test-secret-for-workflow-attribution-32ch"
 _PASSWORD_HASH = hash_password("correct-horse-battery-staple")
@@ -157,8 +160,11 @@ class _Install:
         app.include_router(register_all_routes())
         return app
 
-    def watch(self, monkeypatch) -> None:
-        """Wire the services and record broadcasts, turns and dispatches."""
+    def watch(self, monkeypatch, *, fake_runtime: bool = True) -> None:
+        """Wire the services and record broadcasts, turns and dispatches.
+
+        Without ``fake_runtime`` the engine builds its real clients (a test
+        replaces the CLI underneath them)."""
         real_broadcast = streaming.broadcaster.broadcast
 
         async def _broadcast(channel: str, message: dict) -> None:
@@ -181,7 +187,9 @@ class _Install:
                 self.runtimes[session_id] = _FakeRuntime(self, session_id)
             return self.runtimes[session_id]
 
-        monkeypatch.setattr(self.engine, "_get_or_create_client", _client)
+        if fake_runtime:
+            monkeypatch.setattr(self.engine, "_get_or_create_client", _client)
+        self.engine.add_stop_listener(self.runs._on_session_stop)
         # The test executes dispatched payloads itself (see ``drain``). The
         # stop sequence after a kill is not attribution and does not run.
         monkeypatch.setattr(self.runs, "_spawn_execute", self.spawned.append)
@@ -239,6 +247,13 @@ class _Install:
             for row in await self.db.get_messages(session_id)
             if row["role"] == "user"
         ]
+
+    async def created_event(self, session_id: str) -> tuple:
+        (row,) = [
+            r for r in await self.db.get_session_events(session_id, limit=200)
+            if r["event_type"] == "created"
+        ]
+        return (row["actor_id"], row["caused_by_actor_id"])
 
     async def turn_cause_of(self, session_id: str) -> str | None:
         """The session's stored cause, which its turns run with."""
@@ -433,6 +448,8 @@ async def test_a_rest_run_records_the_person_and_its_turn_runs_for_them(install)
         if fetch["session_id"] == session_id and "cause_id" in fetch
     )
     assert (await install.db.get_session(session_id))["created_by_actor_id"] == system
+    # The session's created event: the system actor, for Alice.
+    assert await install.created_event(session_id) == (system, alice)
     # The live update and the journal carry the IDs.
     update = install.events_of("workflow_run_update")[-1]["run"]
     assert (update["created_by_actor_id"], update["caused_by_actor_id"]) == (alice, alice)
@@ -452,6 +469,7 @@ async def test_a_run_without_a_cause_keeps_its_turn_without_one(install):
     assert install.turns[-1]["cause"] is None
     assert await install.user_rows(session_id) == [(install.system_actor_id, None)]
     assert await install.turn_cause_of(session_id) is None
+    assert await install.created_event(session_id) == (install.system_actor_id, None)
 
 
 @pytest.mark.asyncio
@@ -471,6 +489,23 @@ async def test_a_rest_kill_records_the_person(install):
     body = killed.json()
     assert (body["status"], body["error"]) == ("killed", "not needed (by api)")
     assert (body["killed_by_actor_id"], body["killed_caused_by_actor_id"]) == (bob, bob)
+    assert await install.run_attribution(run_id) == (alice, alice, bob, bob)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_of_the_runs_session_records_who_stopped_it(install):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    async with _client(install.app()) as client:
+        run_id = (await _rest_run(client, install.headers("alice")))["id"]
+    assert (await install.db.get_workflow_run(run_id))["status"] == "running"
+
+    # A stop of the session (the WebSocket stop of the web UI) is a kill.
+    await install.engine.stop_session(
+        f"workflow:{run_id}", attribution=attribution_for(install.actor("bob")),
+    )
+
+    run = await install.db.get_workflow_run(run_id)
+    assert (run["status"], run["error"]) == ("killed", "session stopped")
     assert await install.run_attribution(run_id) == (alice, alice, bob, bob)
 
 
@@ -1046,3 +1081,70 @@ async def test_external_mode_runs_the_turn_for_the_principal(external_install):
     assert (await install.run_attribution(second["id"]))[2:] == (
         CAROL_PRINCIPAL, CAROL_PRINCIPAL,
     )
+
+
+@pytest_asyncio.fixture
+async def external_cli_install(tmp_path, monkeypatch, wire_identity_store, cli):  # noqa: F811
+    """External mode with the real engine clients over T2's recording CLI."""
+    monkeypatch.setenv(AUTH_MODE_ENV, AUTH_MODE_EXTERNAL)
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
+    pin_auth_mode(AUTH_MODE_EXTERNAL)
+    config = _config(tmp_path)
+    config.agent.backend = "claude"
+    set_config(config)
+    database = Database(tmp_path / "nerve.db")
+    await database.connect()
+    installed = None
+    try:
+        await bootstrap_identity(database, config)
+        wire_identity_store(database)
+        engine = AgentEngine(config, database)
+        init_deps(engine, database)
+        installed = _Install(database, engine, config)
+        installed.watch(monkeypatch, fake_runtime=False)
+        yield installed, cli
+    finally:
+        if installed is not None:
+            await installed.close()
+            for session_id in list(installed.engine._idle_watchers):
+                installed.engine._stop_idle_watcher(session_id)
+        await database.close()
+        set_config(NerveConfig())
+
+
+@pytest.mark.asyncio
+async def test_leg_turns_name_the_cause_of_the_run_to_the_model(external_cli_install):
+    install, processes = external_cli_install
+    carol = _as(CAROL_PRINCIPAL, "Carol")
+    system = install.system_actor_id
+    async with _client(install.app()) as client:
+        rest_run = (await _rest_run(client, carol))["id"]
+        created = await client.post(
+            "/api/sessions", headers=carol,
+            json={
+                "title": "Loop chat",
+                "review_loop": {"goal": "Write the report", "verifier": "- C1: it exists"},
+            },
+        )
+    assert created.status_code == 200, created.text
+    await install.wait_for(lambda: len(install.spawned) >= 2)
+    (loop,) = await install.db.list_review_loops()
+    loop_leg = loop["current_run_id"]
+    scheduled = await install.runs.start_run(
+        ENGINE_CLAUDE, {"prompt": "nightly"}, 1.0,
+        attribution=attribution_for(install.db.system_actor),
+    )
+    unknown = await install.runs.start_run(ENGINE_CLAUDE, {"prompt": "unknown"}, 1.0)
+    await install.drain(count=4)
+
+    by_session = {process.spec.session_id: process for process in processes}
+    expected = {
+        rest_run: CAROL_PRINCIPAL,      # a run that Carol started through REST
+        loop_leg: CAROL_PRINCIPAL,      # a leg of the loop that Carol started
+        scheduled["id"]: system,        # autonomous work: the system actor
+        unknown["id"]: None,            # no cause: no header
+    }
+    for run_id, principal in expected.items():
+        process = by_session[f"workflow:{run_id}"]
+        assert process.spec.inference_principal == principal, run_id
+        assert _principals(process.env) == ([principal] if principal else []), run_id

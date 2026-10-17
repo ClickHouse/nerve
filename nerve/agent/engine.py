@@ -1522,7 +1522,8 @@ class AgentEngine:
         anything. Lets run-lifecycle owners (workflow runs) CAS their state
         terminal *before* the stop lands — ``engine.run`` swallows both the
         graceful interrupt and the hard cancel, so callers cannot otherwise
-        distinguish "stopped" from "completed"."""
+        distinguish "stopped" from "completed". The callback also receives
+        the stop's ``attribution``: who asked for the stop, and for whom."""
         self._stop_listeners.append(callback)
 
     async def stop_session(
@@ -1539,7 +1540,7 @@ class AgentEngine:
         had_work = self.sessions.has_running_work(session_id)
         for cb in self._stop_listeners:
             try:
-                await cb(session_id)
+                await cb(session_id, attribution)
             except Exception:  # noqa: BLE001 — listeners never block a stop
                 logger.exception("stop listener failed for %s", session_id)
         # Cancel any pending interactive tool prompts so the handler unblocks
