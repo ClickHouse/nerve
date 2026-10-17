@@ -1069,8 +1069,8 @@ Response: {
 `caused_by_actor_id` name who created the run and on whose behalf; the run's
 turns run for that cause. `killed_by_actor_id` and
 `killed_caused_by_actor_id` name who killed it. All four are `null` on runs
-from before attribution, and the kill pair is `null` when the kill is not
-known (a stop of the run's session). See
+from before attribution, and the kill pair is `null` when the kill names no
+person (for example a `/stop` from a chat channel). See
 [accounts.md](accounts.md#attribution).
 
 #### `POST /api/workflow-runs`

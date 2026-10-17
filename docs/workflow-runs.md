@@ -107,7 +107,11 @@ A run records who created it and on whose behalf
   no cause (one started by input that names no person) runs its turns with
   no cause.
 - A kill records the kill attribution only when it ends the run. A stop of
-  the run's session, a budget stop and a restart record no kill actor.
+  the run's session (the Stop button) is a kill by the person who asked for
+  the stop; a `/stop` from a chat channel names no person. A budget stop and
+  a restart are not kills and record no kill actor.
+- The run's session records its `created` event as the system actor for the
+  run's cause.
 
 `created_by` stays the origin text (`api`, `session:<id>`,
 `review-loop:<id>`, `cron:<job>`); the sidebar reads it to show the run's
