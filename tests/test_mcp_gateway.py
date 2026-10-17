@@ -19,6 +19,8 @@ import pytest
 import pytest_asyncio
 
 from nerve.mcp_gateway import (
+    CONTRACT_MAX_CATALOG_BYTES,
+    FETCH_DEADLINE_SECONDS,
     MAX_CATALOG_BYTES,
     CatalogError,
     GatewayHealth,
@@ -557,6 +559,69 @@ class TestCatalogReader:
             await reader.close()
 
     @pytest.mark.asyncio
+    async def test_a_slow_catalog_counts_as_unavailable(self, gateway):
+        """A body that arrives byte by byte stays under each read timeout.
+
+        The whole request has a deadline, so startup and a new session do not
+        wait for it without limit. The last catalog stays and the retry
+        runs.
+        """
+        gateway.trickle = 0.05
+        reader = McpGatewayCatalog(gateway.url, retry_initial=30, deadline=0.5)
+        loop = asyncio.get_running_loop()
+        try:
+            started = loop.time()
+            await asyncio.wait_for(reader.start(), 5)
+            assert loop.time() - started < 2
+            assert reader.latest is None
+            assert reader.status()["error"] == (
+                "MCP gateway catalog not received within 0.5 seconds"
+            )
+            assert reader.retrying is True
+
+            gateway.trickle = None
+            await reader.refresh()
+            assert reader.latest.generation == 7
+
+            gateway.catalog = catalog_payload(8, {"docs": ["search"]})
+            gateway.trickle = 0.05
+            started = loop.time()
+            await asyncio.wait_for(reader.refresh(), 5)
+            assert loop.time() - started < 2
+            assert reader.latest.generation == 7
+            assert reader.retrying is True
+        finally:
+            await reader.close()
+
+    def test_the_default_deadline_is_bounded(self):
+        from nerve.mcp_gateway import FETCH_DEADLINE_SECONDS
+
+        assert 0 < FETCH_DEADLINE_SECONDS <= 10
+        assert McpGatewayCatalog("http://192.0.2.1:8080")._deadline == FETCH_DEADLINE_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_a_failed_handler_runs_again_on_the_next_request(self, gateway):
+        calls: list[int] = []
+
+        async def on_change(catalog):
+            calls.append(catalog.generation)
+            if len(calls) == 1:
+                raise RuntimeError("database is locked")
+
+        reader = McpGatewayCatalog(gateway.url, on_change=on_change)
+        try:
+            await reader.start()
+            assert calls == [7]
+            # The same catalog: the handler did not complete, so it runs again.
+            await reader.refresh()
+            assert calls == [7, 7]
+            # Now it completed; the same catalog does not call it again.
+            await reader.refresh()
+            assert calls == [7, 7]
+        finally:
+            await reader.close()
+
+    @pytest.mark.asyncio
     async def test_concurrent_refreshes_share_one_request(self, gateway):
         reader = McpGatewayCatalog(gateway.url)
         try:
@@ -714,3 +779,37 @@ class TestWhatMakesAChange:
         }
         assert jira["inventory"] is None
         assert jira["health"]["inventory_state"] == "unknown"
+
+
+class TestBounds:
+    def test_every_catalog_of_the_contract_is_read(self):
+        assert CONTRACT_MAX_CATALOG_BYTES == 4 * 1024 * 1024
+        assert MAX_CATALOG_BYTES >= CONTRACT_MAX_CATALOG_BYTES
+        assert FETCH_DEADLINE_SECONDS == 5.0
+
+    @pytest.mark.asyncio
+    async def test_a_catalog_of_the_contract_maximum_is_read_in_time(self, gateway):
+        """The largest catalog that the gateway sends is read and checked
+        within the request deadline."""
+        tools = {
+            f"server-{index:02d}": [f"tool_{n:04d}_{'x' * 100}" for n in range(64)]
+            for index in range(64)
+        }
+        catalog = catalog_payload(7, tools)
+        body = json.dumps(catalog).encode()
+        # An unknown member fills the body up to the contract's maximum.
+        filler = CONTRACT_MAX_CATALOG_BYTES - len(body) - len(b', "padding": ""') - 1
+        assert filler > 0
+        catalog["padding"] = "p" * filler
+        gateway.catalog_body = json.dumps(catalog).encode() + b"\n"
+        assert len(gateway.catalog_body) == CONTRACT_MAX_CATALOG_BYTES
+
+        reader = McpGatewayCatalog(gateway.url, retry_initial=30)
+        try:
+            await reader.start()
+            # A request that misses the deadline would give an error.
+            assert reader._deadline == FETCH_DEADLINE_SECONDS
+            assert reader.status()["error"] is None
+            assert len(reader.servers) == 64
+        finally:
+            await reader.close()

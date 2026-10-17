@@ -118,7 +118,11 @@ CONTRACT_MAX_CATALOG_BYTES = 4 * 1024 * 1024
 MAX_CATALOG_BYTES = 8 * 1024 * 1024
 
 # One catalog request. A new session waits for it, so it is short.
+# FETCH_TIMEOUT bounds each network operation; FETCH_DEADLINE_SECONDS bounds
+# the whole request, from the connection to the parsed catalog. A gateway that
+# sends its answer too slowly is unavailable for that request.
 FETCH_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+FETCH_DEADLINE_SECONDS = 5.0
 
 # Interval before the first retry after a failure, and its upper limit.
 RETRY_INITIAL_SECONDS = 1.0
@@ -530,12 +534,14 @@ class McpGatewayCatalog:
     """Read the agent's catalog from the MCP gateway and keep the last one.
 
     :meth:`start` reads the catalog once. :meth:`refresh` reads it again
-    before a new session. Concurrent calls share one request. Each catalog
-    read replaces the kept one. A changed catalog also goes to ``on_change``:
-    one with another desired revision, or one where a server's inventory asks
-    for a new tool list (:func:`follow_inventory`). Times, health and the
-    tenant generation do not make a change. A failure keeps the catalog and
-    starts the background retry, which stops at the first success.
+    before a new session. Concurrent calls share one request, which takes at
+    most ``deadline`` seconds. Each catalog read replaces the kept one. A
+    changed catalog also goes to ``on_change``: one with another desired
+    revision, or one where a server's inventory asks for a new tool list
+    (:func:`follow_inventory`). Times, health and the tenant generation do not
+    make a change. When ``on_change`` fails, the next successful request calls
+    it again with the kept catalog. A failure keeps the catalog and starts the
+    background retry, which stops at the first success.
     """
 
     def __init__(
@@ -547,6 +553,7 @@ class McpGatewayCatalog:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         retry_initial: float = RETRY_INITIAL_SECONDS,
         retry_max: float = RETRY_MAX_SECONDS,
+        deadline: float = FETCH_DEADLINE_SECONDS,
     ):
         self._base_url = base_url.rstrip("/")
         self._on_change = on_change
@@ -554,10 +561,13 @@ class McpGatewayCatalog:
         self._sleep = sleep
         self._retry_initial = retry_initial
         self._retry_max = retry_max
+        self._deadline = deadline
         self._client: httpx.AsyncClient | None = None
         self._latest: GatewayCatalog | None = None
         # The inventory revision that the reader knows for each server.
         self._known_inventory: dict[str, str] = {}
+        # Whether on_change completed for the last change.
+        self._handled = True
         self._fetched_at: str | None = None
         self._checked_at: str | None = None
         self._error: str | None = None
@@ -652,11 +662,18 @@ class McpGatewayCatalog:
     async def _fetch_and_keep(self) -> bool:
         self._checked_at = _now()
         try:
-            catalog = await self._fetch()
+            async with asyncio.timeout(self._deadline):
+                catalog = await self._fetch()
         except Exception as e:  # noqa: BLE001 - a failure keeps the catalog
-            error = str(e) if isinstance(e, CatalogError) else (
-                f"MCP gateway catalog request failed ({type(e).__name__})"
-            )
+            if isinstance(e, CatalogError):
+                error = str(e)
+            elif isinstance(e, TimeoutError):
+                error = (
+                    "MCP gateway catalog not received within "
+                    f"{self._deadline:g} seconds"
+                )
+            else:
+                error = f"MCP gateway catalog request failed ({type(e).__name__})"
             # One warning for each new problem; a retry that fails in the
             # same way is logged at debug level.
             log = logger.debug if error == self._error else logger.warning
@@ -670,9 +687,8 @@ class McpGatewayCatalog:
         self._latest = catalog
         self._fetched_at = _now()
         relist = self._follow_inventory(catalog)
-        changed = False
         if previous is None or previous.desired_revision != catalog.desired_revision:
-            changed = True
+            self._handled = False
             logger.info(
                 "MCP gateway catalog read: desired revision %s (generation %d), "
                 "%d server(s) (%s). New sessions get these servers.",
@@ -680,16 +696,20 @@ class McpGatewayCatalog:
                 ", ".join(server.id for server in catalog.servers) or "none",
             )
         if relist:
-            changed = True
+            self._handled = False
             logger.info(
                 "MCP gateway catalog: the observed tools of %s changed",
                 ", ".join(relist),
             )
-        if changed and self._on_change is not None:
+        if not self._handled and self._on_change is not None:
             try:
                 await self._on_change(catalog)
+                self._handled = True
             except Exception:  # noqa: BLE001 - the catalog is kept
-                logger.exception("MCP gateway catalog handler failed")
+                logger.exception(
+                    "MCP gateway catalog handler failed; the next catalog "
+                    "request calls it again",
+                )
         return True
 
     def _follow_inventory(self, catalog: GatewayCatalog) -> tuple[str, ...]:
