@@ -92,11 +92,12 @@ class PlanStore:
 
         A decision reads the plan, checks its status and then acts, and a
         second decision can read the same status before the first one
-        writes. This one statement decides: of several decisions made from
-        the same status, only one changes the row, and only that caller may
-        start the work that the decision causes. A revision request keeps the
-        status ``pending``, so it does not stop a later decision from the same
-        status.
+        writes. This one statement decides: of several decisions that change
+        the status and were made from the same status, only one changes the
+        row, and only that caller may start the work that the decision
+        causes. A decision that keeps the status (a revision request, a
+        feedback-only PATCH) does not stop a later decision from the same
+        status, and two of them can both apply.
 
         ``attribution`` marks a review decision (approve, decline, a
         revision request, a status or feedback change through REST). Its

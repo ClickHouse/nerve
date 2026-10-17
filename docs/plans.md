@@ -180,11 +180,13 @@ four columns are actor IDs; see [Accounts and identity](accounts.md#attribution)
 
 A decision on a plan (approve, decline, `PATCH`, and `plan_update`
 superseding the old version) applies only while the plan still has the
-status that the decision read. Of two concurrent decisions, one wins; the
-other changes nothing and gets HTTP 409 (REST) or a "no longer pending"
-answer (tools). Only the winner starts an implementation or changes the
-task. A revision request leaves the plan `pending`, so a revision and an
-approval of the same plan can both proceed.
+status that the decision read. Of two concurrent decisions that change the
+status, one wins; the other changes nothing and gets HTTP 409 (REST) or a
+"no longer pending" answer (tools). Only the winner starts an
+implementation or changes the task. A decision that keeps the status (a
+`PATCH` with only feedback, a revision request) does not exclude another
+decision: two such requests can both apply, and a revision and an approval
+of the same plan can both proceed.
 
 ## Web UI
 

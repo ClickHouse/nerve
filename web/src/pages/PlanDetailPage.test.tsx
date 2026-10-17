@@ -108,6 +108,18 @@ describe('PlanDetailPage reviewer', () => {
     await waitFor(() => expect(author).toHaveTextContent('Proposed by Nerve for Alice'));
   });
 
+  it('keeps every decision on a pending plan that has revision feedback', async () => {
+    getPlan.mockResolvedValue(plan({
+      status: 'pending', feedback: 'add tests',
+      reviewed_by_actor_id: ALICE, reviewed_caused_by_actor_id: ALICE,
+    }));
+    renderPage();
+    await screen.findByText('Revision feedback');
+    expect(screen.getByRole('button', { name: /Approve/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Decline/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Request Revision/ })).toBeInTheDocument();
+  });
+
   it('shows no reviewer for a plan that nobody reviewed', async () => {
     getPlan.mockResolvedValue(plan({}));
     renderPage();
