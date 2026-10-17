@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import os
@@ -255,11 +254,6 @@ class AgentEngine:
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
         self._active_channel: dict[str, str] = {}
-        # Each session's stored cause (sessions.caused_by_actor_id), read
-        # when this process first loads the session row for a turn or a
-        # client. The value never changes, so it is safe to keep. Read
-        # through session_cause().
-        self._session_causes: dict[str, str | None] = {}
         # Resolved model bound to each session's live SDK client. Used to
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
@@ -388,15 +382,9 @@ class AgentEngine:
         session the instance started for itself, or ``None`` when unknown
         (channel input with no known person, an imported or MCP satellite
         session). The value is set once when the session is created and never
-        changes. It is read from the session row when this process first
-        loads the session for a turn or a client; before that it is ``None``.
+        changes. See :meth:`nerve.db.sessions.SessionStore.session_cause`.
         """
-        return self._session_causes.get(session_id)
-
-    def _remember_session_cause(self, session: dict | None) -> None:
-        """Cache the stored cause of a session row that was just read."""
-        if session and session.get("id"):
-            self._session_causes[session["id"]] = session.get("caused_by_actor_id")
+        return self.db.session_cause(session_id)
 
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
@@ -406,7 +394,8 @@ class AgentEngine:
         """Fresh per-session ToolContext for backend MCP servers.
 
         The agent's tool calls are the system actor's changes, made for the
-        session's stored cause.
+        session's stored cause. The value never changes, so the context
+        keeps the one read here (the client build has just read the row).
         """
         return ToolContext(
             session_id=session_id,
@@ -419,7 +408,7 @@ class AgentEngine:
             engine=self,
             notification_service=self.notification_service,
             actor=self.db.system_actor,
-            cause=functools.partial(self.session_cause, session_id),
+            cause=self.session_cause(session_id),
         )
 
     def _gateway_port(self) -> int | None:
@@ -1122,7 +1111,6 @@ class AgentEngine:
 
             # Session row first — backend resolution is sticky on it.
             session = await self.db.get_session(session_id)
-            self._remember_session_cause(session)
             backend = self._backend_for(session, source)
             requested_model = (
                 model or (session or {}).get("model")
@@ -2649,7 +2637,6 @@ class AgentEngine:
         )
 
         session = await self.db.get_session(session_id)
-        self._remember_session_cause(session)
 
         if not internal and session:
             current_title = session.get("title")

@@ -809,9 +809,10 @@ async def test_resume_after_restart_keeps_the_session_cause(
         session_id = await _new_session(client, install.headers("alice"))
         await _chat(client, install.headers("bob"), session_id, "long job")
     await install.db.update_session_fields(session_id, {"sdk_session_id": "native-1"})
-    # A restart: the new process has read no session row yet.
-    install.engine._session_causes.clear()
-    assert install.engine.session_cause(session_id) is None
+    # A restart: a new connection knows the stored cause before any turn.
+    await install.db.close()
+    await install.db.connect()
+    assert install.engine.session_cause(session_id) == alice
 
     queue = tmp_path / "resume-after-restart"
     queue.write_text(f"{session_id}\n")
@@ -823,6 +824,52 @@ async def test_resume_after_restart_keeps_the_session_cause(
     assert await install.events(resumed["task_id"]) == [
         (None, "pending", session_id, install.system_actor_id, alice),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_engine_knows_every_stored_session_cause(install):
+    """After a restart, before any turn, nothing reads unknown for a known cause."""
+    alice = install.actor_id("alice")
+    await install.db.create_session(
+        "hers", actor=Actor(actor_id=alice, kind="human"),
+    )
+    await install.db.create_session(
+        "nobodys", actor=install.db.system_actor, cause=None,
+    )
+    await install.db.close()
+    await install.db.connect()
+    engine = AgentEngine(install.config, install.db)
+
+    assert engine.session_cause("hers") == alice
+    assert engine._build_tool_context("hers").cause_id == alice
+    assert engine._build_tool_context("hers").attribution == Attribution(
+        install.system_actor_id, alice,
+    )
+    # A stored NULL stays NULL.
+    assert engine.session_cause("nobodys") is None
+    assert engine._build_tool_context("nobodys").cause_id is None
+
+
+@pytest.mark.asyncio
+async def test_the_session_cause_is_known_from_creation_and_from_a_read(install):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    engine = install.engine
+    await install.db.create_session("new", actor=Actor(actor_id=alice, kind="human"))
+    assert engine.session_cause("new") == alice
+
+    # A row that another writer adds after connect is known from its first read.
+    await install.db.db.execute(
+        "INSERT INTO sessions (id, title, source, status, caused_by_actor_id,"
+        " created_at, updated_at) VALUES ('elsewhere', 'x', 'web', 'idle', ?,"
+        " '2026-01-01', '2026-01-01')",
+        (bob,),
+    )
+    await install.db.db.commit()
+    await install.db.get_session("elsewhere")
+    assert engine.session_cause("elsewhere") == bob
+
+    await install.db.delete_session("new")
+    assert engine.session_cause("new") is None
 
 
 @pytest.mark.asyncio

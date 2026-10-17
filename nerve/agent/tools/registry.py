@@ -47,8 +47,8 @@ class ToolContext:
     principal on whose behalf the call happens: for an agent tool call, the
     session's stored cause (``sessions.caused_by_actor_id``); for a route, the
     person. It is a fixed value, or a callable that returns the cause when a
-    handler reads it (the engine reads its cache of the session's cause). Read
-    it through :attr:`cause_id` or :attr:`attribution`, never directly.
+    handler reads it. Read it through :attr:`cause_id` or :attr:`attribution`,
+    never directly.
     """
 
     session_id: str

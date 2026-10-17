@@ -86,7 +86,32 @@ class SessionStore:
     async def get_session(self, session_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+        if not row:
+            return None
+        session = dict(row)
+        # A row that another connection wrote after connect() is known from
+        # its first read on.
+        self._session_causes[session_id] = session.get("caused_by_actor_id")
+        return session
+
+    async def _cache_session_causes(self) -> None:
+        """Load the stored cause of every session. Called by ``connect()``."""
+        async with self.db.execute(
+            "SELECT id, caused_by_actor_id FROM sessions"
+        ) as cursor:
+            self._session_causes = {row[0]: row[1] async for row in cursor}
+
+    def session_cause(self, session_id: str) -> str | None:
+        """The stored cause of a session: who all agent work in it runs for.
+
+        Read from memory, without a query: the value is loaded for every
+        session at connect, and ``create_session`` and ``get_session`` keep it
+        for the rows they write and read. It never changes. ``None`` is a
+        stored NULL (no known cause) or a session that this connection does
+        not know: one that does not exist, or that another connection created
+        and this one has not read yet.
+        """
+        return self._session_causes.get(session_id)
 
     async def list_sessions(
         self, limit: int = 50, include_archived: bool = False,
@@ -265,6 +290,7 @@ class SessionStore:
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self._session_causes.pop(session_id, None)
 
     async def update_session_metadata(self, session_id: str, metadata: dict) -> None:
         """Update the metadata JSON for a session.

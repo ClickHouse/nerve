@@ -341,6 +341,10 @@ class Database(
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
         self._system_actor: Actor | None = None
+        # Each session's stored cause (sessions.caused_by_actor_id). Loaded at
+        # connect and kept by create_session, get_session and delete_session;
+        # a session's cause never changes. Read through session_cause().
+        self._session_causes: dict[str, str | None] = {}
         # Actor ID to the last display name upsert_external_actor() wrote.
         self._external_actor_names: dict[str, str | None] = {}
         # The state-file modes connect() found after its repair. The identity
@@ -417,6 +421,7 @@ class Database(
                 )
             await run_migrations(self._db)
             await self._cache_system_actor()
+            await self._cache_session_causes()
             # After migrations, so the table exists. A key that other users
             # could read is compromised.
             if exposed:
@@ -425,6 +430,7 @@ class Database(
         except BaseException:
             db, self._db = self._db, None
             self._system_actor = None
+            self._session_causes = {}
             try:
                 await db.close()
             except Exception as e:  # noqa: BLE001 — never mask the real failure
@@ -515,6 +521,7 @@ class Database(
             await self._db.close()
             self._db = None
             self._system_actor = None
+            self._session_causes = {}
             self._external_actor_names.clear()
 
     @property
