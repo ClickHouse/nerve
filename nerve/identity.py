@@ -3,9 +3,12 @@
 An :class:`Actor` is the identity carried through an operation: the person who
 made the request, or the agent's system principal when the work is autonomous
 (cron, hooks, background agents). Human actors are resolved per request and
-passed down the call chain. The system actor cannot change, so the database
-caches it at connect (``Database.system_actor``); there is no process-global
-"current actor".
+passed down the call chain. The database caches the system actor at connect
+(``Database.system_actor``); there is no process-global "current actor". The
+ID of the system actor changes only in the identity bootstrap at startup, in
+external mode, when the environment names the ID of the agent's system
+principal (:data:`SYSTEM_PRINCIPAL_ENV`) and no row refers to the old ID yet.
+The bootstrap then refreshes the cache.
 
 This module sits at the top level, outside both :mod:`nerve.db` and
 :mod:`nerve.gateway`, because both ends need it: the gateway resolves an actor
@@ -30,8 +33,10 @@ instance started for itself. ``None`` in either position means unknown.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
+from uuid import UUID
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from nerve.db.accounts import AccountStore
@@ -42,6 +47,45 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
 ACTOR_KIND_HUMAN = "human"
 ACTOR_KIND_SYSTEM = "system"
 ACTOR_KINDS = (ACTOR_KIND_HUMAN, ACTOR_KIND_SYSTEM)
+
+# In external mode, the platform that runs the agent can give the ID of the
+# agent's system principal in this variable. The identity bootstrap reads it
+# once at startup and gives that ID to the system actor (see
+# ``nerve.migrate.bootstrap_identity``). Local mode ignores it.
+SYSTEM_PRINCIPAL_ENV = "NERVE_SYSTEM_PRINCIPAL_ID"
+
+
+class InvalidSystemPrincipalId(ValueError):
+    """The system principal ID is not a canonical lower-case UUID."""
+
+
+def parse_system_principal_id(value: str | None) -> str | None:
+    """Return the system principal ID in ``value``, or ``None`` when it is unset.
+
+    Unset or blank is ``None``. Any other value must be a UUID in its
+    canonical lower-case form (``8-4-4-4-12`` hex digits), because the ID is
+    compared and sent as a string. Raises :class:`InvalidSystemPrincipalId`
+    for a value in another form, also for a valid UUID in upper case: the
+    platform sends the canonical form, so another form is a configuration
+    error.
+    """
+    if value is None or not value.strip():
+        return None
+    try:
+        canonical = str(UUID(value))
+    except ValueError:
+        canonical = None
+    if canonical != value:
+        raise InvalidSystemPrincipalId(
+            f"{SYSTEM_PRINCIPAL_ENV} must be a UUID in canonical lower-case form, "
+            f"got {value!r}"
+        )
+    return canonical
+
+
+def system_principal_id_from_env() -> str | None:
+    """Read and parse ``NERVE_SYSTEM_PRINCIPAL_ID``."""
+    return parse_system_principal_id(os.environ.get(SYSTEM_PRINCIPAL_ENV))
 
 
 class ActorResolutionError(Exception):

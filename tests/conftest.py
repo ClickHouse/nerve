@@ -156,6 +156,18 @@ def _unpin_auth_mode(monkeypatch):
     unpin_auth_mode()
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_system_principal(monkeypatch):
+    """Strip ``NERVE_SYSTEM_PRINCIPAL_ID`` from the developer shell.
+
+    In external mode, the identity bootstrap gives the system actor the ID in
+    that variable. Tests about it set the variable themselves.
+    """
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    monkeypatch.delenv(SYSTEM_PRINCIPAL_ENV, raising=False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _deterministic_umask():
     """Run the suite under umask 022, whatever the developer's shell has.

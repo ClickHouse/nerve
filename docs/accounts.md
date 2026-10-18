@@ -160,6 +160,8 @@ In external mode:
 - Startup creates no account and deletes a setup token from an earlier local
   mode. It still makes the signing secret, because system and MCP tokens need
   it.
+- Startup can give the system actor the ID of the agent's system principal.
+  See [The system actor in external mode](#the-system-actor-in-external-mode).
 - Accounts and history from an earlier local mode stay in `nerve.db`.
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
@@ -170,6 +172,40 @@ In external mode:
 > gateway is the only caller that can reach Nerve. A caller that can send the
 > header can act as any person, also as the actor of an account from an earlier
 > local mode.
+
+### The system actor in external mode
+
+Each database has one system actor. The schema migration gives it a random
+ID. In external mode, the environment can give the ID of the agent's system
+principal in `NERVE_SYSTEM_PRINCIPAL_ID` (see
+[System principal ID](config.md#system-principal-id)). The identity bootstrap
+of `nerve init` and of each server start then gives the system actor that ID
+when these conditions are true:
+
+- No row refers to the system actor. Nerve finds each column that has a
+  foreign key to `actor_refs` in the schema, for example `accounts.actor_id`,
+  `sessions.created_by_actor_id` and `messages.actor_id`, and checks all of
+  them. A check that cannot run counts as a row.
+- No other actor has the new ID.
+- The system actor did not take an ID from the variable before. Nerve records
+  the ID it took in `nerve.db`, in the same transaction as the change, so the
+  ID changes at most once, also when two processes start with different
+  values. A backup made with `--no-secrets` keeps that record, because it is
+  not secret.
+
+Thus a new installation gets the ID before it attributes work to the system
+actor. After the change, system and MCP tokens act as the new ID, and
+autonomous work is attributed to it.
+
+When a condition is false, the system actor keeps its current ID and Nerve
+logs a warning at each start. Nerve does not change rows that refer to that
+ID. `nerve doctor` shows the difference. A value that is not a canonical
+lower-case UUID also keeps the current ID and gives a warning. Local mode
+ignores the variable.
+
+The schema trigger `system_actor_id_cannot_change` prevents all other changes
+to the ID. The bootstrap removes the trigger, changes the ID and creates the
+trigger again in one transaction.
 
 ## Attribution
 
@@ -352,9 +388,12 @@ password hashes, and the generated signing secret. Treat the archive as a
 secret.
 
 `--no-secrets` removes account passwords, the signing secret and the setup
-completion record from the database snapshot, omits `config.local.yaml`, and
-replaces credential values in workspace configuration with environment-variable
-placeholders. It fails if a configuration file cannot be parsed safely.
+completion record from the database snapshot, and keeps the record of the
+system principal ID that the system actor took (see
+[The system actor in external mode](#the-system-actor-in-external-mode)). It
+omits `config.local.yaml`, and replaces credential values in workspace
+configuration with environment-variable placeholders. It fails if a
+configuration file cannot be parsed safely.
 
 After restoring a `--no-secrets` backup:
 
