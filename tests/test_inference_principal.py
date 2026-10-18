@@ -521,6 +521,111 @@ def test_memory_bedrock_clients_name_the_system_actor(external, global_db):
     )
 
 
+class _MemoryService:
+    """memU's cache of OpenAI clients, one per profile, made when first asked.
+
+    Each client sends its requests to an in-process transport that records
+    them in ``sent``.
+    """
+
+    def __init__(self, sent: list) -> None:
+        from types import SimpleNamespace
+
+        self.llm_profiles = SimpleNamespace(
+            profiles=dict.fromkeys(("default", "fast", "embedding")),
+        )
+        self._llm_clients: dict = {}
+        self._sent = sent
+
+    def _get_llm_base_client(self, profile: str | None = None):
+        import httpx
+        from memu.llm.openai_sdk import OpenAISDKClient
+        from openai import AsyncOpenAI
+
+        name = profile or "default"
+        if name not in self.llm_profiles.profiles:
+            raise KeyError(f"Unknown llm profile '{name}'")
+        if name in self._llm_clients:
+            return self._llm_clients[name]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self._sent.append(request)
+            return httpx.Response(200, json={
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
+                "model": "claude-test",
+                "choices": [{
+                    "index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"},
+                }],
+            })
+
+        client = OpenAISDKClient(
+            base_url="https://api.example.test/v1", api_key="test",
+            chat_model="claude-test", embed_model="",
+        )
+        client.client = AsyncOpenAI(
+            api_key="test", base_url="https://api.example.test/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        self._llm_clients[name] = client
+        return client
+
+
+def _memory_bridge(sent: list):
+    from nerve.memory.memu_bridge import MemUBridge
+
+    bridge = MemUBridge(NerveConfig())
+    bridge._service = _MemoryService(sent)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_memory_openai_clients_name_the_system_actor(external, global_db):
+    sent: list = []
+    bridge = _memory_bridge(sent)
+    embedding = bridge._service._get_llm_base_client("embedding")
+    bridge._name_system_principal()
+    for profile in ("default", "fast"):
+        await bridge._service._get_llm_base_client(profile).chat("hello")
+
+    assert [r.headers.get(INFERENCE_PRINCIPAL_HEADER) for r in sent] == (
+        [global_db.system_actor_id] * 2
+    )
+    assert INFERENCE_PRINCIPAL_HEADER not in embedding.client.default_headers
+
+
+@pytest.mark.asyncio
+async def test_memory_openai_clients_name_no_principal_in_local_mode(global_db):
+    sent: list = []
+    bridge = _memory_bridge(sent)
+    bridge._name_system_principal()
+    await bridge._service._get_llm_base_client("fast").chat("hello")
+
+    (request,) = sent
+    assert INFERENCE_PRINCIPAL_HEADER not in request.headers
+
+
+@pytest.mark.asyncio
+async def test_memory_openai_clients_name_the_system_actor_after_a_reset(
+    external, global_db,
+):
+    """A reset evicts the clients, and memU makes new ones without headers."""
+    sent: list = []
+    bridge = _memory_bridge(sent)
+    bridge._name_system_principal()
+    before = bridge._service._get_llm_base_client("fast")
+    await bridge._reset_llm_clients_impl()
+    after = bridge._service._get_llm_base_client("fast")
+    await after.chat("hello")
+
+    assert after is not before
+    # The health probe, the warm-up, and the chat.
+    assert len(sent) == 3
+    assert {r.headers.get(INFERENCE_PRINCIPAL_HEADER) for r in sent} == {
+        global_db.system_actor_id,
+    }
+
+
 def _keyed_config() -> NerveConfig:
     return NerveConfig.from_dict({"anthropic_api_key": "test-key-not-real"})
 

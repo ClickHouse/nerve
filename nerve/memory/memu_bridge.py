@@ -1832,10 +1832,13 @@ class MemUBridge:
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
-            # Bedrock-backed clients.  Must happen before any LLM call
+            # Bedrock-backed clients, or give the OpenAI clients the
+            # principal header.  Must happen before any LLM call
             # (warmup, category sync, etc.).
             if is_bedrock:
                 self._inject_bedrock_clients()
+            else:
+                self._name_system_principal()
 
             await self._ensure_categories()
 
@@ -2252,6 +2255,25 @@ class MemUBridge:
             self._service._llm_clients[name] = self._make_bedrock_client(model)
             logger.info("Injected Bedrock LLM client for profile '%s' (model=%s)", name, model)
 
+    def _name_system_principal(self) -> None:
+        """Make memU's OpenAI chat clients name the system actor.
+
+        memU makes these clients and gives them no headers. In external mode
+        their requests name the system actor as principal, as the Bedrock
+        clients do. The embedding profile calls the OpenAI API directly and
+        gets no header.
+        """
+        headers = system_principal_headers()
+        if not headers:
+            return
+        for name in self._service.llm_profiles.profiles:
+            if name == "embedding":
+                continue
+            client = self._service._get_llm_base_client(name)
+            inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
+            if inner is not None:
+                client.client = inner.with_options(default_headers=headers)
+
     def _instrument_llm_timeouts(self) -> None:
         """Configure per-call timeouts on LLM clients (two layers).
 
@@ -2515,8 +2537,11 @@ class MemUBridge:
 
         # For Bedrock, re-inject fresh Bedrock clients (memU's default
         # _get_llm_base_client would recreate broken OpenAISDK ones).
+        # memU recreates the OpenAI clients without the principal header.
         if is_bedrock:
             self._inject_bedrock_clients()
+        else:
+            self._name_system_principal()
 
         # Re-apply per-call timeouts on the fresh clients
         self._instrument_llm_timeouts()
