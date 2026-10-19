@@ -742,3 +742,194 @@ async def test_idle_watcher_resumes_parked_session_on_background_completion():
     )
     # Task settled → no longer live → the idle sweep may now reap the client.
     assert engine._has_live_background_tasks("s1") is False
+
+
+# ---------------------------------------------------------------------------
+# Autonomous turns → channel router (Telegram and other non-web channels)
+# ---------------------------------------------------------------------------
+
+
+def _record_router(engine: AgentEngine, calls: list) -> None:
+    async def _open(session_id):
+        calls.append(("open", session_id))
+
+    async def _close(session_id):
+        calls.append(("close", session_id))
+
+    engine._router = SimpleNamespace(
+        open_autonomous_stream=_open, close_autonomous_stream=_close,
+    )
+
+
+def _patch_finalize_into(engine: AgentEngine, calls: list) -> None:
+    async def _record(session_id, st, channel, bump_updated_at=True):
+        calls.append(("finalize", st.full_response_text))
+
+    engine._finalize_turn = _record  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_drain_opens_channel_stream_and_closes_it_after_finalize():
+    """The router gets the turn's events between open and close; close comes
+    after finalize, whose ``done`` sends the channel its final message."""
+    engine = _make_engine()
+    calls: list = []
+    _record_router(engine, calls)
+    _patch_finalize_into(engine, calls)
+    stream = _FakeStream([
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("Background job finished."),
+        _result_msg(),
+    ])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        turns = await engine._drain_pending_messages(
+            "s1", _fake_client(stream), "web", None,
+        )
+
+    assert turns == 1
+    assert calls[:3] == [
+        ("open", "s1"),
+        ("finalize", "Background job finished."),
+        ("close", "s1"),
+    ]
+    # Any later close (the drain's finally) is a harmless repeat.
+    assert set(calls[3:]) <= {("close", "s1")}
+
+
+@pytest.mark.asyncio
+async def test_drain_closes_channel_stream_of_an_empty_turn():
+    """An empty turn is dropped without finalize; its channel stream must
+    still close so the channel's placeholder goes away."""
+    engine = _make_engine()
+    calls: list = []
+    _record_router(engine, calls)
+    _patch_finalize_into(engine, calls)
+    stream = _FakeStream([_sys_msg("init", cwd="/tmp")])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        turns = await engine._drain_pending_messages(
+            "s1", _fake_client(stream), "web", None, first_content_timeout=0.05,
+        )
+
+    assert turns == 0
+    assert calls[0] == ("open", "s1")
+    assert ("close", "s1") in calls
+    assert not any(c[0] == "finalize" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_drain_closes_channel_stream_when_the_turn_times_out():
+    engine = _make_engine()
+    calls: list = []
+    _record_router(engine, calls)
+    _patch_finalize_into(engine, calls)
+    stream = _FakeStream([
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("partial"),
+    ])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        engine.config.agent.cli_idle_timeout_seconds = 0.05
+        with pytest.raises(asyncio.TimeoutError):
+            await engine._drain_pending_messages("s1", _fake_client(stream), "web", None)
+
+    assert calls[0] == ("open", "s1")
+    assert calls[-1] == ("close", "s1")
+
+
+@pytest.mark.asyncio
+async def test_drain_without_a_router_is_unchanged():
+    """Engines that never built a router (tests, headless) skip the hooks."""
+    engine = _make_engine()
+    finalized = _patch_finalize(engine)
+    stream = _FakeStream([
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("hello"),
+        _result_msg(),
+    ])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        turns = await engine._drain_pending_messages(
+            "s1", _fake_client(stream), "web", None,
+        )
+
+    assert turns == 1
+    assert finalized[0].full_response_text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_drain_gives_each_autonomous_turn_its_own_channel_stream():
+    """A stream is closed after every turn: a finished adapter ignores
+    further events, so a second turn reusing it would never be sent."""
+    engine = _make_engine()
+    calls: list = []
+    _record_router(engine, calls)
+    _patch_finalize_into(engine, calls)
+    stream = _FakeStream([
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("first"),
+        _result_msg(),
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("second"),
+        _result_msg(),
+    ])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        turns = await engine._drain_pending_messages(
+            "s1", _fake_client(stream), "web", None,
+        )
+
+    assert turns == 2
+    assert calls[:6] == [
+        ("open", "s1"), ("finalize", "first"), ("close", "s1"),
+        ("open", "s1"), ("finalize", "second"), ("close", "s1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_drain_closes_channel_stream_when_cancelled_mid_turn():
+    """/stop cancels the drain without _close_turn; the finally must still
+    flush the channel stream."""
+    engine = _make_engine()
+    engine.config.agent.cli_idle_timeout_seconds = 30
+    calls: list = []
+    _record_router(engine, calls)
+    _patch_finalize_into(engine, calls)
+    stream = _FakeStream([
+        _sys_msg("init", cwd="/tmp"),
+        _assistant_text("partial"),
+    ])
+
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast = AsyncMock()
+        bc.broadcast_token = AsyncMock()
+        bc.mark_turn_open = lambda sid: None
+        task = asyncio.create_task(
+            engine._drain_pending_messages("s1", _fake_client(stream), "web", None),
+        )
+        for _ in range(200):
+            if ("open", "s1") in calls:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # parked waiting for the rest of the turn
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert calls[0] == ("open", "s1")
+    assert calls[-1] == ("close", "s1")
