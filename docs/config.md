@@ -1814,10 +1814,10 @@ change.
 |-----|------|---------|-------------|
 | `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
 
-Nerve reads `GET <mcp_gateway_url>/catalog` when it starts and before each new
-session. The request has no credential, because the gateway identifies the
-agent from the connection. Nerve does not use the proxy environment variables
-for this request. One request takes at most 5 seconds.
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every 30 seconds. The request has no credential, because the
+gateway identifies the agent from the connection. Nerve does not use the proxy
+environment variables for this request. One request takes at most 5 seconds.
 
 - Nerve reads the members `revision` and `servers` of the catalog, and `id`,
   `url` and `revision` of each server. The servers must be in `id` order.
@@ -1829,9 +1829,10 @@ for this request. One request takes at most 5 seconds.
   not valid, as a whole. When the gateway gives no catalog (it is not
   reachable, it answers with an error or too slowly, or the catalog is not
   valid), Nerve keeps the catalog that it read last. After startup there is
-  none, and sessions start with the `nerve` server only.
+  none until a read succeeds, and sessions start with the `nerve` server
+  only.
 - Nerve reads one catalog at a time. A new session that waits while another
-  read runs uses the result of that read.
+  read runs, for example the periodic read, uses the result of that read.
 - When the catalog changes, new sessions get the new servers. A session that
   is running keeps the servers that it started with.
 - A catalog server with the ID `nerve` is not used, because Nerve's own server

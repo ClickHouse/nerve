@@ -436,6 +436,8 @@ class AgentEngine:
             self._mcp_gateway = McpGatewayCatalog(config.mcp_gateway_url)
         # The revision of the catalog in _mcp_servers_cache (external mode).
         self._mcp_catalog_revision: str | None = None
+        # The periodic catalog read, started by initialize().
+        self._mcp_catalog_task: asyncio.Task | None = None
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -622,6 +624,21 @@ class AgentEngine:
         )
         await self._sync_mcp_servers_to_db()
 
+    # The interval of the periodic catalog read in external mode (seconds).
+    _MCP_CATALOG_REFRESH_SECONDS = 30.0
+
+    async def _refresh_mcp_catalog_periodically(self) -> None:
+        """Read the catalog at a fixed interval, until shutdown cancels it.
+
+        This also reads the catalog again after a failed read at startup.
+        """
+        while True:
+            await asyncio.sleep(self._MCP_CATALOG_REFRESH_SECONDS)
+            try:
+                await self._refresh_mcp_catalog()
+            except Exception:  # noqa: BLE001 - the next read tries again
+                logger.exception("Periodic MCP gateway catalog read failed")
+
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
         from nerve.gateway.auth import create_mcp_session_token, effective_jwt_secret
@@ -767,6 +784,11 @@ class AgentEngine:
                     "without MCP servers other than Nerve's own",
                 )
             await self._refresh_mcp_catalog()
+            if self._mcp_gateway is not None:
+                self._mcp_catalog_task = asyncio.create_task(
+                    self._refresh_mcp_catalog_periodically(),
+                    name="mcp-gateway-catalog",
+                )
         else:
             # Load Claude Code plugin directories for SDK plugins field
             from nerve.config import load_claude_code_plugins
@@ -932,6 +954,11 @@ class AgentEngine:
         for sid in list(self._idle_watchers):
             self._stop_idle_watcher(sid)
 
+        if self._mcp_catalog_task is not None:
+            self._mcp_catalog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._mcp_catalog_task
+            self._mcp_catalog_task = None
         if self._mcp_gateway is not None:
             await self._mcp_gateway.close()
 

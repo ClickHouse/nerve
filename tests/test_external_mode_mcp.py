@@ -7,6 +7,7 @@ is an httpx transport (tests/test_mcp_gateway.py).
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -244,6 +245,89 @@ class TestNewSessions:
         assert [(s.name, s.type, s.url, s.headers) for s in servers] == [
             ("wiki", "http", f"{BASE}/s/wiki/mcp", {}),
         ]
+
+
+async def _until(condition, timeout: float = 2.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.005)
+
+
+class TestPeriodicRead:
+    @pytest.mark.asyncio
+    async def test_reads_the_catalog_at_a_fixed_interval(self, tmp_path, db, external):
+        gateway = FakeGateway()
+        gateway.status = 503
+        engine = _engine(tmp_path, db, gateway)
+        engine._MCP_CATALOG_REFRESH_SECONDS = 0.01
+        await _initialize(engine)
+        try:
+            # Startup found no catalog; a later periodic read gets it.
+            assert engine._mcp_catalog_revision is None
+            gateway.status = 200
+            await _until(lambda: engine._mcp_catalog_revision == "sha256:catalog")
+
+            gateway.document = _document("wiki", revision="sha256:two")
+            await _until(lambda: engine._mcp_catalog_revision == "sha256:two")
+            assert [s.name for s in engine._mcp_servers_cache] == ["wiki"]
+        finally:
+            await engine.shutdown()
+
+        # Shutdown stops the reads.
+        assert engine._mcp_catalog_task is None
+        reads = len(gateway.requests)
+        await asyncio.sleep(0.05)
+        assert len(gateway.requests) == reads
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_does_not_stop_the_reads(self, tmp_path, db, external):
+        gateway = FakeGateway()
+        engine = _engine(tmp_path, db, gateway)
+        engine._MCP_CATALOG_REFRESH_SECONDS = 0.01
+        await _initialize(engine)
+        sync = engine._sync_mcp_servers_to_db
+        failures = []
+
+        async def failing_once():
+            if not failures:
+                failures.append(True)
+                raise RuntimeError("database is locked")
+            await sync()
+
+        engine._sync_mcp_servers_to_db = failing_once
+        try:
+            gateway.document = _document("wiki", revision="sha256:two")
+            await _until(lambda: failures)
+            gateway.document = _document("docs", "wiki", revision="sha256:three")
+            await _until(lambda: engine._mcp_catalog_revision == "sha256:three")
+        finally:
+            await engine.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_a_read_in_progress(self, tmp_path, db, external):
+        gateway = FakeGateway()
+        engine = _engine(tmp_path, db, gateway)
+        engine._MCP_CATALOG_REFRESH_SECONDS = 0.01
+        await _initialize(engine)
+        gateway.delay = 3.0
+        await _until(lambda: len(gateway.requests) == 2)
+        async with asyncio.timeout(1):
+            await engine.shutdown()
+        assert engine._mcp_catalog_task is None
+
+    @pytest.mark.asyncio
+    async def test_no_periodic_read_without_a_gateway_url(self, tmp_path, db, external):
+        engine = _engine(tmp_path, db)
+        await _initialize(engine)
+        assert engine._mcp_catalog_task is None
+        await engine.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_no_periodic_read_in_local_mode(self, tmp_path, db):
+        engine = _engine(tmp_path, db, FakeGateway())
+        await _initialize(engine)
+        assert engine._mcp_catalog_task is None
+        await engine.shutdown()
 
 
 class TestLocalModeUnchanged:
