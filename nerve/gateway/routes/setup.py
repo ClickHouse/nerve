@@ -1947,7 +1947,9 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
             if not _EMAIL_RE.match(address):
                 raise SetupFieldError("gmail_accounts", "That is not an email address.")
         gmail_on = live.gmail.enabled if req.gmail is None else bool(req.gmail)
-        if gmail_on and not accounts:
+        # A source the page may not switch here is the operator's to keep
+        # consistent: its live configuration is not this request's to fail.
+        if "gmail" in available and gmail_on and not accounts:
             raise SetupFieldError("gmail_accounts", "Add at least one Gmail address.")
         tg_on = live.telegram.enabled if req.telegram is None else bool(req.telegram)
         # The two sync credentials follow the secret rules: omitted = kept,
@@ -1981,7 +1983,7 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
                 "telegram_api_id",
                 "Add the API id that goes with this API hash (both come from my.telegram.org).",
             )
-        if tg_on and not (api_id and api_hash):
+        if "telegram" in available and tg_on and not (api_id and api_hash):
             raise SetupFieldError("telegram_api_hash", "Telegram sync needs the API id and API hash from my.telegram.org.")
 
         choices = replace_choices(

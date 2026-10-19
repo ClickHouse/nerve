@@ -3369,6 +3369,22 @@ class TestNoLocalSecrets:
             refused = await http.put("/api/setup/sources", json={"github": True, "gmail": False, "telegram": False})
             assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
 
+    async def test_a_github_only_save_ignores_the_operators_gmail_and_telegram_settings(self, claimed, monkeypatch):
+        """With only GitHub on offer, the live Gmail and Telegram configuration
+        is the operator's: an enabled Gmail source without accounts refuses a
+        Gmail save in default mode, but must not refuse the one toggle the page
+        may switch here (the page has no Gmail field to show that error on)."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{"sync.gmail.enabled": True, "sync.telegram.enabled": True})
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["available"] == ["github"]
+            saved = await http.put("/api/setup/sources", json={"github": True})
+            assert saved.status_code == 200, saved.text
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["github"]["enabled"] is True
+
     async def test_a_github_token_from_the_environment_opens_that_one_toggle(self, claimed, monkeypatch):
         """The operator holds the token (GH_TOKEN in the service environment):
         switching the GitHub source on stores nothing here, so the step is
