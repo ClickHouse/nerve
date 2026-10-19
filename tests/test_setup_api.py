@@ -3375,7 +3375,10 @@ class TestNoLocalSecrets:
         Gmail save in default mode, but must not refuse the one toggle the page
         may switch here (the page has no Gmail field to show that error on)."""
         choose(claimed, "personal")
-        _keep_no_secrets(claimed, **{"sync.gmail.enabled": True, "sync.telegram.enabled": True})
+        _keep_no_secrets(claimed, **{
+            "sync.gmail.enabled": True, "sync.telegram.enabled": True,
+            "sync.telegram.api_hash": "REPLACE_HASH_VALUE",  # a hash without its id
+        })
         monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
         async with claimed.client() as http:
             state = (await http.get("/api/setup")).json()

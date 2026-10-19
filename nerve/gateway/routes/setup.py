@@ -1978,7 +1978,7 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
             _refuse_managed(ctx, "sync.gmail.accounts", "gmail_accounts")
         if req.telegram_api_id is not None and req.telegram_api_id <= 0:
             raise SetupFieldError("telegram_api_id", "The API id is a positive number from my.telegram.org.")
-        if api_hash and not api_id:
+        if "telegram" in available and api_hash and not api_id:
             raise SetupFieldError(
                 "telegram_api_id",
                 "Add the API id that goes with this API hash (both come from my.telegram.org).",
