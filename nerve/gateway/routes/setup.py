@@ -84,6 +84,7 @@ from nerve.setup_checklist import (
     Step,
     derive,
     onboarding_from_task,
+    sources_available,
     steps_for_mode,
     summarize,
 )
@@ -1894,6 +1895,33 @@ async def set_channels(req: ChannelsRequest, actor: Actor = Depends(require_pers
 
 _EMAIL_RE = re.compile(r"^[^\s@-][^\s@]*@[^\s@]+\.[^\s@]+$")
 
+#: The source each field of a ``SourcesRequest`` belongs to.
+_SOURCE_OF_FIELD = {
+    "github": "github",
+    "gmail": "gmail",
+    "gmail_accounts": "gmail",
+    "telegram": "telegram",
+    "telegram_api_id": "telegram",
+    "telegram_api_hash": "telegram",
+}
+
+
+def _refuse_closed_sources(ctx: _Context, req: SourcesRequest) -> list[str]:
+    """The sources the page may switch here, after refusing the request for
+    any other. Without local secrets every source keeps a credential on this
+    machine — a GitHub login or token, the Gmail keyring, the Telegram API
+    credentials — so nothing goes through (409, the policy's two sentences),
+    except GitHub when the operator provides its token from the environment:
+    that switch stores nothing, and the Gmail and Telegram fields alone are
+    refused, by name, with the step's reason."""
+    available, unavailable_reason = sources_available(ctx.facts)
+    if not available:
+        _refuse_without_local_secrets(ctx)
+    for name in SourcesRequest.model_fields:
+        if name in req.model_fields_set and _SOURCE_OF_FIELD.get(name, name) not in available:
+            raise SetupFieldError(name, unavailable_reason or NO_LOCAL_SECRETS_TEXT, status_code=409)
+    return available
+
 
 @router.put("/api/setup/sources")
 async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person)):
@@ -1904,11 +1932,10 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
         _require_writable(ctx)
-        # GitHub login or token, the Gmail keyring, the Telegram API
-        # credentials: every source keeps a credential on this machine. Ranked
-        # above the wait for a mode, as the checklist ranks it: choosing a
-        # mode would not open this step, so that is not the answer to give.
-        _refuse_without_local_secrets(ctx)
+        # The policy first, ranked above the wait for a mode as the checklist
+        # ranks it: choosing a mode would not open a closed step, so that is
+        # not the answer to give.
+        available = _refuse_closed_sources(ctx, req)
         if workspace_mode(config.workspace) is None:
             raise HTTPException(status_code=409, detail="Choose a mode first")
         live = config.sync
@@ -1990,7 +2017,10 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         for path in secret_paths:
             secret.setdefault(path, None)
         _write(ctx, machine=machine, portable=portable, secret=secret)
-        answered = req.github is not None and req.gmail is not None and req.telegram is not None
+        # A decision about every source on offer — all three, or GitHub alone
+        # where it is the one the page may switch — is an answer, "none of
+        # these" included.
+        answered = all(getattr(req, source) is not None for source in available)
         return await _finish_mutation(ctx, step=STEP_SOURCES, answered=answered)
 
 
