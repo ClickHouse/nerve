@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupState, TelegramSyncSession, TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession, TelegramSyncSessionSummary,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -1819,6 +1819,63 @@ describe('instances that keep no credentials on disk', () => {
     expect(form.queryByLabelText(/Telegram user id/)).not.toBeInTheDocument();
     expect(form.queryByRole('button', { name: /Test token|Also connect Slack/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
+  });
+
+  const GITHUB_ONLY = 'GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance.';
+  /** The Sources step as the server sends it when the operator's GitHub token comes from the environment. */
+  const githubOnly = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', overrides, {
+    github: { enabled: false, source: 'environment' }, available: ['github'], unavailable_reason: GITHUB_ONLY, ...detail,
+  });
+
+  it('a GitHub token from the environment keeps the GitHub toggle on offer and nothing else', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const form = within(screen.getByRole('form', { name: 'Choose what Nerve reads' }));
+    // The form, with the server's reason — not the closed-step page, and not the policy's sentence.
+    expect(form.getByText(GITHUB_ONLY)).toBeInTheDocument();
+    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByText('Not available on this instance.')).not.toBeInTheDocument();
+    expect(form.getByText('Token: configured by your operator (environment)')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Gmail' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Turn all off' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Skip for now/ })).toBeInTheDocument();
+    const toggle = screen.getByRole('checkbox', { name: /GitHub/ });
+    expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await userEvent.click(continueButton());
+    // The one boolean on offer: a Gmail or Telegram field would be refused.
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('a source the operator switched on where the page may not is shown, not offered', async () => {
+    const provided = githubOnly({ status: 'done' }, {
+      gmail: { enabled: true, accounts: ['alice@example.com'], source: 'config-repo' },
+    });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? provided : s)) });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const gmail = within(screen.getByRole('region', { name: 'Gmail' }));
+    expect(gmail.getByRole('checkbox')).toBeChecked();
+    expect(gmail.getByRole('checkbox')).toBeDisabled();
+    expect(gmail.getByText('alice@example.com')).toBeInTheDocument();
+    expect(gmail.queryByRole('button', { name: /Remove alice@example.com/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /GitHub/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('the overview counts the open GitHub toggle as a step to do, beside the three closed steps', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByText('Not available on this instance')).toHaveLength(3);
+    expect(rows.getByRole('link', { name: 'Sources' }).closest('li')).toHaveTextContent('To do');
+    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
   });
 });
 
