@@ -1027,6 +1027,50 @@ PROXY_CLIENT_MAX_RETRIES = 6
 
 
 @dataclass
+class SubagentsConfig:
+    """Sub-agents and background tasks inside a session (``agent.subagents``).
+
+    See docs/agents.md. Every key hot-reloads except the three a runtime
+    reads when it starts (``per_task_stop_affordance``,
+    ``progress_summaries``, ``forward_subagent_text``), which apply to
+    clients built after the change.
+    """
+
+    # Stop (the red button, Esc, /stop) ends only the orchestrator's turn and
+    # spares background agents. Sent to the CLI as an initialize flag; with it
+    # off, Stop asks before it would end background agents.
+    per_task_stop_affordance: bool = True
+    # A one-line, model-written status per running agent (agentProgressSummaries).
+    # Costs a few small-model calls per agent.
+    progress_summaries: bool = True
+    # Stream foreground and nested sub-agents' text and thinking to Nerve
+    # (background agents always stream everything).
+    forward_subagent_text: bool = True
+    # The UI flags a running agent with no activity for this long as quiet.
+    quiet_after_minutes: int = 10
+    # A member of the CLI's live background set that disappears without a
+    # final frame becomes "lost" after this long.
+    lost_grace_seconds: int = 30
+    # A stop with no final frame after this long is flagged "stop not confirmed".
+    stop_confirm_seconds: int = 10
+    # Cap per stored or streamed tool payload (input or result) of a transcript item.
+    transcript_item_max_bytes: int = 16384
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> SubagentsConfig:
+        return cls(
+            per_task_stop_affordance=d.get("per_task_stop_affordance", True),
+            progress_summaries=d.get("progress_summaries", True),
+            forward_subagent_text=d.get("forward_subagent_text", True),
+            quiet_after_minutes=d.get("quiet_after_minutes", 10),
+            lost_grace_seconds=d.get("lost_grace_seconds", 30),
+            stop_confirm_seconds=d.get("stop_confirm_seconds", 10),
+            transcript_item_max_bytes=d.get("transcript_item_max_bytes", 16384),
+        )
+
+
+@dataclass
 class AgentConfig:
     # Agent backend for NEW sessions: "claude" (Claude Agent SDK) or
     # "codex" (OpenAI Codex app-server; see CodexConfig). Existing
@@ -1156,6 +1200,8 @@ class AgentConfig:
     # default (no SendMessage, no teams).
     agent_teams: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
+    # Sub-agents and background tasks inside a session (docs/agents.md).
+    subagents: SubagentsConfig = field(default_factory=SubagentsConfig)
 
     @property
     def resolved_cron_backend(self) -> str:
@@ -1201,6 +1247,7 @@ class AgentConfig:
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
+            subagents=SubagentsConfig.from_dict(d.get("subagents") or {}),
         )
 
     def context_1m_enabled_for(self, model: str | None) -> bool:

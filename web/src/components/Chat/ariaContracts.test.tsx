@@ -2,7 +2,9 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { useAgentStore } from '../../stores/agentStore';
 import { useChatStore } from '../../stores/chatStore';
+import { FX_WAVE, makeAgentStoreSeed } from '../../test/agentFixtures';
 import type { PanelTab } from '../../types/chat';
 import { ChatInput } from './ChatInput';
 import { InteractiveQuestionCard } from './InteractiveQuestionCard';
@@ -146,12 +148,43 @@ describe("SidePanel's tab strip", () => {
     expect(strip.queryByRole('tablist')).toBeNull();
     expect(strip.queryAllByRole('tab')).toHaveLength(0);
 
-    const explore = strip.getByRole('button', { name: /Explore/ });
+    const explore = strip.getByRole('button', { name: /^Explore/ });
     expect(explore).toHaveAttribute('aria-pressed', 'true');
     expect(explore).not.toHaveAttribute('aria-selected');
     expect(strip.getByRole('button', { name: /^Plan/ })).toHaveAttribute(
       'aria-pressed',
       'false',
     );
+  });
+
+  it('gives every tab a labelled close button beside it, visible without hovering', () => {
+    useChatStore.setState({
+      panels: [panel('p1', 'Explore'), panel('p2', 'Plan')],
+      activePanelId: 'p1',
+      panelVisible: true,
+    });
+    const { container } = render(<SidePanel />);
+    const strip = within(container);
+
+    const close = strip.getByRole('button', { name: 'Close Plan' });
+    // A sibling of the tab, not nested inside it (a button in a button is invalid).
+    expect(close.closest('[aria-pressed]')).toBeNull();
+    expect(close.className).not.toMatch(/opacity-0/);
+    expect(strip.getByRole('button', { name: 'Close Explore' })).toBeInTheDocument();
+  });
+});
+
+describe("SidePanel's Agents roster", () => {
+  it('is a plain list of buttons, with no tree, grid or tablist roles', () => {
+    useAgentStore.setState(makeAgentStoreSeed(FX_WAVE));
+    useChatStore.setState({ panels: [], activePanelId: null, panelVisible: false });
+    useChatStore.getState().openAgentsPanel();
+    const { container } = render(<SidePanel />);
+    const view = within(container);
+
+    expect(view.getByRole('list', { name: 'Agents' })).toBeInTheDocument();
+    for (const role of ['tree', 'treeitem', 'grid', 'treegrid', 'row', 'gridcell', 'tablist', 'tab', 'tabpanel']) {
+      expect(view.queryAllByRole(role)).toHaveLength(0);
+    }
   });
 });

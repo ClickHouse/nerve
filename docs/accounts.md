@@ -330,7 +330,10 @@ work uses the system actor.
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
-| `stop_requested` | A stop request reaches a running turn; each request is one event | |
+| `stop_requested` | A stop request reaches a running turn; each request is one event | `scope` (`turn`), `outcome` (`stopped`, `killed`, `not_stopped`, …), `live_agents` |
+| `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |
+| `agents_stop_all_requested` | Every live agent of the session is stopped | `agent_ids`, `include_shells` |
+| `force_stop_requested` | The session's runtime is stopped by force | `ended_agent_ids` |
 | `external_tool_call` | An external MCP client calls a tool | The tool call |
 
 A change through the web UI, the REST API or the browser WebSocket records the

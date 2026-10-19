@@ -46,6 +46,10 @@ export function hydrateMessage(raw: any): ChatMessage {
         // Dynamic-workflow snapshot, folded into the block by the backend
         // (merge_workflow_into_call) so the panel reconstructs after reload.
         workflow: b.workflow,
+        // The agent record a spawn call created (Agent / Task / Workflow /
+        // Monitor / background Bash), stamped when the turn finalized. Old
+        // history has none and renders the legacy card.
+        ...(typeof b.agent_id === 'string' && b.agent_id ? { agentId: b.agent_id } : {}),
       };
     }
     if (b.type === 'image') {
@@ -58,7 +62,12 @@ export function hydrateMessage(raw: any): ChatMessage {
       return { type: 'wakeup' as const };
     }
     if (b.type === 'auto') {
-      return { type: 'auto' as const };
+      // What woke the orchestrator; old markers carry neither field.
+      return {
+        type: 'auto' as const,
+        ...(Array.isArray(b.triggers) ? { triggers: b.triggers } : {}),
+        ...(typeof b.more === 'number' ? { more: b.more } : {}),
+      };
     }
     if (b.type === 'model_change') {
       return { type: 'model_change' as const, from: b.from, to: b.to || '', downgrade: b.downgrade };

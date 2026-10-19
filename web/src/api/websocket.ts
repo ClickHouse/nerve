@@ -1,6 +1,7 @@
 import { authUrl, hostedSessionActive, isHosted, probeSession } from './hosted';
 import type { ReviewLoop, Task, WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
+import type { AgentSnapshot, AgentWSMessage, AutoTurnTrigger, InteractionAgentRef } from '../types/agents';
 
 export type WSMessage =
   | { type: 'token'; session_id: string; content: string; parent_tool_use_id?: string }
@@ -13,14 +14,18 @@ export type WSMessage =
   | { type: 'error'; session_id: string; error: string }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
-  | { type: 'session_status'; session_id: string; is_running: boolean; status?: string; buffered_events?: WSMessage[] }
+  // `agents` is the roster snapshot, sent on every bind and switch (also when
+  // the session is idle); `buffered_events` only while a turn runs.
+  | { type: 'session_status'; session_id: string; is_running: boolean; status?: string; buffered_events?: WSMessage[]; agents?: AgentSnapshot }
   | { type: 'session_forked'; source_id: string; fork_id: string; title: string }
   | { type: 'session_resumed'; session_id: string }
   | { type: 'session_archived'; session_id: string }
   | { type: 'plan_update'; session_id: string; content: string }
   | { type: 'backend_status'; session_id: string; subtype: string; data: Record<string, unknown> }
-  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown> }
+  // `agent` names the subagent that asked; null or absent for the orchestrator.
+  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
   | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
+  // No longer emitted (agent records replaced them); tolerated and ignored.
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
@@ -34,13 +39,17 @@ export type WSMessage =
   // `actor_id` is the sender, so a second tab can label the bubble the moment
   // it arrives rather than waiting for the stored row to be readable. Null
   // whenever the ingress recorded nobody, which renders exactly as before.
-  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null; actor_id?: string | null }
+  // `client_msg_id` is the sending tab's id for the message, so another tab
+  // can tell the bubble is still queued.
+  | { type: 'user_message'; session_id: string; content: string; blocks?: { type: string; url?: string; filename?: string; media_type?: string; size?: number }[] | null; actor_id?: string | null; client_msg_id?: string | null }
   // pending_wakeup_at / has_background_tasks ride along with every transition:
   // a turn can end with the session still parked on scheduled or background
   // work, and the sidebar redraws that row straight from the event (it skips
   // the list refetch for the active session).
-  | { type: 'session_running'; session_id: string; is_running: boolean; pending_wakeup_at?: string | null; pending_wakeup_created_by_actor_id?: string | null; pending_wakeup_caused_by_actor_id?: string | null; has_background_tasks?: boolean }
+  // `background_count` is the number of live agents of the session.
+  | { type: 'session_running'; session_id: string; is_running: boolean; pending_wakeup_at?: string | null; pending_wakeup_created_by_actor_id?: string | null; pending_wakeup_caused_by_actor_id?: string | null; has_background_tasks?: boolean; background_count?: number }
   | { type: 'session_awaiting_input'; session_id: string; awaiting: boolean }
+  // Kept by the server for one release for old tabs; the agent roster replaces it.
   | { type: 'background_tasks_update'; session_id: string; tasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout' }[] }
   | { type: 'workflow_progress'; session_id: string; tool_use_id: string; workflow: WorkflowSnapshot }
   | { type: 'workflow_run_update'; session_id: string | null; run: WorkflowRun }
@@ -50,11 +59,15 @@ export type WSMessage =
   // NOT view-scoped; the board reflects all of them.
   | { type: 'task_updated'; session_id: null; event: 'created' | 'updated' | 'moved' | 'done'; task: Task }
   | { type: 'wakeup'; session_id: string }
-  | { type: 'auto_turn'; session_id: string }
+  // `triggers` names the agents whose settling started the turn (`more` counts the rest).
+  | { type: 'auto_turn'; session_id: string; triggers?: AutoTurnTrigger[]; more?: number }
   | { type: 'model_changed'; session_id: string; from_model: string; to_model: string; downgrade: boolean }
-  | { type: 'pong' };
+  | { type: 'pong' }
+  // Agent roster, per-agent transcript stream, turn queue, sidebar counts.
+  | AgentWSMessage;
 
 type MessageHandler = (msg: WSMessage) => void;
+type OpenHandler = () => void;
 
 /**
  * Outcome of a send attempt.
@@ -81,6 +94,7 @@ export interface QueuedMessage {
 export class NerveWebSocket {
   private ws: WebSocket | null = null;
   private handlers: Set<MessageHandler> = new Set();
+  private openHandlers: Set<OpenHandler> = new Set();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
@@ -119,6 +133,15 @@ export class NerveWebSocket {
       }
       this._connected = true;
       this.startPing();
+      // Before the queued frames: a handler re-binds the session (and its
+      // agent subscriptions) so the queued messages land on the right view.
+      this.openHandlers.forEach((h) => {
+        try {
+          h();
+        } catch (e) {
+          console.error('WS open handler failed:', e);
+        }
+      });
       this.flushPending();
     };
 
@@ -193,10 +216,15 @@ export class NerveWebSocket {
     return 'dropped';
   }
 
-  sendMessage(content: string, sessionId: string, fileIds?: string[]): SendStatus {
+  sendMessage(content: string, sessionId: string, fileIds?: string[], clientMsgId?: string): SendStatus {
     const msg: Record<string, unknown> = { type: 'message', content, session_id: sessionId };
     if (fileIds && fileIds.length > 0) {
       msg.file_ids = fileIds;
+    }
+    // Lets the server dedupe a retried send and tell this tab when its queued
+    // message starts or is cancelled (queue_update.removed).
+    if (clientMsgId) {
+      msg.client_msg_id = clientMsgId;
     }
     // No model field: the server resolves the session row's model each
     // turn (sessions.model, set at creation or via PATCH), so the pick is
@@ -210,6 +238,19 @@ export class NerveWebSocket {
 
   stopSession(sessionId: string) {
     this.send({ type: 'stop', session_id: sessionId });
+  }
+
+  /**
+   * Stream one agent's transcript items to this socket (`agent_event`). Sent
+   * only on an open socket, never queued: a subscription dies with its socket,
+   * and the `onOpen` handlers subscribe again after a reconnect.
+   */
+  subscribeAgent(sessionId: string, agentId: string): SendStatus {
+    return this.sendIfOpen({ type: 'agent_subscribe', session_id: sessionId, agent_id: agentId });
+  }
+
+  unsubscribeAgent(sessionId: string, agentId: string): SendStatus {
+    return this.sendIfOpen({ type: 'agent_unsubscribe', session_id: sessionId, agent_id: agentId });
   }
 
   forkSession(sessionId: string, atMessageId?: string, title?: string) {
@@ -230,6 +271,18 @@ export class NerveWebSocket {
   }
 
   /**
+   * Run `handler` whenever a socket opens (the first connect and every
+   * reconnect), after the socket counts as connected and before the queued
+   * frames flush. Returns the function that removes it.
+   */
+  onOpen(handler: OpenHandler): () => void {
+    this.openHandlers.add(handler);
+    return () => {
+      this.openHandlers.delete(handler);
+    };
+  }
+
+  /**
    * Remove the chat messages from the queue and return them, so that their
    * text can go back into the drafts. Other queued frames stay.
    */
@@ -246,6 +299,14 @@ export class NerveWebSocket {
     }
     this._pending = rest;
     return messages;
+  }
+
+  /** Send on an open socket; anything else drops the frame (no queueing). */
+  private sendIfOpen(data: Record<string, unknown>): SendStatus {
+    if (isHosted() && !hostedSessionActive()) return 'dropped';
+    if (this.ws?.readyState !== WebSocket.OPEN) return 'dropped';
+    this.ws.send(JSON.stringify(data));
+    return 'sent';
   }
 
   private startPing() {

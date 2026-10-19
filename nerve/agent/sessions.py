@@ -17,7 +17,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable, Literal
 
 from nerve.db import Database
 from nerve.identity import (
@@ -61,6 +61,24 @@ class SessionStatus(StrEnum):
     ERROR = "error"
 
 
+# Why a session's runtime client went away (``remove_client``). The agent
+# registry maps it to the end reason of the agents that ran on the client.
+ClientGoneReason = Literal[
+    "process_exit", "process_ended", "model_switch", "force_stop", "archived",
+    "deleted", "hung_runtime", "idle_reap", "gateway_restart",
+]
+# What ``interrupt_turn`` did.
+InterruptOutcome = Literal["stopped", "not_running", "not_stopped", "killed"]
+
+# The reason an archive refuses a session whose agents still run.
+BUSY_AGENTS_REASON = "background agents running"
+
+
+class SessionBusyError(RuntimeError):
+    """The session cannot be archived now: background agents still run in
+    it (archiving would stop them). Pass ``force=True`` to archive anyway."""
+
+
 class SessionManager:
     """Manages agent sessions with full lifecycle tracking.
 
@@ -73,6 +91,15 @@ class SessionManager:
     - Automatic archival and cleanup
     - Orphan recovery on startup
     """
+
+    # Called as ``on_client_removed(session_id, reason)`` when
+    # ``remove_client`` actually removed a client (the engine wires the agent
+    # registry's ``on_client_gone``: agents die with their runtime). Never
+    # raises into the caller. Class-level defaults for ``__new__`` doubles.
+    on_client_removed: Callable[[str, str], None] | None = None
+    # ``has_live_agents(session_id)``: background agents still run in the
+    # session (the archive guard). Wired to the agent registry.
+    has_live_agents: Callable[[str], bool] | None = None
 
     def __init__(
         self,
@@ -97,6 +124,10 @@ class SessionManager:
         self._last_activity: dict[str, float] = {}
         # Running task tracking
         self._running_tasks: dict[str, asyncio.Task] = {}
+        # The task that runs the session's current orchestrator turn: a
+        # framed autonomous drain (and, later, run() once it holds the run
+        # lock). It is the Stop target; a registered task is the fallback.
+        self._turn_tasks: dict[str, asyncio.Task] = {}
         self._running_sessions: set[str] = set()
         # Stop-requested flag: set when /stop arrives before the SDK client
         # is registered.  _run_inner() checks this after creating the client.
@@ -390,11 +421,44 @@ class SessionManager:
         """Register an SDK client for a session."""
         self._clients[session_id] = client
 
-    def remove_client(self, session_id: str) -> Any | None:
-        """Remove and return the SDK client for a session."""
+    def remove_client(
+        self, session_id: str, *, reason: str = "process_ended",
+    ) -> Any | None:
+        """Remove and return the SDK client for a session.
+
+        Every runtime teardown passes through here, so this is where the
+        agents that ran on the client are reconciled: when a client was
+        actually removed, ``on_client_removed(session_id, reason)`` runs (the
+        agent registry marks the session's live agents interrupted with the
+        reason's end reason). Its failures are logged, never raised.
+        """
         self._client_locks.pop(session_id, None)
         self._last_activity.pop(session_id, None)
-        return self._clients.pop(session_id, None)
+        client = self._clients.pop(session_id, None)
+        if client is not None:
+            self._notify_client_removed(session_id, reason)
+        return client
+
+    def _notify_client_removed(self, session_id: str, reason: str) -> None:
+        hook = self.on_client_removed
+        if hook is None:
+            return
+        try:
+            hook(session_id, reason)
+        except Exception:  # noqa: BLE001 — a teardown hook never breaks teardown
+            logger.exception(
+                "client-removed hook failed for %s (%s)", session_id, reason,
+            )
+
+    def _agents_live(self, session_id: str) -> bool:
+        check = self.has_live_agents
+        if check is None:
+            return False
+        try:
+            return bool(check(session_id))
+        except Exception:  # noqa: BLE001
+            logger.exception("live-agents check failed for %s", session_id)
+            return False
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create a per-session lock for client creation."""
@@ -467,10 +531,47 @@ class SessionManager:
         """Check if a session has a running agent task."""
         return session_id in self._running_sessions
 
+    def set_turn_task(self, session_id: str, task: asyncio.Task | None) -> None:
+        """Record the task that runs the session's current turn.
+
+        ``None`` clears it. Only a turn sets it: ``run()`` once it holds the
+        run lock, and an autonomous drain once it framed a real main-chain
+        turn (never one that only ingests sub-agent traffic), so Stop reaches
+        the turn rather than a queued message.
+        """
+        if task is None:
+            self._turn_tasks.pop(session_id, None)
+        else:
+            self._turn_tasks[session_id] = task
+
+    def clear_turn_task(self, session_id: str, task: asyncio.Task | None) -> None:
+        """Clear the turn task if it is still ``task`` (identity-checked, so a
+        later turn's registration survives an earlier one finishing)."""
+        if self._turn_tasks.get(session_id) is task:
+            self._turn_tasks.pop(session_id, None)
+
+    def turn_task(self, session_id: str) -> asyncio.Task | None:
+        """The live turn task of the session, or ``None`` (missing or done)."""
+        task = self._turn_tasks.get(session_id)
+        if task is None or task.done():
+            return None
+        return task
+
+    def registered_task(self, session_id: str) -> asyncio.Task | None:
+        """The live task registered with :meth:`register_task`, or ``None``."""
+        task = self._running_tasks.get(session_id)
+        if task is None or task.done():
+            return None
+        return task
+
     def has_running_work(self, session_id: str) -> bool:
         """True while a turn of the session runs or its registered task lives."""
         task = self._running_tasks.get(session_id)
-        return self.is_running(session_id) or (task is not None and not task.done())
+        return (
+            self.is_running(session_id)
+            or self.turn_task(session_id) is not None
+            or (task is not None and not task.done())
+        )
 
     def get_running_ids(self) -> set[str]:
         """Return the set of currently running session IDs."""
@@ -488,57 +589,86 @@ class SessionManager:
         except KeyError:
             return False
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop the current turn of a running session.
+    async def interrupt_turn(
+        self, session_id: str, *, allow_hard_cancel: bool, lock_held: bool,
+        wait_s: float = 5.0,
+    ) -> InterruptOutcome:
+        """Stop the session's current turn, and only the turn.
 
-        Sends SDK interrupt first — this gracefully ends the current turn
-        while keeping the client alive for the next message.  Falls back
-        to asyncio task cancellation (which disconnects the client) only
-        if the interrupt doesn't complete within a timeout.
+        * With no turn task, no interrupt is sent (without the CLI's per-task
+          stop affordance an interrupt would end every background agent): a
+          legacy-registered task that has not reached the run lock yet
+          (``lock_held`` False: a workflow or plan task before its run, never
+          a run queued behind the lock) is cancelled; a session that is
+          running but has no turn task yet gets the deferred-stop flag;
+          otherwise ``"not_running"``.
+        * With a turn task, the client is interrupted and the task gets
+          ``wait_s`` seconds to end (``"stopped"``). When it does not end (or
+          there was nothing to interrupt), ``allow_hard_cancel`` cancels it
+          (``"killed"``; its cancel path discards the client), otherwise
+          ``"not_stopped"`` (the caller offers a force stop). The interrupt
+          itself counts against ``wait_s``: a wedged runtime that never
+          answers it (the SDK would wait a minute) gets the same answer in
+          time.
         """
+        task = self.turn_task(session_id)
+        if task is None:
+            legacy = self._running_tasks.get(session_id)
+            if legacy is not None and not legacy.done() and not lock_held:
+                legacy.cancel()
+                logger.info("Cancelled the pre-lock task of session %s", session_id)
+                return "stopped"
+            if self.is_running(session_id):
+                self.request_stop(session_id)
+                logger.info("Deferred stop requested for session %s", session_id)
+                return "stopped"
+            return "not_running"
+
         client = self._clients.get(session_id)
         interrupted = False
-        if client:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        if client is not None:
             try:
-                await client.interrupt()
+                await asyncio.wait_for(client.interrupt(), timeout=wait_s)
                 interrupted = True
-                logger.info("Interrupted SDK client for session %s", session_id)
-            except Exception as e:
+                logger.info("Interrupted the turn of session %s", session_id)
+            except asyncio.TimeoutError:
                 logger.warning(
-                    "SDK interrupt failed for %s: %s",
-                    session_id, e,
+                    "Interrupt of session %s got no answer in %.0fs", session_id, wait_s,
                 )
-
-        task = self._running_tasks.get(session_id)
-        if task and not task.done():
-            if interrupted:
-                # Give interrupt time to complete the turn gracefully.
-                # When it works, receive_response() yields a ResultMessage,
-                # _run_inner exits via the normal path, and the client
-                # stays alive for the next message.
-                done, _ = await asyncio.wait({task}, timeout=5.0)
-                if done:
-                    logger.info(
-                        "Session %s stopped gracefully via interrupt",
-                        session_id,
-                    )
-                    return True
-
-            # Interrupt failed or timed out — force cancel.
-            # The CancelledError handler in _run_inner disconnects the
-            # client since its state is inconsistent.
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Interrupt failed for %s: %s", session_id, e)
+        if interrupted:
+            # When the interrupt works the runtime ends the turn, its task
+            # exits through the normal path and the client stays alive.
+            done, _ = await asyncio.wait(
+                {task}, timeout=max(0.0, deadline - loop.time()),
+            )
+            if done:
+                logger.info("Session %s stopped gracefully via interrupt", session_id)
+                return "stopped"
+        if allow_hard_cancel:
+            # The CancelledError path of the turn discards the client: its
+            # state is inconsistent after a cancel mid-turn.
             task.cancel()
-            logger.info("Cancelled task for session %s (interrupt timed out)", session_id)
-            return True
+            logger.info("Cancelled the turn of session %s (interrupt did not end it)", session_id)
+            return "killed"
+        logger.info(
+            "Turn of session %s did not stop after %.0fs; not cancelling it "
+            "(background agents would die with the runtime)", session_id, wait_s,
+        )
+        return "not_stopped"
 
-        # Session is running but client/task not registered yet — set a
-        # deferred stop flag that _run_inner() will check after client init.
-        if self.is_running(session_id):
-            self.request_stop(session_id)
-            logger.info("Deferred stop requested for session %s", session_id)
-            return True
-
-        return client is not None  # interrupt was sent even if no task
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop the current turn of a running session (compatibility wrapper:
+        interrupt, then hard-cancel when the interrupt does not end it).
+        The engine's ``stop_turn`` is the Stop of the product; it keeps
+        background agents alive."""
+        outcome = await self.interrupt_turn(
+            session_id, allow_hard_cancel=True, lock_held=False,
+        )
+        return outcome in ("stopped", "killed")
 
     # ------------------------------------------------------------------ #
     #  Fork & resume                                                       #
@@ -789,6 +919,7 @@ class SessionManager:
         self, session_id: str, *,
         attribution: Attribution = UNATTRIBUTED,
         details: dict | None = None,
+        force: bool = False,
     ) -> bool:
         """Archive a session: memorize, disconnect client, update status.
 
@@ -797,12 +928,19 @@ class SessionManager:
         of two archives at the same time, only the one that changes the
         status is recorded. Returns ``True`` when this call archived the
         session; raises ``ValueError`` if the session does not exist.
+
+        Archiving ends the session's runtime, and with it every background
+        agent still running in it. Unless ``force``, a session with live
+        agents is refused with :class:`SessionBusyError`; with ``force`` its
+        agents end as interrupted (``archived``).
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         if session.get("status") == SessionStatus.ARCHIVED.value:
             return False
+        if not force and self._agents_live(session_id):
+            raise SessionBusyError(BUSY_AGENTS_REASON)
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -813,7 +951,11 @@ class SessionManager:
                     logger.warning("Background memorize for %s failed: %s", sid, e)
             asyncio.create_task(_memorize_bg())
 
-        client = self.remove_client(session_id)
+        client = self.remove_client(session_id, reason="archived")
+        if client is None and self._agents_live(session_id):
+            # Records still live without a runtime: nothing runs them any
+            # more, so settle them with the archive.
+            self._notify_client_removed(session_id, "archived")
         if client:
             try:
                 await client.disconnect()
@@ -858,6 +1000,7 @@ class SessionManager:
 
     async def archive_session_cascade(
         self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+        force: bool = False,
     ) -> dict:
         """Archive a session and its ENTIRE descendant subtree, bottom-up.
 
@@ -867,6 +1010,10 @@ class SessionManager:
         archived (e.g. currently running) is skipped, and its un-archived
         ancestors are left alone — never producing an archived parent over an
         active child. Fully-archivable sibling subtrees still complete.
+
+        A node whose background agents still run is skipped with the reason
+        ``"background agents running"`` unless ``force`` (archiving it ends
+        them).
 
         Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
 
@@ -897,12 +1044,18 @@ class SessionManager:
             if self.is_running(sid):
                 skipped[sid] = "session is running"
                 continue
+            if not force and self._agents_live(sid):
+                skipped[sid] = BUSY_AGENTS_REASON
+                continue
             try:
                 await self.archive_session(
                     sid, attribution=attribution,
                     details={"cascade_root": session_id} if sid != session_id else None,
+                    force=force,
                 )
                 archived.append(sid)
+            except SessionBusyError:  # agents started meanwhile
+                skipped[sid] = BUSY_AGENTS_REASON
             except Exception as e:  # keep going; sibling subtrees still complete
                 logger.warning("Cascade archive failed for %s: %s", sid, e)
                 skipped[sid] = str(e)
@@ -996,6 +1149,20 @@ class SessionManager:
         # Automatic archives are Nerve's own work.
         system = attribution_for(self.db.system_actor)
 
+        async def _archive(sid: str, reason: str) -> bool:
+            """Archive one session; a session whose background agents still
+            run is skipped (an automatic archive never ends them)."""
+            try:
+                await self.archive_session(
+                    sid, attribution=system, details={"reason": reason},
+                )
+                return True
+            except SessionBusyError:
+                logger.info(
+                    "Session cleanup: skipping %s (%s)", sid, BUSY_AGENTS_REASON,
+                )
+                return False
+
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
         # when interactive_archive_after_hours == 0, so default behavior is unchanged.
         archived_interactive = 0
@@ -1005,27 +1172,29 @@ class SessionManager:
                 icutoff, INTERACTIVE_SOURCES,
             )
             for s in interactive:
+                if self._agents_live(s["id"]):
+                    logger.info(
+                        "Session cleanup: skipping %s (%s)", s["id"], BUSY_AGENTS_REASON,
+                    )
+                    continue
                 try:
                     await self.db.expire_pending_questions_for_session(s["id"])
                 except Exception as e:
                     logger.warning(
                         "Expire pending questions failed for %s: %s", s["id"], e,
                     )
-                await self.archive_session(
-                    s["id"], attribution=system,
-                    details={"reason": "idle_interactive"},
-                )
-            archived_interactive = len(interactive)
+                if await _archive(s["id"], "idle_interactive"):
+                    archived_interactive += 1
 
         # Long backstop cutoff for everything (incl. non-interactive).
         cutoff = (now - timedelta(days=archive_after_days)).isoformat()
 
         # Archive idle/stopped sessions older than cutoff
         stale = await self.db.get_stale_sessions(cutoff)
+        archived_stale = 0
         for s in stale:
-            await self.archive_session(
-                s["id"], attribution=system, details={"reason": "stale"},
-            )
+            if await _archive(s["id"], "stale"):
+                archived_stale += 1
 
         # Enforce max session count (archive oldest beyond limit). Starred
         # sessions are off-budget: excluded from the count and never evicted,
@@ -1037,17 +1206,15 @@ class SessionManager:
                 count - max_sessions,
             )
             for s in excess:
-                await self.archive_session(
-                    s["id"], attribution=system, details={"reason": "overflow"},
-                )
-            overflow = len(excess)
+                if await _archive(s["id"], "overflow"):
+                    overflow += 1
 
         stats = {
             "archived_interactive": archived_interactive,
-            "archived_stale": len(stale),
+            "archived_stale": archived_stale,
             "archived_overflow": overflow,
         }
-        if archived_interactive or stale or overflow:
+        if archived_interactive or archived_stale or overflow:
             logger.info("Session cleanup: %s", stats)
         return stats
 

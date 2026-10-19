@@ -93,6 +93,75 @@ describe('NerveWebSocket', () => {
     expect(MockWebSocket.instances).toHaveLength(3);
   });
 
+  it('sends the client id with a message only when given', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+
+    client.sendMessage('first', 's-1234');
+    client.sendMessage('second', 's-1234', ['f1'], 'c-1');
+
+    expect(socket.send.mock.calls.map(([frame]) => JSON.parse(frame))).toEqual([
+      { type: 'message', content: 'first', session_id: 's-1234' },
+      { type: 'message', content: 'second', session_id: 's-1234', file_ids: ['f1'], client_msg_id: 'c-1' },
+    ]);
+  });
+
+  it('subscribes to an agent on an open socket and never queues the frame', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    const socket = MockWebSocket.instances[0];
+
+    expect(client.subscribeAgent('s-1234', 'ag_3f9a1c2b7d4e')).toBe('dropped');
+    socket.open();
+    expect(socket.send).not.toHaveBeenCalled();
+
+    expect(client.subscribeAgent('s-1234', 'ag_3f9a1c2b7d4e')).toBe('sent');
+    expect(client.unsubscribeAgent('s-1234', 'ag_3f9a1c2b7d4e')).toBe('sent');
+    expect(socket.send.mock.calls.map(([frame]) => JSON.parse(frame))).toEqual([
+      { type: 'agent_subscribe', session_id: 's-1234', agent_id: 'ag_3f9a1c2b7d4e' },
+      { type: 'agent_unsubscribe', session_id: 's-1234', agent_id: 'ag_3f9a1c2b7d4e' },
+    ]);
+  });
+
+  it('runs open handlers once connected and before the queued frames flush', () => {
+    const client = new NerveWebSocket();
+    const seen: boolean[] = [];
+    client.onOpen(() => {
+      seen.push(client.connected);
+      client.switchSession('s-1234');
+    });
+    client.connect();
+    expect(client.sendMessage('queued while connecting', 's-1234')).toBe('queued');
+
+    MockWebSocket.instances[0].open();
+
+    expect(seen).toEqual([true]);
+    expect(MockWebSocket.instances[0].send.mock.calls.map(([frame]) => JSON.parse(frame).type))
+      .toEqual(['switch_session', 'message']);
+  });
+
+  it('runs open handlers on every reconnect until removed, and survives one that throws', () => {
+    const client = new NerveWebSocket();
+    const opened = vi.fn();
+    client.onOpen(() => { throw new Error('boom'); });
+    const remove = client.onOpen(opened);
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    client.connect();
+    MockWebSocket.instances[0].open();
+    MockWebSocket.instances[0].closeUnexpectedly();
+    vi.advanceTimersByTime(3000);
+    MockWebSocket.instances[1].open();
+    remove();
+    MockWebSocket.instances[1].closeUnexpectedly();
+    vi.advanceTimersByTime(3000);
+    MockWebSocket.instances[2].open();
+
+    expect(opened).toHaveBeenCalledTimes(2);
+    quiet.mockRestore();
+  });
+
   it('ignores close events from a detached socket', () => {
     const client = new NerveWebSocket();
     client.connect();

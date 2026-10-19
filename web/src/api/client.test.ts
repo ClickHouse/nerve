@@ -380,3 +380,75 @@ describe('hosted requests', () => {
     expect(useHostedStore.getState().problem).toBe('unavailable');
   });
 });
+
+describe('agent routes', () => {
+  function json(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  }
+  const call = (i = 0) => ({ url: fetchMock.mock.calls[i][0] as string, init: fetchMock.mock.calls[i][1] as RequestInit });
+
+  beforeEach(() => {
+    useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
+    fetchMock.mockImplementation(async () => json({}));
+  });
+
+  it('reads the roster, one agent, its transcript pages and its output', async () => {
+    await api.getSessionAgents('s-1234');
+    await api.getAgentDetail('s-1234', 'ag_3f9a1c2b7d4e');
+    await api.getAgentTranscript('s-1234', 'ag_3f9a1c2b7d4e', {});
+    await api.getAgentTranscript('s-1234', 'ag_3f9a1c2b7d4e', { afterSeq: 40, limit: 500 });
+    await api.getAgentTranscript('s-1234', 'ag_3f9a1c2b7d4e', { beforeSeq: 201 });
+    await api.getAgentOutput('s-1234', 'ag_3f9a1c2b7d4e');
+    await api.getQueue('s-1234');
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/sessions/s-1234/agents?limit=200',
+      '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e',
+      '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e/transcript',
+      '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e/transcript?after_seq=40&limit=500',
+      '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e/transcript?before_seq=201',
+      '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e/output?tail_bytes=65536',
+      '/api/sessions/s-1234/queue',
+    ]);
+  });
+
+  it('stops an agent, the turn, all agents, or the runtime', async () => {
+    await api.stopAgent('s-1234', 'ag_3f9a1c2b7d4e');
+    await api.stopSession('s-1234', { scope: 'turn', confirm_kill_background: true });
+    await api.stopSession('s-1234', { scope: 'all', include_shells: false });
+    await api.stopSession('s-1234', { scope: 'force' });
+
+    expect(call(0)).toMatchObject({ url: '/api/sessions/s-1234/agents/ag_3f9a1c2b7d4e/stop', init: { method: 'POST', body: '{"cascade":true}' } });
+    expect([1, 2, 3].map(i => [call(i).url, call(i).init.method, JSON.parse(call(i).init.body as string)])).toEqual([
+      ['/api/sessions/s-1234/stop', 'POST', { scope: 'turn', confirm_kill_background: true }],
+      ['/api/sessions/s-1234/stop', 'POST', { scope: 'all', include_shells: false }],
+      ['/api/sessions/s-1234/stop', 'POST', { scope: 'force' }],
+    ]);
+  });
+
+  it('cancels a queued message and archives with force', async () => {
+    await api.cancelQueued('s-1234', 'q_9c1d2e3f');
+    await api.archiveSession('s-1234');
+    await api.archiveSession('s-1234', { force: true });
+
+    expect([0, 1, 2].map(i => [call(i).url, call(i).init.method])).toEqual([
+      ['/api/sessions/s-1234/queue/q_9c1d2e3f', 'DELETE'],
+      ['/api/sessions/s-1234/archive', 'POST'],
+      ['/api/sessions/s-1234/archive?force=true', 'POST'],
+    ]);
+  });
+
+  it('reads the detail code of a failed request', async () => {
+    const { apiErrorCode } = await import('./client');
+    fetchMock.mockResolvedValueOnce(json({ detail: { code: 'no_runtime', message: 'gone' } }, 409));
+
+    const failure = await api.stopAgent('s-1234', 'ag_3f9a1c2b7d4e').catch((e: unknown) => e);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect(apiErrorCode(failure)).toBe('no_runtime');
+    expect(apiErrorCode(new ApiError(404, JSON.stringify({ detail: 'Session not found' })))).toBeNull();
+    expect(apiErrorCode(new ApiError(502, 'Bad gateway'))).toBeNull();
+    expect(apiErrorCode(new TypeError('Failed to fetch'))).toBeNull();
+    expect(apiErrorCode('409: {"detail": {"code": "x"}}')).toBeNull();
+  });
+});

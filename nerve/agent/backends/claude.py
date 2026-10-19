@@ -181,17 +181,41 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
                         ),
                         description=str(tool_input.get("description", "")),
                         model=str(tool_input.get("model", "")) or None,
+                        # Set for a nested spawn (an agent's own Agent call).
+                        parent_tool_use_id=parent_id,
                     ))
             elif isinstance(block, ToolResultBlock):
                 out.append(_translate_tool_result(block, parent_id))
+
+        # A sub-agent's model call: keep its model and usage for the agent's
+        # own tokens and cost (the parent turn never sees them). Frames of
+        # one call share a message id; the registry keeps the last one.
+        usage = getattr(message, "usage", None)
+        if parent_id is not None and isinstance(usage, dict) and usage:
+            out.append(ev.SubagentUsage(
+                parent_tool_use_id=parent_id,
+                message_id=(
+                    getattr(message, "message_id", None)
+                    or getattr(message, "uuid", None)
+                ),
+                model=msg_model or None,
+                usage=dict(usage),
+            ))
 
     elif isinstance(message, UserMessage):
         parent_id = getattr(message, "parent_tool_use_id", None)
         content = getattr(message, "content", [])
         if isinstance(content, list):
-            for block in content:
-                if isinstance(block, ToolResultBlock):
-                    out.append(_translate_tool_result(block, parent_id))
+            results = [b for b in content if isinstance(b, ToolResultBlock)]
+            # The structured tool output describes the message's one tool
+            # result; with several results it cannot be attributed.
+            structured = getattr(message, "tool_use_result", None)
+            if len(results) != 1 or not isinstance(structured, dict):
+                structured = None
+            for block in results:
+                out.append(_translate_tool_result(
+                    block, parent_id, structured=structured,
+                ))
 
     elif isinstance(message, SystemMessage):
         subtype = getattr(message, "subtype", "") or ""
@@ -252,12 +276,14 @@ def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
 
 def _translate_tool_result(
     block: ToolResultBlock, parent_id: str | None,
+    *, structured: dict[str, Any] | None = None,
 ) -> ev.ToolResult:
     return ev.ToolResult(
         tool_use_id=getattr(block, "tool_use_id", None),
         content=block.content,
         is_error=bool(getattr(block, "is_error", False) or False),
         parent_tool_use_id=parent_id,
+        structured=structured,
     )
 
 
@@ -376,7 +402,14 @@ class ClaudeToolPermissions:
                 )
             )
 
-        outcome = await hub.request_interaction(tool_name, tool_input)
+        # A foreground sub-agent's question names the agent that asked.
+        agent_task_id = getattr(context, "agent_id", None)
+        if agent_task_id:
+            outcome = await hub.request_interaction(
+                tool_name, tool_input, agent_task_id=agent_task_id,
+            )
+        else:
+            outcome = await hub.request_interaction(tool_name, tool_input)
         if outcome.cancelled:
             return PermissionResultDeny(
                 message=outcome.message or "Session stopped by user.",
@@ -408,6 +441,8 @@ class ClaudeBackend:
         supports_cache_ttl=True,
         interactive_builtins=True,
         reports_context_window=False,
+        supports_task_stop=True,
+        supports_agent_transcripts=True,
     )
 
     def __init__(self, deps: Any):
@@ -477,7 +512,10 @@ class ClaudeBackend:
 
     async def create_client(self, spec: SessionSpec) -> "ClaudeClient":
         options = self._build_options(spec)
-        client = ClaudeClient(spec, options)
+        client = ClaudeClient(
+            spec, options,
+            subagents=getattr(self.config.agent, "subagents", None),
+        )
         await client.connect()
         return client
 
@@ -619,6 +657,13 @@ class ClaudeBackend:
             # Claude Code plugins — loaded via --plugin-dir so the CLI
             # handles OAuth, credentials, and plugin lifecycle natively.
             plugins=self._deps.claude_plugins(),
+            # Foreground and nested sub-agents' text and thinking reach Nerve
+            # too (background agents always stream everything); the engine
+            # routes all of it to the agent registry, never into the turn.
+            forward_subagent_text=bool(getattr(
+                getattr(config.agent, "subagents", None),
+                "forward_subagent_text", False,
+            )),
         )
 
     def _system_prompt_dir(self) -> Path:
@@ -1052,17 +1097,78 @@ class ClaudeBackend:
 #  Client                                                              #
 # ------------------------------------------------------------------ #
 
+def _build_transport(options: ClaudeAgentOptions, extras: dict[str, Any]) -> Any | None:
+    """The CLI transport that declares ``extras`` at the first initialize,
+    or ``None`` when the private SDK seam it needs is missing (the client
+    then runs on the SDK's default transport, without the flags: Stop asks
+    before it would end background agents rather than killing them)."""
+    try:
+        import importlib
+
+        from claude_agent_sdk.types import _configure_can_use_tool
+
+        claude_transport = importlib.import_module("nerve.agent.backends.claude_transport")
+    except ImportError as e:
+        logger.warning(
+            "claude transport seam unavailable (%s): initialize flags %s not "
+            "sent; Stop will ask before it ends background agents",
+            e, sorted(extras),
+        )
+        return None
+    try:
+        # The transport gets the configured copy so the CLI command line keeps
+        # --permission-prompt-tool stdio; the SDK client gets the original.
+        return claude_transport.NerveCLITransport(
+            prompt=claude_transport._never_yields(),
+            options=_configure_can_use_tool(options),
+            init_extras=extras,
+        )
+    except Exception as e:  # noqa: BLE001 — a moved seam must not break the session
+        logger.warning(
+            "claude transport could not be built (%s): initialize flags %s not "
+            "sent; Stop will ask before it ends background agents",
+            e, sorted(extras),
+        )
+        return None
+
+
+# The stop_task control request waits at most this long for the CLI.
+STOP_TASK_TIMEOUT = 10.0
+# The raw interrupt control request (cancel_queued) waits at most this long.
+INTERRUPT_TIMEOUT = 10.0
+
+
 class ClaudeClient(AgentClient):
     """One live Claude Code CLI subprocess for one nerve session."""
 
-    # Class-level default so test doubles built via ``__new__`` (and any
+    # Class-level defaults so test doubles built via ``__new__`` (and any
     # partially-initialized instance) read None instead of raising.
     _last_entry_uuid: str | None = None
+    _transport: Any = None
 
-    def __init__(self, spec: SessionSpec, options: ClaudeAgentOptions):
+    def __init__(
+        self, spec: SessionSpec, options: ClaudeAgentOptions, *,
+        subagents: Any = None,
+    ):
+        from nerve.config import SubagentsConfig
+
         self._spec = spec
         self._options = options
-        self._sdk = ClaudeSDKClient(options=options)
+        # Host-only initialize flags (the Python SDK has no option for them):
+        # with the per-task stop affordance an interrupt ends only the turn
+        # and spares background agents; progress summaries add a one-line
+        # status per running agent to task_progress.
+        sub = subagents or SubagentsConfig()
+        extras: dict[str, Any] = {}
+        if getattr(sub, "per_task_stop_affordance", False):
+            extras["perTaskStopAffordance"] = True
+        if getattr(sub, "progress_summaries", False):
+            extras["agentProgressSummaries"] = True
+        self._transport = _build_transport(options, extras) if extras else None
+        # The ORIGINAL options: the SDK applies _configure_can_use_tool itself
+        # at connect, and a pre-configured copy would set both can_use_tool and
+        # permission_prompt_tool_name (a ValueError there).
+        self._sdk = ClaudeSDKClient(options=options, transport=self._transport)
         self._native_session_id: str | None = spec.resume_native_id
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
@@ -1237,7 +1343,50 @@ class ClaudeClient(AgentClient):
                     event.native_turn_id = self._last_entry_uuid
         return events
 
-    async def interrupt(self) -> None:
+    @property
+    def interrupt_spares_background(self) -> bool:
+        """True only once the CLI got ``perTaskStopAffordance`` at its first
+        initialize: then an interrupt ends the turn and background agents
+        keep running. Nothing else proves it (the CLI sends no capability
+        string), so a client built without the patch, or whose initialize
+        frame the patch did not recognise, reports False."""
+        t = self._transport
+        return bool(
+            t is not None
+            and getattr(t, "init_patched", False)
+            and getattr(t, "init_extras", {}).get("perTaskStopAffordance")
+        )
+
+    @property
+    def supports_task_stop(self) -> bool:
+        return True
+
+    async def stop_task(self, task_id: str) -> None:
+        """Stop one background task (``stop_task`` control request). The CLI
+        then reports ``task_updated{killed}`` and maybe
+        ``task_notification{stopped}``."""
+        try:
+            await asyncio.wait_for(self._sdk.stop_task(task_id), timeout=STOP_TASK_TIMEOUT)
+        except CLIConnectionError as e:
+            raise TransportDiedError(str(e)) from e
+
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        """End the current turn. ``cancel_queued`` also cancels what the CLI
+        queued (task notifications that would wake the orchestrator); the SDK
+        cannot send that field, so it goes through the private
+        ``_send_control_request`` seam when present (pinned like
+        ``_message_stream``)."""
+        query = getattr(self._sdk, "_query", None)
+        if (
+            cancel_queued
+            and query is not None
+            and hasattr(query, "_send_control_request")
+        ):
+            await query._send_control_request(
+                {"subtype": "interrupt", "cancel_queued": True},
+                timeout=INTERRUPT_TIMEOUT,
+            )
+            return
         await self._sdk.interrupt()
 
     def is_alive(self) -> bool:

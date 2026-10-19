@@ -1578,6 +1578,68 @@ class TestAmpersandEscaping:
         assert _md_to_slack("a & b") == "a &amp; b"
 
 
+_STOPPED = {"scope": "turn", "turn": "stopped", "would_end": [], "shell_count": 0}
+
+
+class TestStopAnswersSayWhatHappened:
+    """`/nerve stop` stops the turn only (background agents keep running). A
+    runtime that cannot spare its agents is not stopped, and the answer says
+    so rather than claiming nothing ran."""
+
+    def _ch(self, result):
+        channel = _channel(allow_users=["U1"])
+        channel.router.list_conversation_sessions = AsyncMock(return_value=[
+            {"channel_key": "slack:C1:1.0", "session_id": "s1", "title": "s1"},
+        ])
+        channel.router.stop_turn = AsyncMock(return_value=result)
+        channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        return channel
+
+    async def _said(self, result) -> str:
+        channel = self._ch(result)
+        await channel._cmd_stop("C1", "U1", "slack:C1")
+        channel.router.stop_turn.assert_awaited_once_with("s1")
+        return channel._web.chat_postEphemeral.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_turn(self):
+        assert await self._said(_STOPPED) == "Stopped `s1` in the thread."
+        assert await self._said({**_STOPPED, "turn": "killed"}) == "Stopped `s1` in the thread."
+
+    @pytest.mark.asyncio
+    async def test_nothing_ran(self):
+        said = await self._said({**_STOPPED, "turn": "not_running"})
+        assert said == "`s1` was not running."
+
+    @pytest.mark.asyncio
+    async def test_a_runtime_that_cannot_spare_its_agents(self):
+        brief = {"id": "ag_000000000001", "label": "build-api", "kind": "agent",
+                 "status": "running", "started_at": None, "tokens": 0}
+        said = await self._said({**_STOPPED, "turn": "needs_confirmation", "would_end": [brief, brief]})
+        assert "Couldn't stop `s1`" in said and "2 background agents" in said
+        assert "not running" not in said
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_did_not_stop(self):
+        said = await self._said({**_STOPPED, "turn": "not_stopped"})
+        assert "didn't stop within 5 s" in said and "Force stop" in said
+
+    @pytest.mark.asyncio
+    async def test_the_picker_button_answers_the_same_way(self):
+        channel = self._ch({**_STOPPED, "turn": "needs_confirmation", "would_end": [{"id": "ag_1"}]})
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
+        })
+        channel.router.stop_turn.assert_awaited_once_with("s2")
+        said = channel._replace_via_url.await_args.args[1]
+        assert "Couldn't stop `s2`" in said and "1 background agent." in said
+
+
 class TestSlashCommandsAreThreadBlind:
     """Slack refuses `/nerve` inside a thread — it answers "not supported in
     threads" — so a command never carries thread context and must resolve
@@ -1587,7 +1649,7 @@ class TestSlashCommandsAreThreadBlind:
     def _ch(self, sessions, **kw):
         channel = _channel(allow_users=["U1"], **kw)
         channel.router.list_conversation_sessions = AsyncMock(return_value=sessions)
-        channel.router.stop_session = AsyncMock(return_value=True)
+        channel.router.stop_turn = AsyncMock(return_value=_STOPPED)
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         return channel
 
@@ -1602,7 +1664,7 @@ class TestSlashCommandsAreThreadBlind:
         # beside it is busy, and stop used to report "No active session".
         channel = self._ch([self._row("s1", thread="1.0")])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_awaited_once_with("s1")
+        channel.router.stop_turn.assert_awaited_once_with("s1")
         said = channel._web.chat_postEphemeral.await_args.kwargs["text"]
         assert "s1" in said and "thread" in said
 
@@ -1610,7 +1672,7 @@ class TestSlashCommandsAreThreadBlind:
     async def test_nothing_live_says_so_plainly(self):
         channel = self._ch([])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         assert (
             "No active session"
             in channel._web.chat_postEphemeral.await_args.kwargs["text"]
@@ -1626,7 +1688,7 @@ class TestSlashCommandsAreThreadBlind:
             ]
         )
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         blocks = channel._web.chat_postEphemeral.await_args.kwargs["blocks"]
         action_ids = [
             e["action_id"]
@@ -1649,7 +1711,7 @@ class TestSlashCommandsAreThreadBlind:
                 "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
             }
         )
-        channel.router.stop_session.assert_awaited_once_with("s2")
+        channel.router.stop_turn.assert_awaited_once_with("s2")
 
     @pytest.mark.asyncio
     async def test_a_press_from_an_unauthorized_sender_is_refused(self):
@@ -1665,7 +1727,7 @@ class TestSlashCommandsAreThreadBlind:
                 "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
             }
         )
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_press_with_no_conversation_is_refused(self):
@@ -1689,7 +1751,7 @@ class TestSlashCommandsAreThreadBlind:
                     "actions": [{"action_id": action_id, "value": value}],
                 }
             )
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         channel.router.set_session_starred.assert_not_called()
         channel._notification_service.answer_delivered_notification\
             .assert_not_awaited()
@@ -1879,10 +1941,10 @@ class TestCommandExposure:
     @pytest.mark.asyncio
     async def test_a_disabled_command_is_refused_not_run(self):
         channel = self._ch(commands=["reply"])
-        channel.router.stop_session = AsyncMock()
+        channel.router.stop_turn = AsyncMock()
         said = await self._run(channel, "stop")
         assert "turned off" in said
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restart_is_refused_by_default(self):

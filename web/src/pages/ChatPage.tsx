@@ -11,7 +11,10 @@ import { ContextBar } from '../components/Chat/ContextBar';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
-import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
+import { AgentDock } from '../components/Chat/agents/AgentDock';
+import { ForceStopDialog } from '../components/Chat/agents/ForceStopDialog';
+import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
+import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
 import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
@@ -170,6 +173,13 @@ export function ChatPage() {
       description: 'Toggle side panel',
       section: 'chat',
       action: () => useChatStore.getState().togglePanel(),
+    },
+    {
+      id: 'chat-toggle-agents',
+      combo: { mod: true, shift: true, key: 'e' },
+      description: 'Toggle the agents panel',
+      section: 'chat',
+      action: () => useChatStore.getState().toggleAgentsPanel(),
     },
     {
       id: 'chat-toggle-sidebar',
@@ -435,11 +445,6 @@ export function ChatPage() {
               })()}
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <BackgroundJobs
-                sessions={sessions}
-                activeSession={activeSession}
-                onSelect={switchSession}
-              />
               {canForkSession && (
                 <Button
                   variant="subtle"
@@ -540,17 +545,25 @@ export function ChatPage() {
           <InteractiveQuestionCard />
           <ApprovalCard />
 
-          {/* The composer stays typeable while a turn runs so a reply is never
-              lost mid-stream. `isStreaming` still swaps Send↔Stop and blocks
-              sending (canSend), so the text is just held as the session's draft
-              until the turn ends — a turn in progress is not a reason to block
-              typing, hence no `disabled`. */}
+          {/* What a Stop could not do alone (force, or confirm stopping agents). */}
+          <StopEscalationBanner />
+          {/* The session's agents in one line; opens the Agents panel. */}
+          <AgentDock sessionId={activeSession} />
+
+          {/* The composer always sends: while a turn runs, `isStreaming` swaps
+              Send for Queue next to the split Stop, and a message sent then
+              waits in the server's queue and runs next. Agents running in the
+              background never put it in that state. */}
           <ChatInput
             onSend={sendMessage}
             onStop={stopSession}
             isStreaming={isStreaming}
             seed={suggestedMessage}
           />
+
+          {/* Portals: the stop confirmations. */}
+          <StopAllDialog />
+          <ForceStopDialog />
         </div>
 
         {/* Side panel — sub-agents, plans, files, etc. (always render when tabs exist for animation) */}

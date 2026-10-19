@@ -105,8 +105,10 @@ def _close_code(socket, *, within: float = 5.0) -> int:
 def test_disabling_an_account_closes_only_its_sockets(instance):
     with _connect(instance, instance.bob_id) as bob, \
             _connect(instance, instance.owner_id) as owner:
-        assert bob.receive_json()["type"] == "session_switched"
-        assert owner.receive_json()["type"] == "session_switched"
+        for socket in (bob, owner):
+            assert socket.receive_json()["type"] == "session_switched"
+            # Every bind sends the session's status (the agent roster with it).
+            assert socket.receive_json()["type"] == "session_status"
 
         token = create_session_token(_SECRET, instance.owner_id)
         response = instance.client.post(

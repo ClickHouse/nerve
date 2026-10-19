@@ -45,4 +45,6 @@ ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("session_wakeups", "caused_by_actor_id"),
     ("cron_logs", "actor_id"),
     ("cron_logs", "caused_by_actor_id"),
+    ("session_agents", "stopped_by_actor_id"),
+    ("session_agents", "stopped_caused_by_actor_id"),
 )

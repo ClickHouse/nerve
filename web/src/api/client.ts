@@ -2,6 +2,10 @@ import {
   ApiError, csrfHeaders, handleHostedError, isHosted, setTokenReader,
   type AuthMode,
 } from './hosted';
+import type {
+  AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
+  StopAgentResponse, StopAllResult, StopTurnResult,
+} from '../types/agents';
 
 const API_BASE = '/api';
 
@@ -909,6 +913,49 @@ async function request<T>(path: string, options: RequestInit = {}, authenticate 
 }
 
 /**
+ * The machine-readable code of a failed request: `detail.code` of a body like
+ * `{"detail": {"code": "no_runtime", "message": "..."}}`, read from the
+ * `"<status>: <body>"` message every `ApiError` carries. Null for any other
+ * error or body (a string `detail`, a gateway error, a network failure).
+ */
+export function apiErrorCode(e: unknown): string | null {
+  const code = apiErrorDetail(e)?.code;
+  return typeof code === 'string' ? code : null;
+}
+
+/**
+ * The `detail` object of an `ApiError` (message `"<status>: <body>"`) whose
+ * body is `{"detail": {...}}`, or null.
+ */
+export function apiErrorDetail(e: unknown): Record<string, unknown> | null {
+  if (!(e instanceof Error)) return null;
+  const raw = e.message;
+  const colon = raw.indexOf(':');
+  if (colon < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw.slice(colon + 1).trim());
+    if (!parsed || typeof parsed !== 'object' || !('detail' in parsed)) return null;
+    const detail: unknown = parsed.detail;
+    return detail && typeof detail === 'object' ? detail as Record<string, unknown> : null;
+  } catch {
+    return null; // not a JSON body
+  }
+}
+
+/** The body of `POST /api/sessions/{id}/stop`, one shape per scope. */
+export type StopSessionBody =
+  | { scope: 'turn'; confirm_kill_background?: boolean }
+  | { scope: 'all'; include_shells?: boolean }
+  | { scope: 'force' };
+
+/** Which session ids an archive took, and which it left (and why). */
+export interface ArchiveSessionResult {
+  archived: boolean;
+  archived_ids: string[];
+  skipped: { id: string; reason: string }[];
+}
+
+/**
  * `GET /health` — not under `/api`, unauthenticated, and deliberately a raw
  * `fetch`: during a restart it answers with connection errors and 5xx, and
  * none of those may reach the 401 handler or the hosted re-entry path.
@@ -1239,14 +1286,64 @@ export const api = {
     }),
   resumeSession: (id: string) =>
     request<any>(`/sessions/${id}/resume`, { method: 'POST' }),
-  archiveSession: (id: string) =>
-    request<any>(`/sessions/${id}/archive`, { method: 'POST' }),
+  /** `force` archives even while agents run in the session (they are stopped). */
+  archiveSession: (id: string, opts?: { force?: boolean }) =>
+    request<ArchiveSessionResult>(
+      `/sessions/${id}/archive${opts?.force ? '?force=true' : ''}`, { method: 'POST' },
+    ),
   unarchiveSession: (id: string) =>
     request<any>(`/sessions/${id}/unarchive`, { method: 'POST' }),
   getSessionStatus: (id: string) =>
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+
+  // Agents — the subagent / background-task records of one session, their
+  // transcripts and output, scoped stops, and the server-visible turn queue.
+  getSessionAgents: (sessionId: string, limit = 200) =>
+    request<AgentSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/agents?limit=${limit}`),
+  getAgentDetail: (sessionId: string, agentId: string) =>
+    request<AgentDetail>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}`,
+    ),
+  /** At most one cursor; none returns the tail. Items are always ascending. */
+  getAgentTranscript: (
+    sessionId: string, agentId: string,
+    o: { beforeSeq?: number; afterSeq?: number; limit?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (o.beforeSeq !== undefined) qs.set('before_seq', String(o.beforeSeq));
+    if (o.afterSeq !== undefined) qs.set('after_seq', String(o.afterSeq));
+    if (o.limit !== undefined) qs.set('limit', String(o.limit));
+    const q = qs.toString();
+    return request<AgentTranscriptPage>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/transcript${q ? '?' + q : ''}`,
+    );
+  },
+  getAgentOutput: (sessionId: string, agentId: string, tailBytes = 65536) =>
+    request<AgentOutput>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/output?tail_bytes=${tailBytes}`,
+    ),
+  /** Stop one agent (and, with `cascade`, the agents it spawned). */
+  stopAgent: (sessionId: string, agentId: string, cascade = true) =>
+    request<StopAgentResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/stop`,
+      { method: 'POST', body: JSON.stringify({ cascade }) },
+    ),
+  /** Stop the turn, every agent, or (force) the session's runtime. */
+  stopSession: (sessionId: string, body: StopSessionBody) =>
+    request<StopTurnResult | StopAllResult | ForceStopResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/stop`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  getQueue: (sessionId: string) =>
+    request<{ items: QueueEntryView[] }>(`/sessions/${encodeURIComponent(sessionId)}/queue`),
+  /** Cancel one of the caller's queued messages; `content` is its full text. */
+  cancelQueued: (sessionId: string, queueId: string) =>
+    request<{ cancelled: true; content: string | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
+      { method: 'DELETE' },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>

@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
+from nerve.agent.agents.emitter import agent_channel
 from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
@@ -146,6 +148,24 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
 # Open sockets by client id, so that disabling an account can close its sockets.
 _live_sockets: dict[str, tuple[WebSocketConnection, WebSocket]] = {}
 
+# Runs started by WebSocket messages. The loop only keeps weak references to
+# tasks; these keep them alive until they finish (Stop finds a run through
+# the session's turn task, not through this set).
+_ws_runs: set[asyncio.Task] = set()
+
+# Agent transcript channels one socket may follow at once; subscribing to one
+# more drops the oldest.
+MAX_AGENT_SUBSCRIPTIONS = 8
+_MAX_CLIENT_MSG_ID = 128
+
+
+def _client_msg_id(raw: Any) -> str | None:
+    """The sender's message id from a WebSocket frame, or ``None``."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    return raw if raw and len(raw) <= _MAX_CLIENT_MSG_ID else None
+
 WS_ACCOUNT_DISABLED_CODE = 1008
 WS_ACCOUNT_DISABLED_REASON = "Account disabled"
 
@@ -184,20 +204,36 @@ async def close_account_sockets(account_id: str) -> None:
             logger.debug("WebSocket %s could not be closed: %s", client_id, e)
 
 
+async def _agent_snapshot(session_id: str) -> dict:
+    """The session's ``AgentSnapshot`` (an empty one when the engine cannot
+    answer: ``session_status`` always carries the key)."""
+    from nerve.agent.agents.registry import empty_snapshot
+
+    snapshot = getattr(_engine, "agent_snapshot", None)
+    if snapshot is not None:
+        try:
+            return await snapshot(session_id)
+        except Exception:  # noqa: BLE001 — a status must still go out
+            logger.warning("agent snapshot failed for %s", session_id, exc_info=True)
+    return empty_snapshot(session_id)
+
+
 async def _send_session_status(
     websocket: WebSocket,
     session_id: str,
     is_running: bool,
     session_record: dict | None,
+    *,
+    agents: dict | None = None,
 ) -> None:
     """Send a ``session_status`` event to the freshly-bound listener.
 
-    Called from the initial WS handshake (only when a turn is in flight so an
-    idle client doesn't get a no-op message) and from ``switch_session``
-    (always, to refresh client-side ``is_running``/``status``). When the
-    session is running, the accumulated stream buffer is attached so the
-    client can rebuild ``streamingBlocks``, panels, todos, and interaction
-    state without waiting for new events.
+    Sent on every bind: the initial WS handshake and ``switch_session``, so
+    the client refreshes ``is_running``/``status`` and hydrates the agent
+    roster (``agents``, the session's ``AgentSnapshot``) even when no turn
+    runs. When the session is running, the accumulated stream buffer is
+    attached so the client can rebuild ``streamingBlocks``, panels, todos,
+    and interaction state without waiting for new events.
     """
     status_msg: dict = {
         "type": "session_status",
@@ -207,6 +243,7 @@ async def _send_session_status(
     }
     if is_running:
         status_msg["buffered_events"] = broadcaster.get_buffer(session_id)
+    status_msg["agents"] = agents if agents is not None else await _agent_snapshot(session_id)
     await websocket.send_json(status_msg)
 
 
@@ -1109,6 +1146,14 @@ def create_app() -> FastAPI:
         # registration is caught by the check; one after it closes this socket.
         _live_sockets[client_id] = (connection, websocket)
         active_session: str | None = None
+        # Agent transcript channels this socket follows, oldest first.
+        agent_subs: OrderedDict[str, None] = OrderedDict()
+
+        async def _drop_agent_subs() -> None:
+            for channel in list(agent_subs):
+                await broadcaster.unregister(channel, client_id)
+            agent_subs.clear()
+
         try:
             if not await _account_enabled(connection.actor):
                 await websocket.close(
@@ -1149,17 +1194,16 @@ def create_app() -> FastAPI:
                 "session_id": active_session,
             })
 
-            # If a turn is mid-flight (page reload, transient WS drop, sticky
-            # reconnect after a network blip), replay the broadcaster buffer so
-            # the freshly-bound listener can rebuild the in-flight stream
-            # without waiting for new events. Idle sessions get nothing here;
-            # they hydrate via REST + the existing ``session_switched`` event.
-            if broadcaster.is_buffering(active_session):
-                is_running = _engine.is_session_running(active_session)
-                session_record = await _engine.db.get_session(active_session)
-                await _send_session_status(
-                    websocket, active_session, is_running, session_record,
-                )
+            # Always send the session's status: the agent roster hydrates from
+            # it even when no turn runs, and when a turn is mid-flight (page
+            # reload, transient WS drop, sticky reconnect after a network
+            # blip) it carries the broadcaster buffer so the listener can
+            # rebuild the in-flight stream without waiting for new events.
+            is_running = _engine.is_session_running(active_session)
+            session_record = await _engine.db.get_session(active_session)
+            await _send_session_status(
+                websocket, active_session, is_running, session_record,
+            )
 
             while True:
                 data = await websocket.receive_json()
@@ -1173,9 +1217,14 @@ def create_app() -> FastAPI:
                     # Optional per-message model override from the composer's
                     # model picker (Anthropic default or a local Ollama model).
                     selected_model = data.get("model") or None
+                    # The sender's id for the message: a resend after a
+                    # dropped socket runs once, and every tab matches the
+                    # queue entry and the started turn by it.
+                    client_msg_id = _client_msg_id(data.get("client_msg_id"))
 
                     if session_id != active_session:
                         # Switch sessions
+                        await _drop_agent_subs()
                         await broadcaster.unregister(active_session, client_id)
                         active_session = session_id
                         await broadcaster.register(active_session, client_id, ws_broadcast)
@@ -1201,11 +1250,15 @@ def create_app() -> FastAPI:
                         "content": user_text,
                         "blocks": image_refs or None,
                         "actor_id": connection.actor.actor_id,
+                        "client_msg_id": client_msg_id,
                     }, exclude=client_id)
 
-                    # Run agent in background, store task for stop support.
-                    # The message is this connection's person, fixed at accept
-                    # — never re-read mid-stream.
+                    # Run the agent in the background. While another turn
+                    # holds the session's run lock the run waits in the
+                    # session's queue (visible to every tab, cancellable by
+                    # its sender); it becomes the Stop target only once it
+                    # holds the lock. The message is this connection's
+                    # person, fixed at accept — never re-read mid-stream.
                     task = asyncio.create_task(
                         _engine.run(
                             session_id=session_id,
@@ -1216,9 +1269,12 @@ def create_app() -> FastAPI:
                             images=images or None,
                             image_refs=image_refs or None,
                             actor=connection.actor,
+                            client_msg_id=client_msg_id,
+                            origin="web",
                         )
                     )
-                    _engine.register_task(session_id, task)
+                    _ws_runs.add(task)
+                    task.add_done_callback(_ws_runs.discard)
 
                 elif msg_type == "stop":
                     # User wants to stop the running agent
@@ -1234,8 +1290,42 @@ def create_app() -> FastAPI:
                             "error": "No running task to stop",
                         })
 
+                elif msg_type in ("agent_subscribe", "agent_unsubscribe"):
+                    # Follow (or stop following) one agent's live transcript:
+                    # agent_event frames on its own channel.
+                    session_id = data.get("session_id") or active_session
+                    agent_id = str(data.get("agent_id") or "")
+                    channel = agent_channel(session_id, agent_id)
+                    if msg_type == "agent_unsubscribe":
+                        # Idempotent: a tab closing an agent after a switch
+                        # gets no error.
+                        if channel in agent_subs:
+                            agent_subs.pop(channel, None)
+                            await broadcaster.unregister(channel, client_id)
+                        continue
+                    found = False
+                    if session_id == active_session and agent_id:
+                        await _engine.agents.ensure_loaded(session_id)
+                        found = _engine.agents.get(session_id, agent_id) is not None
+                    if not found:
+                        await websocket.send_json({
+                            "type": "error",
+                            "session_id": session_id,
+                            "error": "agent_not_found",
+                        })
+                        continue
+                    if channel in agent_subs:
+                        agent_subs.move_to_end(channel)
+                        continue
+                    await broadcaster.register(channel, client_id, ws_broadcast)
+                    agent_subs[channel] = None
+                    while len(agent_subs) > MAX_AGENT_SUBSCRIPTIONS:
+                        oldest, _ = agent_subs.popitem(last=False)
+                        await broadcaster.unregister(oldest, client_id)
+
                 elif msg_type == "switch_session":
                     new_session = data.get("session_id", active_session)
+                    await _drop_agent_subs()
                     await broadcaster.unregister(active_session, client_id)
                     active_session = new_session
                     await broadcaster.register(active_session, client_id, ws_broadcast)
@@ -1318,6 +1408,7 @@ def create_app() -> FastAPI:
             logger.warning("WebSocket error for %s: %s", client_id, e)
         finally:
             _live_sockets.pop(client_id, None)
+            await _drop_agent_subs()
             if active_session is not None:
                 await broadcaster.unregister(active_session, client_id)
             await broadcaster.unregister("__global__", f"global:{client_id}")

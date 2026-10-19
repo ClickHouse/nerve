@@ -1,10 +1,11 @@
 import type { WSMessage } from '../../api/websocket';
-import { scheduleAutoClose } from '../helpers/blockHelpers';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
-//  Panel handlers: plan_update, subagent_start/complete, workflow    //
+//  Panel handlers: plan_update, workflow_progress                     //
 // ------------------------------------------------------------------ //
+// Subagents open no panel of their own any more: agent records drive the
+// Agents panel and the per-agent transcript tabs (agentStore).
 
 export function handlePlanUpdate(
   msg: Extract<WSMessage, { type: 'plan_update' }>,
@@ -35,68 +36,6 @@ export function handlePlanUpdate(
       blocks: [],
     });
   }
-}
-
-export function handleSubagentStart(
-  msg: Extract<WSMessage, { type: 'subagent_start' }>,
-  get: Get,
-  _set: Set,
-): void {
-  const state = get();
-  // Server-side sub-agent lifecycle event — update or create panel tab
-  const existing = state.panels.find(p => p.id === msg.tool_use_id);
-  if (existing) {
-    get().updatePanelTab(msg.tool_use_id, {
-      subagentType: msg.subagent_type,
-      label: msg.subagent_type,
-      description: msg.description,
-      model: msg.model,
-      type: msg.subagent_type === 'Plan' ? 'plan' : 'subagent',
-    });
-  } else {
-    get().openPanelTab({
-      id: msg.tool_use_id,
-      type: msg.subagent_type === 'Plan' ? 'plan' : 'subagent',
-      label: msg.subagent_type,
-      subagentType: msg.subagent_type,
-      description: msg.description,
-      model: msg.model,
-      content: null,
-      prompt: '',
-      streaming: true,
-      status: 'running',
-      startedAt: Date.now(),
-      blocks: [],
-    });
-  }
-}
-
-export function handleSubagentComplete(
-  msg: Extract<WSMessage, { type: 'subagent_complete' }>,
-  get: Get,
-  _set: Set,
-): void {
-  const state = get();
-  // Server-side sub-agent lifecycle event — mark complete
-  const tab = state.panels.find(p => p.id === msg.tool_use_id);
-  if (tab) {
-    // A background sub-agent's "complete" fires immediately when the Agent tool
-    // returns its task id — but the sub-agent keeps streaming afterward. Keep
-    // the panel running; it settles when the background task actually ends
-    // (handleBackgroundTasksUpdate). Completing here would send its later
-    // tools/thoughts into the main chat instead of this panel.
-    if (tab.background) return;
-    get().updatePanelTab(msg.tool_use_id, {
-      status: msg.is_error ? 'error' : 'complete',
-      isError: msg.is_error || false,
-      completedAt: Date.now(),
-      streaming: false,
-    });
-    if (tab.type !== 'plan') {
-      scheduleAutoClose(msg.tool_use_id, get);
-    }
-  }
-  get().pruneCompletedTabs();
 }
 
 export function handleWorkflowProgress(

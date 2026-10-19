@@ -12,7 +12,7 @@ import { TaskToolBlock } from './tools/TaskToolBlock';
 import { CCTaskToolBlock } from './tools/CCTaskToolBlock';
 import { ScheduleWakeupBlock } from './tools/ScheduleWakeupBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
-import { SubagentToolBlock } from './tools/SubagentToolBlock';
+import { AgentLine } from './agents/AgentLine';
 import { WorkflowToolBlock } from './tools/WorkflowToolBlock';
 import { QuestionBlock } from './tools/QuestionBlock';
 import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
@@ -53,11 +53,12 @@ export function ToolCallBlock({
     case 'Read':
     case 'Write':
       return <FileToolBlock block={block} />;
-    // Sub-agent spawn: Claude Code 2.1.x renamed "Task" → "Agent". Match both
-    // so old chat history keeps rendering with the sub-agent card.
+    // Sub-agent spawn: Claude Code 2.1.x renamed "Task" → "Agent". Match both.
+    // The live line of the agent record; old history without a record keeps
+    // the legacy sub-agent card.
     case 'Agent':
     case 'Task':
-      return <SubagentToolBlock block={block} />;
+      return <AgentLine block={block} />;
     // Dynamic workflow: compact card in chat; live phase/agent tree in panel.
     case 'Workflow':
       return <WorkflowToolBlock block={block} />;
