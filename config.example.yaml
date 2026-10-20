@@ -88,7 +88,7 @@ agent:
   # prune such entries). Ignored when `models` above is set, on Bedrock, or
   # without an API key. false → always use the built-in list.
   model_discovery: true
-  max_turns: 50                  # Max agentic turns per request
+  max_turns: 1000                # Max agentic turns per request; 0 = no cap
   max_concurrent: 32             # Max concurrent agent sessions
   # Keep the appended system prompt byte-identical across sessions so the
   # exact-prefix prompt cache is shared between them: the session id and the

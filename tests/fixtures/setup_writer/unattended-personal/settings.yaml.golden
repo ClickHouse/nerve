@@ -14,7 +14,7 @@ gateway:
 agent:
   model: claude-opus-5-5
   cron_model: claude-sonnet-5-5
-  max_turns: 50
+  max_turns: 1000
   max_concurrent: 32
   thinking: max
   effort: xhigh

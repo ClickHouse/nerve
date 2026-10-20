@@ -640,7 +640,9 @@ class ClaudeBackend:
         return ClaudeAgentOptions(
             model=selected_model,
             system_prompt=system_prompt,
-            max_turns=spec.max_turns,
+            # 0 (or anything non-positive) = no cap: None keeps `--max-turns`
+            # off the CLI command line, and the turn runs to completion.
+            max_turns=spec.max_turns if spec.max_turns > 0 else None,
             # No permission_mode — can_use_tool callback handles all
             # permissions. Interactive tools pause for user input;
             # everything else auto-approves.
