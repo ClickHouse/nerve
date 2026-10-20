@@ -387,9 +387,10 @@ attack surface, which matters most in **worker mode** where the agent acts on in
 content without a human in the loop.
 
 Filtering happens at the choke point in `SourceRunner` (after `source.preprocess()`,
-before persist). The source cursor still advances normally, so dropped records are not
-re-fetched on the next run. The number of dropped records is reported in the run summary
-(visible in the **Runs** tab and `nerve sync` output).
+before persist). The source cursor still advances normally. A source with an inclusive
+cursor (GitHub) can list a dropped record again on the next run, and the guardrail drops
+it again. The number of dropped records is reported in the run summary (visible in the
+**Runs** tab and `nerve sync` output).
 
 ### How it works
 
@@ -573,10 +574,15 @@ Rules a hook can rely on:
   the sync continues. A hook never fails a sync and never holds back the cursor.
 - **At least one attempt, no retry.** The hook runs after the batch is persisted and
   before the cursor advances. A batch whose persist fails is fetched again, and the hook
-  gets its drops on that run. A crash between the hook and the cursor advance runs it
-  again for the same records, so make the hook idempotent. A hook that *fails* is not
-  retried, because the cursor still advances. If every drop must be handled, spool the
-  records inside the hook and retry from there.
+  gets its drops on that run. A hook that *fails* is not retried. If every drop must be
+  handled, spool the records inside the hook and retry from there.
+- **Once per `id` + `timestamp`.** A source can list a dropped record again. GitHub
+  queries `since=<cursor>` inclusively, so the newest thread comes back on every run
+  until a newer one notifies. Nerve remembers the last 4096 `id` + `timestamp` pairs it
+  passed to the hook and does not pass them again. New activity on a thread changes its
+  `timestamp`, so that reaches the hook. This memory is in the process only. After a
+  restart, a source reload, a CLI `nerve sync`, or a crash between the hook and the
+  cursor advance, the hook can get a record again. Make the hook idempotent.
 - **Own process group.** The hook starts in a new session. On timeout, Nerve kills the
   whole process group, so a child process (a `gh` or `curl` call from a shell script)
   does not keep running. A process that leaves the group (`setsid`, a daemon) is out of

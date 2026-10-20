@@ -7,9 +7,11 @@ what the hook receives, when it runs, and that no hook failure can fail a sync.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -17,6 +19,7 @@ from nerve.config import GitHubSyncConfig, NerveConfig
 from nerve.sources import runner as runner_mod
 from nerve.sources.base import Source
 from nerve.sources.filters import FieldRule, InboxFilter
+from nerve.sources.github import GitHubSource
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.registry import build_source_runners
 from nerve.sources.runner import SourceRunner
@@ -73,6 +76,20 @@ def _batch() -> list[SourceRecord]:
         _rec("by-actor", "owner/repo", ["stranger"]),
         _rec("by-repo", "evil/repo", ["alice"]),
     ]
+
+
+def _big_batch(copies: int = 2000) -> list[SourceRecord]:
+    """``_batch()`` *copies* times, every record a distinct thread.
+
+    More than a pipe buffer of payload. The ids differ because the hook gets a
+    repeated (id, timestamp) only once.
+    """
+    records = []
+    for i in range(copies):
+        for record in _batch():
+            record.id = f"{record.id}-{i}"
+            records.append(record)
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +168,147 @@ async def test_hook_not_run_when_persist_fails(db, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A record listed again is not passed again
+# ---------------------------------------------------------------------------
+
+def _log_calls_hook(out_path, exit_code: int = 0) -> list[str]:
+    """A hook that appends one line per run to *out_path*: the ids it received."""
+    code = (
+        "import json, sys; "
+        "ids = [json.loads(l)['id'] for l in sys.stdin.read().splitlines()]; "
+        f"open({str(out_path)!r}, 'a').write(json.dumps(ids) + '\\n'); "
+        f"sys.exit({exit_code})"
+    )
+    return [sys.executable, "-c", code]
+
+
+def _calls(out_path) -> list[list[str]]:
+    if not out_path.exists():
+        return []
+    return [json.loads(line) for line in out_path.read_text().splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_record_listed_again_is_not_passed_again(db, tmp_path):
+    # An inclusive cursor lists the same records again on the next run.
+    out = tmp_path / "calls.jsonl"
+    source = _FakeSource(_batch())
+    runner = SourceRunner(
+        source=source, db=db, inbox_filter=_filter(), drop_hook=_log_calls_hook(out),
+    )
+
+    await runner.run()
+    result = await runner.run()
+
+    assert result.error is None
+    assert _calls(out) == [["by-actor", "by-repo"]]
+    assert await db.get_sync_cursor("github") == "c1"
+
+    # New activity on a thread is a new timestamp, so it reaches the hook again.
+    newer = _rec("by-actor", "owner/repo", ["stranger"])
+    newer.timestamp = "2026-01-01T00:05:00Z"
+    source._records = [newer, _rec("by-repo", "evil/repo", ["alice"])]
+    await runner.run()
+
+    assert _calls(out) == [["by-actor", "by-repo"], ["by-actor"]]
+
+
+@pytest.mark.asyncio
+async def test_failed_hook_is_not_retried_when_the_record_is_listed_again(db, tmp_path):
+    out = tmp_path / "calls.jsonl"
+    runner = SourceRunner(
+        source=_FakeSource(_batch()), db=db, inbox_filter=_filter(),
+        drop_hook=_log_calls_hook(out, exit_code=3),
+    )
+
+    await runner.run()
+    await runner.run()
+
+    assert _calls(out) == [["by-actor", "by-repo"]]
+
+
+@pytest.mark.asyncio
+async def test_record_repeated_in_one_batch_is_passed_once(db, tmp_path):
+    out = tmp_path / "calls.jsonl"
+    stranger = _rec("by-actor", "owner/repo", ["stranger"])
+    runner = SourceRunner(
+        source=_FakeSource([stranger, stranger]), db=db, inbox_filter=_filter(),
+        drop_hook=_log_calls_hook(out),
+    )
+
+    await runner.run()
+
+    assert _calls(out) == [["by-actor"]]
+
+
+@pytest.mark.asyncio
+async def test_remembered_drops_are_bounded_oldest_first(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_mod, "_DROP_HOOK_SEEN_MAX", 1)
+    out = tmp_path / "calls.jsonl"
+    runner = SourceRunner(
+        source=_FakeSource(_batch()), db=db, inbox_filter=_filter(),
+        drop_hook=_log_calls_hook(out),
+    )
+
+    await runner.run()
+    await runner.run()
+
+    # Only the newest pair is kept, so the older drop is passed once more.
+    assert len(runner._drop_hook_seen) == 1
+    assert _calls(out) == [["by-actor", "by-repo"], ["by-actor"]]
+
+
+@pytest.mark.asyncio
+async def test_github_thread_listed_again_by_the_inclusive_cursor_reaches_the_hook_once(
+    db, tmp_path, monkeypatch,
+):
+    # GitHub's `since` is the cursor itself, so the thread in the cursor's second
+    # is listed again on every run until a newer one notifies.
+    thread = {
+        "id": "77",
+        "reason": "mention",
+        "unread": True,
+        "updated_at": "2026-01-02T10:00:00Z",
+        "subject": {"title": "Hello", "type": "Issue", "url": None},
+        "repository": {"full_name": "evil/repo", "html_url": "https://github.com/evil/repo"},
+    }
+
+    class _FakeGh:
+        returncode = 0
+
+        async def communicate(self, *_):
+            return json.dumps(thread).encode() + b"\n", b""
+
+    real_exec = asyncio.create_subprocess_exec
+    sinces: list[str] = []
+
+    async def fake_exec(*argv, **kwargs):
+        if argv[0] != "gh":  # the drop hook
+            return await real_exec(*argv, **kwargs)
+        sinces.append(parse_qs(urlsplit(argv[2]).query)["since"][0])
+        return _FakeGh()
+
+    monkeypatch.setattr("nerve.sources.github.asyncio.create_subprocess_exec", fake_exec)
+    source = GitHubSource()
+
+    async def no_enrich(notif, sem):
+        return {}
+
+    monkeypatch.setattr(source, "_enrich_notification", no_enrich)
+
+    out = tmp_path / "calls.jsonl"
+    runner = SourceRunner(
+        source=source, db=db, inbox_filter=_filter(), drop_hook=_log_calls_hook(out),
+    )
+
+    await runner.run()
+    await runner.run()
+
+    assert sinces[1] == "2026-01-02T10:00:00Z"
+    assert _calls(out) == [["77"]]
+
+
+# ---------------------------------------------------------------------------
 # A hook can never fail the sync
 # ---------------------------------------------------------------------------
 
@@ -194,7 +352,7 @@ async def test_hook_that_ignores_stdin_is_fine(db, caplog):
     # Exits at once without reading: writing the payload must not break.
     hook = [sys.executable, "-c", "pass"]
     runner = SourceRunner(
-        source=_FakeSource(_batch() * 2000), db=db, inbox_filter=_filter(), drop_hook=hook,
+        source=_FakeSource(_big_batch()), db=db, inbox_filter=_filter(), drop_hook=hook,
     )
 
     result = await runner.run()
@@ -275,7 +433,7 @@ async def test_timeout_kills_a_child_holding_stdin_after_the_hook_exited(
     # More than a pipe buffer of payload: the write blocks on the child, which
     # inherited stdin, long after the hook itself exited 0.
     result, elapsed, child = await _run_spawning_hook(
-        db, tmp_path, monkeypatch, "exit", _batch() * 2000,
+        db, tmp_path, monkeypatch, "exit", _big_batch(),
     )
 
     assert elapsed < 5

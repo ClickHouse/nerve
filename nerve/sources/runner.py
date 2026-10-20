@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
@@ -112,6 +113,12 @@ _DROP_HOOK_REAP_SECS = 5
 
 # Tail of a drop hook's stderr kept in the log line.
 _DROP_HOOK_STDERR_CHARS = 500
+
+# (id, timestamp) pairs of dropped records the hook already received, kept per
+# runner so that a record listed again is not passed again. A source with an
+# inclusive cursor (GitHub) lists the records in the cursor's own second on
+# every run until a newer one arrives. The oldest pairs are forgotten first.
+_DROP_HOOK_SEEN_MAX = 4096
 
 # Batches one run drains before leaving the rest for the next tick. Bounds a
 # very deep backlog, and a source whose has_more never goes false.
@@ -215,6 +222,7 @@ class SourceRunner:
         self.ttl_days = ttl_days
         self.inbox_filter = inbox_filter
         self.drop_hook = self._valid_drop_hook(drop_hook)
+        self._drop_hook_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.schedule = schedule
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
@@ -376,7 +384,8 @@ class SourceRunner:
         # 1b. Guardrail: drop records that don't pass the inbox filter. This is
         # the choke point — dropped records are never persisted, so the agent
         # can never see them (worker-mode safety). The cursor still advances
-        # below, so dropped records are not re-fetched.
+        # below. A source with an inclusive cursor can list a dropped record
+        # again; the drop hook skips one it already received (step 3b).
         dropped: list[SourceRecord] = []
         if self.inbox_filter is not None and self.inbox_filter.active:
             kept, dropped = self.inbox_filter.partition(records)
@@ -434,13 +443,23 @@ class SourceRunner:
         # re-fetches the batch and the hook sees its drops then. Before the
         # cursor advances, so a crash in between runs the hook again rather
         # than never: at-least-once, which is why a hook must be idempotent.
+        # A record the hook already received is not passed again, whether or
+        # not that attempt succeeded: no retry.
         if dropped and self.drop_hook:
-            try:
-                await self._run_drop_hook(dropped)
-            except Exception:  # noqa: BLE001 — a hook must never hold back the cursor
-                logger.warning(
-                    "Source %s: drop hook failed", self.source.source_name, exc_info=True,
+            unseen = self._unseen_drops(dropped)
+            if len(unseen) < len(dropped):
+                logger.debug(
+                    "Source %s: %d dropped record(s) already passed to the drop hook",
+                    self.source.source_name, len(dropped) - len(unseen),
                 )
+            if unseen:
+                try:
+                    await self._run_drop_hook(unseen)
+                except Exception:  # noqa: BLE001 — a hook must never hold back the cursor
+                    logger.warning(
+                        "Source %s: drop hook failed", self.source.source_name, exc_info=True,
+                    )
+                self._remember_drops(unseen)
 
         # 4. Advance source cursor (ingestion complete)
         if result.next_cursor is not None:
@@ -491,6 +510,26 @@ class SourceRunner:
             )
             return []
         return list(drop_hook)
+
+    def _unseen_drops(self, dropped: list[SourceRecord]) -> list[SourceRecord]:
+        """The dropped records the hook has not received, once per (id, timestamp).
+
+        For GitHub, ``id`` is the thread and ``timestamp`` its ``updated_at``, so
+        new activity on a thread is a new pair and reaches the hook again.
+        """
+        unseen: dict[tuple[str, str], SourceRecord] = {}
+        for record in dropped:
+            key = (record.id, record.timestamp)
+            if key not in self._drop_hook_seen:
+                unseen[key] = record
+        return list(unseen.values())
+
+    def _remember_drops(self, delivered: list[SourceRecord]) -> None:
+        """Record what the hook received. Bounded: the oldest pairs go first."""
+        for record in delivered:
+            self._drop_hook_seen[(record.id, record.timestamp)] = None
+        while len(self._drop_hook_seen) > _DROP_HOOK_SEEN_MAX:
+            self._drop_hook_seen.popitem(last=False)
 
     @staticmethod
     def _drop_hook_payload(
