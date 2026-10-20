@@ -184,7 +184,7 @@ keep", never read back.
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
 | **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
-| **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
+| **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
 | **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
@@ -212,7 +212,13 @@ A few things worth knowing per step:
   offered only when the server actually has one; on a Mac, opening the Model
   step may show a Keychain prompt **on the server's screen** once — Deny keeps
   the option hidden. Choosing it copies that credential into
-  `config.local.yaml`, exactly as the terminal wizard does.
+  `config.local.yaml`, exactly as the terminal wizard does. The model you
+  pick — or confirm with Continue after saving a credential, the preselected
+  default included — also becomes `agent.cron_model`, so scheduled jobs run
+  on it; to run them on a cheaper model, set `agent.cron_model` in
+  `settings.yaml` afterwards (a later save that picks nothing leaves it
+  alone; a switch into or out of Bedrock resets both to the installer's
+  defaults, as before).
 - **About you** prefills the time zone from your browser. Quiet hours are
   optional: on a personal install the switch starts on with 22:00–07:00 while
   the instance still has the defaults; a worker's starts off. Continuing

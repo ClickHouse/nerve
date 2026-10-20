@@ -9,7 +9,8 @@ import { ChoiceCards } from '../ChoiceCards';
 import {
   COMMON_AWS_REGIONS, EFFORT_GUIDANCE, EFFORT_SERVER_DEFAULT, HOST_LOGIN_FOUND,
   HOST_LOGIN_NONE, HOST_LOGIN_UNREADABLE, HOST_LOGIN_UNREADABLE_HINT, MANAGED_SOURCE_HINT, MANAGED_SOURCE_TEXT,
-  MODEL_DEFAULT_LINE, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT, NO_LOCAL_SECRETS_TEXT,
+  MODEL_CRON_ELSEWHERE, MODEL_CRON_LINE, MODEL_DEFAULT_LINE, MODEL_FAMILY_GUIDANCE, MODEL_SERVER_DEFAULT,
+  NO_LOCAL_SECRETS_TEXT,
   OAUTH_BACKGROUND_WARNING, PROVIDER_CARDS, PROVIDER_SAVED_PICK_MODEL, PROVIDER_TEST_FAILED_WARNING,
   STEP_HEADINGS, SUBSCRIPTION_NOTICE,
 } from '../copy';
@@ -67,9 +68,10 @@ interface Form {
  * On a pending step the first Continue saves the credential and **stays**:
  * the server's answer makes the step `done` (and remounts this form), the
  * picker appears with the defaults the server applied, and a notice says
- * so. The next Continue sends `{model, effort}` if they were changed, else
- * just advances. The brief's "after success: model picker" is otherwise
- * never seen in the forward flow.
+ * so. The next Continue sends the model on screen — the preselected default
+ * counts as the pick, since the server writes it as the cron model too — and
+ * the effort if it was changed. The brief's "after success: model picker" is
+ * otherwise never seen in the forward flow.
  *
  * A done step with a saved credential opens **compact**: the configured
  * line with Replace, Test, Remove and the picker — the cards and the key
@@ -233,12 +235,26 @@ export function ProviderStep({ step, state }: { step: SetupStep; state: SetupSta
     return true;
   };
 
+  // The picker on screen during the first pass is a choice, the preselected
+  // default included: after a live test on a pending step, and on the
+  // Continue that follows a credential save. The server writes the pick as
+  // the cron model too, so it has to hear it even when it equals the current
+  // model. A done step visited later sends the model only when it changes, so
+  // a cron model set by hand is left alone. The model on screen belongs to
+  // the provider the server runs now: a save that moves between Bedrock and
+  // the Anthropic API takes its ids from the server (geo-prefixed on Bedrock),
+  // so what is on screen is not a choice that save can carry.
+  const providerMoves = (form.type === 'bedrock') !== (detail.type === 'bedrock');
+  const confirmsPick = form.model !== '' && !providerMoves
+    && (done ? (savedNotice === 'provider' || justSaved) : testedOk);
+  const sendsModel = form.model !== '' && (form.model !== detail.model || confirmsPick);
+
   const submit = async () => {
     if (!validate()) return false;
     let body: Record<string, unknown>;
     if (decides(step) && !managedCredential) {
       body = candidate();
-      if (form.model && form.model !== detail.model) body.model = form.model;
+      if (sendsModel) body.model = form.model;
       if (form.effort && form.effort !== detail.effort) body.effort = form.effort;
       const ok = await save('provider', () => api.setupStep('provider', body));
       if (!ok) return false;
@@ -264,6 +280,7 @@ export function ProviderStep({ step, state }: { step: SetupStep; state: SetupSta
         { type: detail.type, aws_region: detail.aws_region, aws_profile: detail.aws_profile, model: detail.model, effort: detail.effort },
         ['type', 'aws_region', 'aws_profile', 'model', 'effort'],
       ) as Record<string, unknown>;
+      if (confirmsPick && diff.model === undefined) diff.model = form.model;
       const key = secretPayload(form.anthropic_api_key);
       const token = secretPayload(form.claude_oauth_token);
       const credentialChanged = !managedCredential
@@ -321,7 +338,12 @@ export function ProviderStep({ step, state }: { step: SetupStep; state: SetupSta
   const defaultLine = models?.default_model && models.default_model !== models.current.model
     ? MODEL_DEFAULT_LINE(labelOf(models.default_model), labelOf(models.current.model))
     : null;
-  const modelHelp = `${MODEL_FAMILY_GUIDANCE[selectedFamily] ?? MODEL_FAMILY_GUIDANCE.other}${defaultLine ? ` ${defaultLine}` : ''}`;
+  // What scheduled jobs will run on after this save: the pick when one is
+  // sent, else whatever agent.cron_model says now.
+  const cronLine = sendsModel || !detail.cron_model || detail.cron_model === detail.model
+    ? MODEL_CRON_LINE
+    : MODEL_CRON_ELSEWHERE(labelOf(detail.cron_model));
+  const modelHelp = `${MODEL_FAMILY_GUIDANCE[selectedFamily] ?? MODEL_FAMILY_GUIDANCE.other}${defaultLine ? ` ${defaultLine}` : ''} ${cronLine}`;
   const efforts = models?.efforts ?? ['max', 'xhigh', 'high', 'medium', 'low'];
   const dirty = !same(form, initial);
   const effortOff = () => !!locked;

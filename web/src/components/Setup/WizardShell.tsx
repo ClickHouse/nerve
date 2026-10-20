@@ -64,6 +64,9 @@ export function WizardShell() {
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [load]);
 
+  // Leaving the wizard altogether also ends the notice.
+  useEffect(() => () => { useSetupStore.getState().clearSavedNotice(); }, []);
+
   // A "Saved…" notice belongs to the step it was shown on, so it goes when
   // the stop changes — a navigation, not a re-render.
   const previousStep = useRef<string | undefined>(stepId);
