@@ -694,6 +694,9 @@ class ClaudeBackend:
             # load via ``plugins`` (--plugin-dir), independent of this setting.
             setting_sources=[],
             mcp_servers=self._build_mcp_servers(spec.session_id),
+            # External mode: the CLI reads no MCP configuration other than
+            # ``mcp_servers``, which holds the MCP gateway's servers.
+            strict_mcp_config=self._deps.managed_mcp,
             # Claude Code plugins — loaded via --plugin-dir so the CLI
             # handles OAuth, credentials, and plugin lifecycle natively.
             plugins=self._deps.claude_plugins(),

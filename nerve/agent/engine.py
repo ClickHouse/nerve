@@ -82,7 +82,7 @@ from nerve.agent.tools import (
 # keep working. The new runtime path uses ``self.registry`` + a
 # per-session ``ToolContext`` and ignores those globals.
 from nerve.agent.tools import init_tools
-from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
+from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import (
     CAUSE_FROM_ACTOR,
@@ -94,6 +94,7 @@ from nerve.identity import (
     resolve_cause,
 )
 from nerve.inference_principal import inference_principal
+from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -424,7 +425,20 @@ class AgentEngine:
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
         self._mcp_loopback_port: int | None = None
-        self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
+        # External mode: the MCP gateway's catalog is the only source of MCP
+        # servers besides Nerve's own, and Nerve loads no Claude Code plugin.
+        # The mode and the gateway URL change only with a restart.
+        from nerve.gateway.auth import is_external_mode
+
+        self._managed_mcp = is_external_mode()
+        self._mcp_gateway: McpGatewayCatalog | None = None
+        if self._managed_mcp and config.mcp_gateway_url:
+            self._mcp_gateway = McpGatewayCatalog(config.mcp_gateway_url)
+        # The revision of the catalog in _mcp_servers_cache (external mode).
+        self._mcp_catalog_revision: str | None = None
+        self._mcp_servers_cache = (  # hot-reloadable
+            [] if self._managed_mcp else list(config.mcp_servers)
+        )
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
         # Tool registry — built once at construction. Per-session MCP
@@ -456,6 +470,7 @@ class AgentEngine:
                 claude_plugins=lambda: self._claude_code_plugins,
                 gateway_port=self._gateway_port,
                 mint_session_token=self._mint_mcp_session_token,
+                managed_mcp=self._managed_mcp,
             )
         )
         self._session_backends: dict[str, str] = {}
@@ -577,6 +592,35 @@ class AgentEngine:
     def set_mcp_loopback_port(self, port: int | None) -> None:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
+
+    async def _refresh_mcp_catalog(self) -> None:
+        """External mode: read the catalog and give its servers to new sessions.
+
+        A failed read keeps the servers of the last catalog read. A catalog
+        server with the name of Nerve's own server is not used.
+        """
+        if self._mcp_gateway is None:
+            return
+        catalog = await self._mcp_gateway.refresh()
+        if catalog is None or catalog.revision == self._mcp_catalog_revision:
+            return
+        servers = [server for server in catalog.servers if server.id != "nerve"]
+        if len(servers) != len(catalog.servers):
+            logger.warning(
+                "MCP gateway catalog names a server 'nerve'; Nerve's own server "
+                "has that name, so the catalog server is not used",
+            )
+        self._mcp_servers_cache = [
+            McpServerConfig(name=server.id, type="http", url=server.url)
+            for server in servers
+        ]
+        self._mcp_catalog_revision = catalog.revision
+        logger.info(
+            "MCP gateway catalog %s: %d server(s) (%s). New sessions get these "
+            "servers.", catalog.revision, len(servers),
+            ", ".join(server.id for server in servers) or "none",
+        )
+        await self._sync_mcp_servers_to_db()
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -714,9 +758,19 @@ class AgentEngine:
             engine=self,
         )
 
-        # Load Claude Code plugin directories for SDK plugins field
-        from nerve.config import load_claude_code_plugins
-        self._claude_code_plugins = load_claude_code_plugins()
+        if self._managed_mcp:
+            # The first catalog. Without one, sessions start with Nerve's
+            # own MCP server only, and each new session reads it again.
+            if self._mcp_gateway is None:
+                logger.warning(
+                    "External mode without mcp_gateway_url: sessions start "
+                    "without MCP servers other than Nerve's own",
+                )
+            await self._refresh_mcp_catalog()
+        else:
+            # Load Claude Code plugin directories for SDK plugins field
+            from nerve.config import load_claude_code_plugins
+            self._claude_code_plugins = load_claude_code_plugins()
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
@@ -766,7 +820,13 @@ class AgentEngine:
 
         New sessions will automatically use the updated config.
         Returns the list of McpServerConfig.
+
+        External mode reads no file: it reads the MCP gateway's catalog again
+        and returns its servers.
         """
+        if self._managed_mcp:
+            await self._refresh_mcp_catalog()
+            return self._mcp_servers_cache
         from nerve.config import load_claude_code_plugins, load_mcp_servers
         # Read from the daemon's actual config dir (not the process cwd) so a
         # reload sees the same config.yaml + workspace/config/settings.yaml that
@@ -871,6 +931,9 @@ class AgentEngine:
         self._shutting_down = True
         for sid in list(self._idle_watchers):
             self._stop_idle_watcher(sid)
+
+        if self._mcp_gateway is not None:
+            await self._mcp_gateway.close()
 
         # The disconnects below bypass remove_client: settle every live agent
         # first, so it reads "interrupted by a gateway restart" (the CLI dies
@@ -1560,6 +1623,10 @@ class AgentEngine:
                         self.db.system_actor, self.session_cause(sid),
                     ),
                 )
+
+            # External mode: read the catalog again, so that the new client
+            # gets the current servers. A failure keeps the last catalog.
+            await self._refresh_mcp_catalog()
 
             spec = SessionSpec(
                 session_id=session_id,

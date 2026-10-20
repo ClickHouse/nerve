@@ -541,6 +541,13 @@ class CodexBackend:
                 continue
             try:
                 overrides += self._translate_mcp_server(srv)
+                if self._deps.managed_mcp:
+                    # An MCP gateway server. The organization approved its
+                    # tools at the gateway, and Codex refuses an MCP tool that
+                    # it would have to ask about under approval policy never.
+                    overrides.append(
+                        f'mcp_servers.{srv.name}.default_tools_approval_mode="approve"'
+                    )
             except Exception as e:
                 logger.warning(
                     "Skipping MCP server %r for codex: %s", srv.name, e,
