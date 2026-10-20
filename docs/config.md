@@ -1833,8 +1833,9 @@ environment variables for this request. One request takes at most 5 seconds.
   only.
 - Nerve reads one catalog at a time. A new session that waits while another
   read runs, for example the periodic read, uses the result of that read.
-- When the catalog changes, new sessions get the new servers. A session that
-  is running keeps the servers that it started with.
+- When the catalog changes, new sessions get the new servers. A running
+  session gets them at its next turn (see
+  [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
 
@@ -1856,6 +1857,39 @@ read the catalog again. The gateway checks the policy on each call.
 
 The Claude CLI and Codex use the proxy environment variables of the Nerve
 service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns. A client gets its MCP servers when Nerve builds it, and neither client
+can add a server while it runs. When the last catalog that Nerve read has
+another `revision` than the catalog of the client's build, Nerve builds the
+client again at the start of the session's next turn, before it sends the
+message. The new client resumes the same conversation (the same Claude
+session or Codex thread) with the same model and working directory.
+
+Nerve keeps the client and its earlier catalog for that turn, and checks
+again at the next turn, when:
+
+- the session runs a background task of the Claude CLI (a background
+  command, agent or monitor),
+- the client has output that Nerve did not read yet, or
+- (Claude only) the conversation file under `~/.claude/projects` is
+  missing, so a new client could not resume the conversation.
+
+If the new client does not start, the turn fails, and the next turn starts a
+new conversation, as after a restart.
+
+A change at the gateway reaches a running session at its first turn after
+Nerve reads the changed catalog: while the gateway is available, at most 30
+seconds and one request after the change. A turn that runs keeps its servers
+until it ends. Work of the Codex app-server that continues after a turn, for
+example a command or a child agent, stops when Nerve builds the client again,
+as for a change of the model.
+
+A session with an earlier catalog gets no access that the policy does not
+allow: the gateway checks each call against the current policy and refuses
+a server or a tool that the organization removed.
 
 ## Auth
 

@@ -3,8 +3,9 @@
 In external mode (``NERVE_AUTH_MODE=external``), an MCP gateway decides which
 MCP servers the agent can use. Nerve reads ``GET <mcp_gateway_url>/catalog``
 when it starts, before each new session, and at a fixed interval, and gives
-each server of the catalog to the agent clients as one HTTP MCP server. The
-gateway identifies the agent from the connection, so the request carries no
+each server of the catalog to the agent clients as one HTTP MCP server. A
+running session gets a changed catalog at its next turn. The gateway
+identifies the agent from the connection, so the request carries no
 credential. The catalog holds no upstream address and no secret.
 
 Nerve reads the members ``revision`` and ``servers`` of the catalog document,
