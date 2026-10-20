@@ -61,7 +61,9 @@ class _StubChannel(BaseChannel):
     async def send(self, message) -> None:
         pass
 
-    async def send_file(self, target: str, file_path: str) -> bool:  # type: ignore[override]
+    async def send_file(  # type: ignore[override]
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         self.send_file_calls.append((target, file_path))
         return self._send_file_returns
 

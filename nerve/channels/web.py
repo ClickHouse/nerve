@@ -84,7 +84,9 @@ class WebChannel(BaseChannel):
             tool_name, tool_input,
         )
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Web file delivery is handled by the persisted tool_call block.
 
         The frontend renders a SendFileBlock card from the stored

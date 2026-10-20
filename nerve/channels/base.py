@@ -254,8 +254,13 @@ class BaseChannel(abc.ABC):
     #  Only called if channel declares ChannelCapability.SEND_FILES.        #
     # ------------------------------------------------------------------ #
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Deliver a file to a target as a downloadable attachment.
+
+        ``session_id`` is the session that sends the file, for channels
+        that track which session produced a message.
 
         Returns True on successful delivery, False if the channel
         cannot deliver the file (size limits, missing transport, etc.).

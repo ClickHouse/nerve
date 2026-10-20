@@ -1759,7 +1759,9 @@ class SlackChannel(BaseChannel):
         except Exception as e:
             logger.warning("Slack reactions.add failed for %s: %s", target, e)
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Upload a file into the conversation as an attachment."""
         if not self.is_available or not target:
             return False
