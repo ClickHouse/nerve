@@ -582,7 +582,9 @@ class HostedChannel(BaseChannel):
         except OperationFailed as error:
             logger.warning("Hosted %s reaction in %s failed: %s", self._provider, target, _why(error))
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Upload a file into *target* through ``file_send``.
 
         Returns ``False`` without a send when the file is missing, empty, or

@@ -372,7 +372,7 @@ class ChannelRouter:
 
         ctx = self._message_context.get(session_id)
         target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
-        return await chan_obj.send_file(target, file_path)
+        return await chan_obj.send_file(target, file_path, session_id=session_id)
 
     # ------------------------------------------------------------------ #
     #  Observation buffer                                                    #

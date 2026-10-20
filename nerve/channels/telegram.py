@@ -1028,11 +1028,15 @@ class TelegramChannel(BaseChannel):
     #  Files: deliver a workspace file as a Telegram document             #
     # ------------------------------------------------------------------ #
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Deliver a file to a Telegram chat as a document attachment.
 
         Size limits are enforced by the Telegram API itself (50 MiB on
         api.telegram.org, up to 2 GiB on self-hosted Bot API servers).
+        A reply to the document routes to ``session_id`` (see
+        ``_record_reply_route``).
         """
         if self._app is None:
             return False
@@ -1040,11 +1044,14 @@ class TelegramChannel(BaseChannel):
         if not path.is_file():
             return False
         try:
-            await self._app.bot.send_document(
-                chat_id=int(target),
+            chat_id = int(target)
+            sent = await self._app.bot.send_document(
+                chat_id=chat_id,
                 document=path,
                 filename=path.name,
             )
+            if session_id and sent is not None:
+                self._record_reply_route(sent.message_id, chat_id, session_id)
             return True
         except Exception as e:
             logger.warning("send_file: send_document failed for %s: %s", target, e)

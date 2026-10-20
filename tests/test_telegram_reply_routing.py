@@ -220,3 +220,139 @@ def test_recording_is_skipped_when_routing_disabled():
     ch = _make_channel(routing_enabled=False)
     ch._record_reply_route(100, 42, "sessA")
     assert ch._lookup_reply_route(100, 42) is None
+
+
+# --------------------------------------------------------------------------- #
+#  Handler: _handle_message with the flag on                                  #
+# --------------------------------------------------------------------------- #
+
+from unittest.mock import AsyncMock, MagicMock
+
+from nerve.channels.telegram import REPLY_UNRESOLVED_MSG
+from nerve.config import NerveConfig
+
+_USER = 999
+_CHAT = 42
+
+
+def _handler_channel(sessions: dict, active: str = "active1") -> TelegramChannel:
+    """A channel whose live branch runs to ``router.handle_message``.
+
+    Attachment extraction is stubbed out; everything from authorization to the
+    reply-routing gate and the delivery call is the production code.
+    """
+    cfg = NerveConfig()
+    cfg.telegram.allowed_users = [_USER]
+    cfg.telegram.reply_routes_to_origin_session = True
+    router = MagicMock()
+    router.observe = AsyncMock(return_value=True)
+    router.handle_message = AsyncMock()
+    router.get_session = AsyncMock(side_effect=lambda sid: sessions.get(sid))
+    router.get_active_session = AsyncMock(return_value=active)
+    ch = TelegramChannel(lambda: cfg, router)
+    ch._extract_image = AsyncMock(return_value=None)
+    ch._extract_sticker = AsyncMock(return_value=(None, None))
+    ch._extract_document = AsyncMock(return_value=([], None))
+    return ch
+
+
+def _reply_update(reply_to_id: int | None, message_id: int = 900):
+    """A private-chat text message, replying to ``reply_to_id`` if given."""
+    update = MagicMock()
+    update.effective_chat.id = _CHAT
+    update.effective_chat.type = "private"
+    update.effective_user.id = _USER
+    message = update.message
+    message.text = "yes, go ahead"
+    message.caption = None
+    message.message_id = message_id
+    message.media_group_id = None
+    message.forward_origin = None
+    message.quote = None
+    message.reply_text = AsyncMock()
+    if reply_to_id is None:
+        message.reply_to_message = None
+    else:
+        reply = MagicMock()
+        reply.message_id = reply_to_id
+        reply.text = "Cron finished: 3 PRs need a look."
+        reply.caption = None
+        reply.from_user = None
+        message.reply_to_message = reply
+    return update
+
+
+@pytest.mark.asyncio
+async def test_handler_routes_a_reply_to_the_session_that_sent_it():
+    ch = _handler_channel({"cronA": {"status": "active"}})
+    ch._record_reply_route(500, _CHAT, "cronA")
+
+    update = _reply_update(500)
+    await ch._handle_message(update, None)
+
+    ch.router.handle_message.assert_awaited_once()
+    assert ch.router.handle_message.await_args.args[0].session_id == "cronA"
+    update.message.reply_text.assert_not_awaited()
+    # A later reply to this inbound message lands in the same session.
+    assert ch._lookup_reply_route(900, _CHAT) == "cronA"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sessions", [{}, {"cronA": {"status": "archived"}}])
+async def test_handler_rejects_an_unresolved_reply_without_delivering(sessions):
+    # Unrecorded message or archived session: nudge, never the active session.
+    ch = _handler_channel(sessions)
+    if sessions:
+        ch._record_reply_route(500, _CHAT, "cronA")
+
+    update = _reply_update(500)
+    await ch._handle_message(update, None)
+
+    ch.router.handle_message.assert_not_awaited()
+    update.message.reply_text.assert_awaited_once_with(REPLY_UNRESOLVED_MSG)
+    assert ch._lookup_reply_route(900, _CHAT) is None
+
+
+@pytest.mark.asyncio
+async def test_handler_delivers_a_plain_message_to_the_active_session():
+    ch = _handler_channel({})
+
+    await ch._handle_message(_reply_update(None), None)
+
+    ch.router.handle_message.assert_awaited_once()
+    assert ch.router.handle_message.await_args.args[0].session_id == "active1"
+    assert ch._lookup_reply_route(900, _CHAT) == "active1"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_to_a_sent_file_routes_to_its_session(tmp_path):
+    ch = _handler_channel({"sessF": {"status": "active"}})
+    doc = tmp_path / "report.md"
+    doc.write_text("# report\n")
+    ch._app = MagicMock()
+    ch._app.bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=700))
+
+    assert await ch.send_file(str(_CHAT), str(doc), session_id="sessF") is True
+
+    await ch._handle_message(_reply_update(700), None)
+    assert ch.router.handle_message.await_args.args[0].session_id == "sessF"
+
+
+@pytest.mark.asyncio
+async def test_router_send_file_passes_the_session_to_the_channel(tmp_path):
+    from nerve.channels.base import ChannelCapability
+    from nerve.channels.router import ChannelRouter
+
+    channel = MagicMock()
+    channel.capabilities = {ChannelCapability.SEND_FILES}
+    channel.send_file = AsyncMock(return_value=True)
+    router = ChannelRouter.__new__(ChannelRouter)
+    router._channels = {"telegram": channel}
+    router._message_context = {
+        "sessF": {"channel_name": "telegram", "target": str(_CHAT)},
+    }
+
+    assert await router.send_file("sessF", str(tmp_path / "f"), channel="telegram")
+    channel.send_file.assert_awaited_once_with(
+        str(_CHAT), str(tmp_path / "f"), session_id="sessF",
+    )
