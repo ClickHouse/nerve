@@ -71,7 +71,7 @@ async def test_update_to_max_rowid_row_resurfaces_to_consumer(db):
 
     # New comment lands on the same thread -> content changes -> re-insert.
     n = await db.insert_source_messages([_rec("hot", "comment-2")], source="github")
-    assert n == 1  # the changed row was (re-)inserted
+    assert n == ["hot"]  # the changed row was (re-)inserted
 
     rowid_after = await _rowid_of(db, "github", "hot")
     assert rowid_after > parked, (
@@ -112,7 +112,7 @@ async def test_unchanged_record_does_not_resurface(db):
     rowid_before = await _rowid_of(db, "github", "t")
 
     n = await db.insert_source_messages([_rec("t", "same")], source="github")
-    assert n == 0  # nothing changed -> skipped silently
+    assert n == []  # nothing changed -> skipped silently
 
     rowid_after = await _rowid_of(db, "github", "t")
     assert rowid_after == rowid_before  # no churn, no spurious re-surface
