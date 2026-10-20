@@ -171,6 +171,7 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     backend = ClaudeBackend(SimpleNamespace(
         config=lambda: cfg,
         claude_plugins=lambda: [],
+        managed_mcp=False,
     ))
     marker = "exact claude system prompt"
     spec = SessionSpec(
@@ -349,6 +350,7 @@ def test_claude_options_pass_resume_session_at_only_for_forks(tmp_path):
     backend = ClaudeBackend(SimpleNamespace(
         config=lambda: cfg,
         claude_plugins=lambda: [],
+        managed_mcp=False,
     ))
     base = dict(
         session_id="fork-opts", source="web", model=cfg.agent.model,
@@ -371,6 +373,7 @@ def test_claude_options_set_stdout_buffer_from_config(tmp_path):
         backend = ClaudeBackend(SimpleNamespace(
             config=lambda: cfg,
             claude_plugins=lambda: [],
+            managed_mcp=False,
         ))
         spec = SessionSpec(
             session_id="buf-opts", source="web", model=cfg.agent.model,
@@ -1748,6 +1751,7 @@ def test_build_options_forwards_subagent_text(tmp_path):
             tool_ctx_factory=lambda sid: None,
             external_mcp_servers=lambda: [],
             claude_plugins=lambda: [],
+            managed_mcp=False,
         ))
         backend._build_mcp_servers = lambda sid: {}
         spec = SessionSpec(

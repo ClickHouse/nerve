@@ -82,7 +82,7 @@ from nerve.agent.tools import (
 # keep working. The new runtime path uses ``self.registry`` + a
 # per-session ``ToolContext`` and ignores those globals.
 from nerve.agent.tools import init_tools
-from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
+from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
 from nerve.identity import (
     CAUSE_FROM_ACTOR,
@@ -94,6 +94,7 @@ from nerve.identity import (
     resolve_cause,
 )
 from nerve.inference_principal import inference_principal
+from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -424,7 +425,24 @@ class AgentEngine:
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
         self._mcp_loopback_port: int | None = None
-        self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
+        # External mode: the MCP gateway's catalog is the only source of MCP
+        # servers besides Nerve's own, and Nerve loads no Claude Code plugin.
+        # The mode and the gateway URL change only with a restart.
+        from nerve.gateway.auth import is_external_mode
+
+        self._managed_mcp = is_external_mode()
+        self._mcp_gateway: McpGatewayCatalog | None = None
+        if self._managed_mcp and config.mcp_gateway_url:
+            self._mcp_gateway = McpGatewayCatalog(config.mcp_gateway_url)
+        # The revision of the catalog in _mcp_servers_cache (external mode).
+        self._mcp_catalog_revision: str | None = None
+        # The periodic catalog read, started by initialize().
+        self._mcp_catalog_task: asyncio.Task | None = None
+        # The catalog revision that each session's client was built with.
+        self._client_mcp_revisions: dict[str, str | None] = {}
+        self._mcp_servers_cache = (  # hot-reloadable
+            [] if self._managed_mcp else list(config.mcp_servers)
+        )
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
         # Tool registry — built once at construction. Per-session MCP
@@ -456,6 +474,7 @@ class AgentEngine:
                 claude_plugins=lambda: self._claude_code_plugins,
                 gateway_port=self._gateway_port,
                 mint_session_token=self._mint_mcp_session_token,
+                managed_mcp=self._managed_mcp,
             )
         )
         self._session_backends: dict[str, str] = {}
@@ -577,6 +596,85 @@ class AgentEngine:
     def set_mcp_loopback_port(self, port: int | None) -> None:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
+
+    async def _refresh_mcp_catalog(self) -> None:
+        """External mode: read the catalog and give its servers to new clients.
+
+        Running sessions get a new client at their next turn
+        (:meth:`_mcp_catalog_rebuild_due`). A failed read keeps the servers of
+        the last catalog read. A catalog server with the name of Nerve's own
+        server is not used.
+        """
+        if self._mcp_gateway is None:
+            return
+        catalog = await self._mcp_gateway.refresh()
+        if catalog is None or catalog.revision == self._mcp_catalog_revision:
+            return
+        servers = [server for server in catalog.servers if server.id != "nerve"]
+        if len(servers) != len(catalog.servers):
+            logger.warning(
+                "MCP gateway catalog names a server 'nerve'; Nerve's own server "
+                "has that name, so the catalog server is not used",
+            )
+        self._mcp_servers_cache = [
+            McpServerConfig(name=server.id, type="http", url=server.url)
+            for server in servers
+        ]
+        self._mcp_catalog_revision = catalog.revision
+        logger.info(
+            "MCP gateway catalog %s: %d server(s) (%s). New sessions get these "
+            "servers, running sessions at their next turn.", catalog.revision,
+            len(servers), ", ".join(server.id for server in servers) or "none",
+        )
+        await self._sync_mcp_servers_to_db()
+
+    # The interval of the periodic catalog read in external mode (seconds).
+    _MCP_CATALOG_REFRESH_SECONDS = 30.0
+
+    async def _refresh_mcp_catalog_periodically(self) -> None:
+        """Read the catalog at a fixed interval, until shutdown cancels it.
+
+        This also reads the catalog again after a failed read at startup.
+        """
+        while True:
+            await asyncio.sleep(self._MCP_CATALOG_REFRESH_SECONDS)
+            try:
+                await self._refresh_mcp_catalog()
+            except Exception:  # noqa: BLE001 - the next read tries again
+                logger.exception("Periodic MCP gateway catalog read failed")
+
+    def _mcp_catalog_rebuild_due(
+        self, session_id: str, client: AgentClient, backend: AgentBackend,
+        native_id: str | None, cwd: str,
+    ) -> bool:
+        """External mode: build the client again when the catalog revision
+        differs from the one of its build, except while the session runs a
+        background task, the client has buffered output, or the backend does
+        not find the stored conversation. See docs/config.md, "Catalog
+        changes in running sessions".
+        """
+        # Without a gateway (local mode) both revisions are None.
+        built = self._client_mcp_revisions.get(session_id)
+        if built == self._mcp_catalog_revision:
+            return False
+        if self._has_live_background_tasks(session_id):
+            wait = "a background task runs"
+        elif client.buffer_used() > 0:
+            wait = "the client has buffered output"
+        elif native_id and not backend.validate_resume_target(native_id, cwd):
+            wait = "the conversation to resume is missing on this host"
+        else:
+            logger.info(
+                "Session %s: MCP gateway catalog %s replaces %s; recreating "
+                "the client, which resumes the conversation",
+                session_id, self._mcp_catalog_revision, built,
+            )
+            return True
+        logger.info(
+            "Session %s keeps MCP gateway catalog %s for this turn: %s",
+            session_id, built, wait,
+        )
+        return False
 
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
@@ -714,9 +812,24 @@ class AgentEngine:
             engine=self,
         )
 
-        # Load Claude Code plugin directories for SDK plugins field
-        from nerve.config import load_claude_code_plugins
-        self._claude_code_plugins = load_claude_code_plugins()
+        if self._managed_mcp:
+            # The first catalog. Without one, sessions start with Nerve's
+            # own MCP server only, and each new session reads it again.
+            if self._mcp_gateway is None:
+                logger.warning(
+                    "External mode without mcp_gateway_url: sessions start "
+                    "without MCP servers other than Nerve's own",
+                )
+            await self._refresh_mcp_catalog()
+            if self._mcp_gateway is not None:
+                self._mcp_catalog_task = asyncio.create_task(
+                    self._refresh_mcp_catalog_periodically(),
+                    name="mcp-gateway-catalog",
+                )
+        else:
+            # Load Claude Code plugin directories for SDK plugins field
+            from nerve.config import load_claude_code_plugins
+            self._claude_code_plugins = load_claude_code_plugins()
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
@@ -766,7 +879,13 @@ class AgentEngine:
 
         New sessions will automatically use the updated config.
         Returns the list of McpServerConfig.
+
+        External mode reads no file: it reads the MCP gateway's catalog again
+        and returns its servers.
         """
+        if self._managed_mcp:
+            await self._refresh_mcp_catalog()
+            return self._mcp_servers_cache
         from nerve.config import load_claude_code_plugins, load_mcp_servers
         # Read from the daemon's actual config dir (not the process cwd) so a
         # reload sees the same config.yaml + workspace/config/settings.yaml that
@@ -871,6 +990,14 @@ class AgentEngine:
         self._shutting_down = True
         for sid in list(self._idle_watchers):
             self._stop_idle_watcher(sid)
+
+        if self._mcp_catalog_task is not None:
+            self._mcp_catalog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._mcp_catalog_task
+            self._mcp_catalog_task = None
+        if self._mcp_gateway is not None:
+            await self._mcp_gateway.close()
 
         # The disconnects below bypass remove_client: settle every live agent
         # first, so it reads "interrupted by a gateway restart" (the CLI dies
@@ -1302,6 +1429,10 @@ class AgentEngine:
         recall priors, renders the system prompt, and hands a
         :class:`SessionSpec` to the backend. The backend owns everything
         runtime-specific (options, hooks, subprocess).
+
+        A live client is built again when its process is dead, its model
+        changed, or the MCP gateway catalog changed after its build
+        (:meth:`_mcp_catalog_rebuild_due`).
         """
         lock = self.sessions.get_lock(session_id)
         async with lock:
@@ -1318,6 +1449,20 @@ class AgentEngine:
             if validate_model is not None:
                 await validate_model(requested_model)
 
+            # Check for stored native session ID for resume
+            sdk_resume_id = session.get("sdk_session_id") if session else None
+            try:
+                session_meta = json.loads(
+                    (session.get("metadata") if session else None) or "{}",
+                )
+            except (TypeError, ValueError):
+                session_meta = {}
+            session_cwd = str(
+                (session or {}).get("cwd")
+                or session_meta.get("codex_cwd")
+                or self.config.workspace
+            )
+
             if client is not None:
                 bound_model = self._session_models.get(session_id)
                 # Health check: verify the underlying subprocess is alive
@@ -1326,13 +1471,7 @@ class AgentEngine:
                         "Client process for session %s is dead, recreating",
                         session_id,
                     )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id, reason="process_exit")
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = None
+                    reason = "process_exit"
                 elif (
                     bound_model is not None and bound_model != requested_model
                     and self.agents.has_live(session_id)
@@ -1356,33 +1495,24 @@ class AgentEngine:
                         "Session %s model changed (%s → %s), recreating client",
                         session_id, bound_model, requested_model,
                     )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id, reason="model_switch")
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = None
+                    reason = "model_switch"
                     # Deliberate switch — drop the observed-model baseline so
                     # the first message on the new model doesn't fire a
                     # model_change event for a change the user asked for.
                     self._observed_models.pop(session_id, None)
+                elif self._mcp_catalog_rebuild_due(
+                    session_id, client, backend, sdk_resume_id, session_cwd,
+                ):
+                    reason = "process_ended"
                 else:
                     return client
-
-            # Check for stored native session ID for resume
-            sdk_resume_id = session.get("sdk_session_id") if session else None
-            try:
-                session_meta = json.loads(
-                    (session.get("metadata") if session else None) or "{}",
-                )
-            except (TypeError, ValueError):
-                session_meta = {}
-            session_cwd = str(
-                (session or {}).get("cwd")
-                or session_meta.get("codex_cwd")
-                or self.config.workspace
-            )
+                self._stop_idle_watcher(session_id)
+                self.sessions.remove_client(session_id, reason=reason)
+                self._session_backends.pop(session_id, None)
+                self._session_models.pop(session_id, None)
+                unregister_handler(session_id)
+                await self._safe_disconnect(client)
+                client = None
 
             # Seed the serving-model baseline from the last persisted
             # observation so downgrade detection survives restarts without
@@ -1561,6 +1691,13 @@ class AgentEngine:
                     ),
                 )
 
+            # External mode: read the catalog again, so that the new client
+            # gets the current servers. A failure keeps the last catalog.
+            await self._refresh_mcp_catalog()
+            # The cache only moves forward, so the client gets this catalog
+            # or a newer one (see _mcp_catalog_rebuild_due).
+            self._client_mcp_revisions[session_id] = self._mcp_catalog_revision
+
             spec = SessionSpec(
                 session_id=session_id,
                 source=source,
@@ -1723,6 +1860,7 @@ class AgentEngine:
         client = self.sessions.remove_client(session_id, reason=reason)
         self._session_backends.pop(session_id, None)
         self._session_models.pop(session_id, None)
+        self._client_mcp_revisions.pop(session_id, None)
         unregister_handler(session_id)
 
         if clear_resume:

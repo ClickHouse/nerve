@@ -292,6 +292,7 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1801,6 +1802,94 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 - **OAuth works** — the CLI uses cached tokens from `~/.claude/.credentials.json`.
 - **Auto-registered in UI** — plugin MCP servers appear in the MCP Servers page on first tool invocation (type: `plugin`).
 - **No conflicts** — Nerve-configured MCPs (from `config.yaml`) and Claude Code plugin MCPs coexist; they use separate mechanisms (`--mcp-config` vs `--plugin-dir`).
+
+### MCP servers in external mode
+
+In [external mode](#authentication-mode), an MCP gateway decides which MCP
+servers the agent can use. Nerve takes its MCP servers only from the catalog
+of the gateway, together with its own `nerve` server. Local mode does not
+change.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every 30 seconds. The request has no credential, because the
+gateway identifies the agent from the connection. Nerve does not use the proxy
+environment variables for this request. One request takes at most 5 seconds.
+
+- Nerve reads the members `revision` and `servers` of the catalog, and `id`,
+  `url` and `revision` of each server. The servers must be in `id` order.
+  Nerve ignores other members, for example `displayName` and `description`.
+  Nerve compares revisions for equality only. Nerve resolves each `url`
+  against the URL of the catalog request; the result must have the scheme,
+  the host and the port of that URL, and no user information.
+- Nerve refuses a catalog without these members, or with a member that is
+  not valid, as a whole. When the gateway gives no catalog (it is not
+  reachable, it answers with an error or too slowly, or the catalog is not
+  valid), Nerve keeps the catalog that it read last. After startup there is
+  none until a read succeeds, and sessions start with the `nerve` server
+  only.
+- Nerve reads one catalog at a time. A new session that waits while another
+  read runs, for example the periodic read, uses the result of that read.
+- When the catalog changes, new sessions get the new servers. A running
+  session gets them at its next turn (see
+  [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
+- A catalog server with the ID `nerve` is not used, because Nerve's own server
+  has that name.
+
+The clients get each gateway server as an HTTP MCP server at its URL, without
+headers:
+
+- **Claude.** The gateway servers and the `nerve` server, with
+  `--strict-mcp-config`, so the CLI reads no other MCP configuration. No
+  Claude Code plugin is loaded.
+- **Codex.** `mcp_servers.<id>.url` and
+  `mcp_servers.<id>.default_tools_approval_mode = "approve"` for each gateway
+  server: the organization approved the tools at the gateway, and with
+  approval policy `never` Codex refuses an MCP tool that it would have to ask
+  about.
+
+In external mode Nerve does not read `mcp_servers` from any configuration
+file. The **Reload** button, the `mcp_reload` tool and a configuration reload
+read the catalog again. The gateway checks the policy on each call.
+
+The Claude CLI and Codex use the proxy environment variables of the Nerve
+service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns. A client gets its MCP servers when Nerve builds it, and neither client
+can add a server while it runs. When the last catalog that Nerve read has
+another `revision` than the catalog of the client's build, Nerve builds the
+client again at the start of the session's next turn, before it sends the
+message. The new client resumes the same conversation (the same Claude
+session or Codex thread) with the same model and working directory.
+
+Nerve keeps the client and its earlier catalog for that turn, and checks
+again at the next turn, when:
+
+- the session runs a background task of the Claude CLI (a background
+  command, agent or monitor),
+- the client has output that Nerve did not read yet, or
+- (Claude only) the conversation file under `~/.claude/projects` is
+  missing, so a new client could not resume the conversation.
+
+If the new client does not start, the turn fails, and the next turn starts a
+new conversation, as after a restart.
+
+A change at the gateway reaches a running session at its first turn after
+Nerve reads the changed catalog: while the gateway is available, at most 30
+seconds and one request after the change. A turn that runs keeps its servers
+until it ends. Work of the Codex app-server that continues after a turn, for
+example a command or a child agent, stops when Nerve builds the client again,
+as for a change of the model.
+
+A session with an earlier catalog gets no access that the policy does not
+allow: the gateway checks each call against the current policy and refuses
+a server or a tool that the organization removed.
 
 ## Auth
 
