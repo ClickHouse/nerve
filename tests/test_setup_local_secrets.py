@@ -30,6 +30,9 @@ def _install(tmp_path: Path, *, settings: str = "", base: str = "") -> Path:
 @pytest.fixture(autouse=True)
 def _no_ambient_anchor(monkeypatch):
     monkeypatch.delenv(LOCAL_SECRETS_ENV, raising=False)
+    # A GitHub token in the developer's shell would read as the operator's.
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 
 
 class TestTheSetting:
@@ -216,6 +219,22 @@ class TestDoctor:
         assert len(lines) == 1
         assert lines[0].startswith("[--] Setup page keeps no credentials on this instance")
         assert "Memory, Channels, Sources and Agents" in lines[0]
+
+    def test_names_the_github_source_the_environment_provides(self, tmp_path, monkeypatch):
+        """With the operator's GitHub token in the environment the Sources
+        step keeps its GitHub toggle: the line closes Gmail and Telegram
+        instead of the whole step."""
+        config_dir, workspace = self._slim(tmp_path)
+        merge_settings_paths(workspace, {"setup.local_secrets": False})
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        report = cli.doctor_report(load_config(config_dir))
+        lines = [line for line in report.splitlines() if "setup.local_secrets: false" in line]
+        assert len(lines) == 1
+        assert lines[0].startswith("[--] Setup page keeps no credentials on this instance")
+        assert "the Memory, Channels and Agents steps and the Gmail and Telegram sources are not offered" in lines[0]
+        assert "GitHub comes from the environment" in lines[0]
+        assert "Memory, Channels, Sources and Agents" not in lines[0]
+        assert "REPLACE" not in report
 
     def test_says_nothing_otherwise(self, tmp_path):
         config_dir, _workspace = self._slim(tmp_path)

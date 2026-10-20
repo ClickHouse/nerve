@@ -213,6 +213,8 @@ export interface TelegramSyncSessionSummary {
   user: TelegramSyncUser | null;
 }
 
+export type SetupSourceId = 'github' | 'gmail' | 'telegram';
+
 export interface SetupSourcesDetail {
   github: { enabled: boolean; source?: CredentialSource | null };
   gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
@@ -223,6 +225,16 @@ export interface SetupSourcesDetail {
     /** Absent from an older backend, which knows nothing about the session. */
     session?: TelegramSyncSessionSummary | null;
   };
+  /**
+   * Which of the three the page may switch here. All of them, except on an
+   * instance that keeps no credentials on disk (`local_secrets: false`): a
+   * GitHub token from the environment keeps the GitHub toggle alone on
+   * offer (`['github']`); otherwise nothing is (`[]`, the step is closed).
+   * Absent from an older backend, which offers all three.
+   */
+  available?: SetupSourceId[];
+  /** Why the others are not offered — the server's sentence, shown on the step. */
+  unavailable_reason?: string | null;
 }
 
 export interface SetupCronJob {

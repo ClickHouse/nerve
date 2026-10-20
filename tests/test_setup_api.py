@@ -184,6 +184,9 @@ def _fresh_module_state(monkeypatch):
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.delenv("NERVE_DOCKER", raising=False)
     monkeypatch.delenv(daemon.SUPERVISOR_ENV, raising=False)
+    # A GitHub token in the developer's shell would read as one the operator provides.
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     yield
     set_config(NerveConfig())
 
@@ -3237,6 +3240,7 @@ class TestManagedValues:
 
 
 _NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
+_GITHUB_ONLY = "GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance."
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
@@ -3364,6 +3368,107 @@ class TestNoLocalSecrets:
             assert step(state, "sources")["blocked_kind"] == "policy"
             refused = await http.put("/api/setup/sources", json={"github": True, "gmail": False, "telegram": False})
             assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
+
+    async def test_a_github_only_save_ignores_the_operators_gmail_and_telegram_settings(self, claimed, monkeypatch):
+        """With only GitHub on offer, the live Gmail and Telegram configuration
+        is the operator's: an enabled Gmail source without accounts refuses a
+        Gmail save in default mode, but must not refuse the one toggle the page
+        may switch here (the page has no Gmail field to show that error on)."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{
+            "sync.gmail.enabled": True, "sync.telegram.enabled": True,
+            "sync.telegram.api_hash": "REPLACE_HASH_VALUE",  # a hash without its id
+        })
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["available"] == ["github"]
+            saved = await http.put("/api/setup/sources", json={"github": True})
+            assert saved.status_code == 200, saved.text
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["github"]["enabled"] is True
+
+    async def test_a_github_token_from_the_environment_opens_that_one_toggle(self, claimed, monkeypatch):
+        """The operator holds the token (GH_TOKEN in the service environment):
+        switching the GitHub source on stores nothing here, so the step is
+        offered for that one decision; Gmail and Telegram stay closed."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+        settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            sources = step(state, "sources")
+            assert sources["status"] == "pending" and sources["blocked_kind"] is None
+            assert sources["read_only"] is False and sources["read_only_reason"] is None
+            assert sources["detail"]["available"] == ["github"]
+            assert sources["detail"]["unavailable_reason"] == _GITHUB_ONLY
+            assert sources["detail"]["github"] == {"enabled": False, "source": "environment"}
+            assert state["steps_left"] == 4  # provider, profile, sources, automation
+            for step_id in ("memory", "channels", "agents"):
+                assert step(state, step_id)["blocked_kind"] == "policy", step_id
+            # A Gmail or Telegram field is refused by name, whatever its value,
+            # and nothing is written — not even the GitHub switch beside it.
+            for body, field in (
+                ({"github": True, "gmail": False, "telegram": False}, "gmail"),
+                ({"gmail": True, "gmail_accounts": ["alice@example.com"]}, "gmail"),
+                ({"gmail_accounts": ["alice@example.com"]}, "gmail_accounts"),
+                ({"github": True, "telegram": False}, "telegram"),
+                ({"telegram": True, "telegram_api_id": 1234567, "telegram_api_hash": "REPLACE_HASH_VALUE"}, "telegram"),
+                ({"telegram_api_id": 1234567}, "telegram_api_id"),
+                ({"telegram_api_hash": "REPLACE_HASH_VALUE"}, "telegram_api_hash"),
+            ):
+                refused = await http.put("/api/setup/sources", json=body)
+                assert refused.status_code == 409, (body, refused.text)
+                assert refused.json() == {"detail": _GITHUB_ONLY, "field": field}, body
+            assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+            # The Telegram sign-in stays closed as before.
+            started = await http.post("/api/setup/sources/telegram/session/start", json={"phone": "+15550100"})
+            assert started.status_code == 409 and started.json()["detail"] == _NO_SECRETS
+            # The GitHub switch goes through, and is the whole answer here.
+            on = await http.put("/api/setup/sources", json={"github": True})
+            assert on.status_code == 200, on.text
+            sources = step(on.json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False and sources["summary"] == "GitHub"
+            settings = claimed.settings_yaml()["sync"]
+            assert settings["github"]["enabled"] is True and settings["github_events"]["enabled"] is True
+            assert settings["gmail"]["enabled"] is False and settings["telegram"]["enabled"] is False
+            assert "sources" in setup_state.load_state().answered
+            # "No" is an answer too; the switch stays open either way.
+            off = await http.put("/api/setup/sources", json={"github": False})
+            assert off.status_code == 200, off.text
+            sources = step(off.json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False and sources["summary"] == "None"
+            assert claimed.settings_yaml()["sync"]["github"]["enabled"] is False
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        assert "ghp_REPLACE" not in json.dumps(off.json())
+
+    async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
+        """Open, the step behaves like any other: it waits for the Mode step
+        (while the closed fields still answer with the policy) and may be
+        skipped and unskipped — the closed steps still refuse a skip."""
+        _keep_no_secrets(claimed)
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert statuses(state)["mode"] == "pending"
+            assert step(state, "sources")["blocked_kind"] == "sequencing"
+            waiting = await http.put("/api/setup/sources", json={"github": True})
+            assert waiting.status_code == 409 and waiting.json()["detail"] == "Choose a mode first"
+            refused = await http.put("/api/setup/sources", json={"gmail": False})
+            assert refused.status_code == 409 and refused.json() == {"detail": _GITHUB_ONLY, "field": "gmail"}
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            skipped = await http.post("/api/setup/steps/sources/skip")
+            assert skipped.status_code == 200, skipped.text
+            assert step(skipped.json(), "sources")["status"] == "skipped"
+            assert setup_state.load_state().skipped == {"sources"}
+            back = await http.post("/api/setup/steps/sources/unskip")
+            assert back.status_code == 200 and step(back.json(), "sources")["status"] == "pending"
+            for step_id in ("memory", "channels", "agents"):
+                closed = await http.post(f"/api/setup/steps/{step_id}/skip")
+                assert closed.status_code == 409 and closed.json()["detail"] == _NO_SECRETS, step_id
 
     async def test_the_model_step_refuses_a_pasted_credential_but_not_bedrock_or_the_picker(self, claimed, monkeypatch):
         choose(claimed, "personal")

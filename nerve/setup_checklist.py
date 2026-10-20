@@ -121,6 +121,16 @@ NO_LOCAL_SECRETS_TEXT = (
     "This instance does not store credentials entered here. "
     "Connections are provided by the operator of this deployment."
 )
+# The Sources step under ``setup.local_secrets: false`` when the operator
+# provides the GitHub token from the environment (``GH_TOKEN`` /
+# ``GITHUB_TOKEN`` in the service environment, or a ``${VAR}`` reference):
+# switching that source on stores nothing here, so its toggle is offered
+# alone. The reason beside it, and the detail of a refused Gmail or Telegram
+# write.
+SOURCES_GITHUB_ONLY_TEXT = (
+    "GitHub is provided by the operator of this deployment; "
+    "Gmail and Telegram are not available on this instance."
+)
 MODE_LOCK_REASON = (
     "Mode was chosen when the workspace was created. Changing it means starting a "
     "new workspace: stop Nerve, point workspace: in config.yaml at an empty "
@@ -167,7 +177,7 @@ ETAG_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     STEP_SOURCES: (
         "github.enabled", "gmail.enabled", "gmail.accounts", "telegram.enabled",
-        "telegram.api_id", "telegram.api_hash",
+        "telegram.api_id", "telegram.api_hash", "available",
     ),
     STEP_AUTOMATION: ("file_present", "optional[].id", "optional[].enabled"),
     STEP_AGENTS: ("enabled", "conflict_policy"),
@@ -666,11 +676,37 @@ def _telegram_handle(user: dict[str, Any] | None) -> str:
     return str(user.get("first_name") or f"id {user.get('id')}")
 
 
+def github_from_environment(facts: Facts) -> bool:
+    """Whether the GitHub token the sources' CLI uses comes from the
+    environment — ``GH_TOKEN`` / ``GITHUB_TOKEN`` in the gateway's
+    environment, or a ``${VAR}`` reference in a layer. A connection the
+    operator provides: switching the source on stores nothing of it here."""
+    return facts.credential_sources.get("github_token") == SOURCE_ENVIRONMENT
+
+
+def sources_available(facts: Facts) -> tuple[list[str], str | None]:
+    """``(the sources the page may switch here, why the others are not)``.
+
+    All three where the page may store a credential. Under
+    ``setup.local_secrets: false`` none of them — except GitHub when its
+    token comes from the environment: the operator holds the token, the
+    toggle writes an ``enabled`` flag and nothing else, so it is offered
+    alone while Gmail (a keyring, addresses) and Telegram (API credentials,
+    a signed-in session) stay closed.
+    """
+    if facts.config.setup.local_secrets:
+        return ["github", "gmail", "telegram"], None
+    if github_from_environment(facts):
+        return ["github"], SOURCES_GITHUB_ONLY_TEXT
+    return [], NO_LOCAL_SECRETS_TEXT
+
+
 def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     sync = facts.config.sync
     sources = facts.credential_sources
     session = telegram_session(facts)
     accounts = list(sync.gmail.accounts or [])
+    available, unavailable_reason = sources_available(facts)
     detail = {
         # ``source`` for GitHub is where a token Nerve forwards to the GitHub
         # CLI comes from (``github_token`` / GH_TOKEN); ``None`` when the CLI's
@@ -687,6 +723,11 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
             "api_hash": mask(sync.telegram.api_hash, sources.get("sync.telegram.api_hash")),
             "session": session,
         },
+        # Which of the three the page may switch here (``sources_available``);
+        # a source that is on but not in the list was switched on by the
+        # operator and is shown, not offered.
+        "available": available,
+        "unavailable_reason": unavailable_reason,
     }
     on = []
     if sync.github.enabled:
@@ -813,6 +854,9 @@ def derive(facts: Facts) -> list[Step]:
     # done — a key from the environment, a Slack the channel gateway holds, an
     # answer that stores nothing.
     keyless = not config.setup.local_secrets
+    # A GitHub token from the environment: the one source whose switch
+    # stores nothing, so the policy leaves that toggle open.
+    github_env = github_from_environment(facts)
     steps: list[Step] = []
 
     def _lockdown(reason: str) -> tuple[str, str, str]:
@@ -938,9 +982,11 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
-            elif keyless:
+            elif keyless and not github_env:
                 # A GitHub login or token, the Gmail keyring, the Telegram
-                # API credentials and the signed-in session.
+                # API credentials and the signed-in session. With the GitHub
+                # token in the environment the step stays open for that one
+                # toggle (``detail["available"]``), to answer or to skip.
                 status, blocked_reason, blocked_kind = _policy()
             elif mode is None:
                 status, blocked_reason, blocked_kind = _until_mode(_CHOOSE_MODE_FIRST)
@@ -988,9 +1034,11 @@ def derive(facts: Facts) -> list[Step]:
         # Without local secrets a done step the policy covers is read-only
         # too: whatever made it done (a key from the environment, a token
         # already on disk, an answer) is not replaced from here. A Slack the
-        # channel gateway holds keeps its one control, the on/off switch.
+        # channel gateway holds keeps its one control, the on/off switch —
+        # and so does GitHub while its token comes from the environment.
         if keyless and status == STATUS_DONE and step_id in _POLICY_STEPS and not (
-            step_id == STEP_CHANNELS and config.slack.mode == "hosted"
+            (step_id == STEP_CHANNELS and config.slack.mode == "hosted")
+            or (step_id == STEP_SOURCES and github_env)
         ):
             if not read_only:
                 read_only, read_only_reason = True, NO_LOCAL_SECRETS_TEXT
