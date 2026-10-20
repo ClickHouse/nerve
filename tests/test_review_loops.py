@@ -20,6 +20,7 @@ amounts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import subprocess
 import time
@@ -29,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.agent.tools.handlers.review_loops import (
     review_loop_kill_handler,
     review_loop_list_handler,
@@ -141,6 +143,7 @@ def _make_engine(db) -> MagicMock:
     engine.has_live_background_tasks = MagicMock(return_value=False)
     engine.get_codex_ultracode_run_ids = MagicMock(return_value=None)
     engine.add_stop_listener = MagicMock()
+    engine.watch_turns = lambda sid: contextlib.nullcontext(TurnWatch(TurnOutcome()))
     engine.notification_service = MagicMock()
     engine.notification_service.send_notification = AsyncMock()
     engine.notification_service.propose_action = AsyncMock(
