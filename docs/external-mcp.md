@@ -59,7 +59,9 @@ and MCP session id. The id format is
 `external:<client_name>:<client_session_id>` if the client supplies a
 stable id). The session shows up in the Nerve UI session list, and
 every tool call is recorded in `session_events` as an
-`external_tool_call` event for audit and diagnostics.
+`external_tool_call` event for audit and diagnostics. The event records the
+system actor as actor and the session's cause as cause (none for a satellite
+session).
 
 External `ask_user` calls are **fire-and-forget**: the user is notified
 on Telegram / web as usual, but Nerve does **not** try to inject the

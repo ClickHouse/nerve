@@ -25,6 +25,7 @@ from nerve.agent.backends.events import (
     ModelObserved,
     NormalizedUsage,
     SubagentStarted,
+    SubagentUsage,
     SystemEvent,
     TextDelta,
     ThinkingDelta,
@@ -64,6 +65,9 @@ class BackendDeps:
     # Codex tool-bridge collaborators (None until the gateway wires them):
     gateway_port: Callable[[], int | None] = field(default=lambda: None)
     mint_session_token: Callable[[str], str] | None = None
+    # External mode: every server in ``external_mcp_servers`` comes from the
+    # MCP gateway's catalog (see nerve.mcp_gateway).
+    managed_mcp: bool = False
 
 
 def build_backends(deps: BackendDeps) -> dict[str, AgentBackend]:
@@ -95,6 +99,7 @@ __all__ = [
     "NormalizedUsage",
     "SessionSpec",
     "SubagentStarted",
+    "SubagentUsage",
     "SystemEvent",
     "TextDelta",
     "ThinkingDelta",

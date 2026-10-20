@@ -95,7 +95,7 @@ function said(text: string, actor_id: string | null, id = 1): ChatMessage {
 }
 
 function renderTranscript(messages: ChatMessage[]) {
-  return render(<MessageList messages={messages} streamingBlocks={[]} isStreaming={false} />);
+  return render(<MessageList messages={messages} isStreaming={false} />);
 }
 
 function labels(): string[] {
@@ -250,7 +250,9 @@ describe('live and optimistic attribution', () => {
   });
 
   it('still sends through the null legacy path when no account identity exists', async () => {
-    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null });
+    // Not streaming: the previous case leaves a turn running, and a message
+    // sent during a turn is queued rather than shown as a bubble.
+    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null, isStreaming: false });
     await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
 
     expect(useChatStore.getState().messages[0].actor_id).toBeNull();

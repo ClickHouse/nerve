@@ -2,6 +2,10 @@ import {
   ApiError, csrfHeaders, handleHostedError, isHosted, setTokenReader,
   type AuthMode,
 } from './hosted';
+import type {
+  AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
+  StopAgentResponse, StopAllResult, StopTurnResult,
+} from '../types/agents';
 
 const API_BASE = '/api';
 
@@ -209,6 +213,8 @@ export interface TelegramSyncSessionSummary {
   user: TelegramSyncUser | null;
 }
 
+export type SetupSourceId = 'github' | 'gmail' | 'telegram';
+
 export interface SetupSourcesDetail {
   github: { enabled: boolean; source?: CredentialSource | null };
   gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
@@ -219,6 +225,16 @@ export interface SetupSourcesDetail {
     /** Absent from an older backend, which knows nothing about the session. */
     session?: TelegramSyncSessionSummary | null;
   };
+  /**
+   * Which of the three the page may switch here. All of them, except on an
+   * instance that keeps no credentials on disk (`local_secrets: false`): a
+   * GitHub token from the environment keeps the GitHub toggle alone on
+   * offer (`['github']`); otherwise nothing is (`[]`, the step is closed).
+   * Absent from an older backend, which offers all three.
+   */
+  available?: SetupSourceId[];
+  /** Why the others are not offered — the server's sentence, shown on the step. */
+  unavailable_reason?: string | null;
 }
 
 export interface SetupCronJob {
@@ -545,7 +561,12 @@ export interface TaskEvent {
   /** null on the row recording the task's creation. */
   from_status: string | null;
   to_status: string;
+  /** Origin of the change: `web`, a session id, `system` or `backfill`. */
   actor: string;
+  /** Who made the change. `null` on rows written before it was recorded. */
+  actor_id: string | null;
+  /** On whose behalf the change was made. `null` when unknown. */
+  caused_by_actor_id: string | null;
   created_at: string;
 }
 
@@ -660,7 +681,14 @@ export interface WorkflowRun {
   warned_at: string | null;
   session_id: string | null;
   journal_dir: string | null;
+  /** Origin text: `api`, `session:<id>`, `review-loop:<id>`, `cron:<job>`. */
   created_by: string;
+  /** Who created the run, and on whose behalf; null on older runs. */
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  /** Who killed the run, and on whose behalf; null when not known. */
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   error: string | null;
   result: string | null;
   created_at: string;
@@ -713,9 +741,38 @@ export interface ReviewLoop {
   spent_usd: number;
   iteration: number;
   current_run_id: string | null;
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   created_at: string;
   updated_at: string;
   ended_at: string | null;
+}
+
+/**
+ * Result of `POST /api/review-loops/{id}/decision`. `applied` is true when
+ * the decision changed the loop; `ok` is false when the leg that it resumes
+ * did not start.
+ */
+export interface ReviewLoopDecisionResult {
+  ok: boolean;
+  applied: boolean;
+  message: string;
+}
+
+/** One decision on a parked loop, oldest first in the loop detail. */
+export interface ReviewLoopDecision {
+  id: number;
+  loop_id: string;
+  decision: string;
+  applied: boolean;
+  message: string;
+  /** Origin text: `api` or `approval-card`. */
+  decided_by: string;
+  actor_id: string | null;
+  caused_by_actor_id: string | null;
+  created_at: string;
 }
 
 export interface ReviewLoopAttempt {
@@ -865,6 +922,49 @@ async function request<T>(path: string, options: RequestInit = {}, authenticate 
     ...(options.headers as Record<string, string> || {}),
   }, authenticate);
   return res.json();
+}
+
+/**
+ * The machine-readable code of a failed request: `detail.code` of a body like
+ * `{"detail": {"code": "no_runtime", "message": "..."}}`, read from the
+ * `"<status>: <body>"` message every `ApiError` carries. Null for any other
+ * error or body (a string `detail`, a gateway error, a network failure).
+ */
+export function apiErrorCode(e: unknown): string | null {
+  const code = apiErrorDetail(e)?.code;
+  return typeof code === 'string' ? code : null;
+}
+
+/**
+ * The `detail` object of an `ApiError` (message `"<status>: <body>"`) whose
+ * body is `{"detail": {...}}`, or null.
+ */
+export function apiErrorDetail(e: unknown): Record<string, unknown> | null {
+  if (!(e instanceof Error)) return null;
+  const raw = e.message;
+  const colon = raw.indexOf(':');
+  if (colon < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw.slice(colon + 1).trim());
+    if (!parsed || typeof parsed !== 'object' || !('detail' in parsed)) return null;
+    const detail: unknown = parsed.detail;
+    return detail && typeof detail === 'object' ? detail as Record<string, unknown> : null;
+  } catch {
+    return null; // not a JSON body
+  }
+}
+
+/** The body of `POST /api/sessions/{id}/stop`, one shape per scope. */
+export type StopSessionBody =
+  | { scope: 'turn'; confirm_kill_background?: boolean }
+  | { scope: 'all'; include_shells?: boolean }
+  | { scope: 'force' };
+
+/** Which session ids an archive took, and which it left (and why). */
+export interface ArchiveSessionResult {
+  archived: boolean;
+  archived_ids: string[];
+  skipped: { id: string; reason: string }[];
 }
 
 /**
@@ -1170,13 +1270,15 @@ export const api = {
   listReviewLoops: (status?: string) =>
     request<{ loops: ReviewLoop[] }>(`/review-loops${status ? `?status=${status}` : ''}`),
   getReviewLoop: (loopId: string) =>
-    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[] }>(`/review-loops/${loopId}`),
+    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[]; decisions: ReviewLoopDecision[] }>(
+      `/review-loops/${loopId}`,
+    ),
   killReviewLoop: (loopId: string, reason = '') =>
     request<ReviewLoop>(`/review-loops/${loopId}/kill`, {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
   decideReviewLoop: (loopId: string, decision: string) =>
-    request<{ ok: boolean; message: string }>(`/review-loops/${loopId}/decision`, {
+    request<ReviewLoopDecisionResult>(`/review-loops/${loopId}/decision`, {
       method: 'POST', body: JSON.stringify({ decision }),
     }),
   getReviewLoopState: (loopId: string) =>
@@ -1196,14 +1298,64 @@ export const api = {
     }),
   resumeSession: (id: string) =>
     request<any>(`/sessions/${id}/resume`, { method: 'POST' }),
-  archiveSession: (id: string) =>
-    request<any>(`/sessions/${id}/archive`, { method: 'POST' }),
+  /** `force` archives even while agents run in the session (they are stopped). */
+  archiveSession: (id: string, opts?: { force?: boolean }) =>
+    request<ArchiveSessionResult>(
+      `/sessions/${id}/archive${opts?.force ? '?force=true' : ''}`, { method: 'POST' },
+    ),
   unarchiveSession: (id: string) =>
     request<any>(`/sessions/${id}/unarchive`, { method: 'POST' }),
   getSessionStatus: (id: string) =>
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+
+  // Agents — the subagent / background-task records of one session, their
+  // transcripts and output, scoped stops, and the server-visible turn queue.
+  getSessionAgents: (sessionId: string, limit = 200) =>
+    request<AgentSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/agents?limit=${limit}`),
+  getAgentDetail: (sessionId: string, agentId: string) =>
+    request<AgentDetail>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}`,
+    ),
+  /** At most one cursor; none returns the tail. Items are always ascending. */
+  getAgentTranscript: (
+    sessionId: string, agentId: string,
+    o: { beforeSeq?: number; afterSeq?: number; limit?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (o.beforeSeq !== undefined) qs.set('before_seq', String(o.beforeSeq));
+    if (o.afterSeq !== undefined) qs.set('after_seq', String(o.afterSeq));
+    if (o.limit !== undefined) qs.set('limit', String(o.limit));
+    const q = qs.toString();
+    return request<AgentTranscriptPage>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/transcript${q ? '?' + q : ''}`,
+    );
+  },
+  getAgentOutput: (sessionId: string, agentId: string, tailBytes = 65536) =>
+    request<AgentOutput>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/output?tail_bytes=${tailBytes}`,
+    ),
+  /** Stop one agent (and, with `cascade`, the agents it spawned). */
+  stopAgent: (sessionId: string, agentId: string, cascade = true) =>
+    request<StopAgentResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/stop`,
+      { method: 'POST', body: JSON.stringify({ cascade }) },
+    ),
+  /** Stop the turn, every agent, or (force) the session's runtime. */
+  stopSession: (sessionId: string, body: StopSessionBody) =>
+    request<StopTurnResult | StopAllResult | ForceStopResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/stop`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  getQueue: (sessionId: string) =>
+    request<{ items: QueueEntryView[] }>(`/sessions/${encodeURIComponent(sessionId)}/queue`),
+  /** Cancel one of the caller's queued messages; `content` is its full text. */
+  cancelQueued: (sessionId: string, queueId: string) =>
+    request<{ cancelled: true; content: string | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
+      { method: 'DELETE' },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>
@@ -1412,8 +1564,10 @@ export const api = {
       langfuse: {
         enabled: boolean;
         host: string | null;
+        project_id: string | null;
         auth_ok: boolean;
         last_flush_at: string | null;
+        usage_rewriter: boolean;
       };
     }>('/observability/status'),
 

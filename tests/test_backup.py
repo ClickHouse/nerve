@@ -8,6 +8,7 @@ running server (the CLI and lifespan task are thin wrappers over this module).
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import stat
@@ -423,6 +424,41 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
     staging = tmp_path / "x2"
     backup_mod.verify_bundle(kept.path, extract_to=staging)
     assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
+
+
+def test_no_secrets_keeps_the_system_principal_claim(nerve_dir, workspace, config_dir, tmp_path):
+    """The record of the system principal ID is instance state, not a secret:
+    a --no-secrets snapshot keeps it and still deletes every secret row."""
+    from nerve.db.accounts import SYSTEM_PRINCIPAL_CLAIM_NAME
+
+    claim = "00000000-0000-4000-8000-00000000c2c2"
+    _plant_instance_secret(nerve_dir / "nerve.db")
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('setup_token', 'planted-setup-token')"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES (?, ?)", (SYSTEM_PRINCIPAL_CLAIM_NAME, claim),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
+    assert report.ok, report.errors
+    snapshot = staging / "state" / "nerve.db"
+    assert _stored_secrets(snapshot) == [claim]
+    raw = snapshot.read_bytes().decode("latin-1")
+    assert "planted-signing-secret" not in raw
+    assert "planted-setup-token" not in raw
+    assert sorted(_stored_secrets(nerve_dir / "nerve.db")) == sorted(
+        ["planted-signing-secret", "planted-setup-token", claim]
+    )
 
 
 # Obviously synthetic, and long enough to be found in the raw file bytes.
@@ -1190,6 +1226,23 @@ def test_restore_refuses_on_live_pidfile(nerve_dir, workspace, config_dir, tmp_p
 
     with pytest.raises(BackupError, match="running"):
         backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
+
+
+def test_restore_refuses_on_held_lock(nerve_dir, workspace, config_dir, tmp_path):
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+    target = tmp_path / "live_nerve"
+    target.mkdir()
+    (target / "nerve.pid").write_text("12345")
+    # Lock through a new descriptor, as the live daemon does.
+    fd = os.open(target / "nerve.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(BackupError, match="running"):
+            backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
+    finally:
+        os.close(fd)
 
 
 def test_restore_refuses_nonempty_without_force(nerve_dir, workspace, config_dir, tmp_path):

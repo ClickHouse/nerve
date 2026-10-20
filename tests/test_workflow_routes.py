@@ -9,6 +9,7 @@ so the routes exercise genuine validation/lifecycle against a fake engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -16,9 +17,11 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.db import Database
 
-from tests.actor_rows import ensure_system_principal
+from tests.actor_rows import ensure_actor_row, ensure_system_principal
+from tests.conftest import TEST_ACTOR
 
 
 @pytest_asyncio.fixture
@@ -79,6 +82,9 @@ class FakeEngine:
     def add_stop_listener(self, callback) -> None:
         pass
 
+    def watch_turns(self, session_id: str):
+        return contextlib.nullcontext(TurnWatch(TurnOutcome()))
+
 
 async def _drain(setup) -> None:
     """Execute spawned run payloads on the current (test) event loop.
@@ -115,6 +121,8 @@ class TestWorkflowRunRoutes:
         cfg.workflows.runs_dir = tmp_path
         cfg.workflows.kill_grace_seconds = 0
         cfg_mod._config = cfg
+        # Create and kill record the signed-in person, a foreign key.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         engine = FakeEngine(db)
         init_deps(engine=engine, db=db)  # type: ignore[arg-type]
@@ -159,6 +167,8 @@ class TestWorkflowRunRoutes:
         assert body["status"] in ("pending", "running")
         assert body["budget_usd"] == 5.0
         assert body["created_by"] == "api"
+        assert body["created_by_actor_id"] == TEST_ACTOR.actor_id
+        assert body["caused_by_actor_id"] == TEST_ACTOR.actor_id
         assert body["spec"]["prompt"] == "fix issue #12 in myorg/myrepo"
 
         await _drain(setup)

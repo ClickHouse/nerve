@@ -18,7 +18,7 @@ from nerve.agent.plan_service import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
             await decline_plan(
                 db=deps.db, engine=deps.engine,
                 plan_id=plan_id, feedback=req.feedback,
+                actor=actor, cause=actor, caller_session_id="web",
             )
         except PlanNotFound:
             raise HTTPException(status_code=404, detail="Plan not found")
@@ -87,7 +88,17 @@ async def update_plan(plan_id: str, req: PlanUpdateRequest, actor: Actor = Depen
         fields["feedback"] = req.feedback
 
     if fields:
-        await deps.db.update_plan(plan_id, **fields)
+        # A status or feedback change is this person's review decision. It
+        # applies only while the plan still has the status read above, so a
+        # decision made in the meantime is not overwritten.
+        if not await deps.db.compare_and_update_plan(
+            plan_id, expect_status=plan["status"],
+            attribution=attribution_for(actor), **fields,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Plan is no longer '{plan['status']}'; another decision was made first",
+            )
 
     return {"plan_id": plan_id, "updated": True}
 
@@ -111,6 +122,8 @@ async def revise_plan(plan_id: str, req: PlanReviseRequest, actor: Actor = Depen
             engine=deps.engine,
             plan_id=plan_id,
             feedback=req.feedback,
+            actor=actor,
+            cause=actor,
         )
     except PlanNotFound:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -137,7 +150,7 @@ async def approve_plan_route(
         result = await approve_plan(
             db=deps.db, engine=deps.engine, plan_id=plan_id,
             # The session exists because this person approved the plan.
-            actor=actor,
+            actor=actor, cause=actor, caller_session_id="web",
         )
     except PlanNotFound:
         raise HTTPException(status_code=404, detail="Plan not found")

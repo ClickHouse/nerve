@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
+from nerve.identity import Actor, ActorOrId, Attribution, actor_id_of
+
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig
@@ -39,6 +41,14 @@ class ToolContext:
     Fields are concrete types rather than Protocols to keep call sites
     readable; tests construct ``ToolContext`` with mocks/None for fields a
     given handler doesn't need.
+
+    ``actor`` performs the tool call: the system actor when the agent calls a
+    tool, the person when an HTTP route invokes a handler. ``cause`` is the
+    principal on whose behalf the call happens: for an agent tool call, the
+    session's stored cause (``sessions.caused_by_actor_id``); for a route, the
+    person. It is a fixed value, or a callable that returns the cause when a
+    handler reads it. Read it through :attr:`cause_id` or :attr:`attribution`,
+    never directly.
     """
 
     session_id: str
@@ -51,6 +61,21 @@ class ToolContext:
     engine: "AgentEngine | None" = None
     notification_service: "NotificationService | None" = None
     runtime_metadata: dict[str, Any] = field(default_factory=dict)
+    actor: Actor | None = None
+    cause: "ActorOrId | Callable[[], ActorOrId | None] | None" = None
+
+    @property
+    def cause_id(self) -> str | None:
+        """The cause actor ID at the time of the read, or ``None`` if unknown."""
+        cause = self.cause() if callable(self.cause) else self.cause
+        return actor_id_of(cause)
+
+    @property
+    def attribution(self) -> Attribution:
+        """The pair that a write made by this tool call records."""
+        return Attribution(
+            actor_id=actor_id_of(self.actor), caused_by_actor_id=self.cause_id,
+        )
 
 
 @dataclass

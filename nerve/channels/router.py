@@ -29,11 +29,37 @@ from nerve.channels.base import (
 )
 from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
+from nerve.identity import UNATTRIBUTED
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
 
 logger = logging.getLogger(__name__)
+
+
+def turn_stop_note(result: dict[str, Any], session_id: str) -> str | None:
+    """What a channel answers when ``/stop`` could not stop the turn, or
+    ``None`` when it stopped one (``stopped`` / ``killed``) or nothing ran.
+
+    ``/stop`` stops the turn only. A runtime that cannot spare background
+    agents is never told to stop (``needs_confirmation``): the answer says
+    so instead of "nothing running". A turn that did not end within the
+    graceful wait while agents run is left running (``not_stopped``).
+    """
+    outcome = result.get("turn")
+    if outcome == "needs_confirmation":
+        n = len(result.get("would_end") or [])
+        agents = "1 background agent" if n == 1 else f"{n} background agents"
+        return (
+            f"Couldn't stop `{session_id}` without stopping its {agents}. "
+            f"Stop {'it' if n == 1 else 'them'} from the web UI."
+        )
+    if outcome == "not_stopped":
+        return (
+            f"`{session_id}` didn't stop within 5 s. Force stop it from the "
+            "web UI; that also ends its background agents."
+        )
+    return None
 
 
 class ChannelRouter:
@@ -214,6 +240,7 @@ class ChannelRouter:
                 # Provider-person mapping is not available yet, so external
                 # human input remains unidentified rather than guessed.
                 actor=None,
+                origin=msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -276,6 +303,7 @@ class ChannelRouter:
                 channel=last_msg.channel_name,
                 images=all_images or None,
                 actor=None,
+                origin=last_msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -507,17 +535,30 @@ class ChannelRouter:
             exclude_statuses=("archived", "stopped"),
         )
 
+    # Channel commands come from a channel user that names no person, so
+    # the session changes that they make are unattributed.
+
     async def stop_session(self, session_id: str) -> bool:
         """Stop a session through the engine lifecycle boundary."""
-        return await self.engine.stop_session(session_id)
+        return await self.engine.stop_session(session_id, attribution=UNATTRIBUTED)
+
+    async def stop_turn(self, session_id: str) -> dict[str, Any]:
+        """Stop the session's turn (background agents keep running) and
+        return the engine's ``StopTurnResult``, so ``/stop`` can say why a
+        turn was left running (see :func:`turn_stop_note`)."""
+        return await self.engine.stop_turn(session_id, attribution=UNATTRIBUTED)
 
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
-        return await self.engine.sessions.set_starred(session_id, starred)
+        return await self.engine.sessions.set_starred(
+            session_id, starred, attribution=UNATTRIBUTED,
+        )
 
     async def toggle_session_starred(self, session_id: str) -> bool:
         """Toggle a session's starred state."""
-        return await self.engine.sessions.toggle_starred(session_id)
+        return await self.engine.sessions.toggle_starred(
+            session_id, attribution=UNATTRIBUTED,
+        )
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""

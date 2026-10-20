@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from nerve.identity import UNATTRIBUTED, Attribution
+
 
 class PlanStore:
     """Mixin providing plan CRUD operations."""
@@ -18,12 +20,21 @@ class PlanStore:
         version: int = 1,
         parent_plan_id: str | None = None,
         plan_type: str = "generic",
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
+        """Insert a plan version.
+
+        ``attribution`` is who wrote this version and on whose behalf:
+        written to ``created_by_actor_id`` and ``caused_by_actor_id``.
+        """
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
-            """INSERT INTO plans (id, task_id, session_id, content, model, version, parent_plan_id, plan_type, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (plan_id, task_id, session_id, content, model, version, parent_plan_id, plan_type, now),
+            """INSERT INTO plans (id, task_id, session_id, content, model, version, parent_plan_id, plan_type, created_at,
+                                  created_by_actor_id, caused_by_actor_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (plan_id, task_id, session_id, content, model, version, parent_plan_id, plan_type, now,
+             attribution.actor_id, attribution.caused_by_actor_id),
         )
         return {"id": plan_id, "task_id": task_id, "version": version, "plan_type": plan_type}
 
@@ -69,21 +80,45 @@ class PlanStore:
             f"UPDATE plans SET {sets} WHERE id = ?", tuple(vals),
         )
 
-    async def transition_plan(self, plan_id: str, from_status: str, **fields) -> bool:
-        """Update a plan only if it is still in ``from_status``.
+    async def compare_and_update_plan(
+        self,
+        plan_id: str,
+        *,
+        expect_status: str,
+        attribution: Attribution | None = None,
+        **fields,
+    ) -> bool:
+        """Write ``fields`` only while the plan's status is ``expect_status``.
 
-        The status check and the write are one statement, so when several
-        callers race to act on the same plan exactly one of them gets
-        ``True``; the others get ``False`` and must not act.
+        A decision reads the plan, checks its status and then acts, and a
+        second decision can read the same status before the first one
+        writes. This one statement decides: of several decisions that change
+        the status and were made from the same status, only one changes the
+        row, and only that caller may start the work that the decision
+        causes. A decision that keeps the status (a revision request, a
+        feedback-only PATCH) does not stop a later decision from the same
+        status, and two of them can both apply.
+
+        ``attribution`` marks a review decision (approve, decline, a
+        revision request, a status or feedback change through REST). Its
+        pair goes to ``reviewed_by_actor_id`` and
+        ``reviewed_caused_by_actor_id`` in the same statement. ``None`` (for
+        example the planner superseding its own plan) leaves them as they
+        are.
+
+        Returns True when this call changed the row.
         """
+        if attribution is not None:
+            fields["reviewed_by_actor_id"] = attribution.actor_id
+            fields["reviewed_caused_by_actor_id"] = attribution.caused_by_actor_id
         if not fields:
-            raise ValueError("transition_plan needs at least one field to set")
+            raise ValueError("compare_and_update_plan needs at least one field")
         sets = ", ".join(f"{k} = ?" for k in fields)
         result = await self._write(
             f"UPDATE plans SET {sets} WHERE id = ? AND status = ?",
-            (*fields.values(), plan_id, from_status),
+            (*fields.values(), plan_id, expect_status),
         )
-        return (result.rowcount or 0) == 1
+        return result.rowcount == 1
 
     async def get_plans_for_task(self, task_id: str) -> list[dict]:
         async with self.db.execute(

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useShallow } from 'zustand/react/shallow';
 import { useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
@@ -10,7 +11,10 @@ import { ContextBar } from '../components/Chat/ContextBar';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
-import { BackgroundJobs } from '../components/Chat/BackgroundJobs';
+import { AgentDock } from '../components/Chat/agents/AgentDock';
+import { ForceStopDialog } from '../components/Chat/agents/ForceStopDialog';
+import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
+import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
 import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
@@ -22,6 +26,7 @@ import type { ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
+import { langfuseSessionUrl, type LangfuseLinkStatus } from '../utils/langfuseLinks';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
 const STATUS_LABELS: Record<string, string> = {
@@ -50,16 +55,50 @@ export function ChatPage() {
     const seed = (location.state as { suggestedMessage?: unknown } | null)?.suggestedMessage;
     return typeof seed === 'string' && seed.trim() ? seed : null;
   });
+  // Nothing here selects streamingBlocks or the panels array: both change for
+  // each streamed token. StreamingMessage subscribes to the blocks itself.
   const {
     sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
-    streamingBlocks, isStreaming, loading,
+    isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
-    sidebarCollapsed, mobileSidebarOpen, panels, panelVisible,
+    sidebarCollapsed, mobileSidebarOpen, panelVisible,
     modifiedFiles, modifiedFilesCount,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
     sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
-  } = useChatStore();
+  } = useChatStore(useShallow(s => ({
+    sessions: s.sessions,
+    archivedSessions: s.archivedSessions,
+    systemSessions: s.systemSessions,
+    activeSession: s.activeSession,
+    virtualSession: s.virtualSession,
+    messages: s.messages,
+    isStreaming: s.isStreaming,
+    loading: s.loading,
+    agentStatus: s.agentStatus,
+    contextUsage: s.contextUsage,
+    backendStatus: s.backendStatus,
+    currentTodos: s.currentTodos,
+    currentCCTasks: s.currentCCTasks,
+    sidebarCollapsed: s.sidebarCollapsed,
+    mobileSidebarOpen: s.mobileSidebarOpen,
+    panelVisible: s.panelVisible,
+    modifiedFiles: s.modifiedFiles,
+    modifiedFilesCount: s.modifiedFilesCount,
+    backendDefault: s.backendDefault,
+    newChatBackend: s.newChatBackend,
+    loadSessions: s.loadSessions,
+    switchSession: s.switchSession,
+    createSession: s.createSession,
+    deleteSession: s.deleteSession,
+    sendMessage: s.sendMessage,
+    stopSession: s.stopSession,
+    toggleSessionList: s.toggleSessionList,
+    setMobileSidebarOpen: s.setMobileSidebarOpen,
+    openFilesPanel: s.openFilesPanel,
+  })));
+  const hasPanels = useChatStore(s => s.panels.length > 0);
+  const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
 
   // The active session row may live in the feed or a lazy archived/system group.
   const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
@@ -134,6 +173,13 @@ export function ChatPage() {
       description: 'Toggle side panel',
       section: 'chat',
       action: () => useChatStore.getState().togglePanel(),
+    },
+    {
+      id: 'chat-toggle-agents',
+      combo: { mod: true, shift: true, key: 'e' },
+      description: 'Toggle the agents panel',
+      section: 'chat',
+      action: () => useChatStore.getState().toggleAgentsPanel(),
     },
     {
       id: 'chat-toggle-sidebar',
@@ -225,14 +271,19 @@ export function ChatPage() {
   }, [activeSession, activeSessionRow]);
 
   // Langfuse deep-link status — fetched once. Shows a small "external link"
-  // icon when observability is enabled so we can jump from a session to
-  // its trace in Langfuse.
-  const [langfuse, setLangfuse] = useState<{ host: string | null; enabled: boolean } | null>(null);
+  // icon when observability is enabled and the project is known, so we can
+  // jump from a session to its traces in Langfuse.
+  const [langfuse, setLangfuse] = useState<LangfuseLinkStatus | null>(null);
   useEffect(() => {
     api.getObservabilityStatus()
-      .then(s => setLangfuse({ host: s.langfuse.host, enabled: s.langfuse.enabled }))
-      .catch(() => setLangfuse({ host: null, enabled: false }));
+      .then(s => setLangfuse({
+        host: s.langfuse.host,
+        enabled: s.langfuse.enabled,
+        project_id: s.langfuse.project_id ?? null,
+      }))
+      .catch(() => setLangfuse(null));
   }, []);
+  const langfuseUrl = langfuseSessionUrl(langfuse, activeSession);
 
   useEffect(() => {
     loadSessions().then(() => {
@@ -266,10 +317,9 @@ export function ChatPage() {
     : STATUS_LABELS[agentStatus.state] || null;
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
-  const filesPanelActive = panels.some(p => p.id === 'files-panel');
   // SidePanel renders nothing without a tab, so it only covers the column when
   // there is one.
-  const panelCoversColumn = isMobile && panelVisible && panels.length > 0;
+  const panelCoversColumn = isMobile && panelVisible && hasPanels;
 
   return (
     // `relative` anchors the mobile side panel, which covers this column but
@@ -395,11 +445,6 @@ export function ChatPage() {
               })()}
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <BackgroundJobs
-                sessions={sessions}
-                activeSession={activeSession}
-                onSelect={switchSession}
-              />
               {canForkSession && (
                 <Button
                   variant="subtle"
@@ -425,9 +470,9 @@ export function ChatPage() {
                   <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
                 </div>
               )}
-              {langfuse?.enabled && langfuse.host && activeSession && (
+              {langfuseUrl && (
                 <a
-                  href={`${langfuse.host}/sessions?sessionId=${encodeURIComponent(activeSession)}`}
+                  href={langfuseUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hidden md:flex items-center gap-1 px-2 py-1 rounded text-xs text-text-faint hover:text-text-secondary hover:bg-surface-raised transition-colors cursor-pointer"
@@ -487,7 +532,6 @@ export function ChatPage() {
             ) : (
               <MessageList
                 messages={messages}
-                streamingBlocks={streamingBlocks}
                 isStreaming={isStreaming}
                 onForkMessage={canForkSession ? handleForkMessage : undefined}
                 messageForks={messageForks}
@@ -501,21 +545,29 @@ export function ChatPage() {
           <InteractiveQuestionCard />
           <ApprovalCard />
 
-          {/* The composer stays typeable while a turn runs so a reply is never
-              lost mid-stream. `isStreaming` still swaps Send↔Stop and blocks
-              sending (canSend), so the text is just held as the session's draft
-              until the turn ends — a turn in progress is not a reason to block
-              typing, hence no `disabled`. */}
+          {/* What a Stop could not do alone (force, or confirm stopping agents). */}
+          <StopEscalationBanner />
+          {/* The session's agents in one line; opens the Agents panel. */}
+          <AgentDock sessionId={activeSession} />
+
+          {/* The composer always sends: while a turn runs, `isStreaming` swaps
+              Send for Queue next to the split Stop, and a message sent then
+              waits in the server's queue and runs next. Agents running in the
+              background never put it in that state. */}
           <ChatInput
             onSend={sendMessage}
             onStop={stopSession}
             isStreaming={isStreaming}
             seed={suggestedMessage}
           />
+
+          {/* Portals: the stop confirmations. */}
+          <StopAllDialog />
+          <ForceStopDialog />
         </div>
 
         {/* Side panel — sub-agents, plans, files, etc. (always render when tabs exist for animation) */}
-        {panels.length > 0 && <SidePanel />}
+        {hasPanels && <SidePanel />}
       </div>
     </div>
   );

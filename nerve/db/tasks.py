@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
+from nerve.identity import UNATTRIBUTED, Attribution
+
 
 # Spacing between task ranks (``tasks.position``). Wide enough that a
 # midpoint insert has ~50 levels of headroom before float precision runs
@@ -45,15 +47,21 @@ def _resolve_kept(value, stored: dict | None, column: str, default):
     return default if kept is None else kept
 
 
+# Columns :meth:`TaskStore.transition_task` may set alongside the status.
+_TRANSITION_FIELDS = frozenset({
+    "file_path", "title", "deadline", "tags", "source", "source_url",
+})
+
+
 class TaskStore:
     """Mixin providing task CRUD, FTS search, and escalation operations."""
 
     async def upsert_task(
         self,
         task_id: str,
-        file_path: str,
+        file_path: str | _Keep,
         title: str,
-        status: str = "pending",
+        status: str | _Keep = "pending",
         source: str | None | _Keep = KEEP,
         source_url: str | None | _Keep = KEEP,
         deadline: str | None | _Keep = KEEP,
@@ -61,11 +69,19 @@ class TaskStore:
         content: str = "",
         position: float | None = None,
         actor: str = "system",
-    ) -> None:
+        *,
+        expect_revision: int | None = None,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Insert or update a task row and its FTS entry.
 
         ``file_path``, ``title``, ``status`` and ``content`` are a full
         replace. Every caller rebuilds them from the markdown file.
+        ``file_path`` and ``status`` also take :data:`KEEP`, which keeps the
+        stored value, read in the same transaction as the write. A caller that
+        edits only the content passes it, so that a status change that lands
+        between its read and this write is kept and is not recorded again.
+        :data:`KEEP` needs an existing row.
 
         ``source``, ``source_url``, ``deadline``, ``tags`` and ``position``
         are preserve-on-omit. An omitted column keeps its stored value. To
@@ -82,6 +98,14 @@ class TaskStore:
         nulled the other four when it moved a file into done/.
         ``test_task_position.py``, ``test_task_reindex.py`` and
         ``test_task_completion.py`` hold the regression coverage.
+
+        With ``expect_revision`` the write only updates an existing row whose
+        ``revision`` still equals it, and otherwise writes nothing and returns
+        ``False``. Without it the call inserts or updates unconditionally and
+        returns ``True``.
+
+        ``actor`` and ``attribution`` go to the status event that a status
+        change records; see :meth:`_record_status_event`.
         """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
@@ -89,6 +113,10 @@ class TaskStore:
             # write. The statement below stays a plain full replace, and the
             # FTS text sees the tags that actually land in the row.
             stored = await self._stored_task_columns(task_id)
+            if stored is None and (file_path is KEEP or status is KEEP):
+                raise ValueError(f"task {task_id!r} has no row to keep values from")
+            file_path = _resolve_kept(file_path, stored, "file_path", None)
+            status = _resolve_kept(status, stored, "status", None)
             source = _resolve_kept(source, stored, "source", None)
             source_url = _resolve_kept(source_url, stored, "source_url", None)
             deadline = _resolve_kept(deadline, stored, "deadline", None)
@@ -99,29 +127,126 @@ class TaskStore:
             previous_status = stored["status"] if stored else None
             if position is None:
                 position = await self._resolve_upsert_position(stored, status)
-            await self.db.execute(
-                """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, position, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       file_path=excluded.file_path, title=excluded.title, status=excluded.status,
-                       source=excluded.source, source_url=excluded.source_url,
-                       deadline=excluded.deadline, tags=excluded.tags,
-                       position=excluded.position, updated_at=?""",
-                (task_id, file_path, title, status, source, source_url, deadline, tags, position, now, now, now),
+            if expect_revision is None:
+                cursor = await self.db.execute(
+                    """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, position, revision, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           file_path=excluded.file_path, title=excluded.title, status=excluded.status,
+                           source=excluded.source, source_url=excluded.source_url,
+                           deadline=excluded.deadline, tags=excluded.tags,
+                           position=excluded.position, updated_at=?,
+                           revision=tasks.revision + 1""",
+                    (task_id, file_path, title, status, source, source_url, deadline, tags, position, now, now, now),
+                )
+            else:
+                # A plain UPDATE, not the upsert: an ON CONFLICT guard binds only
+                # the UPDATE arm, so its INSERT arm would re-create a deleted row.
+                cursor = await self.db.execute(
+                    """UPDATE tasks SET file_path = ?, title = ?, status = ?, source = ?,
+                           source_url = ?, deadline = ?, tags = ?, position = ?,
+                           updated_at = ?, revision = revision + 1
+                       WHERE id = ? AND revision = ?""",
+                    (file_path, title, status, source, source_url, deadline, tags, position, now,
+                     task_id, expect_revision),
+                )
+            rowcount = cursor.rowcount
+            await cursor.close()
+            if expect_revision is not None and (rowcount or 0) != 1:
+                return False
+            await self._record_status_event(
+                task_id, previous_status, status, actor, attribution,
             )
-            # Sync FTS index — include tags and content so they're all searchable.
-            # The join key is the RAW task_id; readers join on `f.task_id = t.id`.
-            # The FTS5 tokenizer already splits the hyphenated slug into words
-            # ("2026-03-10-distribution" → 2026, 03, 10, distribution), so slug
-            # search works without rewriting the key — and the key stays joinable.
-            await self._record_status_event(task_id, previous_status, status, actor)
+            await self._sync_task_fts(task_id, title, content, tags)
+        return True
 
-            fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
-            await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
-            await self.db.execute(
-                "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
-                (task_id, title, fts_content),
+    async def transition_task(
+        self,
+        task_id: str,
+        to_status: str,
+        *,
+        expect: tuple[str, ...] = (),
+        expect_revision: int | None = None,
+        actor: str = "system",
+        attribution: Attribution = UNATTRIBUTED,
+        content: str | None = None,
+        **fields,
+    ) -> bool:
+        """Move a task to ``to_status`` iff it still matches the expectations.
+
+        ``expect`` lists the statuses the row may currently hold (empty means
+        any) and ``expect_revision`` the revision it must carry. Both are
+        checked inside the UPDATE, so they hold against other processes too.
+        Returns ``True`` only for the caller whose write landed; a missing
+        row, an unexpected status or a stale revision writes nothing.
+
+        A rank only means anything relative to its own lane, so a status
+        change re-ranks the card to the top of its destination, while a
+        same-lane call leaves ``position`` alone so a redundant update does not
+        reshuffle the board. Whitelisted ``fields`` land in the same statement,
+        and ``content`` re-syncs the FTS text in the same transaction.
+
+        Unlike the review-loop and workflow-run transitions, ``to_status`` is
+        not validated here: task statuses are user-configured rows, checked at
+        the tool boundary. The guard covers the row, not the caller's file
+        work, so two callers that both succeed can still lose one another's
+        markdown edits.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT status, title, tags FROM tasks WHERE id = ?", (task_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+            assignments = ["status = ?", "updated_at = ?", "revision = revision + 1"]
+            params: list = [to_status, now]
+            if row["status"] != to_status:
+                assignments.append("position = ?")
+                params.append(await self._lane_top_position(to_status))
+            for column, value in fields.items():
+                if column in _TRANSITION_FIELDS:
+                    assignments.append(f"{column} = ?")
+                    params.append(value)
+            where = "id = ?"
+            params.append(task_id)
+            if expect:
+                where += f" AND status IN ({','.join('?' for _ in expect)})"
+                params.extend(expect)
+            if expect_revision is not None:
+                where += " AND revision = ?"
+                params.append(expect_revision)
+            cursor = await self.db.execute(
+                f"UPDATE tasks SET {', '.join(assignments)} WHERE {where}", params,
             )
+            applied = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if not applied:
+                return False
+            await self._record_status_event(
+                task_id, row["status"], to_status, actor, attribution,
+            )
+            if content is not None:
+                await self._sync_task_fts(
+                    task_id, fields.get("title", row["title"]), content,
+                    fields.get("tags", row["tags"]) or "",
+                )
+        return True
+
+    async def _sync_task_fts(self, task_id: str, title: str, content: str, tags: str) -> None:
+        """Rewrite one task's FTS row. Caller must hold ``_atomic()``."""
+        # Sync FTS index — include tags and content so they're all searchable.
+        # The join key is the RAW task_id; readers join on `f.task_id = t.id`.
+        # The FTS5 tokenizer already splits the hyphenated slug into words
+        # ("2026-03-10-distribution" → 2026, 03, 10, distribution), so slug
+        # search works without rewriting the key — and the key stays joinable.
+        fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
+        await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
+        await self.db.execute(
+            "INSERT INTO tasks_fts (task_id, title, content) VALUES (?, ?, ?)",
+            (task_id, title, fts_content),
+        )
 
     async def get_task(self, task_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cursor:
@@ -136,6 +261,7 @@ class TaskStore:
         from_status: str | None,
         to_status: str,
         actor: str,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> None:
         """Append a transition to ``task_events``, if it is one.
 
@@ -149,14 +275,20 @@ class TaskStore:
         is recorded. The single case where reindex *does* change a status —
         resetting an orphaned row to match its directory — is a real
         correction and worth a row.
+
+        ``actor`` is the free-text origin of the change (``web``, a session
+        ID, ``system``). ``attribution`` names the actor that made the change
+        and the principal it was made for, as ``actor_refs`` IDs.
         """
         if from_status == to_status:
             return
         await self.db.execute(
-            "INSERT INTO task_events (task_id, from_status, to_status, actor, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO task_events (task_id, from_status, to_status, actor, "
+            "actor_id, caused_by_actor_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id, from_status, to_status, actor or "system",
+                attribution.actor_id, attribution.caused_by_actor_id,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -220,7 +352,7 @@ class TaskStore:
     async def _stored_task_columns(self, task_id: str) -> dict | None:
         """The columns an upsert can preserve, or ``None`` for a new task."""
         async with self.db.execute(
-            "SELECT status, position, source, source_url, deadline, tags "
+            "SELECT status, file_path, position, source, source_url, deadline, tags "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ) as cursor:
@@ -274,7 +406,7 @@ class TaskStore:
             ids = [row[0] async for row in cursor]
         if ids:
             await self.db.executemany(
-                "UPDATE tasks SET position = ? WHERE id = ?",
+                "UPDATE tasks SET position = ?, revision = revision + 1 WHERE id = ?",
                 [((i + 1) * POSITION_GAP, tid) for i, tid in enumerate(ids)],
             )
 
@@ -320,6 +452,7 @@ class TaskStore:
         before_id: str | None = None,
         after_id: str | None = None,
         actor: str = "system",
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict | None:
         """Place a task at an explicit slot in a lane; return the new row.
 
@@ -354,13 +487,14 @@ class TaskStore:
             )
             now = datetime.now(timezone.utc).isoformat()
             await self.db.execute(
-                "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
+                "UPDATE tasks SET status = ?, position = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
                 (lane, position, now, task_id),
             )
             # A pure reorder leaves status alone, and _record_status_event
             # drops the no-op — so dragging within a lane doesn't pollute
             # the history with rows that say nothing changed.
-            await self._record_status_event(task_id, row[0], lane, actor)
+            await self._record_status_event(task_id, row[0], lane, actor, attribution)
             async with self.db.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,),
             ) as cursor:
@@ -455,42 +589,22 @@ class TaskStore:
 
     async def update_task_status(
         self, task_id: str, status: str, actor: str = "system",
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> None:
-        """Move a task to another status, re-ranking it into the new lane.
+        """An unconditional :meth:`transition_task`; a missing row is a no-op."""
+        await self.transition_task(task_id, status, actor=actor, attribution=attribution)
 
-        A rank only means anything relative to its own lane, so carrying
-        the old one across a status change would drop the card at an
-        arbitrary depth of its destination — the agent marking something
-        in_progress would land it in the middle of the lane rather than
-        somewhere a person would look. Same-lane calls skip the re-rank so
-        a redundant update doesn't reshuffle the board.
-        """
+    async def update_task_tags(
+        self, task_id: str, tags: str, *, expect_revision: int | None = None,
+    ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
-        async with self._atomic():
-            async with self.db.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row is None:
-                return
-            if row[0] == status:
-                await self.db.execute(
-                    "UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id),
-                )
-                return
-            position = await self._lane_top_position(status)
-            await self.db.execute(
-                "UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?",
-                (status, position, now, task_id),
-            )
-            await self._record_status_event(task_id, row[0], status, actor)
-
-    async def update_task_tags(self, task_id: str, tags: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        await self._write(
-            "UPDATE tasks SET tags = ?, updated_at = ? WHERE id = ?",
-            (tags, now, task_id),
-        )
+        sql = "UPDATE tasks SET tags = ?, updated_at = ?, revision = revision + 1 WHERE id = ?"
+        params: tuple = (tags, now, task_id)
+        if expect_revision is not None:
+            sql += " AND revision = ?"
+            params += (expect_revision,)
+        result = await self._write(sql, params)
+        return (result.rowcount or 0) == 1
 
     async def count_tasks_by_status(self) -> dict[str, int]:
         """Task counts keyed by status — one query for every board lane."""
@@ -754,7 +868,8 @@ class TaskStore:
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
-            "UPDATE tasks SET escalation_level = ?, last_reminded_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE tasks SET escalation_level = ?, last_reminded_at = ?, updated_at = ?, "
+            "revision = revision + 1 WHERE id = ?",
             (level, reminded_at or now, now, task_id),
         )
 

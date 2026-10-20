@@ -67,6 +67,7 @@ from nerve.agent.interactive import (
     InteractiveToolHandler,
     _read_file_safe,
 )
+from nerve.inference_principal import custom_headers_env
 from nerve.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,39 @@ _MODEL_ALIAS_ENV_VARS: dict[str, str] = {
     "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
 }
+
+# The CLI keeps a session's history in ~/.claude/projects/<name>/, where
+# <name> is the cwd with every character outside [a-zA-Z0-9] replaced by
+# '-'. When that name is longer than _PROJECT_DIR_MAX_LEN, the CLI cuts it
+# to that length and adds '-' plus a hash of the cwd.
+_PROJECT_DIR_MAX_LEN = 200
+_PROJECT_DIR_UNSAFE = re.compile(r"[^a-zA-Z0-9]")
+
+
+def _encode_project_dir(path: str) -> str:
+    """Return the CLI's project directory name for *path*, before the cut.
+
+    The CLI's regex works on UTF-16 code units, so a character outside
+    the Basic Multilingual Plane becomes two '-'.
+    """
+    return _PROJECT_DIR_UNSAFE.sub(
+        lambda m: "--" if ord(m.group()) > 0xFFFF else "-", path,
+    )
+
+
+def _long_project_dir_names(projects: str, encoded: str) -> list[str]:
+    """Return the entries of *projects* that can hold the history of a
+    cwd whose encoded name is longer than _PROJECT_DIR_MAX_LEN.
+
+    The CLI matches such directories on the cut name plus '-' when it
+    looks up a session, so do the same and do not compute the hash.
+    """
+    prefix = encoded[:_PROJECT_DIR_MAX_LEN] + "-"
+    try:
+        with os.scandir(projects) as entries:
+            return [e.name for e in entries if e.name.startswith(prefix)]
+    except FileNotFoundError:
+        return []
 
 
 # ------------------------------------------------------------------ #
@@ -180,17 +214,41 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
                         ),
                         description=str(tool_input.get("description", "")),
                         model=str(tool_input.get("model", "")) or None,
+                        # Set for a nested spawn (an agent's own Agent call).
+                        parent_tool_use_id=parent_id,
                     ))
             elif isinstance(block, ToolResultBlock):
                 out.append(_translate_tool_result(block, parent_id))
+
+        # A sub-agent's model call: keep its model and usage for the agent's
+        # own tokens and cost (the parent turn never sees them). Frames of
+        # one call share a message id; the registry keeps the last one.
+        usage = getattr(message, "usage", None)
+        if parent_id is not None and isinstance(usage, dict) and usage:
+            out.append(ev.SubagentUsage(
+                parent_tool_use_id=parent_id,
+                message_id=(
+                    getattr(message, "message_id", None)
+                    or getattr(message, "uuid", None)
+                ),
+                model=msg_model or None,
+                usage=dict(usage),
+            ))
 
     elif isinstance(message, UserMessage):
         parent_id = getattr(message, "parent_tool_use_id", None)
         content = getattr(message, "content", [])
         if isinstance(content, list):
-            for block in content:
-                if isinstance(block, ToolResultBlock):
-                    out.append(_translate_tool_result(block, parent_id))
+            results = [b for b in content if isinstance(b, ToolResultBlock)]
+            # The structured tool output describes the message's one tool
+            # result; with several results it cannot be attributed.
+            structured = getattr(message, "tool_use_result", None)
+            if len(results) != 1 or not isinstance(structured, dict):
+                structured = None
+            for block in results:
+                out.append(_translate_tool_result(
+                    block, parent_id, structured=structured,
+                ))
 
     elif isinstance(message, SystemMessage):
         subtype = getattr(message, "subtype", "") or ""
@@ -251,12 +309,14 @@ def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
 
 def _translate_tool_result(
     block: ToolResultBlock, parent_id: str | None,
+    *, structured: dict[str, Any] | None = None,
 ) -> ev.ToolResult:
     return ev.ToolResult(
         tool_use_id=getattr(block, "tool_use_id", None),
         content=block.content,
         is_error=bool(getattr(block, "is_error", False) or False),
         parent_tool_use_id=parent_id,
+        structured=structured,
     )
 
 
@@ -375,7 +435,14 @@ class ClaudeToolPermissions:
                 )
             )
 
-        outcome = await hub.request_interaction(tool_name, tool_input)
+        # A foreground sub-agent's question names the agent that asked.
+        agent_task_id = getattr(context, "agent_id", None)
+        if agent_task_id:
+            outcome = await hub.request_interaction(
+                tool_name, tool_input, agent_task_id=agent_task_id,
+            )
+        else:
+            outcome = await hub.request_interaction(tool_name, tool_input)
         if outcome.cancelled:
             return PermissionResultDeny(
                 message=outcome.message or "Session stopped by user.",
@@ -407,6 +474,8 @@ class ClaudeBackend:
         supports_cache_ttl=True,
         interactive_builtins=True,
         reports_context_window=False,
+        supports_task_stop=True,
+        supports_agent_transcripts=True,
     )
 
     def __init__(self, deps: Any):
@@ -445,11 +514,13 @@ class ClaudeBackend:
 
             ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
 
-        where <encoded-cwd> is the absolute cwd path with every '/'
-        replaced by '-'.  The CLI resolves the cwd symlink before
-        encoding, so when the workspace is itself a symlink the history
-        lives under the *realpath*-encoded directory. Check the realpath
-        first and fall back to the unresolved path.
+        where <encoded-cwd> is the absolute cwd path with every character
+        outside [a-zA-Z0-9] replaced by '-'. A name over 200 characters
+        gets a hash suffix (see ``_PROJECT_DIR_MAX_LEN``).  The CLI
+        resolves the cwd symlink before encoding, so when the workspace
+        is itself a symlink the history lives under the
+        *realpath*-encoded directory. Check the realpath first and fall
+        back to the unresolved path.
 
         Best-effort: any unexpected error returns True so we still
         attempt the resume and let the CLI surface the real error.
@@ -460,10 +531,15 @@ class ClaudeBackend:
             if cwd not in bases:
                 bases.append(cwd)
             for base in bases:
-                encoded = base.replace("/", "-")
-                jsonl = projects + "/" + encoded + "/" + native_id + ".jsonl"
-                if os.path.isfile(jsonl):
-                    return True
+                encoded = _encode_project_dir(base)
+                if len(encoded) <= _PROJECT_DIR_MAX_LEN:
+                    names = [encoded]
+                else:
+                    names = _long_project_dir_names(projects, encoded)
+                for name in names:
+                    jsonl = projects + "/" + name + "/" + native_id + ".jsonl"
+                    if os.path.isfile(jsonl):
+                        return True
             return False
         except Exception as e:
             logger.debug(
@@ -476,7 +552,10 @@ class ClaudeBackend:
 
     async def create_client(self, spec: SessionSpec) -> "ClaudeClient":
         options = self._build_options(spec)
-        client = ClaudeClient(spec, options)
+        client = ClaudeClient(
+            spec, options,
+            subagents=getattr(self.config.agent, "subagents", None),
+        )
         await client.connect()
         return client
 
@@ -503,13 +582,15 @@ class ClaudeBackend:
             config.ollama.enabled and "claude" not in selected_model.lower()
         )
 
-        thinking_config = (
-            None if is_ollama_model
-            else self._parse_thinking_config(config.agent.thinking, selected_model)
-        )
         effort = (
             None if is_ollama_model
             else self._effective_effort(spec.effort, selected_model)
+        )
+        thinking_config = (
+            None if is_ollama_model
+            else self._parse_thinking_config(
+                config.agent.thinking, selected_model, effort,
+            )
         )
         # Some subscriptions reject the context-1m beta for specific models
         # (some Sonnet models, for instance) — skip the beta header for those.
@@ -559,7 +640,9 @@ class ClaudeBackend:
         return ClaudeAgentOptions(
             model=selected_model,
             system_prompt=system_prompt,
-            max_turns=spec.max_turns,
+            # 0 (or anything non-positive) = no cap: None keeps `--max-turns`
+            # off the CLI command line, and the turn runs to completion.
+            max_turns=spec.max_turns if spec.max_turns > 0 else None,
             # No permission_mode — can_use_tool callback handles all
             # permissions. Interactive tools pause for user input;
             # everything else auto-approves.
@@ -594,7 +677,10 @@ class ClaudeBackend:
             # CLI's own autonomous firing is suppressed via the
             # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
             disallowed_tools=["CronCreate", "CronList", "CronDelete"],
-            env=self._build_env(cache_ttl=spec.cache_ttl),
+            env=self._build_env(
+                cache_ttl=spec.cache_ttl,
+                inference_principal=spec.inference_principal,
+            ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
             # prompt. It injects the full identity/memory bundle
@@ -610,9 +696,19 @@ class ClaudeBackend:
             # load via ``plugins`` (--plugin-dir), independent of this setting.
             setting_sources=[],
             mcp_servers=self._build_mcp_servers(spec.session_id),
+            # External mode: the CLI reads no MCP configuration other than
+            # ``mcp_servers``, which holds the MCP gateway's servers.
+            strict_mcp_config=self._deps.managed_mcp,
             # Claude Code plugins — loaded via --plugin-dir so the CLI
             # handles OAuth, credentials, and plugin lifecycle natively.
             plugins=self._deps.claude_plugins(),
+            # Foreground and nested sub-agents' text and thinking reach Nerve
+            # too (background agents always stream everything); the engine
+            # routes all of it to the agent registry, never into the turn.
+            forward_subagent_text=bool(getattr(
+                getattr(config.agent, "subagents", None),
+                "forward_subagent_text", False,
+            )),
         )
 
     def _system_prompt_dir(self) -> Path:
@@ -686,8 +782,14 @@ class ClaudeBackend:
             except OSError:
                 pass
 
-    def _build_env(self, cache_ttl: str = "5m") -> dict[str, str]:
-        """Build environment variables for the SDK subprocess."""
+    def _build_env(
+        self, cache_ttl: str = "5m", inference_principal: str | None = None,
+    ) -> dict[str, str]:
+        """Build environment variables for the SDK subprocess.
+
+        ``inference_principal``: the principal that every model request of
+        the process names (external mode; see nerve.inference_principal).
+        """
         config = self.config
         env: dict[str, str] = {}
         # Prompt-cache TTL: the CLI natively supports the 1-hour TTL via
@@ -757,6 +859,9 @@ class ClaudeBackend:
                 continue
             if target:
                 env[env_name] = str(target)
+        # The SDK merges this dict over Nerve's own environment, so an
+        # inherited ANTHROPIC_CUSTOM_HEADERS is kept and extended here.
+        env.update(custom_headers_env(inference_principal))
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
@@ -947,17 +1052,28 @@ class ClaudeBackend:
         return "4-5" in m or "4-6" in m
 
     @staticmethod
-    def _model_rejects_disabled_thinking(model: str | None) -> bool:
-        # Opus 5.5 returns 400 for thinking.type="disabled" at every effort
-        # level. Effort is the only control.
-        return bool(model) and "opus-5-5" in model.lower()
+    def _model_rejects_disabled_thinking(
+        model: str | None, effort: str | None = None,
+    ) -> bool:
+        # Opus 5.5 and Sonnet 5.5 return 400 for thinking.type="disabled" at
+        # every effort level, so send adaptive and let effort set the depth.
+        # Haiku 5.5 returns 400 for it at xhigh and max. An unset effort can
+        # resolve to either, so only low, medium and high keep it disabled.
+        if not model:
+            return False
+        m = model.lower()
+        if "opus-5-5" in m or "sonnet-5-5" in m:
+            return True
+        return "haiku-5-5" in m and effort not in ("low", "medium", "high")
 
     @staticmethod
-    def _parse_thinking_config(value: str, model: str | None = None) -> dict | None:
+    def _parse_thinking_config(
+        value: str, model: str | None = None, effort: str | None = None,
+    ) -> dict | None:
         """Parse thinking config string into SDK ThinkingConfig dict."""
         v = value.strip().lower()
         if v == "disabled":
-            if ClaudeBackend._model_rejects_disabled_thinking(model):
+            if ClaudeBackend._model_rejects_disabled_thinking(model, effort):
                 return {"type": "adaptive"}
             return {"type": "disabled"}
         if v == "adaptive":
@@ -987,7 +1103,9 @@ class ClaudeBackend:
         "fable-5":    ("low", "medium", "high", "xhigh", "max"),
         "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
+        "sonnet-5-5": ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5":   ("low", "medium", "high", "xhigh", "max"),
+        "haiku-5-5":  ("low", "medium", "high", "xhigh", "max"),
         "opus-4-8":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-7":   ("low", "medium", "high", "xhigh", "max"),
         "opus-4-6":   ("low", "medium", "high", "max"),
@@ -1024,17 +1142,78 @@ class ClaudeBackend:
 #  Client                                                              #
 # ------------------------------------------------------------------ #
 
+def _build_transport(options: ClaudeAgentOptions, extras: dict[str, Any]) -> Any | None:
+    """The CLI transport that declares ``extras`` at the first initialize,
+    or ``None`` when the private SDK seam it needs is missing (the client
+    then runs on the SDK's default transport, without the flags: Stop asks
+    before it would end background agents rather than killing them)."""
+    try:
+        import importlib
+
+        from claude_agent_sdk.types import _configure_can_use_tool
+
+        claude_transport = importlib.import_module("nerve.agent.backends.claude_transport")
+    except ImportError as e:
+        logger.warning(
+            "claude transport seam unavailable (%s): initialize flags %s not "
+            "sent; Stop will ask before it ends background agents",
+            e, sorted(extras),
+        )
+        return None
+    try:
+        # The transport gets the configured copy so the CLI command line keeps
+        # --permission-prompt-tool stdio; the SDK client gets the original.
+        return claude_transport.NerveCLITransport(
+            prompt=claude_transport._never_yields(),
+            options=_configure_can_use_tool(options),
+            init_extras=extras,
+        )
+    except Exception as e:  # noqa: BLE001 — a moved seam must not break the session
+        logger.warning(
+            "claude transport could not be built (%s): initialize flags %s not "
+            "sent; Stop will ask before it ends background agents",
+            e, sorted(extras),
+        )
+        return None
+
+
+# The stop_task control request waits at most this long for the CLI.
+STOP_TASK_TIMEOUT = 10.0
+# The raw interrupt control request (cancel_queued) waits at most this long.
+INTERRUPT_TIMEOUT = 10.0
+
+
 class ClaudeClient(AgentClient):
     """One live Claude Code CLI subprocess for one nerve session."""
 
-    # Class-level default so test doubles built via ``__new__`` (and any
+    # Class-level defaults so test doubles built via ``__new__`` (and any
     # partially-initialized instance) read None instead of raising.
     _last_entry_uuid: str | None = None
+    _transport: Any = None
 
-    def __init__(self, spec: SessionSpec, options: ClaudeAgentOptions):
+    def __init__(
+        self, spec: SessionSpec, options: ClaudeAgentOptions, *,
+        subagents: Any = None,
+    ):
+        from nerve.config import SubagentsConfig
+
         self._spec = spec
         self._options = options
-        self._sdk = ClaudeSDKClient(options=options)
+        # Host-only initialize flags (the Python SDK has no option for them):
+        # with the per-task stop affordance an interrupt ends only the turn
+        # and spares background agents; progress summaries add a one-line
+        # status per running agent to task_progress.
+        sub = subagents or SubagentsConfig()
+        extras: dict[str, Any] = {}
+        if getattr(sub, "per_task_stop_affordance", False):
+            extras["perTaskStopAffordance"] = True
+        if getattr(sub, "progress_summaries", False):
+            extras["agentProgressSummaries"] = True
+        self._transport = _build_transport(options, extras) if extras else None
+        # The ORIGINAL options: the SDK applies _configure_can_use_tool itself
+        # at connect, and a pre-configured copy would set both can_use_tool and
+        # permission_prompt_tool_name (a ValueError there).
+        self._sdk = ClaudeSDKClient(options=options, transport=self._transport)
         self._native_session_id: str | None = spec.resume_native_id
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
@@ -1209,7 +1388,50 @@ class ClaudeClient(AgentClient):
                     event.native_turn_id = self._last_entry_uuid
         return events
 
-    async def interrupt(self) -> None:
+    @property
+    def interrupt_spares_background(self) -> bool:
+        """True only once the CLI got ``perTaskStopAffordance`` at its first
+        initialize: then an interrupt ends the turn and background agents
+        keep running. Nothing else proves it (the CLI sends no capability
+        string), so a client built without the patch, or whose initialize
+        frame the patch did not recognise, reports False."""
+        t = self._transport
+        return bool(
+            t is not None
+            and getattr(t, "init_patched", False)
+            and getattr(t, "init_extras", {}).get("perTaskStopAffordance")
+        )
+
+    @property
+    def supports_task_stop(self) -> bool:
+        return True
+
+    async def stop_task(self, task_id: str) -> None:
+        """Stop one background task (``stop_task`` control request). The CLI
+        then reports ``task_updated{killed}`` and maybe
+        ``task_notification{stopped}``."""
+        try:
+            await asyncio.wait_for(self._sdk.stop_task(task_id), timeout=STOP_TASK_TIMEOUT)
+        except CLIConnectionError as e:
+            raise TransportDiedError(str(e)) from e
+
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        """End the current turn. ``cancel_queued`` also cancels what the CLI
+        queued (task notifications that would wake the orchestrator); the SDK
+        cannot send that field, so it goes through the private
+        ``_send_control_request`` seam when present (pinned like
+        ``_message_stream``)."""
+        query = getattr(self._sdk, "_query", None)
+        if (
+            cancel_queued
+            and query is not None
+            and hasattr(query, "_send_control_request")
+        ):
+            await query._send_control_request(
+                {"subtype": "interrupt", "cancel_queued": True},
+                timeout=INTERRUPT_TIMEOUT,
+            )
+            return
         await self._sdk.interrupt()
 
     def is_alive(self) -> bool:

@@ -25,10 +25,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NoReturn
 
+from nerve.identity import attribution_for
+
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
-    from nerve.identity import Actor
+    from nerve.identity import ActorOrId
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,9 @@ async def request_plan_revision(
     engine: "AgentEngine",
     plan_id: str,
     feedback: str,
+    *,
+    actor: "ActorOrId | None",
+    cause: "ActorOrId | None",
 ) -> dict:
     """Persist revision feedback and dispatch a revision prompt to the planner.
 
@@ -123,6 +128,14 @@ async def request_plan_revision(
         engine: AgentEngine instance (used to ensure session + dispatch run).
         plan_id: The pending plan to revise.
         feedback: Free-text feedback explaining what should change.
+        actor: Who asks for the revision: the person for the HTTP route,
+            the system actor for the tool. Recorded with ``cause`` as the
+            plan's reviewer.
+        cause: On whose behalf the revision is asked for: the person for
+            the HTTP route, the calling session's cause for the tool. It is
+            the reviewer's cause, and the cause of the planner session if
+            this call creates it; an existing planner session keeps its own
+            cause.
 
     Returns:
         ``{"plan_id", "task_id", "session_id", "status"}`` on success.
@@ -133,8 +146,9 @@ async def request_plan_revision(
         PlanNotPending: The plan is declined/superseded/implementing/etc.
 
     Behavior contract:
-        - Stores ``feedback`` on the plan (status untouched — old plan
-          stays ``pending`` until the planner calls ``plan_update``).
+        - Stores ``feedback`` on the plan, and ``actor`` + ``cause`` as its
+          reviewer, only while the plan is pending. The status stays
+          ``pending`` until the planner calls ``plan_update``.
         - Writes a ``Revision requested for {plan_id}`` note to the task.
         - Dispatches ``engine.run()`` on the original proposer session
           (``plan.session_id``), falling back to ``cron:task-planner``
@@ -169,8 +183,15 @@ async def request_plan_revision(
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
     # 1. Store feedback on the plan (status stays pending until planner
-    #    supersedes it via plan_update).
-    await db.update_plan(plan_id, feedback=feedback)
+    #    supersedes it via plan_update). The request is a review decision,
+    #    and it applies only while the plan is still pending.
+    if not await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        feedback=feedback, attribution=attribution_for(actor, cause),
+    ):
+        raise PlanNotPending(
+            f"Plan {plan_id} is no longer pending; another decision was made first."
+        )
 
     # 2. Write a task note so the revision request is visible in the
     #    task's history. Build a ``ToolContext`` from the legacy module
@@ -179,8 +200,11 @@ async def request_plan_revision(
     #    handed to this helper — tests pass a FakeEngine that doesn't
     #    expose ``.config``, so we can't read workspace off ``engine``
     #    directly.
+    #    The note is written by whoever asks for the revision, for its cause.
     feedback_summary = feedback[:80] + "..." if len(feedback) > 80 else feedback
-    task_ctx = replace(_legacy_ctx("system"), db=db, engine=engine)
+    task_ctx = replace(
+        _legacy_ctx("system"), db=db, engine=engine, actor=actor, cause=cause,
+    )
     await task_update_handler(task_ctx, {
         "task_id": plan["task_id"],
         "note": f"Revision requested for {plan_id}: {feedback_summary}",
@@ -202,9 +226,11 @@ async def request_plan_revision(
         if session_id.startswith("cron:")
         else session_id
     )
+    # A planner session that does not exist yet is created by the system
+    # actor for the person who asked for the revision.
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
-        actor=engine.db.system_actor,
+        actor=engine.db.system_actor, cause=cause,
     )
     asyncio.create_task(
         engine.run(
@@ -239,11 +265,22 @@ async def _raise_not_pending(db: "Database", plan_id: str, verb: str) -> NoRetur
 
 
 async def _revert_plan(
-    db: "Database", plan_id: str, from_status: str, **fields,
+    db: "Database", plan: dict, from_status: str, **fields,
 ) -> None:
-    """Best-effort undo of a claimed transition after a later step failed."""
+    """Best-effort undo of a claimed decision after a later step failed.
+
+    Puts ``plan`` back to ``pending`` with the reviewer it had before the
+    decision, so the failed decision leaves no reviewer behind.
+    """
+    plan_id = plan["id"]
     try:
-        await db.transition_plan(plan_id, from_status, **fields)
+        await db.compare_and_update_plan(
+            plan_id, expect_status=from_status,
+            status="pending", reviewed_at=plan.get("reviewed_at"),
+            reviewed_by_actor_id=plan.get("reviewed_by_actor_id"),
+            reviewed_caused_by_actor_id=plan.get("reviewed_caused_by_actor_id"),
+            **fields,
+        )
     except Exception:
         logger.exception("Failed to restore plan %s after an error", plan_id)
 
@@ -253,7 +290,8 @@ async def approve_plan(
     engine: "AgentEngine",
     plan_id: str,
     *,
-    actor: Actor | None,
+    actor: "ActorOrId | None",
+    cause: "ActorOrId | None",
     caller_session_id: str = "system",
 ) -> dict:
     """Approve a pending plan and spawn its implementation session.
@@ -262,14 +300,18 @@ async def approve_plan(
         db: Database instance (plan/task lookups + updates).
         engine: AgentEngine (session creation + run dispatch).
         plan_id: The pending plan to approve.
-        actor: Who approved, stored as the creator of the implementation
-            session: the approving person on the WebUI, ``db.system_actor``
-            when the agent approves through its own tool, ``None`` for a
-            chat user with no local identity. Required keyword-only, like
-            the session store's own ``actor``.
+        actor: Who approves: the person for the HTTP route, the system
+            actor for the tool, ``None`` for chat input with no local
+            identity. Recorded with ``cause`` as the plan's reviewer, as the
+            creator of the implementation session, and as the actor of the
+            task update.
+        cause: On whose behalf the plan is approved: the person for the
+            HTTP route, the calling session's cause for the tool, ``None``
+            for chat. It is the reviewer's cause, the implementation
+            session's cause and the task update's cause.
         caller_session_id: The session the task update runs under, which
             the task's status history records: the calling agent's session
-            id, or ``"system"`` for the WebUI and chat.
+            id, ``"web"`` for the HTTP route, ``"system"`` for chat.
 
     Returns:
         ``{"plan_id", "task_id", "impl_session_id"}`` on success.
@@ -282,8 +324,9 @@ async def approve_plan(
 
     Behavior contract:
         - Claims the plan with one atomic ``pending`` → ``implementing``
-          transition that also stores the new ``impl-<uuid>`` session id, so
-          concurrent approvals spawn exactly one implementation session.
+          transition that also stores the new ``impl-<uuid>`` session id and
+          the reviewer, so concurrent approvals spawn exactly one
+          implementation session.
         - Moves the task to ``in_progress`` with an audit note.
         - If creating the session or updating the task fails, the plan goes
           back to ``pending`` so it can be approved again.
@@ -312,9 +355,10 @@ async def approve_plan(
     plan_type = plan.get("plan_type", "generic")
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
 
-    claimed = await db.transition_plan(
-        plan_id, "pending",
+    claimed = await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
         status="implementing", reviewed_at=now, impl_session_id=impl_session_id,
+        attribution=attribution_for(actor, cause),
     )
     if not claimed:
         await _raise_not_pending(db, plan_id, "approved")
@@ -322,11 +366,14 @@ async def approve_plan(
     # The legacy ToolContext (db/engine overridden with the handed-in
     # instances) is the same pattern request_plan_revision relies on, so
     # tests with a config-less FakeEngine keep working.
-    task_ctx = replace(_legacy_ctx(caller_session_id), db=db, engine=engine)
+    task_ctx = replace(
+        _legacy_ctx(caller_session_id), db=db, engine=engine,
+        actor=actor, cause=cause,
+    )
     try:
         await engine.sessions.get_or_create(
             impl_session_id, title=f"Implement: {task['title']}", source="web",
-            actor=actor,
+            actor=actor, cause=cause,
         )
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],
@@ -350,8 +397,7 @@ async def approve_plan(
     except Exception:
         # Nothing has been dispatched yet, so hand the plan back to review.
         await _revert_plan(
-            db, plan_id, "implementing",
-            status="pending", reviewed_at=plan.get("reviewed_at"),
+            db, plan, "implementing",
             impl_session_id=plan.get("impl_session_id"),
         )
         raise
@@ -398,6 +444,8 @@ async def decline_plan(
     plan_id: str,
     feedback: str = "",
     *,
+    actor: "ActorOrId | None",
+    cause: "ActorOrId | None",
     caller_session_id: str = "system",
 ) -> dict:
     """Decline a pending plan and close its task as done.
@@ -411,9 +459,12 @@ async def decline_plan(
         engine: AgentEngine (only used to build the task-handler context).
         plan_id: The pending plan to decline.
         feedback: Optional free-text reason, recorded on plan + task note.
+        actor: Who declines (see ``approve_plan``). Recorded with ``cause``
+            as the plan's reviewer and as the actor of the task closure.
+        cause: On whose behalf the plan is declined (see ``approve_plan``).
         caller_session_id: The session the task closure runs under, which
             the task's status history records: the calling agent's session
-            id, or ``"system"`` for the WebUI and chat.
+            id, ``"web"`` for the HTTP route, ``"system"`` for chat.
 
     Returns:
         ``{"plan_id", "task_id", "status": "declined", "feedback"}``.
@@ -447,14 +498,20 @@ async def decline_plan(
     fields: dict = {"status": "declined", "reviewed_at": now}
     if feedback:
         fields["feedback"] = feedback
-    if not await db.transition_plan(plan_id, "pending", **fields):
+    if not await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        attribution=attribution_for(actor, cause), **fields,
+    ):
         await _raise_not_pending(db, plan_id, "declined")
 
     if feedback:
         note = f"Plan {plan_id} declined — {feedback}"
     else:
         note = f"Related plan {plan_id} was closed without a specified reason"
-    task_ctx = replace(_legacy_ctx(caller_session_id), db=db, engine=engine)
+    task_ctx = replace(
+        _legacy_ctx(caller_session_id), db=db, engine=engine,
+        actor=actor, cause=cause,
+    )
     try:
         await task_done_handler(task_ctx, {
             "task_id": plan["task_id"],
@@ -463,9 +520,7 @@ async def decline_plan(
     except Exception:
         # The task is still open, so put the plan back up for review.
         await _revert_plan(
-            db, plan_id, "declined",
-            status="pending", reviewed_at=plan.get("reviewed_at"),
-            feedback=plan.get("feedback"),
+            db, plan, "declined", feedback=plan.get("feedback"),
         )
         raise
 

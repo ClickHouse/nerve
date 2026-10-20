@@ -1,5 +1,4 @@
 import type { WSMessage } from '../../api/websocket';
-import { scheduleAutoClose } from '../helpers/blockHelpers';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -11,13 +10,15 @@ export function handleInteraction(
   get: Get,
   set: Set,
 ): void {
-  // Agent is paused waiting for user input (AskUserQuestion, ExitPlanMode, etc.)
+  // Agent is paused waiting for user input (AskUserQuestion, ExitPlanMode, etc.).
+  // `agent` names the subagent that asked (null: the orchestrator itself).
   set({
     pendingInteraction: {
       interactionId: msg.interaction_id,
       interactionType: msg.interaction_type,
       toolName: msg.tool_name,
       toolInput: msg.tool_input,
+      agent: msg.agent ?? null,
     },
   });
   // Auto-open the plan panel when ExitPlanMode fires, so the user sees the plan
@@ -95,39 +96,4 @@ export function handleNotificationExpired(
   import('../notificationStore').then(({ useNotificationStore }) =>
     useNotificationStore.getState().handleWSNotificationExpired(msg)
   );
-}
-
-export function handleBackgroundTasksUpdate(
-  msg: Extract<WSMessage, { type: 'background_tasks_update' }>,
-  get: Get,
-  set: Set,
-): void {
-  if (msg.session_id !== get().activeSession) return;
-  set(s => {
-    // Merge: keep startedAt from existing entries, add new ones
-    const existing = new Map(s.backgroundTasks.map(t => [t.task_id, t]));
-    const updated = msg.tasks.map(t => ({
-      ...t,
-      startedAt: existing.get(t.task_id)?.startedAt || Date.now(),
-    }));
-    return { backgroundTasks: updated };
-  });
-
-  // Background sub-agent panels are held open (running) while their detached
-  // work streams — there's no per-tool_use_id "done" event for them. Once no
-  // background task is still running, the sub-agents can no longer emit, so
-  // settle any still-running background panels (and let them auto-close).
-  if (!msg.tasks.some(t => t.status === 'running')) {
-    const state = get();
-    for (const panel of state.panels) {
-      if (panel.background && panel.status === 'running') {
-        state.updatePanelTab(panel.id, {
-          status: 'complete',
-          streaming: false,
-          completedAt: Date.now(),
-        });
-        if (panel.type !== 'plan') scheduleAutoClose(panel.id, get);
-      }
-    }
-  }
 }

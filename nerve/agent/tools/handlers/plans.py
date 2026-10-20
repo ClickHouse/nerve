@@ -30,6 +30,12 @@ from nerve.agent.tools.handlers.tasks import task_update_handler
 
 logger = logging.getLogger(__name__)
 
+# A decision lost to a concurrent one: the plan stopped being pending after
+# the handler read it.
+_NO_LONGER_PENDING = (
+    "Plan {plan_id} is no longer pending; another decision was made first."
+)
+
 
 async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
@@ -65,7 +71,9 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # Supersede prior pending plan if any
     for p in existing_plans:
         if p.get("status") == "pending":
-            await ctx.db.update_plan(p["id"], status="superseded")
+            await ctx.db.compare_and_update_plan(
+                p["id"], expect_status="pending", status="superseded",
+            )
 
     plan_id = f"plan-{str(uuid.uuid4())[:8]}"
 
@@ -77,6 +85,8 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         model="",
         version=version,
         plan_type=plan_type,
+        # Written by the system actor for the session's cause.
+        attribution=ctx.attribution,
     )
 
     # Note on the task
@@ -115,10 +125,16 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
             f"Plan is '{old_plan['status']}' — only pending plans can be updated."
         )
 
+    # The planner replaces its own plan. That is not a review decision, so
+    # the reviewer columns keep who asked for the revision, if anyone did.
+    # The new version records who wrote it.
     update_fields: dict = {"status": "superseded"}
     if feedback:
         update_fields["feedback"] = feedback
-    await ctx.db.update_plan(plan_id, **update_fields)
+    if not await ctx.db.compare_and_update_plan(
+        plan_id, expect_status="pending", **update_fields,
+    ):
+        return ToolResult.text(_NO_LONGER_PENDING.format(plan_id=plan_id))
 
     new_plan_id = f"plan-{str(uuid.uuid4())[:8]}"
     new_version = int(old_plan.get("version", 1)) + 1
@@ -131,6 +147,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         version=new_version,
         parent_plan_id=plan_id,
         plan_type=old_plan.get("plan_type", "generic"),
+        attribution=ctx.attribution,
     )
 
     note = f"Plan updated: {plan_id} → {new_plan_id} (v{new_version})"
@@ -222,8 +239,8 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         result = await approve_plan(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id,
             # The agent approved this plan through its own tool, so the
-            # implementation session is the instance's own work.
-            actor=ctx.db.system_actor,
+            # system actor approves, for the cause of the calling session.
+            actor=ctx.db.system_actor, cause=ctx.cause_id,
             caller_session_id=ctx.session_id or "system",
         )
     except PlanNotFound:
@@ -257,6 +274,7 @@ async def plan_decline_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await decline_plan(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
+            actor=ctx.actor, cause=ctx.cause_id,
             caller_session_id=ctx.session_id or "system",
         )
     except PlanNotFound:
@@ -300,6 +318,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await request_plan_revision(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
+            actor=ctx.actor, cause=ctx.cause_id,
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")

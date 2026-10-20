@@ -257,7 +257,7 @@ A reload is always explicit. Two things cause one:
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
-| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
+| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
 All of that is reloaded together, and the response says what happened to each
 piece: `POST /api/config/reload` returns `ok`, a per-subsystem `detail`, and an
@@ -289,9 +289,10 @@ reload cannot inspect, and are documented here only.
 | `anthropic_base_url` | memU builds its model clients once at startup. New sessions and the other direct calls would follow a reload and memory would not, so they would use different endpoints |
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
-| `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
+| `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -972,18 +973,25 @@ Backups follow the same rule:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `agent.model` | string | `claude-opus-5-5` | Primary model for conversations. The default (and every other default model id) is defined once, in the constants block at the top of `nerve/config.py` |
-| `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs (cheaper) |
+| `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs. The setup page's Model step sets it to the model you pick, so scheduled work runs on the chosen model; set a cheaper one here afterwards if you want it |
 | `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
 | `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
 | `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5` and `haiku → claude-haiku-5-5` defaults (the `agent.model` and `memory.fast_model` defaults; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
-| `agent.max_turns` | int | `50` | Max agentic turns per request |
+| `agent.max_turns` | int | `1000` | Max agentic turns (model ↔ tool round-trips) per request on the Claude backend; a request that reaches it fails with "Reached maximum number of turns (N)". A last-resort stop for a looping agent, not a budget — real work routinely passes 50 and 100. `0` = no cap (the CLI gets no `--max-turns` flag). Read when a session's CLI client is built, so a changed value applies to new sessions, and to existing ones once their client is rebuilt |
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |
 | `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
 | `agent.cache_ttl_excluded_models` | list | `[]` | Model-name substrings that never request the 1h TTL |
 | `agent.static_system_prompt` | bool | `true` | Keep the appended system prompt byte-identical across sessions of the same workspace/source/tool set so Anthropic's exact-prefix prompt cache shares it between sessions (a cache read instead of a full re-write at every session start). The per-session parts — session id and pre-recalled memories — are delivered once, in a `<session-context>` block at the top of the session's first user message; `mcp__nerve__session_context` returns them live. `false` restores the legacy shape (id and recall inline in the system prompt) |
 | `agent.cli_max_message_bytes` | int | `67108864` (64 MiB) | Upper bound on one stream-json message read from the Claude CLI subprocess (the Agent SDK's `max_buffer_size`). The SDK's own default is 1 MiB, and a line over the bound aborts the whole turn — image tool results routinely exceed it: the Read tool ships the base64 image twice per line and re-encodes anything over 2000 px, so a 300 KB screenshot can become a 1.3 MB line. The Read image validator also refuses images whose encoded line cannot fit under this bound, so a too-big image fails as a tool error instead of killing the turn |
 | `agent.agent_teams` | bool | `true` | Set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` for the CLI subprocess, which registers the `SendMessage` tool. The Agent tool advertises `SendMessage` for resuming a sub-agent whether or not the flag is set, so with it off the model reaches for a tool that does not exist. Nerve loads no settings files (`setting_sources=[]`), so the env dict is the flag's only route in. Teammates stay opt-in per turn and cost a full context window each; the CLI cannot restore in-process teammates when a session's client is recycled (idle timeout, restart, crash retry) |
+| `agent.subagents.per_task_stop_affordance` | bool | `true` | Stop (the red button, Esc, channel `/stop`) ends only the orchestrator's turn and spares background agents and workflows. Sent to the Claude CLI as the `perTaskStopAffordance` flag of its first `initialize`, which the Python SDK cannot express (Nerve adds it to that frame). Off, or when the patch cannot apply after an SDK upgrade: an interrupt would end every background agent, so Stop asks first (`needs_confirmation`). Applies to runtimes started after a change. See [agents.md](agents.md#stopping) |
+| `agent.subagents.progress_summaries` | bool | `true` | A one-line, model-written status per running agent (`agentProgressSummaries`; a few small-model calls per agent). Applies to runtimes started after a change |
+| `agent.subagents.forward_subagent_text` | bool | `true` | Stream foreground and nested sub-agents' text and thinking to Nerve too (background agents always stream everything). It goes to the agent's transcript, never into the orchestrator's turn. Applies to runtimes started after a change |
+| `agent.subagents.quiet_after_minutes` | int | `10` | The web UI flags a running agent with no activity for this long as quiet |
+| `agent.subagents.lost_grace_seconds` | int | `30` | A member of the CLI's live background set that disappears with no final status becomes `lost` after this long |
+| `agent.subagents.stop_confirm_seconds` | int | `10` | A stop of one agent with no confirmation from the runtime after this long is flagged "stop not confirmed" |
+| `agent.subagents.transcript_item_max_bytes` | int | `16384` | Cap on each tool input or result stored in (and streamed from) an agent's transcript |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
 | `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
 | `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |
@@ -1795,6 +1803,94 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 - **Auto-registered in UI** — plugin MCP servers appear in the MCP Servers page on first tool invocation (type: `plugin`).
 - **No conflicts** — Nerve-configured MCPs (from `config.yaml`) and Claude Code plugin MCPs coexist; they use separate mechanisms (`--mcp-config` vs `--plugin-dir`).
 
+### MCP servers in external mode
+
+In [external mode](#authentication-mode), an MCP gateway decides which MCP
+servers the agent can use. Nerve takes its MCP servers only from the catalog
+of the gateway, together with its own `nerve` server. Local mode does not
+change.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every 30 seconds. The request has no credential, because the
+gateway identifies the agent from the connection. Nerve does not use the proxy
+environment variables for this request. One request takes at most 5 seconds.
+
+- Nerve reads the members `revision` and `servers` of the catalog, and `id`,
+  `url` and `revision` of each server. The servers must be in `id` order.
+  Nerve ignores other members, for example `displayName` and `description`.
+  Nerve compares revisions for equality only. Nerve resolves each `url`
+  against the URL of the catalog request; the result must have the scheme,
+  the host and the port of that URL, and no user information.
+- Nerve refuses a catalog without these members, or with a member that is
+  not valid, as a whole. When the gateway gives no catalog (it is not
+  reachable, it answers with an error or too slowly, or the catalog is not
+  valid), Nerve keeps the catalog that it read last. After startup there is
+  none until a read succeeds, and sessions start with the `nerve` server
+  only.
+- Nerve reads one catalog at a time. A new session that waits while another
+  read runs, for example the periodic read, uses the result of that read.
+- When the catalog changes, new sessions get the new servers. A running
+  session gets them at its next turn (see
+  [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
+- A catalog server with the ID `nerve` is not used, because Nerve's own server
+  has that name.
+
+The clients get each gateway server as an HTTP MCP server at its URL, without
+headers:
+
+- **Claude.** The gateway servers and the `nerve` server, with
+  `--strict-mcp-config`, so the CLI reads no other MCP configuration. No
+  Claude Code plugin is loaded.
+- **Codex.** `mcp_servers.<id>.url` and
+  `mcp_servers.<id>.default_tools_approval_mode = "approve"` for each gateway
+  server: the organization approved the tools at the gateway, and with
+  approval policy `never` Codex refuses an MCP tool that it would have to ask
+  about.
+
+In external mode Nerve does not read `mcp_servers` from any configuration
+file. The **Reload** button, the `mcp_reload` tool and a configuration reload
+read the catalog again. The gateway checks the policy on each call.
+
+The Claude CLI and Codex use the proxy environment variables of the Nerve
+service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns. A client gets its MCP servers when Nerve builds it, and neither client
+can add a server while it runs. When the last catalog that Nerve read has
+another `revision` than the catalog of the client's build, Nerve builds the
+client again at the start of the session's next turn, before it sends the
+message. The new client resumes the same conversation (the same Claude
+session or Codex thread) with the same model and working directory.
+
+Nerve keeps the client and its earlier catalog for that turn, and checks
+again at the next turn, when:
+
+- the session runs a background task of the Claude CLI (a background
+  command, agent or monitor),
+- the client has output that Nerve did not read yet, or
+- (Claude only) the conversation file under `~/.claude/projects` is
+  missing, so a new client could not resume the conversation.
+
+If the new client does not start, the turn fails, and the next turn starts a
+new conversation, as after a restart.
+
+A change at the gateway reaches a running session at its first turn after
+Nerve reads the changed catalog: while the gateway is available, at most 30
+seconds and one request after the change. A turn that runs keeps its servers
+until it ends. Work of the Codex app-server that continues after a turn, for
+example a command or a child agent, stops when Nerve builds the client again,
+as for a change of the model.
+
+A session with an earlier catalog gets no access that the policy does not
+allow: the gateway checks each call against the current policy and refuses
+a server or a tool that the organization removed.
+
 ## Auth
 
 | Key | Type | Default | Description |
@@ -1825,11 +1921,64 @@ daemon that started with a different environment can be different.
 > Nerve can act as any person. Use external mode only when the gateway is the
 > only caller that can reach Nerve.
 
+#### Inference principal header
+
+In external mode, Nerve adds one `X-Nerve-Inference-Principal` header to each
+model request that it sends. The value is an actor ID, a lower-case UUID:
+
+| Requests | Principal |
+|---|---|
+| The model requests of an agent session, in every turn, also the turns that another person sends and the turns that the agent starts between turns | The session's cause: the person who started the session, or the system actor for a session that Nerve started (a cron job, a hook). See [Attribution](accounts.md#attribution) |
+| Session titles, prompt rewrite, source condensing, image description, memory, setup checks, the model catalogue, the model check of `nerve doctor` | The system actor (a CLI command such as `nerve sync` or `nerve doctor` reads it from `nerve.db`, and takes the mode from `NERVE_AUTH_MODE` in its own shell) |
+
+A session with no cause, for example a session of a channel without an
+identity mapping, sends no header. Local mode sends no header. In both modes,
+Nerve removes a line for this header from an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, so neither the CLI nor Nerve's own clients send an
+inherited principal.
+
+A proxy in front of the model API can use the header to attribute model usage
+to a person. Nerve does not prove the claim. The proxy must check that the
+principal may be attributed for the agent, and remove the header before it
+forwards the request.
+
+The Claude CLI gets the header through `ANTHROPIC_CUSTOM_HEADERS` in its
+environment. Nerve keeps the other lines of an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, and replaces a line for this header. The CLI reads its
+environment only when it starts. The session's cause never changes, so a CLI
+process keeps its header for its whole life, and a process that Nerve starts
+again for the session (after a model change or a crash) gets the same header.
+
+These requests have no header: memory embedding requests to the OpenAI API,
+and Codex sessions.
+
+### System principal ID
+
+The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the
+agent's system principal. It has an effect only in external mode. It is not a
+configuration key. `nerve init` and the server read it once, in the identity
+bootstrap.
+
+| Value | Behavior |
+|---|---|
+| Unset or empty | The system actor keeps its ID. |
+| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor, no other actor has the ID, and the system actor did not take an ID from this variable before. Otherwise the system actor keeps its current ID and Nerve logs a warning. See [The system actor in external mode](accounts.md#the-system-actor-in-external-mode). |
+| Any other value, also a UUID in upper case | The system actor keeps its ID and Nerve logs a warning. The server starts. |
+
+Set the variable before the first `nerve init` or start, so that the change
+occurs before Nerve attributes work to the system actor. See
+[The system actor in external mode](accounts.md#the-system-actor-in-external-mode).
+
+`nerve doctor` reads the variable in its own shell, as it does for
+`NERVE_AUTH_MODE`. It shows one of these: the system actor has the ID, the
+next start gives it the ID, or the system actor keeps its current ID, with the
+reason.
+
 ## Setup
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps read "Not available on this instance" and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off — one-way, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
+| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps read "Not available on this instance" and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference) — the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off — one-way, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
 
 ## API Keys (config.local.yaml)
 
@@ -1851,7 +2000,8 @@ When set, every model request goes to this endpoint: the Claude CLI (as
 source condensing, image description, `nerve doctor`), memU and model discovery.
 Nerve sends `anthropic_api_key` as the key, or `ANTHROPIC_API_KEY` from the
 daemon's environment when it is unset; the Claude CLI alone also takes
-`claude_oauth_token`.
+`claude_oauth_token`. In external mode, the requests name a principal; see
+[Inference principal header](#inference-principal-header).
 
 Setting `ANTHROPIC_BASE_URL` in Nerve's environment is not the same. The CLI
 inherits it, but the direct calls and memU still go to `api.anthropic.com`.
@@ -1924,6 +2074,12 @@ already-memorized messages (keeping the rendered `content`), prunes append-only
 telemetry and file snapshots older than `retention_days`, and checkpoints the
 WAL. This frees space inside the database but does not shrink the file on disk;
 run `nerve db vacuum` once (with the daemon stopped) to reclaim it.
+
+Sub-agent transcripts (`session_agent_events`: an agent's text, thinking, tool
+calls and results) count as telemetry: they are pruned after `retention_days`,
+starred sessions included, and are not part of the `retention_full_days`
+compaction. Agent records (`session_agents`, including each agent's prompt and
+final report) are kept until their session is deleted.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

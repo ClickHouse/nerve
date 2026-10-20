@@ -34,6 +34,12 @@ from nerve.config import NerveConfig
 logger = logging.getLogger(__name__)
 
 PROVIDER_TEST_TIMEOUT = 20.0
+# Retries for the provider probe (the SDK default). They must end well inside
+# PROVIDER_TEST_TIMEOUT: past it, every failure shows as "No answer in 20 s."
+# and the real cause (a 429, an unreachable proxy) is lost. Without this, a
+# proxy candidate gets PROXY_CLIENT_MAX_RETRIES, whose backoff alone is about
+# 20 s.
+PROVIDER_TEST_MAX_RETRIES = 2
 HTTP_TEST_TIMEOUT = 10.0
 HOST_LOGIN_TIMEOUT = 6.0
 CLI_CHECK_TIMEOUT = 5.0
@@ -191,7 +197,9 @@ def _probe_provider_raw(candidate: NerveConfig) -> dict[str, Any]:
     model = candidate.agent.title_model
     started = time.monotonic()
     try:
-        client = candidate.create_anthropic_client(timeout=PROVIDER_TEST_TIMEOUT - 2)
+        client = candidate.create_anthropic_client(
+            timeout=PROVIDER_TEST_TIMEOUT - 2, max_retries=PROVIDER_TEST_MAX_RETRIES,
+        )
         client.messages.create(
             model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}],
         )

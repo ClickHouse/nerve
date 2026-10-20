@@ -1,3 +1,5 @@
+import type { AutoTurnTrigger } from './agents';
+
 export interface ThinkingBlockData {
   type: 'thinking';
   content: string;
@@ -18,6 +20,10 @@ export interface ToolCallBlockData {
   status: 'running' | 'complete';
   /** Dynamic-workflow progress snapshot (populated during Workflow runs) */
   workflow?: WorkflowSnapshot;
+  /** The agent record this spawn call created (persisted `agent_id`, or a
+   *  transcript's `child_agent_id`). Absent on old history and on calls that
+   *  spawn nothing; the store also resolves records by `toolUseId`. */
+  agentId?: string;
 }
 
 // --- Dynamic workflow (Claude Code Workflow tool) progress ---
@@ -75,9 +81,13 @@ export interface WakeupBlockData {
 }
 
 /** Leading marker on an autonomous turn the CLI ran on its own (e.g. after
- *  a background task settled) — no user message preceded it. */
+ *  a background task settled) — no user message preceded it. `triggers`
+ *  names the agents whose settling woke the orchestrator (`more` counts the
+ *  ones beyond the list); old history has neither. */
 export interface AutoTurnBlockData {
   type: 'auto';
+  triggers?: AutoTurnTrigger[];
+  more?: number;
 }
 
 /** Marker emitted when the API switched the model serving this session —
@@ -105,6 +115,9 @@ export interface ChatMessage {
       Null for unidentified external people, assistant/tool output, and
       history that predates attribution. */
   actor_id?: string | null;
+  /** The id this tab generated when it sent the message (live rows only; the
+      server does not persist it). Matches `QueueEntryView.client_msg_id`. */
+  client_msg_id?: string | null;
 }
 
 export interface Session {
@@ -140,7 +153,15 @@ export interface Session {
   // most one per session); `has_background_tasks` covers run_in_background
   // Bash/Agent work still live inside the session's CLI.
   pending_wakeup_at?: string | null;
+  // Who scheduled the pending wake-up (a person, or the system actor when
+  // the agent did) and on whose behalf it runs. Null when not recorded.
+  pending_wakeup_created_by_actor_id?: string | null;
+  pending_wakeup_caused_by_actor_id?: string | null;
   has_background_tasks?: boolean;
+  // Live (non-ambient) agent records in the session: the sidebar shows the
+  // number next to the parked dot. Kept fresh by session_running and the
+  // global session_agents event.
+  background_count?: number;
   starred?: boolean;
   // Live review-loop state for this observer session (rehydrated from
   // GET /api/sessions, kept fresh by the global review_loop_update event;
@@ -164,8 +185,11 @@ export type AgentStatus =
   | { state: 'writing' };
 
 export interface PanelTab {
-  id: string;              // toolUseId
-  type: 'plan' | 'subagent' | 'files' | 'workflow';
+  id: string;              // toolUseId; 'agents-panel'; `agent:<agentId>`
+  /** 'agents' is the singleton Agents roster; 'agent' is one agent's live
+   *  transcript; 'subagent' stays for the legacy result-only tab of old
+   *  history (no agent record). */
+  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent';
   label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow"
   subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
@@ -180,11 +204,8 @@ export interface PanelTab {
   blocks: MessageBlock[];  // live sub-agent activity (same types as main chat)
   /** For type==='workflow': the live phase/agent progress tree. */
   workflow?: WorkflowSnapshot;
-  /** True for a sub-agent spawned with run_in_background. The Agent tool returns
-   *  immediately (a task id) while the sub-agent keeps streaming, so the panel
-   *  must stay open + running until the background task settles — otherwise its
-   *  later tools/thoughts spill into the main chat instead of this panel. */
-  background?: boolean;
+  /** For type==='agent': the agent record whose transcript the tab shows. */
+  agentId?: string;
 }
 
 // --- Session modified files & diff types ---

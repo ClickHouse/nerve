@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.cron.jobs import RESERVED_JOB_ID_PREFIX
 from nerve.sources.models import IngestResult, SourceRecord
+from nerve.utils.llm import response_text
 
 if TYPE_CHECKING:
     from nerve.db import Database
@@ -366,7 +367,7 @@ class SourceRunner:
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
         try:
-            await self._persist_to_inbox(records)
+            stored_ids = set(await self._persist_to_inbox(records))
         except Exception as e:
             logger.error(
                 "Source %s persistence failed: %s",
@@ -377,6 +378,9 @@ class SourceRunner:
                 records_dropped=dropped_count,
                 error=str(e),
             )
+        # Storage skips an unchanged record and keeps the last copy of a repeated id;
+        # condense and count only what it stored, once per id.
+        records = list({r.id: r for r in records if r.id in stored_ids}.values())
 
         # 3. LLM-based condensation for still-long records (configurable per source)
         if self.condense:
@@ -409,9 +413,9 @@ class SourceRunner:
     # Inbox persistence
     # ------------------------------------------------------------------
 
-    async def _persist_to_inbox(self, records: list[SourceRecord]) -> None:
+    async def _persist_to_inbox(self, records: list[SourceRecord]) -> list[str]:
         """Save records to the source_messages table for inbox display."""
-        await self.db.insert_source_messages(
+        return await self.db.insert_source_messages(
             records, source=self.source.source_name, ttl_days=self.ttl_days,
         )
 
@@ -484,7 +488,9 @@ class SourceRunner:
                     response = await asyncio.wait_for(
                         client.messages.create(
                             model=model,
-                            max_tokens=1024,
+                            # Thinking counts toward max_tokens, and the 5.5
+                            # models think by default.
+                            max_tokens=2048,
                             messages=[{
                                 "role": "user",
                                 "content": prompt_content,
@@ -492,7 +498,13 @@ class SourceRunner:
                         ),
                         timeout=30,
                     )
-                    record.content = response.content[0].text
+                    text = response_text(response)
+                    stop_reason = getattr(response, "stop_reason", None)
+                    if not text or stop_reason == "max_tokens":
+                        raise ValueError(
+                            f"no complete text (stop_reason={stop_reason})"
+                        )
+                    record.content = text
                     logger.debug(
                         "Condensed %s: %d → %d chars",
                         record.id, original_len, len(record.content),

@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nerve.agent.engine import AgentEngine
+from nerve.agent.backends import SystemEvent
+from nerve.agent.engine import AgentEngine, TurnOutcome, TurnResult
 from tests.actor_rows import mock_system_principal
 
 _CONNECTED_AT = "2026-01-01T00:00:00+00:00"
@@ -31,6 +32,13 @@ def _make_engine() -> AgentEngine:
     # write anything, so the mock answers that lookup like a real database.
     mock_system_principal(db)
     return AgentEngine(config, db)
+
+
+async def _live_background_task(engine: AgentEngine, sid: str, label: str) -> None:
+    """A run_in_background task the CLI reports as started (and not settled)."""
+    await engine.agents.on_system_event(sid, SystemEvent("task_started", {
+        "task_id": "bg1", "task_type": "local_bash", "description": label,
+    }))
 
 
 def _engine_with_bridge() -> AgentEngine:
@@ -248,12 +256,12 @@ class TestCronRunDiscard:
         engine.sessions.create_cron_session = AsyncMock(
             return_value={"id": "cron:job:1"},
         )
-        engine.run = AsyncMock(return_value="done")
+        engine._run_turn = AsyncMock(return_value=TurnResult("done", TurnOutcome()))
         engine._discard_client = AsyncMock()
 
         result = await engine.run_cron("job", "prompt")
 
-        assert result == "done"
+        assert result.text == "done"
         engine._discard_client.assert_awaited_once_with(
             "cron:job:1", background_memorize=True,
         )
@@ -262,12 +270,12 @@ class TestCronRunDiscard:
     async def test_run_persistent_cron_discards_with_background_memorize(self):
         engine = _make_engine()
         engine.sessions.get_or_create = AsyncMock(return_value={"id": "cron:job"})
-        engine.run = AsyncMock(return_value="done")
+        engine._run_turn = AsyncMock(return_value=TurnResult("done", TurnOutcome()))
         engine._discard_client = AsyncMock()
 
         result = await engine.run_persistent_cron("job", "prompt")
 
-        assert result == "done"
+        assert result.text == "done"
         engine._discard_client.assert_awaited_once_with(
             "cron:job", background_memorize=True,
         )
@@ -278,7 +286,7 @@ class TestCronRunDiscard:
         engine.sessions.create_cron_session = AsyncMock(
             return_value={"id": "cron:job:1"},
         )
-        engine.run = AsyncMock(side_effect=RuntimeError("boom"))
+        engine._run_turn = AsyncMock(side_effect=RuntimeError("boom"))
         engine._discard_client = AsyncMock()
 
         with pytest.raises(RuntimeError):
@@ -348,18 +356,15 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         engine.sessions.create_cron_session = AsyncMock(
             return_value={"id": "cron:job:1"},
         )
-        engine.run = AsyncMock(return_value="done")
+        engine._run_turn = AsyncMock(return_value=TurnResult("done", TurnOutcome()))
         engine._discard_client = AsyncMock()
         # Agent yielded while a backgrounded build was still running.
-        engine._bg_task_registry["cron:job:1"] = {
-            "bg1": {"task_id": "bg1", "label": "mvn -pl client-v2 test",
-                    "tool": "Bash", "status": "running"},
-        }
+        await _live_background_task(engine, "cron:job:1", "make test")
         assert engine._has_live_background_tasks("cron:job:1") is True
 
         result = await engine.run_cron("job", "prompt")
 
-        assert result == "done"
+        assert result.text == "done"
         # Kept alive: the idle-stream watcher delivers the completion turn and
         # the idle sweep reaps the client once the task settles.
         engine._discard_client.assert_not_awaited()
@@ -373,17 +378,14 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         run isolated paths (run_cron / run_hook)."""
         engine = _make_engine()
         engine.sessions.get_or_create = AsyncMock(return_value={"id": "cron:job"})
-        engine.run = AsyncMock(return_value="done")
+        engine._run_turn = AsyncMock(return_value=TurnResult("done", TurnOutcome()))
         engine._discard_client = AsyncMock()
-        engine._bg_task_registry["cron:job"] = {
-            "bg1": {"task_id": "bg1", "label": "build", "tool": "Bash",
-                    "status": "running"},
-        }
+        await _live_background_task(engine, "cron:job", "build")
         assert engine._has_live_background_tasks("cron:job") is True
 
         result = await engine.run_persistent_cron("job", "prompt")
 
-        assert result == "done"
+        assert result.text == "done"
         # Discarded despite the live bg task (stable session reuse hazard).
         engine._discard_client.assert_awaited_once_with(
             "cron:job", background_memorize=True,
@@ -397,10 +399,7 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         )
         engine.run = AsyncMock(return_value="done")
         engine._discard_client = AsyncMock()
-        engine._bg_task_registry["hook:deploy:1"] = {
-            "bg1": {"task_id": "bg1", "label": "deploy", "tool": "Bash",
-                    "status": "running"},
-        }
+        await _live_background_task(engine, "hook:deploy:1", "deploy")
         assert engine._has_live_background_tasks("hook:deploy:1") is True
 
         result = await engine.run_hook("deploy", "1", "prompt")

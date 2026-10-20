@@ -21,6 +21,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
+from nerve.inference_principal import direct_client_headers
 
 import yaml
 
@@ -1013,8 +1014,60 @@ class PromptRewriteConfig:
         )
 
 
+# SDK retries for Anthropic clients that go through the local proxy. The proxy
+# does not forward Retry-After on Claude errors, so the SDK falls back to its
+# own exponential backoff (0.5 s doubling, capped at 8 s); six retries wait
+# roughly 18-24 s in total, long enough to outlast a short rate limit. The
+# SDK default of two gives up after about 1.5 s.
+PROXY_CLIENT_MAX_RETRIES = 6
+
+
 # The default model ids live in the constants block at the top of this file
 # (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
+
+
+@dataclass
+class SubagentsConfig:
+    """Sub-agents and background tasks inside a session (``agent.subagents``).
+
+    See docs/agents.md. Every key hot-reloads except the three a runtime
+    reads when it starts (``per_task_stop_affordance``,
+    ``progress_summaries``, ``forward_subagent_text``), which apply to
+    clients built after the change.
+    """
+
+    # Stop (the red button, Esc, /stop) ends only the orchestrator's turn and
+    # spares background agents. Sent to the CLI as an initialize flag; with it
+    # off, Stop asks before it would end background agents.
+    per_task_stop_affordance: bool = True
+    # A one-line, model-written status per running agent (agentProgressSummaries).
+    # Costs a few small-model calls per agent.
+    progress_summaries: bool = True
+    # Stream foreground and nested sub-agents' text and thinking to Nerve
+    # (background agents always stream everything).
+    forward_subagent_text: bool = True
+    # The UI flags a running agent with no activity for this long as quiet.
+    quiet_after_minutes: int = 10
+    # A member of the CLI's live background set that disappears without a
+    # final frame becomes "lost" after this long.
+    lost_grace_seconds: int = 30
+    # A stop with no final frame after this long is flagged "stop not confirmed".
+    stop_confirm_seconds: int = 10
+    # Cap per stored or streamed tool payload (input or result) of a transcript item.
+    transcript_item_max_bytes: int = 16384
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> SubagentsConfig:
+        return cls(
+            per_task_stop_affordance=d.get("per_task_stop_affordance", True),
+            progress_summaries=d.get("progress_summaries", True),
+            forward_subagent_text=d.get("forward_subagent_text", True),
+            quiet_after_minutes=d.get("quiet_after_minutes", 10),
+            lost_grace_seconds=d.get("lost_grace_seconds", 30),
+            stop_confirm_seconds=d.get("stop_confirm_seconds", 10),
+            transcript_item_max_bytes=d.get("transcript_item_max_bytes", 16384),
+        )
 
 
 @dataclass
@@ -1068,7 +1121,11 @@ class AgentConfig:
     # are filtered; the configured default and an explicit `models` list are
     # authoritative, so naming a model in config overrides a pattern.
     model_discovery_excluded_models: list[str] = field(default_factory=list)
-    max_turns: int = 100
+    # Agentic turns (model ↔ tool round-trips) one request may take before the
+    # CLI stops it ("Reached maximum number of turns (N)"). A last-resort stop
+    # for a looping agent, not a budget: real work passes 50 and 100 routinely.
+    # 0 = no cap.
+    max_turns: int = 1000
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = DEFAULT_EFFORT  # max, xhigh, high, medium, low
@@ -1147,6 +1204,8 @@ class AgentConfig:
     # default (no SendMessage, no teams).
     agent_teams: bool = True
     prompt_rewrite: PromptRewriteConfig = field(default_factory=PromptRewriteConfig)
+    # Sub-agents and background tasks inside a session (docs/agents.md).
+    subagents: SubagentsConfig = field(default_factory=SubagentsConfig)
 
     @property
     def resolved_cron_backend(self) -> str:
@@ -1171,7 +1230,7 @@ class AgentConfig:
             model_discovery_excluded_models=_str_list(
                 d.get("model_discovery_excluded_models")
             ),
-            max_turns=d.get("max_turns", 100),
+            max_turns=d.get("max_turns", 1000),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", DEFAULT_EFFORT)),
@@ -1192,6 +1251,7 @@ class AgentConfig:
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
+            subagents=SubagentsConfig.from_dict(d.get("subagents") or {}),
         )
 
     def context_1m_enabled_for(self, model: str | None) -> bool:
@@ -3183,6 +3243,39 @@ def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
             if isinstance(cfg, dict)]
 
 
+def _normalize_mcp_gateway_url(value: Any) -> str:
+    """Return ``mcp_gateway_url`` without a trailing ``/``.
+
+    Empty means "no MCP gateway". Raises :class:`ConfigError` for a value that
+    is not an http or https URL with a host, or that has credentials, a query,
+    a fragment or whitespace. The URL goes into logs.
+    """
+    url = "" if value is None else str(value).strip()
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        valid = (
+            parts.scheme in ("http", "https")
+            and bool(parts.hostname)
+            and parts.port != 0  # raises ValueError for a port that is not valid
+            and parts.username is None
+            and parts.password is None
+            and not parts.query
+            and not parts.fragment
+            and not url.endswith(("?", "#"))
+            and not any(ch.isspace() or ord(ch) < 0x20 for ch in url)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(
+            "mcp_gateway_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    return url.rstrip("/")
+
+
 def _get_enabled_claude_code_plugins(
     claude_dir: Path | None = None,
 ) -> list[tuple[str, Path]]:
@@ -3294,8 +3387,8 @@ class LangfuseConfig:
     """Langfuse observability — optional. Activated by setting both keys.
 
     With ``public_key`` and ``secret_key`` configured Nerve traces the agent
-    loop and memU LLM calls into the Langfuse project pointed at by ``host``.
-    Empty keys = no-op, zero overhead, no SDK calls.
+    loop and direct Anthropic SDK calls into the Langfuse project pointed at
+    by ``host``. Empty keys = no-op, zero overhead, no SDK calls.
     """
 
     public_key: str = ""
@@ -3412,6 +3505,10 @@ class NerveConfig:
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
+    # Base URL of the MCP gateway, without a trailing "/". In external mode
+    # Nerve takes its MCP servers only from the gateway's catalog and does not
+    # use mcp_servers. It has no effect in local mode.
+    mcp_gateway_url: str = ""
     external_agents: ExternalAgentsConfig = field(default_factory=ExternalAgentsConfig)
 
     # API keys (from config.local.yaml)
@@ -3556,17 +3653,55 @@ class NerveConfig:
         """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
         return self.selectable_claude_models()
 
-    def create_anthropic_client(self, timeout: float = 60.0) -> Any:
+    def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
+        """The ``max_retries`` argument for an Anthropic client, if any.
+
+        An explicit value wins. Otherwise proxy clients get
+        ``PROXY_CLIENT_MAX_RETRIES`` and the others keep the SDK default.
+        """
+        if max_retries is not None:
+            return {"max_retries": max_retries}
+        if self.proxy.enabled and not self.provider.is_bedrock:
+            return {"max_retries": PROXY_CLIENT_MAX_RETRIES}
+        return {}
+
+    @staticmethod
+    def _client_header_kwargs(principal_id: str | None = None) -> dict[str, Any]:
+        """The ``default_headers`` argument for an Anthropic client, if any.
+
+        In external mode, Nerve's own model calls name ``principal_id``, or
+        the system actor of the server's database when it is ``None``, as the
+        principal of the request, and never another principal from the
+        environment (see :func:`nerve.inference_principal.direct_client_headers`).
+        """
+        headers = direct_client_headers(principal_id=principal_id)
+        return {"default_headers": headers} if headers else {}
+
+    def create_anthropic_client(
+        self, timeout: float = 60.0, *, max_retries: int | None = None,
+        principal_id: str | None = None,
+    ) -> Any:
         """Create an Anthropic client based on the configured provider.
 
         Returns AnthropicBedrock when provider is "bedrock", otherwise
         a standard Anthropic client using the effective API key and base URL.
+
+        ``max_retries`` replaces the default retry budget (see
+        :meth:`_client_retry_kwargs`). A caller with a hard time limit must
+        set it: the proxy budget backs off for about 20 s.
+
+        ``principal_id``: the actor that the requests name in external mode.
+        ``None`` means the system actor of the server's database; a process
+        that has not opened it (a CLI command) passes the ID it read.
         """
         import anthropic
 
         if self.provider.is_bedrock:
             from anthropic import AnthropicBedrock
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {
+                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                **self._client_header_kwargs(principal_id),
+            }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
             if self.provider.aws_profile:
@@ -3580,6 +3715,10 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        kwargs = {
+            **self._client_retry_kwargs(max_retries),
+            **self._client_header_kwargs(principal_id),
+        }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
         # environment itself, so the environment-only install the checks call
@@ -3588,19 +3727,27 @@ class NerveConfig:
             api_key=self.resolve_anthropic_api_key(),
             base_url=base_url,
             timeout=timeout,
+            **kwargs,
         )
 
-    def create_async_anthropic_client(self, timeout: float = 60.0) -> Any:
+    def create_async_anthropic_client(
+        self, timeout: float = 60.0, *, max_retries: int | None = None,
+        principal_id: str | None = None,
+    ) -> Any:
         """Create an async Anthropic client based on the configured provider.
 
         Returns AsyncAnthropicBedrock when provider is "bedrock", otherwise
-        a standard AsyncAnthropic client.
+        a standard AsyncAnthropic client. ``max_retries`` and
+        ``principal_id`` as in :meth:`create_anthropic_client`.
         """
         import anthropic
 
         if self.provider.is_bedrock:
             from anthropic import AsyncAnthropicBedrock
-            kwargs: dict[str, Any] = {"timeout": timeout}
+            kwargs: dict[str, Any] = {
+                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                **self._client_header_kwargs(principal_id),
+            }
             if self.provider.aws_region:
                 kwargs["aws_region"] = self.provider.aws_region
             if self.provider.aws_profile:
@@ -3613,10 +3760,15 @@ class NerveConfig:
         base_url = self.anthropic_api_base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        kwargs = {
+            **self._client_retry_kwargs(max_retries),
+            **self._client_header_kwargs(principal_id),
+        }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
             base_url=base_url,
             timeout=timeout,
+            **kwargs,
         )
 
     _KNOWN_BACKENDS = ("claude", "codex")
@@ -3733,6 +3885,7 @@ class NerveConfig:
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_servers=_parse_mcp_servers(d),
+            mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
             anthropic_api_key=d.get("anthropic_api_key", ""),
             openai_api_key=d.get("openai_api_key", ""),

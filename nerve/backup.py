@@ -8,10 +8,11 @@ snapshot of everything that makes a Nerve instance *this* instance:
   accounts and actor identity. ``--no-secrets`` empties its two credentials in
   the snapshot: the JWT signing secret in ``instance_secrets`` and each
   account's password hash in ``accounts.credential``
-  (see :func:`_scrub_snapshot_secrets`). It also replaces secret values in the
-  staged workspace ``config/*.yaml`` with ``${VAR}`` placeholders, because a
-  tracked ``auth.password_hash`` is still a verifier
-  (see :func:`_sanitised_config`).
+  (see :func:`_scrub_snapshot_secrets`). The one ``instance_secrets`` row that
+  is not secret, the record of the system principal ID, stays. It also
+  replaces secret values in the staged workspace ``config/*.yaml`` with
+  ``${VAR}`` placeholders, because a tracked ``auth.password_hash`` is still a
+  verifier (see :func:`_sanitised_config`).
 - ``memu.sqlite`` — the entire long-term memory
 - the memU sidecar dirs (``memu-conversations/``, ``memu-manual/``, ``memu-resources/``)
 - secrets (``certs/``, ``mcp-token``, ``telegram_sync.session``, ``config.local.yaml``)
@@ -61,6 +62,8 @@ from typing import IO, Callable, Iterator
 
 import yaml
 
+from nerve import pidfile
+
 logger = logging.getLogger(__name__)
 
 # Bundle format revision — bump if the on-disk layout changes incompatibly.
@@ -69,7 +72,7 @@ FORMAT_VERSION = 1
 # --- What goes in state/ (everything under ~/.nerve worth keeping) --------- #
 # The two databases are snapshotted via the online-backup API (below); the
 # rest are plain file/dir copies. Anything not named here is excluded by
-# construction — that intentionally drops nerve.log, nerve.pid, the
+# construction — that intentionally drops nerve.log, nerve.pid, nerve.lock, the
 # *-wal/-shm sidecars (folded into the snapshot), bin/, .crates*, and the
 # stale memu.backup*.sqlite copies.
 STATE_DB_FILES: tuple[str, ...] = ("nerve.db", "memu.sqlite")
@@ -349,14 +352,21 @@ def _snapshot_db(src: Path, dst: Path) -> None:
 
 
 def _scrub_instance_secrets(snapshot: Path) -> None:
-    """Empty ``instance_secrets`` in a snapshot copy of nerve.db.
+    """Delete the secrets from ``instance_secrets`` in a snapshot copy of nerve.db.
 
     The table holds the generated JWT signing secret, which can mint tokens for
-    the live instance, so ``--no-secrets`` must not carry it. This edits the
-    snapshot before it is checksummed and never touches the live database.
-    ``secure_delete`` overwrites the freed pages. A snapshot without the table
-    is left as is. The restored instance generates a new secret on first start.
+    the live instance, so ``--no-secrets`` must not carry it. Every row is
+    deleted except the record of the system principal ID that the system
+    actor took (``nerve.db.accounts.SYSTEM_PRINCIPAL_CLAIM_NAME``): it is
+    instance state, not a secret, and the same ID is in ``actor_refs``. A
+    restored database that lost it could change its system actor ID again.
+    This edits the snapshot before it is checksummed and never touches the
+    live database. ``secure_delete`` overwrites the freed pages. A snapshot
+    without the table is left as is. The restored instance generates a new
+    secret on first start.
     """
+    from nerve.db.accounts import SYSTEM_PRINCIPAL_CLAIM_NAME
+
     conn = _connect(snapshot)
     try:
         exists = conn.execute(
@@ -365,7 +375,9 @@ def _scrub_instance_secrets(snapshot: Path) -> None:
         if not exists:
             return
         conn.execute("PRAGMA secure_delete=ON")
-        conn.execute("DELETE FROM instance_secrets")
+        conn.execute(
+            "DELETE FROM instance_secrets WHERE name != ?", (SYSTEM_PRINCIPAL_CLAIM_NAME,),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1378,21 +1390,6 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
 # --------------------------------------------------------------------------- #
 
 
-def _pid_is_alive(pid_file: Path) -> int | None:
-    """Return the live PID if the daemon is running, else None."""
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    try:
-        os.kill(pid, 0)
-        return pid
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        return pid  # exists but not ours to signal
-
-
 def _dir_nonempty(d: Path) -> bool:
     try:
         return d.is_dir() and any(d.iterdir())
@@ -1426,8 +1423,7 @@ def restore_bundle(
     nerve_dir = Path(nerve_dir).expanduser()
     workspace = Path(workspace).expanduser()
 
-    pid_file = nerve_dir / "nerve.pid"
-    live = _pid_is_alive(pid_file)
+    live = pidfile.live_pid(nerve_dir / "nerve.lock", nerve_dir / "nerve.pid")
     if live is not None:
         raise BackupError(
             f"Nerve daemon appears to be running (PID {live}). "

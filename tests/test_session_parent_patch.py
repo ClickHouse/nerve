@@ -20,6 +20,9 @@ import pytest_asyncio
 from nerve.agent.sessions import SessionManager
 from nerve.db import Database
 
+from tests.actor_rows import ensure_actor_row
+from tests.conftest import TEST_ACTOR
+
 
 @pytest.mark.asyncio
 class TestSessionParentPatch:
@@ -35,6 +38,8 @@ class TestSessionParentPatch:
 
         cfg = NerveConfig()
         cfg_mod._config = cfg
+        # The routes record the signed-in actor on session events.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         sm = SessionManager(db)
         engine = SimpleNamespace(

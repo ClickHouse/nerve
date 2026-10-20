@@ -13,7 +13,9 @@ import base64
 import errno
 import json
 import logging
+import math
 import os
+import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +28,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -40,7 +42,8 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
-from nerve.setup_writer import SetupChoices, apply_mode, write_slim_install
+from nerve.setup_writer import SetupChoices, apply_mode, merge_settings_paths, write_slim_install
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 _PASSWORD = "correct horse battery staple"
 _API_KEY = "sk-ant-REPLACE0000000000"
@@ -181,6 +184,9 @@ def _fresh_module_state(monkeypatch):
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.delenv("NERVE_DOCKER", raising=False)
     monkeypatch.delenv(daemon.SUPERVISOR_ENV, raising=False)
+    # A GitHub token in the developer's shell would read as one the operator provides.
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     yield
     set_config(NerveConfig())
 
@@ -534,7 +540,7 @@ class TestProviderKinds:
         assert _API_KEY not in json.dumps(state)
         settings = claimed.settings_yaml()
         assert settings["provider"] == {"type": "anthropic"}
-        assert settings["agent"] == {"model": "claude-sonnet-4-6", "effort": "high"}
+        assert settings["agent"] == {"model": "claude-sonnet-4-6", "cron_model": "claude-sonnet-4-6", "effort": "high"}
         assert "anthropic_api_key" not in (claimed.config_dir / "config.yaml").read_text()
         assert "sk-ant" not in (claimed.workspace / "config" / "settings.yaml").read_text()
 
@@ -661,7 +667,53 @@ class TestProviderKinds:
             assert effort.status_code == 400 and effort.json()["field"] == "effort"
             ok = await http.put("/api/setup/provider", json={"model": "claude-haiku-4-5-20251001", "effort": "low"})
             assert ok.status_code == 200
-        assert claimed.settings_yaml()["agent"] == {"model": "claude-haiku-4-5-20251001", "effort": "low"}
+        assert claimed.settings_yaml()["agent"] == {
+            "model": "claude-haiku-4-5-20251001", "cron_model": "claude-haiku-4-5-20251001", "effort": "low",
+        }
+
+    async def test_the_cron_model_follows_the_picked_model(self, claimed):
+        """A picked model is the instance's model for scheduled work too: the
+        pick writes agent.cron_model alongside agent.model; an effort-only or
+        credential-only save leaves a hand-set cron model alone; a switch into
+        or out of Bedrock without a pick returns both to the installer's
+        defaults (geo-prefixed on Bedrock)."""
+        async with claimed.client() as http:
+            r = await http.put("/api/setup/provider", json={
+                "type": "anthropic", "anthropic_api_key": _API_KEY, "model": "claude-sonnet-4-6",
+            })
+            assert r.status_code == 200
+            assert step(r.json(), "provider")["detail"]["cron_model"] == "claude-sonnet-4-6"
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == agent["cron_model"] == "claude-sonnet-4-6"
+
+            # A cron model set by hand survives saves that pick nothing — a
+            # distinct value, so "left alone" cannot be confused with
+            # "re-derived from the current model".
+            merge_settings_paths(claimed.workspace, {"agent.cron_model": "claude-haiku-4-5-20251001"})
+            claimed.reload()
+            assert (await http.put("/api/setup/provider", json={"effort": "low"})).status_code == 200
+            assert (await http.put("/api/setup/provider", json={
+                "type": "anthropic", "anthropic_api_key": _API_KEY,
+            })).status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["cron_model"] == "claude-haiku-4-5-20251001" and agent["effort"] == "low"
+
+            r = await http.put("/api/setup/provider", json={"type": "bedrock", "aws_region": "eu-central-1"})
+            assert r.status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == f"eu.anthropic.{DEFAULT_MODEL}"
+            assert agent["cron_model"] == f"eu.anthropic.{DEFAULT_CRON_MODEL}"
+
+            # A geo-prefixed pick lands as-is, for both.
+            picked = f"eu.anthropic.{DEFAULT_MODEL}"
+            assert (await http.put("/api/setup/provider", json={"model": picked})).status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == agent["cron_model"] == picked
+
+            r = await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            assert r.status_code == 200
+        agent = claimed.settings_yaml()["agent"]
+        assert (agent["model"], agent["cron_model"]) == (DEFAULT_MODEL, DEFAULT_CRON_MODEL)
 
     async def test_models_endpoint(self, claimed, monkeypatch):
         """The configured (default) model first, then the catalog as the API
@@ -3234,6 +3286,7 @@ class TestManagedValues:
 
 
 _NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
+_GITHUB_ONLY = "GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance."
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
@@ -3362,6 +3415,107 @@ class TestNoLocalSecrets:
             refused = await http.put("/api/setup/sources", json={"github": True, "gmail": False, "telegram": False})
             assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
 
+    async def test_a_github_only_save_ignores_the_operators_gmail_and_telegram_settings(self, claimed, monkeypatch):
+        """With only GitHub on offer, the live Gmail and Telegram configuration
+        is the operator's: an enabled Gmail source without accounts refuses a
+        Gmail save in default mode, but must not refuse the one toggle the page
+        may switch here (the page has no Gmail field to show that error on)."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{
+            "sync.gmail.enabled": True, "sync.telegram.enabled": True,
+            "sync.telegram.api_hash": "REPLACE_HASH_VALUE",  # a hash without its id
+        })
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["available"] == ["github"]
+            saved = await http.put("/api/setup/sources", json={"github": True})
+            assert saved.status_code == 200, saved.text
+            state = (await http.get("/api/setup")).json()
+            assert step(state, "sources")["detail"]["github"]["enabled"] is True
+
+    async def test_a_github_token_from_the_environment_opens_that_one_toggle(self, claimed, monkeypatch):
+        """The operator holds the token (GH_TOKEN in the service environment):
+        switching the GitHub source on stores nothing here, so the step is
+        offered for that one decision; Gmail and Telegram stay closed."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed)
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+        settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            sources = step(state, "sources")
+            assert sources["status"] == "pending" and sources["blocked_kind"] is None
+            assert sources["read_only"] is False and sources["read_only_reason"] is None
+            assert sources["detail"]["available"] == ["github"]
+            assert sources["detail"]["unavailable_reason"] == _GITHUB_ONLY
+            assert sources["detail"]["github"] == {"enabled": False, "source": "environment"}
+            assert state["steps_left"] == 4  # provider, profile, sources, automation
+            for step_id in ("memory", "channels", "agents"):
+                assert step(state, step_id)["blocked_kind"] == "policy", step_id
+            # A Gmail or Telegram field is refused by name, whatever its value,
+            # and nothing is written — not even the GitHub switch beside it.
+            for body, field in (
+                ({"github": True, "gmail": False, "telegram": False}, "gmail"),
+                ({"gmail": True, "gmail_accounts": ["alice@example.com"]}, "gmail"),
+                ({"gmail_accounts": ["alice@example.com"]}, "gmail_accounts"),
+                ({"github": True, "telegram": False}, "telegram"),
+                ({"telegram": True, "telegram_api_id": 1234567, "telegram_api_hash": "REPLACE_HASH_VALUE"}, "telegram"),
+                ({"telegram_api_id": 1234567}, "telegram_api_id"),
+                ({"telegram_api_hash": "REPLACE_HASH_VALUE"}, "telegram_api_hash"),
+            ):
+                refused = await http.put("/api/setup/sources", json=body)
+                assert refused.status_code == 409, (body, refused.text)
+                assert refused.json() == {"detail": _GITHUB_ONLY, "field": field}, body
+            assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+            # The Telegram sign-in stays closed as before.
+            started = await http.post("/api/setup/sources/telegram/session/start", json={"phone": "+15550100"})
+            assert started.status_code == 409 and started.json()["detail"] == _NO_SECRETS
+            # The GitHub switch goes through, and is the whole answer here.
+            on = await http.put("/api/setup/sources", json={"github": True})
+            assert on.status_code == 200, on.text
+            sources = step(on.json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False and sources["summary"] == "GitHub"
+            settings = claimed.settings_yaml()["sync"]
+            assert settings["github"]["enabled"] is True and settings["github_events"]["enabled"] is True
+            assert settings["gmail"]["enabled"] is False and settings["telegram"]["enabled"] is False
+            assert "sources" in setup_state.load_state().answered
+            # "No" is an answer too; the switch stays open either way.
+            off = await http.put("/api/setup/sources", json={"github": False})
+            assert off.status_code == 200, off.text
+            sources = step(off.json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False and sources["summary"] == "None"
+            assert claimed.settings_yaml()["sync"]["github"]["enabled"] is False
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        assert "ghp_REPLACE" not in json.dumps(off.json())
+
+    async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
+        """Open, the step behaves like any other: it waits for the Mode step
+        (while the closed fields still answer with the policy) and may be
+        skipped and unskipped — the closed steps still refuse a skip."""
+        _keep_no_secrets(claimed)
+        monkeypatch.setenv("GH_TOKEN", "ghp_REPLACE00000000000000")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            assert statuses(state)["mode"] == "pending"
+            assert step(state, "sources")["blocked_kind"] == "sequencing"
+            waiting = await http.put("/api/setup/sources", json={"github": True})
+            assert waiting.status_code == 409 and waiting.json()["detail"] == "Choose a mode first"
+            refused = await http.put("/api/setup/sources", json={"gmail": False})
+            assert refused.status_code == 409 and refused.json() == {"detail": _GITHUB_ONLY, "field": "gmail"}
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            skipped = await http.post("/api/setup/steps/sources/skip")
+            assert skipped.status_code == 200, skipped.text
+            assert step(skipped.json(), "sources")["status"] == "skipped"
+            assert setup_state.load_state().skipped == {"sources"}
+            back = await http.post("/api/setup/steps/sources/unskip")
+            assert back.status_code == 200 and step(back.json(), "sources")["status"] == "pending"
+            for step_id in ("memory", "channels", "agents"):
+                closed = await http.post(f"/api/setup/steps/{step_id}/skip")
+                assert closed.status_code == 409 and closed.json()["detail"] == _NO_SECRETS, step_id
+
     async def test_the_model_step_refuses_a_pasted_credential_but_not_bedrock_or_the_picker(self, claimed, monkeypatch):
         choose(claimed, "personal")
         _keep_no_secrets(claimed)
@@ -3440,3 +3594,36 @@ class TestNoLocalSecrets:
         assert state["steps_left"] == 0
         assert state["finished"] is True
         assert {s["id"] for s in state["steps"] if s["blocked_kind"] == "policy"} == {"memory", "sources", "agents"}
+
+
+@pytest.mark.asyncio
+class TestProviderProbeBehindTheProxy:
+    """Proxy clients back off for about 20 s by default, longer than the
+    probe's time limit. The probe uses its own small retry budget, so each
+    failure keeps its own result instead of "No answer in 20 s."."""
+
+    @staticmethod
+    def _candidate(port: int) -> NerveConfig:
+        return NerveConfig.from_dict({
+            "proxy": {"enabled": True, "port": port, "api_key": "sk-local"},
+        })
+
+    async def test_rate_limit_and_unreachable_proxy_keep_their_own_result(self):
+        """Real SDK backoff, real time limit."""
+        upstream = RateLimitedUpstream(failures=math.inf)
+        with socket.socket() as probe_socket:
+            probe_socket.bind(("127.0.0.1", 0))
+            closed_port = probe_socket.getsockname()[1]
+        try:
+            limited, refused = await asyncio.gather(
+                setup_checks.provider_test(self._candidate(upstream.port)),
+                setup_checks.provider_test(self._candidate(closed_port)),
+            )
+        finally:
+            upstream.close()
+
+        assert limited["code"] == "unknown", limited
+        assert limited["detail"].startswith("RateLimitError:"), limited
+        assert upstream.requests == setup_checks.PROVIDER_TEST_MAX_RETRIES + 1
+        assert refused["code"] == "network", refused
+        assert "could not reach" in refused["detail"], refused

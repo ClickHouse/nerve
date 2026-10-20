@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from nerve.identity import UNATTRIBUTED, Attribution
+
 
 def _loads_object(raw: object) -> dict:
     """Parse a JSON column into a dict, tolerating NULL and bad values."""
@@ -112,8 +114,16 @@ class NotificationStore:
         answer: str,
         answered_by: str,
         actor: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
-        """Record an answer and retain the transport actor in metadata."""
+        """Record an answer and retain the transport actor in metadata.
+
+        ``actor`` is the user ID within the transport (a Telegram or Slack
+        user ID). ``attribution.actor_id`` is the person who answered, written
+        to ``answered_by_actor_id``. An answer names its own person, so the
+        cause is not stored.
+        """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
             async with self.db.execute(
@@ -130,19 +140,23 @@ class NotificationStore:
             await self.db.execute(
                 """UPDATE notifications
                    SET answer = ?, answered_by = ?, answered_at = ?,
-                       status = 'answered', metadata = ?
+                       status = 'answered', metadata = ?,
+                       answered_by_actor_id = ?
                    WHERE id = ?""",
                 (
                     answer,
                     answered_by,
                     now,
                     json.dumps(metadata),
+                    attribution.actor_id,
                     notification_id,
                 ),
             )
         return True
 
-    async def claim_pending_approval(self, notification_id: str) -> bool:
+    async def claim_pending_approval(
+        self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Take a pending approval, so one presser acts on it.
 
         An approval runs its dispatcher before the row is settled, and that
@@ -158,12 +172,17 @@ class NotificationStore:
         can be pressed again. A claim left behind by a process that died
         mid-dispatch refuses later presses until the expiry sweep takes the
         row, which is what an approval nobody answers does in any case.
+
+        The same write stores ``attribution.actor_id`` (the person who
+        decides) in ``answered_by_actor_id``. The expiry sweep can take the
+        row while the dispatcher runs; the action then runs, the row is
+        expired, and it still names who decided.
         """
         now = datetime.now(timezone.utc).isoformat()
         result = await self._write(
-            """UPDATE notifications SET answered_at = ?
+            """UPDATE notifications SET answered_at = ?, answered_by_actor_id = ?
                WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
-            (now, notification_id),
+            (now, attribution.actor_id, notification_id),
         )
         return result.rowcount == 1
 
@@ -237,7 +256,10 @@ class NotificationStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def dismiss_notification(self, notification_id: str) -> bool:
+    async def dismiss_notification(
+        self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it."""
         async with self._atomic():
             async with self.db.execute(
                 "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
@@ -246,15 +268,25 @@ class NotificationStore:
                 if not await cursor.fetchone():
                     return False
             await self.db.execute(
-                "UPDATE notifications SET status = 'dismissed' WHERE id = ?",
-                (notification_id,),
+                """UPDATE notifications
+                   SET status = 'dismissed', dismissed_by_actor_id = ?
+                   WHERE id = ?""",
+                (attribution.actor_id, notification_id),
             )
         return True
 
-    async def dismiss_all_notifications(self) -> int:
-        """Dismiss all pending non-question notifications. Returns count dismissed."""
+    async def dismiss_all_notifications(
+        self, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
+        """Dismiss all pending non-question notifications. Returns count dismissed.
+
+        ``attribution.actor_id`` is who dismissed them.
+        """
         result = await self._write(
-            "UPDATE notifications SET status = 'dismissed' WHERE status = 'pending' AND type = 'notify'",
+            """UPDATE notifications
+               SET status = 'dismissed', dismissed_by_actor_id = ?
+               WHERE status = 'pending' AND type = 'notify'""",
+            (attribution.actor_id,),
         )
         return result.rowcount
 
@@ -335,6 +367,7 @@ class NotificationStore:
 
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
         """Queue a pending notification for re-delivery.
 
@@ -351,6 +384,9 @@ class NotificationStore:
         :meth:`claim_pending_approval` took, so the card that resurfaces
         can be pressed again.
 
+        ``attribution.actor_id`` is who snoozed it, written to
+        ``answered_by_actor_id``. A later decision replaces it.
+
         Returns True on success, False if the row is not pending.
         """
         async with self._atomic():
@@ -362,9 +398,11 @@ class NotificationStore:
                     return False
             await self.db.execute(
                 """UPDATE notifications
-                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL
+                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL,
+                       answered_by_actor_id = ?
                    WHERE id = ?""",
-                (redeliver_at, new_expires_at, notification_id),
+                (redeliver_at, new_expires_at, attribution.actor_id,
+                 notification_id),
             )
         return True
 
@@ -452,19 +490,25 @@ class NotificationStore:
         action: str = "silence",
         created_by: str = "",
         expires_at: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Insert a silence rule.
 
         ``pattern`` is a case-insensitive regex the notification service
         matches against ``title + "\\n" + body``. ``expires_at`` NULL =
-        permanent. Returns the freshly-inserted row.
+        permanent. ``created_by`` is the origin (``web`` or a session ID);
+        ``attribution`` is who created the rule and on whose behalf.
+        Returns the freshly-inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
             """INSERT INTO notification_silences
-               (id, pattern, action, reason, created_by, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (silence_id, pattern, action, reason, created_by, now, expires_at),
+               (id, pattern, action, reason, created_by, created_at, expires_at,
+                created_by_actor_id, caused_by_actor_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (silence_id, pattern, action, reason, created_by, now, expires_at,
+             attribution.actor_id, attribution.caused_by_actor_id),
         )
         row = await self.get_silence(silence_id)
         return row or {"id": silence_id, "pattern": pattern}

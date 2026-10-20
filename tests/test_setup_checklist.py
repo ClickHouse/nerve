@@ -234,6 +234,8 @@ class TestDoneRules:
         assert d["telegram"]["session"] == {"present": False, "authorized": False, "user": None}
         assert d["github"] == {"enabled": False, "source": None}
         assert d["gmail"] == {"enabled": False, "accounts": [], "source": None}
+        # Where the page may store credentials every source is on offer.
+        assert d["available"] == ["github", "gmail", "telegram"] and d["unavailable_reason"] is None
 
     def test_automation(self, personal):
         s = step(facts(personal), "automation")
@@ -472,6 +474,11 @@ def keyless(ws: Path, **top) -> NerveConfig:
     return cfg(ws, setup={"local_secrets": False}, **top)
 
 
+# The operator provides the GitHub token from the environment (GH_TOKEN /
+# GITHUB_TOKEN in the service environment, or a ${VAR} reference).
+GITHUB_ENV = {"github_token": "environment"}
+
+
 class TestNoLocalSecrets:
     """``setup.local_secrets: false``: a step whose only purpose is to store a
     credential on this machine is ``blocked`` with ``policy`` — never pending,
@@ -557,6 +564,72 @@ class TestNoLocalSecrets:
 
     def test_the_summary_says_when_secrets_may_be_kept(self, personal):
         assert checklist.summarize(facts(personal))["local_secrets"] is True
+
+    def test_a_github_token_from_the_environment_keeps_that_toggle_open(self, personal):
+        """Switching the GitHub source on stores nothing here — the operator
+        holds the token — so the step stays open for that one decision:
+        pending, counted, skippable; Gmail and Telegram stay closed."""
+        f = facts(personal, keyless(personal), credential_sources=GITHUB_ENV)
+        s = step(f, "sources")
+        assert s["status"] == "pending" and s["blocked_kind"] is None and s["blocked_reason"] is None
+        assert s["read_only"] is False and s["read_only_reason"] is None
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_ONLY_TEXT
+        assert s["detail"]["github"] == {"enabled": False, "source": "environment"}
+        summary = checklist.summarize(f)
+        assert summary["steps_left"] == 4  # provider, profile, sources, automation
+        kinds = {x["id"]: x["blocked_kind"] for x in summary["steps"] if x["status"] == "blocked"}
+        assert kinds == {"memory": "policy", "channels": "policy", "agents": "policy"}
+        skipped = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, state=SetupState(skipped={"sources"}))
+        assert step(skipped, "sources")["status"] == "skipped"
+        assert checklist.summarize(skipped)["steps_left"] == 3
+
+    def test_github_on_with_a_token_from_the_environment_is_done_and_keeps_its_switch(self, personal):
+        """Done like any switched-on source, but not read-only: the switch is
+        the one control, as the hosted Slack's is."""
+        on = keyless(personal, sync={"github": {"enabled": True}})
+        s = step(facts(personal, on, credential_sources=GITHUB_ENV), "sources")
+        assert s["status"] == "done" and s["read_only"] is False and s["read_only_reason"] is None
+        assert s["summary"] == "GitHub" and s["detail"]["available"] == ["github"]
+        # "No" is an answer too, and still open to change.
+        answered = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, state=SetupState(answered={"sources"}))
+        s = step(answered, "sources")
+        assert s["status"] == "done" and s["read_only"] is False and s["summary"] == "None"
+
+    def test_a_source_the_operator_switched_on_is_shown_beside_the_github_toggle(self, personal):
+        config = keyless(personal, sync={"gmail": {"enabled": True, "accounts": ["alice@example.com"]}})
+        sources = {**GITHUB_ENV, "sync.gmail.accounts": "config-repo"}
+        s = step(facts(personal, config, credential_sources=sources), "sources")
+        assert s["status"] == "done" and s["read_only"] is False
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["gmail"] == {"enabled": True, "accounts": ["alice@example.com"], "source": "config-repo"}
+
+    @pytest.mark.parametrize("sources", [{}, {"github_token": "file"}, {"github_token": "config-repo"}])
+    def test_without_a_token_from_the_environment_the_sources_step_stays_closed(self, personal, sources):
+        """No token, or one in a file on this machine or in the repository: the policy as before."""
+        s = step(facts(personal, keyless(personal), credential_sources=sources), "sources")
+        assert s["status"] == "blocked" and s["blocked_kind"] == "policy"
+        assert s["detail"]["available"] == [] and s["detail"]["unavailable_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+        on = keyless(personal, sync={"github": {"enabled": True}})
+        done = step(facts(personal, on, credential_sources=sources), "sources")
+        assert done["status"] == "done" and done["read_only"] is True
+        assert done["read_only_reason"] == checklist.NO_LOCAL_SECRETS_TEXT and done["detail"]["available"] == []
+
+    def test_the_github_toggle_still_waits_for_a_mode_and_yields_to_lockdown(self, tmp_path, personal):
+        fresh = tmp_path / "fresh"  # a workspace that has never chosen a mode
+        fresh.mkdir()
+        s = step(facts(fresh, keyless(fresh), credential_sources=GITHUB_ENV), "sources")
+        assert s["status"] == "blocked" and s["blocked_kind"] == "sequencing"
+        locked = step(facts(personal, keyless(personal), credential_sources=GITHUB_ENV, lockdown=True), "sources")
+        assert locked["status"] == "blocked" and locked["blocked_kind"] == "lockdown"
+        assert locked["detail"]["available"] == ["github"]
+
+    def test_what_is_on_offer_is_part_of_the_sources_etag(self, personal):
+        """A policy flip changes the set of cards, so the form remounts."""
+        every = step(facts(personal), "sources")["etag"]
+        github_only = step(facts(personal, keyless(personal), credential_sources=GITHUB_ENV), "sources")["etag"]
+        none = step(facts(personal, keyless(personal)), "sources")["etag"]
+        assert len({every, github_only, none}) == 3
 
 
 class TestMaskingAndEtag:

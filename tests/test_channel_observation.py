@@ -1117,7 +1117,7 @@ class TestChannelSource:
         inserted = await db.insert_source_messages(result.records, source="slack")
 
         assert len(result.records) == 2
-        assert inserted == 1
+        assert len(inserted) == 1
 
 
 # ---------------------------------------------------------------------- #

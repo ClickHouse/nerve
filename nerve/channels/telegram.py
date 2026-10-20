@@ -42,6 +42,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.observation import ObservationPolicy
+from nerve.channels.router import turn_stop_note
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -1651,7 +1652,7 @@ class TelegramChannel(BaseChannel):
                 db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
                 # Telegram users are not mapped to local identities yet, so
                 # the approval stays unattributed, like other Telegram input.
-                actor=None,
+                actor=None, cause=None,
             )
         except (PlanNotFound, TaskNotFound):
             await query.answer("That plan is no longer available", show_alert=True)
@@ -1683,6 +1684,8 @@ class TelegramChannel(BaseChannel):
         try:
             await decline_plan(
                 db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+                # Telegram users have no local identity yet: unattributed.
+                actor=None, cause=None,
             )
         except (PlanNotFound, TaskNotFound):
             await query.answer("That plan is no longer available", show_alert=True)
@@ -1740,6 +1743,8 @@ class TelegramChannel(BaseChannel):
             result = await request_plan_revision(
                 db=self.router.engine.db, engine=self.router.engine,
                 plan_id=plan_id, feedback=feedback,
+                # Telegram users have no local identity yet: unattributed.
+                actor=None, cause=None,
             )
         except (PlanNotFound, TaskNotFound):
             await update.message.reply_text("That plan no longer exists.")
@@ -1859,8 +1864,13 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("No active session.")
             return
 
-        stopped = await self.router.stop_session(session_id)
-        if stopped:
+        # The turn only: background agents keep running. A runtime that
+        # cannot spare them is not stopped, and the answer says why.
+        result = await self.router.stop_turn(session_id)
+        note = turn_stop_note(result, session_id)
+        if note:
+            await update.message.reply_text(note, parse_mode=ParseMode.MARKDOWN)
+        elif result.get("turn") in ("stopped", "killed"):
             await update.message.reply_text(
                 f"Stopped session `{session_id}`.",
                 parse_mode=ParseMode.MARKDOWN,

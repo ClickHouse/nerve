@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupState, TelegramSyncSession, TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession, TelegramSyncSessionSummary,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -946,12 +946,15 @@ describe('provider', () => {
     expect(await screen.findByLabelText('Model')).toHaveValue('claude-opus-5-5');
     expect(screen.getByRole('radio', { name: 'max' })).toBeChecked();
     expect(screen.getByText(/leave blank to keep/)).toHaveTextContent('…ab12');
+    // The picker as it stands is the choice, and the choice is the cron model too.
+    expect(screen.getByLabelText('Model')).toHaveAccessibleDescription(/Scheduled jobs run on this model too\./);
 
-    // Change the effort: the next Continue sends just that, then advances.
+    // Change the effort: the next Continue sends that and the model on
+    // screen — the preselected default counts as the pick — then advances.
     await userEvent.click(screen.getByRole('radio', { name: 'high' }));
     m(api.setupStep).mockClear();
     await userEvent.click(continueButton());
-    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high' }));
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high', model: 'claude-opus-5-5' }));
     expect(await heading('About you')).toBeInTheDocument();
     expect(screen.queryByText(/Saved\. Pick the default model/)).not.toBeInTheDocument();
   });
@@ -973,6 +976,53 @@ describe('provider', () => {
     }));
   });
 
+  it('a live test then Continue sends the preselected model with the credential', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.type(screen.getByLabelText('Anthropic API key'), 'sk-ant-REPLACE');
+    await userEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    const model = await screen.findByLabelText('Model');
+    expect(model).toHaveAccessibleDescription(/Scheduled jobs run on this model too\./);
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', {
+      type: 'anthropic', anthropic_api_key: 'sk-ant-REPLACE', model: 'claude-opus-5-5',
+    }));
+  });
+
+  it('Bedrock after a live test sends no model: the one on screen is the Anthropic catalogue\'s, the server applies the region\'s ids', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.click(screen.getByRole('radio', { name: /AWS Bedrock/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    await screen.findByLabelText('Model');
+    m(api.setupStep).mockClear();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { type: 'bedrock', aws_region: 'us-east-1' }));
+  });
+
+  it('a "Saved" notice does not outlive the wizard: coming back later confirms nothing', async () => {
+    const saved = withStep(makeState(), step('provider', { status: 'done', etag: 'provider-etag-2' }, {
+      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'max',
+      cron_model: 'claude-haiku-4-5-20251001',
+    }));
+    m(api.setupStep).mockImplementation(async () => { current = saved; return saved; });
+    const first = renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.type(screen.getByLabelText('Anthropic API key'), 'sk-ant-REPLACE');
+    await userEvent.click(continueButton());
+    expect(await screen.findByText(/Saved\. Pick the default model and effort/)).toBeInTheDocument();
+
+    first.unmount();   // off to the chat page, no Continue
+    m(api.setupStep).mockClear();
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await screen.findByLabelText('Model');
+    expect(screen.queryByText(/Saved\. Pick the default model and effort/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('radio', { name: 'high' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high' }));
+  });
+
   it('lists every model the API returns, marks the configured one recommended, and explains Fable', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'high',
@@ -986,8 +1036,16 @@ describe('provider', () => {
     expect(model).toHaveAccessibleDescription(/Most capable of the classic line/);
     // Nerve's default and the instance's model agree, so nothing is said about it.
     expect(model).not.toHaveAccessibleDescription(/Nerve's default/);
+    // A done step visited later: the cron model set by hand is named, and
+    // only a different pick would move scheduled jobs.
+    expect(model).toHaveAccessibleDescription(
+      /Scheduled jobs run on claude-sonnet-4-6; choosing a different model here moves them to it\./,
+    );
     await userEvent.selectOptions(model, 'claude-fable-5-1');
-    expect(model).toHaveAccessibleDescription('The newest generation; strongest on long, open-ended work.');
+    // The family guidance, then the line that the pick is the cron model too.
+    expect(model).toHaveAccessibleDescription(
+      'The newest generation; strongest on long, open-ended work. Scheduled jobs run on this model too.',
+    );
   });
 
   it('says which model is Nerve\'s default when the instance was set to another', async () => {
@@ -1819,6 +1877,63 @@ describe('instances that keep no credentials on disk', () => {
     expect(form.queryByLabelText(/Telegram user id/)).not.toBeInTheDocument();
     expect(form.queryByRole('button', { name: /Test token|Also connect Slack/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
+  });
+
+  const GITHUB_ONLY = 'GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance.';
+  /** The Sources step as the server sends it when the operator's GitHub token comes from the environment. */
+  const githubOnly = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', overrides, {
+    github: { enabled: false, source: 'environment' }, available: ['github'], unavailable_reason: GITHUB_ONLY, ...detail,
+  });
+
+  it('a GitHub token from the environment keeps the GitHub toggle on offer and nothing else', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const form = within(screen.getByRole('form', { name: 'Choose what Nerve reads' }));
+    // The form, with the server's reason — not the closed-step page, and not the policy's sentence.
+    expect(form.getByText(GITHUB_ONLY)).toBeInTheDocument();
+    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByText('Not available on this instance.')).not.toBeInTheDocument();
+    expect(form.getByText('Token: configured by your operator (environment)')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Gmail' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Turn all off' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Skip for now/ })).toBeInTheDocument();
+    const toggle = screen.getByRole('checkbox', { name: /GitHub/ });
+    expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await userEvent.click(continueButton());
+    // The one boolean on offer: a Gmail or Telegram field would be refused.
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('a source the operator switched on where the page may not is shown, not offered', async () => {
+    const provided = githubOnly({ status: 'done' }, {
+      gmail: { enabled: true, accounts: ['alice@example.com'], source: 'config-repo' },
+    });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? provided : s)) });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const gmail = within(screen.getByRole('region', { name: 'Gmail' }));
+    expect(gmail.getByRole('checkbox')).toBeChecked();
+    expect(gmail.getByRole('checkbox')).toBeDisabled();
+    expect(gmail.getByText('alice@example.com')).toBeInTheDocument();
+    expect(gmail.queryByRole('button', { name: /Remove alice@example.com/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /GitHub/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('the overview counts the open GitHub toggle as a step to do, beside the three closed steps', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByText('Not available on this instance')).toHaveLength(3);
+    expect(rows.getByRole('link', { name: 'Sources' }).closest('li')).toHaveTextContent('To do');
+    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
   });
 });
 

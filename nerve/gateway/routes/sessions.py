@@ -10,14 +10,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nerve.agent.backends.base import BackendError
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.identity import Actor
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ async def _cleanup_uploaded_files(db: object, session_id: str) -> None:
 class MessageRequest(BaseModel):
     message: str
     session_id: str | None = None
+    # The sender's id for this message: a retry with the same id within 10
+    # minutes runs nothing (returns an empty response). Capped like the
+    # WebSocket path's: it is kept for dedupe and echoed to every socket.
+    client_msg_id: str | None = Field(None, max_length=128)
 
 
 class MessageResponse(BaseModel):
@@ -161,8 +165,8 @@ def _page_size() -> int | None:
     return size if size and size > 0 else None
 
 
-async def _pending_wakeup_map(deps) -> dict[str, str]:
-    """``session_id -> fire_at`` for every pending wakeup, in one query.
+async def _pending_wakeup_map(deps) -> dict[str, dict]:
+    """``session_id -> wakeup row`` for every pending wakeup, in one query.
 
     ``ScheduleWakeup`` keeps at most one pending row per session, so a plain
     map is enough. Enrichment: a failure dims the indicator, it must never
@@ -172,7 +176,7 @@ async def _pending_wakeup_map(deps) -> dict[str, str]:
         rows = await deps.db.list_pending_wakeups()
     except Exception:  # noqa: BLE001 — enrichment must never break listing
         return {}
-    return {r["session_id"]: r["fire_at"] for r in rows if r.get("session_id")}
+    return {r["session_id"]: r for r in rows if r.get("session_id")}
 
 
 async def _decorate(deps, sessions: list[dict]) -> list[dict]:
@@ -183,14 +187,34 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
     # a wakeup is scheduled, or a background task is still running inside its
     # CLI. The sidebar keeps those parked sessions in the "Running" group
     # (with their own dot colour) instead of dropping them to idle.
-    wakeup_at = await _pending_wakeup_map(deps)
+    wakeups = await _pending_wakeup_map(deps)
     for s in sessions:
         s["is_running"] = s["id"] in running_ids
         s["awaiting_input"] = s["id"] in awaiting_ids
-        s["pending_wakeup_at"] = wakeup_at.get(s["id"])
+        wakeup = wakeups.get(s["id"]) or {}
+        s["pending_wakeup_at"] = wakeup.get("fire_at")
+        # Who scheduled the wakeup (a person, or the system actor for the
+        # agent) and on whose behalf it runs.
+        s["pending_wakeup_created_by_actor_id"] = wakeup.get("created_by_actor_id")
+        s["pending_wakeup_caused_by_actor_id"] = wakeup.get("caused_by_actor_id")
         s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
+        # How many agents still run (the sidebar's count).
+        s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
     await _attach_review_loops(deps, sessions)
     return sessions
+
+
+def _background_count(deps, session_id: str, has_background: bool | None = None) -> int:
+    """Live agents of a session; an engine without the count reports 0 or 1."""
+    count = getattr(deps.engine, "background_agent_count", None)
+    if count is not None:
+        try:
+            return int(count(session_id))
+        except Exception:  # noqa: BLE001 — enrichment must never break listing
+            logger.debug("background count failed for %s", session_id, exc_info=True)
+    if has_background is None:
+        has_background = bool(deps.engine.has_live_background_tasks(session_id))
+    return int(bool(has_background))
 
 
 def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> dict:
@@ -306,19 +330,24 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
         actor=actor,
     )
     if req.review_loop is not None:
-        session = await _attach_review_loop(deps, session, session_id, cwd, req)
+        session = await _attach_review_loop(deps, session, session_id, cwd, req, actor)
     return session
 
 
-async def _attach_review_loop(deps, session: dict, session_id: str, cwd: str, req: SessionCreateRequest) -> dict:
+async def _attach_review_loop(
+    deps, session: dict, session_id: str, cwd: str, req: SessionCreateRequest,
+    actor: Actor,
+) -> dict:
     """Create the review loop for a freshly created observer session. A
-    rejected loop config rolls the session back — no stray empty sessions."""
+    rejected loop config rolls the session back, so no empty session stays.
+    The rollback is a delete by the person who asked for the session. The
+    person who creates the session creates the loop and is its cause."""
     from nerve.workflows import get_review_loop_service
     from nerve.workflows.review_loop import ReviewLoopError
 
     service = get_review_loop_service()
     if service is None:
-        await deps.db.delete_session(session_id)
+        await deps.db.delete_session(session_id, attribution=attribution_for(actor))
         raise HTTPException(
             status_code=503,
             detail="review loops are disabled (workflows.review_loop.enabled)",
@@ -343,9 +372,10 @@ async def _attach_review_loop(deps, session: dict, session_id: str, cwd: str, re
                 if rl.verifier_leg else None
             ),
             created_by=f"session:{session_id}",
+            attribution=attribution_for(actor),
         )
     except ReviewLoopError as e:
-        await deps.db.delete_session(session_id)
+        await deps.db.delete_session(session_id, attribution=attribution_for(actor))
         raise HTTPException(status_code=400, detail=str(e))
     try:
         meta = json.loads(session.get("metadata") or "{}")
@@ -420,6 +450,10 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     When ``sessions.star_project_hook`` is enabled (default off), a ``starred``
     0<->1 transition fires a one-shot internal turn in that same session so the
     agent can promote it to a project (create its Task card) or archive it.
+
+    Each field that changes records a session event (``title_changed``,
+    ``starred`` / ``unstarred``, ``model_changed``, ``parent_changed``) with
+    the person as actor and cause.
     """
     deps = get_deps()
     session = await deps.db.get_session(session_id)
@@ -434,6 +468,24 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
         requested_model = str(req["model"] or "").strip()
         if not requested_model:
             raise HTTPException(status_code=400, detail="model cannot be empty")
+        # A model switch recreates the session's runtime, and every
+        # background agent still running in it would die with it.
+        agents = getattr(deps.engine, "agents", None)
+        if (
+            agents is not None
+            and requested_model != (session.get("model") or "")
+            and agents.has_live(session_id)
+        ):
+            live = agents.live_count(session_id)
+            raise HTTPException(status_code=409, detail={
+                "code": "live_background_agents",
+                "message": (
+                    f"{live} background agent(s) are still running in this "
+                    "session; switching the model restarts its runtime and "
+                    "would stop them. Stop them or wait for them to finish."
+                ),
+                "live": live,
+            })
         # Backend is sticky on the session row — validate the pick against
         # it (same optional seam as session creation: codex can cheaply
         # reject; claude accepts any ID since Ollama models ride it).
@@ -482,14 +534,17 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
+    attribution = attribution_for(actor)
     # Starring an archived session restores it via the shared unarchive path (logs "unarchived", bumps updated_at) before the star write, so the star->project hook fires on a live session.
     if fields.get("starred") == 1 and session.get("status") == "archived":
         if deps.engine:
-            await deps.engine.sessions.unarchive_session(session_id)
+            await deps.engine.sessions.unarchive_session(
+                session_id, attribution=attribution,
+            )
         else:
             fields["status"] = "idle"
             fields["archived_at"] = None
-    await deps.db.update_session_fields(session_id, fields)
+    await deps.db.change_session_fields(session_id, fields, attribution=attribution)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
     # off). On a starred transition fire a one-shot internal turn.
@@ -529,18 +584,25 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
 
     if engine:
         # Disconnect client
-        client = engine.sessions.remove_client(session_id)
+        client = engine.sessions.remove_client(session_id, reason="deleted")
         if client:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+        # Drop the session's agent records, queued writes and pending emits
+        # before the rows go (a write already in flight fails the foreign key
+        # and is dropped).
+        agents = getattr(engine, "agents", None)
+        if agents is not None:
+            await agents.forget_session(session_id)
         # Snapshot messages for background memorization before deleting
         session = await db.get_session(session_id)
         connected_at = session.get("connected_at") if session else None
         messages = await db.get_messages(session_id, limit=10000) if connected_at else []
-        # Delete from DB immediately (fast)
-        await db.delete_session(session_id)
+        # Delete from DB immediately (fast). The delete is recorded with
+        # the person, because the session's own events go with it.
+        await db.delete_session(session_id, attribution=attribution_for(actor))
         # Cleanup uploaded files for this session
         await _cleanup_uploaded_files(db, session_id)
         # Memorize in background from snapshot
@@ -562,7 +624,7 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
                     logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
             asyncio.create_task(_bg_memorize())
     else:
-        await db.delete_session(session_id)
+        await db.delete_session(session_id, attribution=attribution_for(actor))
         await _cleanup_uploaded_files(db, session_id)
     return {"deleted": True}
 
@@ -579,6 +641,7 @@ async def session_status(session_id: str, actor: Actor = Depends(require_auth)):
         "session_id": session_id,
         "status": session.get("status", "unknown"),
         "is_running": is_running,
+        "background_count": _background_count(deps, session_id),
         "awaiting_input": session_id in get_awaiting_ids(),
         "sdk_session_id": session.get("sdk_session_id"),
         "connected_at": session.get("connected_at"),
@@ -703,8 +766,11 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
         fire_at = (
             datetime.now(timezone.utc) + timedelta(seconds=seconds)
         ).isoformat()
+        # The person schedules the deferred turn, and it runs on their
+        # behalf when it fires.
         await deps.db.add_wakeup(
             req.session_id, prompt=message, fire_at=fire_at, reason="run-later",
+            attribution=attribution_for(actor),
         )
     else:
         ack = _RUN_LATER_MANUAL_ACK
@@ -731,25 +797,36 @@ async def resume_session(session_id: str, actor: Actor = Depends(require_auth)):
     """Resume a stopped or idle session."""
     deps = get_deps()
     try:
-        session = await deps.engine.resume_session(session_id)
+        session = await deps.engine.resume_session(
+            session_id, attribution=attribution_for(actor),
+        )
         return session
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/api/sessions/{session_id}/archive")
-async def archive_session(session_id: str, actor: Actor = Depends(require_auth)):
+async def archive_session(
+    session_id: str, force: bool = False, actor: Actor = Depends(require_auth),
+):
     """Archive a session and its entire descendant subtree (soft delete).
 
     Cascade is the default: children, grandchildren and deeper are archived
     bottom-up. Returns a structured report of which session ids were archived
     vs skipped (with reasons) so a still-running descendant never silently
     leaves an archived-parent-with-active-child orphan.
+
+    A session whose background agents still run is skipped with the reason
+    ``"background agents running"``; ``?force=true`` archives it anyway and
+    its agents end as interrupted (``archived``).
     """
     deps = get_deps()
-    result = await deps.engine.sessions.archive_session_cascade(session_id)
+    result = await deps.engine.sessions.archive_session_cascade(
+        session_id, attribution=attribution_for(actor), force=force,
+    )
     return {
-        "archived": True,
+        # False when every session was skipped (e.g. its agents still run).
+        "archived": bool(result["archived"]),
         "archived_ids": result["archived"],
         "skipped": result["skipped"],
     }
@@ -760,7 +837,9 @@ async def unarchive_session(session_id: str, actor: Actor = Depends(require_auth
     """Restore an archived session (Archived group → Unarchive / Star)."""
     deps = get_deps()
     try:
-        await deps.engine.sessions.unarchive_session(session_id)
+        await deps.engine.sessions.unarchive_session(
+            session_id, attribution=attribution_for(actor),
+        )
         return {"unarchived": True}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -770,7 +849,10 @@ async def unarchive_session(session_id: str, actor: Actor = Depends(require_auth
 async def get_session_events(
     session_id: str, limit: int = 50, actor: Actor = Depends(require_auth),
 ):
-    """Get the lifecycle event log for a session."""
+    """Get the lifecycle event log for a session.
+
+    Each event carries ``actor_id`` and ``caused_by_actor_id``.
+    """
     deps = get_deps()
     events = await deps.db.get_session_events(session_id, limit=limit)
     return {"events": events}
@@ -906,5 +988,7 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         source="web",
         channel="web",
         actor=actor,
+        client_msg_id=req.client_msg_id or None,
+        origin="api",
     )
     return MessageResponse(response=response, session_id=session_id)

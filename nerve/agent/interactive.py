@@ -122,6 +122,12 @@ class InteractiveToolHandler:
         self.interactive_capable = interactive_capable
         self._pending: dict[str, PendingInteraction] = {}
         self._captured_files: set[str] = set()  # paths snapshotted this session
+        # Set by the engine: ``describe_agent(task_id)`` names the sub-agent
+        # that asked (``{"agent_id", "task_id", "label"}`` or None), and
+        # ``on_agent_interaction(task_id, pending)`` marks it waiting for an
+        # answer. A question from the orchestrator has no agent.
+        self.describe_agent: Callable[[str], dict | None] | None = None
+        self.on_agent_interaction: Callable[[str, bool], None] | None = None
 
     # -- snapshot bookkeeping ------------------------------------------- #
 
@@ -139,8 +145,15 @@ class InteractiveToolHandler:
         tool_name: str,
         tool_input: dict[str, Any],
         timeout: float | None = None,
+        *,
+        agent_task_id: str | None = None,
     ) -> InteractionOutcome:
-        """Pause for an interactive built-in (question / plan approval)."""
+        """Pause for an interactive built-in (question / plan approval).
+
+        ``agent_task_id`` is the runtime's id of the sub-agent that asked
+        (a foreground agent); the ``interaction`` event then names it, and
+        the agent shows as waiting for an answer until the pause ends.
+        """
         if not self.interactive_capable:
             logger.info(
                 "Session %s: auto-denying %s (non-interactive channel)",
@@ -150,9 +163,42 @@ class InteractiveToolHandler:
                 denied=True,
                 message=f"{tool_name} is not available in this channel.",
             )
-        return await self._pause(
-            tool_name, tool_input, _interaction_type(tool_name), timeout=timeout,
-        )
+        agent = self._agent_ref(agent_task_id) if agent_task_id else None
+        if agent_task_id:
+            self._mark_agent_waiting(agent_task_id, True)
+        try:
+            return await self._pause(
+                tool_name, tool_input, _interaction_type(tool_name),
+                timeout=timeout, agent=agent,
+            )
+        finally:
+            if agent_task_id:
+                self._mark_agent_waiting(agent_task_id, False)
+
+    def _agent_ref(self, task_id: str) -> dict:
+        """``{"agent_id", "task_id", "label"}`` of the asking agent (its
+        record's id when one is known)."""
+        ref = None
+        if self.describe_agent is not None:
+            try:
+                ref = self.describe_agent(task_id)
+            except Exception:  # noqa: BLE001 — naming never breaks a pause
+                logger.debug("describe_agent failed for %s", task_id, exc_info=True)
+        if not ref:
+            return {"agent_id": None, "task_id": task_id, "label": task_id}
+        return {
+            "agent_id": ref.get("agent_id"),
+            "task_id": ref.get("task_id") or task_id,
+            "label": ref.get("label") or task_id,
+        }
+
+    def _mark_agent_waiting(self, task_id: str, pending: bool) -> None:
+        if self.on_agent_interaction is None:
+            return
+        try:
+            self.on_agent_interaction(task_id, pending)
+        except Exception:  # noqa: BLE001
+            logger.debug("on_agent_interaction failed for %s", task_id, exc_info=True)
 
     async def request_approval(
         self, kind: str, payload: dict[str, Any],
@@ -180,8 +226,12 @@ class InteractiveToolHandler:
         tool_input: dict[str, Any],
         interaction_type: str,
         timeout: float | None = None,
+        agent: dict | None = None,
     ) -> InteractionOutcome:
-        """Broadcast to the UI, wait for the user's response."""
+        """Broadcast to the UI, wait for the user's response.
+
+        ``agent`` names the sub-agent that asked (``None``: the
+        orchestrator)."""
         interaction_id = str(uuid4())
         pending = PendingInteraction(
             interaction_id=interaction_id,
@@ -198,6 +248,7 @@ class InteractiveToolHandler:
             "interaction_type": interaction_type,
             "tool_name": tool_name,
             "tool_input": tool_input,
+            "agent": agent,
         })
         # Tell every connected client this session is now waiting for input,
         # so the sidebar can show the "waiting" indicator (blue dot).

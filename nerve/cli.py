@@ -31,7 +31,7 @@ from pathlib import Path
 
 import click
 
-from nerve import paths
+from nerve import paths, pidfile
 from nerve.config import (
     RESUME_QUEUE_FILE,
     load_config,
@@ -60,31 +60,17 @@ def setup_logging(verbose: bool = False) -> None:
 
 # --- PID file helpers ---
 
-def _read_pid() -> int | None:
-    """Read PID from file. Returns None if no valid PID file."""
-    try:
-        pid = int(paths.pid_file().read_text().strip())
-        return pid
-    except (FileNotFoundError, ValueError):
-        return None
+def _write_pid(config_dir: Path | None = None) -> bool:
+    """Take the daemon lock and write the PID of this process.
 
-
-def _is_running(pid: int) -> bool:
-    """Check if a process with the given PID is alive."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # Process exists but we can't signal it
-
-
-def _write_pid(pid: int, config_dir: Path | None = None) -> None:
+    Returns False if a different process holds the lock.
+    """
     paths.ensure_nerve_home()
-    paths.pid_file().write_text(str(pid))
+    if not pidfile.acquire(paths.lock_file(), paths.pid_file()):
+        return False
     if config_dir is not None:
         write_config_pointer(config_dir)
+    return True
 
 
 def _remove_pid() -> None:
@@ -93,14 +79,8 @@ def _remove_pid() -> None:
 
 def _get_daemon_status() -> tuple[bool, int | None]:
     """Returns (is_running, pid)."""
-    pid = _read_pid()
-    if pid is None:
-        return False, None
-    if _is_running(pid):
-        return True, pid
-    # Stale PID file
-    _remove_pid()
-    return False, None
+    pid = pidfile.live_pid(paths.lock_file(), paths.pid_file())
+    return pid is not None, pid
 
 
 # --- Systemd helpers ---
@@ -242,12 +222,16 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--keep-env", is_flag=True,
     help="Slim setup: pass ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN from this shell to the daemon",
 )
+@click.option(
+    "--serve-next", is_flag=True, hidden=True,
+    help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool,
+    keep_env: bool, serve_next: bool = False,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
@@ -268,6 +252,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
+            system_principal=not serve_next,
         )
         return
 
@@ -596,9 +581,11 @@ def _spawned_daemon_problem(proc) -> str | None:
     other program keeps answering. The child must still be alive and the pid
     file (which ``start --foreground`` writes first thing) must name it.
     """
+    from nerve import daemon
+
     if proc.poll() is not None:
         return f"the new process exited with code {proc.returncode} right after starting"
-    recorded = _read_pid()
+    recorded = daemon.pid_file_pid()
     if recorded != proc.pid:
         return (
             "something else answers on that port (the pid file names "
@@ -756,6 +743,7 @@ def _slim_init(
     clipboard: bool,
     yes: bool,
     keep_env: bool = False,
+    system_principal: bool = True,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -779,11 +767,16 @@ def _slim_init(
 
         # The owner account exists before the daemon answers, so the setup
         # token is available the moment /health is green. No name: the setup
-        # page asks.
+        # page asks. ``system_principal`` is false when this process serves
+        # next (``nerve start -f``): the gateway's bootstrap reads
+        # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, once.
         from nerve.migrate import bootstrap_identity_sync
 
         try:
-            bootstrap_identity_sync(config, display_name=None, passwordless=False)
+            bootstrap_identity_sync(
+                config, display_name=None, passwordless=False,
+                system_principal=system_principal,
+            )
         except Exception as e:  # noqa: BLE001 — the files are written; say what is missing
             raise click.ClickException(
                 f"Setup wrote the configuration, but the local owner account could not "
@@ -892,11 +885,13 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     # Migrate a legacy install to the workspace/config layout if needed
     # (idempotent, best-effort). Non-destructive — originals kept as *.migrated.
-    # The gateway runs the identity bootstrap when it starts.
+    # The gateway runs the identity bootstrap when it starts. It also reads
+    # NERVE_SYSTEM_PRINCIPAL_ID and logs the result, so the preview here does not.
     if config is not None:
         from nerve.migrate import maybe_migrate
         report = maybe_migrate(
             config_dir, workspace=getattr(config, "workspace", None), config=config,
+            preview_system_principal=False,
         )
         if report is not None and report.did_anything:
             # The config in hand was loaded from the old locations, and migration
@@ -921,7 +916,7 @@ def start(ctx: click.Context, foreground: bool) -> None:
             # `start --foreground` would otherwise exit 1 and leave an
             # unsupervised daemon holding the port).
             click.echo("Fresh install detected — running setup...")
-            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True)
+            ctx.invoke(init, no_start=True, no_browser=True, no_clipboard=True, serve_next=True)
             config = ctx.obj.get("config")
             if config is None:
                 raise click.ClickException(
@@ -958,7 +953,10 @@ def start(ctx: click.Context, foreground: bool) -> None:
 
     if foreground:
         # Run directly in this process
-        _write_pid(os.getpid(), config_dir=config_dir)
+        if not _write_pid(config_dir=config_dir):
+            click.echo("Nerve is already running")
+            ctx.exit(1)
+            return
         try:
             from nerve.gateway.server import run_server
             click.echo(f"Starting Nerve on {config.gateway.host}:{config.gateway.port}")
@@ -1008,7 +1006,7 @@ def stop(ctx: click.Context) -> None:
     # Wait for graceful shutdown (up to 15 seconds)
     for i in range(30):
         time.sleep(0.5)
-        if not _is_running(pid):
+        if not pidfile.pid_exists(pid):
             _remove_pid()
             click.echo("Nerve stopped")
             return
@@ -1445,6 +1443,25 @@ def _config_source_label(source: str) -> str:
     }.get(source, source)
 
 
+def _probe_principal_id() -> str | None:
+    """The principal that the doctor's model probe names: the system actor.
+
+    External mode only (``NERVE_AUTH_MODE`` in this shell). The doctor opens
+    no server database, so it reads the stored system actor read-only.
+    ``None`` in local mode, with an invalid mode, or without a database.
+    """
+    from nerve.config import ConfigError
+    from nerve.db.accounts import read_system_actor_id
+    from nerve.gateway.auth import is_external_mode
+
+    try:
+        if not is_external_mode():
+            return None
+    except ConfigError:
+        return None
+    return read_system_actor_id(paths.db_path())
+
+
 def _check_api_connectivity(config) -> tuple[bool, str]:
     """Make a 1-token API call through the configured provider.
 
@@ -1453,7 +1470,9 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
     """
     model = config.agent.title_model
     try:
-        client = config.create_anthropic_client(timeout=15.0)
+        client = config.create_anthropic_client(
+            timeout=15.0, principal_id=_probe_principal_id(),
+        )
         client.messages.create(
             model=model,
             max_tokens=1,
@@ -1528,6 +1547,19 @@ def _source_suffix(config, path: str) -> str:
         return ""
 
 
+def _github_token_from_environment(config) -> bool:
+    """Whether the GitHub token comes from the environment (``GH_TOKEN`` /
+    ``GITHUB_TOKEN``, or a ``${VAR}`` reference) — the one source the setup
+    page still offers on an instance that keeps no credentials. Never raises."""
+    try:
+        from nerve import setup_provenance
+
+        source = setup_provenance.credential_sources(config).get("github_token")
+        return source == setup_provenance.SOURCE_ENVIRONMENT
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
     """Doctor lines for the Telegram *message sync*: credentials, and whether
     the session is signed in. Reads the session file's presence and the state
@@ -1566,6 +1598,44 @@ def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
             f"verified — {both_routes}"
         )
     return lines
+
+
+def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
+    """Doctor lines about ``NERVE_SYSTEM_PRINCIPAL_ID``: ``(lines, warnings)``.
+
+    Like the auth mode, the value comes from this shell, not from the running
+    server. Nothing is reported when the variable is unset here.
+    """
+    from nerve.db.accounts import inspect_system_actor
+    from nerve.identity import (
+        SYSTEM_PRINCIPAL_ENV,
+        InvalidSystemPrincipalId,
+        system_principal_id_from_env,
+    )
+
+    label = f"System actor ({SYSTEM_PRINCIPAL_ENV} from this shell)"
+    if not external:
+        if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
+            return [f"[--] {label}: set, but it has no effect in local mode"], []
+        return [], []
+    try:
+        wanted = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        return [], [f"[WARN] {label}: {e}. The server keeps the current system actor ID."]
+    if wanted is None:
+        return [], []
+    state = inspect_system_actor(paths.db_path(), wanted)
+    if state is None:
+        return [f"[--] {label}: no system actor yet; the next start gives it {wanted}"], []
+    current, blocker = state
+    if current == wanted:
+        return [f"[OK] {label}: {current}"], []
+    if blocker is None:
+        return [f"[--] {label}: {current}; the next start changes it to {wanted}"], []
+    return [], [
+        f"[WARN] {label}: keeps the current ID {current}, not {wanted}: {blocker}. "
+        "Autonomous work is attributed to that ID."
+    ]
 
 
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
@@ -2006,6 +2076,10 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "[WARN] auth.password_hash is set but no account uses it — every "
                 "account has its own password now; the configured value does nothing"
             )
+    if mode is not None:
+        ok, warn = _system_principal_report(external=external)
+        lines.extend(ok)
+        warnings.extend(warn)
 
     # The setup checklist: the same derivation the setup page uses, over the
     # facts this process can read. Never prints the token — `nerve status`
@@ -2031,11 +2105,17 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             lines.append(f"[--] Setup checklist: nothing left to decide here{caveat}")
     if not getattr(getattr(config, "setup", None), "local_secrets", True):
         # The setup page stores no credential here (setup.local_secrets:
-        # false): say so once, next to the checklist it shapes.
+        # false): say so once, next to the checklist it shapes. A GitHub
+        # token from the environment keeps that one source on offer.
+        closed = "the Memory, Channels, Sources and Agents steps are not offered"
+        if _github_token_from_environment(config):
+            closed = (
+                "the Memory, Channels and Agents steps and the Gmail and Telegram "
+                "sources are not offered; GitHub comes from the environment"
+            )
         lines.append(
             "[--] Setup page keeps no credentials on this instance "
-            "(setup.local_secrets: false) — connections come from the operator; "
-            "the Memory, Channels, Sources and Agents steps are not offered"
+            f"(setup.local_secrets: false) — connections come from the operator; {closed}"
         )
     try:
         from nerve import setup_state as _setup_state
@@ -2718,14 +2798,13 @@ def sync(ctx: click.Context, source: str) -> None:
     config = ctx.obj["config"]
 
     async def _run():
-        from nerve.agent.engine import AgentEngine
         from nerve.migrate import open_production_db
         from nerve.sources.registry import build_source_runners
 
         db = await open_production_db(config)
+        engine = None
         try:
-            engine = AgentEngine(config, db)
-            await engine.initialize()
+            engine = await _start_one_shot_engine(config, db)
 
             runners = build_source_runners(config, db)
             if not runners:
@@ -2760,6 +2839,7 @@ def sync(ctx: click.Context, source: str) -> None:
                     error=result.error,
                 )
         finally:
+            await _stop_one_shot_engine(engine)
             await db.close()
 
     click.echo(f"Running sync: {source}")
@@ -2830,13 +2910,12 @@ def cron(ctx: click.Context, job_id: str) -> None:
     config = ctx.obj["config"]
 
     async def _run():
-        from nerve.agent.engine import AgentEngine
         from nerve.migrate import open_production_db
 
         db = await open_production_db(config)
+        engine = None
         try:
-            engine = AgentEngine(config, db)
-            await engine.initialize()
+            engine = await _start_one_shot_engine(config, db)
 
             if job_id:
                 from nerve.cron.service import CronService
@@ -2873,6 +2952,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
                         f"{job.description or job.schedule} ({status})"
                     )
         finally:
+            await _stop_one_shot_engine(engine)
             await db.close()
 
     _run_against_db(ctx, _run())
@@ -3270,6 +3350,33 @@ def _run_against_db(ctx: click.Context, coro):
     except InsecureStateStorage as e:
         click.echo(f"[ERR] {e}")
         ctx.exit(1)
+
+
+async def _start_one_shot_engine(config, db):
+    """The agent engine of one CLI command (``nerve sync``, ``nerve cron``).
+
+    While the gateway runs, the agent records a previous process left live
+    are the gateway's own agents, so the engine leaves them alone instead of
+    marking them interrupted.
+    """
+    from nerve.agent.engine import AgentEngine
+
+    engine = AgentEngine(config, db)
+    gateway_running, _pid = _get_daemon_status()
+    await engine.initialize(reconcile_agents=not gateway_running)
+    return engine
+
+
+async def _stop_one_shot_engine(engine) -> None:
+    """Shut a one-shot engine down before its database closes: the command's
+    runtimes disconnect, their agents are settled, and the agent records
+    still queued for writing reach the database."""
+    if engine is None:
+        return
+    try:
+        await engine.shutdown()
+    except Exception as e:  # noqa: BLE001 — the database must still close
+        logging.getLogger(__name__).warning("engine shutdown failed: %s", e)
 
 
 @main.group(name="db")

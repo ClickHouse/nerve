@@ -23,6 +23,7 @@ from nerve.agent.plan_service import (
 )
 from nerve.db import Database
 from nerve.identity import ACTOR_KIND_HUMAN, Actor
+from tests.actor_rows import ensure_actor_row
 
 # A person approving through the WebUI. The fake session store below keeps
 # actors in memory, so no actor row is needed.
@@ -30,6 +31,8 @@ APPROVER = Actor(
     actor_id="actor-approver", kind=ACTOR_KIND_HUMAN,
     account_id="account-approver", display_name="Approver",
 )
+# A person acts for themselves.
+BY_APPROVER = {"actor": APPROVER, "cause": APPROVER}
 
 
 class FakeSessionManager:
@@ -40,11 +43,11 @@ class FakeSessionManager:
 
     async def get_or_create(
         self, session_id, title=None, source="web", metadata=None,
-        *, actor: Actor | None,
+        *, actor: Actor | None, cause=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id, "title": title, "source": source,
-            "actor": actor,
+            "actor": actor, "cause": cause,
         })
         return {"id": session_id, "title": title or session_id, "source": source}
 
@@ -89,6 +92,8 @@ async def _setup(
     if status != "pending":
         await db.update_plan("plan-act", status=status)
 
+    # The plan's reviewer columns reference actor rows.
+    await ensure_actor_row(db, APPROVER)
     engine = FakeEngine(db)
     tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
     return engine, task_id
@@ -99,7 +104,7 @@ class TestApprovePlan:
     async def test_spawns_impl_marks_implementing_and_moves_task(self, db, tmp_path):
         engine, task_id = await _setup(db, tmp_path)
 
-        result = await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+        result = await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
         impl = result["impl_session_id"]
@@ -125,20 +130,20 @@ class TestApprovePlan:
 
     async def test_skill_create_gets_skill_prompt(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path, plan_type="skill-create")
-        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
         assert "skill_create" in engine.runs[0]["user_message"]
 
     async def test_refuses_non_pending(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path, status="implementing")
         with pytest.raises(PlanNotPending):
-            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         assert engine.runs == []
 
     async def test_raises_plan_not_found(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path)
         with pytest.raises(PlanNotFound):
-            await approve_plan(db=db, engine=engine, plan_id="plan-missing", actor=APPROVER)
+            await approve_plan(db=db, engine=engine, plan_id="plan-missing", actor=APPROVER, cause=APPROVER)
         assert engine.runs == []
 
     async def test_raises_task_not_found(self, db, tmp_path):
@@ -146,7 +151,7 @@ class TestApprovePlan:
         await db.db.execute("DELETE FROM tasks WHERE id = ?", ("t-act",))
         await db.db.commit()
         with pytest.raises(TaskNotFound):
-            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         assert engine.runs == []
 
 
@@ -157,6 +162,7 @@ class TestDeclinePlan:
 
         result = await decline_plan(
             db=db, engine=engine, plan_id="plan-act", feedback="not now",
+            **BY_APPROVER,
         )
         assert result["status"] == "declined"
         assert result["feedback"] == "not now"
@@ -170,7 +176,7 @@ class TestDeclinePlan:
 
     async def test_without_feedback_still_closes(self, db, tmp_path):
         engine, task_id = await _setup(db, tmp_path)
-        result = await decline_plan(db=db, engine=engine, plan_id="plan-act")
+        result = await decline_plan(db=db, engine=engine, plan_id="plan-act", **BY_APPROVER)
         assert result["feedback"] == ""
         plan = await db.get_plan("plan-act")
         assert plan["status"] == "declined"
@@ -180,12 +186,12 @@ class TestDeclinePlan:
     async def test_refuses_non_pending(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path, status="declined")
         with pytest.raises(PlanNotPending):
-            await decline_plan(db=db, engine=engine, plan_id="plan-act")
+            await decline_plan(db=db, engine=engine, plan_id="plan-act", **BY_APPROVER)
 
     async def test_raises_plan_not_found(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path)
         with pytest.raises(PlanNotFound):
-            await decline_plan(db=db, engine=engine, plan_id="plan-missing")
+            await decline_plan(db=db, engine=engine, plan_id="plan-missing", **BY_APPROVER)
 
 
 def _hold_callers_in_get_task(db, monkeypatch, callers: int = 2) -> None:
@@ -213,8 +219,8 @@ class TestConcurrentReview:
         _hold_callers_in_get_task(db, monkeypatch)
 
         results = await asyncio.gather(
-            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER),
-            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER),
+            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER),
+            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER),
             return_exceptions=True,
         )
         wins = [r for r in results if isinstance(r, dict)]
@@ -232,8 +238,8 @@ class TestConcurrentReview:
         _hold_callers_in_get_task(db, monkeypatch)
 
         approved, declined = await asyncio.gather(
-            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER),
-            decline_plan(db=db, engine=engine, plan_id="plan-act"),
+            approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER),
+            decline_plan(db=db, engine=engine, plan_id="plan-act", **BY_APPROVER),
             return_exceptions=True,
         )
         assert sum(isinstance(r, PlanNotPending) for r in (approved, declined)) == 1
@@ -257,16 +263,19 @@ class TestFailureRecovery:
 
         engine.sessions.get_or_create = broken_get_or_create
         with pytest.raises(RuntimeError):
-            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+            await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
 
         plan = await db.get_plan("plan-act")
         assert plan["status"] == "pending"
         assert plan["impl_session_id"] is None
+        # The failed approval leaves no reviewer behind.
+        assert plan["reviewed_by_actor_id"] is None
+        assert plan["reviewed_caused_by_actor_id"] is None
         assert engine.runs == []
 
         # Once the failure clears, the same plan can be approved.
         engine.sessions = FakeSessionManager()
-        result = await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+        result = await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         plan = await db.get_plan("plan-act")
         assert plan["impl_session_id"] == result["impl_session_id"]
 
@@ -282,11 +291,15 @@ class TestFailureRecovery:
 
         monkeypatch.setattr(task_handlers, "task_done_handler", broken_task_done)
         with pytest.raises(RuntimeError):
-            await decline_plan(db=db, engine=engine, plan_id="plan-act", feedback="no")
+            await decline_plan(
+                db=db, engine=engine, plan_id="plan-act", feedback="no", **BY_APPROVER,
+            )
 
         plan = await db.get_plan("plan-act")
         assert plan["status"] == "pending"
         assert plan["feedback"] is None
+        assert plan["reviewed_by_actor_id"] is None
+        assert plan["reviewed_caused_by_actor_id"] is None
         assert (await db.get_task(task_id))["status"] == "pending"
 
 
@@ -301,23 +314,30 @@ class TestAttribution:
 
     async def test_session_is_the_approvers_and_the_run_is_nerves(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path)
-        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER)
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
         assert engine.sessions.calls[0]["actor"] is APPROVER
+        assert engine.sessions.calls[0]["cause"] is APPROVER
         assert engine.runs[0]["actor"] == db.system_actor
+        plan = await db.get_plan("plan-act")
+        assert plan["reviewed_by_actor_id"] == APPROVER.actor_id
+        assert plan["reviewed_caused_by_actor_id"] == APPROVER.actor_id
 
     async def test_status_history_records_the_caller_session(self, db, tmp_path):
         engine, task_id = await _setup(db, tmp_path)
         await approve_plan(
-            db=db, engine=engine, plan_id="plan-act", actor=APPROVER,
+            db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER,
             caller_session_id="sess-agent",
         )
         assert _in_progress_by(await db.list_task_events(task_id)) == ["sess-agent"]
 
-    async def test_decline_status_history_defaults_to_system(self, db, tmp_path):
+    async def test_decline_records_the_reviewer(self, db, tmp_path):
         engine, task_id = await _setup(db, tmp_path)
-        await decline_plan(db=db, engine=engine, plan_id="plan-act")
+        await decline_plan(db=db, engine=engine, plan_id="plan-act", **BY_APPROVER)
+        plan = await db.get_plan("plan-act")
+        assert plan["reviewed_by_actor_id"] == APPROVER.actor_id
+        assert plan["reviewed_caused_by_actor_id"] == APPROVER.actor_id
         events = await db.list_task_events(task_id)
         assert [e["actor"] for e in events if e["to_status"] == "done"] == ["system"]
 
@@ -327,11 +347,19 @@ class TestAttribution:
         from nerve.agent.tools.handlers.plans import plan_approve_handler
 
         engine, task_id = await _setup(db, tmp_path)
-        ctx = replace(tools_mod._legacy_ctx("sess-mcp"), db=db, engine=engine)
+        # The calling session runs for the approver.
+        ctx = replace(
+            tools_mod._legacy_ctx("sess-mcp"), db=db, engine=engine,
+            actor=db.system_actor, cause=APPROVER,
+        )
         await plan_approve_handler(ctx, {"plan_id": "plan-act"})
 
         assert engine.sessions.calls[0]["actor"] == db.system_actor
+        assert engine.sessions.calls[0]["cause"] == APPROVER.actor_id
         assert _in_progress_by(await db.list_task_events(task_id)) == ["sess-mcp"]
+        plan = await db.get_plan("plan-act")
+        assert plan["reviewed_by_actor_id"] == db.system_actor.actor_id
+        assert plan["reviewed_caused_by_actor_id"] == APPROVER.actor_id
 
     async def test_telegram_approval_is_unattributed(self, db, tmp_path):
         from nerve.channels.telegram import TelegramChannel
@@ -347,6 +375,30 @@ class TestAttribution:
         await channel._do_plan_approve(query, "plan-act")
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
-        assert (await db.get_plan("plan-act"))["status"] == "implementing"
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "implementing"
+        assert plan["reviewed_by_actor_id"] is None
+        assert plan["reviewed_caused_by_actor_id"] is None
         assert engine.sessions.calls[0]["actor"] is None
         assert engine.runs[0]["actor"] == db.system_actor
+
+    async def test_telegram_revision_is_unattributed(self, db, tmp_path):
+        from nerve.channels.telegram import TelegramChannel
+
+        replies: list[str] = []
+
+        async def reply_text(text, **kwargs):
+            replies.append(text)
+
+        engine, _ = await _setup(db, tmp_path)
+        channel = TelegramChannel.__new__(TelegramChannel)   # only .router is used
+        channel.router = SimpleNamespace(engine=engine)
+        update = SimpleNamespace(message=SimpleNamespace(reply_text=reply_text))
+
+        await channel._submit_plan_revision(update, "plan-act", "split step two")
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert plan["feedback"] == "split step two"
+        assert plan["reviewed_by_actor_id"] is None
+        assert replies

@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
-import { Download, FileText, Clock, RefreshCw, TrendingDown, TrendingUp } from '../ui/icons';
+import { Download, FileText, Clock, TrendingDown, TrendingUp } from '../ui/icons';
 import type { MessageBlock } from '../../types/chat';
+import { AutoTurnDivider } from './agents/AutoTurnDivider';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
@@ -46,16 +47,7 @@ export function BlockRenderer({
               </div>
             );
           case 'auto':
-            return (
-              <div key={i} className="flex items-center gap-1.5 my-1.5 text-xs text-text-muted">
-                <span className="h-px flex-1 bg-border" />
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-surface">
-                  <RefreshCw size={11} />
-                  Background continuation
-                </span>
-                <span className="h-px flex-1 bg-border" />
-              </div>
-            );
+            return <AutoTurnDivider key={i} block={item} />;
           case 'model_change':
             // The API switched the model serving this session — amber when
             // it moved away from the configured model (downgrade), muted

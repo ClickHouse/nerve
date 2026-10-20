@@ -98,6 +98,15 @@ TASK_LIST_SCHEMA = {
     "required": [],
 }
 
+# Presence, not truthiness, like deadline/tags below: no "default".
+_EXPECT_REVISION = {
+    "type": "integer",
+    "description": "Optional fence: apply only if the task's current revision equals this "
+                   "value (from task_read). On a mismatch neither the task row nor its file "
+                   "is written and the conflict is reported; re-read and retry. Omit for "
+                   "last-write-wins.",
+}
+
 TASK_UPDATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -128,6 +137,7 @@ TASK_UPDATE_SCHEMA = {
             "description": "New task title. Updates the H1 heading in the markdown file and the SQLite index.",
             "default": "",
         },
+        "expect_revision": _EXPECT_REVISION,
     },
     "required": ["task_id"],
 }
@@ -161,6 +171,7 @@ TASK_DONE_SCHEMA = {
             "description": "Completion note",
             "default": "",
         },
+        "expect_revision": _EXPECT_REVISION,
     },
     "required": ["task_id"],
 }

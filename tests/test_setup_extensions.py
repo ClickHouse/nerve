@@ -514,7 +514,7 @@ async def _no_lifespan(_app):
 async def test_onboarding_session_is_identifiable(tmp_path, monkeypatch):
     """The session ``ensure_worker_onboarding`` starts is found as ``running``
     with its id, through the same naming ``AgentEngine.run_cron`` uses."""
-    from nerve.agent.engine import AgentEngine
+    from nerve.agent.engine import AgentEngine, TurnOutcome, TurnResult
     from nerve.db import Database
     from nerve.gateway.routes import _deps as deps_module
     from nerve.gateway.routes import setup as setup_routes
@@ -536,9 +536,9 @@ async def test_onboarding_session_is_identifiable(tmp_path, monkeypatch):
             seen["session_id"] = session_id
             started.set()
             await release.wait()
-            return "done"
+            return TurnResult("done", TurnOutcome())
 
-        monkeypatch.setattr(engine, "run", _run)
+        monkeypatch.setattr(engine, "_run_turn", _run)
         monkeypatch.setattr(engine, "_teardown_oneshot_client", AsyncMock())
         monkeypatch.setattr(engine, "_stamp_cron_session_meta", AsyncMock())
         monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=db))

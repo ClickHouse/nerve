@@ -67,14 +67,36 @@ Claude Agent SDK wrapper providing:
 - **Session lifecycle management** — explicit states (created → active → idle → stopped → archived → error) with transitions logged to `session_events` table
 - **Session resume** via SDK `--resume` flag (survives server restarts; `sdk_session_id` stored as a first-class DB column)
 - **Session forking** — branch conversations via SDK `fork_session=True`, exposed through REST API and WebSocket
-- **Session stop** — uses SDK `client.interrupt()` for clean stop, falls back to `task.cancel()`
+- **Session stop** — scoped: Stop interrupts only the orchestrator's turn (the task that holds the session's run lock) and spares background agents; one agent stops through the runtime's per-task stop; stop-all and force are separate actions. A turn is cancelled only when no agent would die with it, or by force
+- **Turn queue** — runs that wait for a session's run lock are listed (`queue_update`) and can be cancelled by their sender; `client_msg_id` makes a resend run once
 - **Persistent channel mappings** — channel-to-session mapping stored in `channel_sessions` table (survives restarts)
 - **Orphan recovery** — on startup, sessions marked `active` in DB but with no live client are transitioned to `idle` (resumable) or `stopped`
 - **Automatic cleanup** — periodic task (every 6h) archives stale sessions (default 30 days) and enforces max session count (default 500)
-- **Per-run cron sessions** — each cron run gets a unique session ID (`cron:{job_id}:{timestamp}`) to prevent unbounded message accumulation
+- **Per-run cron sessions**: each cron run gets a unique session ID (`cron:{job_id}:{run_id}`, the start time and a random suffix) to prevent unbounded message accumulation
 - AI-generated session titles via lightweight Haiku API call
 - Custom MCP tools (tasks, memory recall, conversation history, sync status, skills CRUD, notifications)
 - API calls routed through configurable base URL (direct Anthropic API or local CLIProxyAPI proxy)
+
+**Sub-agents and background tasks** (`nerve/agent/agents/`). The runtime
+streams a sub-agent's work in the parent's stream, tagged with
+`parent_tool_use_id`. The engine routes every such event (and every
+sub-agent model call's usage) to the **agent registry** instead of the
+current turn, so a sub-agent's work never opens, extends or persists into an
+orchestrator turn, and background agents alone never make a session look
+running. The registry also takes the spawning tool calls (`Agent`, `Task`,
+`Workflow`, `Monitor`, background `Bash`) and the CLI's `task_*` and
+`background_tasks_changed` frames, and keeps one record per agent: status,
+brief, progress, deduplicated usage and an estimated cost, and a per-agent
+transcript with a gap-free `seq`. Records and transcript items are written
+behind to `session_agents` / `session_agent_events` (batched in one
+transaction per session about once a second; status changes are written at
+once) and broadcast through a single pump task
+(`agent_update` to the session, `agent_event` only to sockets that follow
+that agent), so ingestion never waits on the database or a socket while it
+holds the run lock. Every teardown of a session's runtime goes through
+`SessionManager.remove_client(reason=)`, which marks its live agents
+`interrupted` with the reason; shutdown and boot reconcile what bypasses it.
+See [agents.md](agents.md).
 
 ### Channels (`nerve/channels/`)
 Abstract communication layer with three components:
@@ -99,7 +121,8 @@ Async notification system for agent→user communication:
 - **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
 - **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
-- **Answer routing** — answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session
+- **Answer routing**: answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session. A web answer records the person in `answered_by_actor_id`, and the relayed message is written by that person; the agent's work in that turn has the session's cause. A channel answer keeps the provider user ID in metadata and records no actor. An approval dispatcher (`nerve/notifications/handlers.py`) receives the person who answered as its `actor` keyword argument, `None` for a channel answer
+  A dispatcher that asks for a snooze can return an `after_snooze` callback; the service awaits it with the result of its snooze write (False when the card was no longer pending)
 - **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
 
 ### Cron Service (`nerve/cron/`)
@@ -189,7 +212,7 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 
 ### Cron Job
 1. APScheduler triggers at schedule
-2. Isolated per-run session created (`cron:{job_id}:{timestamp}`)
+2. Isolated per-run session created (`cron:{job_id}:{run_id}`)
 3. Agent runs with job prompt and cron model, acting as the system principal — the session and the prompt are attributed to it, not to whoever wrote the schedule
 4. Agent uses `notify`/`ask_user` tools to communicate with user
 5. Run logged in `cron_logs` table
@@ -218,6 +241,7 @@ nerve/db/
 ├── cron.py            # CronStore mixin
 ├── skills.py          # SkillStore mixin
 ├── mcp.py             # McpStore mixin
+├── agents.py          # AgentStore mixin (session_agents, session_agent_events)
 └── audit.py           # AuditStore mixin
 ```
 
@@ -234,9 +258,12 @@ To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with a
 SQLite with WAL mode (schema version 16):
 - `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
 - `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
-- `session_events` — Append-only lifecycle audit log (created, started, idle, stopped, archived, error)
+- `session_events`: append-only lifecycle audit log (created, started, idle, stopped, archived, error, and the changes listed in [Session changes](accounts.md#session-changes)), with `actor_id` and `caused_by_actor_id` → `actor_refs`
+- `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
+- `session_agents` — One row per sub-agent or background task of a session: kind, status and end reason, brief, progress, usage and estimated cost, stop attribution (`stopped_by_actor_id`, `stopped_caused_by_actor_id` → `actor_refs`). Deleted with the session (see [agents.md](agents.md))
+- `session_agent_events` — Each agent's transcript items (`agent_id`, gap-free `seq`, `kind`, JSON `payload`), capped per item; follows telemetry retention when it is enabled
 - `tasks` — Task index (mirrors markdown files)
 - `tasks_fts` — FTS5 full-text search index for tasks
 - `sync_cursors` — Opaque cursor positions per source

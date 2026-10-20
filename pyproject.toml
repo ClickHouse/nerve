@@ -33,7 +33,7 @@ dependencies = [
     # rejects models released after it with "does not support this model;
     # version 2.1.251 or newer is required". 0.2.150 bundles 2.1.257. Every
     # release in 0.2.141..0.2.150 is a CLI-bundle bump only — no API change.
-    "claude-agent-sdk>=0.2.158",
+    "claude-agent-sdk>=0.2.161",
     # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
     # rather than only through claude-agent-sdk. Both bounds are load-bearing:
     # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
@@ -66,7 +66,7 @@ dependencies = [
     "xmemory-ai>=0.10.0",
     # Optional observability stack — only active when langfuse keys are
     # configured. All three are pure-Python wheels.
-    "langfuse>=3.0.0",
+    "langfuse>=4.17.0",
     "langsmith[claude-agent-sdk]>=0.4.0",
     "opentelemetry-instrumentation-anthropic>=0.40.0",
 ]

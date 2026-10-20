@@ -80,8 +80,13 @@ class SessionSpec:
     snapshot: SnapshotFn | None = None
     record_wakeup: WakeupFn | None = None
     cache_ttl: str = "5m"
-    max_turns: int = 100
+    max_turns: int = 1000            # 0 = no cap
     idle_timeout: float = 900.0
+    # Principal ID that each model request of the client names, for a proxy
+    # in front of the model API (nerve.inference_principal): the session's
+    # cause in external mode. None: no principal. A backend that cannot send
+    # it ignores it.
+    inference_principal: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -94,6 +99,11 @@ class BackendCapabilities:
     supports_cache_ttl: bool = True
     interactive_builtins: bool = True
     reports_context_window: bool = False
+    # One background task (sub-agent, shell, workflow) can be stopped on its
+    # own (AgentClient.stop_task).
+    supports_task_stop: bool = False
+    # Sub-agents stream their own transcript (sidechain events) to the host.
+    supports_agent_transcripts: bool = False
 
 
 @runtime_checkable
@@ -122,7 +132,34 @@ class AgentClient(Protocol):
         """
         ...
 
-    async def interrupt(self) -> None: ...
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        """End the current turn.
+
+        ``cancel_queued`` also drops what the runtime queued for later
+        turns (Claude: queued task notifications, so stop-all leaves nothing
+        to wake the orchestrator). Backends without such a queue ignore it.
+        """
+        ...
+
+    async def stop_task(self, task_id: str) -> None:
+        """Stop one background task (sub-agent, shell, workflow) of the
+        runtime without touching the turn. The default: unsupported."""
+        raise BackendError("stop_task unsupported")
+
+    @property
+    def supports_task_stop(self) -> bool:
+        """Whether :meth:`stop_task` works on this client."""
+        return False
+
+    @property
+    def interrupt_spares_background(self) -> bool:
+        """Whether :meth:`interrupt` leaves background agents running.
+
+        ``False`` unless the backend proved it (Claude: the CLI got the
+        per-task stop affordance at its first initialize). Stop asks before
+        it would end background agents when this is ``False``.
+        """
+        return False
 
     async def disconnect(self) -> None:
         """Full teardown, owning every process/transport internal."""
@@ -150,7 +187,8 @@ class AgentClient(Protocol):
         ...
 
     def buffer_used(self) -> int:
-        """Bytes buffered in the native stream (0 when N/A)."""
+        """Messages buffered in the native stream (a count, not bytes; 0
+        when N/A)."""
         ...
 
 

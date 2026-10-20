@@ -4,22 +4,25 @@ import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
+import type { InteractionAgentRef } from '../types/agents';
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
 import { bindSender, selfActorId } from './authStore';
+import { useAgentStore } from './agentStore';
 // Helpers
-import { cancelAutoClose, clearAllAutoCloseTimers, MAX_COMPLETED_TABS } from './helpers/blockHelpers';
+import { MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
+import { removeSeen } from './helpers/agentSeen';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
 // Handlers
-import { handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate } from './handlers/sessionHandlers';
-import { handlePlanUpdate, handleSubagentStart, handleSubagentComplete, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleBackgroundTasksUpdate } from './handlers/auxiliaryHandlers';
+import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
+import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
+import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
+import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -93,15 +96,32 @@ let _quoteId = 0;
 // channel's last real session (server.py get_last_session), which — while a
 // not-yet-sent "new chat" is on screen — differs from it, and the replayed
 // buffer would otherwise hijack the view with a phantom "Thinking…" and a
-// disabled composer. Sidebar/list events (session_running, session_updated, …)
-// stay unguarded so background sessions keep updating their row.
+// disabled composer. Sidebar/list events (session_running, session_updated,
+// session_agents, …) stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
   'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
-  'backend_status',
-  'subagent_start', 'subagent_complete', 'interaction',
+  'backend_status', 'workflow_progress',
+  'agent_update', 'agent_event', 'queue_update', 'interaction',
   'interaction_resolved', 'file_changed',
 ]);
+
+/** The singleton Agents roster tab. */
+export const AGENTS_PANEL_ID = 'agents-panel';
+/** The tab of one agent's transcript. */
+export const agentTabId = (agentId: string) => `agent:${agentId}`;
+/** At most this many agent tabs stay open (the least recently focused closes). */
+export const MAX_AGENT_TABS = 8;
+/** The archive skip reason the server gives while agents run in a session. */
+const AGENTS_RUNNING_REASON = 'background agents running';
+/** The `error` the server answers a refused `agent_subscribe` with (docs/api.md). */
+const AGENT_NOT_FOUND = 'agent_not_found';
+
+// When each panel tab was last opened or focused (a counter, not a clock), so
+// the agent-tab cap closes the least recently focused one.
+const tabFocus = new Map<string, number>();
+let focusTick = 0;
+const touchTab = (tabId: string) => { tabFocus.set(tabId, ++focusTick); };
 
 interface ChatState {
   sessions: Session[];
@@ -159,6 +179,8 @@ interface ChatState {
     interactionType: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval';
     toolName: string;
     toolInput: Record<string, unknown>;
+    /** The subagent that asked; null (or absent) for the orchestrator. */
+    agent?: InteractionAgentRef | null;
   } | null;
 
   // Sidebar collapse (desktop column — persisted)
@@ -175,9 +197,6 @@ interface ChatState {
   // Modified files tracking
   modifiedFiles: ModifiedFileSummary[];
   modifiedFilesCount: number;
-
-  // Background tasks (run_in_background)
-  backgroundTasks: { task_id: string; label: string; tool: string; status: 'running' | 'done' | 'failed' | 'timeout'; startedAt: number }[];
 
   // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
   sessionsHasMore: boolean;
@@ -264,7 +283,13 @@ interface ChatState {
   clearSearch: () => void;
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
-  sendMessage: (content: string) => void;
+  /** Send a message. While a turn streams it is queued on the server (the
+   *  agent store tracks it as a pending send) instead of opening a turn. */
+  sendMessage: (
+    content: string,
+    fileIds?: string[],
+    imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
+  ) => Promise<void>;
   /** Defer a composed prompt into a new session without running the model
    *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
   runLater: (
@@ -282,7 +307,8 @@ interface ChatState {
   setNewChatModel: (backend: string, model: string | null) => void;
   /** Re-point ONE existing session's model (persisted on its row). */
   setSessionModel: (sessionId: string, model: string) => Promise<void>;
-  stopSession: () => void;
+  /** Stop the turn (agents keep running where the runtime allows it). */
+  stopSession: () => Promise<void>;
   handleWSMessage: (msg: WSMessage) => void;
   addQuote: (text: string, action: QuoteAction) => void;
   removeQuote: (id: string) => void;
@@ -298,6 +324,12 @@ interface ChatState {
   setChatWidth: (width: number) => void;
   setSidebarWidth: (width: number) => void;
   pruneCompletedTabs: () => void;
+  /** Open (or focus) the Agents roster tab; `focus` also focuses its list. */
+  openAgentsPanel: (focus?: boolean) => void;
+  /** Hide the panel when the Agents tab is showing, else open it focused. */
+  toggleAgentsPanel: () => void;
+  /** Open (or focus) one agent's transcript tab and start streaming it. */
+  openAgentTab: (agentId: string) => void;
   // Interactions
   answerInteraction: (result: Record<string, string> | null) => void;
   denyInteraction: (message?: string) => void;
@@ -377,7 +409,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   mobileSidebarOpen: false,
   modifiedFiles: [],
   modifiedFilesCount: 0,
-  backgroundTasks: [],
   searchQuery: '',
   searchResults: null,
   searchLoading: false,
@@ -408,6 +439,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   openPanelTab: (tab: PanelTab) => {
     const s = get();
     const existing = s.panels.find(p => p.id === tab.id);
+    touchTab(tab.id);
     if (existing) {
       // Tab already exists — just focus it
       set({ activePanelId: tab.id, panelVisible: true });
@@ -423,7 +455,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   closePanelTab: (tabId: string) => {
-    cancelAutoClose(tabId);
+    tabFocus.delete(tabId);
+    const closing = get().panels.find(p => p.id === tabId);
+    if (closing?.type === 'agent' && closing.agentId) {
+      useAgentStore.getState().closeTranscript(closing.agentId);
+    }
     set(s => {
       const remaining = s.panels.filter(p => p.id !== tabId);
       let nextActive = s.activePanelId;
@@ -440,6 +476,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   focusPanelTab: (tabId: string) => {
+    touchTab(tabId);
     set({ activePanelId: tabId, panelVisible: true });
   },
 
@@ -474,20 +511,78 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   pruneCompletedTabs: () => {
+    // Only result tabs of old history (subagent) and plans are pruned; the
+    // Agents, agent, workflow and files tabs stay until closed.
     set(s => {
-      const completed = s.panels.filter(p => p.status === 'complete' || p.status === 'error');
+      const completed = s.panels.filter(p =>
+        (p.type === 'subagent' || p.type === 'plan') && (p.status === 'complete' || p.status === 'error'));
       if (completed.length <= MAX_COMPLETED_TABS) return {};
-      const running = s.panels.filter(p => p.status === 'running');
       // Keep the most recent completed tabs
       const sorted = [...completed].sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
-      const keep = new Set([
-        ...running.map(p => p.id),
-        ...sorted.slice(0, MAX_COMPLETED_TABS).map(p => p.id),
-      ]);
+      const drop = new Set(sorted.slice(MAX_COMPLETED_TABS).map(p => p.id));
       // Never prune the focused tab
-      if (s.activePanelId) keep.add(s.activePanelId);
-      return { panels: s.panels.filter(p => keep.has(p.id)) };
+      if (s.activePanelId) drop.delete(s.activePanelId);
+      return { panels: s.panels.filter(p => !drop.has(p.id)) };
     });
+  },
+
+  openAgentsPanel: (focus = false) => {
+    get().openPanelTab({
+      id: AGENTS_PANEL_ID,
+      type: 'agents',
+      label: 'Agents',
+      subagentType: 'agents',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: false,
+      status: 'running',
+      startedAt: Date.now(),
+      blocks: [],
+    });
+    if (focus) useAgentStore.getState().requestFocus();
+  },
+
+  toggleAgentsPanel: () => {
+    const s = get();
+    if (s.panelVisible && s.activePanelId === AGENTS_PANEL_ID) set({ panelVisible: false });
+    else get().openAgentsPanel(true);
+  },
+
+  openAgentTab: (agentId: string) => {
+    const tabId = agentTabId(agentId);
+    if (get().panels.some(p => p.id === tabId)) {
+      get().focusPanelTab(tabId);
+    } else {
+      const view = useAgentStore.getState().agents[agentId];
+      get().openPanelTab({
+        id: tabId,
+        type: 'agent',
+        agentId,
+        label: view?.label ?? agentId,
+        subagentType: view?.agent_type ?? view?.kind ?? 'agent',
+        description: view?.description ?? '',
+        model: view?.model ?? undefined,
+        content: null,
+        prompt: '',
+        streaming: false,
+        status: 'running',
+        startedAt: Date.now(),
+        blocks: [],
+      });
+      // Close the least recently focused agent tabs past the cap (never the
+      // one just opened, which is the active tab).
+      const s = get();
+      const agentTabs = s.panels.filter(p => p.type === 'agent');
+      if (agentTabs.length > MAX_AGENT_TABS) {
+        const victims = agentTabs
+          .filter(p => p.id !== s.activePanelId)
+          .sort((a, b) => (tabFocus.get(a.id) ?? 0) - (tabFocus.get(b.id) ?? 0))
+          .slice(0, agentTabs.length - MAX_AGENT_TABS);
+        for (const victim of victims) get().closePanelTab(victim.id);
+      }
+    }
+    void useAgentStore.getState().openTranscript(agentId);
   },
 
   // ------------------------------------------------------------------ //
@@ -627,16 +722,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     }
     if (id === get().activeSession && get().messages.length > 0) return;
-    // Clear all auto-close timers
-    clearAllAutoCloseTimers();
+    discardStreamDeltas();
+    tabFocus.clear();
     set({
       activeSession: id, messages: [], loading: true, streamingBlocks: [],
       isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
       backendStatus: null,
       currentTodos: [], currentCCTasks: [], pendingInteraction: null,
       panels: [], activePanelId: null, panelVisible: false,
-      modifiedFiles: [], modifiedFilesCount: 0, backgroundTasks: [],
+      modifiedFiles: [], modifiedFilesCount: 0,
     });
+    // The agent roster follows the view (it unsubscribes the old transcripts).
+    useAgentStore.getState().reset(id);
     // A virtual chat isn't known to the server (it's created on first send),
     // so don't announce a switch to it — that would raise "Session not found"
     // and drop the socket. The active-session event guard isolates the view
@@ -648,6 +745,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Real session opened → mark it read (R1: auto-clear its unread marker).
     get().markSeen(id);
     ws.switchSession(id);
+    // The roster also rides on session_status; the REST snapshot covers a
+    // socket that is still connecting (the rev merge makes the order moot).
+    void useAgentStore.getState().loadSnapshot(id);
     // Note: opening a chat deliberately does NOT touch updated_at (locally or
     // server-side) — updated_at means "last message activity", so browsing
     // never reorders the session list.
@@ -784,6 +884,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ],
       };
     });
+    // The agent roster now belongs to the server's id.
+    if (get().activeSession === real.id) useAgentStore.getState().reset(real.id);
     return real.id;
   },
 
@@ -802,7 +904,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (get().activeSession === vs.id) {
       const remaining = get().sessions;
       if (remaining.length > 0) get().switchSession(remaining[0].id);
-      else set({ activeSession: '', messages: [] });
+      else {
+        set({ activeSession: '', messages: [] });
+        useAgentStore.getState().reset(null);
+      }
     }
   },
 
@@ -845,6 +950,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.deleteSession(id);
       removeDraft(id);
       removeRead(id);
+      removeSeen(id);
       set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
       await get().loadSessions();
       if (get().activeSession === id) {
@@ -861,9 +967,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   archiveSession: async (id: string) => {
     try {
-      await api.archiveSession(id);
-      removeDraft(id);
-      set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
+      let res = await api.archiveSession(id);
+      // Archiving stops the agents of a session, so the server skips one where
+      // agents run (and every ancestor of it) unless asked again with force.
+      if (res?.skipped?.some(s => s.reason === AGENTS_RUNNING_REASON)
+          && window.confirm('Agents are still running in this session. Archiving stops them. Archive anyway?')) {
+        res = await api.archiveSession(id, { force: true });
+      }
+      // Keep the draft of a session that stayed (declined, or still running).
+      const archived = !Array.isArray(res?.archived_ids) || res.archived_ids.includes(id);
+      if (archived) {
+        removeDraft(id);
+        set(s => { const drafts = { ...s.drafts }; delete drafts[id]; return { drafts }; });
+      }
       // Archiving cascades to the whole descendant subtree server-side, so
       // loadSessions() drops the parent AND its children from the active feed.
       await get().loadSessions();
@@ -1117,6 +1233,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     }
     const vs = get().virtualSession;
+    // The id that lets the server dedupe a retry, and this tab recognize its
+    // message in queue_update (started / cancelled) and in the queue chips.
+    const clientMsgId = randomUUID();
+    if (get().isStreaming && !(vs && vs.id === session)) {
+      // A turn is running: the server queues the message and runs it next. No
+      // bubble yet, and the streaming view is left alone: a "Sending…" chip
+      // shows the pending send until queue_update reports it started (it then
+      // becomes a bubble) or cancelled.
+      useAgentStore.getState().addPendingSend({ clientMsgId, content, blocks, at: Date.now() });
+      if (ws.sendMessage(content, session, fileIds, clientMsgId) === 'dropped') {
+        useAgentStore.getState().dropPendingSend(clientMsgId);
+        set((state) => ({
+          messages: [...state.messages, {
+            role: 'assistant' as const,
+            blocks: [{ type: 'text', content: 'Error: Message could not be sent. The connection is closed; please retry.' }],
+          }],
+        }));
+      }
+      return;
+    }
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
     // or 'dropped' (revert below).
@@ -1126,7 +1262,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Null identity follows the ordinary unattributed-history path.
     const sender = selfActorId();
     set((state) => ({
-      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender }],
+      messages: [...state.messages, { role: 'user' as const, blocks, created_at: new Date().toISOString(), actor_id: sender, client_msg_id: clientMsgId }],
       streamingBlocks: [],
       isStreaming: true,
       agentStatus: { state: 'thinking' as const },
@@ -1154,7 +1290,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // No per-message model override: the session row is the source of
     // truth (bound at creation for new chats, PATCHed by setSessionModel
     // for existing ones), so a pick in another chat can never leak here.
-    const status = ws.sendMessage(content, session, fileIds);
+    const status = ws.sendMessage(content, session, fileIds, clientMsgId);
     if (status === 'dropped') {
       // The message could not reach the server. Revert the optimistic
       // state and surface the failure inline so the user knows to retry.
@@ -1236,11 +1372,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
     });
     if (vs) clearVirtualSession();
+    // The view moved to the new session without switchSession.
+    if (get().activeSession === real.id) useAgentStore.getState().reset(real.id);
   },
 
-  stopSession: () => {
+  stopSession: async () => {
     const session = get().activeSession;
-    ws.stopSession(session);
+    // An unsent chat has no turn on the server.
+    if (!session || session === get().virtualSession?.id) return;
+    const agents = useAgentStore.getState();
+    if (agents.sessionId !== session) {
+      ws.stopSession(session);
+      return;
+    }
+    // Over REST for the structured answer: the escalation banner reads it.
+    const res = await agents.stopTurn();
+    if (res === null) {
+      // The route did not answer (an older server, a network blip): the
+      // legacy frame stops the turn the same way, without confirmation.
+      ws.stopSession(session);
+      return;
+    }
+    // Nothing was running server-side but this tab still streams (its done
+    // or stopped got lost): leave streaming mode.
+    if (res.turn === 'not_running' && get().isStreaming && get().activeSession === session) {
+      set((s) => exitStreaming(s));
+    }
   },
 
   // ------------------------------------------------------------------ //
@@ -1250,6 +1407,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   handleWSMessage: (msg: WSMessage) => {
     const sid = (msg as { session_id?: string }).session_id;
     if (sid && sid !== get().activeSession && VIEW_SCOPED_EVENTS.has(msg.type)) return;
+    if (msg.type !== 'thinking' && msg.type !== 'token') flushStreamDeltas(get, set);
     switch (msg.type) {
       // Streaming
       case 'thinking':     return handleThinking(msg, get, set);
@@ -1262,7 +1420,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'auto_turn':    return handleAutoTurn(msg, get, set);
       case 'model_changed': return handleModelChanged(msg, get, set);
       case 'stopped':      return handleStopped(msg, get, set);
-      case 'error':        return handleError(msg, get, set);
+      case 'error':
+        // The server refused an agent_subscribe (an agent it does not know in
+        // this session). That says nothing about the turn: the transcript tab
+        // shows what its REST fetch found, and the chat keeps streaming.
+        if (msg.error === AGENT_NOT_FOUND) return;
+        return handleError(msg, get, set);
       // Sessions
       case 'session_updated':  return handleSessionUpdated(msg, get, set);
       case 'session_status':   return handleSessionStatus(msg, get, set);
@@ -1279,9 +1442,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'backend_status':
         set({ backendStatus: { subtype: msg.subtype, data: msg.data } });
         return;
-      case 'subagent_start':     return handleSubagentStart(msg, get, set);
-      case 'subagent_complete':  return handleSubagentComplete(msg, get, set);
       case 'workflow_progress':  return handleWorkflowProgress(msg, get, set);
+      // Agents — roster, per-agent transcript stream, turn queue.
+      case 'agent_update':
+        useAgentStore.getState().applyAgentUpdate(msg);
+        return;
+      case 'agent_event':
+        useAgentStore.getState().applyAgentEvent(msg);
+        return;
+      case 'queue_update': {
+        // A send this tab queued while a turn ran has started: its bubble
+        // appears now, in the order the server runs it.
+        const { started } = useAgentStore.getState().applyQueueUpdate(msg);
+        if (started.length > 0) {
+          const now = new Date().toISOString();
+          const actor = selfActorId();
+          set((s) => ({
+            messages: [...s.messages, ...started.map((p) => ({
+              role: 'user' as const, blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: p.clientMsgId,
+            }))],
+          }));
+        }
+        return;
+      }
+      // Global: the sidebar row's agent count between turns.
+      case 'session_agents': {
+        const patch = (sess: Session): Session => sess.id === msg.session_id
+          ? { ...sess, background_count: msg.background_count, has_background_tasks: msg.has_background_tasks }
+          : sess;
+        set((s) => ({ sessions: s.sessions.map(patch), searchResults: s.searchResults?.map(patch) ?? null }));
+        return;
+      }
+      // Superseded by the agent records; still sent by older servers.
+      case 'subagent_start':
+      case 'subagent_complete':
+      case 'background_tasks_update':
+        return;
       // Workflow runs — global event (session_id may be null); upsert into
       // the runs store so the /workflow-runs page stays live.
       case 'workflow_run_update':
@@ -1307,7 +1503,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);
       case 'notification_expired':     return handleNotificationExpired(msg, get, set);
-      case 'background_tasks_update':  return handleBackgroundTasksUpdate(msg, get, set);
     }
   },
 }));
@@ -1332,8 +1527,29 @@ export function registerComposerFlush(flush: () => void): () => void {
 
 setBeforeReenter(() => useChatStore.getState().keepUnsentWork());
 
+// Every socket open (a reconnect after a gateway restart included) binds the
+// socket to the session on screen again — the server would otherwise bind the
+// channel's last session — and resubscribes the open agent transcripts. The
+// type check tolerates test doubles of the socket without onOpen.
+let socketOpenedBefore = false;
+if (typeof ws.onOpen === 'function') {
+  ws.onOpen(() => {
+    const s = useChatStore.getState();
+    if (s.activeSession && s.activeSession !== s.virtualSession?.id) {
+      ws.switchSession(s.activeSession);
+      useAgentStore.getState().resubscribeAll();
+    }
+    // A reconnect (a gateway restart, a dropped network) missed the global
+    // events sent meanwhile, and a restarted server never re-sends the zero
+    // counts: the sidebar rows come back from the server.
+    if (socketOpenedBefore) void s.loadSessions();
+    socketOpenedBefore = true;
+  });
+}
+
 onViewerStorageChange(() => {
-  clearAllAutoCloseTimers();
+  tabFocus.clear();
+  useAgentStore.getState().reset(null);
   useChatStore.setState({
     ...useChatStore.getInitialState(),
     drafts: loadDrafts(),

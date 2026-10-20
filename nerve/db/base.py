@@ -19,6 +19,7 @@ from typing import AsyncIterator, NamedTuple
 import aiosqlite
 
 from nerve.db.accounts import AccountStore
+from nerve.db.agents import AgentStore
 from nerve.db.audit import AuditStore
 from nerve.db.cron import CronStore
 from nerve.db.files import FileStore
@@ -321,6 +322,7 @@ class Database(
     ReviewLoopStore,
     AccountStore,
     MaintenanceStore,
+    AgentStore,
 ):
     """Async SQLite database wrapper.
 
@@ -341,6 +343,10 @@ class Database(
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
         self._system_actor: Actor | None = None
+        # Each session's stored cause (sessions.caused_by_actor_id). Loaded at
+        # connect and kept by create_session, get_session and delete_session;
+        # a session's cause never changes. Read through session_cause().
+        self._session_causes: dict[str, str | None] = {}
         # Actor ID to the last display name upsert_external_actor() wrote.
         self._external_actor_names: dict[str, str | None] = {}
         # The state-file modes connect() found after its repair. The identity
@@ -417,6 +423,7 @@ class Database(
                 )
             await run_migrations(self._db)
             await self._cache_system_actor()
+            await self._cache_session_causes()
             # After migrations, so the table exists. A key that other users
             # could read is compromised.
             if exposed:
@@ -425,6 +432,7 @@ class Database(
         except BaseException:
             db, self._db = self._db, None
             self._system_actor = None
+            self._session_causes = {}
             try:
                 await db.close()
             except Exception as e:  # noqa: BLE001 — never mask the real failure
@@ -434,7 +442,11 @@ class Database(
             raise
 
     async def _cache_system_actor(self) -> None:
-        """Validate and cache the one system actor created by migrations."""
+        """Validate and cache the one system actor created by migrations.
+
+        Called at connect, and again after the identity bootstrap changes the
+        ID (:meth:`AccountStore._rekey_system_actor`).
+        """
         async with self.db.execute(
             "SELECT id, display_name FROM actor_refs WHERE kind = 'system'"
         ) as cursor:
@@ -459,8 +471,11 @@ class Database(
     def system_actor(self) -> Actor:
         """The actor for autonomous work, validated and cached at connect.
 
-        Schema triggers prevent a change to its id or kind, so no caller has to
-        read the row again.
+        Schema triggers prevent a change to its id or kind. The one exception
+        is the identity bootstrap at startup, which can give the system actor
+        the ID of the agent's system principal before anything refers to it,
+        and which then refreshes this cache. So no other caller has to read
+        the row again.
         """
         if self._system_actor is None:
             raise RuntimeError("Database not connected. Call connect() first.")
@@ -515,6 +530,7 @@ class Database(
             await self._db.close()
             self._db = None
             self._system_actor = None
+            self._session_causes = {}
             self._external_actor_names.clear()
 
     @property
@@ -548,7 +564,9 @@ class Database(
         """Serialize a multi-statement write and make it a real transaction.
 
         Once a coroutine begins a multi-statement write, no other coroutine
-        can interleave writes before the commit. The body's statements are
+        can interleave writes before the commit. The transaction begins before
+        the body runs, so its reads and the writes based on them are one
+        transaction against other connections too. The body's statements are
         committed on success and rolled back on any exception — including
         task cancellation — so a failed body neither half-commits nor leaves
         the shared connection inside an open (poisoned) transaction.
@@ -559,6 +577,10 @@ class Database(
         async with self._write_lock:
             await self._heal_leaked_txn()
             try:
+                # IMMEDIATE takes the database write lock before the first read.
+                # A deferred BEGIN would pin a read snapshot that another
+                # connection's commit turns into SQLITE_BUSY_SNAPSHOT.
+                await self.db.execute("BEGIN IMMEDIATE")
                 yield
                 # Shield so a cancellation arriving mid-commit cannot abandon
                 # a half-finished transaction: the inner task runs to
@@ -567,6 +589,23 @@ class Database(
             except BaseException:
                 await self._rollback_quietly()
                 raise
+
+    @asynccontextmanager
+    async def _read_snapshot(self) -> AsyncIterator[None]:
+        """Run several reads against one snapshot of the database.
+
+        A deferred BEGIN takes no write lock: the snapshot starts at the first
+        read and lasts until the rollback at the end. The body must not write.
+        The write lock of this connection is held, so no write on this
+        connection can commit or end the transaction while the body runs.
+        """
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            try:
+                await self.db.execute("BEGIN")
+                yield
+            finally:
+                await self._rollback_quietly()
 
     async def _write(self, sql: str, params: tuple | list = ()) -> WriteResult:
         """Execute one write statement and commit, under the write lock.
