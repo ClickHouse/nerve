@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nerve.agent.backends.base import BackendError
 from nerve.agent.interactive import get_awaiting_ids
@@ -50,6 +50,10 @@ async def _cleanup_uploaded_files(db: object, session_id: str) -> None:
 class MessageRequest(BaseModel):
     message: str
     session_id: str | None = None
+    # The sender's id for this message: a retry with the same id within 10
+    # minutes runs nothing (returns an empty response). Capped like the
+    # WebSocket path's: it is kept for dedupe and echoed to every socket.
+    client_msg_id: str | None = Field(None, max_length=128)
 
 
 class MessageResponse(BaseModel):
@@ -194,8 +198,23 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
         s["pending_wakeup_created_by_actor_id"] = wakeup.get("created_by_actor_id")
         s["pending_wakeup_caused_by_actor_id"] = wakeup.get("caused_by_actor_id")
         s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
+        # How many agents still run (the sidebar's count).
+        s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
     await _attach_review_loops(deps, sessions)
     return sessions
+
+
+def _background_count(deps, session_id: str, has_background: bool | None = None) -> int:
+    """Live agents of a session; an engine without the count reports 0 or 1."""
+    count = getattr(deps.engine, "background_agent_count", None)
+    if count is not None:
+        try:
+            return int(count(session_id))
+        except Exception:  # noqa: BLE001 — enrichment must never break listing
+            logger.debug("background count failed for %s", session_id, exc_info=True)
+    if has_background is None:
+        has_background = bool(deps.engine.has_live_background_tasks(session_id))
+    return int(bool(has_background))
 
 
 def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> dict:
@@ -449,6 +468,24 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
         requested_model = str(req["model"] or "").strip()
         if not requested_model:
             raise HTTPException(status_code=400, detail="model cannot be empty")
+        # A model switch recreates the session's runtime, and every
+        # background agent still running in it would die with it.
+        agents = getattr(deps.engine, "agents", None)
+        if (
+            agents is not None
+            and requested_model != (session.get("model") or "")
+            and agents.has_live(session_id)
+        ):
+            live = agents.live_count(session_id)
+            raise HTTPException(status_code=409, detail={
+                "code": "live_background_agents",
+                "message": (
+                    f"{live} background agent(s) are still running in this "
+                    "session; switching the model restarts its runtime and "
+                    "would stop them. Stop them or wait for them to finish."
+                ),
+                "live": live,
+            })
         # Backend is sticky on the session row — validate the pick against
         # it (same optional seam as session creation: codex can cheaply
         # reject; claude accepts any ID since Ollama models ride it).
@@ -547,12 +584,18 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
 
     if engine:
         # Disconnect client
-        client = engine.sessions.remove_client(session_id)
+        client = engine.sessions.remove_client(session_id, reason="deleted")
         if client:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+        # Drop the session's agent records, queued writes and pending emits
+        # before the rows go (a write already in flight fails the foreign key
+        # and is dropped).
+        agents = getattr(engine, "agents", None)
+        if agents is not None:
+            await agents.forget_session(session_id)
         # Snapshot messages for background memorization before deleting
         session = await db.get_session(session_id)
         connected_at = session.get("connected_at") if session else None
@@ -598,6 +641,7 @@ async def session_status(session_id: str, actor: Actor = Depends(require_auth)):
         "session_id": session_id,
         "status": session.get("status", "unknown"),
         "is_running": is_running,
+        "background_count": _background_count(deps, session_id),
         "awaiting_input": session_id in get_awaiting_ids(),
         "sdk_session_id": session.get("sdk_session_id"),
         "connected_at": session.get("connected_at"),
@@ -762,20 +806,27 @@ async def resume_session(session_id: str, actor: Actor = Depends(require_auth)):
 
 
 @router.post("/api/sessions/{session_id}/archive")
-async def archive_session(session_id: str, actor: Actor = Depends(require_auth)):
+async def archive_session(
+    session_id: str, force: bool = False, actor: Actor = Depends(require_auth),
+):
     """Archive a session and its entire descendant subtree (soft delete).
 
     Cascade is the default: children, grandchildren and deeper are archived
     bottom-up. Returns a structured report of which session ids were archived
     vs skipped (with reasons) so a still-running descendant never silently
     leaves an archived-parent-with-active-child orphan.
+
+    A session whose background agents still run is skipped with the reason
+    ``"background agents running"``; ``?force=true`` archives it anyway and
+    its agents end as interrupted (``archived``).
     """
     deps = get_deps()
     result = await deps.engine.sessions.archive_session_cascade(
-        session_id, attribution=attribution_for(actor),
+        session_id, attribution=attribution_for(actor), force=force,
     )
     return {
-        "archived": True,
+        # False when every session was skipped (e.g. its agents still run).
+        "archived": bool(result["archived"]),
         "archived_ids": result["archived"],
         "skipped": result["skipped"],
     }
@@ -937,5 +988,7 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         source="web",
         channel="web",
         actor=actor,
+        client_msg_id=req.client_msg_id or None,
+        origin="api",
     )
     return MessageResponse(response=response, session_id=session_id)

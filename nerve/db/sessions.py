@@ -357,6 +357,10 @@ class SessionStore:
             ) as cursor:
                 row = await cursor.fetchone()
             await self.db.execute("DELETE FROM session_file_snapshots WHERE session_id = ?", (session_id,))
+            # Agent transcript items before their records (their foreign
+            # key); the cascade is a second line of defence.
+            await self.db.execute("DELETE FROM session_agent_events WHERE session_id = ?", (session_id,))
+            await self.db.execute("DELETE FROM session_agents WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))

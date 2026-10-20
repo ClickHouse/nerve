@@ -20,6 +20,7 @@ attribute to the real session exactly like the in-process Claude MCP.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import logging
@@ -28,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -1160,6 +1162,26 @@ class CodexClient(AgentClient):
             return str(err.get("message") or err)
         return str(err or params.get("message") or "unknown codex error")
 
+    def _collab_call_id(self, item_id: str) -> str:
+        """The tool-use id of a collab agent call: its item id, or a fresh
+        ``codex-agent-<hex>`` when the item carries none (remembered so the
+        matching completion reuses it; a shared fallback would merge agents)."""
+        if item_id:
+            return item_id
+        call_id = f"codex-agent-{uuid.uuid4().hex[:8]}"
+        self.__dict__.setdefault("_collab_unnamed", collections.deque()).append(call_id)
+        return call_id
+
+    def _collab_result_id(self, item_id: str) -> str:
+        """The tool-use id a collab agent's completion settles (pairs an
+        id-less completion with the oldest id-less start)."""
+        if item_id:
+            return item_id
+        pending = self.__dict__.get("_collab_unnamed")
+        if pending:
+            return pending.popleft()
+        return f"codex-agent-{uuid.uuid4().hex[:8]}"
+
     async def _map_item_started(self, item: dict) -> list[ev.AgentEvent]:
         item_id = str(item.get("id") or "")
         item_type = str(item.get("type") or "")
@@ -1210,11 +1232,30 @@ class CodexClient(AgentClient):
                 input={"query": item.get("query", "")},
             ))
         elif item_type == "collabAgentToolCall":
+            # A collab agent lives inside the turn: an Agent call (so the
+            # spawn persists as a tool_call block and becomes a foreground
+            # agent record), then its start. Its item/completed result
+            # settles it.
+            call_id = self._collab_call_id(item_id)
+            prompt = str(item.get("prompt") or "")
+            model = str(item.get("model")) if item.get("model") else None
+            subagent_type = str(item.get("tool") or "Agent")
+            out.append(ev.ToolUse(
+                tool_use_id=call_id,
+                name="Agent",
+                input={
+                    "description": prompt[:200],
+                    "prompt": prompt,
+                    "model": model,
+                    "subagent_type": subagent_type,
+                    "run_in_background": False,
+                },
+            ))
             out.append(ev.SubagentStarted(
-                tool_use_id=item_id or "codex-subagent",
-                subagent_type=str(item.get("tool") or "Agent"),
-                description=str(item.get("prompt") or "Codex subagent"),
-                model=str(item.get("model")) if item.get("model") else None,
+                tool_use_id=call_id,
+                subagent_type=subagent_type,
+                description=prompt or "Codex subagent",
+                model=model,
             ))
         elif item_type == "dynamicToolCall":
             out.append(ev.ToolUse(
@@ -1286,7 +1327,7 @@ class CodexClient(AgentClient):
         elif item_type == "collabAgentToolCall":
             status = str(item.get("status") or "").lower()
             out.append(ev.ToolResult(
-                tool_use_id=item_id or None,
+                tool_use_id=self._collab_result_id(item_id),
                 content=json.dumps({
                     "receivers": item.get("receiverThreadIds") or [],
                     "agents": item.get("agentsStates") or {},
@@ -1921,7 +1962,9 @@ class CodexClient(AgentClient):
 
     # -- lifecycle -------------------------------------------------------- #
 
-    async def interrupt(self) -> None:
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        # ``cancel_queued`` is accepted for the protocol and ignored: Codex
+        # queues nothing between turns (collab agents live inside the turn).
         if self._thread_id and self._turn_id:
             try:
                 await self._transport.request("turn/interrupt", {
@@ -1930,6 +1973,19 @@ class CodexClient(AgentClient):
                 }, timeout=10.0)
             except (CodexRpcError, TransportDiedError) as e:
                 logger.debug("codex interrupt failed: %s", e)
+
+    async def stop_task(self, task_id: str) -> None:
+        # The app-server has no per-agent stop: collab agents end with the
+        # turn (interrupt).
+        raise BackendError("stop_task unsupported")
+
+    @property
+    def supports_task_stop(self) -> bool:
+        return False
+
+    @property
+    def interrupt_spares_background(self) -> bool:
+        return False
 
     async def disconnect(self) -> None:
         await self._transport.close()

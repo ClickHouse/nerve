@@ -339,6 +339,53 @@ class TestRunningState:
         await asyncio.sleep(0.01)
         assert task.cancelled() or task.done()
 
+    async def test_stop_targets_the_turn_task_not_a_queued_run(self, sm: SessionManager):
+        """A framed autonomous drain is the session's turn; a run that is
+        queued behind the run lock (registered by the WS handler) must not
+        take the Stop away from it."""
+        async def long_running():
+            await asyncio.sleep(100)
+
+        turn = asyncio.create_task(long_running())
+        queued = asyncio.create_task(long_running())
+        sm.set_turn_task("stop-2", turn)
+        sm.register_task("stop-2", queued)
+        sm.mark_running("stop-2")
+        assert await sm.stop_session("stop-2") is True
+        await asyncio.sleep(0.01)
+        assert turn.cancelled()
+        assert not queued.done()
+        queued.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await queued
+
+    async def test_turn_task_bookkeeping(self, sm: SessionManager):
+        async def short():
+            await asyncio.sleep(0)
+
+        assert sm.turn_task("tt-1") is None
+        first = asyncio.create_task(asyncio.sleep(100))
+        second = asyncio.create_task(asyncio.sleep(100))
+        sm.set_turn_task("tt-1", first)
+        assert sm.turn_task("tt-1") is first
+        assert sm.has_running_work("tt-1") is True
+        # Identity-checked: an older task cannot clear a newer registration.
+        sm.set_turn_task("tt-1", second)
+        sm.clear_turn_task("tt-1", first)
+        assert sm.turn_task("tt-1") is second
+        sm.clear_turn_task("tt-1", second)
+        assert sm.turn_task("tt-1") is None
+        # A finished task is never reported as the turn.
+        done = asyncio.create_task(short())
+        await done
+        sm.set_turn_task("tt-1", done)
+        assert sm.turn_task("tt-1") is None
+        sm.set_turn_task("tt-1", None)
+        for t in (first, second):
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+
 
 @pytest.mark.asyncio
 class TestFork:

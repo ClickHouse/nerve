@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.agent.backends import SystemEvent
 from nerve.agent.engine import AgentEngine
 from tests.actor_rows import mock_system_principal
 
@@ -31,6 +32,13 @@ def _make_engine() -> AgentEngine:
     # write anything, so the mock answers that lookup like a real database.
     mock_system_principal(db)
     return AgentEngine(config, db)
+
+
+async def _live_background_task(engine: AgentEngine, sid: str, label: str) -> None:
+    """A run_in_background task the CLI reports as started (and not settled)."""
+    await engine.agents.on_system_event(sid, SystemEvent("task_started", {
+        "task_id": "bg1", "task_type": "local_bash", "description": label,
+    }))
 
 
 def _engine_with_bridge() -> AgentEngine:
@@ -351,10 +359,7 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         engine.run = AsyncMock(return_value="done")
         engine._discard_client = AsyncMock()
         # Agent yielded while a backgrounded build was still running.
-        engine._bg_task_registry["cron:job:1"] = {
-            "bg1": {"task_id": "bg1", "label": "mvn -pl client-v2 test",
-                    "tool": "Bash", "status": "running"},
-        }
+        await _live_background_task(engine, "cron:job:1", "make test")
         assert engine._has_live_background_tasks("cron:job:1") is True
 
         result = await engine.run_cron("job", "prompt")
@@ -375,10 +380,7 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         engine.sessions.get_or_create = AsyncMock(return_value={"id": "cron:job"})
         engine.run = AsyncMock(return_value="done")
         engine._discard_client = AsyncMock()
-        engine._bg_task_registry["cron:job"] = {
-            "bg1": {"task_id": "bg1", "label": "build", "tool": "Bash",
-                    "status": "running"},
-        }
+        await _live_background_task(engine, "cron:job", "build")
         assert engine._has_live_background_tasks("cron:job") is True
 
         result = await engine.run_persistent_cron("job", "prompt")
@@ -397,10 +399,7 @@ class TestOneShotRunKeepsClientForLiveBackgroundTasks:
         )
         engine.run = AsyncMock(return_value="done")
         engine._discard_client = AsyncMock()
-        engine._bg_task_registry["hook:deploy:1"] = {
-            "bg1": {"task_id": "bg1", "label": "deploy", "tool": "Bash",
-                    "status": "running"},
-        }
+        await _live_background_task(engine, "hook:deploy:1", "deploy")
         assert engine._has_live_background_tasks("hook:deploy:1") is True
 
         result = await engine.run_hook("deploy", "1", "prompt")

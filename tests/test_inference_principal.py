@@ -198,7 +198,7 @@ class _FakeCli:
 
     started: list[_FakeCli] = []
 
-    def __init__(self, spec, options):
+    def __init__(self, spec, options, **_kwargs):
         self.spec = spec
         self.options = options
         self.env = dict(options.env)

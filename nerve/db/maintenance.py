@@ -40,6 +40,9 @@ _TELEMETRY_TABLES: dict[str, str] = {
     "mcp_tool_usage": "created_at",
     "session_usage": "created_at",
     "memu_audit_log": "timestamp",
+    # Sub-agent transcript items; the agent records themselves are kept for
+    # the session's life.
+    "session_agent_events": "created_at",
 }
 
 # Compaction predicate, shared by the count (dry-run) query and the UPDATE.

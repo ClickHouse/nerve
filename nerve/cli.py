@@ -2779,14 +2779,13 @@ def sync(ctx: click.Context, source: str) -> None:
     config = ctx.obj["config"]
 
     async def _run():
-        from nerve.agent.engine import AgentEngine
         from nerve.migrate import open_production_db
         from nerve.sources.registry import build_source_runners
 
         db = await open_production_db(config)
+        engine = None
         try:
-            engine = AgentEngine(config, db)
-            await engine.initialize()
+            engine = await _start_one_shot_engine(config, db)
 
             runners = build_source_runners(config, db)
             if not runners:
@@ -2821,6 +2820,7 @@ def sync(ctx: click.Context, source: str) -> None:
                     error=result.error,
                 )
         finally:
+            await _stop_one_shot_engine(engine)
             await db.close()
 
     click.echo(f"Running sync: {source}")
@@ -2891,13 +2891,12 @@ def cron(ctx: click.Context, job_id: str) -> None:
     config = ctx.obj["config"]
 
     async def _run():
-        from nerve.agent.engine import AgentEngine
         from nerve.migrate import open_production_db
 
         db = await open_production_db(config)
+        engine = None
         try:
-            engine = AgentEngine(config, db)
-            await engine.initialize()
+            engine = await _start_one_shot_engine(config, db)
 
             if job_id:
                 from nerve.cron.service import CronService
@@ -2934,6 +2933,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
                         f"{job.description or job.schedule} ({status})"
                     )
         finally:
+            await _stop_one_shot_engine(engine)
             await db.close()
 
     _run_against_db(ctx, _run())
@@ -3331,6 +3331,33 @@ def _run_against_db(ctx: click.Context, coro):
     except InsecureStateStorage as e:
         click.echo(f"[ERR] {e}")
         ctx.exit(1)
+
+
+async def _start_one_shot_engine(config, db):
+    """The agent engine of one CLI command (``nerve sync``, ``nerve cron``).
+
+    While the gateway runs, the agent records a previous process left live
+    are the gateway's own agents, so the engine leaves them alone instead of
+    marking them interrupted.
+    """
+    from nerve.agent.engine import AgentEngine
+
+    engine = AgentEngine(config, db)
+    gateway_running, _pid = _get_daemon_status()
+    await engine.initialize(reconcile_agents=not gateway_running)
+    return engine
+
+
+async def _stop_one_shot_engine(engine) -> None:
+    """Shut a one-shot engine down before its database closes: the command's
+    runtimes disconnect, their agents are settled, and the agent records
+    still queued for writing reach the database."""
+    if engine is None:
+        return
+    try:
+        await engine.shutdown()
+    except Exception as e:  # noqa: BLE001 — the database must still close
+        logging.getLogger(__name__).warning("engine shutdown failed: %s", e)
 
 
 @main.group(name="db")

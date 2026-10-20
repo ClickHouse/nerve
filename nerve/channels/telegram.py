@@ -42,6 +42,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.observation import ObservationPolicy
+from nerve.channels.router import turn_stop_note
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -1376,8 +1377,13 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("No active session.")
             return
 
-        stopped = await self.router.stop_session(session_id)
-        if stopped:
+        # The turn only: background agents keep running. A runtime that
+        # cannot spare them is not stopped, and the answer says why.
+        result = await self.router.stop_turn(session_id)
+        note = turn_stop_note(result, session_id)
+        if note:
+            await update.message.reply_text(note, parse_mode=ParseMode.MARKDOWN)
+        elif result.get("turn") in ("stopped", "killed"):
             await update.message.reply_text(
                 f"Stopped session `{session_id}`.",
                 parse_mode=ParseMode.MARKDOWN,

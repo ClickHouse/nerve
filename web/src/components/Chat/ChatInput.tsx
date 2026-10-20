@@ -1,14 +1,18 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, Square, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
+import { Send, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
 import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
+import { useAgentStore } from '../../stores/agentStore';
+import { dockLine } from '../../stores/helpers/agentSelectors';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
 import { findSessionById } from '../../utils/findSession';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
+import { QueuedMessages } from './agents/QueuedMessages';
+import { StopSplitButton } from './agents/StopSplitButton';
 
 const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; color: string; placeholder: string }> = {
   add:      { icon: Plus,       label: 'Add',     color: 'var(--theme-accent)',     placeholder: 'Instructions...' },
@@ -54,7 +58,10 @@ interface AttachmentFile {
 
 export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }: {
   onSend: (message: string, fileIds?: string[], imageBlocks?: Array<{ url: string; filename: string; media_type: string }>) => void;
-  onStop: () => void;
+  /** Stop the turn; the store's stop is async (it answers with what happened). */
+  onStop: () => void | Promise<void>;
+  /** A turn is running: Send becomes Queue next to the split Stop. Typing and
+   *  sending stay possible — a message sent now runs after the turn. */
   isStreaming: boolean;
   disabled?: boolean;
   /**
@@ -151,6 +158,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   const currentModel = isVirtualChat
     ? (newChatModels[activeBackend] ?? modelsDefault)
     : (activeSessionRow?.model ?? modelsDefault);
+  // Switching the model recreates the runtime, which would end every live
+  // agent of this session (the server refuses it too).
+  const liveAgents = useAgentStore(s => (s.sessionId === activeSession ? s.summary.live : 0));
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -209,6 +219,37 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
     historyStashRef.current = '';
     if (activeSession) setTimeout(() => textareaRef.current?.focus(), 0);
   }, [activeSession, setDraft]);
+
+  // The latest composer text, for the agent-store subscription below.
+  const inputRef = useRef(input);
+  useEffect(() => { inputRef.current = input; }, [input]);
+
+  // Text other surfaces put into the composer (Follow up…, Relaunch…, a
+  // cancelled queued message): applied once per request — it replaces an
+  // empty composer and goes on a new paragraph after existing text — then
+  // the composer takes focus with the caret at the end.
+  useEffect(() => {
+    let handled = useAgentStore.getState().composerInsert?.nonce ?? null;
+    return useAgentStore.subscribe((state) => {
+      const insert = state.composerInsert;
+      if (!insert || insert.nonce === handled) return;
+      handled = insert.nonce;
+      const current = inputRef.current;
+      const next = insert.mode === 'replace' || !current.trim()
+        ? insert.text
+        : `${current.replace(/\s+$/, '')}\n\n${insert.text}`;
+      inputRef.current = next;
+      setInput(next);
+      historyIndexRef.current = -1;
+      scheduleDraft(activeSession, next);
+      setTimeout(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }, 0);
+    });
+  }, [activeSession, scheduleDraft]);
 
   // Keep the textarea height in sync with its content (typing + draft load).
   useLayoutEffect(() => {
@@ -333,7 +374,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
 
   const allUploaded = attachments.length === 0 || attachments.every(a => !a.uploading);
   const hasContent = input.trim() || quotes.length > 0 || attachments.some(a => a.uploadedId);
-  const canSend = !disabled && !isStreaming && !rewriteActive && hasContent && allUploaded;
+  // Not gated on `isStreaming`: while a turn runs, sending queues the message
+  // on the server and it runs next.
+  const canSend = !disabled && !rewriteActive && !!hasContent && allUploaded;
 
   /** Actually dispatch a message (with current attachments) and reset the composer. */
   const dispatchSend = (message: string) => {
@@ -405,6 +448,12 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
     }
 
     dispatchSend(message);
+  };
+
+  /** "Stop turn and send": the message queues behind the stopping turn and runs next. */
+  const handleStopAndSend = async () => {
+    await onStop();
+    handleSend();
   };
 
   // Close the kebab menu on an outside click (mirrors SessionSidebar).
@@ -483,6 +532,20 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
       e.preventDefault();
       if (canSend) handleSend();
       return;
+    }
+
+    // ↓ in an empty composer (not browsing the prompt history) opens the
+    // Agents panel with focus in its list, while the session has agents.
+    if (e.key === 'ArrowDown' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
+        && historyIndexRef.current === -1 && input.length === 0) {
+      const agents = useAgentStore.getState();
+      const visible = agents.sessionId === activeSession
+        && dockLine(agents.agents, agents.seen, Date.now(), agents.capabilities.quiet_after_minutes).visible;
+      if (visible) {
+        e.preventDefault();
+        useChatStore.getState().openAgentsPanel(true);
+        return;
+      }
     }
 
     // Shell-style history recall — only when the arrow wouldn't just move the
@@ -665,6 +728,8 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
           composer would make the transcript worse, so the composer fills the
           pane instead. */}
       <div className="px-4 py-3">
+        {/* Messages waiting for the running turn, and this tab's unconfirmed sends. */}
+        <QueuedMessages />
         {/* `relative` is the anchor for the run-later popup below. It hangs off
             this row rather than off its own 40px trigger so that it is aligned
             to the composer and cannot leave the viewport, wherever the trigger
@@ -739,9 +804,16 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
                   setSessionModel(activeSession, picked);
                 }
               }}
-              disabled={disabled || isStreaming || rewriteActive}
-              title="Model for this chat (other chats keep theirs)"
-              className="h-10 max-w-[170px] px-2.5 rounded-xl shrink-0 truncate"
+              disabled={disabled || isStreaming || rewriteActive || liveAgents > 0}
+              title={liveAgents > 0
+                ? `Switching model restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
+                : 'Model for this chat (other chats keep theirs)'}
+              // While a turn streams the picker is disabled and Queue plus the
+              // split Stop replace Send: on a phone it gives up the width they
+              // need, so the controls stay on one line.
+              className={`h-10 px-2.5 rounded-xl shrink-0 truncate ${
+                isStreaming ? 'max-w-[96px] md:max-w-[170px]' : 'max-w-[170px]'
+              }`}
             >
               {/* A session may run on a model the picker no longer offers
                   (retired id, uninstalled Ollama model) — keep it visible
@@ -796,6 +868,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
             placeholder={
               quotes.length > 0 ? 'Add context (optional)...'
               : attachments.length > 0 ? 'Add a message (optional)...'
+              : isStreaming ? 'Queue a message — it runs after this turn...'
               : rewriteAvailable && rewriteEnabled && isNewChat ? 'Send a message — it will be refined before sending...'
               : 'Send a message...'
             }
@@ -876,18 +949,16 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
           </div>
 
           {isStreaming ? (
-            /* Native: this is a solid destructive fill, and IconButton has no
-               `dangerSolid` — its `danger` is red-on-transparent. `bg-error-solid`
-               rather than `bg-error`, which is the pale feedback foreground. */
-            <button
-              type="button"
-              onClick={onStop}
-              className="w-10 h-10 bg-error-solid hover:bg-error-solid/90 text-white rounded-xl inline-flex items-center justify-center cursor-pointer transition-colors shrink-0"
-              title="Stop generation"
-              aria-label="Stop generation"
-            >
-              <Square size={16} />
-            </button>
+            <>
+              <IconButton label="Queue message" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
+                <Clock size={18} />
+              </IconButton>
+              <StopSplitButton
+                onStopTurn={() => { void onStop(); }}
+                hasContent={canSend}
+                onStopAndSend={() => { void handleStopAndSend(); }}
+              />
+            </>
           ) : (
             <IconButton label="Send" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
               <Send size={18} />

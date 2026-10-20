@@ -50,6 +50,7 @@ from nerve.channels.slack_presentation import (
     slack_to_plain,
     split_message,
 )
+from nerve.channels.router import turn_stop_note
 from nerve.config import (
     SLACK_ALL_COMMANDS,
     SLACK_DEFAULT_COMMANDS,
@@ -61,6 +62,17 @@ if TYPE_CHECKING:
     from nerve.channels.router import ChannelRouter
 
 logger = logging.getLogger(__name__)
+
+
+def _stop_answer(result: dict[str, Any], session_id: str, stopped_text: str) -> str:
+    """The reply to a stop: ``stopped_text`` when the turn stopped, why it
+    was left running, or that nothing ran."""
+    note = turn_stop_note(result, session_id)
+    if note:
+        return note
+    if result.get("turn") in ("stopped", "killed"):
+        return stopped_text
+    return f"`{session_id}` was not running."
 
 # The slash command the shipped manifest registers. Only a fallback: the real
 # name comes off each payload, because Slack registers a command workspace-wide
@@ -2070,16 +2082,16 @@ class SlackChannel(BaseChannel):
         user_id: str,
         row: dict[str, Any],
     ) -> None:
-        """Stop one session and say which one, so the answer is checkable."""
+        """Stop one session's turn and say which one, so the answer is
+        checkable. Background agents keep running; a runtime that cannot
+        spare them is not stopped, and the answer says why."""
         session_id = row["session_id"]
-        stopped = await self.router.stop_session(session_id)
+        result = await self.router.stop_turn(session_id)
         where = "the thread" if row.get("thread_ts") else "this channel"
         await self._respond_ephemeral(
             channel_id,
             user_id,
-            f"Stopped `{session_id}` in {where}."
-            if stopped
-            else f"`{session_id}` was not running.",
+            _stop_answer(result, session_id, f"Stopped `{session_id}` in {where}."),
         )
 
     async def _cmd_star(
@@ -2273,10 +2285,9 @@ class SlackChannel(BaseChannel):
             return
 
         if action_id.startswith("sessstop:"):
-            stopped = await self.router.stop_session(value)
+            result = await self.router.stop_turn(value)
             await self._replace_via_url(
-                response_url,
-                f"Stopped `{value}`." if stopped else f"`{value}` was not running.",
+                response_url, _stop_answer(result, value, f"Stopped `{value}`."),
             )
             return
 

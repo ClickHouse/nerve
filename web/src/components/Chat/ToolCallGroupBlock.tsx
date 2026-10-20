@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from '../ui/icons';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2, Bot } from '../ui/icons';
 import { Button } from '../ui';
 import type { ToolCallBlockData } from '../../types/chat';
 import type { ToolCallGroup } from '../../types/renderBlocks';
@@ -15,10 +15,19 @@ const TOOL_ICONS: Record<string, typeof Terminal> = {
   Glob: Search,
   WebSearch: Globe,
   WebFetch: Globe,
+  Agent: Bot,
+  Task: Bot,
 };
 
 /** How many items to always show at the bottom of a collapsed group. */
 const VISIBLE_TAIL = 3;
+/**
+ * Agent spawns are one line each and a wave launches several at once, so a
+ * group of them keeps more in view (8, then "Show N more agents").
+ */
+const VISIBLE_AGENT_TAIL = 8;
+
+const isAgentTool = (tool: string) => tool === 'Agent' || tool === 'Task';
 
 export function ToolCallGroupBlock({
   group,
@@ -31,8 +40,9 @@ export function ToolCallGroupBlock({
   const [expanded, setExpanded] = useState(false);
   const { tool, blocks } = group;
 
+  const agents = isAgentTool(tool);
   const total = blocks.length;
-  const tailStart = Math.max(0, total - VISIBLE_TAIL);
+  const tailStart = Math.max(0, total - (agents ? VISIBLE_AGENT_TAIL : VISIBLE_TAIL));
 
   // A call that holds a workflow-run card stays visible when the group is
   // collapsed. The card is the only live view of its run (status, spend, Kill),
@@ -68,11 +78,15 @@ export function ToolCallGroupBlock({
             ? <Loader2 size={12} className="text-accent animate-spin shrink-0" />
             : <Icon size={12} className={`shrink-0 ${hasError ? 'text-hue-red' : 'text-text-faint'}`} />
           }
-          <span className="font-mono font-medium">
-            {expanded ? 'Collapse' : `Show ${hiddenCount} more`}
+          <span className={agents ? 'font-medium' : 'font-mono font-medium'}>
+            {expanded
+              ? 'Collapse'
+              : agents
+                ? `Show ${hiddenCount} more agent${hiddenCount === 1 ? '' : 's'}`
+                : `Show ${hiddenCount} more`}
           </span>
           <span className="text-text-faint">·</span>
-          <span className="text-text-faint">{total} {tool} calls</span>
+          <span className="text-text-faint">{agents ? `${total} agents` : `${total} ${tool} calls`}</span>
           <div className="ml-auto shrink-0">
             {expanded
               ? <ChevronDown size={12} className="text-text-faint" />
@@ -82,8 +96,8 @@ export function ToolCallGroupBlock({
         </Button>
       )}
 
-      {/* In order: every call when expanded; else the last 3 plus any
-          workflow-run card holders before them. */}
+      {/* In order: every call when expanded; else the last 3 (8 for agent
+          spawns) plus any workflow-run card holders before them. */}
       {blocks.map((block, i) => isShown(block, i) && (
         <ToolCallBlock key={block.toolUseId} block={block} repeatRunCard={repeatRunCalls?.has(block.toolUseId)} />
       ))}

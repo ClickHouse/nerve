@@ -67,7 +67,8 @@ Claude Agent SDK wrapper providing:
 - **Session lifecycle management** — explicit states (created → active → idle → stopped → archived → error) with transitions logged to `session_events` table
 - **Session resume** via SDK `--resume` flag (survives server restarts; `sdk_session_id` stored as a first-class DB column)
 - **Session forking** — branch conversations via SDK `fork_session=True`, exposed through REST API and WebSocket
-- **Session stop** — uses SDK `client.interrupt()` for clean stop, falls back to `task.cancel()`
+- **Session stop** — scoped: Stop interrupts only the orchestrator's turn (the task that holds the session's run lock) and spares background agents; one agent stops through the runtime's per-task stop; stop-all and force are separate actions. A turn is cancelled only when no agent would die with it, or by force
+- **Turn queue** — runs that wait for a session's run lock are listed (`queue_update`) and can be cancelled by their sender; `client_msg_id` makes a resend run once
 - **Persistent channel mappings** — channel-to-session mapping stored in `channel_sessions` table (survives restarts)
 - **Orphan recovery** — on startup, sessions marked `active` in DB but with no live client are transitioned to `idle` (resumable) or `stopped`
 - **Automatic cleanup** — periodic task (every 6h) archives stale sessions (default 30 days) and enforces max session count (default 500)
@@ -75,6 +76,27 @@ Claude Agent SDK wrapper providing:
 - AI-generated session titles via lightweight Haiku API call
 - Custom MCP tools (tasks, memory recall, conversation history, sync status, skills CRUD, notifications)
 - API calls routed through configurable base URL (direct Anthropic API or local CLIProxyAPI proxy)
+
+**Sub-agents and background tasks** (`nerve/agent/agents/`). The runtime
+streams a sub-agent's work in the parent's stream, tagged with
+`parent_tool_use_id`. The engine routes every such event (and every
+sub-agent model call's usage) to the **agent registry** instead of the
+current turn, so a sub-agent's work never opens, extends or persists into an
+orchestrator turn, and background agents alone never make a session look
+running. The registry also takes the spawning tool calls (`Agent`, `Task`,
+`Workflow`, `Monitor`, background `Bash`) and the CLI's `task_*` and
+`background_tasks_changed` frames, and keeps one record per agent: status,
+brief, progress, deduplicated usage and an estimated cost, and a per-agent
+transcript with a gap-free `seq`. Records and transcript items are written
+behind to `session_agents` / `session_agent_events` (batched in one
+transaction per session about once a second; status changes are written at
+once) and broadcast through a single pump task
+(`agent_update` to the session, `agent_event` only to sockets that follow
+that agent), so ingestion never waits on the database or a socket while it
+holds the run lock. Every teardown of a session's runtime goes through
+`SessionManager.remove_client(reason=)`, which marks its live agents
+`interrupted` with the reason; shutdown and boot reconcile what bypasses it.
+See [agents.md](agents.md).
 
 ### Channels (`nerve/channels/`)
 Abstract communication layer with three components:
@@ -219,6 +241,7 @@ nerve/db/
 ├── cron.py            # CronStore mixin
 ├── skills.py          # SkillStore mixin
 ├── mcp.py             # McpStore mixin
+├── agents.py          # AgentStore mixin (session_agents, session_agent_events)
 └── audit.py           # AuditStore mixin
 ```
 
@@ -239,6 +262,8 @@ SQLite with WAL mode (schema version 16):
 - `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
+- `session_agents` — One row per sub-agent or background task of a session: kind, status and end reason, brief, progress, usage and estimated cost, stop attribution (`stopped_by_actor_id`, `stopped_caused_by_actor_id` → `actor_refs`). Deleted with the session (see [agents.md](agents.md))
+- `session_agent_events` — Each agent's transcript items (`agent_id`, gap-free `seq`, `kind`, JSON `payload`), capped per item; follows telemetry retention when it is enabled
 - `tasks` — Task index (mirrors markdown files)
 - `tasks_fts` — FTS5 full-text search index for tasks
 - `sync_cursors` — Opaque cursor positions per source

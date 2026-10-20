@@ -551,8 +551,11 @@ async def test_websocket_stop_and_resume_record_the_connections_person(
     await endpoint(bobs)
 
     assert not [m for m in alices.sent + bobs.sent if m.get("type") == "error"]
+    # The stop is a turn stop; its details say what it did (no turn task
+    # yet: the deferred-stop flag) and how many agents it left running.
     assert await install.events("ws-chat", "stop_requested", "created") == [
-        ("stop_requested", alice, alice, None),
+        ("stop_requested", alice, alice,
+         {"scope": "turn", "outcome": "stopped", "live_agents": 0}),
         ("created", bob, bob, {"reason": "resume"}),
     ]
 

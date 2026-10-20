@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ExternalLink, MessageCircleQuestion, Send, X } from '../ui/icons';
 import { Button, TextField } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
+import { InteractionSource } from './agents/InteractionSource';
 
 interface QuestionOption {
   label: string;
@@ -31,6 +32,9 @@ export function InteractiveQuestionCard() {
 
   const input = pending?.toolInput ?? {};
   const visible = pending?.interactionType === 'question' && input.outOfBand === true;
+  // A sub-agent's own question renders inside its transcript (the tool block
+  // answers it); here it only needs a pointer to that agent.
+  const agentAsks = pending?.interactionType === 'question' && input.outOfBand !== true && !!pending.agent;
   const questions = useMemo(
     () => (Array.isArray(input.questions) ? input.questions as Question[] : []),
     [input.questions],
@@ -39,6 +43,15 @@ export function InteractiveQuestionCard() {
     setSelected({});
     setText({});
   }, [pending?.interactionId]);
+  if (agentAsks && pending?.agent) {
+    return (
+      <div className="mx-4 mb-2 px-3 py-2 flex items-center gap-2 border border-accent/30 rounded-lg bg-accent/10 text-sm" role="status">
+        <MessageCircleQuestion size={15} className="text-accent shrink-0" aria-hidden="true" />
+        <span className="text-text truncate">Waiting for your answer</span>
+        <InteractionSource agent={pending.agent} />
+      </div>
+    );
+  }
   if (!visible) return null;
 
   const keyFor = (q: Question) => q.id || q.question;
@@ -82,6 +95,7 @@ export function InteractiveQuestionCard() {
         <span className="text-sm font-medium text-text">
           {message || 'Codex needs your input'}
         </span>
+        {pending?.agent && <InteractionSource agent={pending.agent} />}
         <span className="ml-auto text-xs text-text-muted">waiting</span>
       </div>
       <div className="px-3 py-3 space-y-3">

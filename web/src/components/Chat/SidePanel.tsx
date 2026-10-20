@@ -1,30 +1,22 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { X, Lightbulb, Bot, Search, Wrench, Files, Loader2, Check, Ban, Workflow as WorkflowIcon } from '../ui/icons';
+import { X, Loader2, Check, Ban } from '../ui/icons';
 import { Button, IconButton } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
+import { useAgentStore } from '../../stores/agentStore';
+import { isLive } from '../../stores/helpers/agentSelectors';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { MarkdownContent } from './MarkdownContent';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
 import { FileChangesPanel } from './FileChangesPanel';
 import { WorkflowPanel } from './WorkflowPanel';
+import { AgentsPanel } from './agents/AgentsPanel';
+import { AgentTranscript } from './agents/AgentTranscript';
+import { identityVisual, statusVisual } from './agents/agentVisuals';
 import type { PanelTab } from '../../types/chat';
 
-const TAB_ICONS: Record<string, typeof Bot> = {
-  Plan: Lightbulb,
-  Explore: Search,
-  'general-purpose': Wrench,
-  files: Files,
-  Workflow: WorkflowIcon,
-};
-
-const TAB_COLORS: Record<string, string> = {
-  Plan: 'text-hue-amber',
-  Explore: 'text-hue-cyan',
-  'general-purpose': 'text-link',
-  files: 'text-hue-teal',
-  Workflow: 'text-hue-violet',
-};
+/** Tabs that draw their own header (the roster and an agent's transcript). */
+const OWN_HEADER = new Set<PanelTab['type']>(['agents', 'agent']);
 
 function formatElapsed(startedAt: number, completedAt?: number): string {
   const ms = (completedAt || Date.now()) - startedAt;
@@ -57,47 +49,75 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
   onFocus: (id: string) => void;
   onClose: (id: string) => void;
 }) {
+  const agents = useAgentStore(s => s.agents);
+  const liveAgents = Object.values(agents).filter(a => !a.ambient && isLive(a)).length;
   return (
     <div className="flex items-center border-b border-border-subtle bg-bg-sunken overflow-x-auto shrink-0">
       {panels.map(tab => {
-        const Icon = TAB_ICONS[tab.subagentType] || Bot;
-        const color = TAB_COLORS[tab.subagentType] || 'text-text-muted';
         const isActive = tab.id === activeId;
+        // An agent tab follows its record's label (it may open before the record loads).
+        const label = (tab.type === 'agent' && tab.agentId && agents[tab.agentId]?.label) || tab.label;
         return (
-          <Button
+          // The tab and its close button are siblings: a button inside a
+          // button is invalid, and the close control has to be reachable
+          // (and visible) without hovering.
+          // The underline sits on the wrapper so it spans the close button too.
+          <div
             key={tab.id}
-            variant="tab"
-            size="sm"
-            active={isActive}
-            // `aria-pressed`, not `aria-selected`: these look like tabs but the
-            // strip is not a `tablist`, the panes are not `tabpanel`s, and there
-            // is no roving tab stop or arrow-key movement. `aria-selected` is
-            // only defined on `option`/`tab`/`row`/`gridcell`, so on a bare
-            // button it is a false promise *and* invalid ARIA. Same reasoning as
-            // the answer pills in InteractiveQuestionCard.
-            aria-pressed={isActive}
-            onClick={() => onFocus(tab.id)}
-            className="group gap-1.5 px-3 py-2 border-r border-r-surface-raised hover:bg-surface-hover"
+            className={`group flex items-center shrink-0 border-r border-r-surface-raised border-b-2 hover:bg-surface-hover ${
+              isActive ? 'border-b-accent' : 'border-b-transparent'
+            }`}
           >
-            {tab.status === 'running'
-              ? <Loader2 size={11} className={`animate-spin ${color}`} />
-              : <Icon size={11} className={tab.isError ? 'text-hue-red' : color} />
-            }
-            <span className="truncate max-w-[100px]">{tab.label}</span>
-            {tab.status !== 'running' && tab.completedAt && (
-              <span className="text-2xs text-text-faint">{formatElapsed(tab.startedAt, tab.completedAt)}</span>
-            )}
-            <span
-              onClick={(e) => { e.stopPropagation(); onClose(tab.id); }}
-              className="ml-1 text-text-faint hover:text-text-muted opacity-0 group-hover:opacity-100 transition-opacity"
+            <Button
+              variant="tab"
+              size="sm"
+              active={isActive}
+              // `aria-pressed`, not `aria-selected`: these look like tabs but the
+              // strip is not a `tablist`, the panes are not `tabpanel`s, and there
+              // is no roving tab stop or arrow-key movement. `aria-selected` is
+              // only defined on `option`/`tab`/`row`/`gridcell`, so on a bare
+              // button it is a false promise *and* invalid ARIA. Same reasoning as
+              // the answer pills in InteractiveQuestionCard.
+              aria-pressed={isActive}
+              onClick={() => onFocus(tab.id)}
+              className="gap-1.5 pl-3 pr-1 py-2 border-b-0"
+            >
+              <TabIcon tab={tab} />
+              <span className="truncate max-w-[100px]">{label}</span>
+              {tab.type === 'agents' && liveAgents > 0 && (
+                <span className="text-2xs tabular-nums text-text-faint">{liveAgents}</span>
+              )}
+              {!OWN_HEADER.has(tab.type) && tab.status !== 'running' && tab.completedAt && (
+                <span className="text-2xs text-text-faint">{formatElapsed(tab.startedAt, tab.completedAt)}</span>
+              )}
+            </Button>
+            <IconButton
+              size="xs"
+              label={`Close ${label}`}
+              onClick={() => onClose(tab.id)}
+              className="mr-1.5 text-text-faint"
             >
               <X size={10} />
-            </span>
-          </Button>
+            </IconButton>
+          </div>
         );
       })}
     </div>
   );
+}
+
+/** A tab's icon: an agent's live status, a running spinner, or the tab's identity. */
+function TabIcon({ tab }: { tab: PanelTab }) {
+  const agent = useAgentStore(s => (tab.type === 'agent' && tab.agentId ? s.agents[tab.agentId] : undefined));
+  if (tab.type === 'agent' && agent) {
+    const visual = statusVisual(agent.status, agent.attention);
+    return <visual.Icon size={11} className={visual.className} aria-hidden="true" />;
+  }
+  const { Icon, className } = identityVisual(tab.type === 'agents' ? 'agents' : tab.subagentType);
+  if (tab.status === 'running' && !OWN_HEADER.has(tab.type)) {
+    return <Loader2 size={11} className={`motion-safe:animate-spin ${className}`} aria-hidden="true" />;
+  }
+  return <Icon size={11} className={tab.isError ? 'text-hue-red' : className} aria-hidden="true" />;
 }
 
 // ------------------------------------------------------------------ //
@@ -105,8 +125,7 @@ function TabBar({ panels, activeId, onFocus, onClose }: {
 // ------------------------------------------------------------------ //
 
 function TabHeader({ tab, onClose }: { tab: PanelTab; onClose: () => void }) {
-  const Icon = TAB_ICONS[tab.subagentType] || Bot;
-  const color = TAB_COLORS[tab.subagentType] || 'text-text-muted';
+  const { Icon, className: color } = identityVisual(tab.subagentType);
 
   return (
     <div className="flex items-center justify-between px-4 py-2.5 border-b border-border-subtle bg-bg shrink-0">
@@ -255,6 +274,25 @@ function PlanActions({ tab }: { tab: PanelTab }) {
 }
 
 // ------------------------------------------------------------------ //
+//  PanelBody — the content of the active tab                           //
+// ------------------------------------------------------------------ //
+
+function PanelBody({ tab, containerRef }: { tab: PanelTab; containerRef: React.RefObject<HTMLDivElement | null> }) {
+  switch (tab.type) {
+    case 'files':
+      return <FileChangesPanel />;
+    case 'workflow':
+      return <WorkflowPanel tab={tab} />;
+    case 'agents':
+      return <AgentsPanel />;
+    case 'agent':
+      return tab.agentId ? <AgentTranscript key={tab.agentId} agentId={tab.agentId} /> : null;
+    default:
+      return <TabContent tab={tab} containerRef={containerRef} />;
+  }
+}
+
+// ------------------------------------------------------------------ //
 //  SidePanel — main exported component                                 //
 // ------------------------------------------------------------------ //
 
@@ -271,6 +309,16 @@ export function SidePanel() {
 
   const activeTab = panels.find(p => p.id === activePanelId) || panels[0] || null;
   const containerRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Hiding the panel with focus inside it (Mod+Shift+E, Mod+\, a header's ×)
+  // would strand focus in content nobody can see: hand it to the composer.
+  useEffect(() => {
+    if (panelVisible) return;
+    if (panelRef.current?.contains(document.activeElement)) {
+      document.getElementById('nerve-chat-input')?.focus();
+    }
+  }, [panelVisible]);
 
   // Drag-to-resize (disable transition during drag for responsiveness)
   const [isDragging, setIsDragging] = useState(false);
@@ -325,6 +373,7 @@ export function SidePanel() {
       // reachable — so it is a named region rather than a dialog, and what it
       // covers is made inert by ChatPage instead of trapped by this panel.
       <div
+        ref={panelRef}
         role="region"
         aria-label={activeTab.label || 'Panel'}
         className={`side-panel absolute inset-0 z-30 flex flex-col overflow-hidden bg-bg-sunken ${isOpen ? '' : 'hidden'}`}
@@ -337,13 +386,8 @@ export function SidePanel() {
             onClose={closePanelTab}
           />
         )}
-        <TabHeader tab={activeTab} onClose={togglePanel} />
-        {activeTab.type === 'files'
-          ? <FileChangesPanel />
-          : activeTab.type === 'workflow'
-            ? <WorkflowPanel tab={activeTab} />
-            : <TabContent tab={activeTab} containerRef={containerRef} />
-        }
+        {!OWN_HEADER.has(activeTab.type) && <TabHeader tab={activeTab} onClose={togglePanel} />}
+        <PanelBody tab={activeTab} containerRef={containerRef} />
         {activeTab.type === 'plan' && <PlanActions tab={activeTab} />}
       </div>
     );
@@ -351,6 +395,10 @@ export function SidePanel() {
 
   return (
     <div
+      ref={panelRef}
+      // Collapsed to no width rather than unmounted (for the slide): keep Tab
+      // out of it while it is hidden.
+      inert={isOpen ? undefined : true}
       className={`side-panel flex flex-col bg-bg-sunken shrink-0 relative overflow-hidden ${
         isOpen ? 'border-l border-border-subtle' : 'border-l-0'
       } ${isDragging ? '' : 'transition-[width] duration-200'}`}
@@ -372,16 +420,11 @@ export function SidePanel() {
         />
       )}
 
-      {/* Header for active tab */}
-      <TabHeader tab={activeTab} onClose={togglePanel} />
+      {/* Header for active tab (the roster and transcripts draw their own) */}
+      {!OWN_HEADER.has(activeTab.type) && <TabHeader tab={activeTab} onClose={togglePanel} />}
 
       {/* Content area */}
-      {activeTab.type === 'files'
-        ? <FileChangesPanel />
-        : activeTab.type === 'workflow'
-          ? <WorkflowPanel tab={activeTab} />
-          : <TabContent tab={activeTab} containerRef={containerRef} />
-      }
+      <PanelBody tab={activeTab} containerRef={containerRef} />
 
       {/* Footer actions (approve/decline for plans) */}
       {activeTab.type === 'plan' && <PlanActions tab={activeTab} />}

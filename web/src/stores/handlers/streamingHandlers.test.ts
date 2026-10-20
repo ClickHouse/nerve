@@ -22,6 +22,10 @@ installStorage();
 vi.mock('../../api/client', () => ({
   api: {
     getMessages: vi.fn().mockResolvedValue({ messages: [] }),
+    // handleDone refreshes the session list.
+    listSessions: vi.fn().mockResolvedValue({ sessions: [], archived_count: 0, system_count: 0, has_more: false, next_offset: 0 }),
+    // switchSession loads the agent roster.
+    getSessionAgents: vi.fn(async (sessionId: string) => ({ session_id: sessionId, agents: [], queue: [] })),
   },
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
   getToken: vi.fn(),
@@ -120,5 +124,82 @@ describe('stream delta batching', () => {
     runFrame();
 
     expect(useChatStore.getState().agentStatus).toBe(status);
+  });
+});
+
+describe('agent spawns and subagent events', () => {
+  const agentInput = { description: 'Build the API', subagent_type: 'general-purpose', prompt: 'Build it', run_in_background: true };
+
+  it('shows an Agent call as a spawn block and opens no panel', () => {
+    send({ type: 'tool_use', session_id: 's1', tool: 'Agent', input: agentInput, tool_use_id: 'toolu_a' });
+
+    expect(useChatStore.getState().streamingBlocks).toEqual([
+      { type: 'tool_call', toolUseId: 'toolu_a', tool: 'Agent', input: agentInput, status: 'running' },
+    ]);
+    expect(useChatStore.getState().panels).toEqual([]);
+    expect(useChatStore.getState().panelVisible).toBe(false);
+
+    // The async-launch result completes the card; still no panel.
+    send({ type: 'tool_result', session_id: 's1', tool_use_id: 'toolu_a', result: 'Async agent launched', is_error: false });
+    expect(useChatStore.getState().streamingBlocks[0]).toMatchObject({ status: 'complete', result: 'Async agent launched' });
+    expect(useChatStore.getState().panels).toEqual([]);
+  });
+
+  it('drops parent-tagged deltas, tool calls and results', () => {
+    send(token('main text'));
+    send({ type: 'token', session_id: 's1', content: 'child text', parent_tool_use_id: 'toolu_a' });
+    send({ type: 'thinking', session_id: 's1', content: 'child thought', parent_tool_use_id: 'toolu_a' });
+    send({ type: 'tool_use', session_id: 's1', tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_child', parent_tool_use_id: 'toolu_a' });
+    send({ type: 'tool_use', session_id: 's1', tool: 'Agent', input: agentInput, tool_use_id: 'toolu_nested', parent_tool_use_id: 'toolu_a' });
+    send({ type: 'tool_use', session_id: 's1', tool: 'Workflow', input: { name: 'wf' }, tool_use_id: 'toolu_wf', parent_tool_use_id: 'toolu_a' });
+    send({ type: 'tool_result', session_id: 's1', tool_use_id: 'toolu_child', result: 'out', is_error: false, parent_tool_use_id: 'toolu_a' });
+    runFrame();
+
+    expect(useChatStore.getState().streamingBlocks).toEqual([{ type: 'text', content: 'main text' }]);
+    expect(useChatStore.getState().panels).toEqual([]);
+  });
+
+  it('keeps the triggers on the auto-turn marker', () => {
+    useChatStore.setState({ isStreaming: false });
+    const trigger = { agent_id: 'ag_000000000001', label: 'build-chart', kind: 'agent' as const, status: 'completed' as const };
+
+    send({ type: 'auto_turn', session_id: 's1', triggers: [trigger], more: 2 });
+
+    expect(useChatStore.getState().streamingBlocks).toEqual([{ type: 'auto', triggers: [trigger], more: 2 }]);
+    expect(useChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it('appends nothing for a turn that only carried its auto marker', () => {
+    useChatStore.setState({ messages: [], isStreaming: false });
+    send({ type: 'auto_turn', session_id: 's1' });
+
+    send({ type: 'done', session_id: 's1' });
+
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().streamingBlocks).toEqual([]);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('keeps a background turn that said something', () => {
+    useChatStore.setState({ messages: [], isStreaming: false });
+    send({ type: 'auto_turn', session_id: 's1' });
+    send(token('build-chart passed'));
+    send({ type: 'done', session_id: 's1' });
+
+    expect(useChatStore.getState().messages.map(m => m.blocks.map(b => b.type))).toEqual([['auto', 'text']]);
+  });
+
+  it('settles only plan tabs when the turn ends', () => {
+    const tab = (id: string, type: 'plan' | 'workflow' | 'agents') => ({
+      id, type, label: id, subagentType: id, description: '', content: null, prompt: '',
+      streaming: true, status: 'running' as const, startedAt: 1, blocks: [],
+    });
+    useChatStore.setState({ panels: [tab('p', 'plan'), tab('w', 'workflow'), tab('agents-panel', 'agents')] });
+
+    send({ type: 'stopped', session_id: 's1' });
+
+    expect(useChatStore.getState().panels.map(p => [p.id, p.status])).toEqual([
+      ['p', 'complete'], ['w', 'running'], ['agents-panel', 'running'],
+    ]);
   });
 });

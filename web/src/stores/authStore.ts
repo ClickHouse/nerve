@@ -9,6 +9,7 @@ import {
 import { useActorStore } from './actorStore';
 import { clearAllDrafts } from './helpers/draftStorage';
 import { clearAllReads } from './helpers/readStorage';
+import { clearAllSeen } from './helpers/agentSeen';
 import { selectViewerStorage } from './helpers/viewerStorage';
 import { useSetupStore } from './setupStore';
 
@@ -32,6 +33,7 @@ export interface Identity {
 function purgeAccountScopedState(): void {
   clearAllDrafts();
   clearAllReads();
+  clearAllSeen();
   // Do not let a name snapshot outlive the session that read it.
   useActorStore.getState().reset();
   // Nor the setup checklist: its state, a pending restart wait and its

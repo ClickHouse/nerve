@@ -113,6 +113,15 @@ agent:
     model: ""                    # Empty → falls back to agent.model (chat model)
     max_tokens: 1024
     timeout_seconds: 45
+  # Sub-agents and background tasks inside a session. Defaults shown.
+  # subagents:
+  #   per_task_stop_affordance: true    # Stop ends only the orchestrator's turn; background agents keep running
+  #   progress_summaries: true          # One-line model-written status per running agent (small extra model calls)
+  #   forward_subagent_text: true       # Stream foreground and nested sub-agents' text too
+  #   quiet_after_minutes: 10           # The UI flags a running agent silent for this long
+  #   lost_grace_seconds: 30            # A live background task gone with no final frame becomes "lost"
+  #   stop_confirm_seconds: 10          # A stop with no final frame after this long shows "stop not confirmed"
+  #   transcript_item_max_bytes: 16384  # Cap per stored/streamed tool payload of an agent transcript
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-5-5
   #   cron_model: us.anthropic.claude-sonnet-5-5

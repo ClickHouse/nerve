@@ -1,6 +1,7 @@
 import { ShieldQuestion, Terminal, FileDiff, Check, Ban } from '../ui/icons';
 import { Button } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
+import { InteractionSource } from './agents/InteractionSource';
 
 /**
  * Floating approval card for backend approval requests (Codex sandbox:
@@ -62,6 +63,7 @@ export function ApprovalCard() {
       <div className="px-3 py-2 flex items-center gap-2 bg-hue-orange/10">
         <Icon size={15} className="text-hue-orange" />
         <span className="text-sm font-medium text-text">{title}</span>
+        {pendingInteraction.agent && <InteractionSource agent={pendingInteraction.agent} />}
         <span className="ml-auto text-xs text-text-muted">approval required</span>
       </div>
 

@@ -13,14 +13,17 @@ web/src/
 │   └── websocket.ts    # WebSocket client with auto-reconnect
 ├── stores/
 │   ├── chatStore.ts    # Chat/session state + thin WS dispatcher (Zustand)
+│   ├── agentStore.ts   # Agent roster, transcripts, turn queue, stops (Zustand)
 │   ├── handlers/       # Domain-specific WebSocket message handlers
-│   │   ├── streamingHandlers.ts  # thinking, token, tool_use, tool_result, done, stopped, error
+│   │   ├── streamingHandlers.ts  # thinking, token, tool_use, tool_result, done, stopped, error, auto_turn
 │   │   ├── sessionHandlers.ts    # session lifecycle (updated/status/switched/forked/resumed/archived/running)
-│   │   ├── panelHandlers.ts      # plan_update, subagent_start/complete, workflow_progress
-│   │   ├── auxiliaryHandlers.ts  # interaction, file_changed, notifications, background_tasks
+│   │   ├── panelHandlers.ts      # plan_update, workflow_progress
+│   │   ├── auxiliaryHandlers.ts  # interaction, file_changed, notifications
 │   │   └── types.ts              # Shared Get/Set type aliases for handlers
 │   ├── helpers/        # Stateless utility functions for chat state
-│   │   ├── blockHelpers.ts       # Panel block append/update, auto-close timers
+│   │   ├── agentSelectors.ts     # Agent groups, dock line, spawn lookup, transcript segments
+│   │   ├── agentSeen.ts          # Per-session "seen" agents (localStorage)
+│   │   ├── blockHelpers.ts       # Panel tab limits (completed tabs kept)
 │   │   └── bufferReplay.ts       # Session reconnect replay, deriveStatus, extractTodos
 │   ├── authStore.ts    # Auth state (Zustand)
 │   ├── setupStore.ts   # Setup checklist state, mutations, restart wait, banner (Zustand)
@@ -32,6 +35,7 @@ web/src/
 │   │   ├── steps/      # ClaimForm, ModeStep, ProviderStep, ProfileStep, …, ReviewStep
 │   │   └── copy.ts     # Every heading, intro and hint of the wizard (no JSX)
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
+│   │   ├── agents/     # Agent lines, dock, Agents panel, transcripts, stop controls, queue chips
 │   │   ├── tools/      # Specialized tool call renderers
 │   │   ├── FileChangesPanel.tsx  # Modified files list + detail navigation
 │   │   └── DiffView.tsx          # GitHub PR-style unified diff renderer
@@ -52,22 +56,21 @@ web/src/
 ## Layout
 
 ```
-┌──────────┬──────────────────────────┬──────────────────┐
-│ Sidebar  │  Header [≡] [title]      │  Side Panel      │
-│ (toggle) │  [status] [context bar]  │  [tab1] [tab2]   │
-│          ├──────────────────────────┤  [header] [X]    │
-│ Today    │                          │                  │
-│  Chat 1  │  Message list            │  Live tool calls │
-│  Chat 2  │  (streaming)             │  (same as chat)  │
-│ Yesterday│                          │  ─────────────   │
-│  Chat 3  │  ┌─ compact card ──────┐ │  Final result    │
-│          │  │ 🔍 Explore  [View →]│ │  (markdown)      │
-│          ├──┴─────────────────────┴─┤                  │
-│ ▶ System │  [input] [send/stop]     │  [Approve] (plan)│
-└──────────┴──────────────────────────┴──────────────────┘
+┌──────────┬────────────────────────────────┬──────────────────────┐
+│ Sidebar  │  Header [≡] [title]            │  Side Panel          │
+│ (toggle) │  [status] [context bar]        │  [Agents][build-api] │
+│          ├────────────────────────────────┤  AGENTS · 2 running  │
+│ Today    │  Message list                  │  NEEDS ATTENTION     │
+│  Chat 1⁵ │  ⟳ build-api  Bash: pytest  ↗■ │  RUNNING             │
+│  Chat 2  │  ✓ build-chart "4 files"    ↗  │   ⟳ build-api     ↗■ │
+│ Yesterday│  ── Background · build-chart ──│  DONE (1)            │
+│  Chat 3  │  ⟳ 2 running · ✓ 1  (dock)     │                      │
+│          │  ⏱ Queued: "also run e2e" [×]  │                      │
+│ ▶ System │  [input] [Queue] [■▾]          │                      │
+└──────────┴────────────────────────────────┴──────────────────────┘
 ```
 
-The sidebar is collapsible (toggle in header, persists via localStorage). The side panel opens on the right when any sub-agent runs (Plan, Explore, general-purpose). Multiple sub-agents get their own tabs. Panel is resizable via drag handle (width persists in localStorage). Toggle with `Cmd/Ctrl + \`.
+The sidebar is collapsible (toggle in header, persists via localStorage). The side panel holds the Agents roster, one tab per opened agent, plan and workflow tabs and the modified files; it opens when you open something in it (spawning an agent opens nothing by itself). Panel is resizable via drag handle (width persists in localStorage). Toggle with `Cmd/Ctrl + \`.
 
 ## Features
 
@@ -75,7 +78,8 @@ The sidebar is collapsible (toggle in header, persists via localStorage). The si
 - **Sidebar** — Collapsible sidebar with sessions split into four groups: **Starred** (pinned, any source), **Conversations** (the feed, grouped by date and paginated with a "…" load-more), **Archived** (lazy, collapsed — archived conversations only; cron/hook sessions are excluded), and **System** (lazy, collapsed — live cron/hook sessions). The Archived and System groups fetch on first expand and drop their rows again on collapse. Toggle the sidebar via header button; state persists in localStorage.
 - **Auto-naming** — New sessions get AI-generated titles via Haiku (e.g. "Italy Summer Vacation Planning" instead of the first message text)
 - **Resumable sessions** — Sessions persist across server restarts via SDK `--resume` flag; full conversation context is restored
-- **Stop button** — Red stop button replaces send during streaming; cancels agent task, saves partial response
+- **Stop button** — While a turn streams, a split red Stop replaces send. The button stops the orchestrator's turn only: background agents keep running. Its caret offers "Stop turn and send" (stop, then send the composer's text) and "Stop all agents…". If the turn does not end within 5 s while agents run, a banner offers "Force stop…" (it restarts the runtime and lists what ends); on a runtime that cannot spare background agents, the banner asks before stopping them. See [agents.md](agents.md#stopping)
+- **Queued messages** — The composer always sends. While a turn streams, Enter queues the message: a chip above the composer shows it (also in other tabs, with its source when it came from a channel or the API) until the turn ends and it runs. Your own chips can be edited (✎: cancel it and continue editing its text in the composer) or cancelled (×); either way its text comes back into the composer, so nothing typed is lost
 
 ### Agent Status
 - **Live indicator** — Header shows current agent state: "Thinking...", "Writing...", "Using Read...", etc.
@@ -89,7 +93,8 @@ Tool calls are collapsed by default with specialized renderers:
 - **Memory** (recall/memorize/history) — Parsed memory items with colored type badges (event, profile, knowledge, behavior)
 - **Tasks** (create/list/update/done) — Task cards with status badges
 - **Skills** (skill_list/get/create/update/read_reference/run_script) — Purple-themed cards. Load Skill shows skill name badge + line count; Create Skill shows name, description, and content preview; List Skills parses into individual skill cards; Update shows content diff preview.
-- **Subagents** (Task tool) — Compact card in main chat with icon, type, description, summary line, and "View →" button. Full tool calls and results are routed to the side panel instead of cluttering the main chat. Expand chevron still available as inline fallback.
+- **Agents** (Agent/Task tool) — One live line at the spawn point: status, name, type, activity or result, elapsed time, tokens, `[Open]` and a two-step `[■]` stop; the chevron reveals the prompt and result. Groups of agent calls show the last 8. Old history without an agent record keeps the legacy card with its "View →" result tab. A sub-agent's own work never appears in the main chat; it is in the agent's tab.
+- **Background continuation** — An autonomous turn (the runtime resumed after background work settled) starts with a divider naming what settled ("Background · build-chart finished").
 - **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Falls back to a regular chat message for historical/non-interactive renders.
 - **ExitPlanMode / EnterPlanMode** — Approval card with Allow/Decline buttons. Agent pauses mid-turn until the user responds. Plan panel auto-closes on approval.
 
@@ -101,17 +106,24 @@ GitHub PR-style diff viewer for files modified during a session. Accessible via 
 - **Snapshot-based** — Original file content is captured via `PreToolUse` hook before the first modification in each session. Only first touch is stored (`INSERT OR IGNORE`). Subsequent edits accumulate in the diff.
 - **Reload resilient** — Snapshots persist in SQLite (`session_file_snapshots` table). On page reload/session switch, `fetchModifiedFiles` re-fetches from the REST API.
 - **Real-time badge** — `file_changed` WebSocket events increment the header badge count as the agent works.
-- **Persistent tab** — The files tab in the side panel does not auto-close (unlike sub-agent tabs).
+- **Persistent tab** — The files tab in the side panel does not auto-close.
+
+### Agents
+Sub-agents and background tasks (shells, monitors, workflows) of the session; see [agents.md](agents.md) for statuses and stops.
+
+- **Agent dock** — One line directly above the composer while the session has agents: counts (running, needing attention, done) and the latest activity. Click it, press `Cmd/Ctrl + Shift + E`, or `↓` in an empty composer to open the Agents panel.
+- **Agents panel** — A side-panel tab grouped **Needs attention** (failed, interrupted, lost, a stop not confirmed, a question waiting) → **Running** (children nested under their parent; quiet agents get an amber chip) → **Done** → **Ended** (stopped, and failures you have seen). Each row shows status, name, type, activity, elapsed time, tokens and `~$` cost, with Open and Stop. The header has **Stop all…**, which lists what ends. Keyboard: `↑ ↓ Home End` move, `Enter` opens, `x x` stops, `Esc` returns to the composer.
+- **Agent tabs** — One tab per opened agent (at most 8): the live transcript (rendered with the chat's own blocks), "Load earlier" for older items, and actions Stop, Copy result, Jump to spawn, Follow up… and Relaunch…. Shells and monitors show their output tail; workflows their tree; Codex agents only the prompt and result. Agent tabs never close on their own.
+- **Reload and restarts** — The roster comes back with the session (agent records are stored); after a gateway restart, agents that were running show as interrupted, with Relaunch….
+- **Sidebar** — A session whose agents still run between turns stays in the Running group with a violet "parked" dot ("N agents running"; the count shows when two or more run).
 
 ### Side Panel
-Generic tabbed panel that replaces the old plan-only preview panel. Auto-opens when any sub-agent runs:
+Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows and modified files:
 
-- **Tabbed interface** — Each sub-agent gets its own tab (Plan, Explore, general-purpose). Tab bar appears when multiple tabs exist. Tabs show icon, label, elapsed time (running) or duration (complete).
-- **Live activity feed** — Sub-agent's internal tool calls (Read, Grep, Bash, etc.) and thinking blocks are rendered in the panel using the **same components as the main chat** (ToolCallBlock, ThinkingBlock, etc.), not the main message stream. Routing uses `parent_tool_use_id` from the SDK to correctly attribute events to the right panel, even for parallel sub-agents.
-- **Final result** — When the sub-agent completes, its markdown result appears below the activity feed, separated by a divider.
+- **Tabbed interface** — Tab bar appears when multiple tabs exist. Each tab has its own labelled close button.
 - **Plan actions** — Plan tabs get Approve/Decline buttons in the footer. When `ExitPlanMode` fires, both buttons appear. Approve resolves the interaction; Decline denies so the agent can revise.
-- **Plan live updates** — Backend broadcasts `plan_update` WS events when Write/Edit targets `.claude/plans/` files, updating the panel content in real-time.
-- **Auto-close** — Non-plan tabs (Explore, general-purpose) auto-close 5 seconds after completion. Plan tabs only close on explicit approve/decline.
+- **Plan live updates** — Backend broadcasts `plan_update` WS events when Write/Edit targets `.claude/plans/` files (also by a sub-agent), updating the panel content in real-time.
+- **Auto-close** — No side-panel tab closes on its own timer. Plan tabs close on approve/decline; finished plan and old-history result tabs beyond the five newest are pruned (never the focused one).
 - **Resizable** — Drag the left edge to resize (20%–65%). Width persists in localStorage.
 - **Keyboard shortcut** — `Cmd/Ctrl + \` toggles panel visibility.
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
@@ -304,6 +316,7 @@ System status dashboard (`/diagnostics`) with:
 ### Reload Resilience
 - Server buffers streaming events per session
 - On reconnect/tab switch, buffered events are replayed to reconstruct streaming state
+- Every bind (and every socket reconnect, which re-binds the active session) sends `session_status` with the agent snapshot; open agent tabs resubscribe and fetch what they missed
 - REST `/api/sessions/{id}/status` fallback for session running state
 - **Ordered blocks** — Assistant messages store an ordered `blocks` JSON column in the DB, preserving the exact interleaving of thinking/text/tool_call blocks from streaming. On page reload, `hydrateMessage` uses this column directly instead of reconstructing from separate fields. Pre-migration messages fall back to the old thinking→tools→text ordering.
 
@@ -349,5 +362,6 @@ Uses Zustand for lightweight state management:
   memory only; same-tab account mutations refresh it, while cross-tab renames
   converge on reload
 - `chatStore` — Sessions, messages, streaming state, agent status, side panel state (tabs, visibility, width), pending interactions (mid-turn user input), sidebar collapsed state, text selection quotes, modified files tracking. WebSocket message handling is dispatched to domain-specific handler modules under `handlers/`, with stateless helpers under `helpers/`.
+- `agentStore` — The active session's agent roster (records keyed by id, newest `rev` wins), summary and capabilities, the turn queue and pending sends, open agent transcripts (live items by `seq`, gaps refetched), the stop escalation and dialogs, and the seen set. Hydrated from `session_status` and `GET /api/sessions/{id}/agents`, kept current by `agent_update`, `agent_event` and `queue_update`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync

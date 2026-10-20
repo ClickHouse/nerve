@@ -909,7 +909,9 @@ function reviewLoopIconTone(status: string): string {
  */
 function parkedTitle(session: Session, scheduledBy: string | null): string {
   const parts: string[] = [];
-  if (session.has_background_tasks) parts.push('Background job running');
+  const agents = session.background_count ?? 0;
+  if (agents > 0) parts.push(`${agents} agent${agents === 1 ? '' : 's'} running`);
+  else if (session.has_background_tasks) parts.push('Background job running');
   if (session.pending_wakeup_at) {
     const at = parseTimestamp(session.pending_wakeup_at);
     const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -930,10 +932,20 @@ function ParkedIndicator({ session }: { session: Session }) {
     session.pending_wakeup_at ? session.pending_wakeup_created_by_actor_id : null,
     session.pending_wakeup_caused_by_actor_id,
   );
-  return (
-    <span className="relative flex h-2 w-2 shrink-0" title={parkedTitle(session, scheduledBy)}>
-      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
+  const agents = session.background_count ?? 0;
+  const title = parkedTitle(session, scheduledBy);
+  const dot = (
+    <span className="relative flex h-2 w-2 shrink-0" title={title}>
+      <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
       <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
+    </span>
+  );
+  // How many agents run, once there is more than one to count.
+  if (agents < 2) return dot;
+  return (
+    <span className="flex items-center gap-1 shrink-0" title={title}>
+      {dot}
+      <span className="text-2xs tabular-nums text-hue-violet">{agents}</span>
     </span>
   );
 }
@@ -951,7 +963,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.awaiting_input) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-blue" />
       </span>
     );
@@ -962,7 +974,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.review_loop?.status === 'awaiting_user') {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-orange" />
       </span>
     );
@@ -975,7 +987,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (loopLive && !isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title={`Review loop ${session.review_loop!.status}`}>
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
@@ -990,7 +1002,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
