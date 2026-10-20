@@ -378,8 +378,9 @@ class SourceRunner:
                 records_dropped=dropped_count,
                 error=str(e),
             )
-        # Storage skips an unchanged record; condense and count only what it stored.
-        records = [r for r in records if r.id in stored_ids]
+        # Storage skips an unchanged record and keeps the last copy of a repeated id;
+        # condense and count only what it stored, once per id.
+        records = list({r.id: r for r in records if r.id in stored_ids}.values())
 
         # 3. LLM-based condensation for still-long records (configurable per source)
         if self.condense:

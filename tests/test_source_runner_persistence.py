@@ -1,3 +1,4 @@
+import dataclasses
 import sqlite3
 
 import pytest
@@ -172,3 +173,22 @@ async def test_runner_condenses_and_counts_only_records_storage_stored(db, monke
     assert condensed[0] == ["a"]
     assert all(ids == [] for ids in condensed[1:])
     assert await db.get_sync_cursor(SOURCE_NAME) == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_content", ["Content a", "Content a, edited"])
+async def test_runner_condenses_and_counts_a_repeated_id_once(db, monkeypatch, repeat_content):
+    repeat = dataclasses.replace(_record("a"), content=repeat_content)
+    runner = SourceRunner(_FixedSource([_record("a"), repeat]), db, condense=True)
+    condensed: list[list[str]] = []
+
+    async def fake_condense(records):
+        condensed.append([r.content for r in records])
+        return records
+
+    monkeypatch.setattr(runner, "_condense_long_content", fake_condense)
+
+    result = await runner.run()
+
+    assert result.records_ingested == 1
+    assert condensed == [[repeat_content]]
