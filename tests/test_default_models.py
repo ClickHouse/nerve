@@ -102,7 +102,7 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     _machine, portable, _shadowed = build_config_layers(SetupChoices())
     assert portable["agent"] == {
         "model": DEFAULT_MODEL, "cron_model": DEFAULT_CRON_MODEL,
-        "max_turns": 50, "max_concurrent": 32, "thinking": "max", "effort": DEFAULT_EFFORT, "context_1m": True,
+        "max_turns": 1000, "max_concurrent": 32, "thinking": "max", "effort": DEFAULT_EFFORT, "context_1m": True,
     }
     assert (portable["memory"]["recall_model"], portable["memory"]["memorize_model"],
             portable["memory"]["fast_model"]) == (DEFAULT_RECALL_MODEL, DEFAULT_MEMORIZE_MODEL, DEFAULT_FAST_MODEL)

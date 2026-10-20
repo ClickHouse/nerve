@@ -80,7 +80,7 @@ class SessionSpec:
     snapshot: SnapshotFn | None = None
     record_wakeup: WakeupFn | None = None
     cache_ttl: str = "5m"
-    max_turns: int = 100
+    max_turns: int = 1000            # 0 = no cap
     idle_timeout: float = 900.0
     # Principal ID that each model request of the client names, for a proxy
     # in front of the model API (nerve.inference_principal): the session's

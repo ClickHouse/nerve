@@ -195,6 +195,37 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     assert "Codex-native skills" not in rendered
 
 
+def test_max_turns_default_and_zero_means_no_cap(tmp_path):
+    """The default cap is a loop guard, not a budget, and 0 (or any non-positive
+    value) lifts it: the CLI options then carry None, which the SDK turns into
+    *no* --max-turns flag."""
+    assert AgentConfig.from_dict({}).max_turns == 1000
+
+    cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    backend = ClaudeBackend(SimpleNamespace(
+        config=lambda: cfg,
+        claude_plugins=lambda: [],
+        managed_mcp=False,
+    ))
+    base = dict(
+        session_id="max-turns-cap",
+        source="web",
+        model=cfg.agent.model,
+        effort="high",
+        system_prompt="cap check",
+        cwd=str(tmp_path),
+    )
+    with patch.object(backend, "_build_mcp_servers", return_value={}), \
+         patch.object(backend, "_build_hooks", return_value={}):
+        capped = backend._build_options(SessionSpec(**base, max_turns=1000))
+        uncapped = [
+            backend._build_options(SessionSpec(**base, max_turns=n)).max_turns
+            for n in (0, -1)
+        ]
+    assert capped.max_turns == 1000
+    assert uncapped == [None, None]
+
+
 # ---------------------------------------------------------------------------
 # ClaudeClient.receive_turn — per-message idle timeout (hung-CLI detection)
 # ---------------------------------------------------------------------------

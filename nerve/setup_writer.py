@@ -552,7 +552,7 @@ def build_config_layers(
         "agent": {
             "model": DEFAULT_MODEL,
             "cron_model": DEFAULT_CRON_MODEL,
-            "max_turns": 50,
+            "max_turns": 1000,
             "max_concurrent": 32,
             "thinking": "max",
             "effort": DEFAULT_EFFORT,

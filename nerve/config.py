@@ -1121,7 +1121,11 @@ class AgentConfig:
     # are filtered; the configured default and an explicit `models` list are
     # authoritative, so naming a model in config overrides a pattern.
     model_discovery_excluded_models: list[str] = field(default_factory=list)
-    max_turns: int = 100
+    # Agentic turns (model ↔ tool round-trips) one request may take before the
+    # CLI stops it ("Reached maximum number of turns (N)"). A last-resort stop
+    # for a looping agent, not a budget: real work passes 50 and 100 routinely.
+    # 0 = no cap.
+    max_turns: int = 1000
     max_concurrent: int = 32
     thinking: str = "max"       # max, high, medium, low, disabled, adaptive, or number (budget_tokens)
     effort: str = DEFAULT_EFFORT  # max, xhigh, high, medium, low
@@ -1226,7 +1230,7 @@ class AgentConfig:
             model_discovery_excluded_models=_str_list(
                 d.get("model_discovery_excluded_models")
             ),
-            max_turns=d.get("max_turns", 100),
+            max_turns=d.get("max_turns", 1000),
             max_concurrent=d.get("max_concurrent", 32),
             thinking=str(d.get("thinking", "max")),
             effort=str(d.get("effort", DEFAULT_EFFORT)),
