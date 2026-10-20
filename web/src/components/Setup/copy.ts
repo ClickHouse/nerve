@@ -208,6 +208,13 @@ export const MODEL_FAMILY_GUIDANCE: Record<string, string> = {
 export const MODEL_DEFAULT_LINE = (defaultLabel: string, currentLabel: string) =>
   `Nerve's default is ${defaultLabel}; this instance is set to ${currentLabel}.`;
 
+/** Under the picker: the pick is written as the cron model as well. */
+export const MODEL_CRON_LINE = 'Scheduled jobs run on this model too.';
+
+/** Under the picker when agent.cron_model names another model (the installer's default, or one set by hand). */
+export const MODEL_CRON_ELSEWHERE = (cronLabel: string) =>
+  `Scheduled jobs run on ${cronLabel}; choosing a different model here moves them to it.`;
+
 export const EFFORT_GUIDANCE: Record<string, string> = {
   max: 'The most reasoning and the slowest answers.',
   xhigh: 'Extended reasoning for hard problems.',

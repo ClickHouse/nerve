@@ -1386,7 +1386,8 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
             portable_paths = []
         if model is not None:
             choices = replace_choices(choices, agent_model=model)
-            portable_paths.append("agent.model")
+            # The pick is the cron model too (build_config_layers derives it).
+            portable_paths += ["agent.model", "agent.cron_model"]
         if effort is not None:
             choices = replace_choices(choices, agent_effort=effort)
             portable_paths.append("agent.effort")

@@ -28,7 +28,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -42,7 +42,7 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
-from nerve.setup_writer import SetupChoices, apply_mode, write_slim_install
+from nerve.setup_writer import SetupChoices, apply_mode, merge_settings_paths, write_slim_install
 from tests.rate_limited_upstream import RateLimitedUpstream
 
 _PASSWORD = "correct horse battery staple"
@@ -540,7 +540,7 @@ class TestProviderKinds:
         assert _API_KEY not in json.dumps(state)
         settings = claimed.settings_yaml()
         assert settings["provider"] == {"type": "anthropic"}
-        assert settings["agent"] == {"model": "claude-sonnet-4-6", "effort": "high"}
+        assert settings["agent"] == {"model": "claude-sonnet-4-6", "cron_model": "claude-sonnet-4-6", "effort": "high"}
         assert "anthropic_api_key" not in (claimed.config_dir / "config.yaml").read_text()
         assert "sk-ant" not in (claimed.workspace / "config" / "settings.yaml").read_text()
 
@@ -667,7 +667,53 @@ class TestProviderKinds:
             assert effort.status_code == 400 and effort.json()["field"] == "effort"
             ok = await http.put("/api/setup/provider", json={"model": "claude-haiku-4-5-20251001", "effort": "low"})
             assert ok.status_code == 200
-        assert claimed.settings_yaml()["agent"] == {"model": "claude-haiku-4-5-20251001", "effort": "low"}
+        assert claimed.settings_yaml()["agent"] == {
+            "model": "claude-haiku-4-5-20251001", "cron_model": "claude-haiku-4-5-20251001", "effort": "low",
+        }
+
+    async def test_the_cron_model_follows_the_picked_model(self, claimed):
+        """A picked model is the instance's model for scheduled work too: the
+        pick writes agent.cron_model alongside agent.model; an effort-only or
+        credential-only save leaves a hand-set cron model alone; a switch into
+        or out of Bedrock without a pick returns both to the installer's
+        defaults (geo-prefixed on Bedrock)."""
+        async with claimed.client() as http:
+            r = await http.put("/api/setup/provider", json={
+                "type": "anthropic", "anthropic_api_key": _API_KEY, "model": "claude-sonnet-4-6",
+            })
+            assert r.status_code == 200
+            assert step(r.json(), "provider")["detail"]["cron_model"] == "claude-sonnet-4-6"
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == agent["cron_model"] == "claude-sonnet-4-6"
+
+            # A cron model set by hand survives saves that pick nothing — a
+            # distinct value, so "left alone" cannot be confused with
+            # "re-derived from the current model".
+            merge_settings_paths(claimed.workspace, {"agent.cron_model": "claude-haiku-4-5-20251001"})
+            claimed.reload()
+            assert (await http.put("/api/setup/provider", json={"effort": "low"})).status_code == 200
+            assert (await http.put("/api/setup/provider", json={
+                "type": "anthropic", "anthropic_api_key": _API_KEY,
+            })).status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["cron_model"] == "claude-haiku-4-5-20251001" and agent["effort"] == "low"
+
+            r = await http.put("/api/setup/provider", json={"type": "bedrock", "aws_region": "eu-central-1"})
+            assert r.status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == f"eu.anthropic.{DEFAULT_MODEL}"
+            assert agent["cron_model"] == f"eu.anthropic.{DEFAULT_CRON_MODEL}"
+
+            # A geo-prefixed pick lands as-is, for both.
+            picked = f"eu.anthropic.{DEFAULT_MODEL}"
+            assert (await http.put("/api/setup/provider", json={"model": picked})).status_code == 200
+            agent = claimed.settings_yaml()["agent"]
+            assert agent["model"] == agent["cron_model"] == picked
+
+            r = await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            assert r.status_code == 200
+        agent = claimed.settings_yaml()["agent"]
+        assert (agent["model"], agent["cron_model"]) == (DEFAULT_MODEL, DEFAULT_CRON_MODEL)
 
     async def test_models_endpoint(self, claimed, monkeypatch):
         """The configured (default) model first, then the catalog as the API

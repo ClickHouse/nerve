@@ -644,8 +644,12 @@ def build_config_layers(
 
     # The model picker's answer, applied after the Bedrock block so a chosen
     # (already geo-prefixed) id is what lands rather than the installer's.
+    # The cron model follows the pick: the person chose the model for this
+    # instance's work, and a worker's work is mostly scheduled. A cheaper
+    # cron model is an edit of agent.cron_model afterwards.
     if choices.agent_model:
         portable["agent"]["model"] = choices.agent_model
+        portable["agent"]["cron_model"] = choices.agent_model
     if choices.agent_effort:
         portable["agent"]["effort"] = choices.agent_effort
 

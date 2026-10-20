@@ -427,6 +427,7 @@ class TestSecretsLandInExactlyOneLayer:
         )
         machine, portable, _ = setup_writer.build_config_layers(choices)
         assert portable["agent"]["model"] == "claude-sonnet-4-6"
+        assert portable["agent"]["cron_model"] == "claude-sonnet-4-6"  # the pick is the cron model too
         assert portable["agent"]["effort"] == "medium"
         assert (portable["quiet_start"], portable["quiet_end"]) == ("22:00", "07:00")
         assert machine["slack"] == {"enabled": True}
