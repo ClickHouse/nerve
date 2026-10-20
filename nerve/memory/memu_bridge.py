@@ -33,18 +33,18 @@ import numpy as np
 from nerve import paths
 from nerve.config import NerveConfig
 from nerve.inference_principal import system_principal_headers
+# Shared with the other memory backends; re-exported under the names this
+# module has always offered, so ``from nerve.memory.memu_bridge import
+# MemoryBackendUnavailable`` (and ``_category_breadcrumb``) keep working.
+from nerve.memory.backend import (  # noqa: F401
+    CATEGORY_BREADCRUMB_MAXLEN as _CATEGORY_BREADCRUMB_MAXLEN,
+    MemoryBackendUnavailable,
+    category_breadcrumb as _category_breadcrumb,
+)
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
 
 logger = logging.getLogger(__name__)
-
-
-class MemoryBackendUnavailable(RuntimeError):
-    """Raised when a memU operation fails because the LLM backend (the shared
-    proxy route) is transiently unavailable — HTTP 429/5xx or an auth blip
-    (``auth_unavailable`` / revoked OAuth) — rather than because the query
-    genuinely had no results. The tool layer surfaces this LOUDLY so a session
-    never mistakes "memory is DOWN" for "no relevant memories"."""
 
 
 def _llm_error_status(exc: BaseException) -> int | None:
@@ -128,41 +128,6 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
-
-# Max characters for a category breadcrumb in recall() output. A category
-# summary is a whole rolled-up topic document (often 5–20KB); recall must
-# surface it as a short navigable pointer, not dump the document.
-_CATEGORY_BREADCRUMB_MAXLEN = 200
-
-
-def _category_breadcrumb(name: str, description: str, summary: str) -> str:
-    """Build a short one-line breadcrumb for a category recall hit.
-
-    Prefers the curated ``description`` (a 1-line purpose). Falls back to the
-    first meaningful line of the rolled-up ``summary`` (with any ``[ref:ID]``
-    citation markers stripped). Never returns the full summary — that is what
-    ``memory_expand_category`` is for.
-    """
-    text = (description or "").strip()
-    if not text:
-        try:
-            from memu.utils.references import strip_references
-        except Exception:  # pragma: no cover - defensive
-            def strip_references(t: str | None) -> str | None:
-                return t
-        for raw in (summary or "").splitlines():
-            line = (strip_references(raw) or "").strip()
-            # Skip markdown headers — they just repeat the category name,
-            # which is returned separately. Take the first real content line.
-            if not line or line.startswith("#"):
-                continue
-            line = line.lstrip("-*").strip()
-            if line:
-                text = line
-                break
-    if len(text) > _CATEGORY_BREADCRUMB_MAXLEN:
-        text = text[: _CATEGORY_BREADCRUMB_MAXLEN - 1].rstrip() + "…"
-    return text
 
 
 class _VectorIndex:
