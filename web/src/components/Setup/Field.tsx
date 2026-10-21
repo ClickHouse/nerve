@@ -1,6 +1,4 @@
 import { Fragment, cloneElement, isValidElement, useId, type ReactElement, type ReactNode } from 'react';
-import { cx } from '../ui/styles';
-import { CONTROL_CLASS } from './controlStyle';
 
 /**
  * A sentence from copy.ts that names a command: each `backticked` part
@@ -25,8 +23,7 @@ export function CodeText({ text }: { text: string }) {
  * The app's `TextField`/`Select` carry no label slot of their own — pages use
  * `aria-label`. The wizard wants visible labels and errors a screen reader
  * announces with the field, which is what this wrapper adds. The child must
- * be a single form control; its `id`, `aria-describedby`, `aria-invalid` and
- * the wizard's control box (`CONTROL_CLASS`, a visible box on any surface)
+ * be a single form control; its `id`, `aria-describedby` and `aria-invalid`
  * are set here.
  */
 export function Field({ label, help, error, children, trailing, id: givenId, className }: {
@@ -51,7 +48,6 @@ export function Field({ label, help, error, children, trailing, id: givenId, cla
       id,
       'aria-describedby': describedBy,
       'aria-invalid': error ? true : undefined,
-      className: cx(typeof child.props.className === 'string' ? child.props.className : undefined, CONTROL_CLASS),
     })
     : children;
 

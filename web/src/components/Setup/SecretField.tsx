@@ -2,7 +2,6 @@ import { useId, useState, type ReactNode } from 'react';
 import type { SecretOut } from '../../api/client';
 import { Button, IconButton, TextField } from '../ui';
 import { Eye, EyeOff } from '../ui/icons';
-import { CONTROL_CLASS } from './controlStyle';
 import { MANAGED_SOURCE_HINT, MANAGED_SOURCE_TEXT } from './copy';
 import { secretManaged } from './credentialSource';
 
@@ -92,7 +91,6 @@ export function SecretField({
             aria-invalid={error ? true : undefined}
             disabled={disabled}
             spellCheck={false}
-            className={CONTROL_CLASS}
           />
           <IconButton
             label={shown ? 'Hide value' : 'Show value'}

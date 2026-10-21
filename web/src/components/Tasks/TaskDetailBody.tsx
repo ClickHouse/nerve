@@ -137,13 +137,10 @@ export function TaskDetailBody({ task }: { task: Task }) {
 
       {mode === 'edit' ? (
         // Deliberately *not* the house `TextArea`. That primitive is a form
-        // field — `bg-surface-raised`, a border, a radius and `px-3 py-2` — and
-        // this is a full-bleed document pane that fills the panel and sits on
-        // the sunken surface. Its chrome cannot be undone from here either:
-        // Tailwind emits same-property utilities alphabetically, so
-        // `bg-bg-sunken` on the call site loses to the primitive's
-        // `bg-surface-raised` at equal specificity. The type scale below is the
-        // design system's; the box is this pane's own.
+        // field, with a border, a radius and `px-3 py-2`, and this is a
+        // full-bleed document pane that fills the panel and sits on the
+        // sunken surface. The type scale below is the design system's; the
+        // box is this pane's own.
         <textarea
           value={localContent}
           onChange={(e) => { setLocalContent(e.target.value); setDirty(true); setSaveError(false); }}
