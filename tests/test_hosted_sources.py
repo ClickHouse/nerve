@@ -618,6 +618,23 @@ class TestStreams:
         assert subscriptions["sources"] == [{"provider": "github", "filters": {}, "pr_watch": True}]
         assert stream.close_code is None
 
+    async def test_subscriptions_refused_even_without_patterns_are_not_sent(self, hosted, monkeypatch, caplog):
+        refused = Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", filters=SourceFilters(allow_repos=("",))),
+            SourceSubscription(provider="github"),
+        ))
+        monkeypatch.setattr(
+            "nerve.channels.hosted.runtime.subscriptions_for", lambda config, providers: refused,
+        )
+        caplog.set_level(logging.WARNING, logger="nerve.channels.hosted.stream")
+
+        stream = await hosted.stream()
+        await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
+
+        assert stream.sent("subscriptions") == []
+        assert stream.close_code is None
+        assert "source subscriptions not sent: the gateway would refuse them" in caplog.text
+
     async def test_a_switched_off_source_subscribes_to_nothing_and_keeps_what_arrives(self, hosted):
         hosted.config.sync.github.enabled = False
         stream = await hosted.stream()

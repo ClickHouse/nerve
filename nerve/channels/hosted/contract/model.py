@@ -64,6 +64,9 @@ SUBSCRIPTIONS_VERSION = "1"
 MAX_SUBSCRIPTION_SOURCES = 16
 MAX_SUBSCRIPTION_PATTERNS = 256
 MAX_SUBSCRIPTION_PATTERN_BYTES = 256
+# A provider name is a lowercase token of at most this many bytes.
+MAX_PROVIDER_BYTES = 64
+_PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
 
 
 def byte_length(value: str) -> int:
@@ -89,6 +92,19 @@ def valid_pattern(pattern: str) -> bool:
         bool(pattern)
         and byte_length(pattern) <= MAX_SUBSCRIPTION_PATTERN_BYTES
         and not any(unicodedata.category(character) == "Cc" for character in pattern)
+    )
+
+
+def valid_provider(provider: str) -> bool:
+    """Whether the gateway takes *provider* as a provider name.
+
+    It must be a non-empty token of lowercase ASCII letters, digits, ``_``,
+    ``-`` and ``.``, within the provider byte limit.
+    """
+    return (
+        bool(provider)
+        and all(character in _PROVIDER_CHARACTERS for character in provider)
+        and len(provider) <= MAX_PROVIDER_BYTES
     )
 
 
@@ -669,14 +685,26 @@ class Subscriptions:
     sources: tuple[SourceSubscription, ...] = omit_empty(())
 
     def validate(self) -> None:
-        """Check the bounds that the gateway checks, before Nerve sends it."""
+        """Check what the gateway checks, before Nerve sends it.
+
+        The version, the number of sources, each provider name and that no
+        provider appears twice, and the bounds of every filter list.
+        """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
         if len(self.sources) > MAX_SUBSCRIPTION_SOURCES:
             reject(RejectionReason.LIMIT_EXCEEDED, "subscriptions name too many sources")
+        providers: set[str] = set()
         for source in self.sources:
             if not source.provider:
                 malformed("source subscription has no provider")
+            if byte_length(source.provider) > MAX_PROVIDER_BYTES:
+                reject(RejectionReason.LIMIT_EXCEEDED, "source subscription provider exceeds its byte limit")
+            if not valid_provider(source.provider):
+                malformed("source subscription provider is not a lowercase token")
+            if source.provider in providers:
+                malformed("subscriptions repeat a provider")
+            providers.add(source.provider)
             for patterns in source.filters.pattern_lists().values():
                 if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
                     reject(RejectionReason.LIMIT_EXCEEDED, "source filter has too many patterns")

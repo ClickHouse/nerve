@@ -545,11 +545,23 @@ class TestSubscriptions:
         (github_subscription(deny_repos=("x" * 257,)), "limit_exceeded"),
         (github_subscription(allow_actors=("",)), "limit_exceeded"),
         (github_subscription(deny_reasons=("sub\tscribed",)), "limit_exceeded"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github"),) * 2), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="GitHub"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="git hub"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="gitlab/self"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="g" * 65),)), "limit_exceeded"),
     ])
     def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
         with pytest.raises(Rejected) as error:
             subscriptions.validate()
         assert error.value.reason == expected
+
+    def test_a_provider_is_any_lowercase_token_within_its_limit(self):
+        Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github"),
+            SourceSubscription(provider="git_hub-2.x"),
+            SourceSubscription(provider="g" * 64),
+        )).validate()
 
     def test_the_largest_subscription_within_bounds_is_valid(self):
         github_subscription(deny_repos=tuple("é" * 128 for _ in range(256))).validate()

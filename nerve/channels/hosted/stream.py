@@ -592,8 +592,10 @@ class ChannelStream:
         settings, and frames leave in call order. Subscriptions that the
         gateway would refuse, by its bounds or its frame limit, go without
         their filter patterns: the gateway then keeps every record, and Nerve's
-        inbox filter still drops what the patterns would have. A stream that
-        is not ready, or that Nerve is draining, sends nothing.
+        inbox filter still drops what the patterns would have. Subscriptions
+        that it would refuse even so are not sent, since the gateway would
+        close the stream over them. A stream that is not ready, or that Nerve
+        is draining, sends nothing.
         """
         if self._subscriptions is None or not self.ready or self.drain_sent:
             return False
@@ -607,11 +609,20 @@ class ChannelStream:
         try:
             body.validate()
         except Rejected as error:
+            wide = body.without_filters()
+            try:
+                wide.validate()
+            except Rejected as still:
+                logger.warning(
+                    "Channel stream %d: source subscriptions not sent: the gateway would "
+                    "refuse them (%s)", self.id, still.detail,
+                )
+                return False
             logger.warning(
                 "Channel stream %d: source subscriptions exceed the gateway's bounds (%s); "
                 "sending them without filter patterns", self.id, error.detail,
             )
-            body = body.without_filters()
+            body = wide
         try:
             try:
                 await self._send_one_way("subscriptions", body)
