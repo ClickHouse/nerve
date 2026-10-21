@@ -212,7 +212,7 @@ function CategorySummaryEditor({ category }: { category: Category }) {
   };
 
   return (
-    <div className="px-3 py-2 bg-bg-sunken border-b border-border-subtle">
+    <div className="px-3 py-2 border-b border-border-subtle">
       <TextArea fieldSize="sm" value={value} onChange={e => setValue(e.target.value)} rows={3} autoFocus />
       <div className="flex justify-end gap-2 mt-1">
         <Button variant="ghost" size="xs" onClick={() => setEditingCategoryId(null)}>Cancel</Button>
