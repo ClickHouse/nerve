@@ -1914,9 +1914,12 @@ class CronService:
 
         Runs the ``source:<source>`` runner at once, after any run of it that
         is in progress (that run may have fetched before the records arrived).
-        Deliveries during the drain make it run once more rather than start
-        a second drain. Then every enabled, scheduled job whose gates include
-        a ``messages`` gate naming *source*, or naming no source, gets one run
+        A run that takes the runner first (a scheduled fire, a manual sync)
+        leaves this one nothing to do; it started after the records arrived,
+        so it is waited for instead. Deliveries during the drain make it run
+        once more rather than start a second drain. Then every enabled,
+        scheduled job whose gates include a ``messages`` gate naming
+        *source*, or naming no source, gets one run
         ``cron.delivery_debounce_seconds`` after the first delivery of a
         burst: later deliveries in that window add nothing. That run waits
         for a run of the job already in flight, and goes through the gates,
@@ -1943,6 +1946,10 @@ class CronService:
                     return
                 await runner.wait_until_idle()
                 await self._run_source_wrapper(runner)
+                # The wrapper awaits before the run starts, so another run can
+                # take the runner in between; this run then returns at once,
+                # and the records are in only when that other run ends.
+                await runner.wait_until_idle()
                 if source not in self._drain_again:
                     break
         finally:

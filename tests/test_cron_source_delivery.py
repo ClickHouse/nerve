@@ -161,6 +161,33 @@ class TestDrain:
 
         assert runner.runs == 2
 
+    async def test_the_jobs_wait_for_a_run_that_took_the_runner_first(self, svc):
+        """The delivery's run logs its start before it runs. A scheduled fire
+        or a manual sync that takes the runner meanwhile leaves the delivery's
+        run nothing to do, and the records are in only once that run ends."""
+        runner = FakeRunner()
+        runner.hold = asyncio.Event()
+        install(svc, job("pr-monitor", sources=["github"]), runners=[runner])
+        others: list[asyncio.Task] = []
+
+        async def log_cron_start(job_id, **kwargs):
+            if job_id == "source:github" and not others:
+                others.append(asyncio.create_task(runner.run()))
+                await runner.started.wait()
+            return 1
+
+        svc.db.log_cron_start = log_cron_start
+        delivered = asyncio.create_task(svc.on_source_delivered("github"))
+        await runner.started.wait()
+        await asyncio.sleep(0.05)
+
+        assert svc.runs.started == []
+        assert not delivered.done()
+        runner.hold.set()
+        await asyncio.gather(delivered, *others)
+        await eventually(lambda: svc.runs.finished == ["pr-monitor"])
+        assert runner.runs == 1
+
     async def test_a_source_without_a_runner_runs_nothing(self, svc):
         install(svc, job("pr-monitor", sources=["github"]), runners=[FakeRunner("gmail:me@example.net")])
 
