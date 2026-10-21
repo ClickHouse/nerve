@@ -615,8 +615,12 @@ its card.
 `next` is the earliest of these, within the next 7 days:
 
 - the next run of each enabled cron job whose gates forecast that the run will
-  happen (see [Forecasts](#forecasts)) — a job forecast to skip its next run does
-  not count;
+  happen (see [Forecasts](#forecasts)). When a job's next run is forecast to
+  skip, Nerve tries up to 8 more of its fire times within the 7 days, asking
+  again only the gates that define their own forecast (an age threshold that
+  will be reached, say), and counts the first one forecast to happen. A gate on
+  the default forecast is asked once: it answers the same for any time, so if it
+  says no, so does every later run;
 - the next run of each source runner;
 - the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
   with "Run later").
@@ -628,11 +632,10 @@ digits and `._:-` (anything else becomes `_`) and to 64 characters. `next` is
 `null` when nothing is due within 7 days.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
-for a job with a next run and `null` for one without (a disabled job, say);
+for a job's next run and `null` for a job without one (a disabled job, say);
 `reason` says why a run is forecast to be skipped.
 
-The forecast looks at each job's next run only, judged from what is known when
-you ask. Code that keeps the answer around can register a schedule listener
+Forecasts are judged from what is known when you ask. Code that keeps the answer around can register a schedule listener
 (`CronService.add_schedule_listener`) to recompute it when it may have changed:
 after a start, a reload or a source reload; when a job or source run ends,
 including one a gate skipped; when a session wakeup is claimed; and when

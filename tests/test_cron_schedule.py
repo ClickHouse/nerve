@@ -409,6 +409,125 @@ async def test_the_schedule_report(held):
     assert by_id["source:mail"]["forecast"] == "run"
 
 
+class _OpensAt(CronGate):
+    """A gate that reasons about the time: runs may go ahead from ``opens`` on."""
+
+    type = "opens_at"
+
+    def __init__(self) -> None:
+        self.opens = datetime.max.replace(tzinfo=UTC)
+        self.asked_at: list[datetime] = []
+
+    async def is_satisfied(self, ctx):
+        return datetime.now(UTC) >= self.opens
+
+    async def forecast(self, ctx, at):
+        self.asked_at.append(at)
+        return at >= self.opens
+
+    def describe(self):
+        return "opens later"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls()
+
+
+class _ChecksNow(CronGate):
+    """A gate on the default forecast that counts how often its check runs."""
+
+    type = "checks_now"
+
+    def __init__(self, answer: bool) -> None:
+        self.answer, self.checks = answer, 0
+
+    async def is_satisfied(self, ctx):
+        self.checks += 1
+        return self.answer
+
+    def describe(self):
+        return "checks now"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls(True)
+
+
+async def _hourly_job_with(held, *gates) -> tuple[CronService, datetime]:
+    """A started service whose one job runs hourly behind *gates*, and that
+    job's next run."""
+    job = _job("hourly")
+    svc = await held([job])
+    job.gates = list(gates)
+    return svc, svc.scheduler.get_job("hourly").next_run_time
+
+
+@pytest.mark.asyncio
+async def test_a_later_run_a_gate_will_let_through_is_the_next_tick(held):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=2)
+
+    tick = await svc.next_scheduled()
+
+    assert tick == ScheduledTick(at=first + timedelta(hours=2), name="hourly", kind="cron")
+    assert opens.asked_at == [first + timedelta(hours=n) for n in range(3)]
+    # The job's next run itself is still forecast to skip.
+    [job] = (await svc.schedule_report())["jobs"]
+    assert job["next_run"] == first.isoformat()
+    assert job["forecast"] == "skip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("opens_after_hours", "found"), [(8, True), (9, False)])
+async def test_eight_more_runs_are_tried_at_most(held, opens_after_hours, found):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=opens_after_hours)
+
+    tick = await svc.next_scheduled()
+
+    assert (tick is not None) is found
+    assert len(opens.asked_at) == 9
+
+
+@pytest.mark.asyncio
+async def test_no_run_beyond_the_horizon_is_tried(held):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=2)
+
+    tick = await svc.next_scheduled(
+        now=first - timedelta(minutes=30), horizon=timedelta(hours=2),
+    )
+
+    assert tick is None
+    assert opens.asked_at == [first, first + timedelta(hours=1)]
+
+
+@pytest.mark.asyncio
+async def test_a_gate_on_the_default_forecast_has_its_check_run_once(held):
+    checks, opens = _ChecksNow(answer=True), _OpensAt()
+    svc, first = await _hourly_job_with(held, checks, opens)
+    opens.opens = first + timedelta(hours=3)
+
+    tick = await svc.next_scheduled()
+
+    assert tick.at == first + timedelta(hours=3)
+    assert checks.checks == 1
+
+
+@pytest.mark.asyncio
+async def test_no_later_run_is_tried_when_a_default_forecast_says_no(held):
+    opens, checks = _OpensAt(), _ChecksNow(answer=False)
+    svc, first = await _hourly_job_with(held, opens, checks)
+    opens.opens = first
+
+    assert await svc.next_scheduled() is None
+    assert checks.checks == 1
+    assert len(opens.asked_at) <= 1
+
+
 # ---------------------------------------------------------------------------
 # Schedule listeners
 # ---------------------------------------------------------------------------

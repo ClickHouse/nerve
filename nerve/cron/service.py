@@ -126,6 +126,11 @@ class _RunsInFlight:
 # How far ahead CronService.next_scheduled() looks by default.
 _SCHEDULE_HORIZON = timedelta(days=7)
 
+# How many more of a job's fire times are tried when its next run is forecast
+# to skip, asking only the gates that define their own forecast (see
+# CronService._forecast_job).
+_FORECAST_MORE_FIRES = 8
+
 # A scheduled tick's name is reported to whatever asks for the next tick, so it
 # is kept to a conservative alphabet and length: anything else in a job id
 # becomes "_", and the rest is cut at the limit.
@@ -162,12 +167,15 @@ def _tick_name(raw: str) -> str:
 @dataclass(frozen=True)
 class _Forecast:
     """A scheduled cron job or source runner, its next run, and what its gates
-    forecast for that run (``reason`` is set for a skip)."""
+    forecast for that run (``reason`` is set for a skip). ``runs_at`` is the
+    first run forecast to happen: the next one, a later one when the next is
+    forecast to skip, or ``None`` when none was found."""
 
     kind: ScheduledKind
     next_run: datetime | None
     runs: bool
     reason: str | None = None
+    runs_at: datetime | None = None
 
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
@@ -2170,17 +2178,20 @@ class CronService:
     ) -> ScheduledTick | None:
         """The earliest work the instance will start on its own within *horizon*.
 
-        The earliest of: the next run of each scheduled cron job, unless its
-        gates forecast that this run will be skipped (judged from what is known
-        now, see :func:`nerve.cron.gates.forecast_gates`); the next run of each
-        source runner; the earliest pending session wakeup. Cleanup and the
-        wakeup sweep are housekeeping and never count. ``None`` when nothing
-        falls within *horizon* of *now* (default: the current time).
+        The earliest of: the first run of each scheduled cron job that its
+        gates forecast to happen (judged from what is known now, see
+        :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
+        is forecast to skip, one of its next few runs (see
+        :meth:`_forecast_job`); the next run of each source runner; the
+        earliest pending session wakeup. Cleanup and the wakeup sweep are
+        housekeeping and never count. ``None`` when nothing falls within
+        *horizon* of *now* (default: the current time).
         """
+        now = now or datetime.now(UTC)
         return self._earliest(
-            await self._forecast_scheduled(),
+            await self._forecast_scheduled(now + horizon),
             await self._next_wakeup(),
-            now or datetime.now(UTC),
+            now,
             horizon,
         )
 
@@ -2193,9 +2204,10 @@ class CronService:
         ``None`` for one without (disabled, or not scheduled); ``reason`` says
         why a run is forecast to be skipped.
         """
-        forecasts = await self._forecast_scheduled()
+        now = datetime.now(UTC)
+        forecasts = await self._forecast_scheduled(now + _SCHEDULE_HORIZON)
         tick = self._earliest(
-            forecasts, await self._next_wakeup(), datetime.now(UTC), _SCHEDULE_HORIZON,
+            forecasts, await self._next_wakeup(), now, _SCHEDULE_HORIZON,
         )
         job_ids = [job.id for job in self._jobs]
         job_ids += [runner.job_id for runner in self._source_runners]
@@ -2215,27 +2227,60 @@ class CronService:
             })
         return {"next": tick.as_dict() if tick else None, "jobs": jobs}
 
-    async def _forecast_scheduled(self) -> dict[str, _Forecast]:
+    async def _forecast_scheduled(self, limit: datetime) -> dict[str, _Forecast]:
         """Every cron job and source runner on the scheduler, by id, with
-        what its gates forecast for its next run."""
-        from nerve.cron.gates import GateContext, forecast_gates
-
+        what its gates forecast for its next run, looking no further than
+        *limit* for a later one."""
         forecasts: dict[str, _Forecast] = {}
         for sched_job in self.scheduler.get_jobs():
             next_run = getattr(sched_job, "next_run_time", None)
             if sched_job.func == self._run_source_wrapper:
-                forecasts[sched_job.id] = _Forecast("source", next_run, runs=True)
+                forecasts[sched_job.id] = _Forecast(
+                    "source", next_run, runs=True, runs_at=next_run,
+                )
             elif sched_job.func == self._run_job_wrapper:
-                # The job object the scheduler will run, gates included.
-                job = sched_job.args[0]
-                runs, reason = True, None
-                if next_run is not None and job.gates:
-                    decision = await forecast_gates(
-                        job.gates, GateContext(job_id=job.id, db=self.db), next_run,
-                    )
-                    runs, reason = decision.should_run, decision.reason or None
-                forecasts[sched_job.id] = _Forecast("cron", next_run, runs, reason)
+                forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
         return forecasts
+
+    async def _forecast_job(self, sched_job, limit: datetime) -> _Forecast:
+        """What the gates of a scheduled cron job forecast for its next run.
+
+        A gate that keeps the default forecast answers from what it sees now,
+        whatever the time, so it is asked once; if it says no, no later run
+        will differ. When those gates let the job through but a gate with a
+        forecast of its own skips the next run, a later run may still happen —
+        an age threshold reached, a cooldown over — so up to
+        ``_FORECAST_MORE_FIRES`` more of the job's fire times, up to *limit*,
+        are tried, asking only the gates with a forecast of their own: a
+        gate's real check never runs more than once per forecast.
+        """
+        from nerve.cron.gates import GateContext, forecast_gates, has_own_forecast
+
+        job = sched_job.args[0]  # the job the scheduler will run, gates included
+        next_run = getattr(sched_job, "next_run_time", None)
+        if next_run is None or not job.gates:
+            return _Forecast("cron", next_run, runs=True, runs_at=next_run)
+        ctx = GateContext(job_id=job.id, db=self.db)
+        steady = [gate for gate in job.gates if not has_own_forecast(gate)]
+        timed = [gate for gate in job.gates if has_own_forecast(gate)]
+        decision = await forecast_gates(steady, ctx, next_run)
+        if not decision.should_run:
+            return _Forecast("cron", next_run, runs=False, reason=decision.reason or None)
+        decision = await forecast_gates(timed, ctx, next_run)
+        if decision.should_run:
+            return _Forecast("cron", next_run, runs=True, runs_at=next_run)
+        at, runs_at = next_run, None
+        for _ in range(_FORECAST_MORE_FIRES):
+            later = sched_job.trigger.get_next_fire_time(at, at + timedelta(microseconds=1))
+            if later is None or later.timestamp() <= at.timestamp() or later > limit:
+                break
+            at = later
+            if (await forecast_gates(timed, ctx, at)).should_run:
+                runs_at = at
+                break
+        return _Forecast(
+            "cron", next_run, runs=False, reason=decision.reason or None, runs_at=runs_at,
+        )
 
     async def _next_wakeup(self) -> ScheduledTick | None:
         """The earliest pending session wakeup, as a tick."""
@@ -2264,9 +2309,9 @@ class CronService:
         """The earliest run forecast to happen, or *wakeup*, up to *horizon*."""
         limit = now + horizon
         ticks = [
-            ScheduledTick(forecast.next_run.astimezone(UTC), _tick_name(job_id), forecast.kind)
+            ScheduledTick(forecast.runs_at.astimezone(UTC), _tick_name(job_id), forecast.kind)
             for job_id, forecast in forecasts.items()
-            if forecast.runs and forecast.next_run is not None and forecast.next_run <= limit
+            if forecast.runs_at is not None and forecast.runs_at <= limit
         ]
         if wakeup is not None and wakeup.at <= limit:
             ticks.append(wakeup)
