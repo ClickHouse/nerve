@@ -13,6 +13,7 @@ import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -775,6 +776,65 @@ async def test_the_health_probe_runs_in_the_background() -> None:
     assert memory._ident is not None and memory._ident.namespace == HOME
     await memory.shutdown()
     assert memory._health_task is None
+
+
+# --------------------------------------------------------------------------- #
+# The memory routes and nerve doctor
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_memory_routes_under_loom(make_memory, monkeypatch) -> None:
+    """No memU store to browse or edit: the snapshot says Loom and links its
+    dashboard, edits are refused, and health is the Loom note."""
+    from fastapi import HTTPException
+
+    from nerve.gateway.routes import memory as routes
+
+    memory = await make_memory(
+        FakeGateway(), org=ORG, namespace=HOME, dashboard_url="https://loom.example.test",
+    )
+    monkeypatch.setattr(routes, "get_deps", lambda: SimpleNamespace(
+        engine=SimpleNamespace(_memory_bridge=memory), db=None,
+    ))
+    assert await routes.get_memu_data() == {
+        "available": False, "backend": "loom",
+        "dashboard_url": f"https://loom.example.test/memories?namespace={HOME}",
+        "categories": [], "items": [], "resources": [], "category_items": {},
+    }
+    for edit in (
+        routes.create_memu_category(routes.CategoryCreateRequest(name="work")),
+        routes.update_memu_item("m1", routes.ItemUpdateRequest(content="new")),
+        routes.delete_memu_item("m1"),
+        routes.update_memu_category("c1", routes.CategoryUpdateRequest(summary="s")),
+    ):
+        with pytest.raises(HTTPException) as err:
+            await edit
+        assert err.value.status_code == 409 and "kept in Loom" in err.value.detail
+    health = await routes.memu_health()
+    assert health["backend"] == "loom" and health["loom"]["namespace"] == HOME
+
+
+@pytest.mark.asyncio
+async def test_memu_health_names_its_backend(monkeypatch) -> None:
+    from nerve.gateway.routes import memory as routes
+
+    bridge = SimpleNamespace(get_health=AsyncMock(return_value={"service_available": True}))
+    monkeypatch.setattr(routes, "get_deps", lambda: SimpleNamespace(
+        engine=SimpleNamespace(_memory_bridge=bridge), db=None,
+    ))
+    assert await routes.memu_health() == {"service_available": True, "backend": "memu"}
+
+
+def test_doctor_names_loom_and_the_gateway() -> None:
+    from nerve import cli
+
+    config = _config()
+    report = cli.doctor_report(config)
+    assert f"[OK] Memory backend: Loom, through the MCP gateway at {BASE}" in report
+    assert "OpenAI API key" not in report
+    config.mcp_gateway_url = ""
+    assert "[ERR] Memory backend: Loom, but mcp_gateway_url is not set" in cli.doctor_report(config)
 
 
 # --------------------------------------------------------------------------- #

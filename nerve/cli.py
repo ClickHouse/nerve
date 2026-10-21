@@ -1936,7 +1936,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             errors.append(f"[ERR] Claude API: {detail}")
 
-    if config.openai_api_key:
+    if config.memory.backend == "loom":
+        # Loom embeds and recalls on its side, and Nerve reaches it through
+        # the MCP gateway with no credential of its own.
+        if config.mcp_gateway_url:
+            lines.append(f"[OK] Memory backend: Loom, through the MCP gateway at {config.mcp_gateway_url}")
+        else:
+            errors.append("[ERR] Memory backend: Loom, but mcp_gateway_url is not set, so Loom cannot be reached")
+    elif config.openai_api_key:
         lines.append(
             f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
             f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"

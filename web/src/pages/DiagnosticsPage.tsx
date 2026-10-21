@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 // import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from '../components/ui/icons';
+import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3, ExternalLink } from '../components/ui/icons';
 import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 import { StatusBadge } from '../components/Cron/controls';
+import { httpLink } from '../utils/httpLink';
 import { totalInputTokens, type UsageTokens } from '../utils/usageTokens';
 import { langfuseProjectUrl } from '../utils/langfuseLinks';
 
@@ -307,11 +308,21 @@ export function DiagnosticsPage() {
           </section>
         )}
 
-        {/* memU Health */}
+        {/* Memory backend health (memU, or Loom through the MCP gateway) */}
         {memuHealth && (
           <section>
             <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
-              <Database size={14} /> memU Memory Service
+              <Database size={14} /> {memuHealth.backend === 'loom' ? 'Loom Memory Service' : 'memU Memory Service'}
+              {memuHealth.backend === 'loom' && httpLink(memuHealth.dashboard_url) && (
+                <a
+                  href={httpLink(memuHealth.dashboard_url) ?? undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-auto inline-flex items-center gap-1 text-xs font-normal text-text-faint hover:text-text-secondary underline-offset-2 hover:underline"
+                >
+                  Open dashboard <ExternalLink size={11} />
+                </a>
+              )}
             </h2>
 
             {/* Summary cards */}
@@ -322,9 +333,31 @@ export function DiagnosticsPage() {
                 value={memuHealth.initialized_at ? formatUptime(memuHealth.initialized_at) : 'N/A'} />
               <InfoCard icon={Database} label="Total Items"
                 value={String(memuHealth.database?.total_items ?? 0)} />
-              <InfoCard icon={HardDrive} label="DB Size"
-                value={`${memuHealth.database?.db_size_mb ?? 0} MB`} />
+              {memuHealth.backend === 'loom' ? (
+                <InfoCard icon={HardDrive} label="Namespace"
+                  value={memuHealth.loom?.namespace || 'not resolved'} />
+              ) : (
+                <InfoCard icon={HardDrive} label="DB Size"
+                  value={`${memuHealth.database?.db_size_mb ?? 0} MB`} />
+              )}
             </div>
+
+            {memuHealth.backend === 'loom' && memuHealth.loom && (
+              <div className="mb-3 text-xs text-text-faint break-words">
+                Through the MCP gateway at {memuHealth.loom.gateway_url || 'no address'}
+                {memuHealth.loom.org && <> · org {memuHealth.loom.org}</>}
+                {memuHealth.loom.identity_source && (
+                  <> · namespace from {memuHealth.loom.identity_source === 'config' ? 'the settings' : 'Loom'}</>
+                )}
+                {memuHealth.loom.checked_at && <> · checked {new Date(memuHealth.loom.checked_at).toLocaleTimeString()}</>}
+              </div>
+            )}
+
+            {memuHealth.backend === 'loom' && memuHealth.loom?.error && (
+              <div className="mb-3 p-3 bg-warning-bg border border-warning-border rounded-lg text-xs text-warning break-words">
+                {memuHealth.loom.error}
+              </div>
+            )}
 
             {/* Type distribution badges */}
             {memuHealth.database?.type_distribution && (

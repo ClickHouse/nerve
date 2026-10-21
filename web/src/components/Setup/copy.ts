@@ -259,6 +259,9 @@ export const MEMORY_WITH_EMBEDDINGS =
   'Fast vector search over Nerve\'s memory. Needs an OpenAI API key; OpenAI charges per note.';
 export const MEMORY_WITHOUT_EMBEDDINGS =
   'Claude ranks memories when Nerve recalls them. Slower when memory is large.';
+export const MEMORY_LOOM =
+  'Memory on this server is kept in Loom. Agents read and write it with Loom\'s own tools, and Loom searches it '
+  + 'without a key from you, so there is nothing to set up here.';
 
 export const TELEGRAM_STEPS = [
   'Open Telegram and message @BotFather.',

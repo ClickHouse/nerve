@@ -1,10 +1,11 @@
 import { useEffect, useState, useMemo } from 'react';
 import {
   Database, Search, Plus, X, Pencil, Trash2, ChevronDown, ChevronRight,
-  FileText, Clock, Circle, History,
+  FileText, Clock, Circle, History, ExternalLink,
 } from '../components/ui/icons';
 import { Badge, Button, IconButton, Select, TextArea, TextField } from '../components/ui';
 import { useMemoryStore, type Category, type MemoryItem, type Resource, type TabView } from '../stores/memoryStore';
+import { httpLink } from '../utils/httpLink';
 import { PageHeader } from '../components/ui/PageHeader';
 import { PaneToggle } from '../components/ui/PaneToggle';
 import { Drawer } from '../components/ui/Drawer';
@@ -758,8 +759,8 @@ function Sidebar({ inDrawer = false, onSelect }: {
 // --- Main Page ---
 
 export function MemuPage() {
-  const { loading, available, items, categories, resources, activeTab, searchQuery,
-    load, setActiveTab, setSearchQuery } = useMemoryStore();
+  const { loading, available, backend, dashboardUrl, items, categories, resources, activeTab,
+    searchQuery, load, setActiveTab, setSearchQuery } = useMemoryStore();
 
   useEffect(() => { load(); }, [load]);
 
@@ -788,6 +789,34 @@ export function MemuPage() {
   }
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-faint">Loading...</div>;
+
+  // This page browses memU's store. With the Loom backend, agents keep
+  // memory with Loom's own tools and Loom's dashboard is where people see it.
+  if (backend === 'loom') {
+    const link = httpLink(dashboardUrl);
+    return (
+      <div className="flex-1 flex items-center justify-center text-text-faint">
+        <div className="text-center max-w-md px-4">
+          <Database size={32} className="mx-auto mb-3 text-text-faint" />
+          <div>Memory is kept in Loom</div>
+          <div className="text-xs text-text-faint mt-1">
+            Agents read and write it with Loom's tools; Nerve recalls from it when a session starts and
+            sends finished conversations to it.
+          </div>
+          {link && (
+            <a
+              href={link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs mt-3 text-text-secondary underline-offset-2 hover:underline"
+            >
+              Open the Loom dashboard <ExternalLink size={11} />
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (!available) {
     return (

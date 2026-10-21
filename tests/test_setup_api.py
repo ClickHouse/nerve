@@ -1050,6 +1050,19 @@ class TestMemory:
         assert step(state, "memory")["status"] == "done"
         assert step(state, "memory")["summary"] == "LLM-ranked recall (chosen)"
 
+    async def test_memory_kept_in_loom_needs_nothing_and_takes_nothing(self, claimed):
+        merge_settings_paths(claimed.workspace, {"memory.backend": "loom"})
+        claimed.reload()
+        async with claimed.client() as http:
+            memory = step((await http.get("/api/setup")).json(), "memory")
+            assert memory["status"] == "done" and memory["summary"] == "Kept in Loom"
+            assert memory["detail"]["backend"] == "loom"
+            refused = await http.put("/api/setup/memory", json={"openai_api_key": _OPENAI})
+            assert refused.status_code == 409 and "kept in Loom" in refused.json()["detail"]
+            tested = await http.post("/api/setup/memory/test", json={"openai_api_key": _OPENAI})
+            assert tested.status_code == 409
+        assert "openai_api_key" not in claimed.local_yaml()
+
     async def test_same_value_twice_changes_no_bytes_and_adds_no_debt(self, claimed):
         async with claimed.client() as http:
             await http.put("/api/setup/memory", json={"openai_api_key": _OPENAI})
