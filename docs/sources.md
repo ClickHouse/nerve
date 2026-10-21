@@ -171,7 +171,11 @@ the hosted channel streams.
   someone else. A pull request seen for the first time gives no record. Such a
   record has the notification metadata plus `number`, `state`, `head`,
   `review_decision` and `changes`, a list of `state`, `head`, `ci`, `review`
-  and `comment`.
+  and `comment`. The agent is always its author, so its `reason` is always
+  `author`, and its `actors` are the reviewers and commenters. Only
+  `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
+  actor, reason and CI branch lists are not checked for it (see
+  [Pull request activity records](#github-pull-request-activity-records)).
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
@@ -572,6 +576,18 @@ would flood the inbox with default-branch runs.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `github.deny_ci_branches` | list | `[]` | Denylist of branch globs for CI runs. Empty = all CI notifications pass |
+
+### GitHub pull request activity records
+
+With `sync.github.mode: hosted` and `pr_watch: true`, the channel gateway also
+delivers `github_pr_activity` records, one for each change on the agent's own open
+pull requests (see [Hosted GitHub source](#hosted-github-source)). The agent is always
+the author of those pull requests: the `reason` of such a record is always `author`, and
+its `actors` are the reviewers and commenters. So only the repo guardrail applies to it.
+`allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons` and `deny_ci_branches` are
+not checked for these records, neither by the gateway nor here. An `allow_actors` list
+that names none of the reviewers, or an `allow_reasons` list without `author`, does not
+drop them; `deny_repos` and an `allow_repos` list that the repo does not match do.
 
 ### Debugging drops
 

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import pytest
 
+from nerve.config import GitHubSyncConfig
 from nerve.sources.base import Source
 from nerve.sources.filters import FieldRule, InboxFilter
+from nerve.sources.github import github_inbox_filter
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.runner import SourceRunner
 
@@ -271,3 +273,61 @@ def test_rejects_names_the_first_failing_rule():
     # Rules are evaluated in order, so the repo rule is reported first.
     by_repo = flt.rejects(_rec("other/repo", ci_branch="main"))
     assert by_repo is not None and by_repo.field == "repo_name"
+
+
+def test_a_rule_does_not_apply_to_the_record_types_it_exempts():
+    rule = FieldRule(field="actors", allow=["alice"], exempt_record_types=("github_pr_activity",))
+    exempt = SourceRecord(
+        id="pr:owner/repo#12", source="github", record_type="github_pr_activity",
+        summary="s", content="c", timestamp="t", metadata={"actors": ["stranger"]},
+    )
+    assert rule.passes(exempt) is True
+    assert rule.passes(_rec(actors=["stranger"])) is False
+    assert rule.passes(_rec(actors=["alice"])) is True
+
+
+# ---------------------------------------------------------------------------
+# GitHub: a record about the agent's own pull request meets the repo rule only
+# ---------------------------------------------------------------------------
+
+def _github(record_type: str, *, repo: str = "owner/repo") -> SourceRecord:
+    """A GitHub record as hosted mode delivers it: the agent is the author,
+    and the actors are a reviewer and a commenter."""
+    return SourceRecord(
+        id=f"{record_type}:{repo}", source="github", record_type=record_type,
+        summary=f"[{repo}] Fix the flaky retry test (author)", content="body",
+        timestamp="2026-01-01T00:00:00Z",
+        metadata={"repo_name": repo, "reason": "author", "actors": ["alice", "bob"], "ci_branch": ""},
+    )
+
+
+def test_an_actor_allow_list_keeps_a_pull_request_record_but_not_a_notification():
+    """The vector both ends of hosted GitHub check, the gateway before it
+    stores a record and Nerve before the inbox."""
+    flt = github_inbox_filter(GitHubSyncConfig(allow_actors=["someone-else"]))
+
+    assert flt.passes(_github("github_pr_activity")) is True
+    assert flt.passes(_github("github_notification")) is False
+
+
+@pytest.mark.parametrize("settings", [
+    {"allow_actors": ["someone-else"]},
+    {"deny_actors": ["bob"]},
+    {"allow_reasons": ["mention", "review_requested"]},
+    {"deny_reasons": ["author"]},
+    {"deny_ci_branches": ["*"]},
+])
+def test_only_the_repo_rule_applies_to_a_pull_request_record(settings):
+    flt = github_inbox_filter(GitHubSyncConfig(**settings))
+
+    assert flt.passes(_github("github_pr_activity")) is True
+    assert flt.passes(_github("github_notification")) is False
+
+
+@pytest.mark.parametrize("settings", [{"allow_repos": ["other/*"]}, {"deny_repos": ["owner/*"]}])
+def test_the_repo_rule_still_applies_to_a_pull_request_record(settings):
+    flt = github_inbox_filter(GitHubSyncConfig(**settings))
+
+    rejected_by = flt.rejects(_github("github_pr_activity"))
+
+    assert rejected_by is not None and rejected_by.field == "repo_name"

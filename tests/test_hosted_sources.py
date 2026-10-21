@@ -538,6 +538,29 @@ class TestStreams:
         assert (result.records_ingested, result.records_dropped) == (1, 1)
         assert await hosted.db.get_source_message("github", "9000000002") is None
 
+    async def test_a_pull_request_record_meets_the_repo_rule_only(self, tmp_path, db, monkeypatch):
+        harness = await start(
+            tmp_path, db, monkeypatch, allow_actors=["someone-else"], allow_reasons=["mention"],
+        )
+        try:
+            stream = await harness.stream()
+            pull_request = harness.gateway.store(source_record_event(
+                record_id="pr:owner/repo#12", record_type="github_pr_activity", reason="author",
+            ))
+            notification = harness.gateway.store(source_record_event(record_id="9000000004"))
+
+            await stream.nudge("observe")
+
+            await harness.acknowledged(pull_request, notification)
+            result = await harness.github_runner().run()
+            assert (result.records_ingested, result.records_dropped) == (1, 1)
+            stored = await db.get_source_message("github", "pr:owner/repo#12")
+            assert stored["record_type"] == "github_pr_activity"
+            assert stored["metadata"]["reason"] == "author"
+            assert await db.get_source_message("github", "9000000004") is None
+        finally:
+            await stop(harness)
+
     async def test_other_github_events_are_rejected_and_settled(self, hosted):
         stream = await hosted.stream()
         invoke = hosted.gateway.store(source_record_event(purpose="invoke"))

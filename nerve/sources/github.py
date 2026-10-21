@@ -42,6 +42,12 @@ _MAX_CONCURRENT_FETCHES = 5
 # A run on the default branch is an upstream sync or a schedule, never a PR.
 _CI_BRANCH_RE = re.compile(r"\bfor (?P<branch>\S+) branch$")
 
+# The record of a change on one of the agent's own open pull requests, which
+# the channel gateway delivers in hosted mode (``sync.github.pr_watch``). The
+# agent is always the author: its ``reason`` is ``author`` and its ``actors``
+# are the reviewers and commenters.
+PR_ACTIVITY_RECORD_TYPE = "github_pr_activity"
+
 
 def _ci_branch(subject_type: str, title: str) -> str:
     """Branch of a CI run, or ``""`` for anything else.
@@ -116,14 +122,30 @@ def github_inbox_filter(settings: GitHubSyncConfig) -> InboxFilter:
     for everything except CheckSuite notifications, so an allow list there
     would fail closed and drop the whole feed.
 
+    Only the repo rule applies to a ``github_pr_activity`` record. It is about
+    the agent's own pull request, so its reason is always ``author`` and its
+    actors are the reviewers and commenters: the actor, reason and CI branch
+    rules, written for notifications, would drop every such record.
+
     The polling source and the hosted one share this filter, and hosted mode
-    publishes the same patterns to the gateway.
+    publishes the same patterns to the gateway, which applies them the same
+    way.
     """
+    own_pull_requests = (PR_ACTIVITY_RECORD_TYPE,)
     return InboxFilter(rules=[
         FieldRule(field="repo_name", allow=settings.allow_repos, deny=settings.deny_repos),
-        FieldRule(field="actors", allow=settings.allow_actors, deny=settings.deny_actors),
-        FieldRule(field="reason", allow=settings.allow_reasons, deny=settings.deny_reasons),
-        FieldRule(field="ci_branch", deny=settings.deny_ci_branches),
+        FieldRule(
+            field="actors", allow=settings.allow_actors, deny=settings.deny_actors,
+            exempt_record_types=own_pull_requests,
+        ),
+        FieldRule(
+            field="reason", allow=settings.allow_reasons, deny=settings.deny_reasons,
+            exempt_record_types=own_pull_requests,
+        ),
+        FieldRule(
+            field="ci_branch", deny=settings.deny_ci_branches,
+            exempt_record_types=own_pull_requests,
+        ),
     ])
 
 

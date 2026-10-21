@@ -20,6 +20,8 @@ Per-rule semantics:
   one of its patterns or the record is dropped. An absent field cannot
   satisfy a non-empty allow list (fail-closed).
 * an empty allow list means "allow anything not denied".
+* a rule may exempt record types: a record of such a type passes the rule
+  whatever its value.
 
 A record is kept only if it passes **every** rule (logical AND).
 
@@ -64,11 +66,14 @@ class FieldRule:
         allow: If non-empty, the field value must match at least one pattern.
         deny: If the field value matches any pattern, the record is dropped
             (takes precedence over ``allow``).
+        exempt_record_types: Record types the rule does not apply to; a
+            record of one of them passes the rule without being matched.
     """
 
     field: str
     allow: list[str] = dataclasses.field(default_factory=list)
     deny: list[str] = dataclasses.field(default_factory=list)
+    exempt_record_types: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -92,6 +97,8 @@ class FieldRule:
 
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""
+        if record.record_type in self.exempt_record_types:
+            return True
         values = self._values(record)
 
         # deny wins — drop on any deny match.

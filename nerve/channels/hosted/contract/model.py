@@ -627,7 +627,8 @@ class SourceFilters:
 
     They match the way Nerve's inbox filter matches: deny wins, a non-empty
     allow list must match, globs ignore case, and a list-valued field matches
-    when any of its elements does.
+    when any of its elements does. A pull request activity record is matched
+    against the repository lists only.
     """
 
     allow_repos: tuple[str, ...] = omit_empty(())

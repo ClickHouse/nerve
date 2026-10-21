@@ -1722,7 +1722,7 @@ the channel transport, matching messages are written to a local buffer.
 |-----|------|---------|-------------|
 | `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
 | `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
-| `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a record whenever one of the agent's own open pull requests changes |
+| `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
