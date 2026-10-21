@@ -229,6 +229,7 @@ Full-page markdown editor for task content:
 - **Ctrl+S / Cmd+S** to save; Save button appears when content is modified
 - **Status dropdown** — change status inline in the header
 - **Metadata** — deadline, source, external link displayed in header
+- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows "A plan waits for your review". The section reads the plans again when the task changes, for example when `plan_propose` writes its note
 - **Back button** — returns to the task list
 
 Saving writes the full markdown file to disk and re-syncs the title and deadline to SQLite.

@@ -5,11 +5,12 @@ import { Button, IconButton } from '../ui';
 import { Calendar, Edit3, ExternalLink, Eye, History, Save } from '../ui/icons';
 import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { TaskPlan } from './TaskPlan';
 import { TaskTimeline } from './TaskTimeline';
 
 /**
- * The task editor itself — metadata row, edit/preview toggle, markdown
- * body, save.
+ * The task editor itself: metadata row, the task's plan, edit/preview
+ * toggle, markdown body, save.
  *
  * Shared by the full page and the board's modal so the two can't drift.
  * Only the surrounding chrome differs: the page supplies a back button and
@@ -128,6 +129,8 @@ export function TaskDetailBody({ task }: { task: Task }) {
           </div>
         </div>
       </div>
+
+      <TaskPlan taskId={task.id} refreshKey={task.updated_at} />
 
       {showHistory && (
         <div className="px-5 py-3 border-b border-border-subtle bg-surface-raised/30 max-h-52 overflow-y-auto shrink-0">

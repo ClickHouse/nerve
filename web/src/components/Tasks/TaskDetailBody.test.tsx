@@ -1,5 +1,7 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render as rtlRender, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
 
@@ -7,7 +9,7 @@ import { api, type Task } from '../../api/client';
 import { TaskDetailBody } from './TaskDetailBody';
 
 vi.mock('../../api/client', () => ({
-  api: { updateTask: vi.fn() },
+  api: { updateTask: vi.fn(), getTaskPlans: vi.fn(async () => ({ plans: [] })) },
   // The timeline's actor labels read the viewer through the auth store,
   // which wires these on import.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -22,14 +24,17 @@ vi.mock('../../api/client', () => ({
  * two places at once.
  */
 
-function task(content: string): Task & { content: string } {
+function task(content: string, updatedAt = '2026-08-05T00:00:00Z'): Task & { content: string } {
   return {
     id: 't1', title: 'Fix the encoder', status: 'pending', position: 1024,
     deadline: null, source: 'manual', source_url: null, tags: '',
-    created_at: '2026-08-05T00:00:00Z', updated_at: '2026-08-05T00:00:00Z',
+    created_at: '2026-08-05T00:00:00Z', updated_at: updatedAt,
     content,
   };
 }
+
+// The plan section links to the plan page, so the body needs a router.
+const render = (ui: ReactElement) => rtlRender(ui, { wrapper: MemoryRouter });
 
 const editor = () => screen.getByPlaceholderText('Task content...');
 const saveButton = () => screen.queryByRole('button', { name: /save/i });
@@ -155,5 +160,26 @@ describe('TaskDetailBody failed saves', () => {
     // edit is still unsaved so Save has to stay.
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(saveButton()).toBeInTheDocument();
+  });
+});
+
+describe('TaskDetailBody plan', () => {
+  const getTaskPlans = vi.mocked(api.getTaskPlans);
+
+  it('shows a plan that the agent proposes while the task is open', async () => {
+    getTaskPlans.mockResolvedValueOnce({ plans: [] });
+    const { rerender } = render(<TaskDetailBody task={task('# original')} />);
+    await waitFor(() => expect(getTaskPlans).toHaveBeenCalledWith('t1'));
+    expect(screen.queryByRole('region', { name: 'Plan' })).not.toBeInTheDocument();
+
+    // plan_propose writes a note on the task, and the task_updated broadcast
+    // carries the new updated_at.
+    getTaskPlans.mockResolvedValueOnce({
+      plans: [{ id: 'plan-1', task_id: 't1', status: 'pending', version: 1, feedback: null }],
+    });
+    rerender(<TaskDetailBody task={task('# original', '2026-08-05T01:00:00Z')} />);
+
+    expect(await screen.findByText('A plan waits for your review')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open plan' })).toBeInTheDocument();
   });
 });
