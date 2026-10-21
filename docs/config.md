@@ -1755,6 +1755,8 @@ process, so startup does not wait on a vector preload.
 | `memory.loom.agent` | string | `nerve` | `NERVE_AGENT_ID` | The `agent` every write is attributed to. Authorship only: reads cover every agent of a namespace. |
 | `memory.loom.timeout_s` | float | `5` | | Seconds a read may take. Writes get three times this, conversation extraction six times (15 s and 30 s by default). Must be positive. |
 | `memory.loom.verify_tls` | bool | `true` | | Verify Loom's TLS certificate (`https` only). |
+| `memory.loom.dashboard_url` | string | *(empty)* | `LOOM_DASHBOARD_URL` | Where people open Loom's dashboard, when that is not `base_url` (an instance that reaches Loom through a local proxy, say). The same URL rules as `base_url`; see *The dashboard link* below. |
+| `memory.loom.extraction_batch_bytes` | int | `1048576` | | The most bytes one conversation-extraction request may carry (1 MiB), so a window stays inside whatever body limit a proxy in front of Loom enforces. At least `131072`. |
 
 **Environment variables.** Each key in the *Environment* column falls back to that
 variable when no config layer sets it (or sets it blank); a value in any file wins.
@@ -1776,44 +1778,83 @@ operation:
    token is a JWT.
 
 When none of them yields both, every memory call fails as "backend unavailable" with a
-message naming each step and why it came up empty; the Diagnostics page shows the same
-text. A failed lookup is retried after 30 seconds, and a resolved identity is looked up
-again after Loom refuses the credential (HTTP 401/403), once, before that counts as an
-outage. Nothing assumes how namespaces are named. In a config repo shared by several
+message naming what went wrong: Loom could not be asked (unreachable, or HTTP 5xx), Loom
+refused the token, or each step and why it came up empty. The Diagnostics page shows
+the same text. A failed lookup is retried after 30 seconds. A resolved identity is
+looked up again, once, when Loom refuses the credential for the home namespace (HTTP
+401, or 403 on the home namespace) before that counts as an outage; a 403 on another
+namespace, or a refusal by a Loom policy (`POLICY_FORBIDDEN`), is an error for that one
+call. Nothing assumes how namespaces are named. In a config repo shared by several
 agents, leave `memory.loom.namespace` and `memory.loom.agent` unset (or `${VAR}`
 references) so each box resolves its own.
 
 **How the tools map.** `memorize` stores one fact with `memory.set`: Loom type
 `semantic` (`procedural` for `behavior`), tags `nerve` and `nerve:<type>`, the session
-id, and for an `event` a `valid_at` of the time it is saved. `memory_recall`,
-`session_context` and the startup recall use `memory.search` (`recipe: fast`, no model
-call) plus `namespace.search_categories`, and print the same `[type] (id:…)` lines and
-`cat:<id>` breadcrumbs as memU, within the same size budgets; a search Loom abstains
-on is "No relevant memories found". The indexing sweep queues each session window with
-`memory.set_from_messages` (`defer: true`, at most 400 messages per call, every fact
-tagged `source:nerve`), and Loom extracts the facts in the background. `memory_update`,
-`memory_delete` and `category_update` use `memory.update_by_id` (against the content
-hash it just read), `memory.assign_category`, `memory.delete` and
+id, and for an `event` a `valid_at` of the time it is saved. `memory_recall` and
+`session_context` use `memory.search` (`recipe: fast`, stored memories only) plus
+`namespace.search_categories`, and print the same `[type] (id:…)` lines and `cat:<id>`
+breadcrumbs as memU, within the same size budgets. The fast recipe makes no LLM call,
+but Loom embeds the query for each of the two searches, so every recall is two billed
+embedding calls (and a rerank, when the namespace has a reranker configured). A search
+Loom abstains on returns no memories: "No relevant memories found", or "Recalled 0
+memories + N related topics" when categories match. Each memory is printed to at most
+500 characters.
+
+The memories a new session starts with come from `context.pack` in startup mode, its
+memories section only: the same fast search, but its hits are kept even where
+`memory.search` would abstain, and no category blurbs take their place. The pack
+searches the home namespace (unless Loom's deployment default searches every namespace
+of the token), where `memory_recall` reads them all. At most 8 memories, 500 characters
+each and 4,000 bytes in all, are frozen into the session. A Loom that refuses
+`context.pack` gets the search instead, with the abstention ignored.
+
+The indexing sweep queues each session window with `memory.set_from_messages`
+(`defer: true`, every fact tagged `source:nerve`), in batches of at most 400 messages
+and `memory.loom.extraction_batch_bytes` (a single message longer than that is cut),
+and Loom extracts the facts in the background. Each queued batch is recorded in
+`nerve.db` with its session and time window, and the next sweep asks
+`memory.extraction_status` about it: a batch Loom finished is forgotten, one Loom gave
+up on is sent again from the stored messages, three sends in all, and after that it is
+logged as an error and counted as failed on the Diagnostics page (the record is kept 30
+days).
+
+`memory_update`, `memory_delete` and `category_update` use `memory.update_by_id`
+(against the content hash it just read), `memory.assign_category`, `memory.delete` and
 `namespace.register_category`. An `id` in tool output is the Loom memory key,
 qualified as `<namespace>/<key>` for a row outside the home namespace; the tools also
-accept a Loom memory id (a UUID).
+accept a Loom memory id (a UUID). Reads do not filter by agent or session: in Loom
+those are authorship, and filtering on them would hide rows other agents wrote to a
+shared namespace.
 
 **Failures.** An unreachable Loom, a timeout, HTTP 5xx or 429, or a refused credential
 fails the call as "backend unavailable" after up to three attempts (only requests Loom
 cannot have acted on, or idempotent ones, are resent): `memory_recall` then says memory
 is DOWN rather than empty, `memorize` says the fact was not saved, and the sweep keeps
-its watermark, so the window is offered again on the next pass. After an unreachable
-Loom, calls fail at once for 15 seconds instead of each waiting out the timeouts.
-Nerve starts normally while Loom is down.
+its watermark, so the window is offered again on the next pass. A 429 or 503 that asks
+to wait longer than five seconds (`Retry-After`) fails at once, and that operation then
+fails fast for the time asked, at most a minute. After Loom could not be reached or did
+not answer, every call fails at once for 15 seconds instead of each waiting out the
+timeouts; a dropped keep-alive connection or a full local connection pool does not
+count. A request Loom refuses (another 4xx) is an error, never an empty result. Nerve
+starts normally while Loom is down.
+
+**The dashboard link.** The Memory and Diagnostics pages link to Loom's dashboard at
+`<dashboard>/memories?namespace=<home namespace>`, where `<dashboard>` is
+`memory.loom.dashboard_url`, or else `base_url` unless that is a loopback, private or
+link-local address (a local proxy's, which no browser reaches). With neither, the pages
+show no link.
 
 **What differs from memU.**
 
 - The memory type (`profile`, `event`, `knowledge`, `behavior`) is the `nerve:<type>`
   tag; Loom's own type only decides how a row is searched. Facts Loom extracted from
-  conversations carry Loom's types (`semantic`, `preference`, …).
+  conversations show Loom's type in the tools' words: `preference` as `profile`,
+  `procedural` as `behavior`, `semantic` as `knowledge`, `episodic` as `event`.
 - `conversation_history` lists the rows of the home namespace that carry a `valid_at`
-  in the range: Loom dates each extracted fact by the turn it came from, or by the date
-  it names.
+  in the range, newest first, reading up to ten pages of 500. Loom dates every fact it
+  extracts by the turn it came from (or by the date it names), so this lists what was
+  said and done on those days, not only events. An `event` saved with `memorize` is
+  dated when it is saved: the tool takes no date.
 - `memory_records_by_date` lists the home namespace's rows newest first by
   `created_at`, scanning at most 2,500 of them. Loom cannot sort by `updated_at`, so
   `updated: true` marks only rows inside that scan; a row created before it and edited
@@ -1821,13 +1862,16 @@ Nerve starts normally while Loom is down.
   `source:nerve`) in the home namespace only, never a namespace attached later.
 - `memory_expand_category` lists the rows tagged with the category's name, which is
   how Loom's extractor files facts into registered categories (`memory_update` adds
-  the tag too).
-- Loom returns only the first 280 characters of a category summary, so a
-  `category_update` that changes only the description of a category with a longer
-  summary is refused; pass the summary as well.
+  the tag too). It shows each row to 500 characters and matches `query` on its first
+  200 characters, saying so when it cut a longer one.
+- Loom returns only the first 280 bytes of a category summary (fewer characters
+  outside ASCII), so a `category_update` that changes only the description of a
+  category with a longer summary is refused, as it is for a category Loom's category
+  search does not show; pass the summary as well.
 - The Memory page's snapshot reads memU's database, so it shows "not available for
-  this backend" with a link to Loom, whose own dashboard browses the memory. The
-  Diagnostics page shows Loom's health and counts.
+  this backend", with the dashboard link when there is one. The Diagnostics page
+  shows Loom's health, counts, and the conversation extraction batches queued and
+  failed.
 - `memory.recall_model`, `memorize_model`, `embed_model`, `sqlite_dsn`,
   `semantic_dedup_threshold` and `knowledge_filter` are memU's and have no effect.
 
