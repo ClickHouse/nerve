@@ -17,10 +17,14 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nerve.sources.base import Source
+from nerve.sources.filters import FieldRule, InboxFilter
 from nerve.sources.models import FetchResult, SourceRecord
+
+if TYPE_CHECKING:
+    from nerve.config import GitHubSyncConfig
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +105,161 @@ def _collect_actors(
     return actors
 
 
+def github_inbox_filter(settings: GitHubSyncConfig) -> InboxFilter:
+    """The inbox guardrail of the GitHub source, from ``sync.github``.
+
+    Restricts which repos (the ``repo_name`` metadata key), which GitHub
+    actors (``actors``: every login involved in a record) and which reasons
+    (``reason``) reach the inbox, and which CI branches (``ci_branch``) do
+    not. The rules AND together; within each, deny wins and a non-empty allow
+    list is fail-closed. ``ci_branch`` is deny-only on purpose: it is empty
+    for everything except CheckSuite notifications, so an allow list there
+    would fail closed and drop the whole feed.
+
+    The polling source and the hosted one share this filter, and hosted mode
+    publishes the same patterns to the gateway.
+    """
+    return InboxFilter(rules=[
+        FieldRule(field="repo_name", allow=settings.allow_repos, deny=settings.deny_repos),
+        FieldRule(field="actors", allow=settings.allow_actors, deny=settings.deny_actors),
+        FieldRule(field="reason", allow=settings.allow_reasons, deny=settings.deny_reasons),
+        FieldRule(field="ci_branch", deny=settings.deny_ci_branches),
+    ])
+
+
+def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseException) -> SourceRecord:
+    """The inbox record of one notification and its enrichment.
+
+    *extra* is what :meth:`GitHubSource._enrich_notification` returned for
+    the notification, or the exception it raised; a failed enrichment gives
+    a record built from the notification alone.
+    """
+    subject = notif.get("subject", {})
+    repo = notif.get("repository", {})
+    updated_at = notif.get("updated_at", "")
+    reason = notif.get("reason", "")
+    repo_name = repo.get("full_name", "?")
+    subject_title = subject.get("title", "?")
+    subject_type = subject.get("type", "")
+
+    # Build enriched content
+    if isinstance(extra, Exception):
+        logger.warning("Enrichment failed for %s: %s", notif.get("id"), extra)
+        extra = {}
+
+    html_url = extra.get("html_url") or repo.get("html_url", "")
+    subject_body = extra.get("body", "")
+    subject_state = extra.get("state", "")
+    subject_user = extra.get("user", "")
+    assignees = extra.get("assignees", [])
+    labels = extra.get("labels", [])
+    comment = extra.get("latest_comment")
+    assigner = extra.get("assigner", "")
+
+    content_parts = [
+        f"Repository: {repo_name}",
+        f"Type: {subject_type}",
+        f"Title: {subject_title}",
+        f"Reason: {reason}",
+        f"State: {subject_state}" if subject_state else None,
+        f"Author: {subject_user}" if subject_user else None,
+        f"Assignees: {', '.join(assignees)}" if assignees else None,
+        # An assignment carries no comment text, so without this the
+        # record never says who asked for the work.
+        f"Assigned by: {assigner}" if assigner else None,
+        f"Labels: {', '.join(labels)}" if labels else None,
+        f"Updated: {updated_at}",
+        f"URL: {html_url}",
+    ]
+
+    # Add the PR/issue body
+    if subject_body:
+        body_text = subject_body[:_MAX_BODY_CHARS]
+        if len(subject_body) > _MAX_BODY_CHARS:
+            body_text += "\n[... truncated]"
+        content_parts.append(f"\n--- Description ---\n{body_text}")
+
+    # Add the latest comment that triggered the notification
+    if comment:
+        comment_body = comment.get("body", "")[:_MAX_COMMENT_CHARS]
+        comment_user = comment.get("user", "?")
+        comment_date = comment.get("created_at", "")
+        content_parts.append(
+            f"\n--- Latest Comment ({comment_user}, {comment_date}) ---\n"
+            f"{comment_body}"
+        )
+
+    # Add latest review state (APPROVED, CHANGES_REQUESTED, etc.)
+    latest_review = extra.get("latest_review")
+    if latest_review:
+        reviewer = latest_review.get("user", "?")
+        review_state = latest_review.get("state", "")
+        review_body = latest_review.get("body", "")
+        content_parts.append(
+            f"\n--- Latest Review ({reviewer}) ---\n"
+            f"State: {review_state}"
+        )
+        if review_body:
+            content_parts.append(
+                review_body[:_MAX_COMMENT_CHARS]
+            )
+
+    # Add inline review comments (code-level feedback)
+    inline_comments = extra.get("review_inline_comments", [])
+    if inline_comments:
+        content_parts.append("\n--- Inline Review Comments ---")
+        for ic in inline_comments:
+            ic_user = ic.get("user", "?")
+            ic_path = ic.get("path", "")
+            ic_line = ic.get("line")
+            ic_body = ic.get("body", "")
+            loc = f"{ic_path}:{ic_line}" if ic_line else ic_path
+            content_parts.append(
+                f"\n{ic_user} on {loc}:\n{ic_body}"
+            )
+
+    # Add recent human comments (catches mentions buried by
+    # bot comments — see _enrich_recent_comments).
+    recent_comments = extra.get("recent_comments", [])
+    if recent_comments:
+        content_parts.append(
+            "\n--- Recent Comments (human, newest first) ---"
+        )
+        for rc in recent_comments:
+            rc_user = rc.get("user", "?")
+            rc_date = rc.get("created_at", "")
+            rc_body = rc.get("body", "")
+            content_parts.append(
+                f"\n{rc_user} ({rc_date}):\n{rc_body}"
+            )
+
+    # Surface every involved login so the inbox guardrail can
+    # allow/deny by actor (the raw notification carries no actor).
+    actors = _collect_actors(
+        subject_user, assignees, comment, latest_review,
+        inline_comments, recent_comments, assigner,
+    )
+
+    return SourceRecord(
+        id=notif.get("id", ""),
+        source="github",
+        record_type="github_notification",
+        summary=f"[{repo_name}] {subject_title} ({reason})",
+        content="\n".join(p for p in content_parts if p),
+        timestamp=updated_at or datetime.now(timezone.utc).isoformat(),
+        metadata={
+            "reason": reason,
+            "unread": notif.get("unread", False),
+            "subject_type": subject_type,
+            "subject_url": html_url,
+            "repo_name": repo_name,
+            "repo_url": repo.get("html_url", ""),
+            "actors": actors,
+            "ci_branch": _ci_branch(subject_type, subject_title),
+        },
+    )
+
+
 class GitHubSource(Source):
     """GitHub notification source using the gh CLI."""
 
@@ -118,13 +277,20 @@ class GitHubSource(Source):
         # cursor's own second. A re-listed unchanged thread is skipped by storage.
         # IMPORTANT: use Z suffix, not +00:00 — the `+` in a URL query
         # string is interpreted as a space, silently breaking the filter.
+        since = None
         if cursor:
             try:
                 cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
                 since = cursor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             except ValueError:
-                since = cursor
-        else:
+                # Not a timestamp, for example the buffer position that the
+                # hosted source keeps under the same name. GitHub refuses such a
+                # `since`, which would fail every run, so look back as on a
+                # first run instead.
+                logger.warning(
+                    "GitHub cursor %r is not a timestamp; fetching the last 24 hours", cursor,
+                )
+        if since is None:
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
@@ -160,133 +326,10 @@ class GitHubSource(Source):
             ]
             enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
 
-            records: list[SourceRecord] = []
-
-            for notif, extra in zip(notifications, enriched):
-                subject = notif.get("subject", {})
-                repo = notif.get("repository", {})
-                updated_at = notif.get("updated_at", "")
-                reason = notif.get("reason", "")
-                repo_name = repo.get("full_name", "?")
-                subject_title = subject.get("title", "?")
-                subject_type = subject.get("type", "")
-
-                # Build enriched content
-                if isinstance(extra, Exception):
-                    logger.warning("Enrichment failed for %s: %s", notif.get("id"), extra)
-                    extra = {}
-
-                html_url = extra.get("html_url") or repo.get("html_url", "")
-                subject_body = extra.get("body", "")
-                subject_state = extra.get("state", "")
-                subject_user = extra.get("user", "")
-                assignees = extra.get("assignees", [])
-                labels = extra.get("labels", [])
-                comment = extra.get("latest_comment")
-                assigner = extra.get("assigner", "")
-
-                content_parts = [
-                    f"Repository: {repo_name}",
-                    f"Type: {subject_type}",
-                    f"Title: {subject_title}",
-                    f"Reason: {reason}",
-                    f"State: {subject_state}" if subject_state else None,
-                    f"Author: {subject_user}" if subject_user else None,
-                    f"Assignees: {', '.join(assignees)}" if assignees else None,
-                    # An assignment carries no comment text, so without this the
-                    # record never says who asked for the work.
-                    f"Assigned by: {assigner}" if assigner else None,
-                    f"Labels: {', '.join(labels)}" if labels else None,
-                    f"Updated: {updated_at}",
-                    f"URL: {html_url}",
-                ]
-
-                # Add the PR/issue body
-                if subject_body:
-                    body_text = subject_body[:_MAX_BODY_CHARS]
-                    if len(subject_body) > _MAX_BODY_CHARS:
-                        body_text += "\n[... truncated]"
-                    content_parts.append(f"\n--- Description ---\n{body_text}")
-
-                # Add the latest comment that triggered the notification
-                if comment:
-                    comment_body = comment.get("body", "")[:_MAX_COMMENT_CHARS]
-                    comment_user = comment.get("user", "?")
-                    comment_date = comment.get("created_at", "")
-                    content_parts.append(
-                        f"\n--- Latest Comment ({comment_user}, {comment_date}) ---\n"
-                        f"{comment_body}"
-                    )
-
-                # Add latest review state (APPROVED, CHANGES_REQUESTED, etc.)
-                latest_review = extra.get("latest_review")
-                if latest_review:
-                    reviewer = latest_review.get("user", "?")
-                    review_state = latest_review.get("state", "")
-                    review_body = latest_review.get("body", "")
-                    content_parts.append(
-                        f"\n--- Latest Review ({reviewer}) ---\n"
-                        f"State: {review_state}"
-                    )
-                    if review_body:
-                        content_parts.append(
-                            review_body[:_MAX_COMMENT_CHARS]
-                        )
-
-                # Add inline review comments (code-level feedback)
-                inline_comments = extra.get("review_inline_comments", [])
-                if inline_comments:
-                    content_parts.append("\n--- Inline Review Comments ---")
-                    for ic in inline_comments:
-                        ic_user = ic.get("user", "?")
-                        ic_path = ic.get("path", "")
-                        ic_line = ic.get("line")
-                        ic_body = ic.get("body", "")
-                        loc = f"{ic_path}:{ic_line}" if ic_line else ic_path
-                        content_parts.append(
-                            f"\n{ic_user} on {loc}:\n{ic_body}"
-                        )
-
-                # Add recent human comments (catches mentions buried by
-                # bot comments — see _enrich_recent_comments).
-                recent_comments = extra.get("recent_comments", [])
-                if recent_comments:
-                    content_parts.append(
-                        "\n--- Recent Comments (human, newest first) ---"
-                    )
-                    for rc in recent_comments:
-                        rc_user = rc.get("user", "?")
-                        rc_date = rc.get("created_at", "")
-                        rc_body = rc.get("body", "")
-                        content_parts.append(
-                            f"\n{rc_user} ({rc_date}):\n{rc_body}"
-                        )
-
-                # Surface every involved login so the inbox guardrail can
-                # allow/deny by actor (the raw notification carries no actor).
-                actors = _collect_actors(
-                    subject_user, assignees, comment, latest_review,
-                    inline_comments, recent_comments, assigner,
-                )
-
-                records.append(SourceRecord(
-                    id=notif.get("id", ""),
-                    source="github",
-                    record_type="github_notification",
-                    summary=f"[{repo_name}] {subject_title} ({reason})",
-                    content="\n".join(p for p in content_parts if p),
-                    timestamp=updated_at or datetime.now(timezone.utc).isoformat(),
-                    metadata={
-                        "reason": reason,
-                        "unread": notif.get("unread", False),
-                        "subject_type": subject_type,
-                        "subject_url": html_url,
-                        "repo_name": repo_name,
-                        "repo_url": repo.get("html_url", ""),
-                        "actors": actors,
-                        "ci_branch": _ci_branch(subject_type, subject_title),
-                    },
-                ))
+            records = [
+                notification_record(notif, extra)
+                for notif, extra in zip(notifications, enriched)
+            ]
 
             # The first item came from the first page, so no notification that arrives
             # while later pages are read is older than its `updated_at`.
