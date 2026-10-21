@@ -20,6 +20,11 @@ describe('MarkdownContent links', () => {
     expect(screen.getByRole('link', { name: 'plan-1' })).toHaveAttribute('href', '/plans/plan-1');
   });
 
+  it('opens a server URL in a new tab', () => {
+    render(<MemoryRouter><MarkdownContent content="[log](/api/files/download?path=a.log)" /></MemoryRouter>);
+    expect(screen.getByRole('link', { name: 'log' })).toHaveAttribute('target', '_blank');
+  });
+
   it('does not keep a protocol-relative link in the tab', () => {
     render(<MemoryRouter><MarkdownContent content="[x](//example.com/x)" /></MemoryRouter>);
     expect(screen.getByRole('link', { name: 'x' })).toHaveAttribute('target', '_blank');

@@ -90,7 +90,7 @@ export function NotificationToast() {
                 {notif.body && (
                   <NotificationBody
                     body={notif.body}
-                    className="text-xs text-text-muted mt-0.5 line-clamp-3 [&_p]:my-0"
+                    className="text-xs text-text-muted mt-0.5 line-clamp-3"
                   />
                 )}
                 <NotificationLinks notif={notif} size="xs" onOpen={() => dismissToast(notif.id)} />

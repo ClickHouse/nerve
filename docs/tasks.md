@@ -50,6 +50,8 @@ Statuses are configurable (`task_status_list`, `task_status_create`, and the boa
 
 `pending`, `plan_review` and `done` are protected and cannot be deleted. Migration v059 adds `backlog` and `plan_review` to an existing install, before and after `pending`; a status that already has one of these names stays as it is.
 
+An install that existed before keeps the `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks, until the Automation step writes that file again. On such an install the planner can propose a plan for a `backlog` task.
+
 ## Agent Tools
 
 | Tool | Description |

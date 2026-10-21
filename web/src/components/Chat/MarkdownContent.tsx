@@ -5,9 +5,12 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from './CodeBlock';
 
-/** A path in this app, such as `/plans/plan-1`. `//host` is another site. */
+/**
+ * A page of this app, such as `/plans/plan-1`. `//host` is another site, and
+ * `/api/...` is a server URL (a download, an upload), not a page.
+ */
 function isAppPath(href: string | undefined): href is string {
-  return !!href && href.startsWith('/') && !href.startsWith('//');
+  return !!href && href.startsWith('/') && !href.startsWith('//') && !href.startsWith('/api/');
 }
 
 /**
