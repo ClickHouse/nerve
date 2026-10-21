@@ -51,8 +51,8 @@ const { useAuthStore } = await import('../../stores/authStore');
 const { useSetupStore } = await import('../../stores/setupStore');
 const { browserTimeZone } = await import('../../utils/timeZones');
 const {
-  CHANNELS, MODE_LOCK_REASON, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState, makeWorkerState, on,
-  step, withStep,
+  CHANNELS, MODE_LOCK_REASON, WAITS_FOR_MODE, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState,
+  makeWorkerState, on, step, withStep,
 } = await import('../../test/setupFixtures');
 const { SetupPage } = await import('../../pages/SetupPage');
 const { ReadyScreen } = await import('./ReadyScreen');
@@ -1732,6 +1732,16 @@ describe('lockdown', () => {
     await heading('Connect a model');
     expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Continue/ })).not.toBeInTheDocument();
+  });
+
+  it('does not count a locked step that waits for Mode', async () => {
+    // The server keeps the Mode reason but marks the step `lockdown`.
+    current = withStep(lockedState(), step('profile', {
+      status: 'blocked', blocked_kind: 'lockdown', read_only: true, blocked_reason: WAITS_FOR_MODE,
+    }));
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.getByText('2 of 2 steps done')).toBeInTheDocument();
   });
 
   it('local lockdown: only the name is editable on the profile and Continue sends just that', async () => {

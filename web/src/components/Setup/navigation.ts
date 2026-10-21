@@ -106,10 +106,12 @@ export function closedByPolicy(step: Pick<SetupStep, 'status' | 'blocked_kind' |
  * A step that a person can complete on this instance, now or after the
  * Mode step. A step that the instance closed by policy or by a lockdown
  * does not apply: the server never counts it as left to do, and the
- * Overview does not count it in "N of M steps done".
+ * Overview does not count it in "N of M steps done". On a locked instance
+ * a step can wait for Mode and still be `lockdown`: nothing on the page
+ * can answer Mode there, so that step does not apply either.
  */
-export function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason'>): boolean {
-  return step.status !== 'blocked' || waitsForMode(step);
+export function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason' | 'blocked_kind'>): boolean {
+  return step.status !== 'blocked' || (waitsForMode(step) && step.blocked_kind !== 'lockdown');
 }
 
 /** Whether the setup page may store a credential here; an older backend says nothing, which means yes. */

@@ -159,8 +159,8 @@ export function WizardShell() {
     }
   }
 
-  // The phone's position line. Steps count the server's steps only (the same
-  // M as the Overview's "N of M"); Review is named, not numbered.
+  // The phone's position line. Steps count the server's steps only; Review
+  // is named, not numbered.
   const position = state && current ? stopPosition(state, current) : null;
   const currentStep = state && current ? stepOf(state, current) : undefined;
   const positionLine = state && current
