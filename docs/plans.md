@@ -41,7 +41,7 @@ User reviews (via /plans UI or chat tools)
 - Supersedes any prior pending plan for the same task
 - Moves the task to `plan_review` when its status is `pending`, `backlog` or `in_progress`. A task in any other status keeps it. The move names the task revision that was read, so a status that another writer set in the meantime stays.
 - Writes a task note with a markdown link to the plan: `Plan proposed: [plan-…](/plans/plan-…) (v1)`
-- Sends one notification, "Plan ready for review: <task title>", with priority `high`. Its metadata holds `plan_id` and `task_id`. The web UI shows "Open plan" and "Open task" for it, and Telegram shows an "Open plan" button that opens the plan in the chat. Agents do not send their own `notify` about the plan.
+- Sends one notification, "Plan ready for review: <task title>", with priority `high`. Its metadata holds `plan_id` and `task_id`. The web UI shows "Open plan" and "Open task" for it, and Telegram shows an "Open plan" button that opens the plan in the chat. During quiet hours it is sent without sound. It dismisses the task's earlier plan notifications, and approve and decline dismiss the last one. Agents do not send their own `notify` about the plan.
 - Returns `{ plan_id, task_id, version }`
 
 ### `plan_list(status?)`

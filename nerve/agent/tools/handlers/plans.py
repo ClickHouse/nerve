@@ -33,6 +33,7 @@ from nerve.agent.tools.schemas import (
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
 from nerve.agent.tools.handlers.tasks import task_update_handler
 from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
+from nerve.tasks.escalation import _is_quiet_hour
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +68,20 @@ async def _notify_plan_ready(
     """Tell the user that a plan waits for review. Returns True when sent.
 
     The notification stores the plan id and the task id, so the web UI and
-    Telegram can open the plan from it.
+    Telegram can open the plan from it. It replaces the task's earlier plan
+    notifications, and it makes no sound during quiet hours.
     """
     if not ctx.notification_service:
         return False
     try:
-        await ctx.notification_service.send_notification(
+        await ctx.db.dismiss_plan_notifications(task["id"], attribution=ctx.attribution)
+        service = ctx.notification_service
+        await service.send_notification(
             session_id=ctx.session_id,
             title=f"Plan ready for review: {task['title']}",
             body=f"Version {version} of plan {plan_id} waits for your decision.",
             priority="high",
+            silent=_is_quiet_hour(service.config),
             metadata={"plan_id": plan_id, "task_id": task["id"]},
         )
     except Exception:
@@ -85,7 +90,7 @@ async def _notify_plan_ready(
     return True
 
 
-def _review_summary(plan_id: str, moved: bool, notified: bool) -> str:
+def _review_summary(moved: bool, notified: bool) -> str:
     """The lines of a plan tool result that say what else happened."""
     lines = []
     if moved:
@@ -95,7 +100,6 @@ def _review_summary(plan_id: str, moved: bool, notified: bool) -> str:
             "The user got a notification with a link to the plan. "
             "Do not send another notification about this plan."
         )
-    lines.append(f"To link the plan in a message, write {plan_link(plan_id)}.")
     return "\n".join(lines)
 
 
@@ -160,7 +164,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review.\n" + _review_summary(plan_id, moved, notified)
+        "Awaiting human review.\n" + _review_summary(moved, notified)
     )
 
 
@@ -225,7 +229,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
         "The new version is pending review.\n"
-        + _review_summary(new_plan_id, moved, notified)
+        + _review_summary(moved, notified)
     )
 
 

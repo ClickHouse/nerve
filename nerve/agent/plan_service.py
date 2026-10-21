@@ -337,7 +337,8 @@ async def approve_plan(
           transition that also stores the new ``impl-<uuid>`` session id and
           the reviewer, so concurrent approvals spawn exactly one
           implementation session.
-        - Moves the task to ``in_progress`` with an audit note.
+        - Moves the task to ``in_progress`` with an audit note, and
+          dismisses the task's pending plan notifications.
         - If creating the session or updating the task fails, the plan goes
           back to ``pending`` so it can be approved again.
         - Dispatches ``engine.run()`` in the background with the build
@@ -414,6 +415,9 @@ async def approve_plan(
             impl_session_id=plan.get("impl_session_id"),
         )
         raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
 
     async def _run_impl():
         try:
@@ -466,6 +470,7 @@ async def decline_plan(
     The ``pending`` → ``declined`` transition is atomic, so it cannot
     interleave with a concurrent approve or decline. If closing the task
     fails, the plan goes back to ``pending`` so the decline can be retried.
+    The task's pending plan notifications are dismissed.
 
     Args:
         db: Database instance.
@@ -536,6 +541,9 @@ async def decline_plan(
             db, plan, "declined", feedback=plan.get("feedback"),
         )
         raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
 
     logger.info(
         "Plan declined: plan=%s task=%s", plan_id, plan["task_id"],

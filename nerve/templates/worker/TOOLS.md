@@ -22,7 +22,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 - `task_done`: moves the file to `done/` and the task's implementing plans to done
 - `task_status_list`/`task_status_create`: configured statuses; create only on request
 
-**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; link a plan as `[plan-<id>](/plans/plan-<id>)`)
+**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
 - `plan_propose`: a plan for a task; one pending plan per task; moves a `pending`, `backlog` or `in_progress` task to `plan_review` and notifies the user with a link, so send no `notify` about it
 - `plan_update`: version n+1 of your own pending plan (instead of decline and propose); moves and notifies like `plan_propose`
 - `plan_list`/`plan_read`: browse; the full plan with version and feedback

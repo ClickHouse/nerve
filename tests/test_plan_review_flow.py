@@ -235,8 +235,41 @@ class TestNotification:
         (new,) = [p for p in await db.get_plans_for_task(TASK_ID) if p["status"] == "pending"]
 
         rows = await _plan_notifications(db)
-        assert [json.loads(r["metadata"])["plan_id"] for r in rows] == [new["id"], old_id]
+        assert [(json.loads(r["metadata"])["plan_id"], r["status"]) for r in rows] == [
+            (new["id"], "pending"), (old_id, "dismissed"),
+        ]
         assert rows[0]["body"].startswith("Version 2 ")
+
+    @pytest.mark.parametrize("decision", ["approve", "decline"])
+    async def test_a_decision_dismisses_the_plan_notification(
+        self, db, tmp_path, broadcasts, decision,
+    ):
+        await _task(db, tmp_path)
+        await db.create_notification("notif-other", "s1", "notify", "Build finished")
+        plan_id, _ = await _propose(_ctx(db, tmp_path, _service(db, tmp_path)))
+        engine = FakeEngine(db)
+        tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
+
+        if decision == "approve":
+            await approve_plan(db=db, engine=engine, plan_id=plan_id, actor=None, cause=None)
+        else:
+            await decline_plan(db=db, engine=engine, plan_id=plan_id, actor=None, cause=None)
+
+        assert [r["status"] for r in await _plan_notifications(db)] == ["dismissed"]
+        assert (await db.get_notification("notif-other"))["status"] == "pending"
+
+    async def test_quiet_hours_send_it_without_sound(
+        self, db, tmp_path, broadcasts, monkeypatch,
+    ):
+        from nerve.agent.tools.handlers import plans as plans_mod
+
+        await _task(db, tmp_path)
+        service = _service(db, tmp_path)
+        sent = AsyncMock(wraps=service.send_notification)
+        monkeypatch.setattr(service, "send_notification", sent)
+        monkeypatch.setattr(plans_mod, "_is_quiet_hour", lambda config: True)
+        await _propose(_ctx(db, tmp_path, service))
+        assert sent.await_args.kwargs["silent"] is True
 
     async def test_a_silenced_notification_keeps_the_plan(self, db, tmp_path, broadcasts):
         await _task(db, tmp_path)
@@ -255,7 +288,6 @@ class TestNotification:
         plan_id, text = await _propose(_ctx(db, tmp_path))
         assert plan_id.startswith("plan-")
         assert "notification" not in text
-        assert f"write [{plan_id}](/plans/{plan_id})" in text
 
 
 @pytest.mark.asyncio
