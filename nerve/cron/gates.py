@@ -138,7 +138,14 @@ class MessagesGate(CronGate):
     empty), the gate fires when *any* source the consumer already tracks has
     unread messages — so a shared/default inbox job can be gated without
     hard-coding the particular set of connected sources. Either way the check
-    only reads cursor state; it never advances a cursor.
+    never advances a cursor.
+
+    The check does keep the cursors it reads from expiring: it renews a live
+    cursor's ``sync.consumer_cursor_ttl_days``. A cursor expires when nothing
+    reads it for that long, and an expired one starts again at the source's
+    newest message, so without this a source that stayed quiet for a few days
+    would lose its first new message to the restart, here and in the job's
+    own poll. The job reads the cursors on every check, so they stay live.
     """
 
     type = "messages"
@@ -154,6 +161,11 @@ class MessagesGate(CronGate):
         self.consumer = consumer
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
+        satisfied = await self._has_unread(ctx)
+        await self._keep_cursors_alive(ctx)
+        return satisfied
+
+    async def _has_unread(self, ctx: GateContext) -> bool:
         if self.sources:
             for source in self.sources:
                 cursor_seq = await ctx.db.get_consumer_cursor(self.consumer, source)
@@ -162,17 +174,32 @@ class MessagesGate(CronGate):
                     return True
             return False
         # No explicit sources: fire if any source the consumer tracks has
-        # unread messages. Read-only and expiry-agnostic — it never
-        # initializes or advances a cursor (unlike get_consumer_cursor) and
-        # still sees a backlog after a quiet inbox's cursors pass their TTL.
+        # unread messages. Expiry-agnostic — it never initializes or advances
+        # a cursor (unlike get_consumer_cursor) and still sees a backlog after
+        # a quiet inbox's cursors pass their TTL.
         return await ctx.db.consumer_has_unread(self.consumer)
 
+    async def _keep_cursors_alive(self, ctx: GateContext) -> None:
+        """Renew the TTL of the live cursors this gate reads (see the class).
+
+        Best effort: a failure is logged and never changes the answer.
+        """
+        try:
+            await ctx.db.keep_consumer_cursors_alive(
+                self.consumer, self.sources or None, ttl_days=_consumer_cursor_ttl_days(),
+            )
+        except Exception as e:  # noqa: BLE001 — the gate's answer stands
+            logger.warning(
+                "messages gate: could not renew the cursors of consumer %s: %s", self.consumer, e,
+            )
+
     async def forecast(self, ctx: GateContext, at: datetime) -> bool:
-        """:meth:`is_satisfied` without its one write.
+        """:meth:`is_satisfied` without its writes.
 
         With explicit ``sources``, the check starts a missing or expired cursor
         at the source's newest message, so that source has nothing unread. The
-        forecast reads the cursor instead and gives the same answer for it.
+        forecast reads the cursor instead and gives the same answer for it,
+        and it renews no cursor.
         """
         if not self.sources:
             return await ctx.db.consumer_has_unread(self.consumer)
@@ -603,6 +630,18 @@ class GitHubPrActivityGate(CronGate):
             )
         except Exception as e:  # noqa: BLE001 — non-fatal; worst case is an extra run
             logger.warning("github_pr_activity: could not persist state: %s", e)
+
+
+def _consumer_cursor_ttl_days() -> int:
+    """``sync.consumer_cursor_ttl_days`` of the loaded config, never loading
+    one; its default without a config or with an unusable value."""
+    from nerve.config import SyncConfig, loaded_config
+
+    config = loaded_config()
+    days = getattr(getattr(config, "sync", None), "consumer_cursor_ttl_days", None)
+    if isinstance(days, int) and not isinstance(days, bool) and days > 0:
+        return days
+    return SyncConfig.consumer_cursor_ttl_days
 
 
 def github_is_hosted() -> bool:

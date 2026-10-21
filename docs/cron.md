@@ -253,6 +253,13 @@ run_if:
     consumer: inbox
 ```
 
+Checking the gate keeps the consumer's cursors from expiring: each check renews
+the TTL (`sync.consumer_cursor_ttl_days`) of the live cursors it reads. A cursor
+expires when nothing reads it for that long, and an expired cursor starts again at
+the source's newest message. So without the renewal, a source that stayed quiet
+for a few days would lose its first new message to the restart. A cursor that has
+already expired still starts again at the newest message, as a new one does.
+
 > **Legacy shorthand.** The older `skip_when_idle: [<sources>]` /
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.

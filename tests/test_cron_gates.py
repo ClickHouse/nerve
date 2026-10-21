@@ -21,6 +21,7 @@ from nerve.cron.gates import (
     evaluate_gates,
 )
 from nerve.cron.jobs import CronJob
+from nerve.sources.models import SourceRecord
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +248,104 @@ class TestMessagesGate:
         })
         assert gate.sources == ["gmail", "github"]
         assert gate.consumer == "inbox"
+
+
+def _message(record_id: str, source: str = "github") -> SourceRecord:
+    return SourceRecord(
+        id=record_id, source=source, record_type="github_notification", summary=f"message {record_id}",
+        content="body", timestamp="2026-09-16T10:00:00Z", metadata={},
+    )
+
+
+async def _read_up_to_date(db, consumer: str, source: str, expires_in: timedelta) -> None:
+    """A consumer that read *source* up to its newest message, its cursor
+    expiring in *expires_in*."""
+    await db.set_consumer_cursor(consumer, source, await db.get_source_max_rowid(source))
+    await db._write(
+        "UPDATE consumer_cursors SET expires_at = ? WHERE consumer = ? AND source = ?",
+        ((datetime.now(timezone.utc) + expires_in).isoformat(), consumer, source),
+    )
+
+
+async def _expiry(db, consumer: str, source: str) -> datetime:
+    async with db.db.execute(
+        "SELECT expires_at FROM consumer_cursors WHERE consumer = ? AND source = ?", (consumer, source),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return datetime.fromisoformat(row[0])
+
+
+class _ThreeHoursLater(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(hours=3)
+
+
+@pytest.mark.asyncio
+class TestMessagesGateKeepsItsCursorsAlive:
+    async def test_a_check_renews_a_live_cursor_about_to_expire(self, db):
+        await db.insert_source_messages([_message("1")], "github")
+        await _read_up_to_date(db, "inbox", "github", timedelta(hours=1))
+
+        assert await MessagesGate(sources=["github"]).is_satisfied(_ctx(db)) is False
+
+        assert await _expiry(db, "inbox", "github") > datetime.now(timezone.utc) + timedelta(days=1)
+
+    async def test_a_quiet_spell_does_not_cost_the_first_new_message(self, db, monkeypatch):
+        """The job's gate is checked while its cursor has an hour left, and the
+        next record arrives three hours later. Had the cursor expired, the gate
+        would start it again at that record and never report it."""
+        gate = MessagesGate(sources=["github"])
+        await db.insert_source_messages([_message("1")], "github")
+        await _read_up_to_date(db, "inbox", "github", timedelta(hours=1))
+        assert await gate.is_satisfied(_ctx(db)) is False
+
+        monkeypatch.setattr("nerve.db.sources.datetime", _ThreeHoursLater)
+        await db.insert_source_messages([_message("2")], "github")
+
+        assert await gate.is_satisfied(_ctx(db)) is True
+
+    async def test_a_check_without_sources_renews_the_consumers_cursors_only(self, db):
+        for source in ("github", "gmail"):
+            await db.insert_source_messages([_message("1", source)], source)
+            await _read_up_to_date(db, "inbox", source, timedelta(hours=1))
+        await _read_up_to_date(db, "triage", "github", timedelta(hours=1))
+
+        assert await MessagesGate().is_satisfied(_ctx(db)) is False
+
+        later = datetime.now(timezone.utc) + timedelta(days=1)
+        assert await _expiry(db, "inbox", "github") > later
+        assert await _expiry(db, "inbox", "gmail") > later
+        assert await _expiry(db, "triage", "github") < later
+
+    async def test_only_a_live_cursor_past_half_its_lifetime_is_renewed(self, db):
+        await db.insert_source_messages([_message("1")], "github")
+        for consumer, expires_in in (("due", timedelta(hours=1)), ("fresh", timedelta(days=1.5)),
+                                     ("expired", timedelta(hours=-1))):
+            await _read_up_to_date(db, consumer, "github", expires_in)
+
+        renewed = [
+            await db.keep_consumer_cursors_alive(consumer, ["github"], ttl_days=2)
+            for consumer in ("due", "fresh", "expired")
+        ]
+
+        assert renewed == [1, 0, 0]
+        assert await db.peek_consumer_cursor("expired", "github") is None
+
+    async def test_the_forecast_renews_nothing(self, db):
+        await db.insert_source_messages([_message("1")], "github")
+        await _read_up_to_date(db, "inbox", "github", timedelta(hours=1))
+        before = await _expiry(db, "inbox", "github")
+
+        assert await MessagesGate(sources=["github"]).forecast(_ctx(db), datetime.now(timezone.utc)) is False
+
+        assert await _expiry(db, "inbox", "github") == before
+
+    async def test_a_failed_renewal_leaves_the_answer_alone(self):
+        db = _db(get_consumer_cursor=5, get_source_max_rowid=9)
+        db.keep_consumer_cursors_alive.side_effect = RuntimeError("database is locked")
+
+        assert await MessagesGate(sources=["gmail"]).is_satisfied(_ctx(db)) is True
 
 
 # ---------------------------------------------------------------------------

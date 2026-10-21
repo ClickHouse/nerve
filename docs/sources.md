@@ -55,7 +55,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
 - New consumer cursors initialize to the latest message (no backlog flooding)
-- Consumer cursors expire after N days of inactivity (configurable, default: 2 days)
+- Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
 ### Default Consumer: `inbox-processor`
