@@ -10,6 +10,7 @@ A frame that fails a check closes its stream.
 from __future__ import annotations
 
 import dataclasses
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -55,6 +56,14 @@ OPERATION_OUTCOMES = (
 )
 # Operations that the gateway may run again without a second provider effect.
 RETRY_SAFE_OPERATIONS = frozenset({"file_read", "typing"})
+# The event kind of a hosted source's record. It carries a ``record`` member
+# and no message.
+EVENT_KIND_SOURCE_RECORD = "source_record"
+# The subscriptions payload, and the bounds that the gateway enforces on it.
+SUBSCRIPTIONS_VERSION = "1"
+MAX_SUBSCRIPTION_SOURCES = 16
+MAX_SUBSCRIPTION_PATTERNS = 256
+MAX_SUBSCRIPTION_PATTERN_BYTES = 256
 
 
 def byte_length(value: str) -> int:
@@ -68,6 +77,19 @@ def byte_length(value: str) -> int:
 def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
     if value not in allowed:
         reject(RejectionReason.KIND_UNSUPPORTED, f"unknown {name} {value!r}")
+
+
+def valid_pattern(pattern: str) -> bool:
+    """Whether the gateway takes *pattern* in a subscription filter.
+
+    It must be non-empty, within the pattern byte limit, and free of control
+    characters.
+    """
+    return (
+        bool(pattern)
+        and byte_length(pattern) <= MAX_SUBSCRIPTION_PATTERN_BYTES
+        and not any(unicodedata.category(character) == "Cc" for character in pattern)
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -231,6 +253,39 @@ class EventDelivery:
 
 
 @_record
+class MetadataEntry:
+    """One metadata member of a source record: a string, or a list of strings."""
+
+    key: str = ""
+    value: str = omit_empty()
+    values: tuple[str, ...] = omit_empty(())
+
+
+@_record
+class SourceRecordPayload:
+    """One record of a hosted source, normalized the way the local source builds it.
+
+    ``id`` is the source's own key for the record. A changed record keeps its
+    ID, and Nerve stores it in place of the earlier copy.
+    """
+
+    id: str = ""
+    record_type: str = ""
+    summary: str = ""
+    content: str = omit_empty()
+    timestamp: datetime = ZERO_TIME
+    metadata: tuple[MetadataEntry, ...] = omit_empty(())
+
+    def validate(self) -> None:
+        if not self.id or not self.record_type or not self.summary:
+            malformed("source record has no ID, record type, or summary")
+        if max(byte_length(self.id), byte_length(self.record_type)) > MAX_IDENTIFIER_BYTES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "source record ID or type exceeds the identifier limit")
+        if max(byte_length(self.summary), byte_length(self.content)) > MAX_TEXT_BYTES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "source record text exceeds the text limit")
+
+
+@_record
 class Event:
     """One normalized provider event.
 
@@ -253,9 +308,10 @@ class Event:
     attachments: tuple[AttachmentReference, ...] = omit_empty(())
     reaction: Reaction | None = omit_empty(None)
     interaction: InteractionReference | None = omit_empty(None)
+    record: SourceRecordPayload | None = omit_empty(None)
 
     def validate(self) -> None:
-        """Check the members that intake and the hosted channel read."""
+        """Check the members that intake, the hosted channel, and the hosted sources read."""
         if not self.event_id or self.connection_id == NIL_UUID or not self.conversation.id:
             malformed("event has no event ID, connection, or conversation")
         if self.delivery is None or not self.delivery.inbox_id:
@@ -271,6 +327,10 @@ class Event:
             malformed("reaction event has no reaction")
         if self.kind == "interaction" and (self.message is None or self.interaction is None):
             malformed("interaction event has no message or interaction")
+        if self.kind == EVENT_KIND_SOURCE_RECORD:
+            if self.record is None:
+                malformed("source record event has no record")
+            self.record.validate()
 
 
 # ---------------------------------------------------------------------- #
@@ -557,6 +617,86 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
 
 
 # ---------------------------------------------------------------------- #
+#  Source subscriptions                                                   #
+# ---------------------------------------------------------------------- #
+
+
+@_record
+class SourceFilters:
+    """The guardrail patterns of one source.
+
+    They match the way Nerve's inbox filter matches: deny wins, a non-empty
+    allow list must match, globs ignore case, and a list-valued field matches
+    when any of its elements does.
+    """
+
+    allow_repos: tuple[str, ...] = omit_empty(())
+    deny_repos: tuple[str, ...] = omit_empty(())
+    allow_actors: tuple[str, ...] = omit_empty(())
+    deny_actors: tuple[str, ...] = omit_empty(())
+    allow_reasons: tuple[str, ...] = omit_empty(())
+    deny_reasons: tuple[str, ...] = omit_empty(())
+    deny_ci_branches: tuple[str, ...] = omit_empty(())
+
+    def pattern_lists(self) -> dict[str, tuple[str, ...]]:
+        """Every pattern list, by member name."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+
+
+@_record
+class SourceSubscription:
+    """What the agent takes from one provider's hosted source.
+
+    ``pr_watch`` asks for a record whenever one of the agent's own open pull
+    requests changes.
+    """
+
+    provider: str = ""
+    filters: SourceFilters = struct(SourceFilters)
+    pr_watch: bool = omit_empty(False)
+
+
+@_record
+class Subscriptions:
+    """The agent's hosted source subscriptions, sent one way to the gateway.
+
+    The gateway keeps the newest one it received for the agent, also while
+    no stream is open. No sources means that the agent subscribes to nothing.
+    """
+
+    version: str = ""
+    sources: tuple[SourceSubscription, ...] = omit_empty(())
+
+    def validate(self) -> None:
+        """Check the bounds that the gateway checks, before Nerve sends it."""
+        if self.version != SUBSCRIPTIONS_VERSION:
+            reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
+        if len(self.sources) > MAX_SUBSCRIPTION_SOURCES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "subscriptions name too many sources")
+        for source in self.sources:
+            if not source.provider:
+                malformed("source subscription has no provider")
+            for patterns in source.filters.pattern_lists().values():
+                if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
+                    reject(RejectionReason.LIMIT_EXCEEDED, "source filter has too many patterns")
+                if not all(valid_pattern(pattern) for pattern in patterns):
+                    reject(
+                        RejectionReason.LIMIT_EXCEEDED,
+                        "source filter pattern is empty, too long, or has a control character",
+                    )
+
+    def without_filters(self) -> Subscriptions:
+        """The same sources with no filter patterns.
+
+        The gateway then keeps every record of those sources, and Nerve's own
+        inbox filter is the only one that drops records.
+        """
+        return dataclasses.replace(self, sources=tuple(
+            dataclasses.replace(source, filters=SourceFilters()) for source in self.sources
+        ))
+
+
+# ---------------------------------------------------------------------- #
 #  Envelope                                                               #
 # ---------------------------------------------------------------------- #
 
@@ -578,6 +718,7 @@ class Payload:
     drain: Drain | None = omit_empty(None)
     negotiation: Negotiation | None = omit_empty(None)
     transfer: TransferChunk | None = omit_empty(None)
+    subscriptions: Subscriptions | None = omit_empty(None)
 
 
 @_record
