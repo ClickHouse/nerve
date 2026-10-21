@@ -3,7 +3,10 @@ memory_records_by_date, memorize, memory_update, memory_delete,
 category_update.
 
 All handlers read collaborators (``memory_bridge``, ``config``) from
-:class:`ToolContext`; nothing is stored at module level.
+:class:`ToolContext`; nothing is stored at module level. The bridge is memU
+or Loom (``memory.backend``); both expose the same surface, and the three
+places where memU is reached around it (a file for ``memorize``, raw SQLite
+for the two date tools) take the Loom bridge's own operations instead.
 """
 
 from __future__ import annotations
@@ -27,7 +30,8 @@ from nerve.agent.tools.schemas import (
     MEMORY_UPDATE_SCHEMA,
     SESSION_CONTEXT_SCHEMA,
 )
-from nerve.memory.memu_bridge import MemoryBackendUnavailable
+from nerve.memory.backend import MemoryBackendUnavailable
+from nerve.memory.loom_bridge import LoomBridge
 
 logger = logging.getLogger(__name__)
 
@@ -341,10 +345,17 @@ async def conversation_history_handler(ctx: ToolContext, args: dict) -> ToolResu
         return ToolResult.text("Memory service not available.")
 
     try:
-        db_path = _resolve_memu_db_path(ctx)
-        rows = await asyncio.to_thread(
-            _fetch_history_rows, db_path, date, end_date, limit,
-        )
+        if isinstance(ctx.memory_bridge, LoomBridge):
+            found = await ctx.memory_bridge.conversation_history(date, end_date, limit)
+            rows = [
+                {"id": r["id"], "memory_type": r["type"], "summary": r["summary"]}
+                for r in found
+            ]
+        else:
+            db_path = _resolve_memu_db_path(ctx)
+            rows = await asyncio.to_thread(
+                _fetch_history_rows, db_path, date, end_date, limit,
+            )
 
         if not rows:
             label = f"{date}" + (f" to {end_date}" if end_date != date else "")
@@ -370,11 +381,26 @@ async def memory_records_by_date_handler(ctx: ToolContext, args: dict) -> ToolRe
         return ToolResult.text("Memory service not available.")
 
     try:
-        db_path = _resolve_memu_db_path(ctx)
-        rows = await asyncio.to_thread(
-            _fetch_records_rows, db_path, date, end_date, limit,
-            bool(include_updated),
-        )
+        if isinstance(ctx.memory_bridge, LoomBridge):
+            found = await ctx.memory_bridge.records_by_date(
+                date, end_date, limit, bool(include_updated),
+            )
+            rows = [
+                {
+                    "id": r["id"],
+                    "memory_type": r["type"],
+                    "summary": r["summary"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                }
+                for r in found
+            ]
+        else:
+            db_path = _resolve_memu_db_path(ctx)
+            rows = await asyncio.to_thread(
+                _fetch_records_rows, db_path, date, end_date, limit,
+                bool(include_updated),
+            )
 
         if not rows:
             label = f"{date}" + (f" to {end_date}" if end_date != date else "")
@@ -402,31 +428,37 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.memory_bridge or not ctx.memory_bridge.available:
         return ToolResult.text("Memory service not available.")
 
-    # Primary write: memU (file + extraction pipeline).
-    memu_ok = False
-    memu_err: str | None = None
-    memu_down = False  # transient backend outage (distinct from a genuine failure)
+    # Primary write: the memory backend — memU through a file and its
+    # extraction pipeline, Loom as one fact stored directly.
+    stored = False
+    store_err: str | None = None
+    store_down = False  # transient backend outage (distinct from a genuine failure)
     try:
-        mem_dir = paths.nerve_path("memu-manual")
-        mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
+        if isinstance(ctx.memory_bridge, LoomBridge):
+            stored = await ctx.memory_bridge.memorize_fact(
+                content, memory_type, session_id=ctx.session_id,
+            )
+        else:
+            mem_dir = paths.nerve_path("memu-manual")
+            mem_path = mem_dir / f"memorize-{int(time.time())}.txt"
 
-        def _write_memorize_file() -> None:
-            mem_dir.mkdir(parents=True, exist_ok=True)
-            mem_path.write_text(f"{memory_type}: {content}", encoding="utf-8")
+            def _write_memorize_file() -> None:
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                mem_path.write_text(f"{memory_type}: {content}", encoding="utf-8")
 
-        await asyncio.to_thread(_write_memorize_file)
+            await asyncio.to_thread(_write_memorize_file)
 
-        memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
+            stored = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
     except MemoryBackendUnavailable as e:
-        logger.warning("Memorize (memU): backend unavailable: %s", e)
-        memu_err = str(e)
-        memu_down = True
+        logger.warning("Memorize: backend unavailable: %s", e)
+        store_err = str(e)
+        store_down = True
     except Exception as e:
-        logger.error("Memorize (memU) failed: %s", e)
-        memu_err = str(e)
+        logger.error("Memorize failed: %s", e)
+        store_err = str(e)
 
     # Optional dual-write to xmemory (async, fire-and-forget). Independent of
-    # the memU outcome and never fails the tool; inert when xmemory is
+    # the primary outcome and never fails the tool; inert when xmemory is
     # disabled. The memorization *sweep* does not go through this handler —
     # its transcripts reach xmemory only via the separate opt-in path
     # (``xmemory.index_conversations`` → XmemoryBridge.memorize_conversation).
@@ -434,17 +466,17 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if ctx.xmemory_bridge is not None and ctx.xmemory_bridge.available:
         xmem_written = await ctx.xmemory_bridge.memorize(f"{memory_type}: {content}")
 
-    if memu_ok:
+    if stored:
         suffix = " (+ xmemory)" if xmem_written else ""
         return ToolResult.text(f"Memorized: {content}{suffix}")
-    if memu_down:
+    if store_down:
         return ToolResult.text(
             "⚠️ NOT saved — MEMORY BACKEND UNAVAILABLE (transient infrastructure "
             "error — NOT a judgment on the content). The fact was NOT stored; "
-            f"retry shortly. ({memu_err})"
+            f"retry shortly. ({store_err})"
         )
-    if memu_err is not None:
-        return ToolResult.text(f"Error: {memu_err}")
+    if store_err is not None:
+        return ToolResult.text(f"Error: {store_err}")
     # memorize_file returned False without raising — pull the underlying
     # cause from bridge metrics so the agent sees an infrastructure error,
     # not an unexplained "refusal".

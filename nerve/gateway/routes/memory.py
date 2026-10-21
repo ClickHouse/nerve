@@ -1,4 +1,10 @@
-"""Memory file and memU routes."""
+"""Memory file and memory-backend routes.
+
+The ``/api/memory/memu*`` paths predate the Loom backend and keep their names.
+The snapshot reads memU's SQLite file directly, so under ``memory.backend:
+loom`` it answers "not available for this backend" with Loom's URL; the other
+routes go through the bridge and work with either backend.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +12,10 @@ import asyncio
 import json
 import logging
 import sqlite3
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
@@ -19,6 +27,8 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.memory.backend import MemoryBackendUnavailable
+from nerve.memory.loom_bridge import LoomBridge, LoomRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +137,23 @@ def _require_memu():
     return deps.engine._memory_bridge
 
 
+async def _bridge_call(work: Awaitable[Any]) -> Any:
+    """Await a bridge call, answering an outage with 503 and a refusal with 4xx.
+
+    memU's bridge methods report failure by returning False; the Loom bridge
+    raises, and an exception here would otherwise surface as a bare 500.
+    """
+    try:
+        return await work
+    except MemoryBackendUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from None
+    except LoomRequestError as e:
+        status = e.status if 400 <= e.status < 500 else 400
+        raise HTTPException(status_code=status, detail=str(e)) from None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+
 def _read_memu_snapshot_sync(db_path: str) -> str:
     """Read the full memU snapshot and JSON-encode it.
 
@@ -187,6 +214,20 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
 async def get_memu_data():
     """Get memU categories and items for the memory UI."""
     deps = get_deps()
+    bridge = getattr(deps.engine, "_memory_bridge", None) if deps.engine else None
+    if isinstance(bridge, LoomBridge):
+        # The snapshot is a read of memU's SQLite file; Loom's own dashboard
+        # is where its memory is browsed.
+        return {
+            "available": False,
+            "backend": "loom",
+            "reason": "not available for this backend",
+            "dashboard_url": bridge.dashboard_url,
+            "categories": [],
+            "items": [],
+            "resources": [],
+            "category_items": {},
+        }
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
         return {"available": False, "categories": [], "items": [], "resources": []}
 
@@ -223,7 +264,9 @@ class CategoryUpdateRequest(BaseModel):
 async def create_memu_category(req: CategoryCreateRequest):
     """Create a new memU memory category at runtime."""
     bridge = _require_memu()
-    success = await bridge.create_category(req.name, req.description, source="web_ui")
+    success = await _bridge_call(
+        bridge.create_category(req.name, req.description, source="web_ui"),
+    )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to create category")
     return {"name": req.name, "created": True}
@@ -235,13 +278,13 @@ async def update_memu_item(item_id: str, req: ItemUpdateRequest):
     bridge = _require_memu()
     if req.content is None and req.memory_type is None and req.categories is None:
         raise HTTPException(status_code=400, detail="Nothing to update")
-    success = await bridge.update_item(
+    success = await _bridge_call(bridge.update_item(
         memory_id=item_id,
         content=req.content,
         memory_type=req.memory_type,
         categories=req.categories,
         source="web_ui",
-    )
+    ))
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update item")
     return {"id": item_id, "updated": True}
@@ -251,7 +294,7 @@ async def update_memu_item(item_id: str, req: ItemUpdateRequest):
 async def delete_memu_item(item_id: str):
     """Delete a memU memory item."""
     bridge = _require_memu()
-    success = await bridge.delete_item(memory_id=item_id, source="web_ui")
+    success = await _bridge_call(bridge.delete_item(memory_id=item_id, source="web_ui"))
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete item")
     return {"id": item_id, "deleted": True}
@@ -263,10 +306,10 @@ async def update_memu_category(category_id: str, req: CategoryUpdateRequest):
     bridge = _require_memu()
     if req.summary is None and req.description is None:
         raise HTTPException(status_code=400, detail="Nothing to update")
-    success = await bridge.update_category(
+    success = await _bridge_call(bridge.update_category(
         category_id=category_id, summary=req.summary, description=req.description,
         source="web_ui",
-    )
+    ))
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update category")
     return {"id": category_id, "updated": True}
@@ -287,8 +330,11 @@ async def get_memu_audit_log(
 
 @router.get("/api/memory/memu/health")
 async def memu_health():
-    """memU memory service health and metrics."""
+    """Memory backend health and metrics; ``backend`` says which (memU or Loom)."""
     deps = get_deps()
     if not deps.engine or not deps.engine._memory_bridge:
         return {"service_available": False}
-    return await deps.engine._memory_bridge.get_health()
+    health = await deps.engine._memory_bridge.get_health()
+    if isinstance(health, dict):
+        health.setdefault("backend", "memu")
+    return health

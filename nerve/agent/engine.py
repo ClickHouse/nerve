@@ -524,7 +524,8 @@ class AgentEngine:
 
     @property
     def memory_bridge(self) -> Any | None:
-        """The memU bridge once :meth:`initialize` built it, else ``None``.
+        """The memory bridge (memU or Loom, per ``memory.backend``) once
+        :meth:`initialize` built it, else ``None``.
 
         The setup page's Mode step applies the chosen memory categories to
         the running service through it (``apply_categories``), so a browser
@@ -812,8 +813,10 @@ class AgentEngine:
         cron``) started while the gateway runs must not mark the gateway's
         live agents interrupted.
         """
-        from nerve.memory.memu_bridge import MemUBridge
-        self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
+        # memory.backend picks the bridge: memU in process (the default) or a
+        # Loom service. ``initialize`` never raises.
+        from nerve.memory.backend import create_memory_bridge
+        self._memory_bridge = create_memory_bridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
 
         # Optional xmemory.ai structured-memory layer — inert unless both a

@@ -46,7 +46,7 @@ def category_breadcrumb(name: str, description: str, summary: str) -> str:
     if not text:
         try:
             from memu.utils.references import strip_references
-        except Exception:  # pragma: no cover - defensive
+        except Exception:  # noqa: BLE001 — without memU there are no markers  # pragma: no cover
             def strip_references(t: str | None) -> str | None:
                 return t
         for raw in (summary or "").splitlines():

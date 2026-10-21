@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig
     from nerve.db import Database
+    from nerve.memory.loom_bridge import LoomBridge
     from nerve.memory.memu_bridge import MemUBridge
     from nerve.memory.xmemory_bridge import XmemoryBridge
     from nerve.notifications.service import NotificationService
@@ -54,7 +55,7 @@ class ToolContext:
     session_id: str
     workspace: "Path | None" = None
     db: "Database | None" = None
-    memory_bridge: "MemUBridge | None" = None
+    memory_bridge: "MemUBridge | LoomBridge | None" = None
     xmemory_bridge: "XmemoryBridge | None" = None
     config: "NerveConfig | None" = None
     skill_manager: "SkillManager | None" = None

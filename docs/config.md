@@ -285,7 +285,7 @@ reload cannot inspect, and are documented here only.
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
-| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
+| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with, and `memory.backend` picks which memory bridge is built at all |
 | `anthropic_base_url` | memU builds its model clients once at startup. New sessions and the other direct calls would follow a reload and memory would not, so they would use different endpoints |
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
@@ -645,7 +645,8 @@ feature depending on it breaks on the next restart. Supply each one as `${ENV_VA
 referenced from `settings.yaml` before you lock the box. The usual ones:
 `auth.jwt_secret`, `auth.password_hash`, `telegram.bot_token`,
 `slack.bot_token`/`slack.app_token`,
-`anthropic_api_key`/`openai_api_key`, `xmemory.api_key`.
+`anthropic_api_key`/`openai_api_key`, `xmemory.api_key`, `memory.loom.token`
+(or let it fall back to `LOOM_API_KEY`).
 
 `auth.jwt_secret` is optional. A locked instance without it generates a signing
 secret on its first start and keeps it in `nerve.db`, which is machine-local
@@ -1714,7 +1715,19 @@ the channel transport, matching messages are written to a local buffer.
 |-----|------|---------|-------------|
 | `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency |
 
-## Memory (memU)
+## Memory
+
+The memory tools (`memory_recall`, `memorize`, `conversation_history`, and the
+rest) are served by one backend, chosen with `memory.backend`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.backend` | string | `memu` | `memu` runs memU inside the Nerve process (the keys in the next table). `loom` uses a Loom memory service over HTTP (see [Loom memory backend](#loom-memory-backend)). Any other value refuses to load. Unset, the `NERVE_MEMORY_BACKEND` environment variable decides. Restart-only. |
+
+`memory.fast_model` is read whatever the backend: source condensation and IMAP
+vision use it too.
+
+### memU (default)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -1724,7 +1737,117 @@ the channel transport, matching messages are written to a local buffer.
 | `memory.embed_model` | string | *(empty)* | Embedding model (only used when `openai_api_key` is set, e.g. `text-embedding-3-small`) |
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
-| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
+| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). With the Loom backend they are registered as Loom categories. |
+
+### Loom memory backend
+
+With `memory.backend: loom`, memory lives in a Loom memory service and Nerve talks to
+it over HTTP (every operation is `POST /v1/<operation>`).
+The tools keep their names, arguments and output; nothing is loaded into the Nerve
+process, so startup does not wait on a vector preload.
+
+| Key | Type | Default | Environment | Description |
+|-----|------|---------|-------------|-------------|
+| `memory.loom.base_url` | string | `http://localhost:7777` | `LOOM_BASE_URL` | Loom's URL. A trailing `/` or `/v1` is dropped; credentials, a query or a fragment refuse to load (the URL is logged and shown on the Diagnostics page). |
+| `memory.loom.token` | string | *(empty)* | `LOOM_API_KEY` | Bearer token for Loom. Secret: put it in `config.local.yaml` or reference the environment, never in the tracked file. Empty sends no `Authorization` header (a Loom running with auth off). |
+| `memory.loom.org` | string | *(the token's org)* | `LOOM_ORG` | The Loom org every request names. |
+| `memory.loom.namespace` | string | *(the token's home namespace)* | `LOOM_NAMESPACE` | The namespace memories are written to and dated reads are scoped to. Recall also reads every namespace the token can (Loom's `all_mine`). |
+| `memory.loom.agent` | string | `nerve` | `NERVE_AGENT_ID` | The `agent` every write is attributed to. Authorship only: reads cover every agent of a namespace. |
+| `memory.loom.timeout_s` | float | `5` | | Seconds a read may take. Writes get three times this, conversation extraction six times (15 s and 30 s by default). Must be positive. |
+| `memory.loom.verify_tls` | bool | `true` | | Verify Loom's TLS certificate (`https` only). |
+
+**Environment variables.** Each key in the *Environment* column falls back to that
+variable when no config layer sets it (or sets it blank); a value in any file wins.
+So an instance whose platform provides the variables (a container, a provisioned VM)
+needs no memory settings in a file at all, and a tracked `settings.yaml` can still
+override them. The same holds for `memory.backend` and `NERVE_MEMORY_BACKEND`. These
+variables survive lockdown, which reads no machine-local file.
+
+**Which org and namespace.** Loom answers only requests that name both, so the bridge
+settles them once per process, in this order, and sends them explicitly with every
+operation:
+
+1. `memory.loom.org` and `memory.loom.namespace` (or `LOOM_ORG` and `LOOM_NAMESPACE`),
+   when both are set. Either one alone is kept and the other is looked up.
+2. Loom's `GET /v1/whoami` for the configured token: its `org`, and the first of its
+   `namespaces` as the home namespace. For an agent token issued by a Loom trust, the
+   first namespace is the agent's own.
+3. The token's own claims (`org`, `namespaces`), read without verification, when the
+   token is a JWT.
+
+When none of them yields both, every memory call fails as "backend unavailable" with a
+message naming each step and why it came up empty; the Diagnostics page shows the same
+text. A failed lookup is retried after 30 seconds, and a resolved identity is looked up
+again after Loom refuses the credential (HTTP 401/403), once, before that counts as an
+outage. Nothing assumes how namespaces are named. In a config repo shared by several
+agents, leave `memory.loom.namespace` and `memory.loom.agent` unset (or `${VAR}`
+references) so each box resolves its own.
+
+**How the tools map.** `memorize` stores one fact with `memory.set`: Loom type
+`semantic` (`procedural` for `behavior`), tags `nerve` and `nerve:<type>`, the session
+id, and for an `event` a `valid_at` of the time it is saved. `memory_recall`,
+`session_context` and the startup recall use `memory.search` (`recipe: fast`, no model
+call) plus `namespace.search_categories`, and print the same `[type] (id:…)` lines and
+`cat:<id>` breadcrumbs as memU, within the same size budgets; a search Loom abstains
+on is "No relevant memories found". The indexing sweep queues each session window with
+`memory.set_from_messages` (`defer: true`, at most 400 messages per call, every fact
+tagged `source:nerve`), and Loom extracts the facts in the background. `memory_update`,
+`memory_delete` and `category_update` use `memory.update_by_id` (against the content
+hash it just read), `memory.assign_category`, `memory.delete` and
+`namespace.register_category`. An `id` in tool output is the Loom memory key,
+qualified as `<namespace>/<key>` for a row outside the home namespace; the tools also
+accept a Loom memory id (a UUID).
+
+**Failures.** An unreachable Loom, a timeout, HTTP 5xx or 429, or a refused credential
+fails the call as "backend unavailable" after up to three attempts (only requests Loom
+cannot have acted on, or idempotent ones, are resent): `memory_recall` then says memory
+is DOWN rather than empty, `memorize` says the fact was not saved, and the sweep keeps
+its watermark, so the window is offered again on the next pass. After an unreachable
+Loom, calls fail at once for 15 seconds instead of each waiting out the timeouts.
+Nerve starts normally while Loom is down.
+
+**What differs from memU.**
+
+- The memory type (`profile`, `event`, `knowledge`, `behavior`) is the `nerve:<type>`
+  tag; Loom's own type only decides how a row is searched. Facts Loom extracted from
+  conversations carry Loom's types (`semantic`, `preference`, …).
+- `conversation_history` lists the rows of the home namespace that carry a `valid_at`
+  in the range: Loom dates each extracted fact by the turn it came from, or by the date
+  it names.
+- `memory_records_by_date` lists the home namespace's rows newest first by
+  `created_at`, scanning at most 2,500 of them. Loom cannot sort by `updated_at`, so
+  `updated: true` marks only rows inside that scan; a row created before it and edited
+  in the range is not found. Both date tools read Nerve's rows (tags `nerve` and
+  `source:nerve`) in the home namespace only, never a namespace attached later.
+- `memory_expand_category` lists the rows tagged with the category's name, which is
+  how Loom's extractor files facts into registered categories (`memory_update` adds
+  the tag too).
+- Loom returns only the first 280 characters of a category summary, so a
+  `category_update` that changes only the description of a category with a longer
+  summary is refused; pass the summary as well.
+- The Memory page's snapshot reads memU's database, so it shows "not available for
+  this backend" with a link to Loom, whose own dashboard browses the memory. The
+  Diagnostics page shows Loom's health and counts.
+- `memory.recall_model`, `memorize_model`, `embed_model`, `sqlite_dsn`,
+  `semantic_dedup_threshold` and `knowledge_filter` are memU's and have no effect.
+
+Two common setups:
+
+```yaml
+# workspace/config/settings.yaml — a local Loom with a token from the environment
+memory:
+  backend: loom
+  loom:
+    base_url: http://localhost:7777
+    token: ${LOOM_API_KEY}
+```
+
+```sh
+# a provisioned instance: nothing in any file
+NERVE_MEMORY_BACKEND=loom
+LOOM_BASE_URL=https://loom.example.test
+LOOM_API_KEY=...
+```
 
 ## xmemory (optional, alongside memU)
 
