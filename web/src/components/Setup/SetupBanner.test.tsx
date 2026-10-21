@@ -1,13 +1,16 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { Link, MemoryRouter } from 'react-router-dom';
+import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../api/client', async () => {
   const actual = await vi.importActual<typeof import('../../api/client')>('../../api/client');
   return {
     ...actual,
-    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn(), setupState: vi.fn() },
+    api: {
+      authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn(), setupState: vi.fn(),
+      setupFinish: vi.fn(),
+    },
     setUnauthorizedHandler: vi.fn(),
   };
 });
@@ -176,5 +179,75 @@ describe('SetupBanner while the onboarding conversation waits', () => {
       expect(screen.queryByRole('status')).not.toBeInTheDocument();
       view.unmount();
     }
+  });
+});
+
+describe('SetupBanner when setup is complete and the conversation has not started', () => {
+  const withMode = (detail: Record<string, unknown>, overrides = {}) => makeState({
+    finished: true, steps_left: 0,
+    steps: [step('mode', { status: 'done' }, {
+      mode: 'personal', onboarding: 'pending', onboarding_session_id: null, ...detail,
+    })],
+    ...overrides,
+  });
+
+  function ChatProbe() {
+    return <p>chat page {useParams().sessionId}</p>;
+  }
+
+  function renderRoutes(path = '/tasks') {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/chat/:sessionId" element={<ChatProbe />} />
+          <Route path="*" element={<p>other page</p>} />
+        </Routes>
+        <SetupBanner />
+      </MemoryRouter>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('starts the conversation once, without Finish, and opens it', async () => {
+    const running = withMode({ onboarding: 'running', onboarding_session_id: 'onboarding-9' });
+    vi.mocked(api.setupFinish).mockResolvedValue({
+      state: running, action: 'reloaded', onboarding: { status: 'running', session_id: 'onboarding-9' },
+    });
+    vi.mocked(api.setupState).mockResolvedValue(running);
+    useSetupStore.setState({ state: withMode({}) });
+    renderRoutes();
+    await userEvent.click(screen.getByRole('button', { name: /ready for its onboarding conversation · Start/ }));
+    expect(await screen.findByText('chat page onboarding-9')).toBeInTheDocument();
+    expect(api.setupFinish).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('waits for the steps first, and is not offered to a worker that sets itself up', () => {
+    useSetupStore.setState({ state: withMode({}, { finished: false, steps_left: 2 }) });
+    let view = renderRoutes();
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('2 steps left');
+    view.unmount();
+
+    useSetupStore.setState({ state: withMode({ onboarding_kind: 'autonomous' }) });
+    view = renderRoutes();
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('only links to the session while a worker sets itself up', () => {
+    useSetupStore.setState({ state: withMode({
+      mode: 'worker', onboarding: 'running', onboarding_session_id: 'onboarding-2', onboarding_kind: 'autonomous',
+    }) });
+    vi.mocked(api.setupState).mockImplementation(async () => useSetupStore.getState().state!);
+    renderRoutes();
+    const link = screen.getByRole('status');
+    expect(link).toHaveTextContent('Your worker is setting itself up from its task description · Open');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-2');
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
   });
 });

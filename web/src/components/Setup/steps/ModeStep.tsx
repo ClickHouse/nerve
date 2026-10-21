@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type SetupMode, type SetupModeDetail, type SetupStep } from '../../../api/client';
-import { useSetupStore } from '../../../stores/setupStore';
+import { onboardingCanStart, useSetupStore } from '../../../stores/setupStore';
 import { Badge, TextArea } from '../../ui';
 import { ChoiceCards } from '../ChoiceCards';
 import {
-  MODE_CARDS, ONBOARDING_OPEN, ONBOARDING_SENTENCES, STEP_HEADINGS, WORKER_NOTE_HELP, WORKER_NOTE_LABEL,
+  MODE_CARDS, ONBOARDING_OPEN, ONBOARDING_OPEN_SESSION, STEP_HEADINGS, WORKER_NOTE_HELP, WORKER_NOTE_LABEL,
+  onboardingSentence,
 } from '../copy';
 import { Field } from '../Field';
 import { Notice } from '../Notice';
@@ -29,6 +30,7 @@ export function ModeStep({ step }: { step: SetupStep }) {
   const detail = step.detail as SetupModeDetail;
   const save = useSetupStore((s) => s.save);
   const fieldError = useSetupStore((s) => s.fieldError);
+  const canStart = useSetupStore((s) => onboardingCanStart(s.state));
   const [initialMode] = useState<SetupMode | null>(
     () => detail.mode ?? (step.status === 'pending' ? 'personal' : null),
   );
@@ -58,6 +60,7 @@ export function ModeStep({ step }: { step: SetupStep }) {
 
   const onboarding = detail.onboarding;
   const sessionId = detail.onboarding_session_id;
+  const kind = detail.onboarding_kind ?? 'conversation';
 
   return (
     <StepFrame
@@ -104,12 +107,12 @@ export function ModeStep({ step }: { step: SetupStep }) {
           link carries the id. */}
       {chosen && onboarding !== 'not_applicable' && (
         <p className="text-xs text-text-dim" role="status">
-          {ONBOARDING_SENTENCES[onboarding]}
+          {onboardingSentence(onboarding, kind, canStart)}
           {onboarding === 'running' && sessionId && (
             <>
               {' '}
               <Link to={`/chat/${sessionId}`} className="underline underline-offset-2 hover:text-text">
-                {ONBOARDING_OPEN}
+                {kind === 'autonomous' ? ONBOARDING_OPEN_SESSION : ONBOARDING_OPEN}
               </Link>
             </>
           )}

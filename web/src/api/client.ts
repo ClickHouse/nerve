@@ -85,6 +85,11 @@ export interface SetupClaimDetail {
  * or `skipped`. `not_applicable` before a mode is chosen.
  */
 export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' | 'skipped';
+/**
+ * How the agent is set up: in a web chat with a person, or, for a worker set
+ * up with `nerve init` and a task description, in one session without a person.
+ */
+export type SetupOnboardingKind = 'conversation' | 'autonomous';
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -92,6 +97,8 @@ export interface SetupModeDetail {
   task_present: boolean;
   onboarding: SetupOnboarding;
   onboarding_session_id: string | null;
+  /** Absent from an older backend: `conversation`. */
+  onboarding_kind?: SetupOnboardingKind;
 }
 
 export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';

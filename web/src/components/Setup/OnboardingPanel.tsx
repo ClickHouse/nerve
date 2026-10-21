@@ -1,24 +1,28 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { SetupState } from '../../api/client';
-import { onboardingOf, useSetupStore } from '../../stores/setupStore';
+import { onboardingCanStart, onboardingOf, useSetupStore } from '../../stores/setupStore';
 import { Button } from '../ui';
 import { MessageSquare } from '../ui/icons';
 import {
-  ONBOARDING_OPEN, ONBOARDING_SENTENCES, ONBOARDING_SKIP, ONBOARDING_SKIP_CONFIRM, ONBOARDING_SKIP_KEEP,
+  ONBOARDING_OPEN, ONBOARDING_OPEN_SESSION, ONBOARDING_SKIP, ONBOARDING_SKIP_CONFIRM, ONBOARDING_SKIP_KEEP,
+  ONBOARDING_START, onboardingSentence,
 } from './copy';
 
 /**
- * The onboarding conversation on the setup page, while it is pending or
- * waits for the person: a way into it, and **Skip onboarding** behind a
- * confirmation. A skip keeps the session; it only stops the reminders.
+ * The onboarding on the setup page, while it is pending or runs: a way into
+ * it (**Start the conversation** once setup is complete), and **Skip
+ * onboarding** behind a confirmation. A skip keeps the session; it only
+ * stops the reminders.
  */
 export function OnboardingPanel({ state }: { state: SetupState }) {
   const navigate = useNavigate();
   const skip = useSetupStore((s) => s.skipOnboarding);
+  const startOnboarding = useSetupStore((s) => s.startOnboarding);
   const busy = useSetupStore((s) => s.busy);
   const [confirming, setConfirming] = useState(false);
-  const { status, sessionId } = onboardingOf(state);
+  const { status, sessionId, kind } = onboardingOf(state);
+  const canStart = onboardingCanStart(state);
   if (status !== 'pending' && status !== 'running') return null;
 
   return (
@@ -28,7 +32,7 @@ export function OnboardingPanel({ state }: { state: SetupState }) {
     >
       <p className="flex items-start gap-2 text-sm text-text">
         <MessageSquare size={16} className="mt-0.5 shrink-0 text-accent" />
-        {ONBOARDING_SENTENCES[status]}
+        {onboardingSentence(status, kind, canStart)}
       </p>
       {confirming ? (
         <div className="flex flex-col gap-2">
@@ -52,7 +56,20 @@ export function OnboardingPanel({ state }: { state: SetupState }) {
         <div className="flex flex-wrap gap-2">
           {status === 'running' && sessionId && (
             <Button variant="primary" size="sm" onClick={() => navigate(`/chat/${sessionId}`)}>
-              {ONBOARDING_OPEN}
+              {kind === 'autonomous' ? ONBOARDING_OPEN_SESSION : ONBOARDING_OPEN}
+            </Button>
+          )}
+          {canStart && (
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={busy !== null}
+              onClick={async () => {
+                const id = await startOnboarding();
+                if (id) navigate(`/chat/${id}`);
+              }}
+            >
+              {ONBOARDING_START}
             </Button>
           )}
           <Button variant="secondary" size="sm" onClick={() => setConfirming(true)}>

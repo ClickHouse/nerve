@@ -1,4 +1,4 @@
-import type { SetupMode, SetupOnboarding, SetupStepId } from '../../api/client';
+import type { SetupMode, SetupOnboarding, SetupOnboardingKind, SetupStepId } from '../../api/client';
 import type { ManagedSource } from './credentialSource';
 
 /**
@@ -489,7 +489,21 @@ export const ONBOARDING_SENTENCES: Record<SetupOnboarding, string> = {
   done: 'Onboarding is done.',
   skipped: 'Onboarding was skipped.',
 };
+/** A worker that sets itself up without a person, after `nerve init`. */
+export const ONBOARDING_AUTONOMOUS = 'Your worker is setting itself up from its task description.';
+/**
+ * The onboarding in one sentence. `canStart`: setup is complete, so a
+ * pending conversation can start now.
+ */
+export function onboardingSentence(status: SetupOnboarding, kind: SetupOnboardingKind, canStart: boolean): string {
+  if (kind === 'autonomous' && status === 'pending') return 'Your worker sets itself up from its task description when Nerve starts.';
+  if (kind === 'autonomous' && status === 'running') return ONBOARDING_AUTONOMOUS;
+  if (status === 'pending' && canStart) return 'Your agent is ready for its onboarding conversation.';
+  return ONBOARDING_SENTENCES[status];
+}
 export const ONBOARDING_OPEN = 'Continue the conversation';
+/** The link to the session of a worker that sets itself up. */
+export const ONBOARDING_OPEN_SESSION = 'Open the session';
 export const ONBOARDING_START = 'Start the conversation';
 export const ONBOARDING_SKIP = 'Skip onboarding';
 export const ONBOARDING_SKIP_CONFIRM =
@@ -502,3 +516,7 @@ export const READY_ONBOARDING =
 export const READY_ONBOARDING_AFTER_RESTART = 'The first conversation with your agent opens after the restart.';
 /** The banner while the conversation waits, on every page but the conversation. */
 export const BANNER_ONBOARDING = 'Your agent waits for you in its onboarding conversation';
+/** The banner when setup is complete and the conversation has not started. */
+export const BANNER_ONBOARDING_START = 'Your agent is ready for its onboarding conversation';
+/** The banner while a worker sets itself up without a person. */
+export const BANNER_ONBOARDING_AUTONOMOUS = 'Your worker is setting itself up from its task description';

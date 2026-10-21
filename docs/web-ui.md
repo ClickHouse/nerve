@@ -222,11 +222,15 @@ needed first, a line that it opens after the restart; when onboarding is over,
 **Say hello** with a suggested first message, or **Open chat** for a worker),
 a pairing card when a live Telegram bot has nobody paired yet, and "Open the
 setup page". The setup Overview shows `OnboardingPanel` while onboarding is
-pending or waits: the way into the conversation and **Skip onboarding**
-behind an inline confirmation. `SetupBanner` shows the onboarding reminder
-first: on every page except the onboarding chat, to every signed-in person,
-with **Continue**; its close button hides it until the next page, and it
-reads the setup state again on each page change while it shows.
+pending or waits: the way into the conversation (**Start the conversation**
+once setup is complete) and **Skip onboarding** behind an inline
+confirmation. `SetupBanner` shows the onboarding reminder first: on every
+page except the onboarding chat, to every signed-in person, with **Continue**;
+when setup is complete and the conversation has not started, with **Start**,
+which calls `POST /api/setup/finish` and opens the conversation; while a
+worker sets itself up without a person, with **Open**, a link to that
+session. Its close button hides it until the next page, and it reads the
+setup state again on each page change while a session runs.
 
 **RestartOverlay** covers the page while the daemon restarts and is never a
 trap: "Restarting Nerve… (12 s)" with **Not now** after ten seconds; for an

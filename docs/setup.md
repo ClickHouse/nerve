@@ -310,16 +310,20 @@ session id), done or skipped, and the kind: the conversation, or the
 [autonomous onboarding](#a-worker-set-up-without-the-browser). A worker
 onboarded by an earlier version (the `TASK.md` marker is gone) counts as done.
 An install from before the onboarding state that still has its marker, and a
-personal install from before, count as pending. Nothing opens without a model
-credential. When the agent's first turn fails (a model error), onboarding goes
-back to pending, and the next Finish or daemon start opens a new conversation.
-Until onboarding is done or skipped:
+personal install from before, count as pending: the banner offers them the
+conversation once setup is complete. Nothing opens without a model credential.
+When the agent's first turn fails (a model error), onboarding goes back to
+pending, and the next Finish or daemon start opens a new conversation. Until
+onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits
   for you, with **Continue**; its close button hides it until the next page.
-  Every signed-in person sees it, because the conversation sets up the shared
-  agent and anyone who can use setup can continue or skip it;
+  When setup is complete and the conversation has not started (nobody pressed
+  Finish, or an install from before), the banner offers **Start**, which does
+  what Finish does and opens the conversation. Every signed-in person sees
+  it, because the conversation sets up the shared agent and anyone who can use
+  setup can continue or skip it;
 - the setup page shows the conversation and **Skip onboarding**, behind a
   confirmation. A skip keeps the session and ends the reminders.
 
@@ -338,7 +342,8 @@ runs it again. Finish on the setup page opens the conversation instead, while
 the session has not started.
 
 With an empty task description, the worker waits for its onboarding
-conversation in the web UI.
+conversation in the web UI: open the web UI after the first start, and the
+banner leads you to it.
 
 ### Coming back later
 

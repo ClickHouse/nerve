@@ -10,8 +10,9 @@ import { onboardingOf, useSetupStore } from '../../stores/setupStore';
 import { Button } from '../ui';
 import { Check, PartyPopper } from '../ui/icons';
 import {
-  MANAGED_SOURCE_SHORT, ONBOARDING_START, PROVIDER_LAST_TEST_FAILED, READY_ONBOARDING,
-  READY_ONBOARDING_AFTER_RESTART, READY_STEPS_LEFT, READY_TELEGRAM_SYNC_LINK, READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
+  MANAGED_SOURCE_SHORT, ONBOARDING_AUTONOMOUS, ONBOARDING_OPEN_SESSION, ONBOARDING_START, PROVIDER_LAST_TEST_FAILED,
+  READY_ONBOARDING, READY_ONBOARDING_AFTER_RESTART, READY_STEPS_LEFT, READY_TELEGRAM_SYNC_LINK,
+  READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
 } from './copy';
 import { providerManaged, secretManaged } from './credentialSource';
 import { stepOf, stopPath } from './navigation';
@@ -23,11 +24,12 @@ import { personNameFor } from './personName';
  * onboarding conversation, where the agent asks what the person wants it to
  * do and sets itself up. The conversation is the primary action while it
  * waits; when a restart comes first, the screen says it opens after the
- * restart. Without onboarding (done, skipped, or an older backend) a
- * personal install offers **Say hello**, which opens the chat with a
- * suggested first message, and a worker offers **Open chat**. The heading
- * takes focus on arrival: the Review's button is gone, and the overlay that
- * may have covered it has closed.
+ * restart. A worker that sets itself up without a person (after `nerve
+ * init`) links to that session instead. Without onboarding (done, skipped,
+ * or an older backend) a personal install offers **Say hello**, which opens
+ * the chat with a suggested first message, and a worker offers **Open
+ * chat**. The heading takes focus on arrival: the Review's button is gone,
+ * and the overlay that may have covered it has closed.
  */
 export function ReadyScreen({ state }: { state: SetupState }) {
   const navigate = useNavigate();
@@ -60,6 +62,7 @@ export function ReadyScreen({ state }: { state: SetupState }) {
   // finish() answers with the checklist read after it opened the conversation.
   const onboarding = onboardingOf(state);
   const conversation = onboarding.status === 'running' ? onboarding.sessionId : null;
+  const autonomous = onboarding.kind === 'autonomous';
   const waitsForRestart = !conversation && onboarding.status === 'pending' && state.restart_pending;
 
   // What was set up, one line each. A credential the operator provided
@@ -135,9 +138,11 @@ export function ReadyScreen({ state }: { state: SetupState }) {
 
       {conversation ? (
         <div className="flex flex-col items-center gap-3">
-          <p className="text-sm text-text-muted max-w-md">{READY_ONBOARDING}</p>
+          <p className="text-sm text-text-muted max-w-md">
+            {autonomous ? ONBOARDING_AUTONOMOUS : READY_ONBOARDING}
+          </p>
           <Button variant="primary" size="md" onClick={() => navigate(`/chat/${conversation}`)} className="min-h-[44px]">
-            {ONBOARDING_START}
+            {autonomous ? ONBOARDING_OPEN_SESSION : ONBOARDING_START}
           </Button>
         </div>
       ) : waitsForRestart ? (

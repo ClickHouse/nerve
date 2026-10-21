@@ -777,6 +777,16 @@ describe('forms open on server values and send the right payload', () => {
       expect(await screen.findByText(text)).toBeInTheDocument();
       again.unmount();
     }
+
+    useSetupStore.getState().reset();
+    const running = chosen('running', 'onboarding-2');
+    const mode = running.steps.find((x) => x.id === 'mode')!;
+    current = withStep(running, { ...mode, detail: { ...mode.detail, onboarding_kind: 'autonomous' } });
+    renderAt('/setup/mode');
+    await heading('Choose a mode');
+    const autonomous = await screen.findByText(/setting itself up from its task description/);
+    expect(within(autonomous).getByRole('link', { name: 'Open the session' }))
+      .toHaveAttribute('href', '/chat/onboarding-2');
   });
 
   it('automation: a done step opens on the file exactly', async () => {
@@ -2385,6 +2395,16 @@ describe('review and the ending', () => {
       expect(await screen.findByText(`chat page onboarding-${mode}`)).toBeInTheDocument();
       view.unmount();
     }
+  });
+
+  it('links a worker that sets itself up to that session', async () => {
+    const state = withOnboarding('worker', 'running', 'onboarding-7');
+    const mode = state.steps.find((x) => x.id === 'mode')!;
+    renderReady(withStep(state, { ...mode, detail: { ...mode.detail, onboarding_kind: 'autonomous' } }));
+    expect(screen.getByText('Your worker is setting itself up from its task description.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start the conversation' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open the session' }));
+    expect(await screen.findByText('chat page onboarding-7')).toBeInTheDocument();
   });
 
   it('says the conversation opens after the restart, and offers chat once onboarding is over', () => {
