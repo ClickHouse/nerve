@@ -121,6 +121,13 @@ class CronGate(ABC):
         return await self.is_satisfied(ctx)
 
 
+def has_own_forecast(gate: CronGate | type[CronGate]) -> bool:
+    """Whether *gate*, or a gate class, defines its own :meth:`CronGate.forecast`
+    rather than keeping the default, which runs its check now."""
+    cls = gate if isinstance(gate, type) else type(gate)
+    return cls.forecast is not CronGate.forecast
+
+
 class MessagesGate(CronGate):
     """Satisfied when the sync sources feeding a consumer have unread messages.
 

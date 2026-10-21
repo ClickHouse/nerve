@@ -165,6 +165,51 @@ async def test_forecast_gates_fails_open_and_says_so(caplog):
     assert any("flaky" in r.getMessage() for r in caplog.records)
 
 
+_PLUGIN = '''
+from nerve.cron.gates import CronGate
+
+
+class {name}(CronGate):
+    type = "{type}"
+
+    async def is_satisfied(self, ctx):
+        return True
+{forecast}
+    def describe(self):
+        return "{type}"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls()
+'''
+
+_OWN_FORECAST = '''
+    async def forecast(self, ctx, at):
+        return True
+'''
+
+
+def test_a_plugin_gate_on_the_default_forecast_is_warned_about(
+    tmp_path, clean_registry, caplog,
+):
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    (tmp_path / "checks.py").write_text(
+        _PLUGIN.format(name="ChecksGate", type="checks_now", forecast=""),
+    )
+    (tmp_path / "forecasts.py").write_text(
+        _PLUGIN.format(name="ForecastsGate", type="forecasts", forecast=_OWN_FORECAST),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="nerve.cron.gate_plugins"):
+        assert load_gate_plugins(tmp_path) == 2
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "'checks_now'" in warnings[0]
+    assert "every schedule read" in warnings[0]
+
+
 # ---------------------------------------------------------------------------
 # The next scheduled tick
 # ---------------------------------------------------------------------------

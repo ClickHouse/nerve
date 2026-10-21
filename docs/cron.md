@@ -374,9 +374,19 @@ run_if:
 ```
 
 A gate must implement the same three methods as a built-in (`is_satisfied`,
-`describe`, `from_config`). It inherits `forecast`, which evaluates
-`is_satisfied` now; override it, as the example does, when the answer depends on
-elapsed time or the check writes anything (see [Forecasts](#forecasts)).
+`describe`, `from_config`).
+
+> **A gate that does not define `forecast` has its check run on every schedule
+> read.** The inherited `forecast` calls `is_satisfied` there and then, and
+> Nerve asks for forecasts on every Cron page load, every `nerve cron next` and
+> every `GET /api/cron/schedule` (see [Forecasts](#forecasts)). Either keep
+> `is_satisfied` free of side effects — it writes nothing (no fingerprint it
+> saves, no cursor it moves), never reaches the network, and is cheap — or
+> override `forecast`, as the example does. A check that uses up what it finds
+> would otherwise have it used up by a page load, and the run that comes later
+> would skip. Override it too when the answer depends on elapsed time. Nerve
+> logs a warning when it loads a plugin gate that keeps the inherited
+> `forecast`.
 
 **Rules** (a bad plugin never crashes the daemon — though it does cost the jobs
 that name its gate, see below):

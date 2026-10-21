@@ -50,14 +50,20 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
 * A gate gets only ``GateContext{job_id, db}`` (DB-only). A liveness/registry
   based gate is out of scope for this loader — it would need the context
   widened, a separate change.
-* A gate also answers ``forecast(ctx, at)``: what it would decide for a run at
-  ``at``, judged from what is known now. The cron service asks it to tell what
-  a job's next run will do and when the instance next has work of its own.
-  The inherited default evaluates ``is_satisfied`` now, which is right when the
-  check only reads local state. Override it when the answer changes with
-  elapsed time, like the age threshold above, or when ``is_satisfied`` writes
-  anything: a forecast must have no side effects and must not reach the
-  network.
+* **A gate that does not define ``forecast`` has its check run on every
+  schedule read, so that check must be side-effect-free.** A gate also answers
+  ``forecast(ctx, at)``: what it would decide for a run at ``at``, judged from
+  what is known now. The cron service asks it on every schedule read — each
+  Cron page load, each ``nerve cron next``, each ``GET /api/cron/schedule`` —
+  to tell what a job's next run will do and when the instance next has work of
+  its own. The inherited default simply calls ``is_satisfied`` there and then.
+  A gate that keeps it must therefore have an ``is_satisfied`` that writes
+  nothing (no fingerprint it saves, no cursor it moves), never reaches the
+  network and is cheap; otherwise a read could use up what the real check is
+  waiting for, and the run would skip. A gate whose check does any of that
+  **must override** ``forecast``, and so must one whose answer changes with
+  elapsed time, like the age threshold above. The loader logs a warning for
+  every plugin gate that keeps the default.
 * Hot-reload: ``load_gate_plugins(dir, replace=True)`` (used by
   :meth:`nerve.cron.service.CronService.reload`) re-reads the directory from
   scratch — a *new* file is registered, an *edited* file's new code replaces the
@@ -91,7 +97,7 @@ import inspect
 import logging
 from pathlib import Path
 
-from nerve.cron.gates import GATE_REGISTRY, CronGate
+from nerve.cron.gates import GATE_REGISTRY, CronGate, has_own_forecast
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +268,15 @@ def _load_file(path: Path) -> int:
             continue
         if _register(gate_type, obj, path):
             count += 1
+            if not has_own_forecast(obj):
+                logger.warning(
+                    "Cron gate plugin %s: gate %s (type %r) does not define "
+                    "forecast(), so its is_satisfied() check will run on every "
+                    "schedule read (the Cron page, nerve cron next); it must be "
+                    "side-effect-free and stay off the network, or the gate "
+                    "must override forecast()",
+                    path.name, name, gate_type,
+                )
     return count
 
 
