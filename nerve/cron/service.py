@@ -1625,6 +1625,9 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
+            if self.config.memory.backend == "loom":
+                # The built-in jobs live here too on such an install.
+                _reword_for_loom(user_jobs)
             kept, self._rejected_job_ids = _drop_reserved(user_jobs)
             return kept
 

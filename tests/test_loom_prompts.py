@@ -297,6 +297,26 @@ def test_a_system_yaml_from_before_the_switch_runs_in_loom_wording() -> None:
     assert loom_wording_of_shipped_job("memory-maintenance", "Tidy up.", "") is None
 
 
+def test_an_install_with_every_job_in_jobs_yaml_is_reworded_too(tmp_path: Path) -> None:
+    """An old install keeps its built-in jobs in jobs.yaml, with no
+    system.yaml: those are reworded for Loom as well."""
+    from types import SimpleNamespace
+
+    from nerve.cron.service import CronService
+
+    jobs = [job for job in _jobs("memu").values() if job["id"] == "memory-maintenance"]
+    (tmp_path / "jobs.yaml").write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    service = SimpleNamespace(
+        config=SimpleNamespace(
+            cron=SimpleNamespace(system_file=tmp_path / "system.yaml", jobs_file=tmp_path / "jobs.yaml"),
+            memory=SimpleNamespace(backend="loom"),
+        ),
+        _rejected_job_ids=[],
+    )
+    (loaded,) = CronService._load_merged_jobs(service)
+    assert loaded.prompt == loom_prompts.MAINTENANCE_PROMPT
+
+
 def test_nerve_init_words_the_workspace_for_the_configured_backend(tmp_path: Path) -> None:
     from nerve.setup_writer import existing_memory_backend
 
