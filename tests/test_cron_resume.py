@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from apscheduler.schedulers.base import STATE_PAUSED, STATE_STOPPED
 from apscheduler.triggers.cron import CronTrigger
 
 from nerve.agent.engine import TurnOutcome, TurnResult
@@ -833,3 +834,83 @@ async def test_a_pause_the_scheduler_notices_first_is_caught_up_too(
         assert svc.scheduler.get_job("every-ten").next_run_time > datetime.now(UTC)
     finally:
         await svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Stopping
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def stubborn_task():
+    """A task that ignores being cancelled until released (at the latest when
+    the test is over): ``(task, cancelled, release)``, where *cancelled* is set
+    once it was asked to stop."""
+    release, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def stubborn() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+
+    task = asyncio.create_task(stubborn())
+    await asyncio.sleep(0)  # under way, so that it sees a cancellation
+    yield task, cancelled, release
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_stop_starts_nothing_new_while_it_waits(held_service, stubborn_task):
+    svc = await held_service()
+    svc.scheduler.resume()
+    task, cancelled, release = stubborn_task
+    svc._catchup_tasks.add(task)
+    svc._on_clock_step = MagicMock(return_value=None)
+
+    stopping = asyncio.create_task(svc.stop())
+    await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+    # While stop() waits for the catch-up, the scheduler starts no run ...
+    assert svc.scheduler.state == STATE_PAUSED
+    # ... and a pause noticed now starts no catch-up.
+    svc._clock_sample = (real_time.time() - 3 * HOUR, real_time.monotonic())
+    svc._check_clock()
+    svc._on_clock_step.assert_not_called()
+    release.set()
+    await asyncio.wait_for(stopping, timeout=2)
+    await _wait_for(lambda: svc.scheduler.state == STATE_STOPPED)
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_wait_forever_for_a_task_that_will_not_stop(
+    held_service, stubborn_task, monkeypatch, caplog,
+):
+    monkeypatch.setattr(cron_service, "_STOP_WAIT_SECONDS", 0.1)
+    svc = await held_service()
+    task, _cancelled, _release = stubborn_task
+    svc._catchup_tasks.add(task)
+
+    with caplog.at_level(logging.WARNING, logger="nerve.cron.service"):
+        await asyncio.wait_for(svc.stop(), timeout=2)
+
+    assert "1 cron task(s) did not stop within 0.1s" in caplog.text
+    await _wait_for(lambda: not svc.scheduler.running)
+    assert not task.done()
+
+
+@pytest.mark.asyncio
+async def test_a_catch_up_still_settling_is_dropped_by_stop(held_service, monkeypatch):
+    monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", HOUR)
+    job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([job])
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("every-ten", next_run_time=resumed - timedelta(hours=1))
+    catch_up = svc._on_clock_step(paused, resumed)
+
+    await svc.stop()
+
+    assert catch_up.cancelled()
+    svc.engine.run_cron.assert_not_awaited()

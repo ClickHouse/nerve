@@ -31,6 +31,7 @@ from nerve.cron.jobs import (
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
@@ -59,6 +60,10 @@ _MISFIRE_GRACE_SECONDS = 30
 # See CronService._watch_clock.
 _CLOCK_WATCH_SECONDS = 5
 _CLOCK_STEP_SECONDS = 5
+
+# How long stop() waits for the tasks it cancels to wind down before it shuts
+# the scheduler down regardless — as long as the gateway gives its own.
+_STOP_WAIT_SECONDS = GRACEFUL_STOP_SECONDS
 
 # How long the catch-up runs after a pause wait before they start. The machine
 # is back, but its network often is not yet (Wi-Fi rejoining, DNS), and a source
@@ -385,6 +390,8 @@ class CronService:
         self._catchup_due: dict[str, int] = {}
         self._catchup_lock = asyncio.Lock()
         self._catchup_tasks: set[asyncio.Task] = set()
+        # Set when stop() begins; from then on nothing new is started.
+        self._stopping = False
 
     def _own_attribution(self) -> Attribution:
         """Attribution of a run that the instance starts itself: a scheduled
@@ -880,17 +887,32 @@ class CronService:
     async def stop(self) -> None:
         """Stop the clock watcher, the catch-ups it started, and the scheduler.
 
-        The scheduler's own shutdown cancels the runs it has in flight; a
-        catch-up after a pause is cancelled the same way.
+        Nothing new starts once this begins: the scheduler is paused first, and
+        the clock check and the catch-ups do nothing more. The watcher and the
+        catch-ups are cancelled and given ``_STOP_WAIT_SECONDS`` to wind down;
+        then the scheduler shuts down, which cancels the runs it has in flight.
+        Stopping again does nothing.
         """
+        if self._stopping:
+            return
+        self._stopping = True
+        if self.scheduler.running:
+            self.scheduler.pause()
         watcher, self._clock_watch_task = self._clock_watch_task, None
-        pending = [t for t in (watcher, *self._catchup_tasks) if t is not None]
+        pending = {t for t in (watcher, *self._catchup_tasks) if t is not None}
         for task in pending:
             task.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            _, unfinished = await asyncio.wait(pending, timeout=_STOP_WAIT_SECONDS)
+            if unfinished:
+                logger.warning(
+                    "%d cron task(s) did not stop within %gs of being cancelled; "
+                    "stopping the scheduler anyway",
+                    len(unfinished), _STOP_WAIT_SECONDS,
+                )
         self._clock_sample = None
-        self.scheduler.shutdown(wait=False)
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         logger.info("Cron service stopped")
 
     # -- Pauses of the machine -------------------------------------------------
@@ -908,14 +930,14 @@ class CronService:
 
     async def _watch_clock(self) -> None:
         """Check the clock now and every ``_CLOCK_WATCH_SECONDS`` until the
-        scheduler stops.
+        scheduler or the service stops.
 
         Prompt detection. The scheduler checks the clock too, right before it
         looks for due jobs (see :class:`_ClockCheckingScheduler`), so whichever
         of the two runs first after a pause handles it. A catch-up runs as a
         task of its own, so the watcher goes on sampling while it runs.
         """
-        while self.scheduler.running:
+        while self.scheduler.running and not self._stopping:
             try:
                 self._check_clock()
             except Exception:
@@ -951,7 +973,10 @@ class CronService:
         The watcher's check, and the scheduler's hook right before it looks for
         due jobs. Runs on the event loop and never waits: the triggers move at
         once, and the catch-up runs start as a task (see :meth:`_on_clock_step`).
+        Does nothing once the service is stopping.
         """
+        if self._stopping:
+            return
         step = self._sample_clock()
         if step is not None:
             self._on_clock_step(*step)
@@ -1075,7 +1100,7 @@ class CronService:
         """
         await asyncio.sleep(_CATCHUP_SETTLE_SECONDS)
         async with self._catchup_lock:
-            if not self.scheduler.running:
+            if self._stopping or not self.scheduler.running:
                 return  # stopped while waiting its turn
             queued, self._catchup_due = self._catchup_due, {}
             runs = {
