@@ -13,8 +13,9 @@ export type NavItem = {
    *  local mode only: hosted Nerve has no local accounts. `setup` is enabled
    *  in both modes once the setup checklist has been read and while setup is
    *  not finished; hidden while the checklist is unknown (an older backend,
-   *  or before the first read answers). When setup is finished, the footer
-   *  of the nav rail and of the phone's "More" drawer link to `/setup`. */
+   *  or before the first read answers). When setup is finished, a gear in
+   *  the nav rail footer links to `/setup`; the phone's "More" drawer keeps
+   *  the entry. */
   feature?: 'ultracode' | 'accounts' | 'setup';
 };
 

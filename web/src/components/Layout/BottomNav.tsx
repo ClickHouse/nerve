@@ -6,7 +6,7 @@ import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { Drawer, IconButton } from '../ui';
-import { MoreHorizontal, LogOut, Settings, X } from '../ui/icons';
+import { MoreHorizontal, LogOut, X } from '../ui/icons';
 import { useSetupStore } from '../../stores/setupStore';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS, PRIMARY_PATHS, visibleNavItems, type NavItem } from './navItems';
@@ -34,7 +34,6 @@ export function BottomNav() {
   // Subscribed, like NavRail: the Setup entry has to appear when the
   // checklist read answers, without waiting for another re-render.
   const setupKnown = useSetupStore(s => s.state !== null);
-  const setupFinished = useSetupStore(s => s.state?.finished === true);
   const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
@@ -43,7 +42,9 @@ export function BottomNav() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished });
+  // Setup stays in the drawer also when it is finished: the drawer is
+  // already the place for rarely used destinations.
+  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));
@@ -51,9 +52,7 @@ export function BottomNav() {
 
   // "More" counts as selected whenever the current route is one of the
   // destinations it hides, so the bar always shows where you are.
-  // A finished setup is reached from the drawer's footer, so it counts too.
-  const onFinishedSetup = setupFinished && location.pathname.startsWith('/setup');
-  const inOverflow = onFinishedSetup || overflow.some(i => location.pathname.startsWith(i.path));
+  const inOverflow = overflow.some(i => location.pathname.startsWith(i.path));
 
   const go = (path: string) => {
     navigate(path);
@@ -164,19 +163,6 @@ export function BottomNav() {
           })}
         </div>
 
-        {/* A finished setup leaves the list above; this keeps it reachable. */}
-        {setupFinished && (
-          <button
-            onClick={() => go('/setup')}
-            aria-current={onFinishedSetup ? 'page' : undefined}
-            className={`flex w-full cursor-pointer items-center gap-3 border-t border-border-subtle px-4 py-3 text-left text-sm transition-colors ${
-              onFinishedSetup ? 'bg-accent/10 text-accent' : 'text-text-muted hover:bg-surface-hover'
-            }`}
-          >
-            <Settings size={18} />
-            Setup
-          </button>
-        )}
         {!hosted && (
           <button
             onClick={logout}

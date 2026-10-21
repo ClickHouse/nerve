@@ -289,7 +289,7 @@ reasons are listed before you click. Then:
 
 The wizard is re-enterable. **Setup** sits in the navigation until setup is
 finished. After that, a gear button labelled **Setup** at the bottom of the
-navigation rail (on a phone: at the bottom of the **More** menu) opens it.
+navigation rail opens it. On a phone, **Setup** stays in the **More** menu.
 An instance that has never chosen a mode opens on the setup page: whoever
 signs in lands on `/setup` once per visit (a link straight into the wizard
 is left where it points) and is free to go anywhere else from there. A partially set-up

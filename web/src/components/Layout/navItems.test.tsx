@@ -28,9 +28,9 @@ function LocationProbe() {
 }
 
 /** Render a nav and let its feature flag and notification reads answer. */
-async function renderNav(nav: 'rail' | 'bottom', path = '/chat') {
+async function renderNav(nav: 'rail' | 'bottom') {
   render(
-    <MemoryRouter initialEntries={[path]}>
+    <MemoryRouter initialEntries={['/chat']}>
       {nav === 'rail' ? <NavRail /> : <BottomNav />}
       <LocationProbe />
     </MemoryRouter>,
@@ -108,18 +108,12 @@ describe('the Setup entry', () => {
     expect(location()).toHaveTextContent('/setup');
   });
 
-  it('moves to the footer of the phone menu once setup is finished', async () => {
+  it('stays in the phone menu once setup is finished', async () => {
     useSetupStore.setState({ state: makeState({ finished: true, steps_left: 0 }) });
     await renderNav('bottom');
     openMore();
     await userEvent.click(screen.getByRole('button', { name: 'Setup' }));
     expect(location()).toHaveTextContent('/setup');
-  });
-
-  it('marks More as current on a finished setup page', async () => {
-    useSetupStore.setState({ state: makeState({ finished: true, steps_left: 0 }) });
-    await renderNav('bottom', '/setup');
-    expect(screen.getByRole('button', { name: 'More' })).toHaveAttribute('aria-current', 'true');
   });
 
   it('shows in hosted mode too', async () => {
