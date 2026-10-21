@@ -556,7 +556,7 @@ one burst, one run.
 
 ```yaml
 cron:
-  delivery_debounce_seconds: 60   # default; 0-600, 0 runs the jobs as soon as the records are in
+  delivery_debounce_seconds: 60   # default; 0 runs the jobs as soon as the records are in, at most 600 applies
 ```
 
 Such a run goes through the job's gates, `lock` and run log like a scheduled

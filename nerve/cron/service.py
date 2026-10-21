@@ -1,6 +1,7 @@
 """Cron scheduler — APScheduler integration.
 
-Runs cron jobs and source runners on schedule.
+Runs cron jobs and source runners on schedule, and, when a hosted source
+delivers records, its runner and the jobs gated on it right away.
 """
 
 from __future__ import annotations
@@ -1949,12 +1950,16 @@ class CronService:
         self._schedule_delivery_runs(source)
 
     def _delivery_debounce(self) -> float:
-        seconds = getattr(getattr(self.config, "cron", None), "delivery_debounce_seconds", None)
-        if isinstance(seconds, int) and not isinstance(seconds, bool):
-            return float(max(seconds, 0))
-        from nerve.config import DEFAULT_DELIVERY_DEBOUNCE_SECONDS
+        """``cron.delivery_debounce_seconds``, within 0 and its maximum."""
+        from nerve.config import (
+            DEFAULT_DELIVERY_DEBOUNCE_SECONDS,
+            MAX_DELIVERY_DEBOUNCE_SECONDS,
+        )
 
-        return float(DEFAULT_DELIVERY_DEBOUNCE_SECONDS)
+        seconds = getattr(getattr(self.config, "cron", None), "delivery_debounce_seconds", None)
+        if not isinstance(seconds, int) or isinstance(seconds, bool):
+            seconds = DEFAULT_DELIVERY_DEBOUNCE_SECONDS
+        return float(min(max(seconds, 0), MAX_DELIVERY_DEBOUNCE_SECONDS))
 
     def _schedule_delivery_runs(self, source: str) -> None:
         """Give each job gated on *source* one pending delivery run."""

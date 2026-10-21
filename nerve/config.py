@@ -2306,23 +2306,20 @@ def _locked_cron_path(configured: Path, default: Path, root: Path, key: str) -> 
 
 
 DEFAULT_DELIVERY_DEBOUNCE_SECONDS = 60
-_DELIVERY_DEBOUNCE_RANGE = (0, 600)
+# The longest wait the cron service applies; a larger value is used as this,
+# and `nerve config validate` says so.
+MAX_DELIVERY_DEBOUNCE_SECONDS = 600
 
 
 def _delivery_debounce(value: object) -> int:
-    """Coerce ``cron.delivery_debounce_seconds`` into its range, with a warning."""
+    """Coerce ``cron.delivery_debounce_seconds``, holding it at or above 0."""
     seconds = _lenient_int(
         value, DEFAULT_DELIVERY_DEBOUNCE_SECONDS, label="cron.delivery_debounce_seconds",
     )
-    low, high = _DELIVERY_DEBOUNCE_RANGE
-    if low <= seconds <= high:
+    if seconds >= 0:
         return seconds
-    bounded = min(max(seconds, low), high)
-    logger.warning(
-        "cron.delivery_debounce_seconds is %r, outside %d-%d; using %d",
-        value, low, high, bounded,
-    )
-    return bounded
+    logger.warning("cron.delivery_debounce_seconds is %r, below 0; using 0", value)
+    return 0
 
 
 @dataclass
@@ -2336,8 +2333,8 @@ class CronConfig:
     gate_plugins_dir: Path = field(default_factory=lambda: paths.cron_dir() / "gates")
     # When a hosted source delivers records, the jobs gated on that source run
     # this many seconds after the first delivery of a burst, so a burst is one
-    # run. 0 runs them as soon as the records are in the inbox. Read per
-    # delivery.
+    # run. 0 runs them as soon as the records are in the inbox; at most
+    # MAX_DELIVERY_DEBOUNCE_SECONDS applies. Read per delivery.
     delivery_debounce_seconds: int = DEFAULT_DELIVERY_DEBOUNCE_SECONDS
 
     @classmethod

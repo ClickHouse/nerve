@@ -328,6 +328,7 @@ def validate_config_bundle(
         # Source runners are scheduled from the same parser as cron jobs, so a
         # typo'd sync schedule fails identically — and needs the same gate.
         _validate_source_schedules(config, result)
+        _validate_delivery_debounce(config, result)
     # Files of the bundle that were actually opened, so "it validated" can be
     # told from "it found nothing to validate".
     read = [
@@ -869,6 +870,17 @@ def _validate_source_schedules(config, result: ValidationResult) -> None:
         problem = _schedule_problem(schedule)
         if problem:
             result.errors.append(f"sync.{f.name}.schedule: {problem}")
+
+
+def _validate_delivery_debounce(config, result: ValidationResult) -> None:
+    """``cron.delivery_debounce_seconds`` above its maximum waits the maximum."""
+    seconds = config.cron.delivery_debounce_seconds
+    if isinstance(seconds, int) and seconds > cfg.MAX_DELIVERY_DEBOUNCE_SECONDS:
+        result.warnings.append(
+            f"cron.delivery_debounce_seconds: {seconds} is above the maximum of "
+            f"{cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}, so the jobs a hosted delivery "
+            f"starts wait {cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}s"
+        )
 
 
 def _job_gate_specs(job, where: str, result: ValidationResult) -> list:

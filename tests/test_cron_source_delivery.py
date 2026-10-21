@@ -307,10 +307,13 @@ class TestJobs:
 
         assert len(heard) >= 2
 
-    async def test_a_debounce_that_is_not_a_number_falls_back_to_the_default(self, svc):
-        svc.config.cron.delivery_debounce_seconds = "soon"
+    @pytest.mark.parametrize(("value", "expected"), [
+        ("soon", 60.0), (None, 60.0), (True, 60.0), (900, 600.0), (-1, 0.0), (5, 5.0),
+    ])
+    async def test_the_debounce_is_held_within_its_range(self, svc, value, expected):
+        svc.config.cron.delivery_debounce_seconds = value
 
-        assert svc._delivery_debounce() == 60.0
+        assert svc._delivery_debounce() == expected
 
 
 async def test_source_reloads_keep_the_github_mode_the_service_started_with():

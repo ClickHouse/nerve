@@ -102,12 +102,28 @@ class TestSettings:
         assert "sync.github.mode" in caplog.text
 
     @pytest.mark.parametrize(("value", "expected"), [
-        (None, 60), (0, 0), (15, 15), ("120", 120), (900, 600), (-5, 0), ("soon", 60),
+        (None, 60), (0, 0), (15, 15), ("120", 120), (900, 900), (-5, 0), ("soon", 60),
     ])
-    def test_the_delivery_debounce_is_bounded(self, value, expected):
+    def test_the_delivery_debounce_is_read_as_a_whole_number_of_seconds(self, value, expected):
         cron = {} if value is None else {"delivery_debounce_seconds": value}
 
         assert NerveConfig.from_dict({"cron": cron}).cron.delivery_debounce_seconds == expected
+
+    def test_config_validate_warns_about_a_debounce_above_the_maximum(self, tmp_path):
+        from nerve.config_validate import ValidationResult, _validate_delivery_debounce
+
+        result = ValidationResult()
+        _validate_delivery_debounce(
+            NerveConfig.from_dict({"cron": {"delivery_debounce_seconds": 900}}), result,
+        )
+        quiet = ValidationResult()
+        _validate_delivery_debounce(NerveConfig(), quiet)
+
+        assert result.warnings == [(
+            "cron.delivery_debounce_seconds: 900 is above the maximum of 600, so the jobs "
+            "a hosted delivery starts wait 600s"
+        )]
+        assert quiet.warnings == []
 
     def test_the_new_keys_are_known(self):
         merged = {
