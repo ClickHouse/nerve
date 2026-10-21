@@ -2169,12 +2169,16 @@ class SlackChannel(BaseChannel):
                 "Notification service not available.",
             )
             return
-        result = await self._notification_service.answer_latest_question(
-            answer,
-            channel="slack",
-            target=channel_id,
-            actor=user_id,
-        )
+        try:
+            result = await self._notification_service.answer_latest_question(
+                answer,
+                channel="slack",
+                target=channel_id,
+                actor=user_id,
+            )
+        except NotAcceptingTurnsError as exc:
+            await self._respond_ephemeral(channel_id, user_id, str(exc))
+            return
         await self._respond_ephemeral(
             channel_id,
             user_id,
@@ -2412,13 +2416,20 @@ class SlackChannel(BaseChannel):
         # would stop matching that record the moment somebody replied under
         # the card, and every later press would read as already answered.
         target = format_target((payload.get("channel") or {}).get("id") or "")
-        result = await self._notification_service.answer_delivered_notification(
-            notification_id,
-            answer,
-            channel="slack",
-            target=target,
-            actor=actor,
-        )
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notification_id,
+                answer,
+                channel="slack",
+                target=target,
+                actor=actor,
+            )
+        except NotAcceptingTurnsError as exc:
+            # The question stays pending, so the card keeps its buttons.
+            await self._respond_ephemeral(
+                (payload.get("channel") or {}).get("id") or "", actor, str(exc),
+            )
+            return
         if not result:
             await self._replace_via_url(
                 response_url,

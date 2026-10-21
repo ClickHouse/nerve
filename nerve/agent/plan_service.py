@@ -144,6 +144,8 @@ async def request_plan_revision(
         PlanNotFound: No plan with that ID.
         TaskNotFound: The plan's task no longer exists.
         PlanNotPending: The plan is declined/superseded/implementing/etc.
+        NotAcceptingTurnsError: The engine is draining, so the planner turn
+            would be refused. Nothing is stored.
 
     Behavior contract:
         - Stores ``feedback`` on the plan, and ``actor`` + ``cause`` as its
@@ -181,6 +183,8 @@ async def request_plan_revision(
     task = await db.get_task(plan["task_id"])
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    _require_accepting_turns(engine)
 
     # 1. Store feedback on the plan (status stays pending until planner
     #    supersedes it via plan_update). The request is a review decision,
@@ -254,6 +258,18 @@ async def request_plan_revision(
     }
 
 
+def _require_accepting_turns(engine: "AgentEngine") -> None:
+    """Raise ``NotAcceptingTurnsError`` while the engine drains.
+
+    Call it before a decision is stored: the turn that acts on the decision
+    would be refused, and the decision would be lost.
+    """
+    if not engine.accepting_turns:
+        from nerve.agent.engine import NotAcceptingTurnsError
+
+        raise NotAcceptingTurnsError()
+
+
 async def _raise_not_pending(db: "Database", plan_id: str, verb: str) -> NoReturn:
     """Raise for a plan that left ``pending`` before this caller could act on it."""
     plan = await db.get_plan(plan_id)
@@ -321,6 +337,8 @@ async def approve_plan(
         PlanNotPending: The plan is not ``pending``, including when a
             concurrent approve or decline got to it first.
         TaskNotFound: The plan's task no longer exists.
+        NotAcceptingTurnsError: The engine is draining, so the
+            implementation turn would be refused. The plan stays pending.
 
     Behavior contract:
         - Claims the plan with one atomic ``pending`` → ``implementing``
@@ -350,6 +368,8 @@ async def approve_plan(
     task = await db.get_task(plan["task_id"])
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    _require_accepting_turns(engine)
 
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
@@ -403,6 +423,8 @@ async def approve_plan(
         raise
 
     async def _run_impl():
+        from nerve.agent.engine import NotAcceptingTurnsError
+
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
@@ -411,6 +433,14 @@ async def approve_plan(
                 # though an approval started it. The session carries who
                 # approved.
                 actor=db.system_actor,
+            )
+        except NotAcceptingTurnsError:
+            # A drain started after the check above. The implementation did
+            # not start, so the plan can be approved again after the restart.
+            logger.info("Plan %s: implementation refused, Nerve is draining", plan_id)
+            await _revert_plan(
+                db, plan, "implementing",
+                impl_session_id=plan.get("impl_session_id"),
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)

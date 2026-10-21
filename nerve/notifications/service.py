@@ -540,6 +540,10 @@ class NotificationService:
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
           method; the dismiss endpoint handles those.
+
+        Raises:
+            NotAcceptingTurnsError: a question answer while the engine
+                drains. The question stays pending.
         """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
@@ -550,18 +554,7 @@ class NotificationService:
                 notif, answer, answered_by, actor, answerer=answerer,
             )
 
-        success = await self.db.answer_notification(
-            notification_id, answer, answered_by, actor=actor,
-            attribution=attribution_for(answerer),
-        )
-        if not success:
-            return False
-
         session_id = notif["session_id"]
-        answerer_id = actor_id_of(answerer)
-        attribution = {"answered_by_actor": actor} if actor else {}
-
-        from nerve.agent.streaming import broadcaster
 
         # External (satellite) sessions are MCP-driven by an outside agent
         # (Codex, Claude Code, ...). Nerve doesn't own their conversation
@@ -572,6 +565,25 @@ class NotificationService:
         is_external = bool(
             session_record and session_record.get("source") == "external"
         )
+
+        # During a drain the turn that delivers the answer is refused. Keep
+        # the question pending, so the person can answer after the restart.
+        if not is_external and not self.engine.accepting_turns:
+            from nerve.agent.engine import NotAcceptingTurnsError
+
+            raise NotAcceptingTurnsError()
+
+        success = await self.db.answer_notification(
+            notification_id, answer, answered_by, actor=actor,
+            attribution=attribution_for(answerer),
+        )
+        if not success:
+            return False
+
+        answerer_id = actor_id_of(answerer)
+        attribution = {"answered_by_actor": actor} if actor else {}
+
+        from nerve.agent.streaming import broadcaster
 
         if is_external:
             await broadcaster.broadcast("__global__", {
@@ -1492,7 +1504,12 @@ class NotificationService:
         gets an ``approval-expired`` event (approvals), the web UI gets
         a ``notification_expired`` broadcast, and the Telegram card is
         edited to show it expired. ``notify``-kind expiry stays silent.
+
+        Does nothing while the engine drains: the turn with the note would
+        be refused. The sweep after the restart expires the rows.
         """
+        if not self.engine.accepting_turns:
+            return 0
         rows = await self.db.expire_due_notifications()
         if rows:
             await self._report_expired(rows)

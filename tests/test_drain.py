@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,6 +23,7 @@ from fastapi.testclient import TestClient
 from sse_starlette.sse import AppStatus
 
 from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError, TurnOutcome, TurnResult
+from nerve.agent.plan_service import approve_plan, request_plan_revision
 from nerve.agent.streaming import broadcaster
 from nerve.channels.base import BaseChannel, ChannelCapability, InboundMessage
 from nerve.channels.router import ChannelRouter
@@ -30,7 +32,10 @@ from nerve.cron.jobs import CronJob
 from nerve.cron.service import CronService
 from nerve.gateway import server as gw
 from nerve.gateway.auth import create_session_token, pin_jwt_secret
+from nerve.notifications.service import NotificationService
 from nerve.workflows.service import WorkflowRunService
+from tests import test_plan_actions as plan_tests
+from tests.actor_rows import ensure_system_principal
 
 _MESSAGE = str(NotAcceptingTurnsError())
 
@@ -504,6 +509,154 @@ def test_rest_chat_returns_503(instance):
     )
     assert response.status_code == 503
     assert response.json() == {"detail": _MESSAGE}
+
+
+# ---------------------------------------------------------------------------
+# Decisions that a turn must deliver: refused before anything is stored
+# ---------------------------------------------------------------------------
+
+
+def _draining_engine() -> MagicMock:
+    engine = MagicMock()
+    engine.accepting_turns = False
+    engine.run = AsyncMock()
+    return engine
+
+
+@pytest.mark.asyncio
+class TestNotificationsDuringDrain:
+    async def test_a_question_answer_is_refused_and_the_question_stays_pending(self, db):
+        await ensure_system_principal(db)
+        engine = _draining_engine()
+        service = NotificationService(NerveConfig(), db, engine)
+        await db.create_session("s1", actor=None)
+        await db.create_notification("n1", "s1", "question", "Proceed?")
+
+        with pytest.raises(NotAcceptingTurnsError):
+            await service.handle_answer("n1", "yes", answered_by="web")
+
+        assert (await db.get_notification("n1"))["status"] == "pending"
+        engine.run.assert_not_called()
+
+    async def test_an_external_session_answer_starts_no_turn_and_is_stored(self, db):
+        await ensure_system_principal(db)
+        engine = _draining_engine()
+        service = NotificationService(NerveConfig(), db, engine)
+        await db.create_session("ext", source="external", actor=None)
+        await db.create_notification("n2", "ext", "question", "Proceed?")
+
+        assert await service.handle_answer("n2", "yes", answered_by="web")
+
+        assert (await db.get_notification("n2"))["status"] == "answered"
+        engine.run.assert_not_called()
+
+    async def test_expiry_waits_for_the_next_start(self, db):
+        await ensure_system_principal(db)
+        engine = _draining_engine()
+        service = NotificationService(NerveConfig(), db, engine)
+        await db.create_session("s1", actor=None)
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await db.create_notification("n3", "s1", "question", "Proceed?", expires_at=past)
+
+        assert await service.expire_stale() == 0
+
+        assert (await db.get_notification("n3"))["status"] == "pending"
+        engine.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestPlansDuringDrain:
+    async def test_approve_is_refused_and_the_plan_stays_pending(self, db, tmp_path):
+        engine, task_id = await plan_tests._setup(db, tmp_path)
+        engine.accepting_turns = False
+
+        with pytest.raises(NotAcceptingTurnsError):
+            await approve_plan(db=db, engine=engine, plan_id="plan-act", **plan_tests.BY_APPROVER)
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert plan["reviewed_by_actor_id"] is None
+        assert (await db.get_task(task_id))["status"] == "pending"
+        assert engine.sessions.calls == []
+        assert engine.runs == []
+
+    async def test_a_refused_implementation_turn_puts_the_plan_back_to_pending(
+        self, db, tmp_path,
+    ):
+        engine, _ = await plan_tests._setup(db, tmp_path)
+        refused = asyncio.Event()
+
+        async def _refuse(*_args, **_kwargs):
+            refused.set()
+            raise NotAcceptingTurnsError()
+
+        # The drain starts after the check in approve_plan.
+        engine.run = _refuse
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", **plan_tests.BY_APPROVER)
+        await asyncio.wait_for(refused.wait(), timeout=1.0)
+        await _until_async(lambda: _plan_status(db, "plan-act"), "pending")
+
+    async def test_revise_is_refused_and_stores_no_feedback(self, db, tmp_path):
+        engine, task_id = await plan_tests._setup(db, tmp_path)
+        engine.accepting_turns = False
+
+        with pytest.raises(NotAcceptingTurnsError):
+            await request_plan_revision(
+                db=db, engine=engine, plan_id="plan-act", feedback="split step two",
+                **plan_tests.BY_APPROVER,
+            )
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert not plan.get("feedback")
+        assert engine.runs == []
+
+    async def test_the_tools_tell_the_agent(self, db, tmp_path):
+        from dataclasses import replace
+
+        from nerve.agent import tools as tools_mod
+        from nerve.agent.tools.handlers.plans import plan_approve_handler, plan_revise_handler
+
+        engine, _ = await plan_tests._setup(db, tmp_path)
+        engine.accepting_turns = False
+        ctx = replace(
+            tools_mod._legacy_ctx("sess-mcp"), db=db, engine=engine,
+            actor=db.system_actor, cause=plan_tests.APPROVER,
+        )
+
+        approved = await plan_approve_handler(ctx, {"plan_id": "plan-act"})
+        revised = await plan_revise_handler(ctx, {"plan_id": "plan-act", "feedback": "x"})
+
+        assert _MESSAGE in str(approved)
+        assert _MESSAGE in str(revised)
+        assert (await db.get_plan("plan-act"))["status"] == "pending"
+
+    async def test_telegram_approve_shows_the_reason(self, db, tmp_path):
+        from nerve.channels.telegram import TelegramChannel
+
+        engine, _ = await plan_tests._setup(db, tmp_path)
+        engine.accepting_turns = False
+        channel = TelegramChannel.__new__(TelegramChannel)   # only .router is used
+        channel.router = SimpleNamespace(engine=engine)
+        query = SimpleNamespace(answer=AsyncMock(), edit_message_text=AsyncMock())
+
+        await channel._do_plan_approve(query, "plan-act")
+
+        query.answer.assert_awaited_once_with(_MESSAGE, show_alert=True)
+        assert (await db.get_plan("plan-act"))["status"] == "pending"
+
+
+async def _plan_status(db, plan_id: str) -> str:
+    return (await db.get_plan(plan_id))["status"]
+
+
+async def _until_async(read, expected, within: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while await read() != expected:
+        if loop.time() > deadline:
+            pytest.fail(f"never became {expected!r}")
+        await asyncio.sleep(0.005)
 
 
 # ---------------------------------------------------------------------------

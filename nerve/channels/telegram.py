@@ -1680,6 +1680,9 @@ class TelegramChannel(BaseChannel):
             await query.answer(str(exc), show_alert=True)
             await self._edit_plan_detail(query, plan_id)
             return
+        except NotAcceptingTurnsError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
         await query.answer("Approved — implementation started")
         impl = _html.escape(str(result.get("impl_session_id") or "?"))
         text = (
@@ -1767,7 +1770,7 @@ class TelegramChannel(BaseChannel):
         except (PlanNotFound, TaskNotFound):
             await update.message.reply_text("That plan no longer exists.")
             return
-        except (PlanNotPending, ValueError) as exc:
+        except (PlanNotPending, ValueError, NotAcceptingTurnsError) as exc:
             await update.message.reply_text(str(exc))
             return
         await update.message.reply_text(
@@ -2738,13 +2741,18 @@ class TelegramChannel(BaseChannel):
             await query.answer("Already answered or expired", show_alert=True)
             return
 
-        result = await self._notification_service.answer_delivered_notification(
-            notification_id,
-            answer,
-            channel="telegram",
-            target=str(update.effective_chat.id),
-            actor=str(query.from_user.id),
-        )
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notification_id,
+                answer,
+                channel="telegram",
+                target=str(update.effective_chat.id),
+                actor=str(query.from_user.id),
+            )
+        except NotAcceptingTurnsError as exc:
+            # The question stays pending, and the card keeps its buttons.
+            await query.answer(_fit_text(str(exc), _TOAST_MAX_LEN), show_alert=True)
+            return
 
         if result:
             status_line = f"\u2705 Answered: {answer}"
@@ -2803,12 +2811,16 @@ class TelegramChannel(BaseChannel):
 
         answer_text = " ".join(context.args)
 
-        result = await self._notification_service.answer_latest_question(
-            answer_text,
-            channel="telegram",
-            target=str(update.effective_chat.id),
-            actor=str(update.effective_user.id),
-        )
+        try:
+            result = await self._notification_service.answer_latest_question(
+                answer_text,
+                channel="telegram",
+                target=str(update.effective_chat.id),
+                actor=str(update.effective_user.id),
+            )
+        except NotAcceptingTurnsError as exc:
+            await update.message.reply_text(str(exc))
+            return
 
         if result:
             await update.message.reply_text(

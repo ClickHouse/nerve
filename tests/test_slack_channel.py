@@ -1836,6 +1836,16 @@ class TestCommandExposure:
         channel.router.list_sessions.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_reply_during_a_drain_says_nerve_is_shutting_down(self):
+        channel = self._ch()
+        channel._notification_service = MagicMock()
+        channel._notification_service.answer_latest_question = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        said = await self._run(channel, "reply yes")
+        assert said == str(NotAcceptingTurnsError())
+
+    @pytest.mark.asyncio
     async def test_reply_is_scoped_to_the_slack_conversation_and_actor(self):
         channel = self._ch()
         channel._notification_service = MagicMock()
@@ -2338,6 +2348,35 @@ class TestNotificationCardRoundTrip:
             "message": {"blocks": blocks},
         })
         return channel, blocks, posts.bodies[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_press_during_a_drain_keeps_the_card(self, monkeypatch):
+        import httpx
+
+        posts = _CapturedPosts()
+        monkeypatch.setattr(httpx, "AsyncClient", posts)
+        channel = _channel(allow_users=["U1"])
+        channel._respond_ephemeral = AsyncMock()
+        service = MagicMock()
+        service.answer_delivered_notification = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        channel._notification_service = service
+
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "notif:n1:approve", "value": "approve"}],
+            "message": {"blocks": build_notification_blocks(self.RAW, "n1", [("Approve", "approve")])},
+        })
+
+        # The card keeps its buttons. Only the person who pressed is told.
+        assert posts.bodies == []
+        channel._respond_ephemeral.assert_awaited_once_with(
+            "C1", "U1", str(NotAcceptingTurnsError()),
+        )
 
     @pytest.mark.asyncio
     async def test_the_card_text_is_carried_across_unchanged(self, monkeypatch):
