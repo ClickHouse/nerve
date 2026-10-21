@@ -150,6 +150,7 @@ Logs: nerve logs. Re-run nerve init after fixing the cause.`
 | `--terminal` | The full terminal wizard — see [The terminal wizard](#the-terminal-wizard-nerve-init---terminal) |
 | `--non-interactive` | Read everything from the environment — see [Unattended installation](#unattended-installation) |
 | `--if-needed` | Exit silently unless this is a fresh install (used by the Docker entrypoint) |
+| `--memory-backend memu\|loom` | Word the workspace templates, bundled skills and built-in jobs written now for this memory backend. Init-only: it does not set `memory.backend`, which a platform switching the instance to Loom writes into `config.local.yaml` afterwards. Without it, `nerve init` uses what an existing configuration names, else `memu`. Works with every path above |
 
 A non-TTY stdin still answers the prompts line by line; only `--yes` skips
 them. Scripted example:

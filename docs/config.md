@@ -1779,9 +1779,20 @@ instance needs.
 | `memory.loom.org` | string | *(empty)* | The Loom org Nerve's own calls name. Empty: Loom uses the org of the agent's credential. |
 | `memory.loom.namespace` | string | *(empty)* | The namespace Nerve's own calls name. Empty: Loom uses the agent's home namespace. |
 | `memory.loom.dashboard_url` | string | *(empty)* | Where people open Loom's dashboard. The Memory page and the Diagnostics card link `<dashboard_url>/memories?namespace=<home namespace>`. An `http://` or `https://` URL with a host and no credentials, query or fragment; a trailing `/` is dropped; anything else refuses to load. Empty: no link. |
+| `memory.loom.defer_extraction` | bool | `false` | Queue conversation extraction in Loom instead of waiting for it. Loom then tries a failed batch three times within about a minute and gives up, and Nerve cannot see that (Loom keeps `memory.extraction_status` off MCP): leave it off unless a lost window is acceptable. |
 
 The `memory.loom` keys are read only while Loom is the backend, never from the
-environment, and need a restart.
+environment, and need a restart. A namespace name is Loom's: lowercase letters,
+digits and hyphens, starting with a letter or digit, at most 128 characters;
+an org name has no whitespace or slash. Anything else refuses to load.
+
+**Rollout.** Switch an instance to `memory.backend: loom` only once the
+gateway's catalog lists `loom` for its agent. Until then the agent has no
+memory tools at all, and its system prompt says so instead of naming Loom's
+tools. A platform that switches the instance after its first `nerve init`
+writes `memory.backend: loom` into `config.local.yaml` (which outranks the
+tracked settings) and passes `nerve init --memory-backend loom`, so the
+workspace written at that first init is worded for Loom.
 
 **The agent uses Loom's tools.** Each catalog server reaches the agent as an
 MCP server, so Loom's tools are `mcp__loom__<tool>` (`loom_search`,
@@ -1790,12 +1801,16 @@ Loom's `core` list). Nerve's nine memory tools (`memorize`, `memory_recall`,
 `memory_update`, `memory_delete`, `conversation_history`,
 `memory_records_by_date`, `memory_expand_category`, `category_update`,
 `session_context`) are not offered: not in the prompt's tool list, not on
-Nerve's MCP server, and not to external MCP clients. The system prompt gets a
-section that names Loom's tools and explains home and shared namespaces
-(shared memories are read-only for the agent, which proposes a change instead
-of editing), write verdicts and abstentions. A workspace, its bundled skills
-and its built-in jobs set up while Loom is the backend are worded for Loom's
-tools (`nerve/memory/loom_prompts.py`). Catalog servers reach the agent only
+Nerve's MCP server, and not to external MCP clients. When the session gets the
+`loom` server, the system prompt gets a section that names Loom's tools and
+explains home and shared namespaces (shared memories are read-only for the
+agent, which proposes a change instead of editing), write verdicts and
+abstentions; when it does not, a short section says memory cannot be used.
+A workspace, its bundled skills and its built-in jobs set up while Loom is the
+backend, or by `nerve init --memory-backend loom`, are worded for Loom's
+tools (`nerve/memory/loom_prompts.py`); a `system.yaml` written for memU runs
+`memory-maintenance` and `inbox-processor` in their Loom wording as long as
+their prompts are the ones Nerve shipped. Catalog servers reach the agent only
 in external mode: with the Loom backend in local mode the agent has no memory
 tools, and Nerve says so in its log at startup.
 
@@ -1807,13 +1822,18 @@ tools, and Nerve says so in its log at startup.
 |---|---|---|
 | A new session starts | `context.pack` (`loom_context_pack`) | `mode: startup`, `only_sections: [memories]`, a section budget of 1,000 tokens, `top_k`, `include_decisions: false`, and the query `context for <source> session` |
 | The pack brought no memories | `search.query` (`loom_search`) | the same query and `top_k` |
-| A session closes or rotates, and the indexing sweep | `memory.set_from_messages` (`loom_memory_set_from_messages`) | the window's messages, in batches of at most 400 within 768 KiB, each with its time; `defer: true`; `session_id`; `extra_tags: [source:nerve]`; the day of the last message as `observation_date`; the previous batch's last ten turns as `last_messages` |
+| A session closes or rotates, and the indexing sweep | `memory.set_from_messages` (`loom_memory_set_from_messages`) | the window's messages, in batches of at most 100 within 128 KiB, each with its time; `defer: false`, so the call waits while Loom extracts (with `defer_extraction`: `defer: true`, batches of at most 400 within 768 KiB); `session_id`; `extra_tags: [source:nerve]`; the day of the last message as `observation_date`; the previous batch's last ten turns as `last_messages` |
 | Health: every five minutes, and on the Diagnostics page | `namespace.summary` (`loom_namespace_summary`) | `top_entities_limit: 0` |
 
 `memory.loom.org` and `memory.loom.namespace` are added to each call that takes
 them. The startup recall freezes at most 8 memories, 500 characters each and
 4,000 bytes in all, into the session, as memU's does. A memory of another
-namespace is shown as `<namespace>/<key>`. `tests/test_loom_contract.py` holds
+namespace is shown as `<namespace>/<key>`. Recalled text is data from whoever
+writes to the namespaces the agent reads, and it lands in the session's
+`<session-context>` block, so each memory is one line and keeps `<` and `>`
+escaped as Loom escapes them (`&lt;`, `&gt;`); the fallback search's text is
+escaped the same way. A startup call has 5 seconds; a pack the gateway's
+policy refuses gets the search as well. `tests/test_loom_contract.py` holds
 these calls, and the tools the agent is told about, to
 `tests/fixtures/loom_lifecycle_ops.json`, which
 `scripts/loom_contract_fixture.py` generates from a Loom checkout.
@@ -1829,20 +1849,30 @@ enabled for the agent, no credential), a condition that may pass (`-32002`:
 unavailable, a limit, an open circuit), a server fault, a timeout or HTTP
 429/5xx: memory is unavailable, and nothing crashes. A new session is told in
 its preamble that no memories could be recalled (not that there are none),
-and nothing is frozen into it; the sweep keeps its watermark, so the window is
-offered again. Reads are tried twice. After a call that got no answer at all,
-calls fail at once for 15 seconds; a `Retry-After` holds that operation (at
-most 60 seconds); a policy refusal makes the next call read the catalog again
-(at most every 30 seconds). A request Loom refused as invalid is logged, not
-retried. The Diagnostics card shows the last error.
+also when the backend did not start at all, and nothing is frozen into it;
+the sweep keeps its watermark, so the window is offered again. Reads are
+tried twice, and wait out a `Retry-After` of up to 2 seconds once (the
+gateway's per-agent limit sends 1); a longer one holds that operation (at
+most 60 seconds). When the gateway is not reached, or a read gets no answer
+in time, calls fail at once for 15 seconds, doubling with each such failure
+in a row up to 5 minutes: the gateway's own circuit does not count calls
+Nerve gave up on. The catalog is read at most every 30 seconds, also while
+none could be read; a policy refusal makes the next call read it again. A
+request Loom refused as invalid is logged, not retried, except a batch the
+gateway refuses as too large (HTTP 413): the byte budget of a batch halves for
+the rest of the process, down to 16 KiB, and the same messages go again. The
+Diagnostics card shows the last error.
 
-**Extraction is Loom's.** Loom extracts a queued batch in the background and
-retries it there. How a batch ended is not on MCP (Loom keeps
-`memory.extraction_status` for people and operators), so each
-`conversation_indexed` row of the memory audit log (`GET
-/api/memory/memu/audit`) names the `queue_ids` of its batches for a lookup in
-Loom's dashboard. A window is queued once per process: offered again after a
-failure, the batches Loom already took are skipped.
+**Extraction waits.** A batch is extracted while the call waits (Loom's model
+pass, typically 10 to 15 seconds, inside the gateway's two minutes), so a
+batch Loom could not extract fails the call and the sweep offers the window
+again. Each `conversation_indexed` row of the memory audit log (`GET
+/api/memory/memu/audit`) counts the batches sent and the facts Loom wrote, and
+names the `queue_ids` of any batch Loom queued instead (with
+`defer_extraction`, or when Loom defers one itself) for a lookup in Loom's
+dashboard: Loom tries a queued batch three times within about a minute, then
+gives up, and how it ended is not on MCP. A batch is sent once per process:
+offered again after a failure, the batches Loom already took are skipped.
 
 ## xmemory (optional, alongside memU)
 
