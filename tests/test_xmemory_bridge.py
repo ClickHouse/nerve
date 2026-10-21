@@ -333,7 +333,7 @@ async def test_recall_handler_combines_memu_and_xmemory() -> None:
     result = await memory_recall_handler(_ctx(memu=memu, xmem=xmem), {"query": "alice"})
     text = result.content[0]["text"]
 
-    assert "[memU]" in text
+    assert text.startswith("[memory] Recalled 1 memories")
     assert "Alice lives in Metropolis" in text
     assert "[xmemory]" in text
     assert "alice@acme.com" in text
@@ -363,7 +363,7 @@ async def test_recall_handler_preserves_memu_only_shape_when_xmemory_disabled() 
     result = await memory_recall_handler(_ctx(memu=memu, xmem=None), {"query": "x"})
     text = result.content[0]["text"]
     assert "Recalled 1 memories" in text
-    assert "[memU]" not in text  # original format, no source labels
+    assert "[memory]" not in text  # original format, no source labels
     assert "[xmemory]" not in text
 
 

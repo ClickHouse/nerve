@@ -136,12 +136,12 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(memu_block)
 
     # Both stores in play → label each source so the two are distinguishable.
-    # The label stays mode-agnostic: under raw-tables/xresponse the payload is
-    # structured rows, not a synthesized answer.
+    # The labels stay mode-agnostic (under raw-tables/xresponse the payload is
+    # structured rows, not a synthesized answer) and name no memory backend.
     memu_part = memu_block if memu_block is not None else "No relevant memories found."
     xmem_part = _clip_to_budget(xmem_answer, _MAX_XMEM_ANSWER_BYTES)
     return ToolResult.text(
-        f"[memU] {memu_part}\n\n---\n\n[xmemory]\n\n{xmem_part}"
+        f"[memory] {memu_part}\n\n---\n\n[xmemory]\n\n{xmem_part}"
     )
 
 

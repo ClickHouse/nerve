@@ -47,7 +47,9 @@ describe('DiagnosticsPage memory card with the Loom backend', () => {
     render(<DiagnosticsPage />);
 
     expect(await screen.findByText(/Conversation extraction: 2 queued in Loom, 1 failed/)).toBeInTheDocument();
-    expect(screen.getByText(/gave up on these windows after three sends/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/not extracted: the retries ran out or the window could not be re-sent/),
+    ).toBeInTheDocument();
     // No dashboard address for people: no link at all.
     expect(screen.queryByRole('link', { name: /Open dashboard/ })).not.toBeInTheDocument();
   });
@@ -61,6 +63,6 @@ describe('DiagnosticsPage memory card with the Loom backend', () => {
     const link = await screen.findByRole('link', { name: /Open dashboard/ });
     expect(link).toHaveAttribute('href', url);
     expect(screen.getByText(/Conversation extraction: 0 queued in Loom, 0 failed/)).toBeInTheDocument();
-    expect(screen.queryByText(/gave up on these windows/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not extracted/)).not.toBeInTheDocument();
   });
 });

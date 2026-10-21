@@ -359,7 +359,7 @@ export function DiagnosticsPage() {
                 Conversation extraction: {memuHealth.extraction.queued ?? 0} queued in Loom,{' '}
                 {memuHealth.extraction.failed ?? 0} failed
                 {memuHealth.extraction.failed > 0 && (
-                  <> (Loom gave up on these windows after three sends; the gateway log names each one)</>
+                  <> (not extracted: the retries ran out or the window could not be re-sent; the gateway log names each one)</>
                 )}
               </div>
             )}
