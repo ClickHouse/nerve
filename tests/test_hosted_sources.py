@@ -54,7 +54,7 @@ from nerve.config import (
 from nerve.cron.gates import GateContext, GitHubPrActivityGate
 from nerve.cron.service import CronService
 from nerve.gateway import server as gateway_server
-from nerve.sources.github import GitHubSource
+from nerve.sources.github import GitHubSource, notification_record
 from nerve.sources.github_hosted import HostedGitHubSource, record_from_buffer
 from nerve.sources.registry import build_source_runners
 from tests.fake_channel_gateway import (
@@ -409,6 +409,19 @@ class TestPollingCursor:
 
         assert result.next_cursor == "57"
         assert seen and "since=57" not in seen[0] and "since=20" in seen[0]
+
+    @pytest.mark.parametrize("failure", [RuntimeError("gh failed"), asyncio.CancelledError()])
+    async def test_a_failed_or_cancelled_enrichment_gives_the_notification_alone(self, failure):
+        notification = {
+            "id": "9000000001", "reason": "mention", "unread": True, "updated_at": "2026-09-16T10:00:00Z",
+            "subject": {"title": "Fix the flaky retry test", "type": "PullRequest"},
+            "repository": {"full_name": "owner/repo"},
+        }
+
+        record = notification_record(notification, failure)
+
+        assert (record.id, record.summary) == ("9000000001", "[owner/repo] Fix the flaky retry test (mention)")
+        assert record.metadata["repo_name"] == "owner/repo" and record.metadata["actors"] == []
 
     async def test_digits_are_no_timestamp_even_when_they_read_as_a_date(self, monkeypatch):
         seen = self.listings(monkeypatch)

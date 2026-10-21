@@ -153,8 +153,9 @@ def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseExcep
     """The inbox record of one notification and its enrichment.
 
     *extra* is what :meth:`GitHubSource._enrich_notification` returned for
-    the notification, or the exception it raised; a failed enrichment gives
-    a record built from the notification alone.
+    the notification, or the exception it raised (``gather`` hands back a
+    cancellation too); a failed enrichment gives a record built from the
+    notification alone.
     """
     subject = notif.get("subject", {})
     repo = notif.get("repository", {})
@@ -165,7 +166,7 @@ def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseExcep
     subject_type = subject.get("type", "")
 
     # Build enriched content
-    if isinstance(extra, Exception):
+    if isinstance(extra, BaseException):
         logger.warning("Enrichment failed for %s: %s", notif.get("id"), extra)
         extra = {}
 
