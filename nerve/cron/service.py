@@ -840,20 +840,19 @@ class CronService:
     # want a catch-up once, as the startup catch-up does for downtime.
 
     async def _watch_clock(self) -> None:
-        """Sample the clocks now and every ``_CLOCK_WATCH_SECONDS`` until the
+        """Check the clock now and every ``_CLOCK_WATCH_SECONDS`` until the
         scheduler stops.
 
         Prompt detection. The scheduler checks the clock too, right before it
         looks for due jobs (see :class:`_ClockCheckingScheduler`), so whichever
-        of the two runs first after a pause handles it.
+        of the two runs first after a pause handles it. A catch-up runs as a
+        task of its own, so the watcher goes on sampling while it runs.
         """
         while self.scheduler.running:
-            step = self._sample_clock()
-            if step is not None:
-                try:
-                    await self._on_clock_step(*step)
-                except Exception:
-                    logger.exception("Catching up after a pause failed")
+            try:
+                self._check_clock()
+            except Exception:
+                logger.exception("Handling a pause of the machine failed")
             await asyncio.sleep(_CLOCK_WATCH_SECONDS)
 
     def _sample_clock(self) -> tuple[datetime, datetime, float] | None:
@@ -880,34 +879,40 @@ class CronService:
         )
 
     def _check_clock(self) -> None:
-        """The scheduler's hook: handle a pause before it looks for due jobs.
+        """Take a clock sample, and handle the pause it shows, if any.
 
-        Runs on the event loop, inside the scheduler's wakeup, so it cannot
-        wait for the catch-up runs; those are started as a task that waits its
-        turn behind any catch-up still running.
+        The watcher's check, and the scheduler's hook right before it looks for
+        due jobs. Runs on the event loop and never waits: the triggers move at
+        once, and the catch-up runs start as a task (see :meth:`_on_clock_step`).
         """
         step = self._sample_clock()
-        if step is None:
-            return
-        due = self._rearm_after_pause(*step)
-        if due:
-            task = asyncio.get_running_loop().create_task(
-                self._catch_up_after_pause(due),
-            )
-            self._catchup_tasks.add(task)
-            task.add_done_callback(self._catchup_tasks.discard)
+        if step is not None:
+            self._on_clock_step(*step)
 
-    async def _on_clock_step(
+    def _on_clock_step(
         self, paused_from: datetime, paused_to: datetime, step: float | None = None,
-    ) -> None:
-        """Re-arm past a pause, then run once what came due during it.
+    ) -> asyncio.Task | None:
+        """Move the triggers past a pause now, and start running once what came
+        due during it.
 
         ``paused_from`` and ``paused_to`` bound the pause; ``step`` is how far
         the wall clock jumped, for the log line (default: the whole window).
-        Returns when the catch-up runs have finished.
+        The runs go in a task of their own, which waits its turn behind any
+        catch-up still running. Returns that task, or ``None`` when nothing
+        that came due wants a catch-up.
         """
         due = self._rearm_after_pause(paused_from, paused_to, step)
-        await self._catch_up_after_pause(due)
+        if not due:
+            return None
+        task = asyncio.get_running_loop().create_task(self._catch_up_after_pause(due))
+        self._catchup_tasks.add(task)
+        task.add_done_callback(self._catch_up_done)
+        return task
+
+    def _catch_up_done(self, task: asyncio.Task) -> None:
+        self._catchup_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Catching up after a pause failed", exc_info=error)
 
     def _rearm_after_pause(
         self, paused_from: datetime, paused_to: datetime, step: float | None = None,
@@ -926,32 +931,36 @@ class CronService:
         between. Returns what to run once now: the cron jobs with ``catchup``
         and the source runners. A job with ``catchup: false``, cleanup and the
         wakeup sweep (which fires every due session wakeup on its next pass)
-        only move on.
+        only move on. Jobs are handled one by one: one that cannot be moved is
+        logged and left to the scheduler, and the rest still move.
         """
         after = paused_to + timedelta(microseconds=1)
         internal = (self._cleanup_expired, self._sweep_wakeups)
         rearmed = 0
         due: list[CronJob | SourceRunner] = []
         for sched_job in self.scheduler.get_jobs():
-            func = sched_job.func
-            if func == self._run_job_wrapper:
-                catchup = sched_job.args[0].catchup
-            elif func == self._run_source_wrapper:
-                catchup = True
-            elif func in internal:
-                catchup = False
-            else:
-                continue
-            current = getattr(sched_job, "next_run_time", None)
-            if current is None or current > paused_to:
-                continue
-            upcoming = sched_job.trigger.get_next_fire_time(None, after)
-            if upcoming is None:
-                continue  # the trigger is done; the scheduler retires the job
-            self.scheduler.modify_job(sched_job.id, next_run_time=upcoming)
-            rearmed += 1
-            if catchup:
-                due.append(sched_job.args[0])
+            try:
+                func = sched_job.func
+                if func == self._run_job_wrapper:
+                    catchup = sched_job.args[0].catchup
+                elif func == self._run_source_wrapper:
+                    catchup = True
+                elif func in internal:
+                    catchup = False
+                else:
+                    continue
+                current = getattr(sched_job, "next_run_time", None)
+                if current is None or current > paused_to:
+                    continue
+                upcoming = sched_job.trigger.get_next_fire_time(None, after)
+                if upcoming is None:
+                    continue  # the trigger is done; the scheduler retires the job
+                self.scheduler.modify_job(sched_job.id, next_run_time=upcoming)
+                rearmed += 1
+                if catchup:
+                    due.append(sched_job.args[0])
+            except Exception:
+                logger.exception("Could not move %s past the pause", sched_job.id)
         # Re-arm the scheduler's own timer against the stepped clock too.
         if self.scheduler.running:
             self.scheduler.wakeup()
@@ -974,8 +983,6 @@ class CronService:
         Gates, ``lock`` and the run log apply as for a scheduled run. Waits
         for any earlier catch-up to finish first, so two never overlap.
         """
-        if not due:
-            return
         async with self._catchup_lock:
             if not self.scheduler.running:
                 return  # stopped while waiting its turn

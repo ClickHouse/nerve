@@ -116,6 +116,15 @@ def _ok() -> TurnResult:
     return TurnResult("ok", TurnOutcome())
 
 
+async def _resume(
+    svc: CronService, paused: datetime, resumed: datetime, step: float | None = None,
+) -> None:
+    """Hand *svc* a pause from *paused* to *resumed*, and wait for its catch-up."""
+    catch_up = svc._on_clock_step(paused, resumed, step)
+    if catch_up is not None:
+        await catch_up
+
+
 # ---------------------------------------------------------------------------
 # The watcher
 # ---------------------------------------------------------------------------
@@ -128,7 +137,7 @@ async def watched(tmp_path, monkeypatch):
     monkeypatch.setattr(cron_service, "time", clock)
     monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", 0.01)
     svc = _service(tmp_path)
-    svc._on_clock_step = AsyncMock()
+    svc._on_clock_step = MagicMock(return_value=None)
     # Held, so the scheduler never wakes up and takes a sample of its own.
     svc.scheduler.start(paused=True)
     svc._clock_watch_task = asyncio.create_task(svc._watch_clock())
@@ -143,16 +152,16 @@ async def test_a_wall_clock_jump_is_handled_as_a_pause(watched):
     before = datetime.now(UTC)
 
     clock.pause(3 * HOUR)
-    await _wait_for(lambda: svc._on_clock_step.await_count)
+    await _wait_for(lambda: svc._on_clock_step.call_count)
 
-    paused_from, paused_to, step = svc._on_clock_step.await_args.args
+    paused_from, paused_to, step = svc._on_clock_step.call_args.args
     assert step == pytest.approx(3 * HOUR, abs=1)
     # From the last sample before the pause to the first one after it.
     assert paused_from <= before + timedelta(seconds=1)
     assert paused_to - paused_from >= timedelta(hours=3)
     assert paused_to - paused_from < timedelta(hours=3, seconds=1)
     await asyncio.sleep(0.05)
-    assert svc._on_clock_step.await_count == 1
+    assert svc._on_clock_step.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -162,7 +171,7 @@ async def test_a_two_second_jump_is_ignored(watched):
     clock.pause(2)
     await asyncio.sleep(0.1)
 
-    svc._on_clock_step.assert_not_awaited()
+    svc._on_clock_step.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -172,7 +181,7 @@ async def test_a_clock_set_back_is_not_a_pause(watched):
     clock.pause(-HOUR)
     await asyncio.sleep(0.1)
 
-    svc._on_clock_step.assert_not_awaited()
+    svc._on_clock_step.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -181,7 +190,7 @@ async def test_the_watcher_stops_with_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(cron_service, "time", clock)
     monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", 0.01)
     svc = _service(tmp_path)
-    svc._on_clock_step = AsyncMock()
+    svc._on_clock_step = MagicMock(return_value=None)
     await _start(svc)
     watcher = svc._clock_watch_task
     await asyncio.sleep(0.05)
@@ -193,7 +202,7 @@ async def test_the_watcher_stops_with_stop(tmp_path, monkeypatch):
     assert svc._clock_watch_task is None
     clock.pause(3 * HOUR)
     await asyncio.sleep(0.05)
-    svc._on_clock_step.assert_not_awaited()
+    svc._on_clock_step.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -209,6 +218,51 @@ async def test_the_watcher_ends_when_the_scheduler_is_shut_down(tmp_path, monkey
     await _wait_for(watcher.done)
     assert not watcher.cancelled()
 
+
+@pytest.mark.asyncio
+async def test_the_watcher_keeps_watching_while_a_catch_up_runs(tmp_path, monkeypatch):
+    """A second pause moves its triggers at once, not after the first catch-up."""
+    clock = FakeClock()
+    monkeypatch.setattr(cron_service, "time", clock)
+    monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", 0.01)
+    first = CronJob(id="first", schedule=EVERY_TEN_MINUTES, prompt="p")
+    second = CronJob(id="second", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = _service(tmp_path)
+    release = asyncio.Event()
+    started: list[str] = []
+
+    async def run_cron(*, job_id, **_kwargs) -> TurnResult:
+        started.append(job_id)
+        if job_id == "first":
+            await release.wait()
+        return _ok()
+
+    svc.engine.run_cron = run_cron
+    await _start(svc, [first, second])
+    try:
+        svc.scheduler.pause()  # only the watcher notices the pauses
+        await _wait_for(lambda: svc._clock_sample is not None)
+
+        def due_in(job_id: str, hours: float) -> datetime:
+            due = datetime.fromtimestamp(clock.time(), UTC) + timedelta(hours=hours)
+            svc.scheduler.modify_job(job_id, next_run_time=due)
+            return due
+
+        due_in("first", 1)
+        due_in("second", 5)  # after the first pause
+        clock.pause(3 * HOUR)
+        await _wait_for(lambda: started == ["first"])
+
+        due = due_in("second", 1)
+        clock.pause(3 * HOUR)
+        await _wait_for(
+            lambda: svc.scheduler.get_job("second").next_run_time > due + timedelta(hours=2),
+            timeout=2,
+        )
+        assert started == ["first"]  # the first catch-up is still running
+    finally:
+        release.set()
+        await svc.stop()
 
 # ---------------------------------------------------------------------------
 # What a pause does to the schedule
@@ -249,7 +303,7 @@ async def test_a_job_due_during_the_pause_runs_once_and_moves_past_it(held_servi
         "every-ten", next_run_time=_first_fire_after(EVERY_TEN_MINUTES, paused),
     )
 
-    await svc._on_clock_step(paused, resumed)
+    await _resume(svc, paused, resumed)
 
     svc.engine.run_cron.assert_awaited_once()
     upcoming = svc.scheduler.get_job("every-ten").next_run_time
@@ -280,7 +334,7 @@ async def test_only_catch_up_jobs_run_but_every_trigger_moves_on(held_service):
     # Not the service's: keeps the scheduler's own handling.
     svc.scheduler.add_job(AsyncMock(), "date", run_date=came_due, id="foreign")
 
-    await svc._on_clock_step(paused, resumed)
+    await _resume(svc, paused, resumed)
 
     ran = [c.kwargs["job_id"] for c in svc.engine.run_cron.await_args_list]
     assert ran == ["wants"]
@@ -309,7 +363,7 @@ async def test_an_interval_job_stays_on_its_anchored_cadence(held_service):
         "every-four", next_run_time=last_success + timedelta(hours=4),
     )
 
-    await svc._on_clock_step(resumed - timedelta(hours=3), resumed)
+    await _resume(svc, resumed - timedelta(hours=3), resumed)
 
     svc.engine.run_cron.assert_awaited_once()
     # The next run on the same grid, not four hours from the resume.
@@ -329,7 +383,7 @@ async def test_a_catch_up_is_gated_like_a_scheduled_run(held_service):
     paused, resumed = _pause_window()
     svc.scheduler.modify_job("planner", next_run_time=resumed - timedelta(hours=1))
 
-    await svc._on_clock_step(paused, resumed)
+    await _resume(svc, paused, resumed)
 
     svc.db.count_tasks.assert_awaited()
     svc.engine.run_cron.assert_not_awaited()
@@ -358,7 +412,7 @@ async def test_a_locked_job_catch_up_waits_for_its_running_run(held_service):
     paused, resumed = _pause_window()
     svc.scheduler.modify_job("locked", next_run_time=resumed - timedelta(hours=1))
 
-    catch_up = asyncio.create_task(svc._on_clock_step(paused, resumed))
+    catch_up = svc._on_clock_step(paused, resumed)
     await asyncio.sleep(0.05)
     assert order == ["start 1"]
     release.set()
@@ -386,14 +440,14 @@ async def test_a_pause_during_a_catch_up_waits_for_it(held_service):
     svc.engine.run_cron = run_cron
     paused, resumed = _pause_window()
     svc.scheduler.modify_job("first", next_run_time=resumed - timedelta(hours=2))
-    first_pause = asyncio.create_task(svc._on_clock_step(paused, resumed))
+    first_pause = svc._on_clock_step(paused, resumed)
     await _wait_for(lambda: order == ["first start"])
 
     paused_again, resumed_again = _pause_window(hours=1)
     svc.scheduler.modify_job(
         "second", next_run_time=resumed_again - timedelta(minutes=30),
     )
-    second_pause = asyncio.create_task(svc._on_clock_step(paused_again, resumed_again))
+    second_pause = svc._on_clock_step(paused_again, resumed_again)
     await asyncio.sleep(0.05)
 
     assert svc.scheduler.get_job("second").next_run_time > resumed_again
@@ -431,7 +485,7 @@ async def test_a_pause_during_the_startup_catch_up_waits_for_it(held_service):
     paused, resumed = _pause_window()
     svc.scheduler.modify_job("due", next_run_time=resumed - timedelta(hours=1))
 
-    after_pause = asyncio.create_task(svc._on_clock_step(paused, resumed))
+    after_pause = svc._on_clock_step(paused, resumed)
     await asyncio.sleep(0.05)
     assert order == ["overdue start"]
     release.set()
@@ -448,7 +502,7 @@ async def test_one_info_line_per_pause(held_service, caplog):
     svc.scheduler.modify_job("every-ten", next_run_time=resumed - timedelta(hours=1))
 
     with caplog.at_level(logging.INFO, logger="nerve.cron.service"):
-        await svc._on_clock_step(paused, resumed, 3 * HOUR)
+        await _resume(svc, paused, resumed, 3 * HOUR)
 
     lines = [
         r.getMessage() for r in caplog.records
@@ -459,6 +513,33 @@ async def test_one_info_line_per_pause(held_service, caplog):
     assert paused.isoformat(timespec="seconds") in lines[0]
     assert resumed.isoformat(timespec="seconds") in lines[0]
     assert "catching up 1" in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_cannot_be_moved_does_not_hold_up_the_rest(held_service, caplog):
+    stuck = CronJob(id="stuck", schedule=EVERY_TEN_MINUTES, prompt="p")
+    fine = CronJob(id="fine", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([stuck, fine])
+    paused, resumed = _pause_window()
+    # "stuck" comes first: the scheduler lists jobs by their next run time.
+    svc.scheduler.modify_job("stuck", next_run_time=resumed - timedelta(hours=2))
+    svc.scheduler.modify_job("fine", next_run_time=resumed - timedelta(hours=1))
+    modify_job = svc.scheduler.modify_job
+
+    def refuse_stuck(job_id, **changes):
+        if job_id == "stuck":
+            raise RuntimeError("job store unavailable")
+        return modify_job(job_id, **changes)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="nerve.cron.service"),
+        patch.object(svc.scheduler, "modify_job", side_effect=refuse_stuck),
+    ):
+        await _resume(svc, paused, resumed)
+
+    assert "Could not move stuck past the pause" in caplog.text
+    assert svc.scheduler.get_job("fine").next_run_time > resumed
+    assert [c.kwargs["job_id"] for c in svc.engine.run_cron.await_args_list] == ["fine"]
 
 
 # ---------------------------------------------------------------------------
@@ -489,14 +570,14 @@ async def test_after_a_three_hour_pause_a_ten_minute_job_runs_once(
     svc, job, clock = await _stage_ten_minute_job(
         tmp_path, db, monkeypatch, watch_seconds=0.01,
     )
-    handled = asyncio.Event()
+    catch_ups: list[asyncio.Task | None] = []
     steps: list[float] = []
     on_clock_step = svc._on_clock_step
 
-    async def spy(paused_from, paused_to, step=None) -> None:
+    def spy(paused_from, paused_to, step=None) -> asyncio.Task | None:
         steps.append(step)
-        await on_clock_step(paused_from, paused_to, step)
-        handled.set()
+        catch_ups.append(on_clock_step(paused_from, paused_to, step))
+        return catch_ups[-1]
 
     svc._on_clock_step = spy
     await _start(svc, [job])
@@ -513,7 +594,9 @@ async def test_after_a_three_hour_pause_a_ten_minute_job_runs_once(
         )
 
         clock.pause(3 * HOUR)
-        await asyncio.wait_for(handled.wait(), timeout=5)
+        await _wait_for(lambda: catch_ups)
+        assert catch_ups[0] is not None
+        await asyncio.wait_for(catch_ups[0], timeout=5)
         svc.scheduler.resume()
         await asyncio.sleep(0.2)
 
