@@ -173,6 +173,48 @@ def test_reload_reports_a_backend_change_without_values() -> None:
     assert "memory.loom.token" in config_reload._SECRET_PATHS
 
 
+def _workspace_settings(tmp_path, text: str):
+    workspace = tmp_path / "ws"
+    (workspace / "config").mkdir(parents=True)
+    (workspace / "config" / "settings.yaml").write_text(text, encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_a_provisioned_settings_file_with_env_references(tmp_path, monkeypatch) -> None:
+    """The shape a provisioning step writes into the tracked settings."""
+    monkeypatch.setenv("LOOM_BASE_URL", "http://10.0.0.2:7777")
+    monkeypatch.setenv("LOOM_API_KEY", "placeholder-token")
+    config_dir = _workspace_settings(tmp_path, (
+        "memory:\n"
+        "  backend: loom\n"
+        "  loom:\n"
+        "    base_url: ${LOOM_BASE_URL}\n"
+        "    token: ${LOOM_API_KEY}\n"
+    ))
+    config = load_config(config_dir)
+    assert config.memory.backend == "loom"
+    assert config.memory.loom.base_url == "http://10.0.0.2:7777"
+    assert config.memory.loom.token == "placeholder-token"
+    assert config.memory.loom.namespace == ""  # resolved from the token at runtime
+
+
+def test_environment_alone_selects_loom(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NERVE_MEMORY_BACKEND", "loom")
+    monkeypatch.setenv("LOOM_BASE_URL", "http://10.0.0.2:7777")
+    monkeypatch.setenv("LOOM_API_KEY", "placeholder-token")
+    config = load_config(_workspace_settings(tmp_path, "timezone: UTC\n"))
+    assert config.memory.backend == "loom"
+    assert config.memory.loom.base_url == "http://10.0.0.2:7777"
+
+
+def test_loom_variables_without_the_backend_switch_keep_memu(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOOM_BASE_URL", "http://10.0.0.2:7777")
+    monkeypatch.setenv("LOOM_API_KEY", "placeholder-token")
+    config = load_config(_workspace_settings(tmp_path, "timezone: UTC\n"))
+    assert config.memory.backend == "memu"
+
+
 def test_load_config_reads_the_section_from_a_file(tmp_path, monkeypatch, caplog) -> None:
     monkeypatch.setenv("LOOM_API_KEY", "env-token")
     (tmp_path / "config.yaml").write_text(
