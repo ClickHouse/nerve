@@ -201,8 +201,10 @@ the `PairingWidget` (t.me link, code, 2 s poll) when the bot is live, with a
 manual user id fallback; Sources load `GET /api/setup/sources/preflight` and
 warn when a toggle is on but its tool is missing; Automation renders
 schedules in the chosen time zone and, for a worker, shows `task-planner` off
-by default with a note that the onboarding session enables it when the worker
-should plan through the approval loop; Agents default-checks what is installed.
+by default with a note that the onboarding conversation turns it on when the
+worker should plan through the approval loop; a job that `jobs.yaml` replaces
+shows that file's state, read-only, with a note; Agents default-checks what is
+installed.
 
 **Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
 runs the server check-up (`GET /api/setup/environment`) with its hints — an

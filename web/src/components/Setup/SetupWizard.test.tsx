@@ -794,7 +794,7 @@ describe('forms open on server values and send the right payload', () => {
     const planner = screen.getByRole('checkbox', { name: /Task planner/ });
     expect(planner).not.toBeChecked();
     expect(planner).toHaveAccessibleDescription(
-      'Off for workers until onboarding decides. The onboarding session enables it when this worker should plan through the approval loop.',
+      'Off for workers until onboarding decides. The onboarding conversation turns it on when this worker should plan through the approval loop.',
     );
     expect(screen.getByRole('checkbox', { name: /Skill reviser/ })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: /Skill extractor/ })).toBeChecked();
@@ -925,6 +925,21 @@ describe('forms open on server values and send the right payload', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('heading', { level: 1, name: 'Choose a mode' })).not.toBeInTheDocument());
+  });
+
+  it('automation: a job that jobs.yaml replaces shows its state and cannot be changed here', async () => {
+    current = withStep(makeWorkerState(), step('automation', {}, {
+      ...WORKER_AUTOMATION,
+      optional: WORKER_AUTOMATION.optional!.map((job) => (
+        job.id === 'task-planner' ? { ...job, enabled: true, overridden: true } : job
+      )),
+    }));
+    renderAt('/setup/automation');
+    await heading('Scheduled jobs');
+    const planner = screen.getByRole('checkbox', { name: /Task planner/ });
+    expect(planner).toBeChecked();
+    expect(planner).toBeDisabled();
+    expect(planner).toHaveAccessibleDescription('Set in jobs.yaml. Change it there, or ask the agent.');
   });
 
   it('a worker\'s note is optional and goes to the server only when given', async () => {

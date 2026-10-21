@@ -274,8 +274,11 @@ export const AUTOMATION_IDLE_UNTIL_SOURCE =
 
 /** Under a worker's task planner while the mode's default leaves it off. */
 export const AUTOMATION_TASK_PLANNER_WORKER =
-  'Off for workers until onboarding decides. The onboarding session enables it when this worker '
+  'Off for workers until onboarding decides. The onboarding conversation turns it on when this worker '
   + 'should plan through the approval loop.';
+
+/** Under a job that `jobs.yaml` replaces: the checkbox shows that file's state. */
+export const AUTOMATION_OVERRIDDEN = 'Set in jobs.yaml. Change it there, or ask the agent.';
 
 /** The Slack card when the shared channel gateway holds the connection: a status line, and only the switch. */
 export const SLACK_GATEWAY_LINE = (connected: boolean) =>

@@ -263,10 +263,12 @@ export interface SetupCronJob {
   default?: boolean;
   /**
    * Whether the mode's first-run default turns this optional job on. A
-   * worker's `task-planner` is off until its onboarding session decides.
+   * worker's `task-planner` is off until its onboarding conversation decides.
    * Absent from an older backend.
    */
   default_enabled?: boolean;
+  /** Set in `jobs.yaml`, which replaces the built-in job; `enabled` is that job's. */
+  overridden?: boolean;
 }
 
 export interface SetupAutomationDetail {

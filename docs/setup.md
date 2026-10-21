@@ -190,7 +190,7 @@ keep", never read back.
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time). With `memory.backend: loom` nothing: the step is done and says memory is kept in Loom | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
 | **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
 | **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash, then a one-time sign-in to your own Telegram account: phone, the code Telegram sends, your two-step password if you have one) as toggle cards, each with a server-side check of its tool (`gh`, `gog`). On an [instance that keeps no credentials](#instances-that-keep-no-credentials) only the GitHub toggle, and only when the operator provides the token from the environment | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml`; the Telegram session → `NERVE_HOME/telegram_sync.session` (owner-only, written by Telethon) | live |
-| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. For a worker `task-planner` starts off: the onboarding session enables it when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
+| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. Each job shows its effective state: a job with the same id in `config/cron/jobs.yaml` replaces the built-in job, and the step shows it read-only. For a worker `task-planner` starts off: the onboarding conversation turns it on when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` (never for a job that `jobs.yaml` replaces) | live (the scheduler reloads) |
 | **Agents** (personal) | which coding agents on this server (Codex, Claude Code) get a connection to Nerve; what to do with an existing config | the agents' own config files; `external_agents.*` and `mcp_endpoint.enabled` → `config.yaml` | restart |
 | **Review and finish** | a server check-up (Claude CLI, Node, `gh`, `gog`, disk, time zone, web build), what was written where, and the apply button | nothing new | hot reload, or a restart when something above needs one |
 
@@ -249,9 +249,10 @@ A few things worth knowing per step:
   screen and `nerve doctor` say so.
 - **Automation** lists the core jobs as always-on and the optional ones as
   checkboxes with their schedule rendered in the chosen time zone. A worker's
-  `task-planner` is unchecked by default; leave it for the onboarding session,
-  which turns it on (scoped to the worker's tasks) when the worker should plan
-  through the approval loop.
+  `task-planner` is unchecked by default; leave it for the onboarding
+  conversation, which turns it on (scoped to the worker's tasks) when the
+  worker should plan through the approval loop. A job that `jobs.yaml`
+  replaces shows that file's state and cannot be changed here.
 - **Review and finish** shows an HTTPS warning when the page is served over
   plain HTTP from an address other than loopback, and a warning when the
   instance is passwordless and listening beyond localhost.

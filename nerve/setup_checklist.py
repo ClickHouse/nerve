@@ -890,6 +890,9 @@ def _automation_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], 
             # older name for the same value.
             "default_enabled": default,
             "default": default,
+            # Set in jobs.yaml, which replaces the system.yaml job: the
+            # Automation step shows it and cannot change it.
+            "overridden": toggle.overridden,
         })
     core = [{
         "id": c["id"], "name": "Memory maintenance" if c["id"] == "memory-maintenance" else c["id"],

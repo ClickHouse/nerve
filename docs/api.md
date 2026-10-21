@@ -341,8 +341,9 @@ default: `02:00`–`08:00` for a personal install, none for a worker. Each job i
 `detail.automation.optional` carries `id`, `name`, `description`, `schedule`
 and `schedule_text`, `requires` and `requirement_met`, `enabled`, and
 `default_enabled`: whether the mode's default set switches it on (`false` for
-a worker's `task-planner`, which the onboarding session decides on; `default`
-is the older name for the same value).
+a worker's `task-planner`, which the onboarding conversation decides on; `default`
+is the older name for the same value), and `overridden`: a job with the same id
+in `jobs.yaml` replaces this one, and `enabled` is that job's.
 
 **Where a value came from.** Every masked secret is
 `{"configured": bool, "last4": str | null, "source": str | null}`. `source`

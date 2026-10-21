@@ -9,6 +9,7 @@ worker rule: no ``TASK.md`` marker means done.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,7 +19,14 @@ from nerve import onboarding
 from nerve.agent.prompts import ONBOARDING_OFFERS, WORKER_GUIDE_URL, onboarding_prompt
 from nerve.agent.tools.handlers.onboarding import onboarding_done_handler
 from nerve.agent.tools.registry import ToolContext
-from nerve.setup_writer import TASK_ONBOARDING_MARKER, apply_mode, render_task_md
+from nerve.setup_writer import (
+    TASK_ONBOARDING_MARKER,
+    apply_mode,
+    list_optional_crons,
+    plan_optional_crons,
+    render_task_md,
+    system_cron_file,
+)
 from tests.actor_rows import ensure_system_principal
 
 DESCRIPTION = "Watch the nightly build for example/repo and propose fixes."
@@ -195,3 +203,29 @@ class TestEnd:
         assert await db.get_session(state.session_id) is not None
         # Done stays done.
         assert (await onboarding.skip(db, tmp_path, actor_id=None)).status == "skipped"
+
+
+class TestEffectiveCronState:
+    def _override(self, ws: Path, text: str) -> None:
+        (system_cron_file(ws).parent / "jobs.yaml").write_text(text)
+
+    def test_a_jobs_yaml_job_replaces_the_built_in_one(self, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        self._override(tmp_path, (
+            "jobs:\n  - id: task-planner\n    schedule: '0 */4 * * *'\n"
+            "    prompt: Plan one task tagged source:ci.\n"
+        ))
+        crons = {c.id: (c.enabled, c.overridden) for c in list_optional_crons(tmp_path)}
+        assert crons["task-planner"] == (True, True)
+        assert crons["skill-extractor"] == (True, False)
+
+    def test_the_automation_step_leaves_an_overridden_job_alone(self, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        self._override(tmp_path, (
+            "jobs:\n  - id: skill-reviser\n    schedule: '0 3 * * 0'\n"
+            "    prompt: Review the skills.\n    enabled: false\n"
+        ))
+        before = system_cron_file(tmp_path).read_text()
+        plan = plan_optional_crons(tmp_path, {"skill-extractor"})
+        assert "skill-reviser" not in plan.disabled and "skill-reviser" not in plan.enabled
+        assert plan.text is None and system_cron_file(tmp_path).read_text() == before
