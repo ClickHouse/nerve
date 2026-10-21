@@ -9,8 +9,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
+from click.testing import CliRunner
+from fastapi import FastAPI
 
 from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron import gates as gates_module
@@ -446,3 +449,97 @@ async def test_async_and_failing_listeners(held, caplog):
     svc.remove_schedule_listener(eager)
     await svc._run_job_wrapper(svc._jobs[0])
     assert calls == ["broken", "async"]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/cron/schedule and `nerve cron next`
+# ---------------------------------------------------------------------------
+
+_REPORT = {
+    "next": {"at": "2026-03-02T09:00:00+00:00", "name": "digest", "kind": "cron"},
+    "jobs": [
+        {"id": "planner", "next_run": "2026-03-02T08:00:00+00:00",
+         "forecast": "skip", "reason": "gate 'tasks' not satisfied (pending tasks exist)"},
+        {"id": "digest", "next_run": "2026-03-02T09:00:00+00:00",
+         "forecast": "run", "reason": None},
+        {"id": "off", "next_run": None, "forecast": None, "reason": None},
+    ],
+}
+
+
+def _cron_app(bypass_auth) -> FastAPI:
+    from nerve.gateway.routes import cron as cron_routes
+
+    app = FastAPI()
+    app.include_router(cron_routes.router)
+    return bypass_auth(app)
+
+
+@pytest.mark.asyncio
+async def test_the_schedule_route_returns_the_report(bypass_auth, monkeypatch):
+    service = SimpleNamespace(schedule_report=AsyncMock(return_value=_REPORT))
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+    transport = httpx.ASGITransport(app=_cron_app(bypass_auth))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cron/schedule")
+
+    assert response.status_code == 200
+    assert response.json() == _REPORT
+
+
+@pytest.mark.asyncio
+async def test_the_schedule_route_without_a_cron_service(bypass_auth, monkeypatch):
+    monkeypatch.setattr("nerve.gateway.server._cron_service", None)
+    transport = httpx.ASGITransport(app=_cron_app(bypass_auth))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cron/schedule")
+
+    assert response.json() == {"next": None, "jobs": []}
+
+
+def _config_dir(tmp_path):
+    config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+    config_dir.mkdir()
+    (workspace / "config").mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        f"workspace: {workspace}\ntimezone: UTC\n", encoding="utf-8",
+    )
+    (config_dir / "config.local.yaml").write_text("", encoding="utf-8")
+    return config_dir
+
+
+def test_cron_next_prints_the_next_tick_and_each_forecast(tmp_path, monkeypatch):
+    from nerve import cli
+
+    calls = []
+
+    def fake_request(ctx, config, method, path, body=None):
+        calls.append((method, path))
+        return _REPORT
+
+    monkeypatch.setattr(cli, "_gateway_request", fake_request)
+    result = CliRunner().invoke(cli.main, ["-c", str(_config_dir(tmp_path)), "cron", "next"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("GET", "/api/cron/schedule")]
+    lines = result.output.splitlines()
+    assert lines[0] == "Next: 2026-03-02 09:00:00 UTC — digest (cron)"
+    assert any(
+        "planner" in line and "skip — gate 'tasks' not satisfied" in line for line in lines
+    )
+    assert any("digest" in line and line.rstrip().endswith("run") for line in lines)
+    assert any(line.split()[:1] == ["off"] and line.rstrip().endswith("—") for line in lines)
+
+
+def test_cron_next_with_nothing_scheduled(tmp_path, monkeypatch):
+    from nerve import cli
+
+    monkeypatch.setattr(
+        cli, "_gateway_request", lambda *a, **k: {"next": None, "jobs": []},
+    )
+    result = CliRunner().invoke(cli.main, ["-c", str(_config_dir(tmp_path)), "cron", "next"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == "Next: nothing scheduled in the next 7 days"

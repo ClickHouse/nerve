@@ -23,6 +23,18 @@ async def list_cron_jobs():
     return {"jobs": jobs}
 
 
+@router.get("/api/cron/schedule")
+async def cron_schedule():
+    """The next work the instance will start on its own, and what each job's
+    gates forecast for its next run (see ``CronService.schedule_report``)."""
+    from nerve.gateway.server import _cron_service
+
+    if not _cron_service:
+        return {"next": None, "jobs": []}
+
+    return await _cron_service.schedule_report()
+
+
 @router.post("/api/cron/reload")
 async def reload_cron_jobs():
     """Re-read cron config and apply changes to the scheduler without a restart."""

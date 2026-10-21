@@ -2902,12 +2902,64 @@ def setup_telegram(ctx: click.Context) -> None:
     asyncio.run(_run())
 
 
+# `nerve cron next` asks the running daemon what runs next instead of running a
+# job of that name.
+_CRON_NEXT = "next"
+
+
+def _print_cron_schedule(report: dict, timezone_name: str) -> None:
+    """Print a ``GET /api/cron/schedule`` body: the next tick, then each job's
+    next run and what its gates forecast for it."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from nerve.cron.service import _SCHEDULE_HORIZON
+
+    zone = ZoneInfo(timezone_name)
+
+    def when(iso: str | None) -> str:
+        if not iso:
+            return "—"
+        return datetime.fromisoformat(iso).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    tick = report.get("next")
+    if tick:
+        click.echo(f"Next: {when(tick['at'])} — {tick['name']} ({tick['kind']})")
+    else:
+        click.echo(
+            f"Next: nothing scheduled in the next {_SCHEDULE_HORIZON.days} days",
+        )
+    rows = []
+    for job in report.get("jobs") or []:
+        forecast = job.get("forecast") or "—"
+        if forecast == "skip" and job.get("reason"):
+            forecast = f"skip — {job['reason']}"
+        rows.append((job["id"], when(job.get("next_run")), forecast))
+    if not rows:
+        return
+    id_width = max(len("JOB"), *(len(row[0]) for row in rows))
+    when_width = max(len("NEXT RUN"), *(len(row[1]) for row in rows))
+    click.echo(f"  {'JOB':<{id_width}}  {'NEXT RUN':<{when_width}}  FORECAST")
+    for job_id, next_run, forecast in rows:
+        click.echo(f"  {job_id:<{id_width}}  {next_run:<{when_width}}  {forecast}")
+
+
 @main.command()
 @click.argument("job_id", default="")
 @click.pass_context
 def cron(ctx: click.Context, job_id: str) -> None:
-    """Run a cron job manually."""
+    """Run a cron job manually, or list the jobs.
+
+    `nerve cron next` shows what the running daemon will run next: the next
+    tick, and for each job its next run and whether its gates, judged now,
+    let that run happen.
+    """
     config = ctx.obj["config"]
+
+    if job_id == _CRON_NEXT:
+        report = _gateway_request(ctx, config, "GET", "/api/cron/schedule")
+        _print_cron_schedule(report, config.timezone)
+        return
 
     async def _run():
         from nerve.migrate import open_production_db
