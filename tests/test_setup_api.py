@@ -3491,13 +3491,13 @@ class TestNoLocalSecrets:
         assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
         assert "ghp_REPLACE" not in json.dumps(off.json())
 
-    async def test_a_hosted_github_opens_that_one_toggle_and_leaves_the_events_source(self, claimed):
+    async def test_a_hosted_github_opens_that_one_toggle_and_keeps_the_events_source_off(self, claimed):
         """The channel gateway polls GitHub, so the switch needs no credential
-        here. It writes ``sync.github.enabled`` alone: the events source reads
-        with gh on this machine, which a hosted GitHub does not set up."""
+        here. The events source reads with gh on this machine, which a hosted
+        GitHub does not set up, so the switch turns it off whichever way it
+        goes, also when an earlier write had turned it on."""
         choose(claimed, "personal")
-        _keep_no_secrets(claimed, **{"sync.github.mode": "hosted"})
-        events_before = claimed.settings_yaml()["sync"]["github_events"]["enabled"]
+        _keep_no_secrets(claimed, **{"sync.github.mode": "hosted", "sync.github_events.enabled": True})
         async with claimed.client() as http:
             sources = step((await http.get("/api/setup")).json(), "sources")
             assert sources["status"] == "pending" and sources["read_only"] is False
@@ -3510,9 +3510,14 @@ class TestNoLocalSecrets:
             sources = step(on.json(), "sources")
             assert sources["status"] == "done" and sources["read_only"] is False
             assert sources["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+            settings = claimed.settings_yaml()["sync"]
+            assert settings["github"] == {"enabled": True, "mode": "hosted"}
+            assert settings["github_events"]["enabled"] is False
+            off = await http.put("/api/setup/sources", json={"github": False})
+            assert off.status_code == 200, off.text
         settings = claimed.settings_yaml()["sync"]
-        assert settings["github"]["enabled"] is True
-        assert settings["github_events"]["enabled"] == events_before
+        assert settings["github"] == {"enabled": False, "mode": "hosted"}
+        assert settings["github_events"]["enabled"] is False
 
     async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
         """Open, the step behaves like any other: it waits for the Mode step

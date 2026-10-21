@@ -206,6 +206,13 @@ the hosted channel streams.
   burst; see [Runs on delivery](cron.md#runs-on-delivery). Gate a pull request
   monitor on `messages` with `sources: [github]` rather than on
   `github_pr_activity`, which always passes in hosted mode.
+- **The events source stays off.** `github_events` reads your own activity
+  with `gh` on this machine, which hosted GitHub does not set up. While the
+  mode is `hosted`, the GitHub switch of the setup page's Sources step and
+  `nerve init` write `sync.github_events.enabled: false`, where in poll mode
+  they switch it on and off together with GitHub. On a machine with a `gh`
+  login it can still be switched on in the settings, until the GitHub switch
+  is saved again.
 - **A switched-off hosted Slack holds GitHub back.** Nerve reads the events of
   every hosted provider from one ordered inbox at the gateway, and it stops
   reading while a hosted channel cannot take events. With `slack.mode: hosted`

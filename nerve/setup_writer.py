@@ -61,6 +61,7 @@ from nerve.config import (
     DEFAULT_MODEL,
     DEFAULT_RECALL_MODEL,
     DEFAULT_TITLE_MODEL,
+    GITHUB_SYNC_MODES,
     _expand_path,
     _interpolate_str,
     workspace_settings_file,
@@ -332,6 +333,13 @@ class SetupChoices:
     enabled_crons: list[str] = field(default_factory=list)
     # sync sources
     github_sync: bool = False
+    # How GitHub reaches the inbox (``sync.github.mode``), which no writer
+    # sets: with ``hosted`` the channel gateway polls it, and the GitHub
+    # switch then leaves the events source off, since that source reads with
+    # gh on this machine. ``None`` takes the mode the tracked settings state
+    # (the installer asks nothing about it); the web steps carry the running
+    # config's.
+    github_mode: str | None = None
     gmail_sync: bool = False
     gmail_accounts: list[str] = field(default_factory=list)
     telegram_sync: bool = False
@@ -596,7 +604,12 @@ def build_config_layers(
             "telegram": {"enabled": choices.telegram_sync},
             "gmail": {"enabled": choices.gmail_sync},
             "github": {"enabled": choices.github_sync},
-            "github_events": {"enabled": choices.github_sync},
+            # The events source reads with gh on this machine: it follows the
+            # GitHub switch while this machine polls GitHub, and stays off
+            # while the channel gateway does.
+            "github_events": {
+                "enabled": choices.github_sync and choices.github_mode != "hosted",
+            },
             # Disabled by default — requires an explicit list of repos to watch.
             "github_repos": {"enabled": False, "repos": []},
         }
@@ -802,13 +815,31 @@ def write_workspace_settings(choices: SetupChoices) -> SettingsOutcome:
     prints a tick, and discards the answer because the key already exists.
     Overwriting is recoverable -- there is a .bak, and the file is in a
     repo where the diff is visible before anyone commits it.
+
+    A GitHub mode the choices leave open is the one this file states: it is
+    the layer of ``sync.github.mode`` that the installer keeps, since it
+    rewrites config.yaml without one.
     """
+    settings_path = workspace_settings_file(workspace_dir(choices))
+    if choices.github_mode is None:
+        choices = dataclasses.replace(choices, github_mode=settings_github_mode(settings_path))
     _machine, portable, shadowed = build_config_layers(choices)
-    return _merge_settings(
-        workspace_settings_file(workspace_dir(choices)),
-        leaf_paths(portable),
-        shadowed,
-    )
+    return _merge_settings(settings_path, leaf_paths(portable), shadowed)
+
+
+def settings_github_mode(settings_path: Path) -> str:
+    """The ``sync.github.mode`` that a settings file states, read as the
+    loader reads it: ``poll`` when the file, the key or a known value is
+    missing."""
+    try:
+        section: Any = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return "poll"
+    for key in ("sync", "github"):
+        section = section.get(key) if isinstance(section, dict) else None
+    mode = section.get("mode") if isinstance(section, dict) else None
+    mode = str(mode or "poll").strip().lower()
+    return mode if mode in GITHUB_SYNC_MODES else "poll"
 
 
 def merge_settings_paths(
@@ -1984,6 +2015,7 @@ def choices_from_config(config) -> SetupChoices:
         ],
         telegram_enabled=bool(config.telegram.enabled),
         github_sync=bool(config.sync.github.enabled),
+        github_mode=str(config.sync.github.mode),
         gmail_sync=bool(config.sync.gmail.enabled),
         gmail_accounts=list(config.sync.gmail.accounts or []),
         telegram_sync=bool(config.sync.telegram.enabled),

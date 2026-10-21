@@ -1998,12 +1998,11 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         )
         portable_paths: list[str] = []
         if req.github is not None:
-            portable_paths.append("sync.github.enabled")
-            if live.github.mode != "hosted":
-                # The events source reads with the gh CLI on this machine,
-                # which a GitHub that the channel gateway polls does not set
-                # up, so with hosted GitHub the switch leaves it alone.
-                portable_paths.append("sync.github_events.enabled")
+            # The events source goes with the switch. It reads with the gh
+            # CLI on this machine, which a GitHub that the channel gateway
+            # polls does not set up, so with hosted GitHub the writer keeps it
+            # off in both directions.
+            portable_paths.extend(("sync.github.enabled", "sync.github_events.enabled"))
         if req.gmail is not None:
             portable_paths.append("sync.gmail.enabled")
         if req.telegram is not None:
