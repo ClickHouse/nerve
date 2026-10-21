@@ -1806,7 +1806,9 @@ memories section only: the same fast search, but its hits are kept even where
 searches the home namespace (unless Loom's deployment default searches every namespace
 of the token), where `memory_recall` reads them all. At most 8 memories, 500 characters
 each and 4,000 bytes in all, are frozen into the session. A Loom that refuses
-`context.pack` gets the search instead, with the abstention ignored.
+`context.pack`, or a pack that brings no memories, gets the search instead, with the
+abstention ignored: Loom answers a pack without a section that failed (an embedder
+timeout, say), and the search then fails as well, so nothing is frozen from it.
 
 The indexing sweep queues each session window with `memory.set_from_messages`
 (`defer: true`, every fact tagged `source:nerve`), in batches of at most 400 messages

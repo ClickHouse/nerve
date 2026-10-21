@@ -1066,6 +1066,60 @@ async def test_startup_recall_falls_back_to_search_ignoring_abstain(make_bridge)
 
 
 @pytest.mark.asyncio
+async def test_startup_recall_searches_when_the_pack_brings_no_memories(make_bridge) -> None:
+    """Loom answers a pack whose memories section failed (an embedder
+    timeout, say) without that section: the search decides."""
+    fake = FakeLoom()
+    fake.search_response = {"results": [
+        {"memory_key": "k1", "memory_type": "semantic", "content_excerpt": "a prior", "tags": []},
+    ], "abstain": True}
+    bridge = await make_bridge(fake)
+    fake.fail("context.pack", FakeLoom.pack_response({}))
+    assert await bridge.startup_recall("context for web session") == [
+        {"id": "k1", "type": "knowledge", "summary": "a prior"},
+    ]
+    # A section in which nothing reads as a whole item counts the same.
+    fake.fail("context.pack", FakeLoom.pack_response({"memories": "- [memory:ag\n" + _PACK_CUT}))
+    assert [m["id"] for m in await bridge.startup_recall("context for web session")] == ["k1"]
+    assert len(fake.bodies("memory.search")) == 2
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_freezes_nothing_while_the_search_fails_too(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    fake.fail("context.pack", FakeLoom.pack_response({}))
+    fake.fail("memory.search", *[_error(503, "EMBED_TIMEOUT", "embedder timed out")] * 3)
+    with pytest.raises(MemoryBackendUnavailable, match="EMBED_TIMEOUT"):
+        await recall_for_startup(bridge, "context for web session", 8)
+
+
+@pytest.mark.asyncio
+async def test_a_cut_inside_the_next_label_keeps_every_whole_item(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    first = _pack_item(f"memory:{HOME}/k1", "the first memory")
+    second = _pack_item(
+        f"memory:{HOME}/k2", "the second memory\nover two lines, the second long enough to be cut",
+    )
+
+    section = _pack_section([first, second], len(first) + 1 + len("- [memory:ag") + len(_PACK_CUT) + 2)
+    assert section == first + "\n- [memory:ag\n" + _PACK_CUT
+    fake.fail("context.pack", FakeLoom.pack_response({"memories": section}))
+    assert await bridge.startup_recall("memory") == [
+        {"id": "k1", "type": "", "summary": "the first memory"},
+    ]
+
+    # A cut inside an item's text or its later lines leaves that item out.
+    for keep in (second.index("\n") - 3, second.index("\n") + 6):
+        section = _pack_section([first, second], len(first) + 1 + keep + len(_PACK_CUT) + 2)
+        assert section.endswith(second[:keep] + "\n" + _PACK_CUT)
+        fake.fail("context.pack", FakeLoom.pack_response({"memories": section}))
+        assert [m["id"] for m in await bridge.startup_recall("memory")] == ["k1"]
+    assert fake.bodies("memory.search") == []
+
+
+@pytest.mark.asyncio
 async def test_startup_recall_outage_raises_so_nothing_is_frozen(make_bridge) -> None:
     fake = FakeLoom()
     bridge = await make_bridge(fake)

@@ -1129,8 +1129,11 @@ class LoomBridge:
         no category blurbs take their place. The pack searches the namespace
         it is given (unless Loom is set to search every namespace of the
         token), so these come from the home namespace. A Loom that refuses
-        the pack gets recall's search with the abstention ignored. At most
-        ``limit`` items of 500 characters, 4,000 bytes in all.
+        the pack, or a pack that brings no memories, gets recall's search with
+        the abstention ignored: Loom builds each section on its own and
+        answers without one that failed, so an empty section does not prove
+        an empty memory, while the search raises when Loom is failing. At
+        most ``limit`` items of 500 characters, 4,000 bytes in all.
         """
         if not self._available:
             return []
@@ -1153,44 +1156,49 @@ class LoomBridge:
             })
         except LoomRequestError as e:
             logger.info("Loom refused context.pack (%s); the startup recall searches instead", e)
-            items = await self._search_items(query, limit, keep_abstained=True)
+            items = []
         else:
             sections = data.get("sections") or {}
             items = self._pack_items(str(sections.get("memories") or ""))
+        if not items:
+            # A section that failed (an embedder timeout, say) is left out of
+            # an answer that still succeeds; nothing must be frozen from it.
+            items = await self._search_items(query, limit, keep_abstained=True)
         return _within_bytes(items[:limit], _STARTUP_MAX_BYTES)
 
     def _pack_items(self, rendered: str) -> list[dict[str, str]]:
         """The items of a context.pack section, in its order.
 
-        Loom escapes ``<`` and ``>`` in recalled text, and a section cut to
-        its budget ends in ``...[truncated]``, its last item perhaps cut
-        short: that one is left out.
+        Loom escapes ``<`` and ``>`` in recalled text. A section cut to its
+        budget ends in a ``...[truncated]`` line; the item the cut went
+        through is left out, and a cut inside the next item's label costs
+        nothing, since that line is no item.
         """
+        lines = rendered.rstrip().splitlines()
+        cut = bool(lines) and lines[-1].strip() == _PACK_TRUNCATED
+        if cut:
+            lines = lines[:-1]
         items: list[dict[str, str]] = []
         current: dict[str, str] | None = None
-        for line in rendered.splitlines():
+        for line in lines:
             if line.startswith("- ["):
-                if current is not None:
-                    items.append(current)
                 current = None
                 match = _PACK_LINE_RE.fullmatch(line)
-                if not match:
-                    continue
-                cite = unquote(match["cite"]).removeprefix("memory:").split("#", 1)[0]
+                cite = unquote(match["cite"]).removeprefix("memory:").split("#", 1)[0] if match else ""
                 namespace, _, key = cite.partition("/")
-                if not key:
-                    continue
-                current = {
-                    "id": self._display_id(key, namespace),
-                    "type": _nerve_type((), key, ""),
-                    "summary": match["text"],
-                }
+                if match and key:
+                    current = {
+                        "id": self._display_id(key, namespace),
+                        "type": _nerve_type((), key, ""),
+                        "summary": match["text"],
+                    }
+                    items.append(current)
             elif line.startswith("  ") and current is not None:
                 current["summary"] += "\n" + line[2:]
-        if current is not None:
-            items.append(current)
-        if rendered.rstrip().endswith(_PACK_TRUNCATED):
-            items = items[:-1]
+            else:
+                current = None
+        if cut and current is not None and items and items[-1] is current:
+            items.pop()  # the cut went through it
         out = []
         for item in items:
             text = item["summary"].replace("&lt;", "<").replace("&gt;", ">")
