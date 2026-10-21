@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   api, type PairingStatus, type SetupChannelsDetail,
-  type SetupOnboarding, type SetupProfileDetail, type SetupProviderDetail, type SetupSourcesDetail,
+  type SetupProfileDetail, type SetupProviderDetail, type SetupSourcesDetail,
   type SetupState,
 } from '../../api/client';
 import { useAuthStore } from '../../stores/authStore';
@@ -18,8 +18,6 @@ import { stepOf, stopPath } from './navigation';
 import { PairingWidget } from './PairingWidget';
 import { personNameFor } from './personName';
 
-type OnboardingAnswer = { status: SetupOnboarding; session_id: string | null };
-
 /**
  * The ending. "Nerve is ready", what was set up, and the way into the
  * onboarding conversation, where the agent asks what the person wants it to
@@ -31,10 +29,7 @@ type OnboardingAnswer = { status: SetupOnboarding; session_id: string | null };
  * takes focus on arrival: the Review's button is gone, and the overlay that
  * may have covered it has closed.
  */
-export function ReadyScreen({ state, onboarding }: {
-  state: SetupState;
-  onboarding?: OnboardingAnswer | null;
-}) {
+export function ReadyScreen({ state }: { state: SetupState }) {
   const navigate = useNavigate();
   const viewer = useAuthStore((s) => s.viewer);
   const error = useSetupStore((s) => s.error);
@@ -62,13 +57,10 @@ export function ReadyScreen({ state, onboarding }: {
     return () => { alive = false; };
   }, [offerPairing]);
 
-  // finish() answered with the conversation it opened; the checklist read
-  // afterwards says the same, and is the newer fact once it names a session.
-  const live = onboardingOf(state);
-  const conversation = live.status === 'running' && live.sessionId
-    ? live.sessionId
-    : (onboarding?.status === 'running' ? onboarding.session_id : null);
-  const waitsForRestart = !conversation && live.status === 'pending' && state.restart_pending;
+  // finish() answers with the checklist read after it opened the conversation.
+  const onboarding = onboardingOf(state);
+  const conversation = onboarding.status === 'running' ? onboarding.sessionId : null;
+  const waitsForRestart = !conversation && onboarding.status === 'pending' && state.restart_pending;
 
   // What was set up, one line each. A credential the operator provided
   // says so (the server's own summary already does for the model); the

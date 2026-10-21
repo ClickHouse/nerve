@@ -296,7 +296,7 @@ class TestInstallerOutputIsUnchanged:
         _assert_matches_golden(produced, "unattended-worker")
         # The worker template with the description in place — the same file
         # the web Mode step and ``nerve init --terminal`` write — still
-        # carrying the marker the onboarding session deletes.
+        # carrying the marker that onboarding_done deletes.
         assert produced["TASK.md"].startswith("# Task\n")
         assert produced["TASK.md"] == render_task_md("Keep the build green.")
         assert produced["TASK.md"].splitlines()[1].startswith(TASK_ONBOARDING_MARKER)
@@ -682,7 +682,7 @@ class TestApplyMode:
         # Still pending (the marker stands): a second description replaces it.
         apply_mode(ws, "worker", "Something else entirely, twenty characters.")
         assert "Something else" in task.read_text(encoding="utf-8")
-        # Once the onboarding session deleted the marker, the file is theirs.
+        # Once onboarding deleted the marker, the file is theirs.
         task.write_text(text.replace(lines[1] + "\n", "", 1), encoding="utf-8")
         again = apply_mode(ws, "worker", "A third description that must not land.")
         assert not again.task_written
@@ -782,7 +782,7 @@ class TestApplyMode:
     def test_worker_mode_writes_no_quiet_hours_and_leaves_task_planner_off(self, tmp_path: Path) -> None:
         """A worker's defaults: quiet hours off — stated as empty strings, so
         the loader's own 02:00–08:00 cannot come back — and task-planner in
-        the catalogue but disabled until the onboarding session decides."""
+        the catalogue but disabled until the onboarding conversation decides."""
         ws = tmp_path / "ws"
         outcome = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
         assert {"quiet_start", "quiet_end"} <= set(outcome.settings_defaults_added)
@@ -972,7 +972,7 @@ class TestFixRoundTwoWriterRules:
 
 class TestModeDefaults:
     """Quiet hours are optional (a worker's are off) and a worker's
-    task-planner is off until its onboarding session enables it."""
+    task-planner is off until its onboarding conversation enables it."""
 
     @staticmethod
     def _quiet(**fields) -> tuple[str, str]:

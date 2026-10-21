@@ -3,8 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupFinishResponse, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession,
-  TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession, TelegramSyncSessionSummary,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -2368,10 +2367,10 @@ describe('review and the ending', () => {
     }), step('provider', { status: 'done' })],
     ...overrides,
   });
-  const renderReady = (state: SetupState, onboarding: SetupFinishResponse['onboarding'] | null = null) => render(
+  const renderReady = (state: SetupState) => render(
     <MemoryRouter initialEntries={['/setup/review']}>
       <Routes>
-        <Route path="/setup/review" element={<ReadyScreen state={state} onboarding={onboarding} />} />
+        <Route path="/setup/review" element={<ReadyScreen state={state} />} />
         <Route path="/chat/:sessionId" element={<ChatProbe />} />
       </Routes>
     </MemoryRouter>,
@@ -2386,12 +2385,6 @@ describe('review and the ending', () => {
       expect(await screen.findByText(`chat page onboarding-${mode}`)).toBeInTheDocument();
       view.unmount();
     }
-  });
-
-  it('follows the conversation that finish() opened while the checklist still reads pending', async () => {
-    renderReady(withOnboarding('personal', 'pending', null), { status: 'running', session_id: 'onboarding-2' });
-    await userEvent.click(screen.getByRole('button', { name: 'Start the conversation' }));
-    expect(await screen.findByText('chat page onboarding-2')).toBeInTheDocument();
   });
 
   it('says the conversation opens after the restart, and offers chat once onboarding is over', () => {

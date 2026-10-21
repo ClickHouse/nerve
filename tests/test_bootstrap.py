@@ -205,7 +205,7 @@ class TestNonInteractiveSetup:
 
     def test_worker_mode_defaults(self, tmp_path: Path) -> None:
         """Worker non-interactive: the two skill jobs on, task-planner
-        written but off (the onboarding session decides), quiet hours none."""
+        written but off (the onboarding conversation decides), quiet hours none."""
         env = {
             "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
             "NERVE_MODE": "worker",

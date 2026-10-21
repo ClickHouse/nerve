@@ -334,9 +334,9 @@ class TestDoneRules:
         assert statuses(facts(personal, state=SetupState(answered={"agents"})))["agents"] == "done"
 
     def test_onboarding_flows_into_the_mode_detail(self, worker):
-        s = step(facts(worker, onboarding="running", onboarding_session_id="cron:worker-onboarding:1"), "mode")
+        s = step(facts(worker, onboarding="running", onboarding_session_id="onboarding-1"), "mode")
         assert s["detail"]["onboarding"] == "running"
-        assert s["detail"]["onboarding_session_id"] == "cron:worker-onboarding:1"
+        assert s["detail"]["onboarding_session_id"] == "onboarding-1"
         assert s["detail"]["task_present"] is True
         assert checklist.onboarding_from_task(worker, "worker") == "pending"
         (worker / "TASK.md").write_text("# Task\n\n## Mission\nx\n", encoding="utf-8")

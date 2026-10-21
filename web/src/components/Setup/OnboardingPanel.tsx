@@ -42,7 +42,8 @@ export function OnboardingPanel({ state }: { state: SetupState }) {
             >
               {ONBOARDING_SKIP}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfirming(false)}>
+            {/* The safe choice takes the focus that the Skip button had. */}
+            <Button variant="ghost" size="sm" autoFocus onClick={() => setConfirming(false)}>
               {ONBOARDING_SKIP_KEEP}
             </Button>
           </div>

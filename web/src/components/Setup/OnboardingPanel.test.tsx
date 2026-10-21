@@ -64,6 +64,7 @@ describe('OnboardingPanel', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Skip onboarding' }));
     expect(screen.getByText(/Nothing is set up for you/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Keep it' })).toHaveFocus();
     expect(api.setupSkipOnboarding).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Keep it' }));
     expect(screen.queryByText(/Nothing is set up for you/)).not.toBeInTheDocument();

@@ -449,7 +449,7 @@ class TestModeLock:
         assert "{{TASK_DESCRIPTION}}" not in task_md
         assert step(state, "profile")["title"] == "Operator"
         # A worker's defaults: no quiet hours, stated in the tracked settings,
-        # and task-planner offered but off until the onboarding session decides.
+        # and task-planner offered but off until the onboarding conversation decides.
         assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("", "")
         profile = step(state, "profile")["detail"]
         assert (profile["quiet_enabled"], profile["quiet_start"], profile["quiet_end"]) == (False, "", "")
