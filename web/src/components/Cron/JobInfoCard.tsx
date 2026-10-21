@@ -1,7 +1,7 @@
 import type { CronJob } from '../../stores/cronStore';
 import { Badge } from '../ui';
 import { Filter, FileText } from '../ui/icons';
-import { formatRelativeTime, formatSchedule } from './utils';
+import { formatForecast, formatRelativeTime, formatSchedule } from './utils';
 import { ChatLink, JobTypeBadge, JobTypeIcon, RotateButton, TriggerButton } from './controls';
 
 export function JobInfoCard({ job }: { job: CronJob }) {
@@ -30,7 +30,7 @@ export function JobInfoCard({ job }: { job: CronJob }) {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
           <div className="text-xs text-text-dim mb-0.5">Schedule</div>
           <div className="text-sm text-text-secondary">{formatSchedule(job.schedule)}</div>
@@ -40,6 +40,14 @@ export function JobInfoCard({ job }: { job: CronJob }) {
           <div className="text-xs text-text-dim mb-0.5">Next Run</div>
           <div className="text-sm text-text-secondary">
             {job.next_run ? formatRelativeTime(job.next_run) : '—'}
+          </div>
+        </div>
+        <div>
+          {/* Judged from what is known now: a gate over local state gives the
+              same answer when the run comes, unless something changes first. */}
+          <div className="text-xs text-text-dim mb-0.5">Forecast</div>
+          <div className="text-sm text-text-secondary" data-testid="cron-forecast">
+            {formatForecast(job)}
           </div>
         </div>
         <div>

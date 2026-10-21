@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type CronSchedule } from '../api/client';
 
 export const LOGS_PAGE_SIZE = 50;
 
@@ -17,6 +17,19 @@ export interface CronJob {
   next_run: string | null;
   /** Most recently active chat session for this job (cron:{id}[:{run}]). */
   last_session_id?: string | null;
+  /** What the gates say about the next run, judged now; null when unknown. */
+  forecast?: 'run' | 'skip' | null;
+  /** Why the next run is forecast to skip. */
+  forecast_reason?: string | null;
+}
+
+/** Each job with the forecast the schedule reports for it. */
+function withForecasts(jobs: CronJob[], schedule: CronSchedule | null): CronJob[] {
+  const byId = new Map((schedule?.jobs ?? []).map(f => [f.id, f]));
+  return jobs.map(job => {
+    const f = byId.get(job.id);
+    return { ...job, forecast: f?.forecast ?? null, forecast_reason: f?.reason ?? null };
+  });
 }
 
 export interface CronLog {
@@ -62,8 +75,15 @@ export const useCronStore = create<CronState>((set, get) => ({
 
   loadJobs: async () => {
     try {
-      const { jobs } = await api.listCronJobs();
-      set({ jobs });
+      const [{ jobs }, schedule] = await Promise.all([
+        api.listCronJobs(),
+        // The forecast adds to the list; the list stands without it.
+        api.getCronSchedule().catch((e) => {
+          console.error('Failed to load the cron schedule:', e);
+          return null;
+        }),
+      ]);
+      set({ jobs: withForecasts(jobs, schedule) });
     } catch (e) {
       console.error('Failed to load cron jobs:', e);
     }
