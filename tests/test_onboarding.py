@@ -229,3 +229,41 @@ class TestEffectiveCronState:
         plan = plan_optional_crons(tmp_path, {"skill-extractor"})
         assert "skill-reviser" not in plan.disabled and "skill-reviser" not in plan.enabled
         assert plan.text is None and system_cron_file(tmp_path).read_text() == before
+
+
+class _NoMemory:
+    available = False
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def initialize(self):
+        return False
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_the_engine_asks_for_the_conversation_when_it_starts(db, tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    from nerve.agent.engine import AgentEngine
+    from nerve.config import NerveConfig
+
+    asked: list[Path] = []
+
+    async def _start_on_boot(engine, workspace):
+        asked.append(workspace)
+
+    monkeypatch.setattr(onboarding, "start_on_boot", _start_on_boot)
+    config = NerveConfig(workspace=tmp_path)
+    config.codex.home_dir = tmp_path / "codex"
+    engine = AgentEngine(config, db)
+    with patch("nerve.memory.memu_bridge.MemUBridge", _NoMemory), \
+         patch("nerve.memory.xmemory_bridge.XmemoryBridge", _NoMemory), \
+         patch("nerve.config.load_claude_code_plugins"):
+        await engine.initialize()
+    await asyncio.wait_for(engine._onboarding_boot, 5)
+    await engine.shutdown()
+    assert asked == [tmp_path]
