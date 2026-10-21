@@ -14,9 +14,10 @@ import { ExternalLink, Lightbulb } from '../ui/icons';
  * to action. A pending plan with feedback has a revision request: the
  * agent writes the next version, and nothing waits for the user.
  *
- * `refreshKey` is the task's `updated_at`. The plan tools write a note on
- * the task when they propose a plan, and that note changes `updated_at`,
- * so a plan that arrives while the task is open shows without a reload.
+ * `refreshKey` is the task's `updated_at`. Each plan change (propose,
+ * update, revision request, approval, decline) writes a note on the task,
+ * and that note changes `updated_at`, so the section shows the change
+ * while the task is open, without a reload.
  */
 export function TaskPlan({ taskId, refreshKey }: { taskId: string; refreshKey?: string }) {
   const navigate = useNavigate();

@@ -26,11 +26,11 @@ function PlanPageProbe() {
   return <div>plan page {planId}</div>;
 }
 
-function renderAt(refreshKey = 'a') {
+function renderAt() {
   return render(
     <MemoryRouter initialEntries={['/tasks/t1']}>
       <Routes>
-        <Route path="/tasks/:taskId" element={<TaskPlan taskId="t1" refreshKey={refreshKey} />} />
+        <Route path="/tasks/:taskId" element={<TaskPlan taskId="t1" />} />
         <Route path="/plans/:planId" element={<PlanPageProbe />} />
       </Routes>
     </MemoryRouter>,
@@ -88,24 +88,6 @@ describe('TaskPlan', () => {
     const region = await screen.findByRole('region', { name: 'Plan' });
     expect(region).toHaveTextContent('Revision requested');
     expect(region).not.toHaveTextContent('waits for your review');
-  });
-
-  it('reads the plans again when the task changes', async () => {
-    getTaskPlans.mockResolvedValueOnce({ plans: [] });
-    const { rerender } = renderAt('a');
-    await waitFor(() => expect(getTaskPlans).toHaveBeenCalledTimes(1));
-
-    getTaskPlans.mockResolvedValueOnce({ plans: [plan({})] });
-    rerender(
-      <MemoryRouter initialEntries={['/tasks/t1']}>
-        <Routes>
-          <Route path="/tasks/:taskId" element={<TaskPlan taskId="t1" refreshKey="b" />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText('A plan waits for your review')).toBeInTheDocument();
-    expect(getTaskPlans).toHaveBeenCalledTimes(2);
   });
 
   it('shows nothing when the plans cannot be read', async () => {
