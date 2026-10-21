@@ -276,7 +276,8 @@ class CodexAppServerClient:
         )
 
     async def close(self) -> None:
-        """Terminate the subprocess and fail everything pending."""
+        """Terminate the subprocess, fail everything pending, then stop the
+        run's scope if the launch was contained."""
         self._closed = True
         tasks = [
             task for task in (self._reader_task, self._stderr_task)
@@ -308,6 +309,22 @@ class CodexAppServerClient:
         self._reader_task = None
         self._stderr_task = None
         self._server_request_tasks.clear()
+
+        # Stop the scope too: it holds descendants outside the process group.
+        if self._containment is not None and self._lifecycle_record is not None:
+            try:
+                receipt = await asyncio.to_thread(
+                    lifecycle.reap, self._containment.run_dir,
+                    unit=self._lifecycle_record.unit,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("codex scope reap failed on close")
+            else:
+                if receipt.outcome not in ("complete", "no_scope"):
+                    logger.warning(
+                        "codex scope %s not reaped on close (%s: %s)",
+                        self._lifecycle_record.unit, receipt.outcome, receipt.error,
+                    )
 
     @staticmethod
     def _signal_process_tree(

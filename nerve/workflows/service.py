@@ -755,12 +755,6 @@ class WorkflowRunService:
                 logger.exception(
                     "workflow run completion listener failed for %s", run_id,
                 )
-        # Reap the run's contained descendants in the background.
-        if str(run.get("engine") or "") == ENGINE_CODEX:
-            self._spawn_detached(
-                self._reap_codex_lifecycle(run_id),
-                f"workflow-lifecycle-reap-{run_id}",
-            )
 
     @staticmethod
     def _is_quiet(run: dict | None) -> bool:
@@ -1029,6 +1023,9 @@ class WorkflowRunService:
             )
         except Exception:  # noqa: BLE001
             logger.exception("client teardown failed for %s", session_id)
+        # Closing a contained client stops its scope; this reaps one the close
+        # left behind (no-op without a record).
+        await self._reap_codex_lifecycle(run_id)
 
     async def _stop_session_hard(self, run_id: str) -> None:
         """Graceful interrupt → grace window → force client discard.

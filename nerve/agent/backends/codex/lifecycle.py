@@ -33,6 +33,7 @@ SCOPE_DESCRIPTION = "Nerve Codex workflow run containment"
 # systemd-run sends TERM, then SIGKILL after this grace, over the whole cgroup.
 TERM_GRACE_SECONDS = 5
 STOP_TIMEOUT_SECONDS = 20
+EMPTY_WAIT_SECONDS = 3
 
 _UNIT_RE = re.compile(r"^nerve-wf-[A-Za-z0-9:_.-]+\.scope$")
 _RUN_ID_RE = re.compile(r"^wfr-[A-Za-z0-9_]+$")
@@ -347,9 +348,10 @@ def record_launched(run_dir: Path, record: LifecycleRecord) -> LifecycleRecord:
 # -- reap + reconcile -------------------------------------------------------- #
 
 
-def reap(run_dir: Path) -> Receipt:
+def reap(run_dir: Path, *, unit: str | None = None) -> Receipt:
     """Reap a run's contained descendants from its durable record. Idempotent:
-    a record already carrying a terminal receipt is returned unchanged."""
+    a record already carrying a terminal receipt is returned unchanged. With
+    ``unit``, a record naming a different unit is left alone (``no_scope``)."""
     run_dir = Path(run_dir)
     if not record_path(run_dir).exists():
         return Receipt(outcome="no_scope")
@@ -358,7 +360,7 @@ def reap(run_dir: Path) -> Receipt:
     except LifecycleError as e:
         logger.warning("refusing to reap from corrupt record in %s: %s", run_dir, e)
         return Receipt(outcome="pending_retry", error="corrupt record")
-    if record is None:
+    if record is None or (unit is not None and record.unit != unit):
         return Receipt(outcome="no_scope")
     prev = _receipt_from(record)
     if prev is not None and prev.is_terminal():
@@ -398,9 +400,18 @@ def _do_reap(record: LifecycleRecord) -> Receipt:
     ok, err = _scope_stop(record.unit)
     if not ok:
         return Receipt(outcome="pending_retry", error=err)
-    if _cgroup_gone_or_empty(record.control_group) is True:
-        return Receipt(outcome="complete")
-    return Receipt(outcome="pending_retry", error="scope still populated after stop")
+    # The cgroup can report populated briefly after the stop returns. A record
+    # written before registration has no cgroup path; the unit unloading then
+    # confirms the scope is empty.
+    deadline = time.monotonic() + EMPTY_WAIT_SECONDS
+    while True:
+        if _cgroup_gone_or_empty(record.control_group) is True:
+            return Receipt(outcome="complete")
+        if (_unit_identity(record.unit) or {}).get("LoadState") == "not-found":
+            return Receipt(outcome="complete")
+        if time.monotonic() >= deadline:
+            return Receipt(outcome="pending_retry", error="scope still populated after stop")
+        time.sleep(0.1)
 
 
 def reconcile(runs_dir: Path) -> list[tuple[str, Receipt]]:

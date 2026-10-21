@@ -323,3 +323,162 @@ def test_reconcile_reaps_recorded_scope(tmp_path, scopes):
 def test_reconcile_skips_dirs_without_a_record(tmp_path):
     (tmp_path / "wf" / "plain-run").mkdir(parents=True)   # e.g. a Claude run dir
     assert lifecycle.reconcile(tmp_path / "wf") == []
+
+
+# -- client close + workflow stop paths ------------------------------------- #
+
+
+def _escaping_launcher(tmp_path: Path) -> tuple[Path, Path]:
+    """An executable that starts a setsid escapee (in its own launch dir), then
+    execs the fake app-server. Returns (launcher, launches_dir)."""
+    launches = tmp_path / "launches"
+    launches.mkdir()
+    launcher = tmp_path / "codex-launcher"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *--version*) exec "$NERVE_PY" "$NERVE_FAKE" "$@";; esac\n'
+        'out=$(mktemp -d "$NERVE_LAUNCHES/l-XXXXXX")\n'
+        '"$NERVE_PY" "$NERVE_ESCAPER" spawn-escapee "$out" >/dev/null 2>&1\n'
+        'exec "$NERVE_PY" "$NERVE_FAKE" "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return launcher, launches
+
+
+def _launcher_env(launches: Path, token: str) -> dict[str, str]:
+    return {"NERVE_PY": sys.executable, "NERVE_FAKE": FAKE, "NERVE_ESCAPER": ESCAPER,
+            "NERVE_LAUNCHES": str(launches), "ESCAPER_TOKEN": token}
+
+
+def _escapees(launches: Path) -> list[int]:
+    return [int((d / "grandchild.pid").read_text())
+            for d in sorted(launches.iterdir()) if (d / "grandchild.pid").exists()]
+
+
+def test_reap_with_unit_leaves_a_newer_record_alone(tmp_path, monkeypatch):
+    run_dir = tmp_path / "w"
+    run_dir.mkdir()
+    lifecycle.write_record(run_dir, lifecycle.LifecycleRecord(
+        run_id="wfr-w", unit="nerve-wf-wfr-w-new.scope", boot_id=lifecycle._boot_id()))
+    monkeypatch.setattr(lifecycle, "_unit_identity", _fail_if_called)
+    monkeypatch.setattr(lifecycle, "_scope_stop", _fail_if_called)
+    assert lifecycle.reap(run_dir, unit="nerve-wf-wfr-w-old.scope").outcome == "no_scope"
+
+
+def test_reap_before_registration_confirms_by_unit_unload(tmp_path, monkeypatch):
+    run_dir = tmp_path / "p"
+    run_dir.mkdir()
+    lifecycle.write_record(run_dir, lifecycle.LifecycleRecord(
+        run_id="wfr-p", unit="nerve-wf-wfr-p-n.scope", boot_id=lifecycle._boot_id()))
+    states = iter([
+        {"LoadState": "loaded", "InvocationID": "i", "ControlGroup": "",
+         "Description": lifecycle.SCOPE_DESCRIPTION},
+        {"LoadState": "not-found"},
+    ])
+    stops = []
+    monkeypatch.setattr(lifecycle, "_unit_identity", lambda u: next(states))
+    monkeypatch.setattr(lifecycle, "_scope_stop", lambda u: (stops.append(u), (True, ""))[1])
+    assert lifecycle.reap(run_dir).outcome == "complete"
+    assert stops == ["nerve-wf-wfr-p-n.scope"]
+
+
+@requires_scope
+@pytest.mark.asyncio
+async def test_close_stops_own_scope(tmp_path, scopes):
+    run_dir = tmp_path / "workflow-runs" / "wfr-close"
+    scopes["run_dirs"].add(run_dir)
+    launcher, launches = _escaping_launcher(tmp_path)
+    token = "lc" + uuid.uuid4().hex[:12]
+    scopes["tokens"].add(token)
+    cwd = tmp_path / "ws"
+    cwd.mkdir()
+
+    async def _handler(method, params):
+        return {}
+
+    client = CodexAppServerClient(
+        bin_path=str(launcher), cwd=str(cwd),
+        env={**os.environ, **_launcher_env(launches, token),
+             "CODEX_HOME": str(tmp_path / "home"), "FAKE_CODEX_MODE": "basic"},
+        server_request_handler=_handler, config_overrides=[],
+        containment=lifecycle.WorkflowContainment(run_dir=run_dir, run_id="wfr-close"),
+    )
+    await client.start()
+    [gc] = _escapees(launches)
+    rec = lifecycle.read_record(run_dir)
+    assert _alive(gc) and lifecycle.proc_cgroup(gc) == rec.control_group
+    await client.close()
+    assert not _alive(gc)                          # escaped the process group, not the scope
+    assert lifecycle.read_record(run_dir).receipt["outcome"] == "complete"
+
+
+@requires_scope
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_via", ["kill_run", "budget_kill", "stop_session"])
+async def test_workflow_stop_before_content_reaps_and_never_relaunches(
+    db, tmp_path, scopes, monkeypatch, stop_via,
+):
+    """A stop or budget kill while the turn has produced no content must not
+    let the engine's transport retry launch a second scope, and must leave no
+    descendant alive. Real AgentEngine, WorkflowRunService and CodexBackend."""
+    import asyncio
+
+    from nerve.agent.engine import AgentEngine
+    from nerve.workflows.service import ENGINE_CODEX, WorkflowRunService
+    from tests.actor_rows import ensure_system_principal
+
+    await ensure_system_principal(db)
+    launcher, launches = _escaping_launcher(tmp_path)
+    token = "lc" + uuid.uuid4().hex[:12]
+    scopes["tokens"].add(token)
+    for k, v in _launcher_env(launches, token).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("FAKE_CODEX_MODE", "stall")
+    runs_dir = tmp_path / "workflow-runs"
+    cfg = NerveConfig.from_dict({
+        "workspace": str(tmp_path / "ws"),
+        "workflows": {"runs_dir": str(runs_dir), "kill_grace_seconds": 1},
+        "codex": {"bin_path": str(launcher), "home_dir": str(tmp_path / "home"),
+                  "model": "gpt-5.6-sol", "lifecycle": {"mode": "strict"}},
+    })
+    (tmp_path / "ws").mkdir()
+    runs_dir.mkdir()
+    engine = AgentEngine(cfg, db)
+    svc = WorkflowRunService(cfg, db, engine)
+    engine.add_stop_listener(svc._on_session_stop)   # registered by svc.start()
+    run_id = "wfr-race" + stop_via.replace("_", "")
+    run_dir = runs_dir / run_id
+    scopes["run_dirs"].add(run_dir)
+    await db.create_workflow_run(run_id, ENGINE_CODEX, {"prompt": "p"}, 5.0)
+    await db.transition_workflow_run(run_id, "running", expect=("pending",))
+    task = asyncio.create_task(svc._execute(run_id))
+    svc._exec_tasks[run_id] = task
+    try:
+        deadline = asyncio.get_running_loop().time() + 30
+        while not (_escapees(launches) and engine.is_session_running(f"workflow:{run_id}")
+                   and (lifecycle.read_record(run_dir) or lifecycle.LifecycleRecord(
+                       run_id=run_id, unit="nerve-wf-x.scope", boot_id="")).control_group):
+            assert asyncio.get_running_loop().time() < deadline, "turn never started"
+            await asyncio.sleep(0.1)
+        [gc] = _escapees(launches)
+        assert _alive(gc)
+
+        if stop_via == "kill_run":
+            await svc.kill_run(run_id, "test")
+        elif stop_via == "budget_kill":
+            await svc._budget_kill(await db.get_workflow_run(run_id), 6.0)
+        else:
+            await engine.stop_session(f"workflow:{run_id}")
+
+        deadline = asyncio.get_running_loop().time() + 60
+        while svc._exec_tasks or svc._kill_tasks:
+            assert asyncio.get_running_loop().time() < deadline, "stop did not settle"
+            await asyncio.gather(*svc._exec_tasks.values(), *svc._kill_tasks,
+                                 return_exceptions=True)
+    finally:
+        await engine.shutdown()
+
+    assert len(list(launches.iterdir())) == 1      # no relaunch after terminal
+    assert not any(_alive(pid) for pid in _escapees(launches))
+    assert lifecycle.read_record(run_dir).receipt["outcome"] == "complete"
+    assert (await db.get_workflow_run(run_id))["status"] in ("killed", "budget_exhausted")
