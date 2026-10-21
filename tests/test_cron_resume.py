@@ -15,6 +15,7 @@ import time as real_time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -54,6 +55,26 @@ class FakeClock:
         self.wall_offset += seconds
 
 
+class ManualClock:
+    """Both clocks, under the test's control alone: nothing moves unless the
+    test moves it, so the difference between two samples is exact."""
+
+    def __init__(self, wall: float) -> None:
+        self.wall = wall
+        self.mono = 1_000.0
+
+    def time(self) -> float:
+        return self.wall
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def run_for(self, seconds: float) -> None:
+        """*seconds* go by, with the machine running: both clocks move."""
+        self.wall += seconds
+        self.mono += seconds
+
+
 def _mock_db() -> AsyncMock:
     db = AsyncMock()
     db.log_cron_start = AsyncMock(return_value=1)
@@ -62,9 +83,9 @@ def _mock_db() -> AsyncMock:
     return db
 
 
-def _service(tmp_path, db=None) -> CronService:
+def _service(tmp_path, db=None, tz: str = "UTC") -> CronService:
     config = MagicMock()
-    config.timezone = "UTC"
+    config.timezone = tz
     config.lockdown = False
     config.cron.gate_plugins_dir = tmp_path / "gates"  # absent -> no plugins
     config.agent.cron_model = "test-model"
@@ -266,6 +287,63 @@ async def test_the_watcher_keeps_watching_while_a_catch_up_runs(tmp_path, monkey
         release.set()
         await svc.stop()
 
+
+@pytest.mark.parametrize(("jump", "is_pause"), [(5.0, True), (4.999, False)])
+def test_a_pause_is_a_jump_of_five_seconds_or_more(tmp_path, monkeypatch, jump, is_pause):
+    clock = ManualClock(wall=1_800_000_000.0)
+    monkeypatch.setattr(cron_service, "time", clock)
+    svc = _service(tmp_path)
+    assert svc._sample_clock() is None  # nothing to compare the first one with
+
+    clock.run_for(60)
+    clock.wall += jump
+    step = svc._sample_clock()
+
+    if is_pause:
+        assert step is not None
+        assert step[2] == jump
+    else:
+        assert step is None
+
+
+NEW_YORK = "America/New_York"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("local_before", "wall_step"),
+    [
+        # 01:59:58 EST, and four seconds later it is 03:00:02 EDT.
+        (datetime(2026, 3, 8, 1, 59, 58, tzinfo=ZoneInfo(NEW_YORK)), 0),
+        # 01:59:58 EDT, and four seconds later it is 01:00:02 EST.
+        (datetime(2026, 11, 1, 1, 59, 58, tzinfo=ZoneInfo(NEW_YORK)), 0),
+        # The same, on a machine whose clock keeps local time and is set back.
+        (datetime(2026, 11, 1, 1, 59, 58, tzinfo=ZoneInfo(NEW_YORK)), -HOUR),
+    ],
+    ids=["dst-starts", "dst-ends", "clock-set-back-as-dst-ends"],
+)
+async def test_a_dst_change_is_not_a_pause(held_service, monkeypatch, local_before, wall_step):
+    """New York's local time jumps at a DST change; the clock the service
+    compares does not, and a wall clock set back is never a pause."""
+    clock = ManualClock(wall=local_before.timestamp())
+    monkeypatch.setattr(cron_service, "time", clock)
+    hourly = CronJob(id="hourly", schedule="0 * * * *", prompt="p")
+    svc = await held_service([hourly], tz=NEW_YORK)
+    svc._on_clock_step = MagicMock(return_value=None)
+    svc._check_clock()
+
+    clock.run_for(4)
+    clock.wall += wall_step
+    local_after = datetime.fromtimestamp(clock.wall, ZoneInfo(NEW_YORK))
+    # Read off a local clock, time jumped by an hour.
+    jumped = local_after.replace(tzinfo=None) - local_before.replace(tzinfo=None)
+    assert abs(abs(jumped) - timedelta(hours=1)) < timedelta(seconds=5)
+    svc._check_clock()
+
+    svc._on_clock_step.assert_not_called()
+    svc.engine.run_cron.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # What a pause does to the schedule
 # ---------------------------------------------------------------------------
@@ -280,8 +358,8 @@ async def held_service(tmp_path, monkeypatch):
     monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0)
     started: list[CronService] = []
 
-    async def make(jobs=(), runners=(), db=None) -> CronService:
-        svc = _service(tmp_path, db)
+    async def make(jobs=(), runners=(), db=None, tz: str = "UTC") -> CronService:
+        svc = _service(tmp_path, db, tz)
         await _start(svc, jobs, runners)
         svc.scheduler.pause()
         started.append(svc)
@@ -735,6 +813,44 @@ async def test_a_job_that_cannot_be_moved_does_not_hold_up_the_rest(held_service
     assert "Could not move stuck past the pause" in caplog.text
     assert svc.scheduler.get_job("fine").next_run_time > resumed
     assert [c.kwargs["job_id"] for c in svc.engine.run_cron.await_args_list] == ["fine"]
+
+
+@pytest.mark.asyncio
+async def test_a_pause_across_a_dst_change_moves_each_job_on_its_own_clock(held_service):
+    """New York springs forward at 02:00 on 2026-03-08, during the pause."""
+    new_york = ZoneInfo(NEW_YORK)
+    anchor = datetime(2026, 3, 7, 22, 0, tzinfo=new_york)  # the 4h job's last success
+    db = _mock_db()
+    db.get_last_successful_cron_run = AsyncMock(
+        return_value={"finished_at": anchor.astimezone(UTC).isoformat()},
+    )
+    jobs = [
+        CronJob(id="hourly", schedule="0 * * * *", prompt="p"),
+        CronJob(id="nightly", schedule="30 1 * * *", prompt="p"),
+        CronJob(id="every-four", schedule="4h", prompt="p"),
+    ]
+    svc = await held_service(jobs, db=db, tz=NEW_YORK)
+    paused = datetime(2026, 3, 8, 0, 30, tzinfo=new_york).astimezone(UTC)  # 00:30 EST
+    resumed = datetime(2026, 3, 8, 7, 45, tzinfo=new_york).astimezone(UTC)  # 07:45 EDT
+    for job in jobs:
+        trigger = svc.scheduler.get_job(job.id).trigger
+        svc.scheduler.modify_job(
+            job.id, next_run_time=trigger.get_next_fire_time(None, paused),
+        )
+
+    await _resume(svc, paused, resumed)
+
+    def next_run(job_id: str) -> datetime:
+        return svc.scheduler.get_job(job_id).next_run_time.astimezone(UTC)
+
+    # The next hour on the local clock: 08:00 EDT.
+    assert next_run("hourly") == datetime(2026, 3, 8, 12, 0, tzinfo=UTC)
+    # 01:30 local again, now EDT: 23 hours after the 01:30 EST it missed.
+    assert next_run("nightly") == datetime(2026, 3, 9, 5, 30, tzinfo=UTC)
+    # Still every four hours from its anchor, DST or not.
+    assert next_run("every-four") == anchor.astimezone(UTC) + timedelta(hours=12)
+    ran = sorted(c.kwargs["job_id"] for c in svc.engine.run_cron.await_args_list)
+    assert ran == ["every-four", "hourly", "nightly"]
 
 
 # ---------------------------------------------------------------------------
