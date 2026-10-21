@@ -339,13 +339,42 @@ async def test_only_catch_up_jobs_run_but_every_trigger_moves_on(held_service):
     ran = [c.kwargs["job_id"] for c in svc.engine.run_cron.await_args_list]
     assert ran == ["wants"]
     runner.run.assert_awaited_once()
-    # Cleanup and the wakeup sweep were re-armed, not run.
-    svc.db.cleanup_expired_messages.assert_not_awaited()
+    # Cleanup ran once; the wakeup sweep was only re-armed.
+    svc.db.cleanup_expired_messages.assert_awaited_once()
     svc.db.get_due_wakeups.assert_not_awaited()
+    # The run the opted-out job skipped is on record, like a late one.
+    await _wait_for(lambda: svc.db.log_cron_missed.await_count)
+    svc.db.log_cron_missed.assert_awaited_once()
+    job_id, due = svc.db.log_cron_missed.await_args.args
+    assert (job_id, due) == ("no-catchup", came_due.strftime("%Y-%m-%d %H:%M:%S"))
+    assert "paused" in svc.db.log_cron_missed.await_args.kwargs["error"]
     for job_id in moved:
         assert svc.scheduler.get_job(job_id).next_run_time > resumed, job_id
     assert svc.scheduler.get_job("yearly").next_run_time == not_due
     assert svc.scheduler.get_job("foreign").next_run_time == came_due
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catchup", [False, True])
+async def test_a_run_due_within_the_misfire_grace_is_left_to_the_scheduler(
+    held_service, catchup,
+):
+    """A short pause: the scheduler starts the run late, as without a pause."""
+    job = CronJob(id="brief", schedule=EVERY_TEN_MINUTES, prompt="p", catchup=catchup)
+    svc = await held_service([job])
+    resumed = datetime.now(UTC)
+    due = resumed - timedelta(seconds=10)
+    svc.scheduler.modify_job("brief", next_run_time=due)
+
+    await _resume(svc, resumed - timedelta(seconds=15), resumed)
+
+    assert svc.scheduler.get_job("brief").next_run_time == due
+    svc.engine.run_cron.assert_not_awaited()
+    svc.scheduler.resume()
+    await _wait_for(lambda: svc.engine.run_cron.await_count)
+    await asyncio.sleep(0.05)
+    svc.engine.run_cron.assert_awaited_once()
+    svc.db.log_cron_missed.assert_not_awaited()
 
 
 @pytest.mark.asyncio

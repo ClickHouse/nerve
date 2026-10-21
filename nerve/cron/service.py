@@ -60,6 +60,10 @@ _MISFIRE_GRACE_SECONDS = 30
 _CLOCK_WATCH_SECONDS = 5
 _CLOCK_STEP_SECONDS = 5
 
+# The cron_logs error of a run that came due during a pause of the machine and
+# was not caught up.
+_PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: false)"
+
 # How a run of a cron job or source runner was started: by its schedule, as a
 # catch-up for fires missed while the daemon was down or the machine paused,
 # or by hand (the Cron page's "Run now", the trigger API).
@@ -489,13 +493,19 @@ class CronService:
             self._record_missed_run(event.job_id, event.scheduled_run_time),
         )
 
-    async def _record_missed_run(self, job_id: str, due: datetime) -> None:
-        """Persist one missed run. Logging a drop must not itself break cron."""
+    async def _record_missed_run(
+        self, job_id: str, due: datetime, error: str | None = None,
+    ) -> None:
+        """Persist one missed run. Logging a drop must not itself break cron.
+
+        ``error`` says why the run did not happen; by default, that the
+        scheduler dropped it for starting too late.
+        """
         try:
             await self.db.log_cron_missed(
                 job_id,
                 due.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                error=(
+                error=error or (
                     f"run dropped: not started within "
                     f"{_MISFIRE_GRACE_SECONDS}s of its scheduled time"
                 ),
@@ -976,24 +986,28 @@ class CronService:
         """Move every trigger that came due during a pause to its next fire time.
 
         Covers what this service scheduled — cron jobs, source runners, cleanup
-        and the wakeup sweep — whose next run time is not after ``paused_to``:
-        it came due during the pause and has not run. Each moves to the first
-        fire time of its own trigger after ``paused_to``, so the scheduler
-        neither runs it again nor reports it missed, and an interval job stays
-        on the cadence its trigger was anchored to. Anything else on the
-        scheduler keeps the scheduler's own handling.
+        and the wakeup sweep — whose next run time came more than the misfire
+        grace before ``paused_to``: it came due during the pause, has not run,
+        and the scheduler would drop it as late. Each moves to the first fire
+        time of its own trigger after ``paused_to``, so the scheduler neither
+        runs it again nor reports it missed, and an interval job stays on the
+        cadence its trigger was anchored to. A run that came due within the
+        grace stays where it is: the scheduler runs it late, as it would have
+        without the pause. Anything else on the scheduler keeps the scheduler's
+        own handling.
 
         Synchronous, so that nothing gets to look at the old fire times in
-        between. Returns the ids to run once now: the cron jobs with ``catchup``
-        and the source runners — except one with a run still going, which the
-        fire that came due would have found going too (see :meth:`_may_start`).
-        A job with ``catchup: false``, cleanup and the wakeup sweep (which
-        fires every due session wakeup on its next pass) only move on. Jobs are
-        handled one by one: one that cannot be moved is logged and left to the
-        scheduler, and the rest still move.
+        between. Returns the ids to run once now: the cron jobs with
+        ``catchup``, the source runners and cleanup — except one with a run
+        still going, which the fire that came due would have found going too
+        (see :meth:`_may_start`). A job with ``catchup: false`` only moves on,
+        with a ``missed`` row for the run it skips; the wakeup sweep (which
+        fires every due session wakeup on its next pass) only moves on. Jobs
+        are handled one by one: one that cannot be moved is logged and left to
+        the scheduler, and the rest still move.
         """
         after = paused_to + timedelta(microseconds=1)
-        internal = (self._cleanup_expired, self._sweep_wakeups)
+        grace = timedelta(seconds=_MISFIRE_GRACE_SECONDS)
         rearmed = 0
         due: list[str] = []
         for sched_job in self.scheduler.get_jobs():
@@ -1001,22 +1015,28 @@ class CronService:
                 func = sched_job.func
                 if func == self._run_job_wrapper:
                     catchup = sched_job.args[0].catchup
-                elif func == self._run_source_wrapper:
+                elif func in (self._run_source_wrapper, self._cleanup_expired):
                     catchup = True
-                elif func in internal:
+                elif func == self._sweep_wakeups:
                     catchup = False
                 else:
                     continue
-                current = getattr(sched_job, "next_run_time", None)
-                if current is None or current > paused_to:
-                    continue
+                missed = getattr(sched_job, "next_run_time", None)
+                if missed is None or missed > paused_to or paused_to - missed <= grace:
+                    continue  # not due, or the scheduler still runs it late
                 upcoming = sched_job.trigger.get_next_fire_time(None, after)
                 if upcoming is None:
                     continue  # the trigger is done; the scheduler retires the job
                 self.scheduler.modify_job(sched_job.id, next_run_time=upcoming)
                 rearmed += 1
-                if catchup and self._may_start(sched_job.id, "catchup"):
-                    due.append(sched_job.id)
+                if catchup:
+                    if self._may_start(sched_job.id, "catchup"):
+                        due.append(sched_job.id)
+                elif func == self._run_job_wrapper:
+                    # As a run the scheduler drops for being late is recorded.
+                    asyncio.create_task(self._record_missed_run(
+                        sched_job.id, missed, error=_PAUSED_MISS,
+                    ))
             except Exception:
                 logger.exception("Could not move %s past the pause", sched_job.id)
         # Re-arm the scheduler's own timer against the stepped clock too.
@@ -1073,6 +1093,10 @@ class CronService:
             return self._run_job_wrapper(sched_job.args[0], origin="catchup")
         if sched_job.func == self._run_source_wrapper:
             return self._run_source_wrapper(sched_job.args[0], origin="catchup")
+        if sched_job.func == self._cleanup_expired:
+            # Once a day at a fixed time, which a machine that is mostly paused
+            # may never be awake for; running it twice does no harm.
+            return self._cleanup_expired()
         return None
 
     # -- Persistent timers -------------------------------------------------

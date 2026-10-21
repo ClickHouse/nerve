@@ -493,17 +493,22 @@ them start late or be dropped as [late runs](#late-runs):
   clock, which stands still while the machine does. A wall clock that got
   5 seconds or more ahead means a pause (a forward step of the system clock
   counts too; a clock set back does not).
-- Every scheduled job whose next run came due during the pause moves to its
-  next regular time after the pause, so none of them is run late or reported
-  `missed`. An interval job keeps its cadence: its next run is the next one on
-  the grid it is anchored to (see [Interval alignment](#interval-alignment)),
-  not a full interval after the resume.
-- Jobs with `catchup: true` (the default) and source runners then run **once**,
-  however many runs the pause swallowed, concurrently. Run gates and `lock`
-  apply as for a scheduled run, and the run is logged as usual.
-- Jobs with `catchup: false`, the daily cleanup and the wakeup sweep only move
-  on. Session wakeups (`ScheduleWakeup`) that came due fire on the sweep's next
-  pass, within 20 seconds.
+- A run that came due less than 30 seconds before the resume stays where it is:
+  the scheduler starts it late, as it does any run up to 30 seconds late (see
+  [Late runs](#late-runs)), whether or not the job has `catchup`.
+- Every other scheduled job whose next run came due during the pause moves to
+  its next regular time after the pause, so the scheduler neither runs it late
+  nor drops it as a late run. An interval job keeps its cadence: its next run is
+  the next one on the grid it is anchored to (see
+  [Interval alignment](#interval-alignment)), not a full interval after the
+  resume.
+- Jobs with `catchup: true` (the default), source runners and the daily cleanup
+  then run **once**, however many runs the pause swallowed, concurrently. Run
+  gates and `lock` apply as for a scheduled run, and the run is logged as usual.
+- Jobs with `catchup: false` only move on; the run each one skipped is recorded
+  in `cron_logs` with status `missed`. The wakeup sweep only moves on too:
+  session wakeups (`ScheduleWakeup`) that came due fire on its next pass, within
+  20 seconds.
 - The daemon log gets one INFO line per pause, with the size of the jump, the
   window and the number of jobs caught up.
 
@@ -515,7 +520,7 @@ several pauses runs once. A job whose run is still going when the
 machine resumes is not caught up, just as the scheduler skips a fire that finds
 the job's previous run still going; and a scheduled fire that comes while the
 job's catch-up run is going is skipped. Both are logged. Jumps under 5 seconds
-are ignored; a run that starts up to 30 seconds late runs anyway.
+are ignored.
 
 ### Late runs
 
@@ -526,8 +531,9 @@ when the scheduler is built, so changing it needs a restart).
 A run delayed beyond that is dropped rather than run very late, and recorded in
 `cron_logs` with status `missed` so the gap is visible next to the runs around it.
 A `missed` row never counts as a successful run, so it does not affect interval
-alignment or startup catch-up. A pause of the whole machine is not a late run:
-see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore).
+alignment or startup catch-up. A run that came due during a pause of the whole
+machine, more than 30 seconds before it ended, is not a late run: see
+[After a pause](#after-a-pause-sleep-suspend-snapshot-restore).
 
 ## Source Runners
 
