@@ -26,7 +26,7 @@ describe('MemuPage', () => {
       available: false,
       backend: 'loom',
       reason: 'not available for this backend',
-      dashboard_url: 'http://loom.example.test',
+      dashboard_url: 'https://loom.example.test/memories?namespace=agent-home',
       categories: [],
       items: [],
       resources: [],
@@ -37,8 +37,26 @@ describe('MemuPage', () => {
 
     expect(await screen.findByText('Memory is kept in Loom')).toBeInTheDocument();
     const link = screen.getByRole('link', { name: /Open the Loom dashboard/ });
-    expect(link).toHaveAttribute('href', 'http://loom.example.test');
+    expect(link).toHaveAttribute('href', 'https://loom.example.test/memories?namespace=agent-home');
     expect(screen.queryByText('memU not available')).not.toBeInTheDocument();
+  });
+
+  it('shows no link when Loom has no dashboard address for people', async () => {
+    getMemuData.mockResolvedValue({
+      available: false,
+      backend: 'loom',
+      reason: 'not available for this backend',
+      dashboard_url: '',
+      categories: [],
+      items: [],
+      resources: [],
+      category_items: {},
+    });
+
+    render(<MemuPage />);
+
+    expect(await screen.findByText('Memory is kept in Loom')).toBeInTheDocument();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
   });
 
   it('still says memU is unavailable when memU is the backend', async () => {

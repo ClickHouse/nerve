@@ -29,7 +29,8 @@ service, a timeout, HTTP 5xx, 429 or a refused credential raises
 :class:`~nerve.memory.backend.MemoryBackendUnavailable` after bounded retries,
 so recall reports memory as DOWN instead of empty and the sweep keeps its
 watermark. An empty or abstaining search is ``[]``, never an error. A request
-Loom understood and refused (another 4xx) raises :class:`LoomRequestError`.
+Loom understood and refused (another 4xx, or a refusal for a namespace other
+than the home one) raises :class:`LoomRequestError`.
 
 Every request carries ``consumer="nerve"``; writes carry the configured
 ``agent`` and, when known, the Nerve session id as ``session_id``. Reads use
@@ -42,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import random
@@ -53,6 +55,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -80,6 +83,14 @@ _NERVE_TAGS = [NERVE_TAG, EXTRACTION_TAG]
 # plain facts. Never `episodic`, which Loom keeps out of search.
 _PROCEDURAL_TYPES = frozenset({"behavior"})
 _TYPE_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+# A row with no Nerve type (a fact Loom extracted) is shown in the tools'
+# vocabulary; a Loom type with no counterpart is shown as it is.
+_LOOM_TYPE_NAMES = {
+    "preference": "profile",
+    "procedural": "behavior",
+    "semantic": "knowledge",
+    "episodic": "event",
+}
 
 # Keys this bridge mints: `nerve_<type>_<20 hex>`. The type is in the key
 # because memory.timeline answers without tags; a tag still wins wherever one
@@ -99,8 +110,11 @@ _EXTRACT_TIMEOUT_FACTOR = 6
 _CONNECT_TIMEOUT_S = 5.0
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_S = 0.25
+# The longest Retry-After waited out in-line. A longer one fails the call at
+# once and holds that operation for the asked time, at most the hold below.
 _MAX_RETRY_AFTER_S = 5.0
-# After a call fails on the connection or a 5xx, fail fast for this long
+_RATE_LIMIT_HOLD_MAX_S = 60.0
+# After Loom could not be reached or did not answer, fail fast for this long
 # instead of making every turn wait out the timeouts again.
 _BREAKER_S = 15.0
 # How long an identity that could not be resolved is remembered before the
@@ -127,16 +141,24 @@ _IDEMPOTENT_OPS = frozenset({
 })
 # 503 codes Loom answers before running the operation: any op may resend.
 _NEVER_RAN_CODES = frozenset({"AUTH_UNAVAILABLE", "OVERLOADED", "IDEMPOTENT_IN_PROGRESS"})
+# A 403 with this code is a rule refusing this one request, not a credential.
+_POLICY_REFUSAL = "POLICY_FORBIDDEN"
 
-# memory.set_from_messages takes at most 400 messages; a window is cut into
-# batches of that size, and smaller when the bytes add up.
+# What the tools print per memory.
+_ITEM_MAX_CHARS = 500
+_LIST_PREVIEW_CHARS = 500
+# memory.list matches `contains` on at most this many characters.
+_CONTAINS_MAX_CHARS = 200
+
+# memory.set_from_messages takes at most 400 messages. A window is cut into
+# batches of that size whose bodies stay within memory.loom.extraction_batch_bytes,
+# less this reserve for the request's other fields and the context turns.
 _BATCH_MAX_MESSAGES = 400
-_BATCH_MAX_BYTES = 4 * 1024 * 1024
-_MESSAGE_MAX_CHARS = 200_000
+_ENVELOPE_RESERVE_BYTES = 32 * 1024
 # Turns of the previous batch handed to the next as context (Loom's cap is 20),
 # each clipped: they only resolve references, they are not extracted again.
 _CONTEXT_MESSAGES = 10
-_CONTEXT_MAX_CHARS = 2000
+_CONTEXT_MAX_BYTES = 2000
 # Batches Loom accepted, remembered so a retried window does not queue the
 # same extraction twice (in this process).
 _ACCEPTED_TTL_S = 24 * 3600
@@ -145,10 +167,12 @@ _ACCEPTED_MAX = 4096
 # memory_records_by_date scans memory.list newest first, at most this far.
 _RECORDS_PAGE = 500
 _RECORDS_MAX_PAGES = 5
-# memory.timeline answers at most 500 rows.
+# memory.timeline answers at most 500 rows a call; conversation_history pages
+# backwards at most this many times.
 _TIMELINE_MAX = 500
-# namespace.search_categories shows the first 280 characters of a summary.
-_SUMMARY_EXCERPT_CHARS = 280
+_TIMELINE_MAX_PAGES = 10
+# namespace.search_categories shows the first 280 BYTES of a summary.
+_SUMMARY_EXCERPT_BYTES = 280
 
 
 class LoomRequestError(RuntimeError):
@@ -170,7 +194,7 @@ class LoomRequestError(RuntimeError):
 
 
 class _AuthRefused(Exception):
-    """A 401/403: the identity is re-resolved once before it counts as an outage."""
+    """A 401/403, sorted by ``_op`` into a credential problem or a refusal."""
 
     def __init__(self, status: int, code: str, message: str) -> None:
         super().__init__(f"HTTP {status} {code}")
@@ -354,6 +378,10 @@ def _iso_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 def _day_range(start: str, end: str) -> tuple[datetime, datetime]:
     """``[start 00:00, end + 1 day)`` in UTC for two ``YYYY-MM-DD`` dates."""
     try:
@@ -385,7 +413,7 @@ def _type_tag(tag: str) -> str | None:
 
 def _nerve_type(tags: Any, memory_key: str, loom_type: Any) -> str:
     """The type the tools show: the ``nerve:<type>`` tag, else the one in a
-    key this bridge minted, else Loom's own ``memory_type``."""
+    key this bridge minted, else Loom's ``memory_type`` in the tools' words."""
     for tag in tags or ():
         kind = _type_tag(tag)
         if kind:
@@ -393,16 +421,60 @@ def _nerve_type(tags: Any, memory_key: str, loom_type: Any) -> str:
     minted = _MINTED_KEY_RE.fullmatch(memory_key or "")
     if minted:
         return minted.group(1)
-    return str(loom_type or "")
+    native = str(loom_type or "")
+    return _LOOM_TYPE_NAMES.get(native, native)
 
 
 def _text(value: Any) -> str:
-    """A stored value as the one line of text the tools print."""
+    """A stored value as the text the tools print."""
     if value is None:
         return ""
     if isinstance(value, str):
         return value.strip()
     return json.dumps(value, ensure_ascii=False)
+
+
+def _clip(text: str, limit: int = _ITEM_MAX_CHARS) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _json_size(value: Any) -> int:
+    """Bytes of ``value`` in a request body (httpx sends compact UTF-8 JSON)."""
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _fit_turn(turn: dict[str, Any], max_bytes: int) -> dict[str, Any]:
+    """``turn`` with its content cut until its JSON is at most ``max_bytes``."""
+    size = _json_size(turn)
+    if size <= max_bytes:
+        return turn
+    content = str(turn.get("content") or "")
+    marker = " […truncated]"
+    for _ in range(8):
+        keep = max(0, int(len(content) * (max_bytes - 64) / max(size, 1)))
+        content = content[:keep]
+        candidate = {**turn, "content": content + marker}
+        size = _json_size(candidate)
+        if size <= max_bytes:
+            return candidate
+    return {**turn, "content": marker.strip()}
+
+
+def _linkable(url: str) -> bool:
+    """Whether a person's browser can be sent to ``url``: not a loopback,
+    private or link-local address (a local proxy's, say)."""
+    host = urlsplit(url).hostname or ""
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # a name
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_unspecified or ip.is_multicast
+    )
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -435,7 +507,8 @@ class LoomBridge:
     ) -> None:
         self.config = config
         self._cfg = config.memory.loom
-        self._audit_db = audit_db
+        # nerve.db, for the memory audit log.
+        self._db = audit_db
         # Tests hand in an httpx.MockTransport; production uses the default.
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
@@ -449,6 +522,7 @@ class LoomBridge:
         self._ident_retry_at = 0.0
         self._down_until = 0.0
         self._down_reason = ""
+        self._limited: dict[str, tuple[float, str]] = {}
         self._accepted: dict[str, float] = {}
         self._ignored_noted: set[str] = set()
         self._background: set[asyncio.Task] = set()
@@ -460,6 +534,10 @@ class LoomBridge:
             "write": read * _WRITE_TIMEOUT_FACTOR,
             "extract": read * _EXTRACT_TIMEOUT_FACTOR,
         }
+        # Message bodies of one extraction request, and the most one message may take.
+        self._batch_bytes = max(
+            int(self._cfg.extraction_batch_bytes) - _ENVELOPE_RESERVE_BYTES, 64 * 1024,
+        )
         self._backoff_base_s = _BACKOFF_BASE_S
 
     # ------------------------------------------------------------------ #
@@ -536,8 +614,20 @@ class LoomBridge:
 
     @property
     def dashboard_url(self) -> str:
-        """Loom's base URL, which also serves its dashboard, for the UI to link to."""
-        return self._base_url or self._cfg.base_url
+        """Where a person opens this memory in Loom's dashboard, or "".
+
+        ``memory.loom.dashboard_url`` when set, else the base URL unless that
+        is a local proxy's private or loopback address, which no browser
+        reaches. Names the home namespace when it is known.
+        """
+        base = (self._cfg.dashboard_url or "").strip().rstrip("/")
+        if not base:
+            candidate = self._base_url or self._cfg.base_url
+            base = candidate.rstrip("/") if _linkable(candidate) else ""
+        if not base:
+            return ""
+        namespace = self._ident.namespace if self._ident else ""
+        return f"{base}/memories?namespace={quote(namespace, safe='')}" if namespace else base
 
     @staticmethod
     def _release_memory() -> None:
@@ -548,7 +638,7 @@ class LoomBridge:
     # ------------------------------------------------------------------ #
 
     async def _identity(self) -> LoomIdentity:
-        """The identity, resolved once per process and again after a 401/403."""
+        """The identity, resolved once per process and again after a refused credential."""
         ident = self._ident
         if ident is None:
             async with self._ident_lock:
@@ -568,14 +658,26 @@ class LoomBridge:
         self._seed_categories_later()
         return ident
 
-    def _forget_identity(self) -> None:
-        self._ident = None
-        self._ident_error = ""
-        self._ident_retry_at = 0.0
+    async def _refresh_identity(self, stale: LoomIdentity) -> LoomIdentity | None:
+        """Look the identity up again after Loom refused the credential.
+
+        None when the lookup fails; the old identity is kept and nothing is
+        held back, since a lookup that blinked must not block every call.
+        """
+        async with self._ident_lock:
+            if self._ident is not None and self._ident is not stale:
+                return self._ident  # another call refreshed it meanwhile
+            try:
+                fresh = await self._resolve_identity()
+            except MemoryBackendUnavailable as e:
+                logger.warning("Looking up the Loom identity again failed: %s", e)
+                return None
+            self._ident, self._ident_error = fresh, ""
+            return fresh
 
     async def _resolve_identity(self) -> LoomIdentity:
         """Explicit settings first, then Loom's ``GET /v1/whoami``, then the
-        token's own claims. Raises naming every step that came up empty.
+        token's own claims. Raises naming what went wrong.
 
         For an agent token Loom lists the agent's own namespace first, which
         is where its memory lives unless ``memory.loom.namespace`` says
@@ -587,9 +689,10 @@ class LoomBridge:
             return LoomIdentity(org, namespace, (namespace,), "config")
         tried: list[str] = []
         unreachable: list[str] = []
+        refused: list[str] = []
         for source in ("whoami", "token"):
             if source == "whoami":
-                claims = await self._whoami(tried, unreachable)
+                claims = await self._whoami(tried, unreachable, refused)
             else:
                 claims = self._token_claims(tried)
             if claims is None:
@@ -606,9 +709,14 @@ class LoomBridge:
         if unreachable:
             # Loom is down rather than misconfigured: say that first.
             raise MemoryBackendUnavailable(
-                f"memory backend unavailable: cannot reach Loom at {self._base_url} to learn "
-                f"the org and namespace ({unreachable[0]}); setting memory.loom.org and "
-                "memory.loom.namespace skips the lookup"
+                f"memory backend unavailable: Loom at {self._base_url} could not be asked "
+                f"for the org and namespace ({unreachable[0]}); setting memory.loom.org "
+                "and memory.loom.namespace skips the lookup"
+            )
+        if refused:
+            raise MemoryBackendUnavailable(
+                "memory backend unavailable: Loom refused the configured token when asked "
+                f"whose it is ({refused[0]}); check memory.loom.token (or LOOM_API_KEY)"
             )
         raise MemoryBackendUnavailable(
             "memory backend unavailable: cannot tell which Loom org and namespace to use: "
@@ -617,7 +725,9 @@ class LoomBridge:
             f"and {LOOM_NAMESPACE_ENV})"
         )
 
-    async def _whoami(self, tried: list[str], unreachable: list[str]) -> dict[str, Any] | None:
+    async def _whoami(
+        self, tried: list[str], unreachable: list[str], refused: list[str],
+    ) -> dict[str, Any] | None:
         client = self._client
         if client is None:
             tried.append("the HTTP client is not running")
@@ -633,6 +743,10 @@ class LoomBridge:
             return None
         if resp.status_code != 200:
             tried.append(f"GET /v1/whoami answered HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                refused.append(f"HTTP {resp.status_code}")
+            elif resp.status_code >= 500:
+                unreachable.append(f"HTTP {resp.status_code}")
             return None
         try:
             data = resp.json()
@@ -643,9 +757,11 @@ class LoomBridge:
             return None
         if not data.get("authenticated"):
             reason = str(data.get("reason") or "").strip()
-            tried.append(
-                "GET /v1/whoami: Loom did not accept the token" + (f" ({reason})" if reason else "")
-            )
+            if self._cfg.token:
+                refused.append(reason or "not accepted")
+                tried.append("GET /v1/whoami: Loom did not accept the token")
+            else:
+                tried.append("GET /v1/whoami: no token is configured")
             return None
         return data
 
@@ -666,22 +782,36 @@ class LoomBridge:
         *,
         kind: str = "read",
         org_only: bool = False,
+        row_namespace: str | None = None,
         idempotency_key: str | None = None,
         attempts: int = _MAX_ATTEMPTS,
     ) -> dict[str, Any]:
         """``POST /v1/<op>`` with ``org`` and ``namespace`` filled in.
 
         ``fields`` may name another ``namespace`` (a row that lives in one);
-        ``org_only`` leaves the namespace out for ops addressed by id.
+        ``org_only`` leaves the namespace out for ops addressed by id, whose
+        row's namespace, when known, is ``row_namespace``.
+
+        A 401, or a 403 for the home namespace, is a credential problem: the
+        identity is looked up again once, then the call fails as unavailable.
+        A 403 for another namespace, or a policy refusal, is about this one
+        request and raises ``LoomRequestError``.
         """
         if self._client is None or not self._available:
             raise MemoryBackendUnavailable("memory backend unavailable: the Loom bridge is not running")
-        if time.monotonic() < self._down_until:
-            wait = self._down_until - time.monotonic()
+        now = time.monotonic()
+        if now < self._down_until:
             raise MemoryBackendUnavailable(
-                f"memory backend unavailable: {self._down_reason} (not retried for another {wait:.0f}s)"
+                f"memory backend unavailable: {self._down_reason} "
+                f"(not retried for another {self._down_until - now:.0f}s)"
             )
-        for refused_once in (False, True):
+        held = self._limited.get(op)
+        if held and now < held[0]:
+            raise MemoryBackendUnavailable(
+                f"memory backend unavailable: {held[1]} "
+                f"(rate limited; not retried for another {held[0] - now:.0f}s)"
+            )
+        for attempt in (1, 2):
             ident = await self._identity()
             body: dict[str, Any] = {"org": ident.org}
             if not org_only:
@@ -693,10 +823,13 @@ class LoomBridge:
                     op, body, kind=kind, idempotency_key=idempotency_key, attempts=attempts,
                 )
             except _AuthRefused as e:
-                if not refused_once:
+                target = body.get("namespace", row_namespace)
+                foreign = e.status == 403 and bool(target) and target != ident.namespace
+                if e.code == _POLICY_REFUSAL or foreign:
+                    raise LoomRequestError(op, e.status, e.code, e.message) from None
+                if attempt == 1 and await self._refresh_identity(ident) is not None:
                     # The token may have moved on (a renewed agent token, a
-                    # revoked grant): learn the identity again, once.
-                    self._forget_identity()
+                    # revoked grant): try once more with what Loom says now.
                     continue
                 raise MemoryBackendUnavailable(
                     f"memory backend unavailable: Loom refused the credential on {op} "
@@ -715,11 +848,13 @@ class LoomBridge:
     ) -> dict[str, Any]:
         """One operation with bounded retries.
 
-        A request the server never received (no connection) is resent for
-        any op, and so is one Loom refused before running it (429, a 503
-        AUTH_UNAVAILABLE/OVERLOADED). A timeout, a cut-off response or
-        another 5xx is resent only for an idempotent op, since the server may
-        have acted. Whatever is still failing then raises
+        A request the server never received (no connection, no free pool
+        slot) is resent for any op, and so is one Loom refused before running
+        it (429, a 503 AUTH_UNAVAILABLE/OVERLOADED) when it asks to wait no
+        longer than five seconds; a longer wait fails the call and holds the
+        operation for that time (at most a minute). A timeout, a broken
+        connection or another 5xx is resent only for an idempotent op, since
+        the server may have acted. Whatever is still failing then raises
         ``MemoryBackendUnavailable``.
         """
         client = self._client
@@ -730,7 +865,9 @@ class LoomBridge:
         failure = f"{op} failed"
         # Only an unreachable or silent Loom trips the breaker: those are the
         # failures that cost every caller a timeout. An HTTP error comes back
-        # fast and may concern this one operation (a slow embedder, say).
+        # fast and may concern this one operation (a slow embedder, say), and a
+        # dropped keep-alive connection or an exhausted local pool says nothing
+        # about Loom.
         unreachable = False
         for attempt in range(1, attempts + 1):
             headers = {"X-Request-Id": str(uuid.uuid4())}
@@ -739,14 +876,17 @@ class LoomBridge:
             hint: float | None = None
             try:
                 resp = await client.post(f"/v1/{op}", json=body, headers=headers, timeout=http_timeout)
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 retry, unreachable = True, True
                 failure = f"cannot reach Loom at {self._base_url} ({type(e).__name__})"
+            except httpx.PoolTimeout:
+                retry, unreachable = True, False
+                failure = f"no free connection to Loom for {op} (PoolTimeout)"
             except httpx.TimeoutException:
                 retry, unreachable = idempotent, True
                 failure = f"Loom did not answer {op} within {timeout:g}s"
             except httpx.RequestError as e:
-                retry, unreachable = idempotent, True
+                retry, unreachable = idempotent, False
                 failure = f"the connection to Loom broke during {op} ({type(e).__name__})"
             else:
                 status = resp.status_code
@@ -757,16 +897,21 @@ class LoomBridge:
                 code, message = _error_detail(resp)
                 if status in (401, 403):
                     raise _AuthRefused(status, code, message)
-                if status in (408, 429) or (status == 503 and code in _NEVER_RAN_CODES):
-                    retry, unreachable = True, False
-                elif status >= 500:
-                    retry, unreachable = idempotent, False
-                else:
-                    raise LoomRequestError(op, status, code, message)
+                unreachable = False
                 failure = f"Loom answered {op} with HTTP {status} {code}" + (
                     f": {message}" if message else ""
                 )
                 hint = _retry_after(resp)
+                if status in (408, 429) or (status == 503 and code in _NEVER_RAN_CODES):
+                    retry = True
+                    if hint is not None and hint > _MAX_RETRY_AFTER_S:
+                        hold = min(hint, _RATE_LIMIT_HOLD_MAX_S)
+                        self._limited[op] = (time.monotonic() + hold, failure)
+                        retry = False
+                elif status >= 500:
+                    retry = idempotent
+                else:
+                    raise LoomRequestError(op, status, code, message)
             if not retry or attempt >= attempts:
                 break
             await asyncio.sleep(self._backoff(attempt, hint))
@@ -820,10 +965,10 @@ class LoomBridge:
         details: dict | None = None,
     ) -> None:
         """Best-effort row in the memory audit log (the web Log tab)."""
-        if not self._audit_db:
+        if not self._db:
             return
         try:
-            await self._audit_db.log_audit(action, target_type, target_id, source, details)
+            await self._db.log_audit(action, target_type, target_id, source, details)
         except Exception as e:  # noqa: BLE001 — the audit log never fails a write
             logger.warning("Audit log failed: %s", e)
 
@@ -856,17 +1001,13 @@ class LoomBridge:
         (``{id: "cat:<id>", type: "category", name, summary}``) — memU's shape.
 
         An abstaining search is no items. A failing category lookup costs
-        the breadcrumbs only; a failing search raises.
+        the breadcrumbs only; a failing or refused search raises.
         """
         if not self._available:
             return []
-        try:
-            return await self._tracked(
-                "recall", query[:80], self._recall(query, int(limit), int(category_limit)),
-            )
-        except LoomRequestError as e:
-            logger.error("Loom recall refused: %s", e)
-            return []
+        return await self._tracked(
+            "recall", query[:80], self._recall(query, int(limit), int(category_limit)),
+        )
 
     async def _recall(self, query: str, limit: int, category_limit: int) -> list[dict[str, str]]:
         items, cats = await asyncio.gather(
@@ -893,6 +1034,8 @@ class LoomBridge:
             "include_tags": True,
             "bodies": "full",
             "explain": False,
+            # Stored memories only: a session digest has no key a tool can edit.
+            "legs": ["memory"],
         })
         if data.get("abstain"):
             return []
@@ -903,7 +1046,7 @@ class LoomBridge:
                 continue
             # A verbatim chunk of a long value answers for the fact it came from.
             key = str(hit.get("parent_memory_key") or hit.get("memory_key") or "")
-            summary = _text(hit.get("content_excerpt"))
+            summary = _clip(_text(hit.get("content_excerpt")))
             if not key or not summary:
                 continue
             item_id = self._display_id(key, str(hit.get("namespace") or ""))
@@ -975,14 +1118,15 @@ class LoomBridge:
 
         Members are the rows tagged with the category's name: Loom's
         extractor tags facts with the registered category names, and
-        ``update_item`` tags what it assigns. ``name`` is None for an unknown
+        ``update_item`` tags what it assigns. A keyword longer than Loom
+        matches on is cut to its first 200 characters, and the answer says so
+        (``query``, ``query_clipped``). ``name`` is None for an unknown
         category; an outage raises.
         """
         empty: dict[str, Any] = {"name": None, "total": 0, "items": []}
         if not self._available:
             return empty
-        ref = category_id.removeprefix("cat:")
-        ref = ref.strip()
+        ref = category_id.removeprefix("cat:").strip()
         if not ref:
             return empty
         try:
@@ -1004,23 +1148,33 @@ class LoomBridge:
             "tags": [cat["name"]],
             "sort_by": "recency",
             "limit": max(1, min(limit, 1000)),
+            "preview_chars": _LIST_PREVIEW_CHARS,
         }
-        if query:
-            fields["contains"] = query
+        keyword = query[:_CONTAINS_MAX_CHARS]
+        if keyword:
+            fields["contains"] = keyword
         data = await self._op("memory.list", fields)
         items = []
         for entry in data.get("entries") or []:
             row = self._row_from_entry(entry)
             if row:
                 items.append({"id": row["id"], "type": row["type"], "summary": row["summary"]})
-        return {"name": cat["name"], "total": int(data.get("total") or len(items)), "items": items}
+        result: dict[str, Any] = {
+            "name": cat["name"],
+            "total": int(data.get("total") or len(items)),
+            "items": items,
+        }
+        if len(query) > _CONTAINS_MAX_CHARS:
+            result["query"] = keyword
+            result["query_clipped"] = True
+        return result
 
     def _row_from_entry(self, entry: Any) -> dict[str, Any] | None:
         """A memory.list entry as the dict the date tools print."""
         if not isinstance(entry, dict):
             return None
         key = str(entry.get("memory_key") or "")
-        summary = _text(entry.get("value"))
+        summary = _clip(_text(entry.get("value")))
         if not key or not summary:
             return None
         return {
@@ -1070,14 +1224,14 @@ class LoomBridge:
         """Replace a category's summary and/or description (Loom re-embeds).
 
         Loom stores a category whole, so the field not being changed is sent
-        back as it is. Its summary can only be read back up to 280
-        characters: a description-only update of a longer summary is refused
-        rather than truncating it.
+        back as it is. Its summary can only be read back up to 280 bytes, and
+        only while it shows in a category search: a description-only update
+        that cannot read the whole summary back is refused rather than
+        truncating or erasing it.
         """
         if not self._available:
             return False
-        ref = category_id.removeprefix("cat:")
-        ref = ref.strip()
+        ref = category_id.removeprefix("cat:").strip()
         if not ref or (summary is None and description is None):
             return False
         return await self._tracked(
@@ -1091,30 +1245,40 @@ class LoomBridge:
         cat = await self._find_category(ref)
         if cat is None:
             return False
+        summary_changed = summary is not None
         new_description = description if description is not None else cat["description"]
-        if summary is None:
-            summary = await self._current_summary(cat)
-        await self._register_category(cat["name"], new_description, summary)
+        new_summary = summary if summary is not None else await self._current_summary(cat)
+        await self._register_category(cat["name"], new_description, new_summary)
         await self._audit("category_updated", "category", cat["id"], source, {
-            "summary_changed": summary is not None,
+            "summary_changed": summary_changed,
             "description_changed": description is not None,
         })
         return True
 
     async def _current_summary(self, cat: dict[str, Any]) -> str:
+        """The summary Loom holds for ``cat``, when it can be read back whole."""
         data = await self._op("namespace.search_categories", {"query": cat["name"], "top_k": 20})
         for hit in data.get("results") or []:
             if isinstance(hit, dict) and hit.get("category_id") == cat["id"]:
                 excerpt = str(hit.get("summary_excerpt") or "")
-                if len(excerpt) < _SUMMARY_EXCERPT_CHARS:
+                # Loom cuts at 280 bytes, perhaps inside a character: anything that
+                # close to the cut (or ending in a replacement character) may be cut.
+                whole = (
+                    len(excerpt.encode("utf-8")) <= _SUMMARY_EXCERPT_BYTES - 4
+                    and not excerpt.endswith("�")
+                )
+                if whole:
                     return excerpt
                 raise ValueError(
                     f"category {cat['name']!r} has a summary longer than Loom returns "
-                    f"({_SUMMARY_EXCERPT_CHARS} characters), so updating only its "
-                    "description would cut the summary short; pass the summary as well"
+                    f"({_SUMMARY_EXCERPT_BYTES} bytes), so updating only its description "
+                    "would cut the summary short; pass the summary as well"
                 )
-        # Not embedded (search never returns it) or no summary: nothing to keep.
-        return ""
+        raise ValueError(
+            f"category {cat['name']!r} does not show in Loom's category search, so its "
+            "summary cannot be read back and updating only its description could erase "
+            "it; pass the summary as well"
+        )
 
     async def apply_categories(self, categories: list[Any]) -> bool:
         """Register the configured categories that Loom does not have yet.
@@ -1249,89 +1413,110 @@ class LoomBridge:
         """Queue a session window for extraction (``memory.set_from_messages``,
         ``defer=true``): Loom extracts the facts in the background.
 
-        Cut into batches of at most 400 messages. RAISES on any failure — the
-        sweep advances its watermark unless this raises, and a window that
+        Cut into batches of at most 400 messages within the byte budget.
+        RAISES on any failure, the bridge not running included:
+        the sweep advances its watermark unless this raises, and a window that
         was not queued must be offered again. False only when there is
         nothing to send.
         """
-        if not messages or not self._available:
+        if not messages:
             return False
-        turns = [t for t in (self._turn(m) for m in messages) if t]
-        if not turns:
+        if not self._available:
+            raise MemoryBackendUnavailable("memory backend unavailable: the Loom bridge is not running")
+        entries = self._entries(messages)
+        if not entries:
             return False
         return await self._tracked(
             "memorize_conversation", f"session {session_id}",
-            self._memorize_conversation(session_id or "-", turns),
+            self._memorize_conversation(session_id or "-", entries),
         )
 
-    @staticmethod
-    def _turn(message: dict) -> dict[str, Any] | None:
+    def _turn(self, message: dict) -> dict[str, Any] | None:
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             return None
-        if len(content) > _MESSAGE_MAX_CHARS:
-            content = content[:_MESSAGE_MAX_CHARS] + " […truncated]"
         turn: dict[str, Any] = {"role": str(message.get("role") or "user"), "content": content}
         stamp = _parse_dt(message.get("created_at"))
         if stamp is not None:
             # Loom anchors what a turn says ("yesterday") to when it was said.
             turn["timestamp"] = _iso_utc(stamp)
-        return turn
+        return _fit_turn(turn, self._batch_bytes - 1024)
 
-    @staticmethod
-    def _batches(turns: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        batches: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
+    def _entries(self, messages: list[dict]) -> list[tuple[dict[str, Any], datetime | None]]:
+        """Each sendable message as ``(turn, when it was said)``."""
+        out = []
+        for message in messages:
+            turn = self._turn(message)
+            if turn is not None:
+                out.append((turn, _parse_dt(message.get("created_at"))))
+        return out
+
+    def _batches(
+        self, entries: list[tuple[dict[str, Any], datetime | None]],
+    ) -> list[list[tuple[dict[str, Any], datetime | None]]]:
+        batches: list[list[tuple[dict[str, Any], datetime | None]]] = []
+        current: list[tuple[dict[str, Any], datetime | None]] = []
         size = 0
-        for turn in turns:
-            turn_size = len(turn["content"].encode("utf-8")) + 128
-            if current and (len(current) >= _BATCH_MAX_MESSAGES or size + turn_size > _BATCH_MAX_BYTES):
+        for entry in entries:
+            entry_size = _json_size(entry[0]) + 1
+            if current and (
+                len(current) >= _BATCH_MAX_MESSAGES or size + entry_size > self._batch_bytes
+            ):
                 batches.append(current)
                 current, size = [], 0
-            current.append(turn)
-            size += turn_size
+            current.append(entry)
+            size += entry_size
         if current:
             batches.append(current)
         return batches
 
-    async def _memorize_conversation(self, session_id: str, turns: list[dict[str, Any]]) -> bool:
-        queued: list[str] = []
-        previous: list[dict[str, Any]] = []
-        batches = self._batches(turns)
+    @staticmethod
+    def _context(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The context a following batch gets: the last turns, kept short."""
+        return [_fit_turn(turn, _CONTEXT_MAX_BYTES) for turn in turns[-_CONTEXT_MESSAGES:]]
+
+    async def _send_window(
+        self, session_id: str, turns: list[dict[str, Any]], context: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "agent": self._cfg.agent_name,
+            "session_id": session_id,
+            "messages": turns,
+            "defer": True,
+            "extra_tags": [EXTRACTION_TAG],
+            "observation_date": self._observation_date(turns),
+        }
+        if context:
+            fields["last_messages"] = context
+        return await self._op("memory.set_from_messages", fields, kind="extract")
+
+    async def _memorize_conversation(
+        self, session_id: str, entries: list[tuple[dict[str, Any], datetime | None]],
+    ) -> bool:
+        queued = 0
+        context: list[dict[str, Any]] = []
+        batches = self._batches(entries)
         for batch in batches:
+            turns = [turn for turn, _ in batch]
             digest = hashlib.sha256(
-                json.dumps([session_id, batch], ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                json.dumps([session_id, turns], ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ).hexdigest()
             if not self._was_accepted(digest):
-                fields: dict[str, Any] = {
-                    "agent": self._cfg.agent_name,
-                    "session_id": session_id,
-                    "messages": batch,
-                    "defer": True,
-                    "extra_tags": [EXTRACTION_TAG],
-                    "observation_date": self._observation_date(batch),
-                }
-                if previous:
-                    fields["last_messages"] = previous
-                data = await self._op("memory.set_from_messages", fields, kind="extract")
+                await self._send_window(session_id, turns, context)
                 self._remember_accepted(digest)
-                queued.append(str(data.get("queue_id") or ""))
-            # Context for the next batch only (not extracted again): kept short.
-            previous = [
-                {**turn, "content": turn["content"][:_CONTEXT_MAX_CHARS]}
-                for turn in batch[-_CONTEXT_MESSAGES:]
-            ]
+                queued += 1
+            context = self._context(turns)
         await self._audit("conversation_indexed", "resource", session_id, "bridge", {
-            "message_count": len(turns),
+            "message_count": len(entries),
             "batches": len(batches),
-            "queued": len(queued),
+            "queued": queued,
         })
         return True
 
     @staticmethod
-    def _observation_date(batch: list[dict[str, Any]]) -> str:
+    def _observation_date(turns: list[dict[str, Any]]) -> str:
         """The day a batch was said (its last turn), for relative dates."""
-        for turn in reversed(batch):
+        for turn in reversed(turns):
             stamp = turn.get("timestamp")
             if stamp:
                 return str(stamp)[:10]
@@ -1436,7 +1621,9 @@ class LoomBridge:
                 wanted = _dedupe([registered[n.strip().lower()] for n in categories
                                   if n.strip().lower() in registered])
                 keep = {w.lower() for w in wanted}
-                dropped = [t for t in tags if t.lower() in registered and t.lower() not in keep]
+                # Loom matches a category by its registered name, exactly; a tag is lowercase.
+                dropped = _dedupe([registered[t.lower()] for t in tags
+                                   if t.lower() in registered and t.lower() not in keep])
                 tags = [t for t in tags if t.lower() not in registered] + [w.lower() for w in wanted]
             tags = _dedupe(tags)
             fields: dict[str, Any] = {"memory_id": row["memory_id"]}
@@ -1450,7 +1637,7 @@ class LoomBridge:
                 try:
                     data = await self._op(
                         "memory.update_by_id", fields, kind="write", org_only=True,
-                        idempotency_key=str(uuid.uuid4()),
+                        row_namespace=row["namespace"], idempotency_key=str(uuid.uuid4()),
                     )
                 except LoomRequestError as e:
                     if e.code == "PRECONDITION_FAILED" and attempt == 1:
@@ -1523,10 +1710,11 @@ class LoomBridge:
     async def conversation_history(
         self, date_from: str, date_to: str = "", limit: int = 30,
     ) -> list[dict[str, Any]]:
-        """Memories that happened in ``[date_from, date_to]`` (UTC days), newest
-        first: ``memory.timeline`` over Nerve's rows, keeping those with a
-        ``valid_at`` (Loom's "when it happened"; the extractor dates facts by
-        the turn they came from)."""
+        """Memories dated in ``[date_from, date_to]`` (UTC days), newest first:
+        ``memory.timeline`` over Nerve's rows, keeping those with a
+        ``valid_at`` — Loom's "when it happened". The extractor dates every
+        fact by the turn it came from (or the date it names), so this lists
+        what was said and done on those days, not events only."""
         if not self._available:
             return []
         start, end = _day_range(date_from, date_to)
@@ -1538,32 +1726,48 @@ class LoomBridge:
     async def _conversation_history(
         self, start: datetime, end: datetime, limit: int,
     ) -> list[dict[str, Any]]:
-        if limit <= 0:
-            return []
-        data = await self._op("memory.timeline", {
-            "agent": "*",
-            "tags": list(_NERVE_TAGS),
-            "since": _iso_utc(start),
-            "until": _iso_utc(end - timedelta(seconds=1)),
-            "top_k": min(_TIMELINE_MAX, max(limit * 3, 50)),
-            "order": "desc",
-        })
         rows: list[dict[str, Any]] = []
-        for event in data.get("events") or []:
-            if not isinstance(event, dict) or not event.get("valid_at"):
-                continue
-            key = str(event.get("memory_key") or "")
-            summary = _text(event.get("content_excerpt"))
-            if not key or not summary:
-                continue
-            rows.append({
-                "id": self._display_id(key, str(event.get("namespace") or "")),
-                "type": _nerve_type((), key, event.get("memory_type")),
-                "summary": summary,
-                "happened_at": event.get("valid_at"),
+        if limit <= 0:
+            return rows
+        seen: set[tuple[str, str]] = set()
+        until = end - timedelta(seconds=1)
+        for _page in range(_TIMELINE_MAX_PAGES):
+            data = await self._op("memory.timeline", {
+                "agent": "*",
+                "tags": list(_NERVE_TAGS),
+                "since": _iso_utc(start),
+                "until": _iso_utc(until),
+                "top_k": _TIMELINE_MAX,
+                "order": "desc",
             })
-            if len(rows) >= limit:
+            events = [e for e in data.get("events") or [] if isinstance(e, dict)]
+            fresh = 0
+            oldest: datetime | None = None
+            for event in events:
+                key = str(event.get("memory_key") or "")
+                namespace = str(event.get("namespace") or "")
+                when = _parse_dt(event.get("valid_at") or event.get("created_at"))
+                if when is not None and (oldest is None or when < oldest):
+                    oldest = when
+                if (namespace, key) in seen:
+                    continue
+                seen.add((namespace, key))
+                fresh += 1
+                summary = _clip(_text(event.get("content_excerpt")))
+                if not event.get("valid_at") or not key or not summary:
+                    continue  # undated: not something that happened on a day
+                rows.append({
+                    "id": self._display_id(key, namespace),
+                    "type": _nerve_type((), key, event.get("memory_type")),
+                    "summary": summary,
+                    "happened_at": event.get("valid_at"),
+                })
+                if len(rows) >= limit:
+                    return rows
+            if len(events) < _TIMELINE_MAX or fresh == 0 or oldest is None:
                 break
+            # Older rows next; the boundary second is read again and skipped.
+            until = oldest
         return rows
 
     async def records_by_date(
@@ -1604,6 +1808,7 @@ class LoomBridge:
                 "sort_by": "recency",
                 "limit": _RECORDS_PAGE,
                 "offset": offset,
+                "preview_chars": _LIST_PREVIEW_CHARS,
             })
             entries = data.get("entries") or []
             for entry in entries:
@@ -1663,11 +1868,12 @@ class LoomBridge:
 
     async def get_health(self) -> dict[str, Any]:
         """The diagnostics snapshot, in memU's shape plus ``backend``,
-        ``dashboard_url`` (Loom's URL) and ``loom`` (identity and last error)."""
+        ``dashboard_url`` (a link for people, or "") and ``loom`` (identity
+        and last error)."""
         result = self._metrics.to_dict()
         ident = self._ident
         info: dict[str, Any] = {
-            "base_url": self.dashboard_url,
+            "base_url": self._base_url or self._cfg.base_url,
             "org": ident.org if ident else self._cfg.org,
             "namespace": ident.namespace if ident else self._cfg.namespace,
             "agent": self._cfg.agent_name,

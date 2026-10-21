@@ -4,6 +4,9 @@ Covers every memory tool path through the real handlers, the bridge's
 failure contract (an outage raises ``MemoryBackendUnavailable`` after bounded
 retries; an abstaining search is empty, never an error), identity resolution,
 and output parity with the memU bridge on the same inputs.
+
+The fake is strict: a request field an operation does not take is refused,
+as Loom refuses one on a write, so a misspelt field fails a test.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import pytest
 import pytest_asyncio
 
 from nerve.agent.tools.handlers.memory import (
+    MEMORY_SPECS,
     category_update_handler,
     conversation_history_handler,
     memorize_handler,
@@ -48,6 +52,77 @@ ORG = "acme"
 HOME = "agent-home"
 SHARED = "team-shared"
 TOKEN = "test-token-value"
+
+# The fields the bridge sends with each operation (besides `consumer`), as
+# Loom's API names them. The fake refuses any other, so a misspelt or new field
+# fails a test until it is checked against the API and added here.
+_FIELDS = {
+    "context.pack": {
+        "org", "namespace", "agent", "query", "mode", "only_sections", "top_k",
+        "section_token_budgets", "include_decisions",
+    },
+    "memory.set": {
+        "org", "namespace", "agent", "session_id", "memory_key", "memory_type", "value",
+        "tags", "valid_at",
+    },
+    "memory.search": {
+        "org", "namespace", "agent", "query", "recipe", "namespace_scope", "top_k",
+        "include_tags", "bodies", "explain", "legs",
+    },
+    "memory.list": {
+        "org", "namespace", "agent", "user_id", "session_id", "tags", "sort_by", "limit",
+        "offset", "preview_chars", "contains",
+    },
+    "memory.timeline": {
+        "org", "namespace", "agent", "tags", "since", "until", "top_k", "order",
+    },
+    "memory.get": {"org", "namespace", "agent", "user_id", "session_id", "memory_key"},
+    "memory.get_by_id": {"org", "memory_id"},
+    "memory.update_by_id": {"org", "memory_id", "value", "tags", "if_match_sha256"},
+    "memory.delete": {"org", "namespace", "agent", "user_id", "session_id", "memory_key"},
+    "memory.assign_category": {"org", "namespace", "memory_key", "category_name", "tombstone"},
+    "memory.set_from_messages": {
+        "org", "namespace", "agent", "session_id", "messages", "last_messages", "defer",
+        "extra_tags", "observation_date",
+    },
+    "memory.extraction_status": {
+        "org", "namespace", "agent", "session_id", "queue_id", "limit",
+    },
+    "namespace.search_categories": {"org", "namespace", "query", "top_k"},
+    "namespace.list_categories": {"org", "namespace"},
+    "namespace.register_category": {"org", "namespace", "name", "description", "summary"},
+    "namespace.summary": {"org", "namespace", "top_entities_limit"},
+}
+_MESSAGE_FIELDS = {"role", "content", "timestamp"}
+
+# A context pack's item label percent-encodes (UTF-8, upper-case hex) the
+# characters that would end the label or start another attribute in it.
+_LABEL_STOPS = frozenset('[]=%",')
+_PACK_CUT = "...[truncated]"
+
+
+def _label(text: str) -> str:
+    return "".join(
+        "".join(f"%{byte:02X}" for byte in ch.encode()) if ch.isspace() or ch in _LABEL_STOPS else ch
+        for ch in text
+    )
+
+
+def _pack_item(cite: str, text: str) -> str:
+    """One memories-section item the way a pack renders it: the label, then
+    the text, its later lines indented by two spaces."""
+    body = "\n  ".join(text.splitlines())
+    return f"- [{_label(cite)} source=fact by=process:sa%3Atest] {body}"
+
+
+def _pack_section(items: list[str], budget_chars: int) -> str:
+    """Items joined into a section with < and > escaped; a section longer than
+    its budget keeps what fits ahead of a final cut-marker line."""
+    section = "\n".join(items).replace("<", "&lt;").replace(">", "&gt;")
+    if len(section) <= budget_chars:
+        return section
+    room = max(0, budget_chars - len(_PACK_CUT) - 2)
+    return section[:room].rstrip() + "\n" + _PACK_CUT
 
 
 def _iso(dt: datetime) -> str:
@@ -83,19 +158,27 @@ def _jwt(claims: dict) -> str:
     return f"{part({'alg': 'HS256'})}.{part(claims)}.signature"
 
 
+def _compact(value) -> int:
+    """Bytes of ``value`` as httpx sends it."""
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
 class FakeLoom:
     """Just enough of Loom's HTTP API, with state, to run every tool."""
 
     def __init__(self, *, namespaces=(HOME, SHARED), whoami_status=200, authenticated=True):
         self.namespaces = list(namespaces)
-        self.whoami_status = whoami_status
+        self.whoami_status = whoami_status  # 0: the connection fails
         self.authenticated = authenticated
         self.whoami_calls = 0
         self.calls: list[tuple[str, dict, httpx.Headers]] = []
+        self.sizes: dict[str, list[int]] = {}
         self.rows: dict[tuple[str, str], dict] = {}
+        # Keyed by the exact name: Loom matches a category by its registered name.
         self.categories: dict[tuple[str, str], dict] = {}
         self.links: set[tuple[str, str, str]] = set()
         self.queued: list[dict] = []
+        self.queue: dict[str, dict] = {}
         self.failures: dict[str, list] = {}
         self.search_response: dict | None = None
 
@@ -130,6 +213,12 @@ class FakeLoom:
         op = request.url.path.removeprefix("/v1/")
         body = json.loads(request.content or b"{}")
         self.calls.append((op, body, request.headers))
+        self.sizes.setdefault(op, []).append(len(request.content))
+        unknown = set(body) - _FIELDS[op] - {"consumer"}
+        for message in body.get("messages", []) + body.get("last_messages", []):
+            unknown |= {f"messages[].{k}" for k in set(message) - _MESSAGE_FIELDS}
+        if unknown:
+            return _error(422, "UNKNOWN_ARGUMENT", f"{op} takes no {sorted(unknown)}")
         pending = self.failures.get(op)
         if pending:
             failure = pending.pop(0)
@@ -153,7 +242,7 @@ class FakeLoom:
 
     def add_category(self, namespace, name, description="", summary="") -> str:
         cat_id = hashlib.sha256(f"{ORG}\x00{namespace}\x00{name}".encode()).hexdigest()[:32]
-        self.categories[(namespace, name.lower())] = {
+        self.categories[(namespace, name)] = {
             "category_id": cat_id, "name": name, "description": description, "summary": summary,
         }
         return cat_id
@@ -161,7 +250,47 @@ class FakeLoom:
     def _row_by_id(self, memory_id) -> dict | None:
         return next((r for r in self.rows.values() if r["memory_id"] == memory_id), None)
 
+    def _hits(self, query: str, top_k: int, include_tags: bool, namespace: str = "") -> list[dict]:
+        """Rows matching a word of ``query``: in every namespace (all_mine),
+        or in ``namespace`` only."""
+        words = [w.lower() for w in query.split() if len(w) > 2]
+        hits = []
+        for (ns, key), row in self.rows.items():
+            if namespace and ns != namespace:
+                continue
+            if any(w in str(row["value"]).lower() for w in words):
+                hit = {
+                    "memory_key": key, "memory_type": row["memory_type"],
+                    "content_excerpt": str(row["value"]), "distance": 0.2,
+                    "similarity": 0.8, "namespace": ns,
+                }
+                if include_tags:
+                    hit["tags"] = list(row["tags"])
+                hits.append(hit)
+        return hits[:top_k]
+
     # -- operations -------------------------------------------------------
+
+    def _context_pack(self, b):
+        # Startup mode with a query renders the search's hits of the namespace
+        # it names, even where memory.search would abstain, in a section of
+        # four characters per budgeted token (80 tokens at least).
+        items = [
+            _pack_item(f"memory:{hit['namespace']}/{hit['memory_key']}", hit["content_excerpt"])
+            for hit in self._hits(b.get("query", ""), b.get("top_k", 5), False, b["namespace"])
+        ]
+        tokens = (b.get("section_token_budgets") or {}).get("memories", 300)
+        body = _pack_section(items, 4 * max(tokens, 80)) if items else ""
+        return self.pack_response({"memories": body} if body else {})
+
+    @staticmethod
+    def pack_response(sections: dict[str, str]) -> httpx.Response:
+        return _ok({
+            "rendered": "\n".join(f"<{name}>\n{text}\n</{name}>" for name, text in sections.items()),
+            "sections": sections, "blocks": [], "section_meta": {},
+            "section_count": len(sections), "truncated": False, "token_budget": 2000,
+            "mode": "startup",
+        })
 
     def _memory_set(self, b):
         row = self.add_row(
@@ -178,26 +307,17 @@ class FakeLoom:
     def _memory_search(self, b):
         if self.search_response is not None:
             return _ok(self.search_response)
-        words = [w.lower() for w in b["query"].split() if len(w) > 2]
-        hits = []
-        for (namespace, key), row in self.rows.items():
-            if any(w in str(row["value"]).lower() for w in words):
-                hit = {
-                    "memory_key": key, "memory_type": row["memory_type"],
-                    "content_excerpt": str(row["value"]), "distance": 0.2,
-                    "similarity": 0.8, "namespace": namespace,
-                }
-                if b.get("include_tags"):
-                    hit["tags"] = list(row["tags"])
-                hits.append(hit)
-        hits = hits[: b.get("top_k", 5)]
+        hits = self._hits(b["query"], b.get("top_k", 5), bool(b.get("include_tags")))
         return _ok({"results": hits, "abstain": not hits})
 
     def _namespace_search_categories(self, b):
         cats = [c for (ns, _), c in self.categories.items() if ns == b["namespace"]]
         return _ok({"results": [
+            # Loom's excerpt is substring(summary, 1, 280): BYTES, perhaps
+            # ending inside a character.
             {"category_id": c["category_id"], "name": c["name"], "description": c["description"],
-             "summary_excerpt": c["summary"][:280], "distance": 0.3, "similarity": 0.7}
+             "summary_excerpt": c["summary"].encode()[:280].decode("utf-8", "replace"),
+             "distance": 0.3, "similarity": 0.7}
             for c in cats[: b.get("top_k", 5)]
         ]})
 
@@ -222,13 +342,15 @@ class FakeLoom:
             rows = [r for r in rows if b["contains"].lower() in str(r["value"]).lower()]
         rows.sort(key=lambda r: r["created_at"], reverse=True)
         offset, limit = b.get("offset", 0), b.get("limit", 100)
+        preview = b.get("preview_chars", 2048)
         page = rows[offset: offset + limit]
         return _ok({
             "entries": [
                 {"memory_key": r["memory_key"], "memory_type": r["memory_type"], "confidence": 1.0,
                  "version": 1, "created_at": r["created_at"], "updated_at": r["updated_at"],
                  "valid_at": r["valid_at"], "tags": r["tags"], "agent": r["agent"],
-                 "user_id": r["user_id"], "session_id": r["session_id"], "value": r["value"]}
+                 "user_id": r["user_id"], "session_id": r["session_id"],
+                 "value": str(r["value"])[:preview]}
                 for r in page
             ],
             "truncated": offset + limit < len(rows),
@@ -292,7 +414,7 @@ class FakeLoom:
         return _ok({"tombstoned": row is not None, "found": row is not None, "version": 3})
 
     def _memory_assign_category(self, b):
-        cat = self.categories.get((b["namespace"], b["category_name"].lower()))
+        cat = self.categories.get((b["namespace"], b["category_name"]))
         if cat is None:
             return _error(404, "CATEGORY_NOT_FOUND", "not registered")
         link = (b["namespace"], b["memory_key"], cat["category_id"])
@@ -305,7 +427,29 @@ class FakeLoom:
     def _memory_set_from_messages(self, b):
         assert 1 <= len(b["messages"]) <= 400
         self.queued.append(b)
-        return _ok({"written": [], "deferred": True, "queue_id": f"q{len(self.queued)}"})
+        queue_id = f"q{len(self.queued)}"
+        self.queue[queue_id] = {
+            "queue_id": queue_id, "agent": b["agent"], "user_id": "-",
+            "session_id": b.get("session_id", "-"), "status": "pending", "attempts": 0,
+            "message_count": len(b["messages"]), "content_chars": 0, "written": 0,
+            "last_error": "", "enqueued_at": _iso(_now()), "updated_at": _iso(_now()),
+        }
+        return _ok({"written": [], "deferred": True, "queue_id": queue_id})
+
+    def _memory_extraction_status(self, b):
+        rows = list(reversed(self.queue.values()))  # newest first
+        if b.get("session_id", "-") != "-":
+            rows = [r for r in rows if r["session_id"] == b["session_id"]]
+        if b.get("queue_id"):
+            rows = [r for r in rows if r["queue_id"] == b["queue_id"]]
+        if b.get("status"):
+            rows = [r for r in rows if r["status"] == b["status"]]
+        rows = rows[: b.get("limit", 50)]
+        return _ok({
+            "batches": rows,
+            "pending": sum(1 for r in rows if r["status"] in ("pending", "running")),
+            "failed": sum(1 for r in rows if r["status"] == "failed"),
+        })
 
     def _namespace_summary(self, b):
         rows = [r for (ns, _), r in self.rows.items() if ns == b["namespace"]]
@@ -322,7 +466,7 @@ def _config(**loom) -> NerveConfig:
     config = NerveConfig()
     config.memory = MemoryConfig(
         backend="loom",
-        loom=LoomMemoryConfig(base_url="http://loom.test", token=TOKEN, **loom),
+        loom=LoomMemoryConfig(**{"base_url": "http://loom.test", "token": TOKEN, **loom}),
     )
     return config
 
@@ -361,6 +505,19 @@ def test_factory_builds_the_configured_backend() -> None:
     assert isinstance(create_memory_bridge(NerveConfig()), MemUBridge)
 
 
+def test_tool_descriptions_name_no_backend() -> None:
+    for spec in MEMORY_SPECS:
+        text = spec.description + json.dumps(spec.input_schema)
+        assert "memu" not in text.lower(), spec.name
+
+
+@pytest.mark.asyncio
+async def test_the_fake_refuses_fields_an_operation_does_not_take(make_bridge) -> None:
+    bridge = await make_bridge(FakeLoom())
+    with pytest.raises(LoomRequestError, match="UNKNOWN_ARGUMENT"):
+        await bridge._op("memory.search", {"query": "x", "namepsace_scope": "all_mine"})
+
+
 @pytest.mark.asyncio
 async def test_identity_from_whoami_uses_the_first_namespace(make_bridge) -> None:
     fake = FakeLoom()
@@ -395,9 +552,7 @@ async def test_org_setting_combines_with_whoami_namespace(make_bridge) -> None:
 @pytest.mark.asyncio
 async def test_identity_falls_back_to_the_jwt_claims(make_bridge) -> None:
     fake = FakeLoom(whoami_status=404)  # e.g. a proxy that does not forward it
-    config = _config()
-    config.memory.loom.token = _jwt({"org": "jwt-org", "namespaces": ["jwt-home", "x"]})
-    bridge = await make_bridge(fake, config=config)
+    bridge = await make_bridge(fake, token=_jwt({"org": "jwt-org", "namespaces": ["jwt-home", "x"]}))
     await bridge.recall("anything")
     body = fake.bodies("memory.search")[0]
     assert (body["org"], body["namespace"]) == ("jwt-org", "jwt-home")
@@ -429,16 +584,27 @@ async def test_unreachable_loom_is_reported_as_such(make_bridge) -> None:
     assert bridge.available  # boot does not fail on it
     with pytest.raises(MemoryBackendUnavailable) as err:
         await bridge.recall("anything")
-    assert "cannot reach Loom at http://loom.test" in str(err.value)
+    assert "Loom at http://loom.test could not be asked" in str(err.value)
     assert "ConnectError" in str(err.value)
 
 
 @pytest.mark.asyncio
-async def test_rejected_token_is_reported(make_bridge) -> None:
-    fake = FakeLoom(authenticated=False)
-    bridge = await make_bridge(fake)
-    with pytest.raises(MemoryBackendUnavailable, match="did not accept the token"):
+async def test_an_unavailable_whoami_names_the_availability_problem(make_bridge) -> None:
+    bridge = await make_bridge(FakeLoom(whoami_status=503))
+    with pytest.raises(MemoryBackendUnavailable) as err:
         await bridge.recall("anything")
+    assert "could not be asked for the org and namespace (HTTP 503)" in str(err.value)
+    assert "Set memory.loom.org" not in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_token_names_the_credential(make_bridge) -> None:
+    for fake in (FakeLoom(whoami_status=401), FakeLoom(authenticated=False)):
+        bridge = await make_bridge(fake)
+        with pytest.raises(MemoryBackendUnavailable) as err:
+            await bridge.recall("anything")
+        assert "refused the configured token" in str(err.value)
+        assert "memory.loom.token" in str(err.value)
 
 
 @pytest.mark.asyncio
@@ -449,18 +615,72 @@ async def test_identity_is_resolved_again_after_a_401(make_bridge) -> None:
     fake.namespaces = ["renewed-home"]
     fake.fail("memory.search", _error(401, "AUTH_INVALID", "token expired"))
     await bridge.recall("after renewal")
-    searches = fake.bodies("memory.search")
-    assert searches[-1]["namespace"] == "renewed-home"
+    assert fake.bodies("memory.search")[-1]["namespace"] == "renewed-home"
     assert fake.whoami_calls == 2
 
 
 @pytest.mark.asyncio
-async def test_a_persistent_401_is_an_outage(make_bridge) -> None:
+async def test_a_refused_home_credential_is_an_outage(make_bridge) -> None:
     fake = FakeLoom()
     bridge = await make_bridge(fake)
-    fake.fail("memory.search", *[_error(403, "AUTH_INSUFFICIENT", "no grant")] * 2)
+    fake.fail("memory.set", *[_error(403, "AUTH_INSUFFICIENT", "no writer grant")] * 2)
     with pytest.raises(MemoryBackendUnavailable, match="refused the credential.*403"):
-        await bridge.recall("anything")
+        await bridge.memorize_fact("x")
+    assert fake.whoami_calls == 2  # looked up again once
+
+
+@pytest.mark.asyncio
+async def test_a_403_for_another_namespace_is_a_refusal_not_an_outage(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(SHARED, "team_rule", "Deploy on Tuesdays")
+    bridge = await make_bridge(fake)
+    # The id is first tried as a key at home (not found), then in the shared
+    # namespace, where the token only reads.
+    fake.fail("memory.delete", _ok({"tombstoned": False, "found": False}),
+              _error(403, "AUTH_INSUFFICIENT", "viewer only"))
+    text = _text(await memory_delete_handler(_ctx(bridge), {"memory_id": f"{SHARED}/team_rule"}))
+    assert text == "Error: Loom refused memory.delete (HTTP 403 AUTH_INSUFFICIENT): viewer only"
+    assert fake.bodies("memory.delete")[-1]["namespace"] == SHARED
+    assert fake.whoami_calls == 1  # no identity lookup for it
+    assert (SHARED, "team_rule") in fake.rows
+
+
+@pytest.mark.asyncio
+async def test_a_403_on_a_row_of_another_namespace_is_a_refusal(make_bridge) -> None:
+    fake = FakeLoom()
+    row = fake.add_row(SHARED, "team_rule", "Deploy on Tuesdays")
+    bridge = await make_bridge(fake)
+    fake.fail("memory.update_by_id", _error(403, "AUTH_INSUFFICIENT", "viewer only"))
+    text = _text(await memory_update_handler(
+        _ctx(bridge), {"memory_id": row["memory_id"], "content": "Deploy on Fridays"},
+    ))
+    assert text == "Error: Loom refused memory.update_by_id (HTTP 403 AUTH_INSUFFICIENT): viewer only"
+    assert "namespace" not in fake.bodies("memory.update_by_id")[0]
+    assert fake.whoami_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_policy_refusal_is_a_refusal_not_an_outage(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    fake.fail("memory.set", _error(403, "POLICY_FORBIDDEN", "writes are paused"))
+    text = _text(await memorize_handler(_ctx(bridge), {"content": "x"}))
+    assert text == "Error: Loom refused memory.set (HTTP 403 POLICY_FORBIDDEN): writes are paused"
+    assert fake.whoami_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lookup_after_a_refusal_does_not_block_later_calls(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    await bridge.recall("warm up")
+    fake.whoami_status = 503
+    fake.fail("memory.search", _error(401, "AUTH_INVALID", "blip"))
+    with pytest.raises(MemoryBackendUnavailable, match="refused the credential"):
+        await bridge.recall("x")
+    fake.whoami_status = 200
+    await bridge.recall("right after")  # the old identity, nothing held back
+    assert fake.bodies("memory.search")[-1]["namespace"] == HOME
 
 
 @pytest.mark.asyncio
@@ -482,9 +702,7 @@ async def test_every_request_carries_consumer_org_and_bearer(make_bridge) -> Non
 
 @pytest.mark.asyncio
 async def test_bad_url_fails_initialize_without_raising() -> None:
-    config = _config()
-    config.memory.loom.base_url = "not a url"
-    bridge = LoomBridge(config, transport=FakeLoom().transport())
+    bridge = LoomBridge(_config(base_url="not a url"), transport=FakeLoom().transport())
     assert await bridge.initialize() is False
     assert bridge.available is False
     assert await bridge.recall("x") == []
@@ -498,6 +716,90 @@ async def test_shutdown_is_idempotent(make_bridge) -> None:
     await bridge.shutdown()
     assert bridge.available is False
     LoomBridge._release_memory()  # the sweep calls it; a no-op here
+
+
+# --------------------------------------------------------------------------- #
+# Transport: retries, the breaker, rate limits
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_outage_raises_after_three_attempts_then_fails_fast(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    await bridge.recall("warm up")  # identity resolved
+    fake.fail("memory.search", *[httpx.ConnectError("refused")] * 3)
+    with pytest.raises(MemoryBackendUnavailable, match="cannot reach Loom"):
+        await bridge.recall("anything")
+    assert len(fake.bodies("memory.search")) == 1 + 3
+    # The breaker: the next call does not wait out the timeouts again.
+    with pytest.raises(MemoryBackendUnavailable, match="not retried for another"):
+        await bridge.recall("anything")
+    assert len(fake.bodies("memory.search")) == 1 + 3
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_connection_or_full_pool_does_not_trip_the_breaker(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(HOME, "k1", "the sky is blue")
+    bridge = await make_bridge(fake)
+    fake.fail("memory.search", httpx.RemoteProtocolError("server disconnected"),
+              httpx.PoolTimeout("no free connection"))
+    assert (await bridge.recall("sky blue"))[0]["id"] == "k1"  # sent again, then answered
+    fake.fail("memory.search", *[httpx.PoolTimeout("no free connection")] * 3)
+    with pytest.raises(MemoryBackendUnavailable, match="PoolTimeout"):
+        await bridge.recall("sky blue")
+    assert bridge._down_until == 0.0
+    assert (await bridge.recall("sky blue"))[0]["id"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_recall_handler_says_down_not_empty(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    fake.fail("memory.search", *[_error(503, "BACKEND_UNAVAILABLE", "storage down")] * 3)
+    text = _text(await memory_recall_handler(_ctx(bridge), {"query": "q"}))
+    assert "MEMORY BACKEND DOWN" in text and "NOT empty" in text
+    # A fast HTTP answer does not open the breaker; the next call asks again.
+    assert bridge._down_until == 0.0
+    assert await bridge.recall("q") == []
+
+
+@pytest.mark.asyncio
+async def test_a_transient_5xx_is_retried(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(HOME, "k1", "the sky is blue", tags=["nerve", "nerve:knowledge"])
+    bridge = await make_bridge(fake)
+    fake.fail("memory.search", _error(502, "BAD_GATEWAY"))
+    out = await bridge.recall("sky blue")
+    assert out and out[0]["summary"] == "the sky is blue"
+    assert len(fake.bodies("memory.search")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_short_rate_limit_is_waited_out(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(HOME, "k1", "the sky is blue")
+    bridge = await make_bridge(fake)
+    fake.fail("memory.search", _error(429, "RATE_LIMITED", "slow down", **{"Retry-After": "0"}))
+    assert (await bridge.recall("sky blue"))[0]["id"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_a_long_rate_limit_fails_at_once_and_holds_the_operation(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(HOME, "k1", "the sky is blue")
+    bridge = await make_bridge(fake)
+    fake.fail("memory.search", _error(429, "RATE_LIMITED", "slow down", **{"Retry-After": "300"}))
+    with pytest.raises(MemoryBackendUnavailable, match="RATE_LIMITED"):
+        await bridge.recall("sky blue")
+    assert len(fake.bodies("memory.search")) == 1  # not sent again
+    with pytest.raises(MemoryBackendUnavailable, match="rate limited; not retried for another (59|60)s"):
+        await bridge.recall("sky blue")
+    assert len(fake.bodies("memory.search")) == 1
+    assert await bridge.memorize_fact("other operations still go")
+    bridge._limited.clear()
+    assert (await bridge.recall("sky blue"))[0]["id"] == "k1"
 
 
 # --------------------------------------------------------------------------- #
@@ -521,6 +823,10 @@ async def test_recall_request_and_result_shape(make_bridge) -> None:
          "content_excerpt": "the whole long doc", "tags": [], "namespace": HOME},
         {"memory_key": "deploy_window", "memory_type": "semantic",
          "content_excerpt": "Deploys run Tuesdays", "tags": [], "namespace": SHARED},
+        {"memory_key": "weekly_review", "memory_type": "procedural",
+         "content_excerpt": "Reviews notes on Fridays", "tags": [], "namespace": HOME},
+        {"memory_key": "met_bob", "memory_type": "episodic",
+         "content_excerpt": "Met Bob at the conference", "tags": [], "namespace": HOME},
     ], "abstain": False}
     cat_id = fake.add_category(HOME, "preferences", "How things should be done", "# x\n" + "y" * 5000)
     bridge = await make_bridge(fake)
@@ -532,31 +838,37 @@ async def test_recall_request_and_result_shape(make_bridge) -> None:
     assert search["namespace_scope"] == "all_mine"
     assert search["top_k"] == 10
     assert search["include_tags"] is True
+    assert search["legs"] == ["memory"]
     assert fake.bodies("namespace.search_categories")[0]["top_k"] == 3
     items = [m for m in out if m["type"] != "category"]
     cats = [m for m in out if m["type"] == "category"]
+    # Loom's types read in the tools' words.
     assert items == [
         {"id": "nerve_profile_" + "a" * 20, "type": "profile", "summary": "Alice lives in Metropolis"},
-        {"id": "user_coffee", "type": "preference", "summary": "Prefers black coffee"},
-        {"id": "long_doc", "type": "semantic", "summary": "a passage of the long doc"},
-        {"id": f"{SHARED}/deploy_window", "type": "semantic", "summary": "Deploys run Tuesdays"},
+        {"id": "user_coffee", "type": "profile", "summary": "Prefers black coffee"},
+        {"id": "long_doc", "type": "knowledge", "summary": "a passage of the long doc"},
+        {"id": f"{SHARED}/deploy_window", "type": "knowledge", "summary": "Deploys run Tuesdays"},
+        {"id": "weekly_review", "type": "behavior", "summary": "Reviews notes on Fridays"},
+        {"id": "met_bob", "type": "event", "summary": "Met Bob at the conference"},
     ]
     assert cats == [{"id": f"cat:{cat_id}", "type": "category", "name": "preferences",
                      "summary": "How things should be done"}]
 
 
 @pytest.mark.asyncio
-async def test_recall_caps_and_clips_crumbs(make_bridge) -> None:
+async def test_recall_clips_items_and_crumbs(make_bridge) -> None:
     fake = FakeLoom()
     fake.search_response = {"results": [
-        {"memory_key": f"k{n}", "memory_type": "semantic", "content_excerpt": f"fact {n}", "tags": []}
+        {"memory_key": f"k{n}", "memory_type": "semantic", "content_excerpt": "x" * 1200, "tags": []}
         for n in range(8)
     ]}
     for n in range(6):
         fake.add_category(HOME, f"cat{n}", "", "# heading\n- " + "z" * 900)
     bridge = await make_bridge(fake)
     out = await bridge.recall("q", limit=3, category_limit=2)
-    assert [m["id"] for m in out if m["type"] != "category"] == ["k0", "k1", "k2"]
+    items = [m for m in out if m["type"] != "category"]
+    assert [m["id"] for m in items] == ["k0", "k1", "k2"]
+    assert all(len(m["summary"]) == 500 and m["summary"].endswith("…") for m in items)
     cats = [m for m in out if m["type"] == "category"]
     assert len(cats) == 2
     assert all(len(c["summary"]) <= 200 for c in cats)
@@ -585,59 +897,16 @@ async def test_abstain_keeps_the_topics(make_bridge) -> None:
 
 
 @pytest.mark.asyncio
-async def test_outage_raises_after_three_attempts_then_fails_fast(make_bridge) -> None:
-    fake = FakeLoom()
-    bridge = await make_bridge(fake)
-    await bridge.recall("warm up")  # identity resolved
-    fake.fail("memory.search", *[httpx.ConnectError("refused")] * 3)
-    with pytest.raises(MemoryBackendUnavailable, match="cannot reach Loom"):
-        await bridge.recall("anything")
-    assert len(fake.bodies("memory.search")) == 1 + 3
-    # The breaker: the next call does not wait out the timeouts again.
-    with pytest.raises(MemoryBackendUnavailable, match="not retried for another"):
-        await bridge.recall("anything")
-    assert len(fake.bodies("memory.search")) == 1 + 3
-
-
-@pytest.mark.asyncio
-async def test_recall_handler_says_down_not_empty(make_bridge) -> None:
-    fake = FakeLoom()
-    bridge = await make_bridge(fake)
-    fake.fail("memory.search", *[_error(503, "BACKEND_UNAVAILABLE", "storage down")] * 3)
-    text = _text(await memory_recall_handler(_ctx(bridge), {"query": "q"}))
-    assert "MEMORY BACKEND DOWN" in text and "NOT empty" in text
-    # A fast HTTP answer does not open the breaker; the next call asks again.
-    assert bridge._down_until == 0.0
-    assert await bridge.recall("q") == []
-
-
-@pytest.mark.asyncio
-async def test_a_transient_5xx_is_retried(make_bridge) -> None:
-    fake = FakeLoom()
-    fake.add_row(HOME, "k1", "the sky is blue", tags=["nerve", "nerve:knowledge"])
-    bridge = await make_bridge(fake)
-    fake.fail("memory.search", _error(502, "BAD_GATEWAY"))
-    out = await bridge.recall("sky blue")
-    assert out and out[0]["summary"] == "the sky is blue"
-    assert len(fake.bodies("memory.search")) == 2
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_is_retried_after_the_hint(make_bridge) -> None:
-    fake = FakeLoom()
-    fake.add_row(HOME, "k1", "the sky is blue")
-    bridge = await make_bridge(fake)
-    fake.fail("memory.search", _error(429, "RATE_LIMITED", "slow down", **{"Retry-After": "0"}))
-    assert (await bridge.recall("sky blue"))[0]["id"] == "k1"
-
-
-@pytest.mark.asyncio
-async def test_a_refused_search_is_empty_and_not_an_outage(make_bridge) -> None:
+async def test_a_refused_search_raises(make_bridge) -> None:
     fake = FakeLoom()
     bridge = await make_bridge(fake)
     fake.fail("memory.search", _error(422, "VALIDATION_FAILED", "query too long"))
-    assert await bridge.recall("x" * 10) == []
+    with pytest.raises(LoomRequestError, match="VALIDATION_FAILED"):
+        await bridge.recall("x" * 10)
     assert bridge._down_until == 0.0
+    fake.fail("memory.search", _error(422, "VALIDATION_FAILED", "query too long"))
+    text = _text(await memory_recall_handler(_ctx(bridge), {"query": "x"}))
+    assert text.startswith("Memory recall error: Loom refused memory.search (HTTP 422")
 
 
 @pytest.mark.asyncio
@@ -704,13 +973,20 @@ async def test_recall_output_respects_the_size_budget(make_bridge) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_context_uses_recall(make_bridge) -> None:
+async def test_session_context_uses_recall_within_the_budget(make_bridge) -> None:
     fake = FakeLoom()
     fake.add_row(HOME, "k1", "context for the deploy topic", tags=["nerve", "nerve:knowledge"])
     bridge = await make_bridge(fake)
     text = _text(await session_context_handler(_ctx(bridge), {"topic": "deploy topic"}))
     assert "- [knowledge] (id:k1) context for the deploy topic" in text
     assert fake.bodies("memory.search")[0]["top_k"] == 15
+    fake.search_response = {"results": [
+        {"memory_key": f"k{n}", "memory_type": "semantic", "content_excerpt": "y" * 1200, "tags": []}
+        for n in range(60)
+    ]}
+    text = _text(await session_context_handler(_ctx(bridge), {"topic": "t", "memory_limit": 60}))
+    assert "truncated to fit recall size budget" in text
+    assert len(text.encode("utf-8")) < 12_000
 
 
 # --------------------------------------------------------------------------- #
@@ -734,6 +1010,7 @@ async def test_expand_category_lists_the_tagged_rows_newest_first(make_bridge) -
     body = fake.bodies("memory.list")[0]
     assert body["tags"] == ["travel"] and body["sort_by"] == "recency"
     assert (body["agent"], body["user_id"], body["session_id"]) == ("*", "*", "*")
+    assert body["preview_chars"] == 500
     assert result["name"] == "travel" and result["total"] == 2
     assert [i["id"] for i in result["items"]] == ["new", "old"]
     assert result["items"][0]["type"] == "event"
@@ -743,6 +1020,21 @@ async def test_expand_category_lists_the_tagged_rows_newest_first(make_bridge) -
     ))
     assert fake.bodies("memory.list")[-1]["contains"] == "porto"
     assert text.startswith("Category 'travel' — showing 1 of 1 items (matching 'porto'):")
+
+
+@pytest.mark.asyncio
+async def test_expand_category_clips_a_long_keyword_and_says_so(make_bridge) -> None:
+    fake = FakeLoom()
+    cat_id = fake.add_category(HOME, "travel", "Trips")
+    fake.add_row(HOME, "trip", "porto " * 60, tags=["travel"])
+    bridge = await make_bridge(fake)
+    keyword = "porto " * 50  # 300 characters
+    text = _text(await memory_expand_category_handler(
+        _ctx(bridge), {"category_id": f"cat:{cat_id}", "query": keyword},
+    ))
+    assert len(fake.bodies("memory.list")[-1]["contains"]) == 200
+    assert "the keyword's first 200 characters" in text
+    assert "showing 1 of 1 items" in text
 
 
 @pytest.mark.asyncio
@@ -767,27 +1059,34 @@ async def test_create_category_registers_once(make_bridge) -> None:
 @pytest.mark.asyncio
 async def test_category_update_replaces_the_summary(make_bridge) -> None:
     fake = FakeLoom()
+    audit = MagicMock()
+    audit.log_audit = AsyncMock()
     cat_id = fake.add_category(HOME, "finance", "Money matters", "old summary")
-    bridge = await make_bridge(fake)
+    bridge = await make_bridge(fake, audit_db=audit)
     text = _text(await category_update_handler(
         _ctx(bridge), {"category_id": cat_id, "summary": "new summary"},
     ))
     assert text == f"Category {cat_id} updated and re-embedded."
     register = fake.bodies("namespace.register_category")[-1]
-    assert register == {**register, "name": "finance", "description": "Money matters",
-                        "summary": "new summary"}
+    assert (register["name"], register["description"], register["summary"]) == (
+        "finance", "Money matters", "new summary",
+    )
+    assert audit.log_audit.call_args.args[4] == {"summary_changed": True, "description_changed": False}
 
 
 @pytest.mark.asyncio
 async def test_description_update_keeps_a_short_summary(make_bridge) -> None:
     fake = FakeLoom()
+    audit = MagicMock()
+    audit.log_audit = AsyncMock()
     cat_id = fake.add_category(HOME, "finance", "Money", "short summary")
-    bridge = await make_bridge(fake)
+    bridge = await make_bridge(fake, audit_db=audit)
     assert await bridge.update_category(f"cat:{cat_id}", description="Money and taxes")
     assert fake.categories[(HOME, "finance")] == {
         "category_id": cat_id, "name": "finance", "description": "Money and taxes",
         "summary": "short summary",
     }
+    assert audit.log_audit.call_args.args[4] == {"summary_changed": False, "description_changed": True}
 
 
 @pytest.mark.asyncio
@@ -802,6 +1101,28 @@ async def test_description_update_refuses_to_cut_a_long_summary(make_bridge) -> 
         _ctx(bridge), {"category_id": cat_id, "description": "x"},
     ))
     assert text.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_description_update_counts_the_summary_in_bytes(make_bridge) -> None:
+    """213 Cyrillic letters are 426 bytes, of which Loom returns 280."""
+    fake = FakeLoom()
+    cat_id = fake.add_category(HOME, "finance", "Money", "д" * 213)
+    bridge = await make_bridge(fake)
+    with pytest.raises(ValueError, match="280 bytes"):
+        await bridge.update_category(cat_id, description="Money and taxes")
+    assert fake.categories[(HOME, "finance")]["summary"] == "д" * 213
+
+
+@pytest.mark.asyncio
+async def test_description_update_refuses_a_category_search_does_not_show(make_bridge) -> None:
+    fake = FakeLoom()
+    cat_id = fake.add_category(HOME, "finance", "Money", "a summary to keep")
+    bridge = await make_bridge(fake)
+    fake.fail("namespace.search_categories", _ok({"results": []}))  # e.g. never embedded
+    with pytest.raises(ValueError, match="does not show in Loom's category search"):
+        await bridge.update_category(cat_id, description="Money and taxes")
+    assert fake.categories[(HOME, "finance")]["summary"] == "a summary to keep"
 
 
 @pytest.mark.asyncio
@@ -959,6 +1280,20 @@ async def test_memorize_conversation_queues_batches(make_bridge) -> None:
 
 
 @pytest.mark.asyncio
+async def test_extraction_batches_stay_within_the_byte_budget(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, extraction_batch_bytes=128 * 1024)
+    messages = _messages(60, datetime(2026, 10, 18, tzinfo=UTC), content="w" * 8000)
+    messages.append({"role": "user", "content": "é" * 300_000, "created_at": "2026-10-18 02:00:00"})
+    await bridge.memorize_conversation("sess-1", messages)
+    assert len(fake.queued) >= 6
+    assert max(fake.sizes["memory.set_from_messages"]) <= 128 * 1024
+    assert fake.queued[-1]["messages"][-1]["content"].endswith("[…truncated]")
+    sent = [m["content"] for b in fake.queued for m in b["messages"]]
+    assert sent[:60] == [f"{'w' * 8000} {n}" for n in range(60)]  # all of them, in order
+
+
+@pytest.mark.asyncio
 async def test_context_turns_are_clipped(make_bridge) -> None:
     fake = FakeLoom()
     bridge = await make_bridge(fake)
@@ -967,7 +1302,9 @@ async def test_context_turns_are_clipped(make_bridge) -> None:
     await bridge.memorize_conversation("sess-1", messages)
     first, second = fake.queued
     assert len(first["messages"][399]["content"]) == 5000  # extracted whole
-    assert len(second["last_messages"][-1]["content"]) == 2000
+    context = second["last_messages"][-1]
+    assert context["content"].endswith("[…truncated]")
+    assert _compact(context) <= 2000
 
 
 @pytest.mark.asyncio
@@ -1007,6 +1344,16 @@ async def test_nothing_to_send_is_false(make_bridge) -> None:
     assert fake.queued == []
 
 
+@pytest.mark.asyncio
+async def test_memorize_conversation_raises_when_the_bridge_is_down(make_bridge) -> None:
+    """The sweep moves its watermark unless this raises."""
+    bridge = await make_bridge(FakeLoom())
+    await bridge.shutdown()
+    with pytest.raises(MemoryBackendUnavailable, match="not running"):
+        await bridge.memorize_conversation("s", _messages(2, _now()))
+    assert await bridge.memorize_conversation("s", []) is False
+
+
 def _engine_with(bridge):
     from nerve.agent.engine import AgentEngine
     from tests.actor_rows import mock_system_principal
@@ -1025,6 +1372,7 @@ def _engine_with(bridge):
     engine.db.get_messages = AsyncMock(return_value=[
         {"created_at": "2026-01-01 00:05:00", "role": "user", "content": "I moved to Berlin"},
     ])
+    engine.db.get_sessions_needing_memorization = AsyncMock(return_value=[])
     return engine
 
 
@@ -1120,6 +1468,19 @@ async def test_update_type_and_categories(make_bridge) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dropping_a_capitalised_category_names_it_as_registered(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_category(HOME, "Work Projects", "Work")
+    fake.add_category(HOME, "Travel", "Trips")
+    fake.add_row(HOME, "k", "Conference in Lisbon", tags=["Work Projects"])  # tags are lowercase
+    bridge = await make_bridge(fake)
+    assert await bridge.update_item("k", categories=["travel"])
+    assigns = {(a["category_name"], a["tombstone"]) for a in fake.bodies("memory.assign_category")}
+    assert assigns == {("Travel", False), ("Work Projects", True)}
+    assert fake.rows[(HOME, "k")]["tags"] == ["travel"]
+
+
+@pytest.mark.asyncio
 async def test_update_by_loom_memory_id(make_bridge) -> None:
     fake = FakeLoom()
     row = fake.add_row(SHARED, "team_rule", "Deploy on Tuesdays", agent="other-agent", session_id="x")
@@ -1143,7 +1504,6 @@ async def test_delete_by_key_and_by_qualified_id(make_bridge) -> None:
     fake.add_row(HOME, "k1", "one")
     fake.add_row(SHARED, "k2", "two")
     bridge = await make_bridge(fake)
-    await bridge.recall("warm up")  # learn the home namespace
 
     assert _text(await memory_delete_handler(_ctx(bridge), {"memory_id": "k1"})) == "Memory k1 deleted."
     assert (HOME, "k1") not in fake.rows
@@ -1192,12 +1552,42 @@ async def test_conversation_history_reads_the_timeline(make_bridge) -> None:
     body = fake.bodies("memory.timeline")[0]
     assert body["tags"] == ["nerve", "source:nerve"]
     assert body["since"] == "2026-10-18T00:00:00Z" and body["until"] == "2026-10-18T23:59:59Z"
-    assert body["order"] == "desc" and body["agent"] == "*"
+    assert body["order"] == "desc" and body["agent"] == "*" and body["top_k"] == 500
     assert text == (
         "Memories from 2026-10-18 (2 items):\n\n"
         f"- [event] (id:nerve_event_{'c' * 20}) Signed the lease\n"
-        "- [semantic] (id:trip) Flew to Lisbon"
+        "- [knowledge] (id:trip) Flew to Lisbon"
     )
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_pages_past_undated_rows(make_bridge) -> None:
+    fake = FakeLoom()
+    day = datetime(2026, 10, 18, 23, 0, tzinfo=UTC)
+    for n in range(520):  # recent and undated: they fill the first page
+        fake.add_row(HOME, f"u{n}", f"undated {n}", tags=["nerve"], created_at=_iso(day - timedelta(seconds=n)))
+    for n in range(5):
+        fake.add_row(HOME, f"d{n}", f"dated {n}", tags=["source:nerve"],
+                     valid_at=_iso(day - timedelta(hours=10 + n)))
+    bridge = await make_bridge(fake)
+    rows = await bridge.conversation_history("2026-10-18", limit=10)
+    assert [r["id"] for r in rows] == [f"d{n}" for n in range(5)]
+    timeline = fake.bodies("memory.timeline")
+    assert len(timeline) == 2
+    assert timeline[1]["until"] == _iso(day - timedelta(seconds=499))  # the oldest row seen
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_stops_at_the_limit(make_bridge) -> None:
+    fake = FakeLoom()
+    day = datetime(2026, 10, 18, 20, 0, tzinfo=UTC)
+    for n in range(30):
+        fake.add_row(HOME, f"d{n}", f"dated {n}", tags=["source:nerve"],
+                     valid_at=_iso(day - timedelta(minutes=n)))
+    bridge = await make_bridge(fake)
+    rows = await bridge.conversation_history("2026-10-18", limit=7)
+    assert [r["id"] for r in rows] == [f"d{n}" for n in range(7)]
+    assert len(fake.bodies("memory.timeline")) == 1
 
 
 @pytest.mark.asyncio
@@ -1222,12 +1612,13 @@ async def test_records_by_date_reads_created_at(make_bridge) -> None:
     text = _text(await memory_records_by_date_handler(_ctx(bridge), {"date": "2026-10-20"}))
     assert text == (
         "Records from 2026-10-20 (2 items):\n\n"
-        "- [semantic] (id:new) Created today\n"
-        "- [semantic] (id:dated) About last year"
+        "- [knowledge] (id:new) Created today\n"
+        "- [knowledge] (id:dated) About last year"
     )
     body = fake.bodies("memory.list")[0]
     assert body["tags"] == ["nerve", "source:nerve"] and body["sort_by"] == "recency"
     assert (body["agent"], body["user_id"], body["session_id"]) == ("*", "*", "*")
+    assert body["preview_chars"] == 500
 
     text = _text(await memory_records_by_date_handler(
         _ctx(bridge), {"date": "2026-10-20", "updated": True},
@@ -1252,7 +1643,7 @@ async def test_records_by_date_pages_and_stops_at_the_window(make_bridge) -> Non
 
 
 # --------------------------------------------------------------------------- #
-# Health and routes
+# Health, the dashboard link, routes
 # --------------------------------------------------------------------------- #
 
 
@@ -1269,7 +1660,7 @@ async def test_health_shape(make_bridge) -> None:
 
     assert health["backend"] == "loom"
     assert health["service_available"] is True
-    assert health["dashboard_url"] == "http://loom.test"
+    assert health["dashboard_url"] == f"http://loom.test/memories?namespace={HOME}"
     assert health["database"]["total_items"] == 2
     assert health["database"]["type_distribution"] == {"semantic": 1, "procedural": 1}
     assert health["database"]["total_categories"] == 1
@@ -1290,6 +1681,23 @@ async def test_health_when_loom_is_down(make_bridge) -> None:
     assert len(fake.bodies("namespace.summary")) == 1  # one attempt only
 
 
+@pytest.mark.parametrize(("base_url", "dashboard_url", "expected"), [
+    # A local proxy's address is no link for a browser.
+    ("http://10.0.0.5:3000", "", ""),
+    ("http://127.0.0.1:7777", "", ""),
+    ("http://localhost:7777", "", ""),
+    ("http://169.254.10.1:7777", "", ""),
+    ("http://[::1]:7777", "", ""),
+    ("http://10.0.0.5:3000", "https://loom.example.test/",
+     f"https://loom.example.test/memories?namespace={HOME}"),
+    ("https://loom.example.test", "", f"https://loom.example.test/memories?namespace={HOME}"),
+])
+@pytest.mark.asyncio
+async def test_dashboard_link(make_bridge, base_url, dashboard_url, expected) -> None:
+    bridge = await make_bridge(FakeLoom(), base_url=base_url, dashboard_url=dashboard_url)
+    assert bridge.dashboard_url == expected
+
+
 @pytest.mark.asyncio
 async def test_snapshot_route_degrades_for_loom(make_bridge, monkeypatch) -> None:
     from nerve.gateway.routes import memory as routes
@@ -1302,7 +1710,7 @@ async def test_snapshot_route_degrades_for_loom(make_bridge, monkeypatch) -> Non
     assert snapshot["available"] is False
     assert snapshot["backend"] == "loom"
     assert snapshot["reason"] == "not available for this backend"
-    assert snapshot["dashboard_url"] == "http://loom.test"
+    assert snapshot["dashboard_url"] == f"http://loom.test/memories?namespace={HOME}"
 
     health = await routes.memu_health()
     assert health["backend"] == "loom"
