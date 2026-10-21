@@ -64,6 +64,7 @@ _RESTART_ONLY_PATHS = (
     "proxy",
     "slack.mode",
     "sync.codex",
+    "sync.github.mode",
     "telegram.allowed_users",
     "telegram.bot_token",
     "telegram.enabled",
@@ -353,6 +354,25 @@ def _reload_hosted_keys(engine) -> str | None:
         return f"{_ERROR_PREFIX}{detail}"
 
 
+async def _republish_hosted_subscriptions(engine) -> str | None:
+    """Send the hosted source subscriptions to the gateway again.
+
+    The filters and ``pr_watch`` follow a reload this way; the gateway keeps
+    the newest subscription it received. ``None`` without hosted sources.
+    """
+    if engine is None:
+        return None
+    try:
+        runtime = engine.get_channel_runtime("hosted")
+        if runtime is None:
+            return None
+        return await runtime.republish_subscriptions()
+    except Exception as e:  # noqa: BLE001 - report the subsystem and continue
+        detail = str(e) or type(e).__name__
+        logger.warning("Hosted source subscriptions were not published: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     """Re-read config and hot-reload all reloadable subsystems.
 
@@ -413,6 +433,9 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
             summary["sources"] = await cron_service.reload_sources()
         except Exception as e:  # noqa: BLE001
             summary["sources"] = f"{_ERROR_PREFIX}{e}"
+    subscriptions = await _republish_hosted_subscriptions(engine)
+    if subscriptions is not None:
+        summary["subscriptions"] = subscriptions
 
     # 3. MCP servers.
     if engine is not None:
