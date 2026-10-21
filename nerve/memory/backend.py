@@ -64,6 +64,19 @@ def category_breadcrumb(name: str, description: str, summary: str) -> str:
     return text
 
 
+async def recall_for_startup(bridge: Any, query: str, limit: int) -> list[dict]:
+    """The memories a new session starts with; the engine freezes their
+    summaries for the whole session.
+
+    A backend with a read of its own for this (the Loom bridge's
+    ``startup_recall``, which serves memories even where a search abstains,
+    and no category blurbs) answers it; memU recalls.
+    """
+    if callable(getattr(type(bridge), "startup_recall", None)):
+        return await bridge.startup_recall(query, limit=limit)
+    return await bridge.recall(query, limit=limit)
+
+
 def create_memory_bridge(config: Any, audit_db: Any = None) -> Any:
     """The memory backend ``config.memory.backend`` names, not yet initialized.
 

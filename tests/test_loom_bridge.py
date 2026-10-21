@@ -3,7 +3,8 @@
 Covers every memory tool path through the real handlers, the bridge's
 failure contract (an outage raises ``MemoryBackendUnavailable`` after bounded
 retries; an abstaining search is empty, never an error), identity resolution,
-and output parity with the memU bridge on the same inputs.
+the startup recall, and output parity with the memU bridge on the same
+inputs.
 
 The fake is strict: a request field an operation does not take is refused,
 as Loom refuses one on a write, so a misspelt field fails a test.
@@ -44,7 +45,11 @@ from nerve.config import (
     MemoryConfig,
     NerveConfig,
 )
-from nerve.memory.backend import MemoryBackendUnavailable, create_memory_bridge
+from nerve.memory.backend import (
+    MemoryBackendUnavailable,
+    create_memory_bridge,
+    recall_for_startup,
+)
 from nerve.memory.loom_bridge import LoomBridge, LoomRequestError
 from nerve.memory.memu_bridge import MemUBridge
 
@@ -987,6 +992,102 @@ async def test_session_context_uses_recall_within_the_budget(make_bridge) -> Non
     text = _text(await session_context_handler(_ctx(bridge), {"topic": "t", "memory_limit": 60}))
     assert "truncated to fit recall size budget" in text
     assert len(text.encode("utf-8")) < 12_000
+
+
+# --------------------------------------------------------------------------- #
+# Startup recall
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_serves_memories_where_the_search_abstains(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.search_response = {"results": [], "abstain": True}  # memory.search abstains
+    fake.add_row(HOME, "user_city", "Lives in Lisbon, near the river", tags=["source:nerve"])
+    fake.add_row(HOME, "review_rule", "Changes need a second reviewer")
+    fake.add_row(SHARED, "team_rule", "Deploys need a second reviewer")  # not searched
+    fake.add_category(HOME, "home", "Where the user lives")
+    bridge = await make_bridge(fake)
+
+    out = await recall_for_startup(bridge, "Lisbon reviewer session", 8)
+
+    assert out == [
+        {"id": "user_city", "type": "", "summary": "Lives in Lisbon, near the river"},
+        {"id": "review_rule", "type": "", "summary": "Changes need a second reviewer"},
+    ]
+    body = fake.bodies("context.pack")[0]
+    assert body["mode"] == "startup" and body["only_sections"] == ["memories"]
+    assert body["query"] == "Lisbon reviewer session" and body["top_k"] == 8
+    assert body["section_token_budgets"] == {"memories": 1000}
+    assert body["agent"] == "nerve"
+    # A session id would narrow the read to the new session's own rows.
+    assert "session_id" not in body
+    assert fake.bodies("memory.search") == []  # and no category blurbs
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_reads_multiline_and_escaped_items(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.add_row(HOME, "k=1 [a]", "first line of the plan\nsecond line: <b>bold</b>")
+    bridge = await make_bridge(fake)
+    out = await bridge.startup_recall("plan", limit=8)
+    assert out == [{"id": "k=1 [a]", "type": "",
+                    "summary": "first line of the plan\nsecond line: <b>bold</b>"}]
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_is_bounded(make_bridge) -> None:
+    fake = FakeLoom()
+    for n in range(12):
+        fake.add_row(HOME, f"k{n}", f"plan {n} " + "z" * 900)
+    bridge = await make_bridge(fake)
+    out = await bridge.startup_recall("plan", limit=8)
+    # Loom cut the section to its budget inside the fifth item: four whole ones.
+    assert [m["id"] for m in out] == ["k0", "k1", "k2", "k3"]
+    assert all(len(m["summary"]) == 500 for m in out)
+    assert sum(len(m["summary"].encode()) for m in out) <= 4000
+    fake.add_row(HOME, "short", "plan short")
+    out = await bridge.startup_recall("short plan", limit=2)
+    assert len(out) <= 2
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_falls_back_to_search_ignoring_abstain(make_bridge) -> None:
+    fake = FakeLoom()
+    fake.search_response = {"results": [
+        {"memory_key": "k1", "memory_type": "semantic", "content_excerpt": "a weak prior", "tags": []},
+    ], "abstain": True}
+    fake.add_category(HOME, "work", "Projects")
+    bridge = await make_bridge(fake)
+    fake.fail("context.pack", httpx.Response(404, json={"detail": "Not Found"}))
+    out = await bridge.startup_recall("context for web session")
+    assert out == [{"id": "k1", "type": "knowledge", "summary": "a weak prior"}]
+    assert fake.bodies("namespace.search_categories") == []
+
+
+@pytest.mark.asyncio
+async def test_startup_recall_outage_raises_so_nothing_is_frozen(make_bridge) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake)
+    fake.fail("context.pack", *[httpx.ConnectError("refused")] * 3)
+    with pytest.raises(MemoryBackendUnavailable):
+        await recall_for_startup(bridge, "context for web session", 8)
+
+
+@pytest.mark.asyncio
+async def test_memu_keeps_recall_for_startup() -> None:
+    class RecallOnly:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        async def recall(self, query, limit=10, category_limit=5):
+            self.calls.append((query, limit))
+            return [{"summary": "prior"}]
+
+    assert not hasattr(MemUBridge, "startup_recall")
+    bridge = RecallOnly()
+    assert await recall_for_startup(bridge, "context for web session", 8) == [{"summary": "prior"}]
+    assert bridge.calls == [("context for web session", 8)]
 
 
 # --------------------------------------------------------------------------- #

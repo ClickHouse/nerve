@@ -13,7 +13,8 @@ How the tools map onto Loom operations:
   ``nerve:<type>``, and ``valid_at`` for events.
 * ``memory_recall`` → ``memory.search`` (``recipe="fast"``, every namespace
   the token reads) plus ``namespace.search_categories``, returned in memU's
-  shape: items, then ``cat:<id>`` category breadcrumbs.
+  shape: items, then ``cat:<id>`` category breadcrumbs. The memories a new
+  session starts with come from ``context.pack`` in startup mode instead.
 * ``memory_expand_category`` → ``namespace.list_categories`` to name the
   category, then ``memory.list`` of the rows tagged with that name.
 * ``conversation_history`` → ``memory.timeline`` (``valid_at`` is the date a
@@ -55,7 +56,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -126,6 +127,7 @@ _SEED_RETRY_S = 300.0
 # Operations safe to send again after a timeout: reads, and the writes Loom
 # marks idempotent (sent with an Idempotency-Key, so a resend replays).
 _IDEMPOTENT_OPS = frozenset({
+    "context.pack",
     "memory.search",
     "memory.list",
     "memory.timeline",
@@ -144,9 +146,12 @@ _NEVER_RAN_CODES = frozenset({"AUTH_UNAVAILABLE", "OVERLOADED", "IDEMPOTENT_IN_P
 # A 403 with this code is a rule refusing this one request, not a credential.
 _POLICY_REFUSAL = "POLICY_FORBIDDEN"
 
-# What the tools print per memory.
+# What the tools print per memory, and what the startup recall may freeze into
+# a session (items and bytes in all).
 _ITEM_MAX_CHARS = 500
 _LIST_PREVIEW_CHARS = 500
+_STARTUP_MAX_BYTES = 4000
+_STARTUP_SECTION_TOKENS = 1000
 # memory.list matches `contains` on at most this many characters.
 _CONTAINS_MAX_CHARS = 200
 
@@ -173,6 +178,11 @@ _TIMELINE_MAX = 500
 _TIMELINE_MAX_PAGES = 10
 # namespace.search_categories shows the first 280 BYTES of a summary.
 _SUMMARY_EXCERPT_BYTES = 280
+
+# One item of a context.pack section: `- [<citation> <labels>] <text>`, with
+# continuation lines indented by two spaces. The citation is percent-escaped.
+_PACK_LINE_RE = re.compile(r"- \[(?P<cite>[^\s\]]+)[^\]]*\] ?(?P<text>.*)")
+_PACK_TRUNCATED = "...[truncated]"
 
 
 class LoomRequestError(RuntimeError):
@@ -238,6 +248,7 @@ class LoomMetrics:
 
     OPERATIONS = (
         "recall",
+        "startup_recall",
         "memorize",
         "memorize_conversation",
         "expand_category",
@@ -459,6 +470,19 @@ def _fit_turn(turn: dict[str, Any], max_bytes: int) -> dict[str, Any]:
         if size <= max_bytes:
             return candidate
     return {**turn, "content": marker.strip()}
+
+
+def _within_bytes(items: list[dict[str, str]], max_bytes: int) -> list[dict[str, str]]:
+    """The leading items whose summaries fit in ``max_bytes`` together."""
+    kept: list[dict[str, str]] = []
+    used = 0
+    for item in items:
+        size = len(item["summary"].encode("utf-8"))
+        if kept and used + size > max_bytes:
+            break
+        kept.append(item)
+        used += size
+    return kept
 
 
 def _linkable(url: str) -> bool:
@@ -1022,7 +1046,9 @@ class LoomBridge:
             cats = []
         return items[:limit] + cats[:category_limit]
 
-    async def _search_items(self, query: str, limit: int) -> list[dict[str, str]]:
+    async def _search_items(
+        self, query: str, limit: int, *, keep_abstained: bool = False,
+    ) -> list[dict[str, str]]:
         if limit <= 0:
             return []
         data = await self._op("memory.search", {
@@ -1037,7 +1063,7 @@ class LoomBridge:
             # Stored memories only: a session digest has no key a tool can edit.
             "legs": ["memory"],
         })
-        if data.get("abstain"):
+        if data.get("abstain") and not keep_abstained:
             return []
         items: list[dict[str, str]] = []
         seen: set[str] = set()
@@ -1079,6 +1105,85 @@ class LoomBridge:
             if cat_id and (crumb or name):
                 cats.append({"id": f"cat:{cat_id}", "type": "category", "name": name, "summary": crumb})
         return cats
+
+    async def startup_recall(self, query: str, limit: int = 8) -> list[dict[str, str]]:
+        """The memories a new session starts with; the engine freezes them for
+        the whole session.
+
+        ``context.pack`` in startup mode, memories section only: recall's fast
+        search, but its hits are served even when the search abstains, and
+        no category blurbs take their place. The pack searches the namespace
+        it is given (unless Loom is set to search every namespace of the
+        token), so these come from the home namespace. A Loom that refuses
+        the pack gets recall's search with the abstention ignored. At most
+        ``limit`` items of 500 characters, 4,000 bytes in all.
+        """
+        if not self._available:
+            return []
+        return await self._tracked(
+            "startup_recall", query[:80], self._startup_recall(query, int(limit)),
+        )
+
+    async def _startup_recall(self, query: str, limit: int) -> list[dict[str, str]]:
+        if limit <= 0:
+            return []
+        try:
+            data = await self._op("context.pack", {
+                "agent": self._cfg.agent_name,
+                "query": query,
+                "mode": "startup",
+                "only_sections": ["memories"],
+                "top_k": max(1, min(limit, 20)),
+                "section_token_budgets": {"memories": _STARTUP_SECTION_TOKENS},
+                "include_decisions": False,
+            })
+        except LoomRequestError as e:
+            logger.info("Loom refused context.pack (%s); the startup recall searches instead", e)
+            items = await self._search_items(query, limit, keep_abstained=True)
+        else:
+            sections = data.get("sections") or {}
+            items = self._pack_items(str(sections.get("memories") or ""))
+        return _within_bytes(items[:limit], _STARTUP_MAX_BYTES)
+
+    def _pack_items(self, rendered: str) -> list[dict[str, str]]:
+        """The items of a context.pack section, in its order.
+
+        Loom escapes ``<`` and ``>`` in recalled text, and a section cut to
+        its budget ends in ``...[truncated]``, its last item perhaps cut
+        short: that one is left out.
+        """
+        items: list[dict[str, str]] = []
+        current: dict[str, str] | None = None
+        for line in rendered.splitlines():
+            if line.startswith("- ["):
+                if current is not None:
+                    items.append(current)
+                current = None
+                match = _PACK_LINE_RE.fullmatch(line)
+                if not match:
+                    continue
+                cite = unquote(match["cite"]).removeprefix("memory:").split("#", 1)[0]
+                namespace, _, key = cite.partition("/")
+                if not key:
+                    continue
+                current = {
+                    "id": self._display_id(key, namespace),
+                    "type": _nerve_type((), key, ""),
+                    "summary": match["text"],
+                }
+            elif line.startswith("  ") and current is not None:
+                current["summary"] += "\n" + line[2:]
+        if current is not None:
+            items.append(current)
+        if rendered.rstrip().endswith(_PACK_TRUNCATED):
+            items = items[:-1]
+        out = []
+        for item in items:
+            text = item["summary"].replace("&lt;", "<").replace("&gt;", ">")
+            item["summary"] = _clip(text)
+            if item["summary"]:
+                out.append(item)
+        return out
 
     # ------------------------------------------------------------------ #
     # Categories

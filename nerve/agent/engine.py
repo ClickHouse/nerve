@@ -97,6 +97,7 @@ from nerve.identity import (
 )
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
+from nerve.memory.backend import recall_for_startup
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -1603,9 +1604,8 @@ class AgentEngine:
                 recalled_memories = [str(m) for m in frozen_recall]
             elif self._memory_bridge and self._memory_bridge.available:
                 try:
-                    raw = await self._memory_bridge.recall(
-                        f"context for {source} session",
-                        limit=8,
+                    raw = await recall_for_startup(
+                        self._memory_bridge, f"context for {source} session", 8,
                     )
                     recalled_memories = [m["summary"] for m in raw]
                     meta_updates["recalled_memories"] = recalled_memories

@@ -387,6 +387,74 @@ class TestPreRecallFreeze:
             "recalled_memories",
         ) == first
 
+    @pytest.mark.asyncio
+    async def test_a_backend_with_a_startup_read_serves_the_priors(
+        self, tmp_path, db,
+    ):
+        """A memory backend with a startup read of its own (the Loom
+        bridge's ``startup_recall``) is asked for the priors, not recall."""
+        import json
+
+        from nerve.agent.backends.base import BackendCapabilities
+
+        class StartupBridge:
+            available = True
+
+            def __init__(self):
+                self.calls = []
+
+            async def recall(self, query, limit=10, category_limit=5):
+                raise AssertionError("recall is not the startup read")
+
+            async def startup_recall(self, query, limit=8):
+                self.calls.append((query, limit))
+                return [{"id": "k1", "type": "", "summary": "prior-from-pack-3a1"}]
+
+        class StubClient:
+            model = "gpt-5.6-sol"
+
+            def is_alive(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+        class StubBackend:
+            name = "codex"
+            capabilities = BackendCapabilities(
+                cost_is_cumulative=False,
+                supports_idle_stream=False,
+                supports_cache_ttl=False,
+                interactive_builtins=False,
+                reports_context_window=True,
+            )
+
+            def default_model(self, source):
+                return "gpt-5.6-sol"
+
+            def excluded_tools(self):
+                return set()
+
+            def validate_resume_target(self, native_id, cwd):
+                return True
+
+            async def create_client(self, spec):
+                return StubClient()
+
+        engine = _engine(tmp_path, db)
+        await db.create_session("s-pack", source="web", backend="codex", actor=None)
+        bridge = StartupBridge()
+        engine._memory_bridge = bridge
+        engine._backends["codex"] = StubBackend()
+
+        await engine._get_or_create_client("s-pack", "web", None)
+
+        assert bridge.calls == [("context for web session", 8)]
+        session = await db.get_session("s-pack")
+        meta = json.loads(session.get("metadata") or "{}")
+        assert meta.get("recalled_memories") == ["prior-from-pack-3a1"]
+        assert "- prior-from-pack-3a1" in engine._pending_preambles["s-pack"]
+
 
 class TestCreateSessionRoute:
     """POST /api/sessions with the new-chat backend selector's param."""
