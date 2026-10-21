@@ -68,7 +68,7 @@ async def trigger_cron_job(job_id: str, actor: Actor = Depends(require_auth)):
     runners = getattr(_cron_service, "_source_runners", [])
     runner = next((r for r in runners if r.job_id == job_id), None)
     if runner:
-        await _cron_service._run_source_wrapper(runner, attribution)
+        await _cron_service._run_source_wrapper(runner, attribution, origin="manual")
         return {"job_id": job_id, "triggered": True}
 
     # Regular cron job
