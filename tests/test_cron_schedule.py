@@ -406,9 +406,11 @@ async def test_nothing_beyond_the_horizon_counts(held):
 @pytest.mark.asyncio
 async def test_now_must_be_timezone_aware(held):
     svc = await held([_job("digest")])
+    # Naive on purpose: a time without a zone is what must be refused.
+    naive = datetime.now(UTC).replace(tzinfo=None)
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        await svc.next_scheduled(now=datetime.now())
+        await svc.next_scheduled(now=naive)
 
 
 @pytest.mark.asyncio
@@ -630,6 +632,39 @@ async def test_listeners_hear_every_run_including_a_gate_skip(held):
     assert heard.call_count == 2
     await svc._run_source_wrapper(runner)
     assert heard.call_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["job", "source"])
+async def test_listeners_hear_a_scheduled_fire_skipped_for_its_catch_up(held, kind):
+    """A fire that comes while the job's catch-up still runs is skipped; the
+    listeners hear about it as about any other run that ends."""
+    runner = _runner("mail")
+    svc = await held([_job("digest")], [runner])
+    if kind == "job":
+        work, wrapper, target = svc.engine.run_cron, svc._run_job_wrapper, svc._jobs[0]
+    else:
+        work, wrapper, target = runner.run, svc._run_source_wrapper, runner
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def until_released(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return work.return_value
+
+    work.side_effect = until_released
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+    catch_up = asyncio.create_task(wrapper(target, origin="catchup"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    await wrapper(target)  # the scheduler's fire
+
+    work.assert_awaited_once()
+    heard.assert_called_once_with()
+    release.set()
+    await catch_up
+    assert heard.call_count == 2
 
 
 @pytest.mark.asyncio
