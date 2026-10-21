@@ -608,13 +608,19 @@ class GitHubPrActivityGate(CronGate):
 def github_is_hosted() -> bool:
     """Whether GitHub records come from the channel gateway (``sync.github.mode: hosted``).
 
-    Reads the loaded process config and never loads one, so a process
-    without a config (a test, a one-off command) counts as polling.
+    The mode is restart-only, so this reads the configuration the process
+    started with, as the GitHub source runner and the hosted streams do:
+    after a reload that changes the mode, the gate keeps to the mode in
+    effect until the restart. A process that did not start the gateway reads
+    the loaded config and never loads one, so one without a config (a test,
+    a one-off command) counts as polling.
     """
     from nerve.config import loaded_config
+    from nerve.config_reload import startup_config
 
-    config = loaded_config()
-    return config is not None and config.sync.github.mode == "hosted"
+    config = startup_config() or loaded_config()
+    github = getattr(getattr(config, "sync", None), "github", None)
+    return getattr(github, "mode", None) == "hosted"
 
 
 #: Maps a gate's ``type`` key to its implementing class. Register new gate

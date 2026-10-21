@@ -833,35 +833,62 @@ class TestRunsOnDelivery:
 # ---------------------------------------------------------------------- #
 
 
+def recorded_gh(monkeypatch) -> list[tuple[str, ...]]:
+    """The processes the gate starts. Each fails, so the gate fails open, and
+    only the record tells whether gh ran."""
+    calls: list[tuple[str, ...]] = []
+
+    async def failing(*args, **kwargs):
+        calls.append(args)
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr("nerve.cron.gates.asyncio.create_subprocess_exec", failing)
+    return calls
+
+
+def github_config(mode: str) -> NerveConfig:
+    config = NerveConfig()
+    config.sync.github = GitHubSyncConfig(mode=mode)
+    return config
+
+
 @pytest.mark.asyncio
 class TestPullRequestGate:
     async def test_in_hosted_mode_it_passes_without_gh(self, db, monkeypatch):
-        config = NerveConfig()
-        config.sync.github = hosted_github()
-        monkeypatch.setattr(config_module, "_config", config)
-
-        async def no_process(*args, **kwargs):
-            raise AssertionError("gh must not run in hosted mode")
-
-        monkeypatch.setattr("nerve.cron.gates.asyncio.create_subprocess_exec", no_process)
+        monkeypatch.setattr(config_module, "_config", github_config("hosted"))
+        calls = recorded_gh(monkeypatch)
         gate = GitHubPrActivityGate(author="example-agent")
 
         assert await gate.is_satisfied(GateContext(job_id="pr-monitor", db=db)) is True
+        assert calls == []
 
     async def test_in_poll_mode_it_still_runs_gh(self, db, monkeypatch):
         monkeypatch.setattr(config_module, "_config", NerveConfig())
-        calls: list[tuple[str, ...]] = []
-
-        async def failing(*args, **kwargs):
-            calls.append(args)
-            raise FileNotFoundError("gh")
-
-        monkeypatch.setattr("nerve.cron.gates.asyncio.create_subprocess_exec", failing)
+        calls = recorded_gh(monkeypatch)
 
         assert await GitHubPrActivityGate(author="example-agent").is_satisfied(
             GateContext(job_id="pr-monitor", db=db),
         ) is True
         assert calls and calls[0][0] == "gh"
+
+    @pytest.mark.parametrize(("started", "reloaded", "runs_gh"), [
+        ("poll", "hosted", True),
+        ("hosted", "poll", False),
+    ])
+    async def test_it_keeps_the_mode_the_process_started_with(
+        self, db, monkeypatch, started, reloaded, runs_gh,
+    ):
+        """The mode is restart-only: after a reload that changes it, the
+        source still runs in the old mode until the restart, and so does the
+        gate."""
+        config_reload.remember_startup_config(github_config(started))
+        monkeypatch.setattr(config_module, "_config", github_config(reloaded))
+        calls = recorded_gh(monkeypatch)
+
+        assert await GitHubPrActivityGate(author="example-agent").is_satisfied(
+            GateContext(job_id="pr-monitor", db=db),
+        ) is True
+        assert bool(calls) is runs_gh
 
 
 def doctor_config(tmp_path: Path, **github: Any) -> NerveConfig:
