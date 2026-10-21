@@ -67,6 +67,7 @@ from nerve.agent.prompts import (
     build_session_preamble,
     build_system_prompt,
     current_time_str,
+    memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
     worker_onboarding_prompt,
@@ -97,6 +98,11 @@ from nerve.identity import (
 )
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
+from nerve.memory.backend import (
+    MemoryBackendUnavailable,
+    create_memory_bridge,
+    recall_for_startup,
+)
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 from nerve.setup_writer import (
@@ -813,8 +819,7 @@ class AgentEngine:
         cron``) started while the gateway runs must not mark the gateway's
         live agents interrupted.
         """
-        from nerve.memory.memu_bridge import MemUBridge
-        self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
+        self._memory_bridge = create_memory_bridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
 
         # Optional xmemory.ai structured-memory layer — inert unless both a
@@ -1607,18 +1612,25 @@ class AgentEngine:
             recalled_memories: list[str] = []
             meta_updates: dict[str, Any] = {}
             frozen_recall = session_meta.get("recalled_memories")
+            # Said in place of the memories when the Loom backend could not
+            # recall any (memU stays silent): an outage is not an empty memory.
+            memory_note: str | None = None
             if isinstance(frozen_recall, list):
                 recalled_memories = [str(m) for m in frozen_recall]
             elif self._memory_bridge and self._memory_bridge.available:
                 try:
-                    raw = await self._memory_bridge.recall(
-                        f"context for {source} session",
-                        limit=8,
+                    raw = await recall_for_startup(
+                        self._memory_bridge, f"context for {source} session", 8,
                     )
                     recalled_memories = [m["summary"] for m in raw]
                     meta_updates["recalled_memories"] = recalled_memories
                 except Exception as e:
                     logger.warning("Pre-recall failed: %s", e)
+                    if (
+                        self.config.memory.backend == "loom"
+                        and isinstance(e, MemoryBackendUnavailable)
+                    ):
+                        memory_note = memory_unavailable_note(str(e))
 
             # Resolve the prompt-cache TTL for this client build (cadence-
             # aware; see nerve/agent/cache_policy.py). Claude-only — other
@@ -1696,6 +1708,7 @@ class AgentEngine:
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
                 static=static_prompt,
+                memory_note=memory_note,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1793,6 +1806,7 @@ class AgentEngine:
             if deliver_preamble:
                 self._pending_preambles[session_id] = build_session_preamble(
                     session_id, source, recalled_memories or None,
+                    memory_note=memory_note,
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
