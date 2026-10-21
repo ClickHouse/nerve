@@ -1103,6 +1103,7 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
         try:
             outcome = apply_mode(
                 ws, mode, task, in_container=daemon.in_container(), locked=locked,
+                memory_backend=ctx.config.memory.backend,
             )
         except ModeRefused as e:
             raise HTTPException(status_code=409, detail=str(e)) from e

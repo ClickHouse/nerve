@@ -875,9 +875,12 @@ def _stub_backend():
             return True
 
         async def create_client(self, spec):
+            self.specs.append(spec)
             return _StubClient()
 
-    return StubBackend()
+    backend = StubBackend()
+    backend.specs = []
+    return backend
 
 
 async def _engine_for(tmp_path, db, memory, backend: str):
@@ -910,6 +913,8 @@ async def test_a_new_session_starts_from_the_startup_pack(make_memory, tmp_path,
     meta = json.loads((await db.get_session("s-pack")).get("metadata") or "{}")
     assert meta.get("recalled_memories") == ["Lives in Lisbon"]
     assert "- Lives in Lisbon" in engine._pending_preambles["s-pack"]
+    # The session is told to use Loom's tools.
+    assert "# Memory: Loom" in engine._backends["codex"].specs[-1].system_prompt
 
 
 @pytest.mark.asyncio

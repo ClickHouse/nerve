@@ -267,5 +267,26 @@
       "role": "viewer",
       "tool": "loom_search"
     }
-  }
+  },
+  "tools_named_in_prompts": [
+    "loom_blacklist_add",
+    "loom_context_pack",
+    "loom_memory_delete",
+    "loom_memory_get",
+    "loom_memory_history",
+    "loom_memory_list",
+    "loom_memory_pin",
+    "loom_memory_related",
+    "loom_memory_set",
+    "loom_memory_update",
+    "loom_namespace_list_mine",
+    "loom_namespace_validate",
+    "loom_op",
+    "loom_search",
+    "loom_working_memory_*",
+    "loom_working_memory_append",
+    "loom_working_memory_delete",
+    "loom_working_memory_replace",
+    "loom_working_memory_set"
+  ]
 }

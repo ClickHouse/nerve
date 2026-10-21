@@ -18,9 +18,12 @@ It reads two files of the checkout (with ``git show <ref>:<path>`` when
   synthetic tool of their own.
 
 Only what Nerve uses is written: the ops in LOOM_CALLS, the request fields
-Nerve may send plus the ones Loom requires, and the result fields Nerve
-reads. It fails, writing nothing, when Nerve calls an op Loom does not have
-or does not serve on MCP, or names a field Loom does not know.
+Nerve may send plus the ones Loom requires, the result fields Nerve reads,
+and the tools the agent-facing wording names
+(``nerve.memory.loom_prompts.tool_names``). It fails, writing nothing, when
+Nerve calls an op Loom does not have or does not serve on MCP, names a field
+Loom does not know, or tells agents about a tool Loom does not list by
+default.
 """
 
 from __future__ import annotations
@@ -41,9 +44,12 @@ TOOLSETS_FILE = "server/operations/toolsets.py"
 SYNTHETIC_TOOLS = {"search.query": "loom_search"}
 # The listed tool that runs an op the toolset does not list.
 LOOM_OP = "loom_op"
+# Tools every toolset lists that run no op of their own.
+META_TOOLS = (LOOM_OP, "loom_activate")
 
 sys.path.insert(0, str(ROOT))
 from nerve.memory.loom import LOOM_CALLS
+from nerve.memory.loom_prompts import tool_names
 
 
 def read_source(loom: Path, path: str, ref: str | None) -> str:
@@ -168,7 +174,16 @@ def frozensets(source: str, names: tuple[str, ...]) -> dict[str, frozenset[str]]
     return out
 
 
-def build(ops_source: str, toolsets_source: str) -> tuple[dict[str, Any], list[str]]:
+def listed_tools(sets: dict[str, frozenset[str]]) -> set[str]:
+    """The tools the default (``core``) toolset lists."""
+    tools = {"loom_" + op.replace(".", "_") for op in sets["_MCP_CORE_OPS"]}
+    tools |= {SYNTHETIC_TOOLS[op] for op in sets["SYNTHETIC_TOOL_OPS"] if op in SYNTHETIC_TOOLS}
+    return tools | set(META_TOOLS)
+
+
+def build(
+    ops_source: str, toolsets_source: str, named: set[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
     schemas = Schemas(ops_source)
     sets = frozensets(toolsets_source, ("_MCP_CORE_OPS", "_MCP_HIDDEN_OPS", "SYNTHETIC_TOOL_OPS"))
     errors: list[str] = []
@@ -209,10 +224,20 @@ def build(ops_source: str, toolsets_source: str) -> tuple[dict[str, Any], list[s
                 },
             },
         }
+    listed = listed_tools(sets)
+    named = tool_names() if named is None else named
+    for name in sorted(named):
+        if name.endswith("*"):
+            if not any(tool.startswith(name[:-1]) for tool in listed):
+                errors.append(f"Loom lists no tool {name}")
+        elif name not in listed:
+            errors.append(f"Loom does not list {name} by default")
     fixture = {
         "generated_by": "scripts/loom_contract_fixture.py",
         "from": [OPS_FILE, TOOLSETS_FILE],
         "ops": ops,
+        # Each one listed by Loom's default toolset when this was written.
+        "tools_named_in_prompts": sorted(named),
     }
     return fixture, errors
 

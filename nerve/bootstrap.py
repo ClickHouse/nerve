@@ -1575,12 +1575,13 @@ class SetupWizard:
         ws_path = self._workspace_dir()
         created = initialize_workspace(
             ws_path, self.choices.mode, skip=WRITER_OWNED_TEMPLATES,
+            memory_backend=self.choices.memory_backend,
         )
         click.secho(" ✓", fg="green")
 
         # 2. Install bundled skills
         click.echo("  Installing bundled skills...", nl=False)
-        install_bundled_skills(ws_path)
+        install_bundled_skills(ws_path, memory_backend=self.choices.memory_backend)
         click.secho(" ✓", fg="green")
 
         # 2b. Scaffold the git-syncable config subtree (workspace/config/)

@@ -130,7 +130,22 @@ def _get_bundled_skills_dir() -> Path | None:
     return None
 
 
-def install_bundled_skills(workspace_path: Path) -> list[str]:
+def _write_template(src: Path, dst: Path, relative: str, memory_backend: str) -> None:
+    """Copy one template file to ``dst``. Under the Loom backend a template
+    that names Nerve's memory tools gets Loom's wording instead
+    (:func:`nerve.memory.loom_prompts.template_text`)."""
+    if memory_backend == "loom":
+        from nerve.memory.loom_prompts import template_text
+
+        text = src.read_text(encoding="utf-8")
+        loom_text = template_text(relative, text)
+        if loom_text != text:
+            dst.write_text(loom_text, encoding="utf-8")
+            return
+    shutil.copy2(src, dst)
+
+
+def install_bundled_skills(workspace_path: Path, *, memory_backend: str = "memu") -> list[str]:
     """Copy bundled skills into the workspace skills directory.
 
     Only copies skills that don't already exist — never overwrites.
@@ -139,6 +154,8 @@ def install_bundled_skills(workspace_path: Path) -> list[str]:
 
     Args:
         workspace_path: Target workspace directory.
+        memory_backend: ``memory.backend``; under ``loom`` a skill that
+            names Nerve's memory tools names Loom's instead.
 
     Returns:
         List of skill IDs that were installed.
@@ -166,6 +183,11 @@ def install_bundled_skills(workspace_path: Path) -> list[str]:
             continue
 
         shutil.copytree(skill_src, skill_dst)
+        if memory_backend == "loom":
+            _write_template(
+                skill_src / "SKILL.md", skill_dst / "SKILL.md", f"skills/{skill_id}/SKILL.md",
+                memory_backend,
+            )
         logger.info("Installed bundled skill: %s", skill_id)
         installed.append(skill_id)
 
@@ -225,7 +247,7 @@ def install_config_scaffold(workspace_path: Path) -> list[str]:
 
 
 def initialize_workspace(
-    workspace_path: Path, mode: str, *, skip: Collection[str] = (),
+    workspace_path: Path, mode: str, *, skip: Collection[str] = (), memory_backend: str = "memu",
 ) -> list[str]:
     """Copy mode-appropriate template files into a workspace directory.
 
@@ -239,6 +261,9 @@ def initialize_workspace(
             in place (:func:`nerve.setup_writer.apply_task_md`), and a bare
             copy would put the literal ``{{TASK_DESCRIPTION}}`` token into
             every prompt of a worker that was given no description.
+        memory_backend: ``memory.backend``; under ``loom`` the templates that
+            name Nerve's memory tools (``AGENTS.md``, ``TOOLS.md``,
+            ``MEMORY.md``) are written with Loom's instead.
 
     Returns:
         List of filenames that were created.
@@ -267,7 +292,7 @@ def initialize_workspace(
             logger.warning("Template file missing: %s", src)
             continue
 
-        shutil.copy2(src, dst)
+        _write_template(src, dst, f"{mode}/{filename}", memory_backend)
         logger.info("Created %s (%s)", filename, description)
         created.append(filename)
 

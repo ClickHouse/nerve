@@ -91,6 +91,18 @@ You are running on Nerve's Codex backend.
 """
 
 
+def _backend_notes(memory_backend: str) -> str:
+    """The backend notes; under Loom, the tool line names Loom's memory tools
+    instead of Nerve's, which are not served then."""
+    if memory_backend != "loom":
+        return _BACKEND_NOTES
+    from nerve.memory import loom_prompts
+
+    return loom_prompts.apply_edits(
+        _BACKEND_NOTES, (loom_prompts.CODEX_NOTE_EDIT,), name="Codex backend notes",
+    )
+
+
 class CodexTurnError(BackendError):
     """A codex turn failed with a non-retryable error."""
 
@@ -639,7 +651,8 @@ class CodexBackend:
             # review-loop verifier legs to enforce workspace-write.
             "sandbox": str(spec.extra.get("sandbox") or "") or self.codex.sandbox,
             "approvalPolicy": self.codex.approval_policy,
-            "developerInstructions": spec.system_prompt + _BACKEND_NOTES,
+            "developerInstructions": spec.system_prompt
+            + _backend_notes(self.config.memory.backend),
         }
         return params
 

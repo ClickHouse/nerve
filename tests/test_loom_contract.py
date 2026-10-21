@@ -5,7 +5,8 @@ by ``scripts/loom_contract_fixture.py``, never edited by hand. These tests
 hold ``nerve/memory/loom.py`` to it: each op is served on MCP by the tool
 Nerve calls, every argument Nerve sends on the wire exists in Loom's request
 schema with the type Loom declares, and every result field Nerve reads is one
-Loom answers with.
+Loom answers with. The tools the agent-facing wording names
+(``nerve/memory/loom_prompts.py``) are ones Loom lists by default.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import pytest
 import pytest_asyncio
 
 from nerve.memory.loom import LOOM_CALLS, LOOM_OP, LoomCall, LoomMemory
+from nerve.memory.loom_prompts import tool_names
 from tests.test_loom_memory import HOME, ORG, FakeGateway, _config, _messages
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +88,11 @@ def test_nerve_names_only_fields_loom_has(op) -> None:
     assert call.fields <= set(OPS[op]["request"]["properties"]), REGENERATE
     assert set(OPS[op]["request"]["required"]) <= call.fields
     assert call.reads <= set(OPS[op]["result"]["properties"]), REGENERATE
+
+
+def test_agents_are_told_only_about_tools_loom_lists() -> None:
+    """The generator refused any named tool the default toolset does not list."""
+    assert tool_names() == set(FIXTURE["tools_named_in_prompts"]), REGENERATE
 
 
 def test_only_reads_are_retried() -> None:
@@ -216,9 +223,9 @@ def generator(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    def build(**calls: LoomCall):
+    def build(named: set[str] | None = None, **calls: LoomCall):
         monkeypatch.setattr(module, "LOOM_CALLS", {k.replace("_", "."): v for k, v in calls.items()})
-        return module.build(_OPS_SOURCE, _TOOLSETS_SOURCE)
+        return module.build(_OPS_SOURCE, _TOOLSETS_SOURCE, named or set())
 
     return build
 
@@ -264,4 +271,16 @@ def test_the_generator_refuses_what_loom_does_not_serve(generator) -> None:
         "Loom has no op a.missing",
         "Loom's a.read takes no agent",
         "Loom's a.read answers no gone",
+    ]
+
+
+def test_the_generator_checks_the_named_tools(generator) -> None:
+    fixture, errors = generator(named={"loom_a_read", "loom_search", "loom_op", "loom_a_*"})
+    assert errors == []
+    assert fixture["tools_named_in_prompts"] == ["loom_a_*", "loom_a_read", "loom_op", "loom_search"]
+    _, errors = generator(named={"loom_a_unlisted", "loom_a_hidden", "loom_b_*"})
+    assert errors == [
+        "Loom does not list loom_a_hidden by default",
+        "Loom does not list loom_a_unlisted by default",
+        "Loom lists no tool loom_b_*",
     ]

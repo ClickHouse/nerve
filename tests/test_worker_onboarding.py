@@ -34,7 +34,7 @@ def _section_headings(text: str) -> list[str]:
 def _bare_engine(ws: Path) -> AgentEngine:
     """An engine with only what the onboarding methods touch."""
     engine = AgentEngine.__new__(AgentEngine)
-    engine.config = SimpleNamespace(workspace=ws)
+    engine.config = SimpleNamespace(workspace=ws, memory=SimpleNamespace(backend="memu"))
     return engine
 
 

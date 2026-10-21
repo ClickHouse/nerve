@@ -821,6 +821,14 @@ class AgentEngine:
         """
         self._memory_bridge = create_memory_bridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
+        if self.config.memory.backend == "loom" and not self._managed_mcp:
+            # Loom's own tools reach agents as a server of the MCP gateway's
+            # catalog, which only external mode reads.
+            logger.warning(
+                "memory.backend is loom, but this instance is not in external "
+                "mode, so agents get no MCP gateway catalog and no Loom tools: "
+                "only the startup recall and transcript extraction use Loom",
+            )
 
         # Optional xmemory.ai structured-memory layer — inert unless both a
         # token and instance_id are configured. Runs alongside memU; never
@@ -995,7 +1003,7 @@ class AgentEngine:
             logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
 
         guide = await asyncio.to_thread(read_worker_guide)
-        prompt = worker_onboarding_prompt(task_description, guide)
+        prompt = worker_onboarding_prompt(task_description, guide, self.config.memory.backend)
 
         try:
             await self.run_cron(
@@ -1608,7 +1616,7 @@ class AgentEngine:
             # prompts across rebuilds are what let a resumed conversation
             # hit the prompt cache (see nerve/agent/cache_policy.py), and a
             # session keeping its original priors is more consistent anyway
-            # — live recall stays available via the memory_recall tool.
+            # — live recall stays available via the memory tools.
             recalled_memories: list[str] = []
             meta_updates: dict[str, Any] = {}
             frozen_recall = session_meta.get("recalled_memories")
@@ -1709,6 +1717,7 @@ class AgentEngine:
                 excluded_tools=backend.excluded_tools(),
                 static=static_prompt,
                 memory_note=memory_note,
+                memory_backend=self.config.memory.backend,
             )
 
             # Observer sessions of a review loop get a context block so the

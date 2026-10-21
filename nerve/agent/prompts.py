@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from nerve.agent.tools import build_default_registry
+from nerve.memory import loom_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -195,14 +196,16 @@ it back.
 """
 
 
-def worker_onboarding_prompt(task_description: str, guide: str) -> str:
+def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: str = "memu") -> str:
     """The first-boot onboarding session's prompt for a worker.
 
     Role line, the operator's description, the worker guide in full (it is
     the standard the filled ``TASK.md`` is held to, so the session gets the
     whole text rather than a link), then the steps. ``guide`` is the text of
     ``docs/worker-best-practices.md`` (:func:`nerve.workspace.read_worker_guide`);
-    when it is empty the prompt points at the published copy instead.
+    when it is empty the prompt points at the published copy instead. Under
+    ``memory_backend`` ``loom`` the step that saves what was learned names
+    Loom's tool.
     """
     quoted = "\n".join(
         f"> {line}" if line.strip() else ">" for line in task_description.strip().splitlines()
@@ -211,6 +214,9 @@ def worker_onboarding_prompt(task_description: str, guide: str) -> str:
         "(The guide could not be read from this installation. Fetch it from "
         f"{WORKER_GUIDE_URL} and read it in full before step 2.)"
     )
+    steps = _ONBOARDING_STEPS
+    if memory_backend == "loom":
+        steps = loom_prompts.apply_edits(steps, loom_prompts.ONBOARDING_EDITS, name="onboarding steps")
     return (
         "You are running the **first-boot onboarding** for this Nerve worker: one "
         "session with full tool access that turns the operator's description into "
@@ -228,7 +234,7 @@ def worker_onboarding_prompt(task_description: str, guide: str) -> str:
         "---\n\n"
         f"{body}\n\n"
         "---\n\n"
-        f"{_ONBOARDING_STEPS}"
+        f"{steps}"
     )
 
 
@@ -283,6 +289,7 @@ def build_system_prompt(
     excluded_tools: "set[str] | None" = None,
     static: bool = True,
     memory_note: str | None = None,
+    memory_backend: str = "memu",
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -303,6 +310,10 @@ def build_system_prompt(
     memories inline in the system prompt. ``memory_note`` takes the place of
     the memories when none could be recalled (see
     :func:`memory_unavailable_note`), in either shape's place for them.
+
+    ``memory_backend`` ``loom`` adds the memory section that names Loom's
+    tools in place of Nerve's (:data:`nerve.memory.loom_prompts.SYSTEM_PROMPT_SECTION`);
+    it depends on the configuration only, so the prompt stays static.
     """
     parts: list[str] = []
 
@@ -364,6 +375,9 @@ You have access to the following custom tools:
 You have access to the following custom tools:
 {_format_tool_list(excluded_tools)}"""
     parts.append(context)
+
+    if memory_backend == "loom":
+        parts.append(loom_prompts.SYSTEM_PROMPT_SECTION)
 
     # Skills summary (progressive disclosure level 1: name + description only)
     skills_section = _format_skills_list(skill_summaries)
