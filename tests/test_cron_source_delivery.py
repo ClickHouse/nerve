@@ -291,7 +291,7 @@ class TestJobs:
         await svc.on_source_delivered("github")
         await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
 
-        await svc._run_job_wrapper(monitor)
+        await asyncio.wait_for(svc._run_job_wrapper(monitor), timeout=1)
         assert svc.runs.ids() == ["pr-monitor"]
 
         person = attribution_for(FAKE_SYSTEM_ACTOR)
