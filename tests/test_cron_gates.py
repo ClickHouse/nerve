@@ -249,6 +249,65 @@ class TestMessagesGate:
         assert gate.consumer == "inbox"
 
 
+@pytest.mark.asyncio
+class TestMessagesGateBootstrap:
+    """No-sources MessagesGate against a real DB: the cursorless-consumer deadlock.
+
+    The no-sources branch reads consumer_cursors only, and the job the gate
+    blocks is the one whose poll would create those rows. Without a bootstrap
+    path the gate wedges shut in two ways: a fresh install (no rows ever) and
+    a cursor-TTL cleanup after a quiet stretch (rows deleted). Both must fire.
+    """
+
+    async def _ingest(self, db, source: str, count: int, offset: int = 0) -> None:
+        from nerve.sources.models import SourceRecord
+        records = [
+            SourceRecord(
+                id=f"msg-{source}-{offset + i}",
+                source=source,
+                record_type="test",
+                summary=f"message {offset + i}",
+                content=f"content {offset + i}",
+                timestamp=f"2026-08-14T{10 + i:02d}:00:00Z",
+            )
+            for i in range(count)
+        ]
+        await db.insert_source_messages(records, source=source)
+
+    async def test_fresh_install_backlog_opens_gate(self, db):
+        """Fresh DB, telegram messages ingested, no cursor rows → gate fires."""
+        await self._ingest(db, "telegram", 3)
+        gate = MessagesGate(consumer="inbox")
+        assert await gate.is_satisfied(_ctx(db)) is True
+
+    async def test_fresh_install_empty_inbox_keeps_gate_shut(self, db):
+        """Fresh DB with no messages at all → nothing to do, gate stays shut."""
+        gate = MessagesGate(consumer="inbox")
+        assert await gate.is_satisfied(_ctx(db)) is False
+
+    async def test_gate_reopens_after_cursor_cleanup(self, db):
+        """Cursor seeded, then expired and deleted by cleanup, then new mail → fires."""
+        await self._ingest(db, "telegram", 2)
+        max_seq = await db.get_source_max_rowid("telegram")
+        # Caught up, but the TTL has already lapsed (quiet weekend).
+        await db.set_consumer_cursor("inbox", "telegram", max_seq, ttl_days=-1)
+        assert await db.cleanup_expired_consumer_cursors() == 1
+
+        gate = MessagesGate(consumer="inbox")
+        await self._ingest(db, "telegram", 2, offset=2)
+        assert await gate.is_satisfied(_ctx(db)) is True
+
+    async def test_established_consumer_still_ignores_untracked_backlog(self, db):
+        """With at least one live cursor row, untracked sources stay ignored."""
+        await self._ingest(db, "telegram", 2)
+        await self._ingest(db, "gmail", 2)
+        max_seq = await db.get_source_max_rowid("telegram")
+        await db.set_consumer_cursor("inbox", "telegram", max_seq)
+
+        gate = MessagesGate(consumer="inbox")
+        assert await gate.is_satisfied(_ctx(db)) is False
+
+
 # ---------------------------------------------------------------------------
 # build_gate / build_gates
 # ---------------------------------------------------------------------------
