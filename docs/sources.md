@@ -186,8 +186,15 @@ the hosted channel streams.
   gateway cannot take — more than 256 patterns, or a pattern longer than 256
   bytes or with a control character — goes to the gateway wider, never
   narrower: an allow list is left out and a deny list keeps the patterns that
-  fit, and the local guardrail drops the rest. With `enabled: false` Nerve
-  tells the gateway that it subscribes to nothing.
+  fit, and the local guardrail drops the rest. Blank patterns are not sent; here
+  a blank allow pattern matches only an empty value, which GitHub never gives a
+  repo, an actor or a reason. If the whole subscription is still larger than
+  the gateway's frame limit, it goes with no patterns at all, and the guardrail
+  here does all the filtering. With `enabled: false` Nerve tells the gateway
+  that it subscribes to nothing.
+- **The gateway must know the subscriptions.** A gateway that predates hosted
+  sources closes a stream that publishes them, hosted Slack traffic included,
+  so update the gateway before an agent switches to `mode: hosted`.
 - **Same source, same name.** The records go to a local buffer, and the
   `source:github` runner drains it. The drop hook, `condense`, health checks,
   consumer cursors, `messages` gates and the Sources page work as they do for
@@ -210,7 +217,17 @@ the hosted channel streams.
   combination. This is a known limitation: reading each provider's events on
   its own, so that GitHub records arrive while hosted Slack is off, is a
   follow-up.
-- **Restart-only.** A change of `mode` takes effect at the next restart.
+- **Restart-only.** A change of `mode` takes effect at the next restart. To go
+  back from `hosted` to `poll`, switch the source off first: set
+  `enabled: false` and reload while the mode is still `hosted`. Nerve then
+  tells the gateway that it subscribes to nothing (a subscriptions frame of
+  `{"version":"1"}`), and the gateway stops polling GitHub for the agent at
+  once. Then set `mode: poll`, switch `enabled` back on, and restart. In poll
+  mode Nerve publishes no subscriptions at all. The gateway also counts an agent
+  as subscribed to nothing when a stream opens and publishes no subscriptions
+  within a short grace period, or when Nerve no longer serves the stream
+  endpoint. Until it notices, though, it keeps polling and delivering records
+  that Nerve no longer takes, which is why the reload comes first.
 
 ```yaml
 sync:

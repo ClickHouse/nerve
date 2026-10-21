@@ -301,10 +301,12 @@ would silently drop human feedback.
 
 With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
 channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
-and delivers a `github_pr_activity` record for each change, which also starts
-the job at once (see [Runs on delivery](#runs-on-delivery)). Gate such a job on
-`messages` with `sources: [github]` instead; `nerve doctor` names the jobs that
-still use this gate.
+and delivers a `github_pr_activity` record for each change. A record does not
+start a job by itself. It starts a job gated on `messages` with
+`sources: [github]` at once (see [Runs on delivery](#runs-on-delivery)), so gate
+pull request monitors that way. A job gated on `github_pr_activity` alone is
+never started by a delivery, and since the gate always passes, it runs, in full,
+on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
 ### Adding a built-in gate type
 
@@ -556,10 +558,11 @@ A hosted source — GitHub with `sync.github.mode: hosted`, see
 schedule. When the channel gateway delivers records, the source's runner runs
 at once, after any run of it already in progress (which may have fetched
 before the records arrived); deliveries during that drain make it run once
-more. Then every enabled job whose gates include a `messages` gate naming that
-source, or naming no source, runs once `cron.delivery_debounce_seconds` after
-the first delivery of a burst. Later deliveries in that window add nothing:
-one burst, one run.
+more. Then every enabled job on the schedule (a job whose schedule did not
+parse is not) whose gates include a `messages` gate naming that source, or
+naming no source, runs once `cron.delivery_debounce_seconds` after the first
+delivery of a burst. Later deliveries in that window add nothing: one burst,
+one run.
 
 ```yaml
 cron:
