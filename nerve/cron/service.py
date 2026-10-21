@@ -925,8 +925,9 @@ class CronService:
     # that came due during the pause would then start late — and be dropped as
     # missed when it is later than the misfire grace — or wait out the rest of
     # a timer armed before the pause. Instead the service notices the step,
-    # moves every trigger that came due past the pause and runs the jobs that
-    # want a catch-up once, as the startup catch-up does for downtime.
+    # moves every trigger the scheduler would drop as late past the pause, and
+    # runs the jobs that want a catch-up once, as the startup catch-up does for
+    # downtime.
 
     async def _watch_clock(self) -> None:
         """Check the clock now and every ``_CLOCK_WATCH_SECONDS`` until the
@@ -1064,7 +1065,7 @@ class CronService:
                     if self._may_start(sched_job.id, "catchup"):
                         due.append(sched_job.id)
                 elif func == self._run_job_wrapper:
-                    # As a run the scheduler drops for being late is recorded.
+                    # Recorded like a run the scheduler drops for being late.
                     asyncio.create_task(self._record_missed_run(
                         sched_job.id, missed, error=_PAUSED_MISS,
                     ))
