@@ -599,7 +599,7 @@ class ChannelStream:
             return False
         try:
             body = self._subscriptions()
-        except Exception:  # noqa: BLE001 - a bad setting must not close the stream
+        except Exception:  # a bad setting must not close the stream
             logger.exception("Channel stream %d: could not build the source subscriptions", self.id)
             return False
         if body is None:

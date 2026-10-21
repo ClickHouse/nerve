@@ -232,7 +232,7 @@ class HostedSourceConsumer:
             return
         try:
             outcome = listener(self._provider)
-        except Exception:  # noqa: BLE001 - the record is stored; the runner's schedule still drains it
+        except Exception:  # the record is stored; the runner's schedule still drains it
             logger.exception("The %s delivery listener failed", self._provider)
             return
         if inspect.isawaitable(outcome):

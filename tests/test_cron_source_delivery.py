@@ -23,7 +23,6 @@ from nerve.identity import attribution_for
 from nerve.sources.github import GitHubSource
 from nerve.sources.github_hosted import HostedGitHubSource
 from nerve.sources.models import IngestResult
-
 from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
 pytestmark = pytest.mark.asyncio

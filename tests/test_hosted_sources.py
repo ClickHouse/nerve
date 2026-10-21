@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -42,14 +42,18 @@ from nerve.channels.hosted.sources import (
 )
 from nerve.channels.router import ChannelRouter
 from nerve.cli import doctor_report
-from nerve.config import GitHubSyncConfig, NerveConfig, SlackConfig, validate_config_keys
+from nerve.config import (
+    GitHubSyncConfig,
+    NerveConfig,
+    SlackConfig,
+    validate_config_keys,
+)
 from nerve.cron.gates import GateContext, GitHubPrActivityGate
 from nerve.cron.service import CronService
 from nerve.gateway import server as gateway_server
 from nerve.sources.github import GitHubSource
 from nerve.sources.github_hosted import HostedGitHubSource, record_from_buffer
 from nerve.sources.registry import build_source_runners
-
 from tests.fake_channel_gateway import (
     EVENT_TIMEOUT,
     FakeChannelGateway,

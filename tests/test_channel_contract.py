@@ -422,7 +422,7 @@ class TestSourceRecords:
         assert (record.id, record.record_type) == ("9000000001", "github_notification")
         assert record.summary == "[owner/repo] Fix the flaky retry test (mention)"
         assert record.content.startswith("Repository: owner/repo\nType: PullRequest")
-        assert record.timestamp == datetime(2026, 9, 16, 10, 0, tzinfo=timezone.utc)
+        assert record.timestamp.isoformat() == "2026-09-16T10:00:00+00:00"
         entries = {entry.key: entry for entry in record.metadata}
         assert entries["actors"] == MetadataEntry(key="actors", values=("alice", "bob"))
         assert entries["unread"] == MetadataEntry(key="unread", value="true")
