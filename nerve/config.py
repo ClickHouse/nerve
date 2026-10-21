@@ -2197,6 +2197,11 @@ LOOM_API_KEY_ENV = "LOOM_API_KEY"
 LOOM_ORG_ENV = "LOOM_ORG"
 LOOM_NAMESPACE_ENV = "LOOM_NAMESPACE"
 LOOM_AGENT_ENV = "NERVE_AGENT_ID"
+LOOM_DASHBOARD_URL_ENV = "LOOM_DASHBOARD_URL"
+# The most bytes one memory.set_from_messages body may carry, so it stays
+# inside whatever body limit a proxy in front of Loom enforces.
+DEFAULT_LOOM_EXTRACTION_BATCH_BYTES = 1024 * 1024
+MIN_LOOM_EXTRACTION_BATCH_BYTES = 128 * 1024
 
 
 def _setting_or_env(value: Any, env: str, default: str = "") -> str:
@@ -2220,6 +2225,20 @@ def normalize_loom_base_url(value: Any) -> str:
     credentials, a query or a fragment: the URL is logged and shown on the
     diagnostics page, and the credential goes in ``memory.loom.token``.
     """
+    return _checked_loom_url(value, "memory.loom.base_url").removesuffix("/v1")
+
+
+def normalize_loom_dashboard_url(value: Any) -> str:
+    """``memory.loom.dashboard_url`` without a trailing ``/``; empty stays empty.
+
+    The same rules as the base URL: it is shown as a link.
+    """
+    if value is None or not str(value).strip():
+        return ""
+    return _checked_loom_url(value, "memory.loom.dashboard_url")
+
+
+def _checked_loom_url(value: Any, key: str) -> str:
     url = "" if value is None else str(value).strip()
     parts = urlsplit(url)
     if (
@@ -2230,10 +2249,10 @@ def normalize_loom_base_url(value: Any) -> str:
         or parts.fragment
     ):
         raise ValueError(
-            "memory.loom.base_url must be an http:// or https:// URL with a host "
+            f"{key} must be an http:// or https:// URL with a host "
             "and no credentials, query or fragment"
         )
-    return url.rstrip("/").removesuffix("/v1")
+    return url.rstrip("/")
 
 
 @dataclass
@@ -2254,6 +2273,11 @@ class LoomMemoryConfig:
     agent: str = ""
     timeout_s: float = 5.0  # reads; writes get 3x, conversation extraction 6x
     verify_tls: bool = True
+    # Where people open Loom's dashboard, when that is not base_url (an
+    # instance that reaches Loom through a local proxy, say).
+    dashboard_url: str = ""
+    # Byte budget of one conversation-extraction request body.
+    extraction_batch_bytes: int = DEFAULT_LOOM_EXTRACTION_BATCH_BYTES
 
     @property
     def agent_name(self) -> str:
@@ -2271,6 +2295,10 @@ class LoomMemoryConfig:
             agent=_setting_or_env(d.get("agent"), LOOM_AGENT_ENV),
             timeout_s=d.get("timeout_s", 5.0),
             verify_tls=d.get("verify_tls", True),
+            dashboard_url=_setting_or_env(d.get("dashboard_url"), LOOM_DASHBOARD_URL_ENV),
+            extraction_batch_bytes=d.get(
+                "extraction_batch_bytes", DEFAULT_LOOM_EXTRACTION_BATCH_BYTES,
+            ),
         )
 
 
@@ -3966,10 +3994,16 @@ class NerveConfig:
             return
         loom = self.memory.loom
         loom.base_url = normalize_loom_base_url(loom.base_url)
+        loom.dashboard_url = normalize_loom_dashboard_url(loom.dashboard_url)
         if not loom.timeout_s > 0:
             raise ValueError(
                 f"memory.loom.timeout_s must be a positive number of seconds, "
                 f"got {loom.timeout_s!r}"
+            )
+        if loom.extraction_batch_bytes < MIN_LOOM_EXTRACTION_BATCH_BYTES:
+            raise ValueError(
+                f"memory.loom.extraction_batch_bytes must be at least "
+                f"{MIN_LOOM_EXTRACTION_BATCH_BYTES}, got {loom.extraction_batch_bytes!r}"
             )
 
     def _validate_anthropic_base_url(self) -> None:

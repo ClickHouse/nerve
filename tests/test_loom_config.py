@@ -14,6 +14,7 @@ import pytest
 from nerve import config_reload
 from nerve.config import (
     DEFAULT_LOOM_BASE_URL,
+    DEFAULT_LOOM_EXTRACTION_BATCH_BYTES,
     LoomMemoryConfig,
     MemoryConfig,
     NerveConfig,
@@ -29,6 +30,7 @@ _ENV = (
     "LOOM_ORG",
     "LOOM_NAMESPACE",
     "NERVE_AGENT_ID",
+    "LOOM_DASHBOARD_URL",
 )
 
 
@@ -48,6 +50,8 @@ def test_defaults_keep_memu() -> None:
     assert memory.loom.agent == "" and memory.loom.agent_name == "nerve"
     assert memory.loom.timeout_s == 5.0
     assert memory.loom.verify_tls is True
+    assert memory.loom.dashboard_url == ""
+    assert memory.loom.extraction_batch_bytes == DEFAULT_LOOM_EXTRACTION_BATCH_BYTES == 1024 * 1024
     assert NerveConfig().memory.backend == "memu"
 
 
@@ -58,6 +62,7 @@ def test_environment_fills_every_unset_key(monkeypatch) -> None:
     monkeypatch.setenv("LOOM_ORG", "acme")
     monkeypatch.setenv("LOOM_NAMESPACE", "agent-home")
     monkeypatch.setenv("NERVE_AGENT_ID", "agent-1")
+    monkeypatch.setenv("LOOM_DASHBOARD_URL", "https://loom.example.test")
 
     memory = MemoryConfig.from_dict({})
 
@@ -67,6 +72,7 @@ def test_environment_fills_every_unset_key(monkeypatch) -> None:
     assert memory.loom.org == "acme"
     assert memory.loom.namespace == "agent-home"
     assert memory.loom.agent_name == "agent-1"
+    assert memory.loom.dashboard_url == "https://loom.example.test"
 
 
 def test_a_value_in_a_file_wins_over_the_environment(monkeypatch) -> None:
@@ -95,9 +101,12 @@ def test_a_blank_value_falls_through_to_the_environment(monkeypatch) -> None:
 
 
 def test_scalars_from_env_references_are_coerced() -> None:
-    loom = LoomMemoryConfig.from_dict({"timeout_s": "7.5", "verify_tls": "false"})
+    loom = LoomMemoryConfig.from_dict({
+        "timeout_s": "7.5", "verify_tls": "false", "extraction_batch_bytes": "262144",
+    })
     assert loom.timeout_s == 7.5
     assert loom.verify_tls is False
+    assert loom.extraction_batch_bytes == 262144
 
 
 def test_a_non_mapping_loom_section_uses_the_defaults() -> None:
@@ -134,10 +143,33 @@ def test_unusable_loom_url_refuses_to_load(url) -> None:
         NerveConfig.from_dict({"memory": {"backend": "loom", "loom": {"base_url": url}}})
 
 
+def test_dashboard_url_is_normalized_when_loom_is_the_backend() -> None:
+    config = NerveConfig.from_dict({
+        "memory": {"backend": "loom", "loom": {"dashboard_url": "https://loom.example.test/"}},
+    })
+    assert config.memory.loom.dashboard_url == "https://loom.example.test"
+
+
+@pytest.mark.parametrize("url", ["loom.example.test", "https://loom.example.test/#x"])
+def test_unusable_dashboard_url_refuses_to_load(url) -> None:
+    with pytest.raises(ValueError, match="memory.loom.dashboard_url"):
+        NerveConfig.from_dict({"memory": {"backend": "loom", "loom": {"dashboard_url": url}}})
+
+
+def test_too_small_an_extraction_budget_refuses_to_load() -> None:
+    with pytest.raises(ValueError, match="extraction_batch_bytes must be at least 131072"):
+        NerveConfig.from_dict({
+            "memory": {"backend": "loom", "loom": {"extraction_batch_bytes": 4096}},
+        })
+
+
 def test_the_loom_section_is_inert_under_memu() -> None:
     """A stale Loom value must not stop a memU instance from starting."""
     config = NerveConfig.from_dict({
-        "memory": {"backend": "memu", "loom": {"base_url": "not a url", "timeout_s": 0}},
+        "memory": {"backend": "memu", "loom": {
+            "base_url": "not a url", "timeout_s": 0, "dashboard_url": "nope",
+            "extraction_batch_bytes": 1,
+        }},
     })
     assert config.memory.backend == "memu"
 
@@ -156,6 +188,7 @@ def test_loom_keys_are_known_to_the_validator() -> None:
     merged = {"memory": {"backend": "loom", "loom": {
         "base_url": "http://x", "token": "t", "org": "o", "namespace": "n",
         "agent": "a", "timeout_s": 5, "verify_tls": True,
+        "dashboard_url": "https://d", "extraction_batch_bytes": 1048576,
     }}}
     assert validate_config_keys(merged) == []
     typo = validate_config_keys({"memory": {"loom": {"namespcae": "n"}}})
