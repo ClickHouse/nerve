@@ -1889,20 +1889,25 @@ Diagnostics card shows the last error.
 pass, typically 10 to 15 seconds), so a batch Loom could not extract fails the
 call and the sweep offers the window again. This depends on the gateway's call
 limit (`MCP_GATEWAY_CALL_TIMEOUT`, two minutes by default; Nerve waits 130
-seconds): when the gateway gives up first ("MCP server timed out"), Loom may
-still finish the batch, and the window goes again with the next sweep in
-batches half as large. A batch Loom keeps failing on its side (a fault it does
-not name as passing, three sweeps in a row) is halved until the one message
-it fails on is found; that message is skipped, with a
-`conversation_turn_skipped` audit row (its role and time, never its text),
-once Loom has extracted something else since, so a fault on every batch (an
-outage) skips nothing. Each `conversation_indexed` row of the memory audit log (`GET
-/api/memory/memu/audit`) counts the batches sent and the facts Loom wrote, and
-names the `queue_ids` of any batch Loom queued instead (with
-`defer_extraction`, or when Loom defers one itself) for a lookup in Loom's
-dashboard: Loom tries a queued batch three times within about a minute, then
-gives up, and how it ended is not on MCP. A batch is sent once per process:
-offered again after a failure, the batches Loom already took are skipped.
+seconds): when either gives up ("MCP server timed out" from the gateway),
+Loom may still finish the batch, and the window goes again with the next
+sweep in batches half as large; after ten batches in a row go through, the
+budget grows back toward the default. A fault Loom gives a code (its database
+unreachable, a grant busy, an overload) is "not now", as is any other
+failure. Only Loom's uncoded internal error can be about the batch itself: a
+batch failing with it three sweeps in a row is halved until the one message
+it fails on is found. That message is left out of the next batch and of its
+context, and is skipped, with a `conversation_turn_skipped` audit row (its
+role and time, never its text), only when that next batch goes through (for
+the window's last message: when a batch went through since the isolation
+began in that sweep); a failure first skips nothing, so a Loom that fails
+every batch skips nothing. A window offered again sends only the messages
+Loom has not taken yet (in this process). Each `conversation_indexed` row of
+the memory audit log (`GET /api/memory/memu/audit`) counts the batches sent
+and the facts Loom wrote, and names the `queue_ids` of any batch Loom queued
+instead (with `defer_extraction`, or when Loom defers one itself) for a
+lookup in Loom's dashboard: Loom tries a queued batch three times within
+about a minute, then gives up, and how it ended is not on MCP.
 
 ## xmemory (optional, alongside memU)
 
