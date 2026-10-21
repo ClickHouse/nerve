@@ -391,12 +391,9 @@ async def test_a_catch_up_is_gated_like_a_scheduled_run(held_service):
     assert svc.scheduler.get_job("planner").next_run_time > resumed
 
 
-@pytest.mark.asyncio
-async def test_a_locked_job_catch_up_waits_for_its_running_run(held_service):
-    job = CronJob(id="locked", schedule=EVERY_TEN_MINUTES, prompt="p", lock=True)
-    svc = await held_service([job])
-    release = asyncio.Event()
-    order: list[str] = []
+def _first_run_waits_for(release: asyncio.Event, order: list[str]):
+    """An ``engine.run_cron`` that records each run's start and end in *order*;
+    the first run waits for *release*."""
 
     async def run_cron(**_kwargs) -> TurnResult:
         n = sum(1 for o in order if o.startswith("start")) + 1
@@ -406,17 +403,95 @@ async def test_a_locked_job_catch_up_waits_for_its_running_run(held_service):
         order.append(f"end {n}")
         return _ok()
 
-    svc.engine.run_cron = run_cron
+    return run_cron
+
+
+def test_runs_in_flight_tracks_each_run_and_how_it_started():
+    runs = cron_service._RunsInFlight()
+    assert not runs.running("job")
+
+    with runs.track("job", "schedule"):
+        with runs.track("job", "catchup"):
+            assert runs.running("job", "catchup")
+        assert runs.running("job")
+        assert runs.running("job", "schedule")
+        assert not runs.running("job", "catchup")
+        assert not runs.running("other")
+
+    assert not runs.running("job")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lock", [False, True])
+async def test_a_job_whose_run_is_still_going_is_not_caught_up(held_service, caplog, lock):
+    """As the scheduler skips a fire that finds the job's previous run going."""
+    job = CronJob(id="busy", schedule=EVERY_TEN_MINUTES, prompt="p", lock=lock)
+    svc = await held_service([job])
+    release = asyncio.Event()
+    order: list[str] = []
+    svc.engine.run_cron = _first_run_waits_for(release, order)
+    # Started before the pause, and still going after it.
     in_flight = asyncio.create_task(svc._run_job_wrapper(job))
     await _wait_for(lambda: order == ["start 1"])
     paused, resumed = _pause_window()
-    svc.scheduler.modify_job("locked", next_run_time=resumed - timedelta(hours=1))
+    svc.scheduler.modify_job("busy", next_run_time=resumed - timedelta(hours=1))
 
+    with caplog.at_level(logging.INFO, logger="nerve.cron.service"):
+        catch_up = svc._on_clock_step(paused, resumed)
+
+    assert catch_up is None
+    assert "Not catching up busy: a run of it is still going" in caplog.text
+    assert svc.scheduler.get_job("busy").next_run_time > resumed
+    release.set()
+    await in_flight
+    await asyncio.sleep(0.05)
+    assert order == ["start 1", "end 1"]
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_fire_is_skipped_while_its_catch_up_runs(held_service, caplog):
+    job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([job])
+    release = asyncio.Event()
+    order: list[str] = []
+    svc.engine.run_cron = _first_run_waits_for(release, order)
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("every-ten", next_run_time=resumed - timedelta(hours=1))
     catch_up = svc._on_clock_step(paused, resumed)
+    await _wait_for(lambda: order == ["start 1"])
+
+    # The job's next fire comes while its catch-up run is still going.
+    with caplog.at_level(logging.INFO, logger="nerve.cron.service"):
+        svc.scheduler.modify_job("every-ten", next_run_time=datetime.now(UTC))
+        svc.scheduler.resume()
+        await _wait_for(
+            lambda: "Skipping the scheduled run of every-ten: its catch-up run is "
+            "still going" in caplog.text,
+        )
+    release.set()
+    await catch_up
+    await asyncio.sleep(0.05)
+
+    assert order == ["start 1", "end 1"]
+
+
+@pytest.mark.asyncio
+async def test_a_manual_run_waits_for_a_locked_catch_up(held_service):
+    job = CronJob(id="locked", schedule=EVERY_TEN_MINUTES, prompt="p", lock=True)
+    svc = await held_service([job])
+    release = asyncio.Event()
+    order: list[str] = []
+    svc.engine.run_cron = _first_run_waits_for(release, order)
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("locked", next_run_time=resumed - timedelta(hours=1))
+    catch_up = svc._on_clock_step(paused, resumed)
+    await _wait_for(lambda: order == ["start 1"])
+
+    manual = asyncio.create_task(svc.run_job("locked"))
     await asyncio.sleep(0.05)
     assert order == ["start 1"]
     release.set()
-    await asyncio.gather(in_flight, catch_up)
+    await asyncio.gather(catch_up, manual)
 
     assert order == ["start 1", "end 1", "start 2", "end 2"]
 

@@ -6,11 +6,12 @@ Runs cron jobs and source runners on schedule.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
 from apscheduler.events import EVENT_JOB_MISSED
@@ -32,7 +33,7 @@ from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from nerve.cron.gates import CronGate
     from nerve.sources.runner import SourceRunner
@@ -58,6 +59,43 @@ _MISFIRE_GRACE_SECONDS = 30
 # See CronService._watch_clock.
 _CLOCK_WATCH_SECONDS = 5
 _CLOCK_STEP_SECONDS = 5
+
+# How a run of a cron job or source runner was started: by its schedule, as a
+# catch-up for fires missed while the daemon was down or the machine paused,
+# or by hand (the Cron page's "Run now", the trigger API).
+RunOrigin = Literal["schedule", "catchup", "manual"]
+
+
+class _RunsInFlight:
+    """The runs in progress, by job id, and how each was started.
+
+    The scheduler starts a job at most once at a time, but it only counts the
+    runs it started itself. The run wrappers record every run here, so that
+    whatever starts a run can first see what is already going.
+    """
+
+    def __init__(self) -> None:
+        self._origins: dict[str, list[RunOrigin]] = {}
+
+    def running(self, job_id: str, origin: RunOrigin | None = None) -> bool:
+        """Whether a run of *job_id* is in progress — one started as *origin*,
+        if given."""
+        origins = self._origins.get(job_id, [])
+        return origin in origins if origin is not None else bool(origins)
+
+    @contextlib.contextmanager
+    def track(self, job_id: str, origin: RunOrigin) -> Iterator[None]:
+        """Count a run of *job_id*, started as *origin*, as in progress for
+        the duration of the block."""
+        self._origins.setdefault(job_id, []).append(origin)
+        try:
+            yield
+        finally:
+            origins = self._origins[job_id]
+            origins.remove(origin)
+            if not origins:
+                del self._origins[job_id]
+
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
@@ -311,6 +349,8 @@ class CronService:
         self._rejected_job_ids: list[str] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
+        # Every run in progress, however it was started (see _may_start).
+        self._runs = _RunsInFlight()
         # Set by the gateway before start() so freshly-(re)built source runners
         # get wired to health-alert notifications, including after a reload.
         self.notification_service = None
@@ -929,10 +969,12 @@ class CronService:
 
         Synchronous, so that nothing gets to look at the old fire times in
         between. Returns what to run once now: the cron jobs with ``catchup``
-        and the source runners. A job with ``catchup: false``, cleanup and the
-        wakeup sweep (which fires every due session wakeup on its next pass)
-        only move on. Jobs are handled one by one: one that cannot be moved is
-        logged and left to the scheduler, and the rest still move.
+        and the source runners — except one with a run still going, which the
+        fire that came due would have found going too (see :meth:`_may_start`).
+        A job with ``catchup: false``, cleanup and the wakeup sweep (which
+        fires every due session wakeup on its next pass) only move on. Jobs are
+        handled one by one: one that cannot be moved is logged and left to the
+        scheduler, and the rest still move.
         """
         after = paused_to + timedelta(microseconds=1)
         internal = (self._cleanup_expired, self._sweep_wakeups)
@@ -957,7 +999,7 @@ class CronService:
                     continue  # the trigger is done; the scheduler retires the job
                 self.scheduler.modify_job(sched_job.id, next_run_time=upcoming)
                 rearmed += 1
-                if catchup:
+                if catchup and self._may_start(sched_job.id, "catchup"):
                     due.append(sched_job.args[0])
             except Exception:
                 logger.exception("Could not move %s past the pause", sched_job.id)
@@ -988,9 +1030,9 @@ class CronService:
                 return  # stopped while waiting its turn
             results = await asyncio.gather(
                 *(
-                    self._run_job_wrapper(item)
+                    self._run_job_wrapper(item, origin="catchup")
                     if isinstance(item, CronJob)
-                    else self._run_source_wrapper(item)
+                    else self._run_source_wrapper(item, origin="catchup")
                     for item in due
                 ),
                 return_exceptions=True,
@@ -1067,7 +1109,7 @@ class CronService:
         )
         async with self._catchup_lock:
             await asyncio.gather(
-                *(self._run_job_wrapper(job) for job in overdue),
+                *(self._run_job_wrapper(job, origin="catchup") for job in overdue),
             )
 
     @staticmethod
@@ -1369,18 +1411,46 @@ class CronService:
 
     async def _run_job_wrapper(
         self, job: CronJob, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule",
     ) -> None:
         """Wrapper to run a cron job with logging and optional lock.
 
         ``attribution`` names who started the run and its cause. ``None``
-        (the scheduler's call) is the instance's own run.
+        (the scheduler's call) is the instance's own run. ``origin`` says how
+        the run was started; the scheduler's call is ``"schedule"``. A run that
+        would overlap another run of the job is skipped as :meth:`_may_start`
+        says; otherwise it counts as in progress until it ends.
         """
-        if job.lock:
-            lock = self._job_locks.setdefault(job.id, asyncio.Lock())
-            async with lock:
+        if not self._may_start(job.id, origin):
+            return
+        with self._runs.track(job.id, origin):
+            if job.lock:
+                lock = self._job_locks.setdefault(job.id, asyncio.Lock())
+                async with lock:
+                    await self._run_job_inner(job, attribution)
+            else:
                 await self._run_job_inner(job, attribution)
-        else:
-            await self._run_job_inner(job, attribution)
+
+    def _may_start(self, job_id: str, origin: RunOrigin) -> bool:
+        """Whether a run of *job_id* started as *origin* may start now.
+
+        The scheduler never starts a job while its previous scheduled run is
+        still going; it skips that fire. A catch-up stands in for a scheduled
+        fire, so the same rule holds between the two: a catch-up is skipped
+        while any run of the job is going, and a scheduled fire while a
+        catch-up of the job is going. Each skip is logged. A manual run always
+        starts (with ``lock`` it waits for the run before it).
+        """
+        if origin == "catchup" and self._runs.running(job_id):
+            logger.info("Not catching up %s: a run of it is still going", job_id)
+            return False
+        if origin == "schedule" and self._runs.running(job_id, "catchup"):
+            logger.info(
+                "Skipping the scheduled run of %s: its catch-up run is still going",
+                job_id,
+            )
+            return False
+        return True
 
     async def _run_job_inner(
         self, job: CronJob, attribution: Attribution | None = None,
@@ -1598,11 +1668,22 @@ class CronService:
 
     async def _run_source_wrapper(
         self, runner: SourceRunner, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule",
     ) -> None:
         """Wrapper to run a source ingestion with cron and source logging.
 
-        ``attribution`` is as for :meth:`_run_job_wrapper`.
+        ``attribution`` and ``origin`` are as for :meth:`_run_job_wrapper`, and
+        so is skipping a run that would overlap another.
         """
+        if not self._may_start(runner.job_id, origin):
+            return
+        with self._runs.track(runner.job_id, origin):
+            await self._run_source_inner(runner, attribution)
+
+    async def _run_source_inner(
+        self, runner: SourceRunner, attribution: Attribution | None = None,
+    ) -> None:
+        """The body of :meth:`_run_source_wrapper`."""
         log_id = await self.db.log_cron_start(
             runner.job_id, attribution=attribution or self._own_attribution(),
         )
@@ -1743,7 +1824,7 @@ class CronService:
         if not job:
             raise ValueError(f"Job not found: {job_id}")
 
-        await self._run_job_wrapper(job, attribution)
+        await self._run_job_wrapper(job, attribution, origin="manual")
 
     async def rotate_session(self, job_id: str) -> dict:
         """Force-rotate a persistent cron to a fresh chat session.

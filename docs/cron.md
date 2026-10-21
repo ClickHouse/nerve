@@ -140,7 +140,7 @@ prompt definition.
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once if the job missed a run while the server was down (on startup) or while the machine was paused (on resume — see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)) (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Serialize this job's runs inside the daemon: a catch-up or web-triggered run waits for the previous one to finish. An overlapping scheduled fire is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish. An overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -508,8 +508,11 @@ them start late or be dropped as [late runs](#late-runs):
   window and the number of jobs caught up.
 
 A catch-up waits for one that is still running — at startup or after an earlier
-pause — instead of overlapping it. Jumps under 5 seconds are ignored; a run that
-starts up to 30 seconds late runs anyway.
+pause — instead of overlapping it. A job whose run is still going when the
+machine resumes is not caught up, just as the scheduler skips a fire that finds
+the job's previous run still going; and a scheduled fire that comes while the
+job's catch-up run is going is skipped. Both are logged. Jumps under 5 seconds
+are ignored; a run that starts up to 30 seconds late runs anyway.
 
 ### Late runs
 
