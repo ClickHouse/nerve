@@ -22,6 +22,12 @@ chunks after the operation frame, sized to the gateway's ``frame_bytes``, and
 stops when the result arrives first. Nerve starts an upload only while its
 size, together with the uploads already in flight, fits the gateway's
 ``memory_bytes``.
+
+When the agent has hosted sources, the stream sends its ``subscriptions``
+frame as soon as negotiation completes, and again whenever the runtime
+publishes changed settings. A subscription that the gateway's bounds or frame
+limit would refuse goes without its filter patterns, so it never closes the
+stream; Nerve's own inbox filter still applies to every record.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from nerve.channels.hosted.contract import (
     Rejected,
     RejectionReason,
     StreamLimits,
+    Subscriptions,
     decode_envelope,
     encode_envelope,
     validate_inbox_read_result,
@@ -169,7 +176,9 @@ class ChannelStream:
 
     ``receive_limits`` is what Nerve accepts on this stream. Nerve advertises
     the same limits on every stream, so a row that one stream cannot carry
-    cannot be carried by another either.
+    cannot be carried by another either. ``subscriptions`` returns the
+    agent's current source subscriptions, or ``None`` when it has no hosted
+    sources and sends no ``subscriptions`` frame.
     """
 
     def __init__(
@@ -181,6 +190,7 @@ class ChannelStream:
         listener: StreamListener,
         timing: StreamTiming = StreamTiming(),
         clock: Callable[[], float] = time.monotonic,
+        subscriptions: Callable[[], Subscriptions | None] | None = None,
     ) -> None:
         self.id = stream_id
         self._websocket = websocket
@@ -188,6 +198,8 @@ class ChannelStream:
         self._listener = listener
         self._timing = timing
         self._clock = clock
+        self._subscriptions = subscriptions
+        self._publish_task: asyncio.Task | None = None
         self.opened_at = clock()
         self.state = "negotiating"
         # The gateway sent drain: new requests go to another stream.
@@ -304,11 +316,14 @@ class ChannelStream:
         except StreamClosed:
             pass
         finally:
-            watchdog.cancel()
-            try:
-                await watchdog
-            except (asyncio.CancelledError, Exception):
-                pass
+            for task in (watchdog, self._publish_task):
+                if task is None:
+                    continue
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._mark_closed()
 
     async def close(self, code: int = CLOSE_NORMAL, reason: str = "") -> None:
@@ -407,6 +422,12 @@ class ChannelStream:
             self.peer_limits = body.receive_limits
             self.state = "ready"
             logger.info("Channel stream %d negotiated version %s", self.id, PROTOCOL_VERSION)
+            if self._subscriptions is not None:
+                # Started before the reader hears of the stream, so the
+                # subscriptions are the first frame after negotiation.
+                self._publish_task = asyncio.get_running_loop().create_task(
+                    self.publish_subscriptions(), name=f"channel-stream-{self.id}-subscriptions",
+                )
             self._listener.stream_ready(self)
         elif kind == "heartbeat":
             pass
@@ -563,6 +584,51 @@ class ChannelStream:
         self._next_one_way += 1
         text = self._encode(kind, body, connection_id, f"o-{self._next_one_way}")
         await self._send_text(text)
+
+    async def publish_subscriptions(self) -> bool:
+        """Send the agent's current source subscriptions; ``True`` when sent.
+
+        The settings are read at the call, so the newest call sends the newest
+        settings, and frames leave in call order. Subscriptions that the
+        gateway would refuse, by its bounds or its frame limit, go without
+        their filter patterns: the gateway then keeps every record, and Nerve's
+        inbox filter still drops what the patterns would have. A stream that
+        is not ready, or that Nerve is draining, sends nothing.
+        """
+        if self._subscriptions is None or not self.ready or self.drain_sent:
+            return False
+        try:
+            body = self._subscriptions()
+        except Exception:  # noqa: BLE001 - a bad setting must not close the stream
+            logger.exception("Channel stream %d: could not build the source subscriptions", self.id)
+            return False
+        if body is None:
+            return False
+        try:
+            body.validate()
+        except Rejected as error:
+            logger.warning(
+                "Channel stream %d: source subscriptions exceed the gateway's bounds (%s); "
+                "sending them without filter patterns", self.id, error.detail,
+            )
+            body = body.without_filters()
+        try:
+            try:
+                await self._send_one_way("subscriptions", body)
+            except Rejected as error:
+                if error.reason != RejectionReason.FRAME_TOO_LARGE:
+                    raise
+                logger.warning(
+                    "Channel stream %d: source subscriptions exceed the gateway's frame limit; "
+                    "sending them without filter patterns", self.id,
+                )
+                await self._send_one_way("subscriptions", body.without_filters())
+        except StreamClosed:
+            return False
+        except Rejected as error:
+            logger.warning("Channel stream %d: source subscriptions not sent: %s", self.id, error)
+            return False
+        return True
 
     def _check_room(
         self, kind: str, body: Any, connection_id: uuid.UUID | None, upload: bytes | None,
