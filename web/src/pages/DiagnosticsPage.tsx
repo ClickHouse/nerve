@@ -347,6 +347,23 @@ export function DiagnosticsPage() {
               </div>
             )}
 
+            {/* Conversation windows Loom extracts in the background */}
+            {memuHealth.backend === 'loom' && memuHealth.extraction && (
+              <div
+                className={`mb-3 p-3 border rounded-lg text-xs break-words ${
+                  memuHealth.extraction.failed > 0
+                    ? 'bg-warning-bg border-warning-border text-warning'
+                    : 'bg-surface border-border-subtle text-text-muted'
+                }`}
+              >
+                Conversation extraction: {memuHealth.extraction.queued ?? 0} queued in Loom,{' '}
+                {memuHealth.extraction.failed ?? 0} failed
+                {memuHealth.extraction.failed > 0 && (
+                  <> (Loom gave up on these windows after three sends; the gateway log names each one)</>
+                )}
+              </div>
+            )}
+
             {/* Type distribution badges */}
             {memuHealth.database?.type_distribution && (
               <div className="flex gap-2 mb-3 flex-wrap">

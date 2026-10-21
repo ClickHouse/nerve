@@ -3,8 +3,8 @@
 Covers every memory tool path through the real handlers, the bridge's
 failure contract (an outage raises ``MemoryBackendUnavailable`` after bounded
 retries; an abstaining search is empty, never an error), identity resolution,
-the startup recall, and output parity with the memU bridge on the same
-inputs.
+the startup recall, the follow-up of queued extraction, and output parity
+with the memU bridge on the same inputs.
 
 The fake is strict: a request field an operation does not take is refused,
 as Loom refuses one on a write, so a misspelt field fails a test.
@@ -1511,6 +1511,196 @@ async def test_memorize_file_parses_the_type_prefix(make_bridge, tmp_path) -> No
 
 
 # --------------------------------------------------------------------------- #
+# Queued extraction: what Loom finished, and what it gave up on
+# --------------------------------------------------------------------------- #
+
+
+async def _session_with_messages(db, session_id: str, count: int, start: datetime) -> list[dict]:
+    await db.create_session(session_id, actor=None)
+    for message in _messages(count, start):
+        await db.add_message(
+            session_id, message["role"], message["content"],
+            created_at=message["created_at"], actor=None,
+        )
+    return await db.get_messages(session_id, limit=10000)
+
+
+@pytest.mark.asyncio
+async def test_queued_batches_are_recorded(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 450, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    rows = await db.memory_extractions()
+    assert [(r["queue_id"], r["message_count"], r["sends"]) for r in rows] == [
+        ("q1", 400, 1), ("q2", 50, 1),
+    ]
+    assert rows[0]["window_start"] == "2026-10-18T00:00:00"
+    assert rows[1]["window_end"] == "2026-10-18T07:29:00"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_drops_finished_batches(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 3, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    assert (await bridge.reconcile_extractions())["waiting"] == 1
+    fake.queue["q1"]["status"] = "done"
+    stats = await bridge.reconcile_extractions()
+    assert stats["done"] == 1
+    assert await db.memory_extractions() == []
+    body = fake.bodies("memory.extraction_status")[-1]
+    assert body["session_id"] == "sess-1" and body["agent"] == "*"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_finds_a_batch_older_than_one_listing(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    for n in range(500):  # newer batches of the same session, queued elsewhere
+        fake.queue[f"other-{n}"] = {**fake.queue["q1"], "queue_id": f"other-{n}"}
+    fake.queue["q1"]["status"] = "done"
+    stats = await bridge.reconcile_extractions()
+    assert stats["done"] == 1
+    assert fake.bodies("memory.extraction_status")[-1]["queue_id"] == "q1"
+    assert await db.memory_extractions() == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resends_a_failed_window_from_the_stored_messages(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 5, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    fake.queue["q1"].update(status="failed", attempts=3, last_error="RateLimited: over budget")
+
+    stats = await bridge.reconcile_extractions()
+
+    assert stats["resent"] == 1
+    resent = fake.queued[-1]
+    assert [m["content"] for m in resent["messages"]] == [f"message {n}" for n in range(5)]
+    assert resent["session_id"] == "sess-1" and resent["defer"] is True
+    (row,) = await db.memory_extractions()
+    assert (row["queue_id"], row["sends"], row["last_error"]) == ("q2", 2, "RateLimited: over budget")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gives_up_after_three_sends_and_reports_it(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    for _ in range(3):
+        for queued in fake.queue.values():
+            queued["status"] = "failed"
+        await bridge.reconcile_extractions()
+    assert len(fake.queued) == 3  # the first send and two more
+    assert await db.memory_extractions() == []
+    (failed,) = await db.memory_extractions("failed")
+    assert failed["sends"] == 3 and "after 3 sends" in failed["last_error"]
+    health = await bridge.get_health()
+    assert health["extraction"]["failed"] == 1 and health["extraction"]["queued"] == 0
+    assert health["extraction"]["last_check"]["gave_up"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gives_up_when_the_messages_are_gone(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    await db.add_memory_extraction(
+        "deleted-session", "q-old", "2026-10-18T00:00:00", "2026-10-18T00:05:00", 6,
+    )
+    fake.queue["q-old"] = {
+        "queue_id": "q-old", "agent": "nerve", "user_id": "-", "session_id": "deleted-session",
+        "status": "failed", "attempts": 3, "message_count": 6, "content_chars": 0,
+        "written": 0, "last_error": "boom", "enqueued_at": None, "updated_at": None,
+    }
+    stats = await bridge.reconcile_extractions()
+    assert stats["gave_up"] == 1
+    (failed,) = await db.memory_extractions("failed")
+    assert failed["last_error"] == "boom; its messages are gone"
+    assert fake.queued == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_takes_an_old_unlisted_batch_as_failed(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    fake.queue.clear()  # Loom no longer lists it
+    assert (await bridge.reconcile_extractions())["waiting"] == 1  # a fresh one waits
+    await db._write("UPDATE memory_extractions SET created_at = ?", ("2026-01-01T00:00:00+00:00",))
+    assert (await bridge.reconcile_extractions())["resent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gives_up_on_a_refused_resend(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    fake.queue["q1"]["status"] = "failed"
+    fake.fail("memory.set_from_messages", _error(422, "VALIDATION_FAILED", "bad message"))
+    stats = await bridge.reconcile_extractions()
+    assert stats["gave_up"] == 1
+    (failed,) = await db.memory_extractions("failed")
+    assert "sending it again was refused" in failed["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_outage_keeps_the_records(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    fake.fail("memory.extraction_status", *[httpx.ConnectError("refused")] * 3)
+    with pytest.raises(MemoryBackendUnavailable):
+        await bridge.reconcile_extractions()
+    assert len(await db.memory_extractions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_forgets_old_given_up_batches(make_bridge, db) -> None:
+    bridge = await make_bridge(FakeLoom(), audit_db=db)
+    row_id = await db.add_memory_extraction("sess-1", "q-old", "", "", 1)
+    await db.update_memory_extraction(row_id, state="failed", last_error="boom")
+    await bridge.reconcile_extractions()
+    assert len(await db.memory_extractions("failed")) == 1  # recent: kept
+    await db._write("UPDATE memory_extractions SET updated_at = ?", ("2026-01-01T00:00:00+00:00",))
+    await bridge.reconcile_extractions()
+    assert await db.memory_extractions("failed") == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_checks_queued_extraction(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    stored = await _session_with_messages(db, "sess-1", 2, datetime(2026, 10, 18, tzinfo=UTC))
+    await bridge.memorize_conversation("sess-1", stored)
+    fake.queue["q1"]["status"] = "done"
+    engine = _engine_with(bridge)
+    stats = await engine.run_memorization_sweep()
+    assert stats["extraction"]["done"] == 1
+    assert await db.memory_extractions() == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_survives_a_failed_check(make_bridge, db) -> None:
+    fake = FakeLoom()
+    bridge = await make_bridge(fake, audit_db=db)
+    await db.add_memory_extraction("sess-1", "q-x", "", "", 1)
+    fake.fail("memory.extraction_status", *[httpx.ConnectError("refused")] * 3)
+    engine = _engine_with(bridge)
+    stats = await engine.run_memorization_sweep()
+    assert "extraction" not in stats
+    assert stats["sessions_scanned"] == 0
+
+
+# --------------------------------------------------------------------------- #
 # Update and delete
 # --------------------------------------------------------------------------- #
 
@@ -1767,6 +1957,7 @@ async def test_health_shape(make_bridge) -> None:
     assert health["database"]["total_categories"] == 1
     assert health["operations"]["recall"]["call_count"] == 1
     assert health["loom"]["namespace"] == HOME and health["loom"]["identity_source"] == "whoami"
+    assert health["extraction"] == {"queued": 0, "failed": 0, "last_check": {}}
     assert TOKEN not in json.dumps(health)
 
 
@@ -1815,6 +2006,7 @@ async def test_snapshot_route_degrades_for_loom(make_bridge, monkeypatch) -> Non
 
     health = await routes.memu_health()
     assert health["backend"] == "loom"
+    assert health["extraction"]["failed"] == 0
 
 
 @pytest.mark.asyncio

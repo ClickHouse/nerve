@@ -25,6 +25,7 @@ from nerve.db.cron import CronStore
 from nerve.db.files import FileStore
 from nerve.db.maintenance import MaintenanceStore
 from nerve.db.mcp import McpStore
+from nerve.db.memory_extractions import MemoryExtractionStore
 from nerve.db.messages import MessageStore
 from nerve.db.migrations.runner import discover_migrations, run_migrations
 from nerve.db.notifications import NotificationStore
@@ -323,6 +324,7 @@ class Database(
     AccountStore,
     MaintenanceStore,
     AgentStore,
+    MemoryExtractionStore,
 ):
     """Async SQLite database wrapper.
 

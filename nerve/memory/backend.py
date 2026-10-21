@@ -77,6 +77,14 @@ async def recall_for_startup(bridge: Any, query: str, limit: int) -> list[dict]:
     return await bridge.recall(query, limit=limit)
 
 
+async def reconcile_extractions(bridge: Any) -> dict | None:
+    """Let a backend that queues extraction check on what it queued (the
+    Loom bridge's ``reconcile_extractions``); None for one that does not."""
+    if callable(getattr(type(bridge), "reconcile_extractions", None)):
+        return await bridge.reconcile_extractions()
+    return None
+
+
 def create_memory_bridge(config: Any, audit_db: Any = None) -> Any:
     """The memory backend ``config.memory.backend`` names, not yet initialized.
 

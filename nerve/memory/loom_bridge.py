@@ -23,7 +23,10 @@ How the tools map onto Loom operations:
 * ``memory_update`` → ``memory.update_by_id`` (no-clobber via
   ``if_match_sha256``) and ``memory.assign_category``; ``memory_delete`` →
   ``memory.delete``; ``category_update`` → ``namespace.register_category``.
-* the indexing sweep → ``memory.set_from_messages`` with ``defer=true``.
+* the indexing sweep → ``memory.set_from_messages`` with ``defer=true``; each
+  queued batch is recorded in ``nerve.db`` and checked with
+  ``memory.extraction_status`` on the next sweep, so a batch Loom gives up on
+  is sent again instead of lost.
 
 Failure contract, the part the rest of Nerve depends on: an unreachable
 service, a timeout, HTTP 5xx, 429 or a refused credential raises
@@ -66,6 +69,7 @@ from nerve.config import (
     NerveConfig,
     normalize_loom_base_url,
 )
+from nerve.db.memory_extractions import EXTRACTION_FAILED, EXTRACTION_QUEUED
 from nerve.memory.backend import MemoryBackendUnavailable, category_breadcrumb
 
 logger = logging.getLogger(__name__)
@@ -133,6 +137,7 @@ _IDEMPOTENT_OPS = frozenset({
     "memory.timeline",
     "memory.get",
     "memory.get_by_id",
+    "memory.extraction_status",
     "memory.set",
     "memory.update_by_id",
     "memory.delete",
@@ -168,6 +173,12 @@ _CONTEXT_MAX_BYTES = 2000
 # same extraction twice (in this process).
 _ACCEPTED_TTL_S = 24 * 3600
 _ACCEPTED_MAX = 4096
+# A queued window is sent at most this many times in all; one Loom no longer
+# lists is taken as failed after this long; given-up windows are kept this long.
+_EXTRACTION_MAX_SENDS = 3
+_EXTRACTION_UNLISTED_S = 24 * 3600
+_EXTRACTION_FAILED_KEEP = timedelta(days=30)
+_EXTRACTION_CHECK_LIMIT = 500
 
 # memory_records_by_date scans memory.list newest first, at most this far.
 _RECORDS_PAGE = 500
@@ -251,6 +262,7 @@ class LoomMetrics:
         "startup_recall",
         "memorize",
         "memorize_conversation",
+        "reconcile",
         "expand_category",
         "conversation_history",
         "records_by_date",
@@ -531,7 +543,8 @@ class LoomBridge:
     ) -> None:
         self.config = config
         self._cfg = config.memory.loom
-        # nerve.db, for the memory audit log.
+        # nerve.db: the audit log, the messages a failed window is re-read
+        # from, and the record of queued extraction batches.
         self._db = audit_db
         # Tests hand in an httpx.MockTransport; production uses the default.
         self._transport = transport
@@ -552,6 +565,7 @@ class LoomBridge:
         self._background: set[asyncio.Task] = set()
         self._seeded = False
         self._seed_retry_at = 0.0
+        self._last_reconcile: dict[str, Any] = {}
         read = float(self._cfg.timeout_s)
         self._timeouts = {
             "read": read,
@@ -1518,8 +1532,9 @@ class LoomBridge:
         """Queue a session window for extraction (``memory.set_from_messages``,
         ``defer=true``): Loom extracts the facts in the background.
 
-        Cut into batches of at most 400 messages within the byte budget.
-        RAISES on any failure, the bridge not running included:
+        Cut into batches of at most 400 messages within the byte budget; each
+        queued batch is recorded so the sweep can find out whether Loom
+        finished it. RAISES on any failure, the bridge not running included:
         the sweep advances its watermark unless this raises, and a window that
         was not queued must be offered again. False only when there is
         nothing to send.
@@ -1607,8 +1622,11 @@ class LoomBridge:
                 json.dumps([session_id, turns], ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ).hexdigest()
             if not self._was_accepted(digest):
-                await self._send_window(session_id, turns, context)
+                data = await self._send_window(session_id, turns, context)
                 self._remember_accepted(digest)
+                queue_id = str(data.get("queue_id") or "")
+                if queue_id:
+                    await self._track_batch(session_id, queue_id, batch)
                 queued += 1
             context = self._context(turns)
         await self._audit("conversation_indexed", "resource", session_id, "bridge", {
@@ -1617,6 +1635,32 @@ class LoomBridge:
             "queued": queued,
         })
         return True
+
+    async def _track_batch(
+        self,
+        session_id: str,
+        queue_id: str,
+        batch: list[tuple[dict[str, Any], datetime | None]],
+        *,
+        sends: int = 1,
+    ) -> None:
+        """Record a queued batch, so the sweep can check on it. Best effort: a
+        record that cannot be written is logged, the batch stays queued."""
+        db = self._db
+        if db is None or not hasattr(db, "add_memory_extraction"):
+            return
+        stamps = [when for _, when in batch if when is not None]
+        start = min(stamps).isoformat() if stamps else ""
+        end = max(stamps).isoformat() if stamps else ""
+        try:
+            await db.add_memory_extraction(
+                session_id, queue_id, start, end, len(batch), sends=sends,
+            )
+        except Exception as e:  # noqa: BLE001 — the queued batch stands without its record
+            logger.warning(
+                "Could not record queued extraction %s of session %s: %s",
+                queue_id, session_id, e,
+            )
 
     @staticmethod
     def _observation_date(turns: list[dict[str, Any]]) -> str:
@@ -1639,6 +1683,143 @@ class LoomBridge:
             if len(self._accepted) >= _ACCEPTED_MAX:
                 self._accepted.pop(next(iter(self._accepted)))
         self._accepted[digest] = now
+
+    # ------------------------------------------------------------------ #
+    # Queued extraction: what Loom finished, and what it gave up on
+    # ------------------------------------------------------------------ #
+
+    async def reconcile_extractions(self) -> dict[str, int]:
+        """Check the windows queued for extraction; run by the indexing sweep.
+
+        Loom gives a queued batch a few attempts and then marks it failed for
+        good, after the sweep already moved its watermark past the window. So
+        each recorded batch is looked up with ``memory.extraction_status``:
+        one Loom finished is dropped, a failed one is sent again from the
+        messages in ``nerve.db`` (three sends in all), and one given up on is
+        kept as failed for the diagnostics page and logged. An outage raises;
+        nothing is lost by that, the next sweep checks again.
+        """
+        stats = {"checked": 0, "done": 0, "resent": 0, "gave_up": 0, "waiting": 0}
+        db = self._db
+        if not self._available or db is None or not hasattr(db, "memory_extractions"):
+            return stats
+        return await self._tracked("reconcile", "extraction batches", self._reconcile(db, stats))
+
+    async def _reconcile(self, db: Any, stats: dict[str, int]) -> dict[str, int]:
+        rows = await db.memory_extractions(EXTRACTION_QUEUED, limit=_EXTRACTION_CHECK_LIMIT)
+        by_session: dict[str, list[dict]] = {}
+        for row in rows:
+            by_session.setdefault(str(row["session_id"]), []).append(row)
+        for session_id, tracked in by_session.items():
+            try:
+                listed = await self._extraction_status(session_id)
+            except LoomRequestError as e:
+                logger.warning("Loom refused the extraction status of session %s: %s", session_id, e)
+                continue
+            states = {str(b.get("queue_id")): b for b in listed}
+            for row in tracked:
+                stats["checked"] += 1
+                batch = states.get(str(row["queue_id"]))
+                if batch is None and len(listed) >= _EXTRACTION_CHECK_LIMIT:
+                    # Loom lists a session's batches newest first, as many as
+                    # one answer holds: ask after an older one by its id.
+                    try:
+                        found = await self._extraction_status(session_id, str(row["queue_id"]))
+                    except LoomRequestError:
+                        found = []
+                    batch = found[0] if found else None
+                if batch is None:
+                    created = _parse_dt(row.get("created_at"))
+                    if created is None or (_now() - created).total_seconds() < _EXTRACTION_UNLISTED_S:
+                        stats["waiting"] += 1
+                        continue
+                    batch = {"status": "failed", "last_error": "no longer in Loom's queue"}
+                status = str(batch.get("status") or "")
+                if status == "done":
+                    await db.delete_memory_extraction(row["id"])
+                    stats["done"] += 1
+                elif status == "failed":
+                    last_error = str(batch.get("last_error") or "")
+                    try:
+                        outcome = await self._resend(db, row, last_error)
+                    except LoomRequestError as e:
+                        # The same request would be refused on every sweep.
+                        outcome = await self._give_up(
+                            db, row, last_error, f"sending it again was refused: {e}",
+                        )
+                    stats[outcome] += 1
+                else:
+                    stats["waiting"] += 1
+        await db.prune_memory_extractions(
+            EXTRACTION_FAILED, (datetime.now(UTC) - _EXTRACTION_FAILED_KEEP).isoformat(),
+        )
+        self._last_reconcile = {**stats, "at": datetime.now(UTC).isoformat()}
+        return stats
+
+    async def _extraction_status(self, session_id: str, queue_id: str = "") -> list[dict]:
+        """A session's queued batches as Loom reports them, newest first."""
+        fields: dict[str, Any] = {
+            "agent": "*", "session_id": session_id, "limit": _EXTRACTION_CHECK_LIMIT,
+        }
+        if queue_id:
+            fields.update(queue_id=queue_id, limit=1)
+        data = await self._op("memory.extraction_status", fields)
+        return [b for b in data.get("batches") or [] if isinstance(b, dict)]
+
+    async def _resend(self, db: Any, row: dict, last_error: str) -> str:
+        """Send a failed window again, or give up on it: ``resent`` / ``gave_up``."""
+        sends = int(row.get("sends") or 1)
+        if sends >= _EXTRACTION_MAX_SENDS:
+            return await self._give_up(db, row, last_error, f"after {sends} sends")
+        entries = await self._window_entries(db, row)
+        if not entries:
+            return await self._give_up(db, row, last_error, "its messages are gone")
+        first = True
+        for batch in self._batches(entries):
+            data = await self._send_window(str(row["session_id"]), [t for t, _ in batch], [])
+            queue_id = str(data.get("queue_id") or "")
+            if first:
+                first = False
+                if queue_id:
+                    await db.update_memory_extraction(
+                        row["id"], queue_id=queue_id, sends=sends + 1, last_error=last_error,
+                    )
+                else:  # extracted inline: nothing left to watch
+                    await db.delete_memory_extraction(row["id"])
+            elif queue_id:
+                await self._track_batch(str(row["session_id"]), queue_id, batch, sends=sends + 1)
+        logger.warning(
+            "Loom gave up extracting %s messages of session %s (%s); sent again",
+            row.get("message_count"), row.get("session_id"), last_error or "no error given",
+        )
+        return "resent"
+
+    async def _give_up(self, db: Any, row: dict, last_error: str, why: str) -> str:
+        error = f"{last_error}; {why}" if last_error else why
+        await db.update_memory_extraction(row["id"], state=EXTRACTION_FAILED, last_error=error)
+        logger.error(
+            "Memories of %s messages of session %s were not extracted by Loom: %s",
+            row.get("message_count"), row.get("session_id"), error,
+        )
+        return "gave_up"
+
+    async def _window_entries(
+        self, db: Any, row: dict,
+    ) -> list[tuple[dict[str, Any], datetime | None]]:
+        """The recorded window's messages, read back from ``nerve.db``."""
+        start, end = _parse_dt(row.get("window_start")), _parse_dt(row.get("window_end"))
+        if start is None or end is None or not hasattr(db, "get_messages"):
+            return []
+        messages = await db.get_messages(str(row["session_id"]), limit=10000)
+        out = []
+        for message in messages:
+            when = _parse_dt(message.get("created_at"))
+            if when is None or when < start or when > end:
+                continue
+            turn = self._turn(message)
+            if turn is not None:
+                out.append((turn, when))
+        return out
 
     # ------------------------------------------------------------------ #
     # Update and delete
@@ -1971,10 +2152,25 @@ class LoomBridge:
         stats["total_categories"] = len(data.get("categories") or [])
         return stats
 
+    async def _extraction_health(self) -> dict[str, Any]:
+        """Queued and given-up extraction batches, from ``nerve.db``."""
+        counts: dict[str, int] = {}
+        db = self._db
+        if db is not None and hasattr(db, "memory_extraction_counts"):
+            try:
+                counts = await db.memory_extraction_counts()
+            except Exception as e:  # noqa: BLE001 — health reports, never fails
+                logger.warning("Could not count queued extraction batches: %s", e)
+        return {
+            "queued": int(counts.get(EXTRACTION_QUEUED, 0)),
+            "failed": int(counts.get(EXTRACTION_FAILED, 0)),
+            "last_check": dict(self._last_reconcile),
+        }
+
     async def get_health(self) -> dict[str, Any]:
         """The diagnostics snapshot, in memU's shape plus ``backend``,
-        ``dashboard_url`` (a link for people, or "") and ``loom`` (identity
-        and last error)."""
+        ``dashboard_url`` (a link for people, or ""), ``loom`` (identity and
+        last error) and ``extraction`` (queued and given-up batches)."""
         result = self._metrics.to_dict()
         ident = self._ident
         info: dict[str, Any] = {
@@ -1999,4 +2195,5 @@ class LoomBridge:
         result["backend"] = self.backend
         result["dashboard_url"] = self.dashboard_url
         result["loom"] = info
+        result["extraction"] = await self._extraction_health()
         return result

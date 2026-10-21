@@ -97,7 +97,7 @@ from nerve.identity import (
 )
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
-from nerve.memory.backend import recall_for_startup
+from nerve.memory.backend import recall_for_startup, reconcile_extractions
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -1366,6 +1366,15 @@ class AgentEngine:
                     total_messages += count
                     sessions_indexed += 1
 
+            # A backend that extracts in the background (Loom) is asked about
+            # the windows it queued: the watermarks above already moved past
+            # them, so one it gave up on is sent again from here.
+            extraction = None
+            try:
+                extraction = await reconcile_extractions(self._memory_bridge)
+            except Exception as e:  # noqa: BLE001 — the next sweep checks again
+                logger.warning("Checking queued memory extraction failed: %s", e)
+
             # Release memory after the sweep — prevents RSS ratcheting
             # from intermediate list[float]→numpy conversions and JSON
             # parsing.  gc.collect can take 100ms+ — keep it off the loop.
@@ -1377,6 +1386,8 @@ class AgentEngine:
                 "sessions_indexed": sessions_indexed,
                 "messages_indexed": total_messages,
             }
+            if extraction is not None:
+                stats["extraction"] = extraction
             if sessions_indexed > 0:
                 logger.info("Memorization sweep: %s", stats)
             return stats
