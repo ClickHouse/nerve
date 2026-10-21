@@ -22,17 +22,11 @@ logger = logging.getLogger(__name__)
 def build_source_runners(
     config: NerveConfig,
     db: Database,
-    *,
-    github_mode: str | None = None,
 ) -> list[SourceRunner]:
     """Build SourceRunner instances for all enabled sources.
 
     Runners are pure ingestors — they fetch, preprocess, condense, and persist.
     No agent processing. Consumption is handled separately by consumer tools.
-
-    ``github_mode`` overrides ``sync.github.mode``. The mode is restart-only,
-    so the cron service passes the one it started with, and a reload keeps
-    the GitHub source it has.
 
     Returns:
         List of SourceRunner objects ready to be registered as cron jobs.
@@ -165,7 +159,7 @@ def build_source_runners(
     if gh.enabled:
         from nerve.sources.github import github_inbox_filter
 
-        hosted = (github_mode or gh.mode) == "hosted"
+        hosted = gh.mode == "hosted"
         if hosted:
             from nerve.sources.github_hosted import HostedGitHubSource
 

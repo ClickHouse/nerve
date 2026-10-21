@@ -593,9 +593,10 @@ async def lifespan(app: FastAPI):
             # retryable while the web UI and other channels continue starting.
             logger.error("Slack bot failed to start: %s", e, exc_info=True)
 
-        # Hosted channels: a shared gateway holds the provider connections and
-        # streams admitted events to /_internal/channel/v1/stream. Optional like
-        # Slack: a failure leaves the endpoint refusing upgrades.
+        # Hosted channels and sources: a shared gateway holds the provider
+        # connections, polls the hosted sources, and streams admitted events to
+        # /_internal/channel/v1/stream. Optional like Slack: a failure leaves
+        # the endpoint refusing upgrades.
         from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_providers
 
         if hosted_providers(config):
@@ -603,6 +604,7 @@ async def lifespan(app: FastAPI):
                 runtime = HostedChannelRuntime(
                     config, _engine.router, get_config,
                     notification_service=notification_service,
+                    db=db,
                 )
                 await runtime.start()
                 startup_cleanups.append(("hosted channels", runtime.stop))
@@ -627,6 +629,10 @@ async def lifespan(app: FastAPI):
             startup_cleanups.append(("cron service", cron.stop))
             _cron_service = cron
             logger.info("Cron service started")
+            if _hosted_channels is not None:
+                # A hosted source's records reach the inbox as they arrive, and
+                # the jobs gated on that source run soon after.
+                _hosted_channels.set_delivery_listener(cron.on_source_delivered)
 
             # Register cron jobs that suppress the session label in notifications
             for job in cron._jobs:
