@@ -1238,6 +1238,39 @@ class TestPeriodicLoop:
         )
         assert clock.cycles == 0 and len(calls) == 3
 
+    @pytest.mark.asyncio
+    async def test_a_cycle_keeps_the_machine_awake_until_it_has_applied(self, monkeypatch):
+        """The config-sync keep-awake lease covers the pull and the apply, and is
+        dropped between cycles."""
+        import nerve.config as nerve_config
+        from nerve.platform.activity import LEASE_CONFIG_SYNC, held_leases
+
+        monkeypatch.setattr(nerve_config, "_config", _loop_config())
+        seen: list[tuple[str, bool]] = []
+
+        def pull(_workspace, _config_dir, **_kwargs):
+            seen.append(("pull", LEASE_CONFIG_SYNC in held_leases()))
+            return sync.SyncResult(ok=True, changed=True, message="updated")
+
+        async def apply(*_a, **_k):
+            seen.append(("apply", LEASE_CONFIG_SYNC in held_leases()))
+            return {"config": "reloaded"}
+
+        monkeypatch.setattr(sync, "sync_workspace", pull)
+        monkeypatch.setattr(sync, "_apply_sync", apply)
+        stop, _clock = _run_cycles(
+            monkeypatch, 2,
+            hook=lambda _i: seen.append(("between", LEASE_CONFIG_SYNC in held_leases())),
+        )
+        await sync.run_periodic_sync(
+            nerve_config.get_config(), AsyncMock(), AsyncMock(), stop,
+        )
+        assert seen == [
+            ("between", False), ("pull", True), ("apply", True),
+            ("between", False), ("pull", True), ("apply", True),
+            ("between", False),
+        ]
+
 
 class TestSyncRoute:
     @pytest.mark.asyncio
@@ -1300,6 +1333,39 @@ class TestSyncRoute:
         assert body["ok"] and body["changed"] and body["applied"]
         assert body["status"] == "applied"
         assert applied == [tmp_path / "cfg"]
+
+    @pytest.mark.asyncio
+    async def test_route_keeps_the_machine_awake_while_it_syncs(self, monkeypatch, tmp_path):
+        import nerve.gateway.routes.config as route_mod
+        import nerve.gateway.server as srv
+        from nerve.platform.activity import LEASE_CONFIG_SYNC, held_leases
+        from nerve.sync_service import SyncResult
+
+        fake_cfg = type("C", (), {})()
+        fake_cfg.workspace = str(tmp_path / "ws")
+        fake_cfg.config_dir = str(tmp_path / "cfg")
+        fake_cfg.workspace_sync = WorkspaceSyncConfig(enabled=True)
+        fake_cfg.lockdown = False
+        monkeypatch.setattr("nerve.config.get_config", lambda: fake_cfg)
+        monkeypatch.setattr(srv, "_cron_service", None, raising=False)
+        monkeypatch.setattr(
+            route_mod, "get_deps", lambda: type("D", (), {"engine": None})(),
+        )
+        held: list[bool] = []
+
+        def pull(*_a, **_k):
+            held.append(LEASE_CONFIG_SYNC in held_leases())
+            return SyncResult(ok=True, changed=True, message="updated")
+
+        async def apply(engine, cron_service, config_dir):
+            held.append(LEASE_CONFIG_SYNC in held_leases())
+            return {"config": "reloaded"}
+
+        monkeypatch.setattr(sync, "sync_workspace", pull)
+        monkeypatch.setattr(sync, "_apply_sync", apply)
+        body = await route_mod.sync_workspace_route()
+        assert body["applied"] and held == [True, True]
+        assert LEASE_CONFIG_SYNC not in held_leases()
 
     @pytest.mark.asyncio
     async def test_status_separates_the_two_reasons_applied_is_false(

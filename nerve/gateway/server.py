@@ -58,6 +58,7 @@ from nerve.observability.langfuse import (
     flush as langfuse_flush,
     init_langfuse,
 )
+from nerve.platform.activity import LEASE_BACKUP, keep_awake
 from nerve.setup_checks import scrub_secrets as _scrub
 from nerve.utils.aio import stop_background_task
 
@@ -84,6 +85,9 @@ _external_agents_sync = None
 # HostedChannelRuntime assigned during lifespan when a provider is in hosted
 # mode. The channel stream endpoint refuses every upgrade while it is None.
 _hosted_channels = None
+# ActivityReporter (nerve.platform.activity), assigned during lifespan only
+# when the platform's local activity socket exists.
+_activity_reporter = None
 
 # Memorization sweep stats (updated by background task, read by diagnostics)
 _memorize_stats: dict = {
@@ -146,7 +150,15 @@ async def _accept_websocket(websocket: WebSocket) -> WebSocketConnection | None:
 
 
 # Open sockets by client id, so that disabling an account can close its sockets.
+# Its size is the client connection count the activity reporter sends.
 _live_sockets: dict[str, tuple[WebSocketConnection, WebSocket]] = {}
+
+
+def _connections_changed() -> None:
+    """Tell the activity reporter, if one runs, that a client came or went."""
+    reporter = _activity_reporter
+    if reporter is not None:
+        reporter.notify()
 
 # Runs started by WebSocket messages. The loop only keeps weak references to
 # tasks; these keep them alive until they finish (Stop finds a run through
@@ -196,6 +208,7 @@ async def close_account_sockets(account_id: str) -> None:
         if connection.actor.account_id != account_id:
             continue
         _live_sockets.pop(client_id, None)
+        _connections_changed()
         try:
             await websocket.close(
                 code=WS_ACCOUNT_DISABLED_CODE, reason=WS_ACCOUNT_DISABLED_REASON,
@@ -312,19 +325,20 @@ async def _periodic_backup(notification_service) -> None:
             if age is not None and age < interval_s:
                 continue  # not due yet
 
-            result = await asyncio.to_thread(
-                backup_mod.create_backup,
-                nerve_dir,
-                config.workspace,
-                target,
-                config_dir=config.config_dir,
-                include_workspace=bcfg.include_workspace,
-                include_secrets=True,
-                workspace_excludes=bcfg.workspace_excludes,
-            )
-            deleted = await asyncio.to_thread(
-                backup_mod.prune, target, bcfg.retention_count,
-            )
+            with keep_awake(LEASE_BACKUP):
+                result = await asyncio.to_thread(
+                    backup_mod.create_backup,
+                    nerve_dir,
+                    config.workspace,
+                    target,
+                    config_dir=config.config_dir,
+                    include_workspace=bcfg.include_workspace,
+                    include_secrets=True,
+                    workspace_excludes=bcfg.workspace_excludes,
+                )
+                deleted = await asyncio.to_thread(
+                    backup_mod.prune, target, bcfg.retention_count,
+                )
             size_str = (
                 f"{result.size / (1024 ** 3):.1f} GB"
                 if result.size >= 1024 ** 3
@@ -361,7 +375,7 @@ async def _periodic_backup(notification_service) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize DB, engine, channels on startup."""
-    global _engine, _mcp_manager, _hosted_channels
+    global _engine, _mcp_manager, _hosted_channels, _activity_reporter
     config = get_config()
     # Create the state directory owner-only before anything writes to it.
     # Database.connect refuses a state directory that other users can write to.
@@ -635,6 +649,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Cron service failed to start: %s", e)
 
+        # Report activity to the platform's local activity socket, when this
+        # machine has one (nerve/platform/activity.py): running turns, client
+        # connections, the next scheduled task, and keep-awake leases. Optional
+        # in every way: a reporter that fails leaves reporting off, never the
+        # gateway down.
+        try:
+            from nerve.platform.activity import ActivityReporter
+
+            reporter = ActivityReporter(
+                config, _engine, db, cron_task,
+                connection_count=lambda: len(_live_sockets),
+            )
+            startup_cleanups.append(("activity reporter", reporter.stop))
+            if await reporter.start():
+                _activity_reporter = reporter
+        except Exception:  # reporting must never stop the gateway
+            logger.exception("Activity reporter failed to start")
+
         # Start the workflow-run service (budget-capped multi-agent jobs).
         # After notification_service wiring so budget alerts can deliver, and
         # after engine init so runs execute against live backends. A startup
@@ -651,6 +683,11 @@ async def lifespan(app: FastAPI):
                     ("workflow run service", _workflow_run_service.stop),
                 )
                 logger.info("Workflow run service started")
+                if _activity_reporter is not None:
+                    try:
+                        _activity_reporter.watch_workflow_runs(_workflow_run_service)
+                    except Exception as e:  # noqa: BLE001 — reporting is optional
+                        logger.error("Activity reporter cannot watch workflow runs: %s", e)
         except Exception as e:
             logger.error("Workflow run service failed to start: %s", e)
             _workflow_run_service = None
@@ -992,6 +1029,14 @@ async def lifespan(app: FastAPI):
         # cancellation either way; the bounded wait is for the reload that
         # follows it. Cancellation is the backstop, not the mechanism.
         await stop_background_task(ws_sync_task, ws_sync_stop, "Workspace sync")
+    # Before the cron service and the engine it reads from. Its last report
+    # says nothing runs any more; its leases are released.
+    if _activity_reporter is not None:
+        try:
+            await _activity_reporter.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Activity reporter shutdown raised: %s", e)
+        _activity_reporter = None
     if cron_task:
         await cron_task.stop()
     if _review_loop_service is not None:
@@ -1145,6 +1190,7 @@ def create_app() -> FastAPI:
         # Register, then check the account. A disable that commits before the
         # registration is caught by the check; one after it closes this socket.
         _live_sockets[client_id] = (connection, websocket)
+        _connections_changed()
         active_session: str | None = None
         # Agent transcript channels this socket follows, oldest first.
         agent_subs: OrderedDict[str, None] = OrderedDict()
@@ -1407,7 +1453,8 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.warning("WebSocket error for %s: %s", client_id, e)
         finally:
-            _live_sockets.pop(client_id, None)
+            if _live_sockets.pop(client_id, None) is not None:
+                _connections_changed()
             await _drop_agent_subs()
             if active_session is not None:
                 await broadcaster.unregister(active_session, client_id)

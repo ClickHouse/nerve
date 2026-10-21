@@ -161,3 +161,41 @@ class TestBackupLoop:
 
         assert delays[:2] == [3600, 3600]  # cadence is a fixed hourly tick
         assert len(made) == 1  # nothing on the first tick, a bundle on the second
+
+    @pytest.mark.asyncio
+    async def test_a_backup_keeps_the_machine_awake_while_it_runs(
+        self, tmp_path, monkeypatch,
+    ):
+        from nerve import backup as backup_mod
+        from nerve.platform.activity import LEASE_BACKUP, held_leases
+
+        target = tmp_path / "bundles"
+        target.mkdir()
+        monkeypatch.setattr(cfgmod, "_config", _config(
+            workspace=tmp_path / "ws",
+            backup=BackupConfig(enabled=True, target_dir=str(target)),
+        ))
+        monkeypatch.setattr(backup_mod, "latest_bundle_age_seconds", lambda _t: None)
+        seen: list[tuple[str, bool]] = []
+
+        def create(*_a, **_k):
+            seen.append(("create", LEASE_BACKUP in held_leases()))
+            return SimpleNamespace(path=tmp_path / "b.tar.zst", size=1024, file_count=3)
+
+        def prune(*_a, **_k):
+            seen.append(("prune", LEASE_BACKUP in held_leases()))
+            return []
+
+        monkeypatch.setattr(backup_mod, "create_backup", create)
+        monkeypatch.setattr(backup_mod, "prune", prune)
+        monkeypatch.setattr(backup_mod, "list_bundles", lambda _t: [])
+        _fake_clock(
+            monkeypatch, 1,
+            between=lambda _n: seen.append(("between", LEASE_BACKUP in held_leases())),
+        )
+        with pytest.raises(_StopLoop):
+            await srv._periodic_backup(AsyncMock())
+
+        assert seen == [
+            ("between", False), ("create", True), ("prune", True), ("between", False),
+        ]

@@ -1638,6 +1638,25 @@ def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
     ]
 
 
+def _platform_activity_line(config) -> str:
+    """The doctor line for the platform's local activity socket.
+
+    Whether the socket exists, which is what decides whether the gateway
+    reports its activity there when it starts.
+    """
+    from nerve.platform.activity import activity_socket_present
+
+    path = config.platform.activity_socket
+    if not path:
+        return (
+            "[--] Platform activity socket: not present "
+            "(platform.activity_socket is empty, reporting is off)"
+        )
+    if activity_socket_present(path):
+        return f"[OK] Platform activity socket: present ({path})"
+    return f"[--] Platform activity socket: not present ({path})"
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -2230,6 +2249,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             "[--] Backups not configured — set backup.target_dir + enabled to "
             f"protect {paths.home_label()} against disk loss"
         )
+
+    lines.append(_platform_activity_line(config))
 
     # Check external tools
     import shutil

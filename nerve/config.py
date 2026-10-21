@@ -2397,6 +2397,62 @@ class BackupConfig:
         )
 
 
+DEFAULT_PLATFORM_ACTIVITY_SOCKET = "/run/nerve/guestd.sock"
+PLATFORM_ACTIVITY_INTERVAL_RANGE = (5, 300)
+PLATFORM_LEASE_TTL_RANGE = (10, 3600)
+
+
+def _int_within(value: object, default: int, bounds: tuple[int, int], label: str) -> int:
+    """Coerce an int setting and hold it inside ``bounds``, saying so when it moves."""
+    low, high = bounds
+    number = _lenient_int(value, default, label=label)
+    if low <= number <= high:
+        return number
+    held = min(max(number, low), high)
+    logger.warning("%s is %d, outside %d-%d. Using %d.", label, number, low, high, held)
+    return held
+
+
+@dataclass
+class PlatformConfig:
+    """Reporting this instance's activity to the platform that runs it.
+
+    A platform that parks idle machines, and wakes them for scheduled work,
+    can offer a local activity socket: HTTP on a Unix socket, through which
+    Nerve says how many turns run, how many clients are connected, when the
+    next scheduled task is due, and which background work must keep the
+    machine awake. Reporting is on only when ``activity_socket`` exists when
+    the gateway starts; ``""`` switches it off. Read once at startup. See
+    docs/platform-activity.md.
+    """
+
+    # Resolved when the config is built, not when the class is defined, so a
+    # test suite can keep every instance it builds away from a real socket.
+    activity_socket: str = field(default_factory=lambda: DEFAULT_PLATFORM_ACTIVITY_SOCKET)
+    activity_interval_seconds: int = 30
+    lease_ttl_seconds: int = 120
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> PlatformConfig:
+        # Blank (or null) is the documented way to switch reporting off, so it
+        # stays blank instead of falling back to the default path.
+        socket = str(d.get("activity_socket", DEFAULT_PLATFORM_ACTIVITY_SOCKET) or "").strip()
+        return cls(
+            activity_socket=os.path.expanduser(socket) if socket else "",
+            activity_interval_seconds=_int_within(
+                d.get("activity_interval_seconds"), 30,
+                PLATFORM_ACTIVITY_INTERVAL_RANGE,
+                "platform.activity_interval_seconds",
+            ),
+            lease_ttl_seconds=_int_within(
+                d.get("lease_ttl_seconds"), 120,
+                PLATFORM_LEASE_TTL_RANGE,
+                "platform.lease_ttl_seconds",
+            ),
+        )
+
+
 @dataclass
 class ReviewLoopLegConfig:
     """Engine/model/effort defaults for one review-loop role."""
@@ -3498,6 +3554,7 @@ class NerveConfig:
     cron: CronConfig = field(default_factory=CronConfig)
     workspace_sync: WorkspaceSyncConfig = field(default_factory=WorkspaceSyncConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
+    platform: PlatformConfig = field(default_factory=PlatformConfig)
     sessions: SessionsConfig = field(default_factory=SessionsConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
@@ -3878,6 +3935,7 @@ class NerveConfig:
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
             workspace_sync=WorkspaceSyncConfig.from_dict(d.get("workspace_sync", {})),
             backup=BackupConfig.from_dict(d.get("backup", {})),
+            platform=PlatformConfig.from_dict(d.get("platform") or {}),
             sessions=SessionsConfig.from_dict(d.get("sessions", {})),
             retention=RetentionConfig.from_dict(d.get("retention", {})),
             auth=AuthConfig.from_dict(d.get("auth", {})),

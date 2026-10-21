@@ -74,35 +74,37 @@ async def sync_workspace_route():
     from nerve.config import get_config
     from nerve.config_reload import reload_failures
     from nerve.gateway.server import _cron_service
+    from nerve.platform.activity import LEASE_CONFIG_SYNC, keep_awake
     from nerve.sync_service import _apply_sync, sync_workspace
 
     config = get_config()
-    # Hand over the raw configured values: sync_workspace coerces them inside its
-    # own never-raises guard, so a `workspace` that is null or a list reports a
-    # 400 rather than a 500 with a stack trace.
-    result = await asyncio.to_thread(
-        sync_workspace,
-        config.workspace,
-        config.config_dir or config.workspace,
-        branch=config.workspace_sync.branch,
-        validate=config.workspace_sync.validate,
-        strict_env=config.workspace_sync.strict_env,
-        locked=config.lockdown,
-    )
-    if not result.ok:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": result.message,
-                "errors": result.validation_errors,
-                "warnings": result.validation_warnings,
-            },
+    with keep_awake(LEASE_CONFIG_SYNC):
+        # Hand over the raw configured values: sync_workspace coerces them inside
+        # its own never-raises guard, so a `workspace` that is null or a list
+        # reports a 400 rather than a 500 with a stack trace.
+        result = await asyncio.to_thread(
+            sync_workspace,
+            config.workspace,
+            config.config_dir or config.workspace,
+            branch=config.workspace_sync.branch,
+            validate=config.workspace_sync.validate,
+            strict_env=config.workspace_sync.strict_env,
+            locked=config.lockdown,
         )
-    summary: dict = {}
-    if result.changed:
-        deps = get_deps()
-        config_dir = Path(config.config_dir) if config.config_dir else Path(config.workspace)
-        summary = await _apply_sync(deps.engine, _cron_service, config_dir)
+        if not result.ok:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": result.message,
+                    "errors": result.validation_errors,
+                    "warnings": result.validation_warnings,
+                },
+            )
+        summary: dict = {}
+        if result.changed:
+            deps = get_deps()
+            config_dir = Path(config.config_dir) if config.config_dir else Path(config.workspace)
+            summary = await _apply_sync(deps.engine, _cron_service, config_dir)
     failures = reload_failures(summary)
     # The merge is a real state change, so this is not a 4xx — but a merge whose
     # config the daemon then refused to load has applied nothing, and reporting
