@@ -233,6 +233,17 @@ class SourceRunner:
         """Set the notification service for degradation alerts."""
         self._notification_service = service
 
+    async def wait_until_idle(self) -> None:
+        """Return once no run of this runner is in progress; at once when idle.
+
+        A run in progress may have fetched before newer records arrived, and
+        :meth:`run` returns without fetching while one is, so a caller that
+        must see those records waits for it first.
+        """
+        if self._lock.locked():
+            async with self._lock:
+                pass
+
     async def _notify_state_change(self, new_state: str) -> None:
         """Send a notification when health state transitions."""
         svc = self._notification_service

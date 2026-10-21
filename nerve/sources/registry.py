@@ -152,26 +152,23 @@ def build_source_runners(
                 imap.match.only_matched, vision.enabled,
             )
 
-    # GitHub (notifications)
+    # GitHub (notifications). In hosted mode the gateway polls GitHub and the
+    # runner drains the records it delivered; everything past the fetch —
+    # guardrail, drop hook, condensing, the source name — is the same.
     gh = config.sync.github
     if gh.enabled:
-        from nerve.sources.filters import FieldRule, InboxFilter
-        from nerve.sources.github import GitHubSource
+        from nerve.sources.github import github_inbox_filter
 
-        source = GitHubSource()
-        # Guardrails: restrict which repos (matched on the "repo_name" metadata
-        # key) and which GitHub actors (matched on the "actors" metadata key —
-        # every login involved in a notification) reach the inbox. The rules
-        # AND together; within each, deny wins and a non-empty allow is
-        # fail-closed. ci_branch is deny-only on purpose: it is empty for
-        # everything except CheckSuite notifications, so an allow list there
-        # would fail closed and drop the whole feed.
-        gh_filter = InboxFilter(rules=[
-            FieldRule(field="repo_name", allow=gh.allow_repos, deny=gh.deny_repos),
-            FieldRule(field="actors", allow=gh.allow_actors, deny=gh.deny_actors),
-            FieldRule(field="reason", allow=gh.allow_reasons, deny=gh.deny_reasons),
-            FieldRule(field="ci_branch", deny=gh.deny_ci_branches),
-        ])
+        hosted = gh.mode == "hosted"
+        if hosted:
+            from nerve.sources.github_hosted import HostedGitHubSource
+
+            source = HostedGitHubSource(db)
+        else:
+            from nerve.sources.github import GitHubSource
+
+            source = GitHubSource()
+        gh_filter = github_inbox_filter(gh)
         gh_runner = SourceRunner(
             source=source,
             db=db,
@@ -186,12 +183,13 @@ def build_source_runners(
         runners.append(gh_runner)
         # The runner's copy is validated (a wrong-shaped value turns it off).
         hook = gh_runner.drop_hook
+        label = "github (hosted)" if hosted else "github"
         if gh_filter.active:
             logger.info(
-                "Registered source: github (batch=%d, guardrail: "
+                "Registered source: %s (batch=%d, guardrail: "
                 "repos allow=%s deny=%s; actors allow=%s deny=%s; "
                 "reasons allow=%s deny=%s; ci_branches deny=%s; drop_hook=%s)",
-                gh.batch_size,
+                label, gh.batch_size,
                 gh.allow_repos or "*", gh.deny_repos or [],
                 gh.allow_actors or "*", gh.deny_actors or [],
                 gh.allow_reasons or "*", gh.deny_reasons or [],
@@ -205,7 +203,7 @@ def build_source_runners(
                     hook[0],
                 )
         else:
-            logger.info("Registered source: github (batch=%d)", gh.batch_size)
+            logger.info("Registered source: %s (batch=%d)", label, gh.batch_size)
             if hook:
                 logger.warning(
                     "sync.github.drop_hook is set but no guardrail is, so "

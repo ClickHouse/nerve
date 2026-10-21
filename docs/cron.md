@@ -140,7 +140,7 @@ prompt definition.
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once if the job missed a run while the server was down (on startup) or while the machine was paused (on resume — see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)) (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish. An overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish, and so does a scheduled fire that comes while a run for delivered source records goes on (see [Runs on delivery](#runs-on-delivery)). Any other overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -253,6 +253,13 @@ run_if:
     consumer: inbox
 ```
 
+Checking the gate keeps the consumer's cursors from expiring: each check renews
+the TTL (`sync.consumer_cursor_ttl_days`) of the live cursors it reads. A cursor
+expires when nothing reads it for that long, and an expired cursor starts again at
+the source's newest message. So without the renewal, a source that stayed quiet
+for a few days would lose its first new message to the restart. A cursor that has
+already expired still starts again at the newest message, as a new one does.
+
 > **Legacy shorthand.** The older `skip_when_idle: [<sources>]` /
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
@@ -291,6 +298,15 @@ rather than bot autodetection, because bots are not reliably identifiable here:
 `CONTRIBUTOR` — the same value as some review bots. A denylist fails in the safe
 direction: an unlisted bot costs one extra wake, whereas a wrong autodetect
 would silently drop human feedback.
+
+With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
+channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
+and delivers a `github_pr_activity` record for each change. A record does not
+start a job by itself. It starts a job gated on `messages` with
+`sources: [github]` at once (see [Runs on delivery](#runs-on-delivery)), so gate
+pull request monitors that way. A job gated on `github_pr_activity` alone is
+never started by a delivery, and since the gate always passes, it runs, in full,
+on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
 ### Forecasts
 
@@ -672,6 +688,35 @@ Source runners:
 - Appear in `list_jobs()` alongside regular cron jobs
 
 See [sources.md](sources.md) for full documentation.
+
+### Runs on delivery
+
+A hosted source — GitHub with `sync.github.mode: hosted`, see
+[Hosted GitHub source](sources.md#hosted-github-source) — does not wait for its
+schedule. When the channel gateway delivers records, the source's runner runs
+at once, after any run of it already in progress (which may have fetched
+before the records arrived); deliveries during that drain make it run once
+more. Then every enabled job on the schedule (a job whose schedule did not
+parse is not) whose gates include a `messages` gate naming that source, or
+naming no source, runs once `cron.delivery_debounce_seconds` after the first
+delivery of a burst. Later deliveries in that window add nothing: one burst,
+one run.
+
+```yaml
+cron:
+  delivery_debounce_seconds: 60   # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+```
+
+Such a run goes through the job's gates, `lock` and run log like a scheduled
+run, and the schedule listeners hear of it. It waits for a run of the job that
+is already in flight. While it runs, a scheduled fire of the job is skipped, as
+an overlapping scheduled fire is, or waits for it when the job has `lock`; a
+catch-up is skipped, as it is while any run of the job goes on; and a run
+started by hand starts as it always does. A catch-up queued before the run does
+not run the job again, since the job has run since. The drain counts as a run
+of the source's runner in the same way. Jobs without such a gate keep to their
+schedule, and the schedules stay the fallback for everything. The setting is
+read for each delivery, so a reload applies it.
 
 ## Logging
 

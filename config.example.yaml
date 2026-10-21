@@ -297,6 +297,13 @@ sync:
   github:
     enabled: true
     schedule: "*/15 * * * *"
+    # mode: poll                   # poll = gh CLI on this machine; hosted = the
+                                   # channel gateway polls GitHub and streams the
+                                   # records (needs channels.hosted). Restart-only.
+    # pr_watch: true               # hosted only: a record when one of your own
+                                   # open PRs changes (state, commit, review, CI,
+                                   # comment). Its reason is always "author", and
+                                   # only allow_repos/deny_repos apply to it.
     # Guardrails (case-insensitive globs; deny wins; non-empty allow is
     # fail-closed). allow_* = allowlist (empty = all pass).
     #   repo_name — the notification's repo full_name ("ClickHouse/nerve").

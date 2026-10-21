@@ -25,7 +25,7 @@ from starlette.responses import Response as HTTPResponse
 from starlette.websockets import WebSocket
 
 from nerve.channels.hosted.auth import GatewayTokenVerifier, TokenRejected
-from nerve.channels.hosted.contract import Capabilities, StreamLimits
+from nerve.channels.hosted.contract import Capabilities, StreamLimits, Subscriptions
 from nerve.channels.hosted.stream import (
     CLOSE_GOING_AWAY,
     ChannelStream,
@@ -65,6 +65,8 @@ class StreamManager:
     """Accept authenticated gateway streams and choose among them.
 
     ``on_ready`` and ``on_nudge`` report stream events to the inbox reader.
+    ``subscriptions``, when given, is what every stream publishes after it
+    negotiates (see :meth:`ChannelStream.publish_subscriptions`).
     """
 
     def __init__(
@@ -76,6 +78,7 @@ class StreamManager:
         timing: StreamTiming = StreamTiming(),
         on_ready: Callable[[ChannelStream], None] = lambda stream: None,
         on_nudge: Callable[[ChannelStream, str], None] = lambda stream, purpose: None,
+        subscriptions: Callable[[], Subscriptions | None] | None = None,
     ) -> None:
         self._verifier = verifier
         self._receive_limits = receive_limits
@@ -83,6 +86,7 @@ class StreamManager:
         self._timing = timing
         self._on_ready = on_ready
         self._on_nudge = on_nudge
+        self._subscriptions = subscriptions
         self._streams: dict[int, ChannelStream] = {}
         self._ids = itertools.count(1)
         self._changed = asyncio.Event()
@@ -134,6 +138,7 @@ class StreamManager:
             receive_limits=self._receive_limits,
             listener=self,
             timing=self._timing,
+            subscriptions=self._subscriptions,
         )
         # Reserved before the first await, so concurrent upgrades cannot
         # both pass the stream limit.
@@ -234,6 +239,26 @@ class StreamManager:
             await asyncio.wait_for(changed.wait(), timeout)
         except TimeoutError:
             pass
+
+    async def publish_subscriptions(self) -> int:
+        """Send the current source subscriptions on every ready stream.
+
+        Returns the number of streams that sent them. Each stream bounds its
+        own send, so a stalled one costs at most that bound; a stream that
+        fails is logged and the others still send. A stream that negotiates
+        later sends the settings current at that time.
+        """
+        streams = [stream for stream in self.streams if stream.ready]
+        outcomes = await asyncio.gather(
+            *(stream.publish_subscriptions() for stream in streams), return_exceptions=True,
+        )
+        for stream, outcome in zip(streams, outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(
+                    "Channel stream %d: publishing the source subscriptions failed: %r",
+                    stream.id, outcome, exc_info=outcome,
+                )
+        return sum(1 for outcome in outcomes if outcome is True)
 
     def capabilities_for(self, connection_id: uuid.UUID) -> Capabilities | None:
         """The capabilities of *connection_id* on the preferred stream that has them."""

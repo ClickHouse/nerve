@@ -242,7 +242,8 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. **`sync.codex` is not one of these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters and `pr_watch` are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
@@ -254,7 +255,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -294,6 +295,7 @@ reload cannot inspect, and are documented here only.
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
+| `sync.github.mode` | the GitHub source, and in hosted mode the stream endpoint and the consumer of the gateway's records, are chosen at startup. Until a restart the source keeps the mode it started with, and so does the `github_pr_activity` gate. The filters and `pr_watch` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1319,7 +1321,9 @@ latest accepted event.
 reload. The stream endpoint still accepts streams, and events stay in the
 gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
 Nerve sends no notifications and refuses `send_channel_message`. A turn that
-is already running still sends its reply.
+is already running still sends its reply. Nerve reads nothing from the
+gateway's inbox while Slack is paused, so the records of a hosted GitHub
+source wait there too (see below).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1359,6 +1363,21 @@ reports this and the local settings that still apply.
 `slack.mode` and `channels.hosted.*` need a restart; a reload of running
 hosted channels reads the key file again. Changing `mode` from `socket` to
 `hosted` stops the Socket Mode connection at once.
+
+The same streams carry hosted sources. With `sync.github.mode: hosted` the
+gateway polls GitHub for the agent and streams the records; the
+`channels.hosted` settings above apply unchanged, and they are enough on their
+own: Slack need not be hosted too. See
+[Hosted GitHub source](sources.md#hosted-github-source).
+
+When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
+the events of every hosted provider from one ordered inbox, and it reads
+nothing while hosted Slack is switched off (`slack.enabled: false`): the
+GitHub records wait at the gateway until Slack is switched on again, and past
+the gateway's limit of stored records the oldest are dropped. Keep a hosted
+Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
+This is a known limitation: a read for each provider on its own, which would
+keep GitHub records arriving while hosted Slack is off, is a follow-up.
 
 ### Setting up the Slack app
 
@@ -1713,7 +1732,14 @@ the channel transport, matching messages are written to a local buffer.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency |
+| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
+| `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
+| `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
+
+`cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
+hosted delivery starts; a negative value reads as `0`, and a value above `600`
+waits `600` seconds (`nerve config validate` warns). See
+[cron.md](cron.md#runs-on-delivery).
 
 ## Memory (memU)
 

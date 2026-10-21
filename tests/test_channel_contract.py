@@ -22,11 +22,15 @@ from nerve.channels.hosted.contract import (
     InboxAck,
     InboxAckItem,
     InboxRead,
+    MetadataEntry,
     Negotiation,
     Operation,
     OperationResult,
     Payload,
     Rejected,
+    SourceFilters,
+    SourceSubscription,
+    Subscriptions,
     decode_envelope,
     encode_envelope,
     validate_inbox_read_result,
@@ -58,8 +62,15 @@ from nerve.channels.hosted.contract.model import (
     TransferChunk,
     TypingOperation,
 )
+from nerve.channels.hosted.contract.model import MAX_TEXT_BYTES
 from nerve.channels.hosted.runtime import RECEIVE_LIMITS
-from tests.fake_channel_gateway import CONNECTION_ID, capabilities, gateway_negotiation, message_event
+from tests.fake_channel_gateway import (
+    CONNECTION_ID,
+    capabilities,
+    gateway_negotiation,
+    message_event,
+    source_record_event,
+)
 
 
 def direct_message(**changes: Any) -> dict[str, Any]:
@@ -390,3 +401,170 @@ class TestEncoding:
         with pytest.raises(Rejected) as error:
             encode_envelope(envelope, 16384)
         assert error.value.reason == "frame_too_large"
+
+
+def record_page(**changes: Any) -> dict[str, Any]:
+    return page(source_record_event(**changes))
+
+
+def record_of(value: dict[str, Any]) -> dict[str, Any]:
+    return value["payload"]["inbox_read_result"]["events"][0]["record"]
+
+
+class TestSourceRecords:
+    def test_a_record_decodes_into_its_typed_members(self):
+        event = decode(record_page()).body.events[0]
+
+        assert (event.provider, event.kind, event.admission.purpose) == ("github", "source_record", "observe")
+        assert (event.conversation.id, event.conversation.kind) == ("owner/repo", "repository")
+        assert event.message is None
+        record = event.record
+        assert (record.id, record.record_type) == ("9000000001", "github_notification")
+        assert record.summary == "[owner/repo] Fix the flaky retry test (mention)"
+        assert record.content.startswith("Repository: owner/repo\nType: PullRequest")
+        assert record.timestamp.isoformat() == "2026-09-16T10:00:00+00:00"
+        entries = {entry.key: entry for entry in record.metadata}
+        assert entries["actors"] == MetadataEntry(key="actors", values=("alice", "bob"))
+        assert entries["unread"] == MetadataEntry(key="unread", value="true")
+        assert entries["ci_branch"] == MetadataEntry(key="ci_branch")
+
+    def test_a_record_needs_no_message_author_or_content(self):
+        value = record_page()
+        event = value["payload"]["inbox_read_result"]["events"][0]
+        del event["author"]
+        del event["record"]["content"]
+        del event["record"]["metadata"]
+
+        record = decode(value).body.events[0].record
+        assert (record.content, record.metadata) == ("", ())
+
+    @pytest.mark.parametrize("member", ["id", "record_type", "summary"])
+    def test_a_record_needs_its_id_type_and_summary(self, member):
+        value = record_page()
+        del record_of(value)[member]
+
+        assert reason(value) == "malformed_frame"
+
+    def test_a_source_record_event_needs_its_record(self):
+        value = record_page()
+        del value["payload"]["inbox_read_result"]["events"][0]["record"]
+
+        assert reason(value) == "malformed_frame"
+
+    def test_the_base_checks_still_apply(self):
+        value = record_page()
+        value["payload"]["inbox_read_result"]["events"][0]["conversation"] = {"kind": "repository"}
+
+        assert reason(value) == "malformed_frame"
+
+    def test_a_record_time_needs_a_time_zone(self):
+        value = record_page()
+        record_of(value)["timestamp"] = "2026-09-16T10:00:00"
+
+        assert reason(value) == "malformed_frame"
+
+    def test_list_metadata_of_another_type_is_malformed(self):
+        value = record_page()
+        record_of(value)["metadata"][6] = {"key": "actors", "values": "alice"}
+
+        assert reason(value) == "malformed_frame"
+
+    @pytest.mark.parametrize(("member", "size"), [
+        ("id", 257), ("record_type", 257), ("summary", MAX_TEXT_BYTES + 1), ("content", MAX_TEXT_BYTES + 1),
+    ])
+    def test_record_members_above_nerves_limits_are_refused(self, member, size):
+        value = record_page()
+        record_of(value)[member] = "x" * size
+
+        assert reason(value) == "limit_exceeded"
+
+    def test_the_gateways_own_caps_fit_inside_nerves_limits(self):
+        value = record_page()
+        record_of(value)["summary"] = "é" * 256        # 512 bytes
+        record_of(value)["content"] = "x" * 64 * 1024
+
+        record = decode(value).body.events[0].record
+        assert len(record.content) == 64 * 1024
+
+    def test_a_record_member_on_another_kind_is_not_checked(self):
+        value = page(direct_message())
+        value["payload"]["inbox_read_result"]["events"][0]["record"] = {"id": ""}
+
+        assert decode(value).body.events[0].kind == "message"
+
+
+def github_subscription(**filters: tuple[str, ...]) -> Subscriptions:
+    return Subscriptions(version="1", sources=(
+        SourceSubscription(provider="github", filters=SourceFilters(**filters), pr_watch=True),
+    ))
+
+
+class TestSubscriptions:
+    def test_nerve_sends_exactly_the_contract_members(self):
+        body = github_subscription(
+            allow_repos=("owner/*",), deny_repos=("owner/secret",), deny_actors=("codecov", "*-bot"),
+            deny_reasons=("subscribed",), deny_ci_branches=("main", "release/*"),
+        )
+        envelope = Envelope(version="1", kind="subscriptions", request_id="o-2", payload=Payload(subscriptions=body))
+
+        value = json.loads(encode_envelope(envelope))
+
+        assert value == {"version": "1", "kind": "subscriptions", "request_id": "o-2", "payload": {
+            "subscriptions": {"version": "1", "sources": [{
+                "provider": "github",
+                "filters": {
+                    "allow_repos": ["owner/*"],
+                    "deny_repos": ["owner/secret"],
+                    "deny_actors": ["codecov", "*-bot"],
+                    "deny_reasons": ["subscribed"],
+                    "deny_ci_branches": ["main", "release/*"],
+                },
+                "pr_watch": True,
+            }]},
+        }}
+
+    def test_no_sources_subscribes_to_nothing(self):
+        envelope = Envelope(
+            version="1", kind="subscriptions", request_id="o-2",
+            payload=Payload(subscriptions=Subscriptions(version="1")),
+        )
+
+        assert json.loads(encode_envelope(envelope))["payload"] == {"subscriptions": {"version": "1"}}
+
+    def test_without_filters_keeps_the_sources_and_the_pull_request_watch(self):
+        wide = github_subscription(allow_repos=("owner/*",)).without_filters()
+
+        assert wide.sources == (SourceSubscription(provider="github", filters=SourceFilters(), pr_watch=True),)
+        wide.validate()
+
+    @pytest.mark.parametrize(("subscriptions", "expected"), [
+        (Subscriptions(version="2"), "version_unsupported"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github"),) * 17), "limit_exceeded"),
+        (Subscriptions(version="1", sources=(SourceSubscription(),)), "malformed_frame"),
+        (github_subscription(deny_repos=tuple(f"owner/r{n}" for n in range(257))), "limit_exceeded"),
+        (github_subscription(deny_repos=("x" * 257,)), "limit_exceeded"),
+        (github_subscription(allow_actors=("",)), "limit_exceeded"),
+        (github_subscription(deny_reasons=("sub\tscribed",)), "limit_exceeded"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github"),) * 2), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="GitHub"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="git hub"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="gitlab/self"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="g" * 65),)), "limit_exceeded"),
+    ])
+    def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
+        with pytest.raises(Rejected) as error:
+            subscriptions.validate()
+        assert error.value.reason == expected
+
+    def test_a_provider_is_any_lowercase_token_within_its_limit(self):
+        Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github"),
+            SourceSubscription(provider="git_hub-2.x"),
+            SourceSubscription(provider="g" * 64),
+        )).validate()
+
+    def test_the_largest_subscription_within_bounds_is_valid(self):
+        github_subscription(deny_repos=tuple("é" * 128 for _ in range(256))).validate()
+
+    def test_the_gateway_never_sends_subscriptions(self):
+        assert reason(frame("subscriptions", {"version": "1"})) == "kind_unsupported"

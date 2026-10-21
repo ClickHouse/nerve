@@ -1535,6 +1535,49 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
+def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for ``sync.github.mode: hosted``.
+
+    The gateway polls GitHub, so there is no gh login to check; the hosted
+    stream settings are, as for hosted Slack, also when the source is off.
+    Nerve reads the gateway's events for every hosted provider in one
+    ordered inbox and stops reading while hosted Slack is switched off, so
+    a switched-off hosted Slack holds the GitHub records back too.
+    """
+    github = config.sync.github
+    if github.mode != "hosted":
+        return []
+    from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
+    lines: list[str] = []
+    if not github.enabled:
+        lines.append(
+            "[--] GitHub is hosted but switched off (sync.github.enabled is false); "
+            "the gateway is told that this agent subscribes to nothing"
+        )
+    hosted = config.channels.hosted
+    problems = hosted.problems()
+    if not problems:
+        try:
+            read_key_file(hosted.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] GitHub is hosted but {problem}" for problem in problems)
+    elif github.enabled:
+        lines.append(
+            "[OK] GitHub notifications come from the channel gateway: filters "
+            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}"
+        )
+    if github.enabled and config.slack.mode == "hosted" and not config.slack.enabled:
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so the "
+            "hosted GitHub records wait there too"
+        )
+    return lines
+
+
 def _source_suffix(config, path: str) -> str:
     """`` (environment)`` / `` (config-repo)`` after a configured connection
     line when the value did not come from a file on this machine; ``""`` for
@@ -1997,6 +2040,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 )
     else:
         lines.append("[--] Slack disabled")
+    lines.extend(_hosted_github_lines(config, errors, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -2193,6 +2237,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         all_jobs = list(merged.values())
         enabled = sum(1 for j in all_jobs if j.enabled)
 
+        if config.sync.github.mode == "hosted":
+            pr_gated = sorted(
+                j.id for j in all_jobs
+                if j.enabled and any(g.type == "github_pr_activity" for g in j.gates)
+            )
+            if pr_gated:
+                warnings.append(
+                    f"[WARN] Cron job(s) {', '.join(pr_gated)} use the github_pr_activity "
+                    "gate, which always passes while GitHub is hosted — gate them on "
+                    "messages with sources: [github]; the gateway delivers PR changes as "
+                    "records (sync.github.pr_watch)"
+                )
+
         if all_jobs:
             detail = f"{enabled}/{len(all_jobs)} enabled"
             if overridden:
@@ -2254,9 +2311,13 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
 
     # Check external tools
     import shutil
+
+    from nerve.setup_checks import gh_needed
     for tool_name in ["gog", "gh"]:
         if shutil.which(tool_name):
             lines.append(f"[OK] {tool_name} CLI found")
+        elif tool_name == "gh" and not gh_needed(config):
+            lines.append("[--] gh CLI not found (not needed: GitHub comes from the channel gateway)")
         else:
             warnings.append(f"[WARN] {tool_name} CLI not found (needed for sync)")
 

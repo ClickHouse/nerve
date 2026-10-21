@@ -131,6 +131,12 @@ SOURCES_GITHUB_ONLY_TEXT = (
     "GitHub is provided by the operator of this deployment; "
     "Gmail and Telegram are not available on this instance."
 )
+# The same, when the channel gateway polls GitHub (``sync.github.mode:
+# hosted``): no GitHub credential is used on this machine at all.
+SOURCES_GITHUB_HOSTED_TEXT = (
+    "GitHub comes from the channel gateway of this deployment; "
+    "Gmail and Telegram are not available on this instance."
+)
 MODE_LOCK_REASON = (
     "Mode was chosen when the workspace was created. Changing it means starting a "
     "new workspace: stop Nerve, point workspace: in config.yaml at an empty "
@@ -231,9 +237,10 @@ class Facts:
     #: ``None`` (:func:`nerve.setup_provenance.credential_sources`). A path
     #: missing here reads as ``file`` when the value is configured.
     credential_sources: dict[str, str | None] = field(default_factory=dict)
-    #: ``slack.mode: hosted`` only: the stream manager's ``status()`` —
-    #: ``{"streams", "connected", "last_event_at"}``; ``None`` otherwise or
-    #: when no process can ask (``nerve doctor``).
+    #: ``slack.mode: hosted`` or ``sync.github.mode: hosted`` only: the
+    #: stream manager's ``status()`` — ``{"streams", "connected",
+    #: "last_event_at"}``; ``None`` otherwise or when no process can ask
+    #: (``nerve doctor``).
     hosted_gateway: dict[str, Any] | None = None
     #: The Telethon session file for the Telegram message sync exists.
     telegram_session_present: bool = False
@@ -684,18 +691,27 @@ def github_from_environment(facts: Facts) -> bool:
     return facts.credential_sources.get("github_token") == SOURCE_ENVIRONMENT
 
 
+def github_hosted(facts: Facts) -> bool:
+    """Whether the channel gateway polls GitHub (``sync.github.mode:
+    hosted``). No GitHub credential is used on this machine then, so
+    switching that source on stores nothing here."""
+    return facts.config.sync.github.mode == "hosted"
+
+
 def sources_available(facts: Facts) -> tuple[list[str], str | None]:
     """``(the sources the page may switch here, why the others are not)``.
 
     All three where the page may store a credential. Under
-    ``setup.local_secrets: false`` none of them — except GitHub when its
-    token comes from the environment: the operator holds the token, the
+    ``setup.local_secrets: false`` none of them — except GitHub when the
+    channel gateway polls it or its token comes from the environment: the
     toggle writes an ``enabled`` flag and nothing else, so it is offered
     alone while Gmail (a keyring, addresses) and Telegram (API credentials,
     a signed-in session) stay closed.
     """
     if facts.config.setup.local_secrets:
         return ["github", "gmail", "telegram"], None
+    if github_hosted(facts):
+        return ["github"], SOURCES_GITHUB_HOSTED_TEXT
     if github_from_environment(facts):
         return ["github"], SOURCES_GITHUB_ONLY_TEXT
     return [], NO_LOCAL_SECRETS_TEXT
@@ -707,11 +723,19 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     session = telegram_session(facts)
     accounts = list(sync.gmail.accounts or [])
     available, unavailable_reason = sources_available(facts)
+    # ``source`` for GitHub is where a token Nerve forwards to the GitHub
+    # CLI comes from (``github_token`` / GH_TOKEN); ``None`` when the CLI's
+    # own login is all there is (the preflight reports that one).
+    github: dict[str, Any] = {"enabled": bool(sync.github.enabled), "source": sources.get("github_token")}
+    gateway = None
+    if github_hosted(facts):
+        # What the stream manager reports about the gateway's streams, as
+        # the Channels step shows for a hosted Slack. Volatile: outside the
+        # step's etag.
+        gateway = facts.hosted_gateway or {"streams": 0, "connected": False, "last_event_at": None}
+        github.update(mode="hosted", gateway=gateway)
     detail = {
-        # ``source`` for GitHub is where a token Nerve forwards to the GitHub
-        # CLI comes from (``github_token`` / GH_TOKEN); ``None`` when the CLI's
-        # own login is all there is (the preflight reports that one).
-        "github": {"enabled": bool(sync.github.enabled), "source": sources.get("github_token")},
+        "github": github,
         "gmail": {
             "enabled": bool(sync.gmail.enabled),
             "accounts": accounts,
@@ -730,7 +754,12 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
         "unavailable_reason": unavailable_reason,
     }
     on = []
-    if sync.github.enabled:
+    if sync.github.enabled and gateway is not None:
+        on.append(
+            "GitHub from the channel gateway · "
+            + ("connected" if gateway.get("connected") else "waiting for the gateway")
+        )
+    elif sync.github.enabled:
         on.append("GitHub")
     if sync.gmail.enabled:
         on.append("Gmail")
@@ -854,9 +883,10 @@ def derive(facts: Facts) -> list[Step]:
     # done — a key from the environment, a Slack the channel gateway holds, an
     # answer that stores nothing.
     keyless = not config.setup.local_secrets
-    # A GitHub token from the environment: the one source whose switch
-    # stores nothing, so the policy leaves that toggle open.
-    github_env = github_from_environment(facts)
+    # GitHub polled by the channel gateway, or with its token from the
+    # environment: the one source whose switch stores nothing, so the policy
+    # leaves that toggle open.
+    github_open = github_hosted(facts) or github_from_environment(facts)
     steps: list[Step] = []
 
     def _lockdown(reason: str) -> tuple[str, str, str]:
@@ -982,11 +1012,12 @@ def derive(facts: Facts) -> list[Step]:
                 status = STATUS_DONE
             elif locked:
                 status, blocked_reason, blocked_kind = _lockdown(_LOCKDOWN_CONFIG_STEP)
-            elif keyless and not github_env:
+            elif keyless and not github_open:
                 # A GitHub login or token, the Gmail keyring, the Telegram
-                # API credentials and the signed-in session. With the GitHub
-                # token in the environment the step stays open for that one
-                # toggle (``detail["available"]``), to answer or to skip.
+                # API credentials and the signed-in session. With GitHub
+                # hosted, or its token in the environment, the step stays
+                # open for that one toggle (``detail["available"]``), to
+                # answer or to skip.
                 status, blocked_reason, blocked_kind = _policy()
             elif mode is None:
                 status, blocked_reason, blocked_kind = _until_mode(_CHOOSE_MODE_FIRST)
@@ -1035,10 +1066,11 @@ def derive(facts: Facts) -> list[Step]:
         # too: whatever made it done (a key from the environment, a token
         # already on disk, an answer) is not replaced from here. A Slack the
         # channel gateway holds keeps its one control, the on/off switch —
-        # and so does GitHub while its token comes from the environment.
+        # and so does GitHub while the gateway polls it or its token comes
+        # from the environment.
         if keyless and status == STATUS_DONE and step_id in _POLICY_STEPS and not (
             (step_id == STEP_CHANNELS and config.slack.mode == "hosted")
-            or (step_id == STEP_SOURCES and github_env)
+            or (step_id == STEP_SOURCES and github_open)
         ):
             if not read_only:
                 read_only, read_only_reason = True, NO_LOCAL_SECRETS_TEXT

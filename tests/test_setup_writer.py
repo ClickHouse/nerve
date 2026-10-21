@@ -175,14 +175,21 @@ def run_writers(root: Path, choices: SetupChoices) -> dict[str, str]:
     return produced
 
 
-def run_unattended(root: Path, mode: str, extra: dict[str, str]) -> dict[str, str]:
+def run_unattended(
+    root: Path, mode: str, extra: dict[str, str], *, on_path: tuple[str, ...] = (),
+) -> dict[str, str]:
     """``run_non_interactive`` under a deterministic environment.
 
-    No CLIs on PATH (so no source is auto-enabled), no web build, a fixed
-    credential and timezone. The extra files are the workspace files whose
-    placeholders the unattended path must leave exactly as the template has
-    them (only the terminal wizard, given a name, fills them in).
+    No CLIs on PATH but those *on_path* names (so by default no source is
+    auto-enabled), no web build, a fixed credential and timezone. The extra
+    files are the workspace files whose placeholders the unattended path must
+    leave exactly as the template has them (only the terminal wizard, given a
+    name, fills them in).
     """
+
+    def which(name: str, *args: object, **kwargs: object) -> str | None:
+        return f"/usr/bin/{name}" if name in on_path else None
+
     config_dir = root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     env = {
@@ -199,7 +206,7 @@ def run_unattended(root: Path, mode: str, extra: dict[str, str]) -> dict[str, st
         "NERVE_TASK": "Keep the build green." if mode == "worker" else "",
     })
     with mock.patch.dict(os.environ, env, clear=True), \
-            mock.patch("nerve.bootstrap.shutil.which", return_value=None), \
+            mock.patch("nerve.bootstrap.shutil.which", side_effect=which), \
             mock.patch.object(SetupWizard, "_build_web_ui", lambda self: None):
         run_non_interactive(config_dir)
     produced = {}
@@ -1019,3 +1026,63 @@ class TestModeDefaults:
             "memory-maintenance": True, "task-planner": False,
             "skill-extractor": True, "skill-reviser": True,
         }
+
+
+class TestHostedGitHubKeepsTheEventsSourceOff:
+    """The events source reads with gh on this machine, which a GitHub that
+    the channel gateway polls does not set up. Wherever the writers derive it
+    from the GitHub switch, it stays off while GitHub is hosted."""
+
+    @pytest.mark.parametrize(("mode", "events"), [(None, True), ("poll", True), ("hosted", False)])
+    def test_the_layers_follow_the_switch_only_while_github_is_polled_here(self, mode, events) -> None:
+        _machine, portable, _shadowed = setup_writer.build_config_layers(
+            SetupChoices(mode="personal", github_sync=True, github_mode=mode),
+        )
+        assert portable["sync"]["github"] == {"enabled": True}
+        assert portable["sync"]["github_events"] == {"enabled": events}
+
+    @pytest.mark.parametrize(("settings", "events"), [
+        ("", True),
+        ("sync:\n  github:\n    mode: poll\n", True),
+        ("sync:\n  github:\n    mode: hosted\n", False),
+        ("sync:\n  github:\n    mode: ' Hosted '\n", False),
+        ("sync:\n  github:\n    mode: elsewhere\n", True),
+    ])
+    def test_the_installer_takes_the_mode_from_the_settings_it_writes(
+        self, tmp_path: Path, settings: str, events: bool,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        settings_file = workspace / "config" / "settings.yaml"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(settings, encoding="utf-8")
+
+        run_writers(tmp_path, personal_choices(workspace))
+
+        sync = yaml.safe_load(settings_file.read_text(encoding="utf-8"))["sync"]
+        assert sync["github"]["enabled"] is True
+        assert sync["github_events"] == {"enabled": events}
+
+    def test_unattended_init_with_gh_on_the_path_keeps_it_off_over_hosted_settings(
+        self, tmp_path: Path,
+    ) -> None:
+        """The unattended installer switches GitHub on whenever gh is on the
+        PATH; over settings that say ``hosted`` the events source stays off."""
+        settings_file = tmp_path / "workspace" / "config" / "settings.yaml"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text("sync:\n  github:\n    mode: hosted\n", encoding="utf-8")
+
+        produced = run_unattended(tmp_path, "personal", {}, on_path=("gh",))
+
+        sync = yaml.safe_load(produced["settings.yaml"])["sync"]
+        assert sync["github"] == {"mode": "hosted", "enabled": True}
+        assert sync["github_events"] == {"enabled": False}
+
+    def test_the_web_steps_carry_the_running_mode(self, tmp_path: Path) -> None:
+        hosted = choices_from_config(NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"), "sync": {"github": {"enabled": True, "mode": "hosted"}},
+        }))
+        assert hosted.github_mode == "hosted"
+        _machine, portable, _shadowed = setup_writer.build_config_layers(hosted)
+        assert portable["sync"]["github_events"] == {"enabled": False}
+        polled = choices_from_config(NerveConfig.from_dict({"workspace": str(tmp_path / "ws")}))
+        assert polled.github_mode == "poll"

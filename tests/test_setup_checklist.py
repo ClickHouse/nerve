@@ -237,6 +237,24 @@ class TestDoneRules:
         # Where the page may store credentials every source is on offer.
         assert d["available"] == ["github", "gmail", "telegram"] and d["unavailable_reason"] is None
 
+    def test_sources_show_the_gateway_when_only_github_is_hosted(self, personal):
+        """As the Channels step does for a hosted Slack; volatile, so outside
+        the etag."""
+        hosted = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+
+        connected = step(facts(personal, hosted, hosted_gateway=live), "sources")
+        waiting = step(facts(personal, hosted), "sources")
+
+        assert connected["detail"]["github"] == {
+            "enabled": True, "source": None, "mode": "hosted", "gateway": live,
+        }
+        assert connected["summary"] == "GitHub from the channel gateway · connected"
+        assert waiting["detail"]["github"]["gateway"] == {"streams": 0, "connected": False, "last_event_at": None}
+        assert waiting["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+        assert connected["etag"] == waiting["etag"]
+        assert step(facts(personal, hosted), "channels")["detail"]["slack"]["gateway"] is None
+
     def test_automation(self, personal):
         s = step(facts(personal), "automation")
         assert s["status"] == "pending"
@@ -583,6 +601,19 @@ class TestNoLocalSecrets:
         skipped = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, state=SetupState(skipped={"sources"}))
         assert step(skipped, "sources")["status"] == "skipped"
         assert checklist.summarize(skipped)["steps_left"] == 3
+
+    def test_a_hosted_github_keeps_that_toggle_open_without_a_token(self, personal):
+        """The channel gateway polls GitHub, so the switch needs no credential
+        on this machine and stores nothing here."""
+        f = facts(personal, keyless(personal, sync={"github": {"mode": "hosted"}}))
+        s = step(f, "sources")
+        assert s["status"] == "pending" and s["blocked_kind"] is None
+        assert s["read_only"] is False and s["read_only_reason"] is None
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_HOSTED_TEXT
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        done = step(facts(personal, on), "sources")
+        assert done["status"] == "done" and done["read_only"] is False and done["read_only_reason"] is None
 
     def test_github_on_with_a_token_from_the_environment_is_done_and_keeps_its_switch(self, personal):
         """Done like any switched-on source, but not read-only: the switch is

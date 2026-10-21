@@ -55,7 +55,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
 - New consumer cursors initialize to the latest message (no backlog flooding)
-- Consumer cursors expire after N days of inactivity (configurable, default: 2 days)
+- Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
 ### Default Consumer: `inbox-processor`
@@ -151,6 +151,101 @@ visible rather than failing the fetch.
 - **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
 - **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
 - **Default schedule:** `*/15 * * * *` (every 15 min)
+- **Hosted mode:** with `sync.github.mode: hosted` the channel gateway polls GitHub instead; see below
+
+#### Hosted GitHub source
+
+With `sync.github.mode: hosted`, this process does not poll GitHub and needs no
+`gh` login. The shared channel gateway (the one that serves
+[hosted Slack](config.md#hosted-mode), set up with the same `channels.hosted`
+settings) polls GitHub for the agent with its own credential, builds each record
+the way the polling source does, enrichment included, and keeps the records
+until Nerve reads them, also while Nerve is not running. Nerve reads them over
+the hosted channel streams.
+
+- **What arrives:** `github_notification` records, one for each notification
+  thread whose `updated_at` moved, with the summary, content and metadata of the
+  polling source. With `pr_watch: true` (the default) also `github_pr_activity`
+  records: one whenever one of the agent's own open pull requests changes —
+  its state, head commit, review decision, CI checks, or a comment or review by
+  someone else. A pull request seen for the first time gives no record. Such a
+  record has the notification metadata plus `number`, `state`, `head`,
+  `review_decision` and `changes`, a list of `state`, `head`, `ci`, `review`
+  and `comment`. The agent is always its author, so its `reason` is always
+  `author`, and its `actors` are the reviewers and commenters. Only
+  `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
+  actor, reason and CI branch lists are not checked for it (see
+  [Pull request activity records](#github-pull-request-activity-records)).
+- **The filters are published from this config.** Nerve sends the gateway the
+  guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
+  `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
+  `deny_ci_branches`) and `pr_watch` whenever a stream opens and again on every
+  reload. The gateway keeps the newest set and applies it before it stores a
+  record, so a record that the filters drop never reaches this agent and is
+  never a reason to start it. The guardrail still runs here too. A list that the
+  gateway cannot take — more than 256 patterns, or a pattern longer than 256
+  bytes or with a control character — goes to the gateway wider, never
+  narrower: an allow list is left out and a deny list keeps the patterns that
+  fit, and the local guardrail drops the rest. Blank patterns are not sent; here
+  a blank allow pattern matches only an empty value, which GitHub never gives a
+  repo, an actor or a reason. If the whole subscription is still larger than
+  the gateway's frame limit, it goes with no patterns at all, and the guardrail
+  here does all the filtering. With `enabled: false` Nerve tells the gateway
+  that it subscribes to nothing.
+- **The gateway must know the subscriptions.** A gateway that predates hosted
+  sources closes a stream that publishes them, hosted Slack traffic included,
+  so update the gateway before an agent switches to `mode: hosted`.
+- **Same source, same name.** The records go to a local buffer, and the
+  `source:github` runner drains it. The drop hook, `condense`, health checks,
+  consumer cursors, `messages` gates and the Sources page work as they do for
+  the polling source. The drain also runs on `sync.github.schedule`, as a
+  fallback.
+- **Runs on delivery.** As soon as records arrive, the runner drains them, and
+  the jobs gated on `messages` for `github`, or for any source, run once
+  `cron.delivery_debounce_seconds` (default 60) after the first record of a
+  burst; see [Runs on delivery](cron.md#runs-on-delivery). Gate a pull request
+  monitor on `messages` with `sources: [github]` rather than on
+  `github_pr_activity`, which always passes in hosted mode.
+- **The events source stays off.** `github_events` reads your own activity
+  with `gh` on this machine, which hosted GitHub does not set up. While the
+  mode is `hosted`, the GitHub switch of the setup page's Sources step and
+  `nerve init` write `sync.github_events.enabled: false`, where in poll mode
+  they switch it on and off together with GitHub. On a machine with a `gh`
+  login it can still be switched on in the settings, until the GitHub switch
+  is saved again.
+- **A switched-off hosted Slack holds GitHub back.** Nerve reads the events of
+  every hosted provider from one ordered inbox at the gateway, and it stops
+  reading while a hosted channel cannot take events. With `slack.mode: hosted`
+  and `slack.enabled: false`, Nerve therefore reads nothing from the gateway:
+  the GitHub records wait there too, no delivery starts a job, and past the
+  gateway's limit of stored records the oldest are dropped. They arrive once
+  Slack is switched on again. While GitHub is hosted, keep a hosted Slack
+  switched on, or switch both off; `nerve doctor` warns about this
+  combination. This is a known limitation: reading each provider's events on
+  its own, so that GitHub records arrive while hosted Slack is off, is a
+  follow-up.
+- **Restart-only.** A change of `mode` takes effect at the next restart. To go
+  back from `hosted` to `poll`, switch the source off first: set
+  `enabled: false` and reload while the mode is still `hosted`. Nerve then
+  tells the gateway that it subscribes to nothing (a subscriptions frame of
+  `{"version":"1"}`), and the gateway stops polling GitHub for the agent at
+  once. Then set `mode: poll`, switch `enabled` back on, and restart. In poll
+  mode Nerve publishes no subscriptions at all. The gateway also counts an agent
+  as subscribed to nothing when a stream opens and publishes no subscriptions
+  within a short grace period, or when Nerve no longer serves the stream
+  endpoint. Until it notices, though, it keeps polling and delivering records
+  that Nerve no longer takes, which is why the reload comes first.
+
+```yaml
+sync:
+  github:
+    mode: hosted
+    pr_watch: true
+    deny_reasons: ["subscribed"]   # applied by the gateway and again here
+```
+
+`nerve doctor` checks the hosted settings and names the jobs that still rely
+on the `github_pr_activity` gate.
 
 ### GitHub Events
 - **Adapter:** `nerve/sources/github_events.py` — uses `gh api /users/{username}/events` CLI
@@ -346,6 +441,8 @@ sync:
 
   github:
     enabled: true
+    mode: poll                    # poll = gh CLI here; hosted = the channel gateway polls (restart-only)
+    pr_watch: true                # Hosted mode: also a record when one of your open PRs changes
     schedule: "*/15 * * * *"
     batch_size: 30
     condense: true                # Haiku extraction for long notifications
@@ -514,6 +611,18 @@ would flood the inbox with default-branch runs.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `github.deny_ci_branches` | list | `[]` | Denylist of branch globs for CI runs. Empty = all CI notifications pass |
+
+### GitHub pull request activity records
+
+With `sync.github.mode: hosted` and `pr_watch: true`, the channel gateway also
+delivers `github_pr_activity` records, one for each change on the agent's own open
+pull requests (see [Hosted GitHub source](#hosted-github-source)). The agent is always
+the author of those pull requests: the `reason` of such a record is always `author`, and
+its `actors` are the reviewers and commenters. So only the repo guardrail applies to it.
+`allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons` and `deny_ci_branches` are
+not checked for these records, neither by the gateway nor here. An `allow_actors` list
+that names none of the reviewers, or an `allow_reasons` list without `author`, does not
+drop them; `deny_repos` and an `allow_repos` list that the repo does not match do.
 
 ### Debugging drops
 
@@ -693,7 +802,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
-- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
+- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`, and for the records of the hosted GitHub source, drained by the `github` runner. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints
@@ -860,7 +969,8 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/registry.py` | Config → `list[SourceRunner]` factory |
 | `nerve/sources/telegram.py` | Telegram adapter (Telethon) |
 | `nerve/sources/gmail.py` | Gmail adapter (gog CLI) |
-| `nerve/sources/github.py` | GitHub notifications adapter (gh CLI) |
+| `nerve/sources/github.py` | GitHub notifications adapter (gh CLI), record builder, GitHub guardrail |
+| `nerve/sources/github_hosted.py` | GitHub source in hosted mode: drains the records the channel gateway delivered |
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |
 | `web/src/components/Sources/` | Source message renderers (email, GitHub, default markdown) |

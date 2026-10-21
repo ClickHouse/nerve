@@ -3287,6 +3287,7 @@ class TestManagedValues:
 
 _NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
 _GITHUB_ONLY = "GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance."
+_GITHUB_HOSTED = "GitHub comes from the channel gateway of this deployment; Gmail and Telegram are not available on this instance."
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
@@ -3489,6 +3490,34 @@ class TestNoLocalSecrets:
             assert claimed.settings_yaml()["sync"]["github"]["enabled"] is False
         assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
         assert "ghp_REPLACE" not in json.dumps(off.json())
+
+    async def test_a_hosted_github_opens_that_one_toggle_and_keeps_the_events_source_off(self, claimed):
+        """The channel gateway polls GitHub, so the switch needs no credential
+        here. The events source reads with gh on this machine, which a hosted
+        GitHub does not set up, so the switch turns it off whichever way it
+        goes, also when an earlier write had turned it on."""
+        choose(claimed, "personal")
+        _keep_no_secrets(claimed, **{"sync.github.mode": "hosted", "sync.github_events.enabled": True})
+        async with claimed.client() as http:
+            sources = step((await http.get("/api/setup")).json(), "sources")
+            assert sources["status"] == "pending" and sources["read_only"] is False
+            assert sources["detail"]["available"] == ["github"]
+            assert sources["detail"]["unavailable_reason"] == _GITHUB_HOSTED
+            refused = await http.put("/api/setup/sources", json={"github": True, "gmail": False})
+            assert refused.status_code == 409 and refused.json() == {"detail": _GITHUB_HOSTED, "field": "gmail"}
+            on = await http.put("/api/setup/sources", json={"github": True})
+            assert on.status_code == 200, on.text
+            sources = step(on.json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False
+            assert sources["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+            settings = claimed.settings_yaml()["sync"]
+            assert settings["github"] == {"enabled": True, "mode": "hosted"}
+            assert settings["github_events"]["enabled"] is False
+            off = await http.put("/api/setup/sources", json={"github": False})
+            assert off.status_code == 200, off.text
+        settings = claimed.settings_yaml()["sync"]
+        assert settings["github"] == {"enabled": False, "mode": "hosted"}
+        assert settings["github_events"]["enabled"] is False
 
     async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
         """Open, the step behaves like any other: it waits for the Mode step

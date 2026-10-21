@@ -501,7 +501,22 @@ def reset_caches() -> None:
 #  Sources preflight                                                           #
 # --------------------------------------------------------------------------- #
 
-_sources_cache: tuple[float, dict[str, Any]] | None = None
+# (taken at, GitHub hosted, result)
+_sources_cache: tuple[float, bool, dict[str, Any]] | None = None
+
+GH_HOSTED_HINT = "The channel gateway polls GitHub for this agent; gh is not needed on the server."
+
+
+def gh_needed(config: NerveConfig) -> bool:
+    """Whether something in *config* runs the gh CLI.
+
+    Hosted GitHub (``sync.github.mode: hosted``) does not; the GitHub events
+    and repos sources still do.
+    """
+    sync = config.sync
+    if sync.github.mode != "hosted":
+        return True
+    return bool(sync.github_events.enabled or sync.github_repos.enabled)
 
 
 def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
@@ -529,10 +544,18 @@ def _gh_status() -> dict[str, Any]:
     }
 
 
-def _sources_probe() -> dict[str, Any]:
+def _gh_hosted_status() -> dict[str, Any]:
+    """The GitHub preflight in hosted mode: nothing to sign in, so gh is not run."""
+    return {
+        "cli": bool(shutil.which("gh")), "authenticated": False, "login": None,
+        "hint": GH_HOSTED_HINT, "hosted": True,
+    }
+
+
+def _sources_probe(github_hosted: bool = False) -> dict[str, Any]:
     gog = bool(shutil.which("gog"))
     return {
-        "github": _gh_status(),
+        "github": _gh_hosted_status() if github_hosted else _gh_status(),
         "gmail": {
             "cli": gog,
             "hint": None if gog else "Install gog, then run gog gmail setup <account> on the server.",
@@ -544,18 +567,23 @@ def _sources_probe() -> dict[str, Any]:
 async def sources_preflight(config: NerveConfig) -> dict[str, Any]:
     global _sources_cache
     now = time.monotonic()
-    if _sources_cache is not None and now - _sources_cache[0] < CACHE_SECONDS:
-        result = dict(_sources_cache[1])
+    hosted = config.sync.github.mode == "hosted"
+    cached = _sources_cache
+    if cached is not None and cached[1] == hosted and now - cached[0] < CACHE_SECONDS:
+        result = dict(cached[2])
     else:
         try:
-            result = await run_blocking(_sources_probe, HTTP_TEST_TIMEOUT + 2)
+            result = await run_blocking(lambda: _sources_probe(hosted), HTTP_TEST_TIMEOUT + 2)
         except asyncio.TimeoutError:
             result = {
-                "github": {"cli": bool(shutil.which("gh")), "authenticated": False, "login": None, "hint": "gh did not answer."},
+                "github": _gh_hosted_status() if hosted else {
+                    "cli": bool(shutil.which("gh")), "authenticated": False, "login": None,
+                    "hint": "gh did not answer.",
+                },
                 "gmail": {"cli": bool(shutil.which("gog")), "hint": None},
                 "checked_at": _now(),
             }
-        _sources_cache = (now, dict(result))
+        _sources_cache = (now, hosted, dict(result))
     result["telegram"] = {
         "credentials_configured": bool(config.sync.telegram.api_id and config.sync.telegram.api_hash),
     }
@@ -682,6 +710,10 @@ async def environment(config: NerveConfig) -> list[dict[str, Any]]:
         except asyncio.TimeoutError:
             checks = []
         _environment_cache = (now, [dict(c) for c in checks])
+    if not gh_needed(config):
+        for check in checks:
+            if check["id"] == "gh" and check["status"] == "missing":
+                check.update(status="ok", detail="not needed", hint=GH_HOSTED_HINT)
     tz_ok = True
     try:
         from zoneinfo import ZoneInfo

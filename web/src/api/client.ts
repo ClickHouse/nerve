@@ -415,7 +415,8 @@ export interface PairingCode {
 }
 
 export interface SourcesPreflight {
-  github: { cli: boolean; authenticated: boolean; login: string | null; hint: string | null };
+  /** `hosted`: the channel gateway polls GitHub (`sync.github.mode: hosted`), so gh was not checked. */
+  github: { cli: boolean; authenticated: boolean; login: string | null; hint: string | null; hosted?: boolean };
   gmail: { cli: boolean; hint: string | null };
   telegram: { credentials_configured: boolean };
   checked_at: string;

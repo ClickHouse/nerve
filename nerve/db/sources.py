@@ -399,6 +399,38 @@ class SourceStore:
             (consumer, source, cursor_seq, session_id, now.isoformat(), expires),
         )
 
+    async def keep_consumer_cursors_alive(
+        self, consumer: str, sources: list[str] | None = None, ttl_days: int = 2,
+    ) -> int:
+        """Renew the TTL of a consumer's live cursors, leaving their positions.
+
+        For a reader that still uses the cursors without moving them, such as
+        a ``messages`` gate checked on every run of its job: a quiet source
+        then keeps its place instead of starting again at its newest message.
+        Only a live cursor with less than half of *ttl_days* left is renewed,
+        to *ttl_days* from now, so a frequent caller seldom writes; an expired
+        cursor stays expired. *sources* limits it to those sources, ``None``
+        means all of the consumer's. Returns the number of cursors renewed.
+        """
+        if sources is not None and not sources:
+            return 0
+        now = datetime.now(UTC)
+        renew_before = (now + timedelta(days=ttl_days / 2)).isoformat()
+        where = "consumer = ? AND expires_at IS NOT NULL AND expires_at > ? AND expires_at < ?"
+        params: list = [consumer, now.isoformat(), renew_before]
+        if sources is not None:
+            where += f" AND source IN ({', '.join('?' for _ in sources)})"
+            params.extend(sources)
+        async with self.db.execute(f"SELECT COUNT(*) FROM consumer_cursors WHERE {where}", params) as cursor:
+            row = await cursor.fetchone()
+        if not row or not row[0]:
+            return 0  # nothing due, so no write
+        expires = (now + timedelta(days=ttl_days)).isoformat()
+        result = await self._write(
+            f"UPDATE consumer_cursors SET expires_at = ? WHERE {where}", [expires, *params],
+        )
+        return result.rowcount or 0
+
     async def list_consumer_cursors(self, consumer: str | None = None) -> list[dict]:
         """List active (non-expired) consumer cursors with unread counts."""
         now = datetime.now(timezone.utc).isoformat()
