@@ -469,6 +469,11 @@ class LoomMemory:
         # Set when a call says the catalog may have changed (a policy refusal).
         self._catalog_stale = False
         # Extraction: wait for it (the default) or queue it in Loom.
+        # TODO: once Loom serves memory.extraction_status_mine and
+        # memory.extraction_retry_mine over MCP (through loom_op, arguments
+        # {"queue_ids": [...], "namespace"?}), the queued mode can move the
+        # sweep's watermark only after status_mine reports a batch written
+        # (done), and replay a failed one once with retry_mine.
         self._defer = bool(self._cfg.defer_extraction)
         self._batch_max_messages = _DEFERRED_BATCH_MAX_MESSAGES if self._defer else _BATCH_MAX_MESSAGES
         self._batch_max_bytes = _DEFERRED_BATCH_MAX_BYTES if self._defer else _BATCH_MAX_BYTES
