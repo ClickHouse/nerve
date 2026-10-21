@@ -2,9 +2,9 @@
 
 In hosted mode the channel gateway polls a source instead of this process.
 It applies the filters that Nerve publishes before it stores a record, keeps
-the records in the agent's inbox while the agent is parked, and Nerve reads
-them over the same streams that carry hosted channel traffic. GitHub is the
-only hosted source.
+the records in the agent's inbox until Nerve reads them, also while Nerve is
+not running, and Nerve reads them over the same streams that carry hosted
+channel traffic. GitHub is the only hosted source.
 
 :class:`HostedSourceConsumer` takes a provider's records from the inbox reader
 and writes each one to the local ``channel_observations`` buffer under the
