@@ -229,6 +229,8 @@ Tasks are listed with status filter buttons and a search input (250ms debounce).
 
 The New Task dialog has a status picker with the configured statuses. It starts on `backlog`, or on the status of the board column whose add button opened it, and falls back to `pending` when `backlog` does not exist. A hint under the picker says that the agent may pick up a `pending` task.
 
+Task notes that the plan tools write link to the plan (`/plans/<id>`) and to the implementation session (`/chat/<id>`). The markdown preview opens these links in the app.
+
 ### Task Detail (`/tasks/:taskId`)
 
 Full-page markdown editor for task content:

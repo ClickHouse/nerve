@@ -24,6 +24,10 @@ STATUS_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 # v030 for the rationale). Kept here so handlers/routes share one source.
 DEFAULT_STATUS = "pending"   # initial status assigned to new tasks
 TERMINAL_STATUS = "done"     # task_done moves file to done/, hidden by default
+# A plan for the task waits for a human decision (migration v059). The plan
+# tools move a task to it only from these statuses, never from a custom one.
+PLAN_REVIEW_STATUS = "plan_review"
+PLAN_REVIEW_FROM = ("pending", "backlog", "in_progress")
 
 # Curated palette for "random by default" colors — pleasant, distinct hues
 # that read well on both light and dark themes.

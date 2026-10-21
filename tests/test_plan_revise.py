@@ -167,7 +167,7 @@ class TestRequestPlanRevision:
         task = await db.get_task(task_id)
         task_md = tmp_path / task["file_path"]
         body = task_md.read_text(encoding="utf-8")
-        assert "Revision requested for plan-orig" in body
+        assert "Revision requested for [plan-orig](/plans/plan-orig)" in body
         assert "needs more tests" in body
 
     async def test_routes_to_proposer_session(self, db: Database, tmp_path):
