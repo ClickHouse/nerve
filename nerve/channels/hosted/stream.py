@@ -25,7 +25,9 @@ size, together with the uploads already in flight, fits the gateway's
 
 When the agent has hosted sources, the stream sends its ``subscriptions``
 frame as soon as negotiation completes, and again whenever the runtime
-publishes changed settings. A subscription that the gateway's bounds or frame
+publishes changed settings. The first frame waits for the stream for as long
+as it is open; a republish gives up after a short bound, so a stalled stream
+does not hold up a reload. A subscription that the gateway's bounds or frame
 limit would refuse goes without its filter patterns, so it never closes the
 stream; Nerve's own inbox filter still applies to every record.
 """
@@ -78,8 +80,9 @@ RESPONSE_KIND = {
 _BEFORE_NEGOTIATION = frozenset({"negotiation", "heartbeat", "drain"})
 # A drain is a courtesy; a peer that does not take it quickly is closed anyway.
 _DRAIN_SEND_SECONDS = 2.0
-# How long the subscriptions frame may take to go out, bounded as the drain
-# is: a stream that is stalled must not hold up a reload.
+# How long a republished subscriptions frame may take to go out, bounded as
+# the drain is: a stream that is stalled must not hold up a reload. The frame
+# sent after negotiation has no such bound.
 _SUBSCRIPTIONS_SEND_SECONDS = 2.0
 # Room left in an upload chunk frame for a longer offset or final marker.
 _CHUNK_FRAME_MARGIN = 32
@@ -427,9 +430,13 @@ class ChannelStream:
             logger.info("Channel stream %d negotiated version %s", self.id, PROTOCOL_VERSION)
             if self._subscriptions is not None:
                 # Started before the reader hears of the stream, so the
-                # subscriptions are the first frame after negotiation.
+                # subscriptions are the first frame after negotiation. Nothing
+                # waits for this publish and nothing repeats it before a
+                # reload, so it is not bounded: a stall delays the frame and
+                # never drops it. The stream's end cancels it.
                 self._publish_task = asyncio.get_running_loop().create_task(
-                    self.publish_subscriptions(), name=f"channel-stream-{self.id}-subscriptions",
+                    self.publish_subscriptions(bounded=False),
+                    name=f"channel-stream-{self.id}-subscriptions",
                 )
                 self._publish_task.add_done_callback(self._publish_done)
             self._listener.stream_ready(self)
@@ -582,35 +589,72 @@ class ChannelStream:
             self._mark_closed()
             raise StreamClosed() from error
 
+    def _one_way_id(self) -> str:
+        """The request ID of the next one-way frame, taken in call order."""
+        self._next_one_way += 1
+        return f"o-{self._next_one_way}"
+
     async def _send_one_way(
         self, kind: str, body: Any, connection_id: uuid.UUID | None = None,
     ) -> None:
-        self._next_one_way += 1
-        text = self._encode(kind, body, connection_id, f"o-{self._next_one_way}")
+        text = self._encode(kind, body, connection_id, self._one_way_id())
         await self._send_text(text)
 
-    async def publish_subscriptions(self) -> bool:
+    async def publish_subscriptions(self, *, bounded: bool = True) -> bool:
         """Send the agent's current source subscriptions; ``True`` when sent.
 
-        The settings are read at the call, so the newest call sends the newest
-        settings, and frames leave in call order. Subscriptions that the
+        Frames leave in call order, and each one is built from the settings
+        current when the stream is free to send it, so the last frame to leave
+        carries the newest settings even after a wait. Subscriptions that the
         gateway would refuse, by its bounds or its frame limit, go without
         their filter patterns: the gateway then keeps every record, and Nerve's
         inbox filter still drops what the patterns would have. Subscriptions
         that it would refuse even so are not sent, since the gateway would
         close the stream over them. A stream that is not ready, or that Nerve
-        is draining, sends nothing, and one that cannot send the frame within
-        ``_SUBSCRIPTIONS_SEND_SECONDS`` gives up, as the drain does.
+        is draining, sends nothing.
+
+        A *bounded* call that cannot send the frame within
+        ``_SUBSCRIPTIONS_SEND_SECONDS`` gives up, as the drain does, so that a
+        stalled stream does not hold up the reload that waits for it. An
+        unbounded call waits for as long as the stream is open.
         """
         if self._subscriptions is None or not self.ready or self.drain_sent:
             return False
+        request_id = self._one_way_id()
+        bound = _SUBSCRIPTIONS_SEND_SECONDS if bounded else None
+        try:
+            async with asyncio.timeout(bound):
+                async with self._send_lock:
+                    if not self.ready or self.drain_sent:
+                        return False
+                    text = self._subscriptions_frame(request_id)
+                    if text is None:
+                        return False
+                    await self._send_locked(text)
+        except StreamClosed:
+            return False
+        except TimeoutError:
+            logger.warning(
+                "Channel stream %d: source subscriptions not sent: the stream could not send "
+                "them within %gs", self.id, bound,
+            )
+            return False
+        return True
+
+    def _subscriptions_frame(self, request_id: str) -> str | None:
+        """The ``subscriptions`` frame from the current settings, encoded.
+
+        ``None`` when there is nothing to send: no hosted sources, settings
+        that cannot be read, or subscriptions that the gateway would refuse
+        even without their filter patterns.
+        """
         try:
             body = self._subscriptions()
         except Exception:  # a bad setting must not close the stream
             logger.exception("Channel stream %d: could not build the source subscriptions", self.id)
-            return False
+            return None
         if body is None:
-            return False
+            return None
         try:
             body.validate()
         except Rejected as error:
@@ -622,36 +666,26 @@ class ChannelStream:
                     "Channel stream %d: source subscriptions not sent: the gateway would "
                     "refuse them (%s)", self.id, still.detail,
                 )
-                return False
+                return None
             logger.warning(
                 "Channel stream %d: source subscriptions exceed the gateway's bounds (%s); "
                 "sending them without filter patterns", self.id, error.detail,
             )
             body = wide
         try:
-            async with asyncio.timeout(_SUBSCRIPTIONS_SEND_SECONDS):
-                try:
-                    await self._send_one_way("subscriptions", body)
-                except Rejected as error:
-                    if error.reason != RejectionReason.FRAME_TOO_LARGE:
-                        raise
-                    logger.warning(
-                        "Channel stream %d: source subscriptions exceed the gateway's frame "
-                        "limit; sending them without filter patterns", self.id,
-                    )
-                    await self._send_one_way("subscriptions", body.without_filters())
-        except StreamClosed:
-            return False
-        except TimeoutError:
-            logger.warning(
-                "Channel stream %d: source subscriptions not sent: the stream could not send "
-                "them within %gs", self.id, _SUBSCRIPTIONS_SEND_SECONDS,
-            )
-            return False
+            try:
+                return self._encode("subscriptions", body, None, request_id)
+            except Rejected as error:
+                if error.reason != RejectionReason.FRAME_TOO_LARGE:
+                    raise
+                logger.warning(
+                    "Channel stream %d: source subscriptions exceed the gateway's frame "
+                    "limit; sending them without filter patterns", self.id,
+                )
+                return self._encode("subscriptions", body.without_filters(), None, request_id)
         except Rejected as error:
             logger.warning("Channel stream %d: source subscriptions not sent: %s", self.id, error)
-            return False
-        return True
+            return None
 
     def _publish_done(self, task: asyncio.Task) -> None:
         """Log a failure of the publish that negotiation started, when it happens."""

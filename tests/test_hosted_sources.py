@@ -9,9 +9,10 @@ service; only the agent turn is a stand-in.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,6 +63,7 @@ from tests.fake_channel_gateway import (
     FakeChannelGateway,
     FakeStream,
     NerveServer,
+    gateway_negotiation,
     message_event,
     source_record_event,
 )
@@ -507,6 +509,24 @@ async def hosted(tmp_path, db, monkeypatch):
         await stop(harness)
 
 
+@contextlib.asynccontextmanager
+async def stalled_through_negotiation(harness: Harness) -> AsyncIterator[FakeStream]:
+    """A stream that negotiates while Nerve's side of it cannot send, as when
+    another frame is stuck on the socket. The stall clears on leaving, and the
+    gateway then advertises its capabilities."""
+    stream = await harness.stream(negotiate=False)
+    await asyncio.wait_for(stream.nerve_negotiation.wait(), EVENT_TIMEOUT)
+    [nerve_side] = harness.runtime.streams.streams
+    await nerve_side._send_lock.acquire()
+    try:
+        await stream.send("negotiation", gateway_negotiation())
+        await eventually(lambda: nerve_side.ready)
+        yield stream
+    finally:
+        nerve_side._send_lock.release()
+    await stream.advertise()
+
+
 @pytest.mark.asyncio
 class TestStreams:
     async def test_a_stream_publishes_the_subscriptions_right_after_negotiation(self, hosted):
@@ -689,6 +709,46 @@ class TestStreams:
             f"Channel stream {stalled.id}: source subscriptions not sent: the stream could not "
             "send them within 0.2s"
         ) in caplog.text
+
+    async def test_a_stall_right_after_negotiation_delays_the_subscriptions_but_never_drops_them(
+        self, hosted, monkeypatch, caplog,
+    ):
+        """Nothing waits for the publish that negotiation starts, and nothing
+        sends the frame again before a reload, so a stall longer than a
+        republish's bound still ends with the frame sent, once."""
+        monkeypatch.setattr("nerve.channels.hosted.stream._SUBSCRIPTIONS_SEND_SECONDS", 0.2)
+        caplog.set_level(logging.WARNING, logger="nerve.channels.hosted.stream")
+
+        async with stalled_through_negotiation(hosted) as stream:
+            await asyncio.sleep(0.6)
+            assert stream.sent("subscriptions") == []
+
+        await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
+        await asyncio.sleep(0.3)
+        kinds = [frame["kind"] for frame in stream.frames if frame["kind"] != "heartbeat"]
+        assert kinds[:3] == ["negotiation", "subscriptions", "inbox_read"]
+        assert len(stream.sent("subscriptions")) == 1
+        assert hosted.gateway.subscriptions[0]["sources"][0]["filters"] == GITHUB_DENY
+        assert stream.close_code is None
+        assert "source subscriptions not sent" not in caplog.text
+
+    async def test_subscriptions_that_waited_through_a_stall_carry_the_settings_of_when_they_left(
+        self, hosted, monkeypatch,
+    ):
+        """A reload during the stall gives up on the stream after its bound, so
+        the frame that waited is the one the gateway gets: it is built when it
+        leaves, from the reloaded settings."""
+        monkeypatch.setattr("nerve.channels.hosted.stream._SUBSCRIPTIONS_SEND_SECONDS", 0.2)
+
+        async with stalled_through_negotiation(hosted) as stream:
+            hosted.config.sync.github.deny_reasons = ["subscribed", "comment"]
+            outcome = await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
+            assert outcome == "published on 0 stream(s)"
+
+        await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
+        [frame] = stream.sent("subscriptions")
+        filters = frame["payload"]["subscriptions"]["sources"][0]["filters"]
+        assert filters["deny_reasons"] == ["subscribed", "comment"]
 
     async def test_a_stream_that_fails_to_publish_is_logged_and_the_others_still_send(
         self, hosted, monkeypatch, caplog,
