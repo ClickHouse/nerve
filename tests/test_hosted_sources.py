@@ -13,7 +13,7 @@ import copy
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -425,12 +425,12 @@ class TestPollingCursor:
 
     async def test_digits_are_no_timestamp_even_when_they_read_as_a_date(self, monkeypatch):
         seen = self.listings(monkeypatch)
-        a_day_ago = datetime.now(timezone.utc) - timedelta(hours=24, minutes=5)
+        a_day_ago = datetime.now(UTC) - timedelta(hours=24, minutes=5)
 
         await GitHubSource().fetch("20000101")
 
         since = seen[0].split("since=", 1)[1].split("&", 1)[0]
-        assert datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) > a_day_ago
+        assert datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC) > a_day_ago
 
 
 # ---------------------------------------------------------------------- #

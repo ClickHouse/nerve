@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -263,7 +263,7 @@ async def _read_up_to_date(db, consumer: str, source: str, expires_in: timedelta
     await db.set_consumer_cursor(consumer, source, await db.get_source_max_rowid(source))
     await db._write(
         "UPDATE consumer_cursors SET expires_at = ? WHERE consumer = ? AND source = ?",
-        ((datetime.now(timezone.utc) + expires_in).isoformat(), consumer, source),
+        ((datetime.now(UTC) + expires_in).isoformat(), consumer, source),
     )
 
 
@@ -289,7 +289,7 @@ class TestMessagesGateKeepsItsCursorsAlive:
 
         assert await MessagesGate(sources=["github"]).is_satisfied(_ctx(db)) is False
 
-        assert await _expiry(db, "inbox", "github") > datetime.now(timezone.utc) + timedelta(days=1)
+        assert await _expiry(db, "inbox", "github") > datetime.now(UTC) + timedelta(days=1)
 
     async def test_a_quiet_spell_does_not_cost_the_first_new_message(self, db, monkeypatch):
         """The job's gate is checked while its cursor has an hour left, and the
@@ -313,7 +313,7 @@ class TestMessagesGateKeepsItsCursorsAlive:
 
         assert await MessagesGate().is_satisfied(_ctx(db)) is False
 
-        later = datetime.now(timezone.utc) + timedelta(days=1)
+        later = datetime.now(UTC) + timedelta(days=1)
         assert await _expiry(db, "inbox", "github") > later
         assert await _expiry(db, "inbox", "gmail") > later
         assert await _expiry(db, "triage", "github") < later
@@ -337,7 +337,7 @@ class TestMessagesGateKeepsItsCursorsAlive:
         await _read_up_to_date(db, "inbox", "github", timedelta(hours=1))
         before = await _expiry(db, "inbox", "github")
 
-        assert await MessagesGate(sources=["github"]).forecast(_ctx(db), datetime.now(timezone.utc)) is False
+        assert await MessagesGate(sources=["github"]).forecast(_ctx(db), datetime.now(UTC)) is False
 
         assert await _expiry(db, "inbox", "github") == before
 

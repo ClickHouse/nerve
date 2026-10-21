@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -410,7 +410,7 @@ class SourceStore:
         """
         if sources is not None and not sources:
             return 0
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         renew_before = (now + timedelta(days=ttl_days / 2)).isoformat()
         where = "consumer = ? AND expires_at IS NOT NULL AND expires_at > ? AND expires_at < ?"
         params: list = [consumer, now.isoformat(), renew_before]
