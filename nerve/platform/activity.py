@@ -50,6 +50,7 @@ from nerve.utils.aio import stop_background_task
 
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
+    from nerve.cron.service import CronService, ScheduledTick
 
 logger = logging.getLogger(__name__)
 
@@ -220,12 +221,14 @@ def _rfc3339(at: datetime) -> str:
 def next_task_name(name: object) -> str | None:
     """*name* in the form the socket takes, or ``None`` when nothing is left.
 
-    Characters outside ``[A-Za-z0-9._:-]`` become ``-`` (so the result is
+    The cron service already names its ticks this way; this is the guard at
+    the boundary, since one name the socket refuses loses the whole report.
+    Characters outside ``[A-Za-z0-9._:-]`` become ``_`` (so the result is
     ASCII and its length is its size in bytes), cut at 64.
     """
     if not isinstance(name, str):
         return None
-    cleaned = _NEXT_TASK_NAME_REFUSED.sub("-", name)[:NEXT_TASK_NAME_MAX_BYTES]
+    cleaned = _NEXT_TASK_NAME_REFUSED.sub("_", name)[:NEXT_TASK_NAME_MAX_BYTES]
     return cleaned or None
 
 
@@ -274,7 +277,7 @@ class ActivityReporter:
         config: NerveConfig,
         engine: Any,
         db: Any,
-        cron_service: Any,
+        cron_service: CronService | None,
         *,
         connection_count: Callable[[], int] | None = None,
     ) -> None:
@@ -300,7 +303,7 @@ class ActivityReporter:
         # inside one coalescing window is still reported as running once.
         self._turn_started = False
         # The cron service's last answer, kept for when it fails.
-        self._next_tick: tuple[datetime, str] | None = None
+        self._next_tick: ScheduledTick | None = None
         # Leases the socket may hold, by name.
         self._leases: dict[str, _Lease] = {}
         self._last_post = -math.inf
@@ -458,10 +461,10 @@ class ActivityReporter:
         _keep_awake.add_listener(self._leases_changed)
         self._undo.append(lambda: _keep_awake.remove_listener(self._leases_changed))
 
-        if self._cron is not None and _add_schedule_listener(self._cron, self.notify):
-            remove = getattr(self._cron, "remove_schedule_listener", None)
-            if remove is not None:
-                self._undo.append(lambda: remove(self.notify))
+        cron = self._cron
+        if cron is not None:
+            cron.add_schedule_listener(self.notify)
+            self._undo.append(lambda: cron.remove_schedule_listener(self.notify))
 
     def _on_running_changed(self, _session_id: str, running: bool) -> None:
         if running:
@@ -519,14 +522,12 @@ class ActivityReporter:
         return self._body(running, self._active_sessions(), tick)
 
     @staticmethod
-    def _body(
-        running: int, sessions: int, tick: tuple[datetime, str] | None,
-    ) -> dict[str, Any]:
+    def _body(running: int, sessions: int, tick: ScheduledTick | None) -> dict[str, Any]:
         return {
             "runningTurns": running,
             "activeSessions": sessions,
-            "nextScheduledAt": _rfc3339(tick[0]) if tick else None,
-            _TASK_NAME_KEY: next_task_name(tick[1]) if tick else None,
+            "nextScheduledAt": _rfc3339(tick.at) if tick else None,
+            _TASK_NAME_KEY: next_task_name(tick.name) if tick else None,
         }
 
     async def _post_activity(self, body: dict[str, Any]) -> bool:
@@ -538,16 +539,16 @@ class ActivityReporter:
             return False
         if response.status_code == 400 and _TASK_NAME_KEY in body:
             # A socket that predates the task's name refuses the unknown field,
-            # and with it the whole report. Send the report without the name,
-            # and keep leaving the name out if that is what it takes.
+            # and with it the whole report. Send the report once more without
+            # the name; if that is taken, leave the name out from now on.
             retry = {key: value for key, value in body.items() if key != _TASK_NAME_KEY}
             second = await self._request("POST", ACTIVITY_ROUTE, retry, None)
             if second is not None and second.is_success:
                 self._send_task_name = False
                 self._activity_failures.succeeded()
                 logger.info(
-                    "Platform activity socket refused the next task's name "
-                    "(%s); reporting without it", _error_detail(response),
+                    "Platform activity socket does not accept task names; "
+                    "reporting times only (%s)", _error_detail(response),
                 )
                 return True
         if response.is_success:
@@ -581,12 +582,12 @@ class ActivityReporter:
             logger.debug("activity reporter: connection count unavailable: %s", e)
             return 0
 
-    async def _next_scheduled(self) -> tuple[datetime, str] | None:
+    async def _next_scheduled(self) -> ScheduledTick | None:
         if self._cron is None:
             return None
         try:
             tick = await asyncio.wait_for(
-                _next_scheduled(self._cron), SCHEDULE_TIMEOUT_SECONDS,
+                self._cron.next_scheduled(), SCHEDULE_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             raise
@@ -594,8 +595,8 @@ class ActivityReporter:
             self._schedule_failures.failed(f"{type(e).__name__}: {e}")
             return self._next_tick
         self._schedule_failures.succeeded()
-        self._next_tick = None if tick is None else (tick.at, tick.name)
-        return self._next_tick
+        self._next_tick = tick
+        return tick
 
     # ------------------------------------------------------------------ #
     #  Leases                                                             #
@@ -708,25 +709,3 @@ class ActivityReporter:
         if spacing > 0:
             await asyncio.sleep(spacing)
         await self._post_activity(self._body(0, 0, self._next_tick))
-
-
-# --------------------------------------------------------------------------- #
-#  Cron service seam                                                          #
-# --------------------------------------------------------------------------- #
-
-
-async def _next_scheduled(cron_service: Any) -> Any:
-    """The cron service's next scheduled tick (``at``, ``name``), or ``None``."""
-    method = getattr(cron_service, "next_scheduled", None)
-    if method is None:
-        return None
-    return await method()
-
-
-def _add_schedule_listener(cron_service: Any, listener: Callable[[], None]) -> bool:
-    """Ask the cron service to call *listener* when its schedule changes."""
-    add = getattr(cron_service, "add_schedule_listener", None)
-    if add is None:
-        return False
-    add(listener)
-    return True

@@ -46,7 +46,7 @@ Every report is `POST /v1/activity` with this JSON body:
 | `runningTurns` | Sessions running a turn now, plus [workflow runs](workflow-runs.md) that are queued or still running without a turn (for example while background work they started drains). A run counts once. Its turn is counted through its session. Review-loop legs are workflow runs. A turn that starts and ends between two reports is still reported once as running, so the platform can tell that something ran. |
 | `activeSessions` | Open web UI connections (authenticated WebSocket clients of `/ws`). Telegram, Slack and hosted channel streams are not client connections and are not counted. |
 | `nextScheduledAt` | When the next scheduled task that will actually run is due, in UTC (RFC 3339, whole seconds). `null` when nothing is scheduled. The cron service forecasts it. Jobs whose gates would skip the run are left out, and source runners and pending session wakeups are included. The internal `cleanup` and `wakeup_sweep` jobs never count. See [Cron](cron.md). |
-| `nextScheduledName` | That task's name: the job id, `source:<name>`, or `wakeup:<first 8 characters of the session id>`. Any character outside `[A-Za-z0-9._:-]` becomes `-`, and the name is cut at 64 characters. `null` together with `nextScheduledAt`. |
+| `nextScheduledName` | That task's name: the job id, `source:<name>`, or `wakeup:<first 8 characters of the session id>`. Any character outside `[A-Za-z0-9._:-]` becomes `_`, and the name is cut at 64 characters: the socket refuses a whole report whose name breaks that rule. `null` together with `nextScheduledAt`. |
 
 A report is sent:
 
@@ -55,7 +55,9 @@ A report is sent:
   finishing, a wakeup being claimed), or a workflow run finishes. At most one
   report goes out every 250 ms. A burst of changes is folded into one report
   that shows the state at its end. The first change after a quiet period goes
-  out at once, so a turn start reaches the platform right away.
+  out at once, so a turn start reaches the platform right away. The report that
+  follows a run already names the task after it. A wakeup that a session
+  schedules during its turn is in the report at the end of that turn.
 - every `platform.activity_interval_seconds` (default 30), whatever happened.
 - once more at shutdown, saying nothing runs and nobody is connected. The next
   scheduled task is kept, because it is still due after a restart.
@@ -119,9 +121,11 @@ seconds.
 
 If the cron forecast fails, the last known next task is reported again.
 
-A socket that does not know `nextScheduledName` may refuse the field with a
-400, and with it the whole report. In that case the report is sent again
-without the name, and later reports leave the name out.
+A socket that does not know `nextScheduledName` refuses the field with a 400,
+and with it the whole report. On a 400 the report is sent once more without
+the name. If that is taken, every later report leaves the name out until the
+gateway restarts, and one INFO line says so ("activity socket does not accept
+task names; reporting times only").
 
 ## Switching it off
 

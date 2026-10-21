@@ -12,6 +12,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -26,6 +27,7 @@ import pytest_asyncio
 import nerve.config
 from nerve.agent.sessions import SessionManager
 from nerve.config import NerveConfig, PlatformConfig
+from nerve.cron.service import ScheduledTick
 from nerve.platform import activity
 from nerve.platform.activity import (
     LEASE_BACKGROUND,
@@ -41,6 +43,10 @@ from nerve.platform.activity import (
 # --------------------------------------------------------------------------- #
 #  The fake socket                                                            #
 # --------------------------------------------------------------------------- #
+
+
+# What the socket takes as the next task's name; anything else refuses the report.
+_TASK_NAME = re.compile(r"[A-Za-z0-9._:-]{0,64}")
 
 
 @dataclass
@@ -122,6 +128,10 @@ class FakeActivitySocket:
             return status, {"error": "invalid_request"}
         if isinstance(body, dict) and self.unknown_fields & body.keys():
             return 400, {"error": "invalid_request"}
+        if target == "/v1/activity" and not _TASK_NAME.fullmatch(
+            (body or {}).get("nextScheduledName") or "",
+        ):
+            return 400, {"error": "invalid_name"}  # the whole report is refused
         if method == "POST" and target == "/v1/leases":
             return 200, {"name": body["name"], "expiresAt": "2030-01-01T00:00:00Z"}
         return 200, {"ok": True}
@@ -189,15 +199,14 @@ class FakeDb:
         return list(self.runs)
 
 
-@dataclass(frozen=True)
-class Tick:
-    at: datetime
-    name: str
-    kind: str = "cron"
+def tick(at: datetime, name: str, kind: str = "cron") -> ScheduledTick:
+    return ScheduledTick(at=at, name=name, kind=kind)
 
 
 class FakeCron:
-    def __init__(self, tick: Tick | None = None) -> None:
+    """The cron service's schedule surface, with a settable answer."""
+
+    def __init__(self, tick: ScheduledTick | None = None) -> None:
         self.tick = tick
         self.listeners: list[Callable[[], Any]] = []
         self.fail = False
@@ -210,8 +219,11 @@ class FakeCron:
     def add_schedule_listener(self, callback: Callable[[], Any]) -> None:
         self.listeners.append(callback)
 
+    def remove_schedule_listener(self, callback: Callable[[], Any]) -> None:
+        self.listeners.remove(callback)
+
     def changed(self) -> None:
-        for callback in self.listeners:
+        for callback in list(self.listeners):
             callback()
 
 
@@ -415,7 +427,7 @@ async def test_active_sessions_is_the_client_connection_count(fake_socket, repor
 @pytest.mark.asyncio
 async def test_next_scheduled_task_is_reported_in_utc(fake_socket, reporters):
     eastern = timezone(timedelta(hours=-4))
-    cron = FakeCron(Tick(datetime(2026, 10, 21, 23, 0, 0, 750000, tzinfo=eastern), "memory-maintenance"))
+    cron = FakeCron(tick(datetime(2026, 10, 21, 23, 0, 0, 750000, tzinfo=eastern), "memory-maintenance"))
     await started(reporters, make_reporter(fake_socket.path, cron=cron))
     await fake_socket.wait_for(lambda: fake_socket.reports())
 
@@ -424,7 +436,7 @@ async def test_next_scheduled_task_is_reported_in_utc(fake_socket, reporters):
     assert report["nextScheduledName"] == "memory-maintenance"
 
     # The cron service says its schedule changed: a new report follows.
-    cron.tick = Tick(datetime(2026, 10, 22, 5, 30, tzinfo=UTC), "wakeup:0f3a9c2e", "wakeup")
+    cron.tick = tick(datetime(2026, 10, 22, 5, 30, tzinfo=UTC), "wakeup:0f3a9c2e", "wakeup")
     cron.changed()
     await fake_socket.wait_for(
         lambda: fake_socket.reports()[-1]["nextScheduledName"] == "wakeup:0f3a9c2e",
@@ -439,7 +451,7 @@ async def test_next_scheduled_task_is_reported_in_utc(fake_socket, reporters):
 
 @pytest.mark.asyncio
 async def test_a_failing_forecast_keeps_the_last_known_task(fake_socket, reporters):
-    cron = FakeCron(Tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
     reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
     await fake_socket.wait_for(lambda: fake_socket.reports())
 
@@ -449,9 +461,24 @@ async def test_a_failing_forecast_keeps_the_last_known_task(fake_socket, reporte
     assert fake_socket.reports()[-1]["nextScheduledName"] == "digest"
 
 
+@pytest.mark.asyncio
+async def test_a_task_name_the_socket_would_refuse_is_cleaned_first(fake_socket, reporters):
+    """One name the socket refuses would lose the whole report, so the name
+    is cleaned before it is sent: other characters become ``_``, cut at 64."""
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "Daily digest (EU)/ü" + "x" * 80))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    await asyncio.sleep(0.3)
+
+    (report,) = fake_socket.reports()  # accepted the first time: no retry
+    name = report["nextScheduledName"]
+    assert name.startswith("Daily_digest__EU___") and len(name) == 64
+    assert _TASK_NAME.fullmatch(name)
+
+
 def test_next_task_names_are_made_acceptable():
     assert next_task_name("source:gmail") == "source:gmail"
-    assert next_task_name("daily digest/ü") == "daily-digest--"
+    assert next_task_name("daily digest/ü") == "daily_digest__"
     assert next_task_name("x" * 80) == "x" * 64
     assert next_task_name("") is None
     assert next_task_name(None) is None
@@ -665,7 +692,7 @@ async def test_a_400_is_logged_once_and_never_raised(fake_socket, reporters, cap
 @pytest.mark.asyncio
 async def test_a_socket_that_refuses_the_task_name_gets_reports_without_it(fake_socket, reporters, caplog):
     fake_socket.unknown_fields = {"nextScheduledName"}
-    cron = FakeCron(Tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
     with caplog.at_level(logging.INFO, logger="nerve.platform.activity"):
         reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
         await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 2)
@@ -678,8 +705,17 @@ async def test_a_socket_that_refuses_the_task_name_gets_reports_without_it(fake_
         reporter.notify()
         await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 3)
         assert "nextScheduledName" not in fake_socket.reports()[2]
-        # Logged once the retry's answer is read, which the third report follows.
-        assert any("reporting without it" in r.getMessage() for r in caplog.records)
+        reporter.notify()
+        await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 4)
+        assert "nextScheduledName" not in fake_socket.reports()[3]
+        # Logged once, when the retry's answer was read (the third report follows it).
+        said = [
+            r for r in caplog.records
+            if "activity socket does not accept task names; reporting times only"
+            in r.getMessage()
+        ]
+        assert len(said) == 1 and said[0].levelno == logging.INFO
+        assert not [r for r in caplog.records if "activity report failed" in r.getMessage()]
 
 
 @pytest.mark.asyncio
@@ -714,7 +750,7 @@ async def test_the_socket_going_away_and_coming_back(fake_socket, reporters, cap
 @pytest.mark.asyncio
 async def test_stop_releases_leases_and_reports_nothing_running(fake_socket):
     engine = FakeEngine()
-    cron = FakeCron(Tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
     reporter = make_reporter(fake_socket.path, engine=engine, cron=cron)
     assert await reporter.start()
     engine.sessions.mark_running("web:main")
@@ -731,7 +767,7 @@ async def test_stop_releases_leases_and_reports_nothing_running(fake_socket):
     }
     assert not reporter.active
     assert engine.sessions._running_listeners == ()
-    assert cron.listeners  # the fake has no remove; the listener is a no-op now
+    assert cron.listeners == []
     count = len(fake_socket.requests)
     engine.sessions.mark_not_running("web:main")
     cron.changed()
@@ -923,3 +959,100 @@ def test_doctor_report_shows_a_present_socket(tmp_path, listening):
     (config_dir / "config.local.yaml").write_text("{}\n", encoding="utf-8")
     report = doctor_report(load_config(config_dir))
     assert f"[OK] Platform activity socket: present ({listening})" in report
+
+
+# --------------------------------------------------------------------------- #
+#  With the real cron service                                                 #
+# --------------------------------------------------------------------------- #
+
+
+@pytest_asyncio.fixture
+async def cron_service(tmp_path, monkeypatch):
+    """A started cron service with two jobs and its scheduler held, so a test
+    sets each job's next run itself. Runs go to an engine double."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from nerve.agent.engine import TurnOutcome, TurnResult
+    from nerve.cron import service as cron_module
+    from nerve.cron.jobs import CronJob
+    from nerve.cron.service import CronService
+    from tests.actor_rows import mock_system_principal
+
+    monkeypatch.setattr(cron_module, "_CLOCK_WATCH_SECONDS", 3600)
+    config = MagicMock()
+    config.timezone = "UTC"
+    config.lockdown = False
+    config.cron.gate_plugins_dir = tmp_path / "gates"
+    config.agent.cron_model = "test-model"
+    engine = AsyncMock()
+    engine.run_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
+    db = AsyncMock()
+    db.log_cron_start = AsyncMock(return_value=1)
+    db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    db.list_pending_wakeups = AsyncMock(return_value=[])
+    mock_system_principal(db)
+    service = CronService(config, engine, db)
+    jobs = [
+        CronJob(id="nightly-digest", schedule="0 * * * *", prompt="p"),
+        CronJob(id="weekly-review", schedule="0 * * * *", prompt="p"),
+    ]
+    with (
+        patch.object(service, "_load_merged_jobs", return_value=jobs),
+        patch.object(service, "_register_source_runners"),
+        patch.object(service, "_catchup_missed_jobs", AsyncMock()),
+    ):
+        await service.start()
+    service.scheduler.pause()
+    yield service
+    await service.stop()
+
+
+def _rfc(at: datetime) -> str:
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.asyncio
+async def test_reports_follow_the_cron_services_forecast(fake_socket, reporters, cron_service):
+    now = datetime.now(UTC).replace(microsecond=0)
+    cron_service.scheduler.modify_job("nightly-digest", next_run_time=now + timedelta(hours=1))
+    cron_service.scheduler.modify_job("weekly-review", next_run_time=now + timedelta(hours=5))
+
+    reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron_service))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert fake_socket.reports()[0]["nextScheduledAt"] == _rfc(now + timedelta(hours=1))
+    assert fake_socket.reports()[0]["nextScheduledName"] == "nightly-digest"
+
+    # A reload, say, tells the service's listeners what runs next may have changed.
+    cron_service.scheduler.modify_job("nightly-digest", next_run_time=now + timedelta(hours=2))
+    cron_service._schedule_changed()
+    await fake_socket.wait_for(
+        lambda: fake_socket.reports()[-1]["nextScheduledAt"] == _rfc(now + timedelta(hours=2)),
+    )
+
+    await reporter.stop()
+    assert reporter.notify not in cron_service._schedule_listeners
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_is_reported_with_the_task_after_it(fake_socket, reporters, cron_service):
+    """The platform reads the last report when it parks the machine, so the
+    report that follows a run already names the task after the one that ran."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    cron_service.scheduler.modify_job("nightly-digest", next_run_time=now + timedelta(minutes=5))
+    cron_service.scheduler.modify_job("weekly-review", next_run_time=now + timedelta(hours=2))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron_service))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert fake_socket.reports()[-1]["nextScheduledName"] == "nightly-digest"
+    await asyncio.sleep(0.3)  # past the first report's coalescing window
+
+    # The scheduler moves a job to its next fire time as it starts the run.
+    cron_service.scheduler.modify_job("nightly-digest", next_run_time=now + timedelta(hours=3))
+    before = len(fake_socket.reports())
+    await cron_service.run_job("nightly-digest")
+    finished = asyncio.get_running_loop().time()
+
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) > before)
+    report = fake_socket.reports()[before]
+    assert report["nextScheduledName"] == "weekly-review"
+    assert report["nextScheduledAt"] == _rfc(now + timedelta(hours=2))
+    assert fake_socket.report_times()[before] - finished < 0.2
