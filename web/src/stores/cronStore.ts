@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type CronSchedule } from '../api/client';
 
 export const LOGS_PAGE_SIZE = 50;
 
@@ -17,7 +17,64 @@ export interface CronJob {
   next_run: string | null;
   /** Most recently active chat session for this job (cron:{id}[:{run}]). */
   last_session_id?: string | null;
+  /** What the gates say about the next run, judged now; null when unknown. */
+  forecast?: 'run' | 'skip' | null;
+  /** Why the next run is forecast to skip. */
+  forecast_reason?: string | null;
 }
+
+/** Each job with the forecast the schedule reports for it. */
+function withForecasts(jobs: CronJob[], schedule: CronSchedule | null): CronJob[] {
+  const byId = new Map((schedule?.jobs ?? []).map(f => [f.id, f]));
+  return jobs.map(job => {
+    const f = byId.get(job.id);
+    return { ...job, forecast: f?.forecast ?? null, forecast_reason: f?.reason ?? null };
+  });
+}
+
+/** Each job with the forecast it had in `previous`, until fresh ones arrive. */
+function keepForecasts(jobs: CronJob[], previous: CronJob[]): CronJob[] {
+  const byId = new Map(previous.map(job => [job.id, job]));
+  return jobs.map(job => {
+    const before = byId.get(job.id);
+    return {
+      ...job,
+      forecast: before?.forecast ?? null,
+      forecast_reason: before?.forecast_reason ?? null,
+    };
+  });
+}
+
+/**
+ * How long the Cron page waits for the forecasts. Every job's gates are asked
+ * for them on the server, so a slow gate makes them slow; the job list never
+ * waits for them, and after this long the page goes on without them.
+ */
+export const FORECAST_TIMEOUT_MS = 10_000;
+
+/** The schedule, or null when it fails or takes longer than FORECAST_TIMEOUT_MS. */
+async function loadSchedule(): Promise<CronSchedule | null> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<null>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort();
+      console.error(`The cron forecasts took longer than ${FORECAST_TIMEOUT_MS / 1000}s; showing the jobs without them`);
+      resolve(null);
+    }, FORECAST_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([api.getCronSchedule(controller.signal), timedOut]);
+  } catch (e) {
+    console.error('Failed to load the cron schedule:', e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Counts loadJobs calls, so that answers to an older one never replace a newer one's. */
+let jobsLoads = 0;
 
 export interface CronLog {
   id: number;
@@ -61,12 +118,22 @@ export const useCronStore = create<CronState>((set, get) => ({
   rotating: null,
 
   loadJobs: async () => {
+    const load = ++jobsLoads;
+    // Asked for alongside the list, but the list never waits for them: the
+    // jobs show as soon as they arrive (with the forecasts they had), and the
+    // fresh forecasts are filled in when they come.
+    const schedule = loadSchedule();
     try {
       const { jobs } = await api.listCronJobs();
-      set({ jobs });
+      if (load !== jobsLoads) return;
+      set({ jobs: keepForecasts(jobs, get().jobs) });
     } catch (e) {
       console.error('Failed to load cron jobs:', e);
+      return;
     }
+    void schedule.then(forecasts => {
+      if (load === jobsLoads) set({ jobs: withForecasts(get().jobs, forecasts) });
+    });
   },
 
   loadLogs: async (offset?: number) => {

@@ -4,13 +4,17 @@ own next, judged from what is known now."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 import pytest_asyncio
+from click.testing import CliRunner
+from fastapi import FastAPI
 
 from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron import gates as gates_module
@@ -33,6 +37,11 @@ IN_AN_HOUR = timedelta(hours=1)
 
 def _ctx(db, job_id: str = "job") -> GateContext:
     return GateContext(job_id=job_id, db=db)
+
+
+@pytest.fixture(autouse=True)
+def _no_forecast_failure_warned_yet(monkeypatch):
+    monkeypatch.setattr(gates_module, "_forecast_warned", {})
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +101,20 @@ async def test_a_messages_gate_forecast_sees_unread_messages(db):
 
     assert await gate.forecast(_ctx(db), datetime.now(UTC)) is True
     assert await gate.is_satisfied(_ctx(db)) is True
+
+
+@pytest.mark.asyncio
+async def test_a_messages_gate_forecast_sees_its_cursor_expire_before_the_run(db):
+    """When the run comes, an expired cursor starts again at the newest message,
+    so the check finds nothing unread there."""
+    await db.insert_source_messages([_record("m1")], source="mail")
+    await db.set_consumer_cursor("inbox", "mail", 0, ttl_days=1)
+    gate = MessagesGate(sources=["mail"], consumer="inbox")
+    now = datetime.now(UTC)
+
+    assert await gate.forecast(_ctx(db), now + timedelta(hours=3)) is True
+    assert await gate.forecast(_ctx(db), now + timedelta(days=2)) is False
+    assert await db.peek_consumer_cursor("inbox", "mail") == 0  # still live now
 
 
 @pytest.mark.asyncio
@@ -159,6 +182,75 @@ async def test_forecast_gates_fails_open_and_says_so(caplog):
 
     assert decision.should_run is True
     assert any("flaky" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_forecast_is_warned_about_once_per_job_in_ten_minutes(caplog):
+    async def read(job_id: str) -> None:
+        await forecast_gates(
+            [_Gate(raises=True)], _ctx(AsyncMock(), job_id), datetime.now(UTC),
+        )
+
+    def warned() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    with caplog.at_level(logging.DEBUG, logger="nerve.cron.gates"):
+        for _ in range(5):
+            await read("flaky")
+        assert len(warned()) == 1
+        assert sum(r.levelno == logging.DEBUG for r in caplog.records) == 4
+
+        await read("other")  # each job is warned about on its own
+        assert len(warned()) == 2
+
+        gates_module._forecast_warned["flaky"] -= 600  # ten minutes on
+        await read("flaky")
+        assert len(warned()) == 3
+
+
+_PLUGIN = '''
+from nerve.cron.gates import CronGate
+
+
+class {name}(CronGate):
+    type = "{type}"
+
+    async def is_satisfied(self, ctx):
+        return True
+{forecast}
+    def describe(self):
+        return "{type}"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls()
+'''
+
+_OWN_FORECAST = '''
+    async def forecast(self, ctx, at):
+        return True
+'''
+
+
+def test_a_plugin_gate_on_the_default_forecast_is_warned_about(
+    tmp_path, clean_registry, caplog,
+):
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    (tmp_path / "checks.py").write_text(
+        _PLUGIN.format(name="ChecksGate", type="checks_now", forecast=""),
+    )
+    (tmp_path / "forecasts.py").write_text(
+        _PLUGIN.format(name="ForecastsGate", type="forecasts", forecast=_OWN_FORECAST),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="nerve.cron.gate_plugins"):
+        assert load_gate_plugins(tmp_path) == 2
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "'checks_now'" in warnings[0]
+    assert "every schedule read" in warnings[0]
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +404,29 @@ async def test_nothing_beyond_the_horizon_counts(held):
 
 
 @pytest.mark.asyncio
+async def test_now_must_be_timezone_aware(held):
+    svc = await held([_job("digest")])
+    # Naive on purpose: a time without a zone is what must be refused.
+    naive = datetime.now(UTC).replace(tzinfo=None)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await svc.next_scheduled(now=naive)
+
+
+@pytest.mark.asyncio
+async def test_a_wakeup_due_but_not_yet_fired_keeps_its_due_time(held):
+    now = datetime.now(UTC)
+    db = _mock_db(pending_wakeups=[
+        {"session_id": "0a1b2c3d4e5f", "fire_at": (now - timedelta(seconds=15)).isoformat()},
+    ])
+    svc = await held(db=db)
+
+    tick = await svc.next_scheduled(now=now)
+
+    assert tick.at == now - timedelta(seconds=15)
+
+
+@pytest.mark.asyncio
 async def test_names_are_safe_to_report(held):
     now = datetime.now(UTC)
     long_id = "a-very-long-job-name-" * 5
@@ -360,6 +475,125 @@ async def test_the_schedule_report(held):
     assert by_id["source:mail"]["forecast"] == "run"
 
 
+class _OpensAt(CronGate):
+    """A gate that reasons about the time: runs may go ahead from ``opens`` on."""
+
+    type = "opens_at"
+
+    def __init__(self) -> None:
+        self.opens = datetime.max.replace(tzinfo=UTC)
+        self.asked_at: list[datetime] = []
+
+    async def is_satisfied(self, ctx):
+        return datetime.now(UTC) >= self.opens
+
+    async def forecast(self, ctx, at):
+        self.asked_at.append(at)
+        return at >= self.opens
+
+    def describe(self):
+        return "opens later"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls()
+
+
+class _ChecksNow(CronGate):
+    """A gate on the default forecast that counts how often its check runs."""
+
+    type = "checks_now"
+
+    def __init__(self, answer: bool) -> None:
+        self.answer, self.checks = answer, 0
+
+    async def is_satisfied(self, ctx):
+        self.checks += 1
+        return self.answer
+
+    def describe(self):
+        return "checks now"
+
+    @classmethod
+    def from_config(cls, _config):
+        return cls(True)
+
+
+async def _hourly_job_with(held, *gates) -> tuple[CronService, datetime]:
+    """A started service whose one job runs hourly behind *gates*, and that
+    job's next run."""
+    job = _job("hourly")
+    svc = await held([job])
+    job.gates = list(gates)
+    return svc, svc.scheduler.get_job("hourly").next_run_time
+
+
+@pytest.mark.asyncio
+async def test_a_later_run_a_gate_will_let_through_is_the_next_tick(held):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=2)
+
+    tick = await svc.next_scheduled()
+
+    assert tick == ScheduledTick(at=first + timedelta(hours=2), name="hourly", kind="cron")
+    assert opens.asked_at == [first + timedelta(hours=n) for n in range(3)]
+    # The job's next run itself is still forecast to skip.
+    [job] = (await svc.schedule_report())["jobs"]
+    assert job["next_run"] == first.isoformat()
+    assert job["forecast"] == "skip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("opens_after_hours", "found"), [(8, True), (9, False)])
+async def test_eight_more_runs_are_tried_at_most(held, opens_after_hours, found):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=opens_after_hours)
+
+    tick = await svc.next_scheduled()
+
+    assert (tick is not None) is found
+    assert len(opens.asked_at) == 9
+
+
+@pytest.mark.asyncio
+async def test_no_run_beyond_the_horizon_is_tried(held):
+    opens = _OpensAt()
+    svc, first = await _hourly_job_with(held, opens)
+    opens.opens = first + timedelta(hours=2)
+
+    tick = await svc.next_scheduled(
+        now=first - timedelta(minutes=30), horizon=timedelta(hours=2),
+    )
+
+    assert tick is None
+    assert opens.asked_at == [first, first + timedelta(hours=1)]
+
+
+@pytest.mark.asyncio
+async def test_a_gate_on_the_default_forecast_has_its_check_run_once(held):
+    checks, opens = _ChecksNow(answer=True), _OpensAt()
+    svc, first = await _hourly_job_with(held, checks, opens)
+    opens.opens = first + timedelta(hours=3)
+
+    tick = await svc.next_scheduled()
+
+    assert tick.at == first + timedelta(hours=3)
+    assert checks.checks == 1
+
+
+@pytest.mark.asyncio
+async def test_no_later_run_is_tried_when_a_default_forecast_says_no(held):
+    opens, checks = _OpensAt(), _ChecksNow(answer=False)
+    svc, first = await _hourly_job_with(held, opens, checks)
+    opens.opens = first
+
+    assert await svc.next_scheduled() is None
+    assert checks.checks == 1
+    assert len(opens.asked_at) <= 1
+
+
 # ---------------------------------------------------------------------------
 # Schedule listeners
 # ---------------------------------------------------------------------------
@@ -398,6 +632,39 @@ async def test_listeners_hear_every_run_including_a_gate_skip(held):
     assert heard.call_count == 2
     await svc._run_source_wrapper(runner)
     assert heard.call_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["job", "source"])
+async def test_listeners_hear_a_scheduled_fire_skipped_for_its_catch_up(held, kind):
+    """A fire that comes while the job's catch-up still runs is skipped; the
+    listeners hear about it as about any other run that ends."""
+    runner = _runner("mail")
+    svc = await held([_job("digest")], [runner])
+    if kind == "job":
+        work, wrapper, target = svc.engine.run_cron, svc._run_job_wrapper, svc._jobs[0]
+    else:
+        work, wrapper, target = runner.run, svc._run_source_wrapper, runner
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def until_released(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return work.return_value
+
+    work.side_effect = until_released
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+    catch_up = asyncio.create_task(wrapper(target, origin="catchup"))
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    await wrapper(target)  # the scheduler's fire
+
+    work.assert_awaited_once()
+    heard.assert_called_once_with()
+    release.set()
+    await catch_up
+    assert heard.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -446,3 +713,174 @@ async def test_async_and_failing_listeners(held, caplog):
     svc.remove_schedule_listener(eager)
     await svc._run_job_wrapper(svc._jobs[0])
     assert calls == ["broken", "async"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_async_listener_is_logged_with_its_traceback(held, caplog):
+    svc = await held([_job("digest")])
+
+    async def broken() -> None:
+        raise RuntimeError("listener bug")
+
+    svc.add_schedule_listener(broken)
+    with caplog.at_level(logging.ERROR, logger="nerve.cron.service"):
+        await svc._run_job_wrapper(svc._jobs[0])
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    [record] = [r for r in caplog.records if "listener" in r.getMessage().lower()]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_listeners_hear_nothing_once_the_service_is_stopping(held):
+    svc = await held([_job("digest")])
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+
+    async def run_until_cancelled(**_kwargs) -> TurnResult:
+        await asyncio.Event().wait()
+
+    svc.engine.run_cron = run_until_cancelled
+    run = asyncio.create_task(svc._run_job_wrapper(svc._jobs[0]))
+    await asyncio.sleep(0)
+    await svc.stop()
+    # The shutdown cancels the runs in flight; each still ends in the wrapper.
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run
+
+    heard.assert_not_called()
+    assert not svc._listener_tasks
+
+
+# ---------------------------------------------------------------------------
+# GET /api/cron/schedule and `nerve cron next`
+# ---------------------------------------------------------------------------
+
+_REPORT = {
+    "next": {"at": "2026-03-02T09:00:00+00:00", "name": "digest", "kind": "cron"},
+    "jobs": [
+        {"id": "planner", "next_run": "2026-03-02T08:00:00+00:00",
+         "forecast": "skip", "reason": "gate 'tasks' not satisfied (pending tasks exist)"},
+        {"id": "digest", "next_run": "2026-03-02T09:00:00+00:00",
+         "forecast": "run", "reason": None},
+        {"id": "off", "next_run": None, "forecast": None, "reason": None},
+    ],
+}
+
+
+def _cron_app(bypass_auth) -> FastAPI:
+    from nerve.gateway.routes import cron as cron_routes
+
+    app = FastAPI()
+    app.include_router(cron_routes.router)
+    return bypass_auth(app)
+
+
+@pytest.mark.asyncio
+async def test_the_schedule_route_returns_the_report(bypass_auth, monkeypatch):
+    service = SimpleNamespace(schedule_report=AsyncMock(return_value=_REPORT))
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+    transport = httpx.ASGITransport(app=_cron_app(bypass_auth))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cron/schedule")
+
+    assert response.status_code == 200
+    assert response.json() == _REPORT
+
+
+@pytest.mark.asyncio
+async def test_the_schedule_route_without_a_cron_service(bypass_auth, monkeypatch):
+    monkeypatch.setattr("nerve.gateway.server._cron_service", None)
+    transport = httpx.ASGITransport(app=_cron_app(bypass_auth))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/cron/schedule")
+
+    assert response.json() == {"next": None, "jobs": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/sources/mail/sync", "/api/sources/sync-all"])
+async def test_a_source_synced_by_hand_tells_the_schedule_listeners(
+    bypass_auth, monkeypatch, path,
+):
+    """New messages can change what a gated job's next run will do."""
+    from nerve.gateway.routes import sources as source_routes
+
+    runner = _runner("mail")
+    service = SimpleNamespace(
+        _source_runners=[runner], notify_schedule_changed=MagicMock(),
+    )
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+    monkeypatch.setattr(source_routes, "get_deps", lambda: SimpleNamespace(db=AsyncMock()))
+    app = FastAPI()
+    app.include_router(source_routes.router)
+    transport = httpx.ASGITransport(app=bypass_auth(app))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path)
+
+    assert response.status_code == 200
+    runner.run.assert_awaited_once()
+    service.notify_schedule_changed.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_work_done_elsewhere_reaches_the_listeners(held):
+    svc = await held()
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+
+    svc.notify_schedule_changed()
+
+    heard.assert_called_once_with()
+
+
+def _config_dir(tmp_path):
+    config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+    config_dir.mkdir()
+    (workspace / "config").mkdir(parents=True)
+    (config_dir / "config.yaml").write_text(
+        f"workspace: {workspace}\ntimezone: UTC\n", encoding="utf-8",
+    )
+    (config_dir / "config.local.yaml").write_text("", encoding="utf-8")
+    return config_dir
+
+
+def test_cron_next_prints_the_next_tick_and_each_forecast(tmp_path, monkeypatch):
+    from nerve import cli
+
+    calls = []
+
+    def fake_request(ctx, config, method, path, body=None):
+        calls.append((method, path))
+        return _REPORT
+
+    monkeypatch.setattr(cli, "_gateway_request", fake_request)
+    result = CliRunner().invoke(cli.main, ["-c", str(_config_dir(tmp_path)), "cron", "next"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("GET", "/api/cron/schedule")]
+    lines = result.output.splitlines()
+    assert lines[0] == "Next: 2026-03-02 09:00:00 UTC — digest (cron)"
+    assert any(
+        "planner" in line and "skip — gate 'tasks' not satisfied" in line for line in lines
+    )
+    assert any("digest" in line and line.rstrip().endswith("run") for line in lines)
+    assert any(line.split()[:1] == ["off"] and line.rstrip().endswith("—") for line in lines)
+
+
+def test_cron_next_with_nothing_scheduled(tmp_path, monkeypatch):
+    from nerve import cli
+
+    monkeypatch.setattr(
+        cli, "_gateway_request", lambda *a, **k: {"next": None, "jobs": []},
+    )
+    result = CliRunner().invoke(cli.main, ["-c", str(_config_dir(tmp_path)), "cron", "next"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == "Next: nothing scheduled in the next 7 days"
