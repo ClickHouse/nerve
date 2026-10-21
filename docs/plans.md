@@ -211,6 +211,25 @@ of the same plan can both proceed.
   - **Request Revision** — quote-style feedback input, sends to planner session
 - Previous feedback shown as blockquote
 
+## Telegram
+
+`/plans` shows the pending and implementing plans as an inline keyboard, one
+button per plan, with paging and a refresh button. Opening a plan shows its
+content and, while it is pending, three actions:
+
+- **Approve**, then **Yes, approve & implement**: the same approval as the web
+  UI, which spawns the implementation session.
+- **Decline**, then **Yes, decline & close**: marks the plan declined and
+  closes its task.
+- **Revise**: asks for feedback in a reply. Only a reply to that prompt, from
+  the user who tapped it, is taken as the feedback; it goes to the planner
+  session as with `plan_revise`.
+
+Every button and the revision reply are checked against the bot's allowed
+users. Telegram users are not mapped to local identities, so a decision made
+from Telegram records no reviewer (both reviewer columns stay empty), and its
+task updates and sessions have no actor or cause.
+
 ## API Endpoints
 
 | Method | Path | Description |
