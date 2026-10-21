@@ -82,6 +82,7 @@ _SECRET_PATHS = frozenset({
     "auth.jwt_secret",
     "langfuse.public_key",
     "langfuse.secret_key",
+    "memory.loom.token",
     "slack.app_token",
     "slack.bot_token",
     "telegram.bot_token",

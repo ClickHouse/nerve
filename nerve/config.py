@@ -2176,8 +2176,108 @@ class MemoryCategoryConfig:
         return cls(name=d["name"], description=d.get("description", ""))
 
 
+# The backends ``memory.backend`` accepts: ``memu`` runs memU inside the
+# process, ``loom`` uses a Loom memory service over HTTP (LoomMemoryConfig).
+MEMORY_BACKENDS: tuple[str, ...] = ("memu", "loom")
+DEFAULT_MEMORY_BACKEND = "memu"
+# Where a local Loom listens by default.
+DEFAULT_LOOM_BASE_URL = "http://localhost:7777"
+# The `agent` Nerve writes under when neither memory.loom.agent nor
+# NERVE_AGENT_ID names one.
+DEFAULT_LOOM_AGENT = "nerve"
+
+# Environment variables that supply a memory setting no config layer sets. A
+# value in any layer wins; the variable only fills a key that is absent or
+# blank. That makes an environment-provisioned instance (a container, a VM
+# seeded by its platform) work with no file at all, and still lets a tracked
+# settings.yaml override it.
+MEMORY_BACKEND_ENV = "NERVE_MEMORY_BACKEND"
+LOOM_BASE_URL_ENV = "LOOM_BASE_URL"
+LOOM_API_KEY_ENV = "LOOM_API_KEY"
+LOOM_ORG_ENV = "LOOM_ORG"
+LOOM_NAMESPACE_ENV = "LOOM_NAMESPACE"
+LOOM_AGENT_ENV = "NERVE_AGENT_ID"
+
+
+def _setting_or_env(value: Any, env: str, default: str = "") -> str:
+    """A string setting, else the environment variable ``env``, else ``default``.
+
+    Blank counts as unset on both sides, so ``namespace:`` with nothing after
+    it, or an exported but empty variable, falls through to the next source.
+    """
+    text = "" if value is None else str(value).strip()
+    if text:
+        return text
+    return os.environ.get(env, "").strip() or default
+
+
+def normalize_loom_base_url(value: Any) -> str:
+    """``memory.loom.base_url`` without a trailing ``/`` or ``/v1``.
+
+    The bridge appends ``/v1/<operation>`` itself, so a value that ends in
+    ``/v1`` would otherwise request ``/v1/v1/...``. Raises ValueError for a
+    value that is not an http or https URL with a host, or that carries
+    credentials, a query or a fragment: the URL is logged and shown on the
+    diagnostics page, and the credential goes in ``memory.loom.token``.
+    """
+    url = "" if value is None else str(value).strip()
+    parts = urlsplit(url)
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or parts.username is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            "memory.loom.base_url must be an http:// or https:// URL with a host "
+            "and no credentials, query or fragment"
+        )
+    return url.rstrip("/").removesuffix("/v1")
+
+
+@dataclass
+class LoomMemoryConfig:
+    """How to reach a Loom memory service when ``memory.backend`` is ``loom``.
+
+    Every string key falls back to an environment variable when no config
+    layer sets it (see the ``*_ENV`` names above). ``org`` and ``namespace``
+    are optional: unset, the bridge asks Loom whose token it holds and uses
+    that token's home namespace (see ``nerve.memory.loom_bridge``).
+    """
+
+    base_url: str = DEFAULT_LOOM_BASE_URL
+    # A bearer token. Secret: config.local.yaml or ${ENV}; never in repr().
+    token: str = field(default="", repr=False)
+    org: str = ""
+    namespace: str = ""
+    agent: str = ""
+    timeout_s: float = 5.0  # reads; writes get 3x, conversation extraction 6x
+    verify_tls: bool = True
+
+    @property
+    def agent_name(self) -> str:
+        """The ``agent`` every write is attributed to."""
+        return self.agent or DEFAULT_LOOM_AGENT
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> LoomMemoryConfig:
+        return cls(
+            base_url=_setting_or_env(d.get("base_url"), LOOM_BASE_URL_ENV, DEFAULT_LOOM_BASE_URL),
+            token=_setting_or_env(d.get("token"), LOOM_API_KEY_ENV),
+            org=_setting_or_env(d.get("org"), LOOM_ORG_ENV),
+            namespace=_setting_or_env(d.get("namespace"), LOOM_NAMESPACE_ENV),
+            agent=_setting_or_env(d.get("agent"), LOOM_AGENT_ENV),
+            timeout_s=d.get("timeout_s", 5.0),
+            verify_tls=d.get("verify_tls", True),
+        )
+
+
 @dataclass
 class MemoryConfig:
+    # Which memory backend serves the memory tools: "memu" or "loom".
+    backend: str = DEFAULT_MEMORY_BACKEND
     recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
     memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
     fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
@@ -2186,6 +2286,7 @@ class MemoryConfig:
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
+    loom: LoomMemoryConfig = field(default_factory=LoomMemoryConfig)
 
     @classmethod
     @_coerced
@@ -2193,7 +2294,17 @@ class MemoryConfig:
         default_dsn = f"sqlite:///{paths.memu_sqlite()}"
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
+        raw_loom = d.get("loom")
+        if raw_loom is not None and not isinstance(raw_loom, dict):
+            logger.warning(
+                "memory.loom must be a mapping of settings, got %s; using the defaults",
+                type(raw_loom).__name__,
+            )
+            raw_loom = None
         return cls(
+            backend=_setting_or_env(
+                d.get("backend"), MEMORY_BACKEND_ENV, DEFAULT_MEMORY_BACKEND,
+            ).lower(),
             recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
             memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
             fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
@@ -2202,6 +2313,7 @@ class MemoryConfig:
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
             categories=categories,
+            loom=LoomMemoryConfig.from_dict(raw_loom or {}),
         )
 
 
@@ -3832,7 +3944,33 @@ class NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
         config._validate_anthropic_base_url()
+        config._validate_memory_backend()
         return config
+
+    def _validate_memory_backend(self) -> None:
+        """Refuse an unknown ``memory.backend``, and an unusable Loom
+        connection when Loom is the backend.
+
+        A typo in the backend name is a hard error, as it is for
+        ``agent.backend``: falling back to memU would boot an instance with
+        an empty memory and nothing to say why. The ``memory.loom`` section
+        is checked only when it is in use, so a stale value there cannot
+        stop a memU instance from starting.
+        """
+        backend = self.memory.backend
+        if backend not in MEMORY_BACKENDS:
+            raise ValueError(
+                f"memory.backend must be one of {MEMORY_BACKENDS}, got {backend!r}"
+            )
+        if backend != "loom":
+            return
+        loom = self.memory.loom
+        loom.base_url = normalize_loom_base_url(loom.base_url)
+        if not loom.timeout_s > 0:
+            raise ValueError(
+                f"memory.loom.timeout_s must be a positive number of seconds, "
+                f"got {loom.timeout_s!r}"
+            )
 
     def _validate_anthropic_base_url(self) -> None:
         """Refuse ``anthropic_base_url`` together with another endpoint setting.
