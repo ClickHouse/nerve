@@ -13,6 +13,7 @@ import copy
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -383,7 +384,9 @@ class TestRegistry:
 
 @pytest.mark.asyncio
 class TestPollingCursor:
-    async def test_a_cursor_that_is_no_timestamp_looks_back_a_day(self, monkeypatch):
+    @staticmethod
+    def listings(monkeypatch) -> list[str]:
+        """The notification listings that the polling source asks gh for."""
         seen: list[str] = []
 
         class _Proc:
@@ -397,11 +400,24 @@ class TestPollingCursor:
             return _Proc()
 
         monkeypatch.setattr("nerve.sources.github.asyncio.create_subprocess_exec", fake_exec)
+        return seen
+
+    async def test_a_cursor_that_is_no_timestamp_looks_back_a_day(self, monkeypatch):
+        seen = self.listings(monkeypatch)
 
         result = await GitHubSource().fetch("57")
 
         assert result.next_cursor == "57"
         assert seen and "since=57" not in seen[0] and "since=20" in seen[0]
+
+    async def test_digits_are_no_timestamp_even_when_they_read_as_a_date(self, monkeypatch):
+        seen = self.listings(monkeypatch)
+        a_day_ago = datetime.now(timezone.utc) - timedelta(hours=24, minutes=5)
+
+        await GitHubSource().fetch("20000101")
+
+        since = seen[0].split("since=", 1)[1].split("&", 1)[0]
+        assert datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) > a_day_ago
 
 
 # ---------------------------------------------------------------------- #

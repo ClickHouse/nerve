@@ -302,6 +302,10 @@ class GitHubSource(Source):
         since = None
         if cursor:
             try:
+                if cursor.isdigit():
+                    # Digits are the buffer position of the hosted source, not
+                    # a time, though eight of them parse as a date.
+                    raise ValueError(cursor)
                 cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
                 since = cursor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             except ValueError:
