@@ -51,8 +51,8 @@ const { useAuthStore } = await import('../../stores/authStore');
 const { useSetupStore } = await import('../../stores/setupStore');
 const { browserTimeZone } = await import('../../utils/timeZones');
 const {
-  CHANNELS, MODE_LOCK_REASON, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState, makeWorkerState, on,
-  step, withStep,
+  CHANNELS, MODE_LOCK_REASON, WAITS_FOR_MODE, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState,
+  makeWorkerState, on, step, withStep,
 } = await import('../../test/setupFixtures');
 const { SetupPage } = await import('../../pages/SetupPage');
 const { ReadyScreen } = await import('./ReadyScreen');
@@ -1725,11 +1725,23 @@ describe('lockdown', () => {
     expect(screen.getAllByRole('status').some((el) => el.textContent?.includes(LOCK))).toBe(true);
     const nav = screen.getByRole('navigation', { name: 'Setup steps' });
     expect(within(nav).getAllByText('Blocked')).toHaveLength(6);
+    // Nothing on the page can complete a locked step, so the count leaves it out.
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
 
     await userEvent.click(within(nav).getByRole('link', { name: /Model/ }));
     await heading('Connect a model');
     expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Continue/ })).not.toBeInTheDocument();
+  });
+
+  it('does not count a locked step that waits for Mode', async () => {
+    // The server keeps the Mode reason but marks the step `lockdown`.
+    current = withStep(lockedState(), step('profile', {
+      status: 'blocked', blocked_kind: 'lockdown', read_only: true, blocked_reason: WAITS_FOR_MODE,
+    }));
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.getByText('2 of 2 steps done')).toBeInTheDocument();
   });
 
   it('local lockdown: only the name is editable on the profile and Continue sends just that', async () => {
@@ -1788,6 +1800,26 @@ describe('instances that keep no credentials on disk', () => {
     const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
     expect(nav.getAllByText('Not available')).toHaveLength(4);
     expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+  });
+
+  it('the overview counts only the steps that apply here', async () => {
+    current = keylessState();
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    // Account and Mode, of Account, Mode, Model, About you and Automation.
+    expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
+    view.unmount();
+
+    // Finished: the closed steps stay in the list, and the count is whole.
+    useSetupStore.getState().reset();
+    current = keylessState({
+      finished: true, steps_left: 0,
+      steps: keylessState().steps.map((s) => (s.status === 'blocked' ? s : step(s.id, { status: 'done' }))),
+    });
+    renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText('5 of 5 steps done')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getAllByText('Not available on this instance')).toHaveLength(4);
   });
 
   it('opening a closed step shows the sentence instead of the form and reads Next', async () => {

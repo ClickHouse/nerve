@@ -418,9 +418,9 @@
      is not the darkest surface, and it holds card-to-lane at 1.053.
 
        bg      #f6f7fa   page
-       sunken  #edeef1   recessed wells
+       sunken  #edeef1   recessed wells, form fields
        surface #ffffff   cards, panels, assistant messages
-       raised  #fafbfc   inputs and secondary buttons sitting on a card
+       raised  #fafbfc   dialogs, secondary buttons sitting on a card
        hover   #eff0f3   hover, which has to darken rather than lighten here
 
      The text ramp below is solved against the darkest background, `sunken`

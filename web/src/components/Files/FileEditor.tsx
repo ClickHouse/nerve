@@ -74,7 +74,7 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
           // Not the `TextArea` primitive: `.editor-textarea` carries the mono
           // stack and `tab-size: 2` that make this a code editor rather than a
           // form field, and the primitive's field chrome (border, radius,
-          // raised surface, px-3 py-2) is wrong for a full-pane editor.
+          // background, px-3 py-2) is wrong for a full-pane editor.
           className="flex-1 p-4 bg-bg-sunken text-sm text-text outline-none resize-none editor-textarea"
           spellCheck={false}
         />

@@ -5,11 +5,12 @@ import { Button, IconButton } from '../ui';
 import { Calendar, Edit3, ExternalLink, Eye, History, Save } from '../ui/icons';
 import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { TaskPlan } from './TaskPlan';
 import { TaskTimeline } from './TaskTimeline';
 
 /**
- * The task editor itself — metadata row, edit/preview toggle, markdown
- * body, save.
+ * The task editor itself: metadata row, the task's plan, edit/preview
+ * toggle, markdown body, save.
  *
  * Shared by the full page and the board's modal so the two can't drift.
  * Only the surrounding chrome differs: the page supplies a back button and
@@ -129,6 +130,8 @@ export function TaskDetailBody({ task }: { task: Task }) {
         </div>
       </div>
 
+      <TaskPlan taskId={task.id} refreshKey={task.updated_at} />
+
       {showHistory && (
         <div className="px-5 py-3 border-b border-border-subtle bg-surface-raised/30 max-h-52 overflow-y-auto shrink-0">
           <TaskTimeline taskId={task.id} currentStatus={task.status} />
@@ -137,13 +140,10 @@ export function TaskDetailBody({ task }: { task: Task }) {
 
       {mode === 'edit' ? (
         // Deliberately *not* the house `TextArea`. That primitive is a form
-        // field — `bg-surface-raised`, a border, a radius and `px-3 py-2` — and
-        // this is a full-bleed document pane that fills the panel and sits on
-        // the sunken surface. Its chrome cannot be undone from here either:
-        // Tailwind emits same-property utilities alphabetically, so
-        // `bg-bg-sunken` on the call site loses to the primitive's
-        // `bg-surface-raised` at equal specificity. The type scale below is the
-        // design system's; the box is this pane's own.
+        // field, with a border, a radius and `px-3 py-2`, and this is a
+        // full-bleed document pane that fills the panel and sits on the
+        // sunken surface. The type scale below is the design system's; the
+        // box is this pane's own.
         <textarea
           value={localContent}
           onChange={(e) => { setLocalContent(e.target.value); setDirty(true); setSaveError(false); }}

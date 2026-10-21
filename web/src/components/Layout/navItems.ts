@@ -11,8 +11,11 @@ export type NavItem = {
   label: string;
   /** Hidden unless the named feature is enabled. `accounts` is enabled in
    *  local mode only: hosted Nerve has no local accounts. `setup` is enabled
-   *  in both modes once the setup checklist has been read; hidden only while
-   *  it is unknown (an older backend, or before the first read answers). */
+   *  in both modes once the setup checklist has been read and while setup is
+   *  not finished; hidden while the checklist is unknown (an older backend,
+   *  or before the first read answers). When setup is finished, a gear in
+   *  the nav rail footer links to `/setup`; the phone's "More" drawer keeps
+   *  the entry. */
   feature?: 'ultracode' | 'accounts' | 'setup';
 };
 
@@ -40,6 +43,8 @@ export interface NavVisibility {
   ultracodeEnabled: boolean;
   /** The setup store has read the checklist at least once. */
   setupKnown: boolean;
+  /** The checklist says that setup is finished. */
+  setupFinished: boolean;
 }
 
 /**
@@ -48,11 +53,11 @@ export interface NavVisibility {
  * store with `getState()` inside a render-time filter, which would not
  * re-render when the answer changes.
  */
-export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, setupKnown }: NavVisibility): NavItem[] {
+export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, setupKnown, setupFinished }: NavVisibility): NavItem[] {
   return items.filter((item) => {
     if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
     if (item.feature === 'accounts' && hosted) return false;
-    if (item.feature === 'setup' && !setupKnown) return false;
+    if (item.feature === 'setup' && (!setupKnown || setupFinished)) return false;
     return true;
   });
 }

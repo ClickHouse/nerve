@@ -72,8 +72,7 @@ export function firstPendingStop(state: SetupState): WizardStop {
 
 /**
  * One-based position of a *step*, for "Step 3 of 9". Review is not a step
- * (it is a frontend route), so it has no position and the Overview's
- * "N of M steps done" counts the same M.
+ * (it is a frontend route), so it has no position.
  */
 export function stopPosition(state: SetupState, id: WizardStop): { index: number; total: number } | null {
   const index = state.steps.findIndex((s) => s.id === id);
@@ -101,6 +100,18 @@ export function waitsForMode(step: Pick<SetupStep, 'status' | 'blocked_reason'>)
 export function closedByPolicy(step: Pick<SetupStep, 'status' | 'blocked_kind' | 'blocked_reason'>): boolean {
   return step.status === 'blocked'
     && (step.blocked_kind === 'policy' || step.blocked_reason === NO_LOCAL_SECRETS_TEXT);
+}
+
+/**
+ * A step that a person can complete on this instance, now or after the
+ * Mode step. A step that the instance closed by policy or by a lockdown
+ * does not apply: the server never counts it as left to do, and the
+ * Overview does not count it in "N of M steps done". On a locked instance
+ * a step can wait for Mode and still be `lockdown`: nothing on the page
+ * can answer Mode there, so that step does not apply either.
+ */
+export function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason' | 'blocked_kind'>): boolean {
+  return step.status !== 'blocked' || (waitsForMode(step) && step.blocked_kind !== 'lockdown');
 }
 
 /** Whether the setup page may store a credential here; an older backend says nothing, which means yes. */

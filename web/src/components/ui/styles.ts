@@ -86,12 +86,20 @@ export function overridable(
 }
 
 /**
+ * The box of a form field, visible on every surface it can sit on.
+ *
+ * The recessed editing surface is darker than the page, a card and a dialog
+ * panel in both themes (`#1d1d1d` dark, `#edeef1` light), and the
+ * full-strength border is distinct from the box. A field must not take the
+ * colour of the `Modal` panel (`bg-surface-raised`): in the dark theme an
+ * empty field in a dialog would then show only when it has focus.
+ *
  * The one focus treatment in the app: the border takes the accent colour and
  * nothing else moves. There is no focus ring anywhere in this codebase, so
  * adding one here would make these controls look unlike their neighbours.
  */
 export const FIELD_BASE =
-  'bg-surface-raised border border-border-subtle text-text outline-none ' +
+  'bg-bg-sunken border border-border text-text outline-none ' +
   'transition-colors focus:border-accent/50 placeholder:text-text-faint ' +
   'disabled:opacity-50 disabled:cursor-not-allowed';
 

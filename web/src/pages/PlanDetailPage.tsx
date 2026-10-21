@@ -1,20 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/ui/icons';
-import { Badge, type BadgeTone, Button, IconButton, TextArea } from '../components/ui';
+import { Badge, Button, IconButton, TextArea } from '../components/ui';
+import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
-
-/** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
-const STATUS_TONES: Record<string, BadgeTone> = {
-  pending: 'warning',
-  approved: 'success',
-  implementing: 'info',
-  declined: 'danger',
-  superseded: 'neutral',
-  failed: 'danger',
-};
 
 /** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
 const TYPE_LABELS: Record<string, string> = {
@@ -91,9 +82,7 @@ export function PlanDetailPage() {
           <h1 className="text-lg font-semibold text-text">
             {plan.task_title || plan.task_id}
           </h1>
-          <Badge size="sm" pill outline tone={STATUS_TONES[plan.status] ?? 'neutral'}>
-            {plan.status}
-          </Badge>
+          <PlanStatusBadge status={plan.status} />
           {plan.plan_type && plan.plan_type !== 'generic' && TYPE_LABELS[plan.plan_type] && (
             <Badge size="sm" pill outline tone="purple">
               {TYPE_LABELS[plan.plan_type]}

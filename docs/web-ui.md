@@ -168,7 +168,9 @@ Back on a dirty form asks "Leave without saving?" inline (`role="alertdialog"`).
 The **Overview** orients: "Signed in as alice" (in external mode: "Signed in
 as Alice Example through your organisation's sign-in"), what the wizard does,
 N of M steps done, the step list with badges and Change links, a notice when a
-restart is pending, and Continue to the first pending step.
+restart is pending, and Continue to the first pending step. M counts only the
+steps that apply on this instance: a step closed by policy ("Not available on
+this instance") or by a lockdown stays in the list but is not counted.
 
 Step forms (`steps/*.tsx`) open on the server's values and are keyed by
 `${viewer.id}:${step.etag}`, so another person's save — or a restart —
@@ -239,7 +241,9 @@ restart is left. Bottom-left on desktop, top on phones. Hidden on `/setup`,
 when setup is finished, while the state is unknown, during a restart, and
 after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
 The **Setup** entry in the navigation appears as soon as the checklist has
-been read, in both auth modes, and stays visible when setup is finished. The
+been read, in both auth modes, and leaves the rail's list when setup is
+finished. Then a gear button labelled "Setup" in the footer of the nav rail
+opens `/setup`. On a phone the entry stays in the **More** drawer. The
 chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
 
