@@ -159,8 +159,12 @@ _HEALTH_FRESH_S = 60.0
 # Codes in a Loom refusal that mean "not now" rather than "never".
 _TRANSIENT_CODES = frozenset({
     "RATE_LIMITED", "OVERLOADED", "BACKEND_TIMEOUT", "EMBED_TIMEOUT", "SCHEMA_PENDING",
-    "AUTH_UNAVAILABLE",
+    "AUTH_UNAVAILABLE", "BACKEND_UNAVAILABLE", "GRANT_BUSY",
 })
+# How Loom words a fault of its own it gives no code: the one fault (JSON-RPC
+# -32000) taken as possibly about the request itself. Every coded fault is
+# Loom saying "not now".
+_UNCODED_FAULT = "tool execution failed: internal error"
 
 # What the startup recall may freeze into a session: items of this many
 # characters, this many bytes in all, from a memories section of this many
@@ -183,11 +187,14 @@ _DEFERRED_BATCH_MAX_MESSAGES = 400
 _DEFERRED_BATCH_MAX_BYTES = 768 * 1024
 _BATCH_MIN_BYTES = 16 * 1024
 _BATCH_MIN_MESSAGES = 10
-# A batch Loom keeps failing on its side (a fault, -32000, it does not name as
-# passing) is isolated after this many failures in a row: cut in halves while
-# the halves fail, down to one message, which is skipped (with an audit row)
-# once Loom has extracted something else since: a fault on every batch is an
-# outage, not a bad batch.
+# A budget cut after a timeout grows back, doubling, after this many batches
+# in a row went through; one cut after a body too large stays.
+_BATCH_GROW_AFTER = 10
+# A batch Loom keeps failing with its uncoded internal error is isolated
+# after this many failures in a row: cut in halves while the halves fail,
+# down to one message. That message is skipped (with an audit row) only once
+# the next batch goes through, so Loom is shown working at that moment; a
+# failure first skips nothing.
 _BATCH_FAULTS_BEFORE_ISOLATING = 3
 _BATCH_FAULTS_MAX = 1024
 # Turns of the previous batch handed to the next as context (Loom's cap is
@@ -197,10 +204,11 @@ _BATCH_FAULTS_MAX = 1024
 _CONTEXT_MESSAGES = 10
 _CONTEXT_MAX_BYTES = 2000
 _CONTEXT_MIN_BYTES = 256
-# Batches Loom accepted, remembered so a retried window does not queue the
-# same extraction twice (in this process).
+# Messages Loom took (or that were skipped), remembered so a window offered
+# again does not send them twice, whatever the batches look like then (in
+# this process).
 _ACCEPTED_TTL_S = 24 * 3600
-_ACCEPTED_MAX = 4096
+_ACCEPTED_MAX = 32768
 # Every fact Loom extracts from a Nerve conversation carries this tag.
 EXTRACTION_TAG = "source:nerve"
 
@@ -244,13 +252,14 @@ class LoomToolRefused(MemoryBackendUnavailable):
 
 
 class LoomServerFault(MemoryBackendUnavailable):
-    """Loom answered with a fault of its own (JSON-RPC ``-32000``) that it
-    does not name as passing: the same request may fail the same way."""
+    """Loom answered with its uncoded internal error (JSON-RPC ``-32000``):
+    the one fault that may be about the request itself."""
 
 
 class LoomUpstreamTimeout(MemoryBackendUnavailable):
-    """The gateway gave up waiting for Loom (its call limit,
-    ``MCP_GATEWAY_CALL_TIMEOUT``); Loom may still finish the call."""
+    """The call ran out of time, at the gateway (its call limit,
+    ``MCP_GATEWAY_CALL_TIMEOUT``: "MCP server timed out") or at Nerve; Loom
+    may still finish it."""
 
 
 @dataclass(frozen=True)
@@ -507,10 +516,14 @@ class LoomMemory:
         self._defer = bool(self._cfg.defer_extraction)
         self._batch_max_messages = _DEFERRED_BATCH_MAX_MESSAGES if self._defer else _BATCH_MAX_MESSAGES
         self._batch_max_bytes = _DEFERRED_BATCH_MAX_BYTES if self._defer else _BATCH_MAX_BYTES
-        # Batches Loom failed on its side: digest -> (failures, first at).
-        self._batch_faults: dict[str, tuple[int, float]] = {}
-        # When Loom last extracted a batch.
-        self._extract_ok_at = float("-inf")
+        # The byte budget a body too large cut for good, and the batches in a
+        # row that went through since the budget was last cut.
+        self._batch_ceiling_bytes = self._batch_max_bytes
+        self._batch_successes = 0
+        # Batches Loom failed with its uncoded internal error: digest -> count.
+        self._batch_faults: dict[str, int] = {}
+        # Messages skipped as ones Loom keeps failing on: never context again.
+        self._skipped: dict[str, None] = {}
         # The last health probe: what the Diagnostics page shows.
         self._health: dict[str, Any] = {}
         self._health_at = 0.0
@@ -743,9 +756,9 @@ class LoomMemory:
         if e.status == 413:
             # A body over the limit of the gateway in front of Loom.
             return LoomRequestError(op, 413, "PAYLOAD_TOO_LARGE", str(e))
-        if e.code == RETRY_LATER and e.rpc_message == UPSTREAM_TIMEOUT_MESSAGE:
+        if e.timed_out or (e.code == RETRY_LATER and e.rpc_message == UPSTREAM_TIMEOUT_MESSAGE):
             return LoomUpstreamTimeout(f"memory backend unavailable: {e}")
-        if e.code == SERVER_FAULT and not any(code in e.rpc_message for code in _TRANSIENT_CODES):
+        if e.code == SERVER_FAULT and e.rpc_message.startswith(_UNCODED_FAULT):
             return LoomServerFault(f"memory backend unavailable: {e}")
         if e.code is not None and not e.retryable:
             # A JSON-RPC error the same call gets again (invalid params,
@@ -960,30 +973,46 @@ class LoomMemory:
             size += turn_size
         return batch
 
-    def _shrink_batches(self, why: str) -> bool:
-        """Halve the budget of a batch, bytes and messages, for the rest of
-        the process; False when it is at the minimum already."""
+    def _shrink_batches(self, why: str, *, lasting: bool) -> bool:
+        """Halve the budget of a batch, bytes and messages; ``lasting`` (a
+        body too large) for the rest of the process, else (a timeout) until
+        batches go through again. False when it is at the minimum already."""
         if self._batch_max_bytes <= _BATCH_MIN_BYTES and self._batch_max_messages <= _BATCH_MIN_MESSAGES:
             return False
         self._batch_max_bytes = max(_BATCH_MIN_BYTES, self._batch_max_bytes // 2)
         self._batch_max_messages = max(_BATCH_MIN_MESSAGES, self._batch_max_messages // 2)
+        if lasting:
+            self._batch_ceiling_bytes = self._batch_max_bytes
+        self._batch_successes = 0
         logger.warning(
             "%s; extraction batches are now at most %d messages in %d bytes",
             why, self._batch_max_messages, self._batch_max_bytes,
         )
         return True
 
-    def _isolation_start(self, digest: str, isolating_since: float | None) -> float | None:
-        """Count a fault of a batch; when Loom failed it often enough (or a
-        larger batch around it is being isolated already), when its failures
-        began, else None."""
-        count, first = self._batch_faults.get(digest, (0, time.monotonic()))
+    def _batch_went_through(self) -> None:
+        """Count a batch Loom took; after enough in a row, grow a budget a
+        timeout cut back toward the default (not past a lasting cut)."""
+        self._batch_successes += 1
+        if self._batch_successes < _BATCH_GROW_AFTER:
+            return
+        self._batch_successes = 0
+        default_messages = _DEFERRED_BATCH_MAX_MESSAGES if self._defer else _BATCH_MAX_MESSAGES
+        default_bytes = _DEFERRED_BATCH_MAX_BYTES if self._defer else _BATCH_MAX_BYTES
+        grown = (
+            min(self._batch_max_messages * 2, default_messages),
+            min(self._batch_max_bytes * 2, self._batch_ceiling_bytes, default_bytes),
+        )
+        if grown != (self._batch_max_messages, self._batch_max_bytes):
+            self._batch_max_messages, self._batch_max_bytes = grown
+            logger.info("Extraction batches grow back to at most %d messages in %d bytes", *grown)
+
+    def _note_fault(self, digest: str) -> int:
+        """Count an uncoded internal error on a batch; how many in a row."""
         if len(self._batch_faults) >= _BATCH_FAULTS_MAX and digest not in self._batch_faults:
             self._batch_faults.pop(next(iter(self._batch_faults)))
-        self._batch_faults[digest] = (count + 1, first)
-        if isolating_since is not None:
-            return isolating_since
-        return first if count + 1 >= _BATCH_FAULTS_BEFORE_ISOLATING else None
+        self._batch_faults[digest] = self._batch_faults.get(digest, 0) + 1
+        return self._batch_faults[digest]
 
     def _context(self, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """The context a following batch gets: the last turns, kept short."""
@@ -1014,78 +1043,116 @@ class LoomMemory:
         result = await self._call("memory.set_from_messages", arguments, timeout=_EXTRACT_TIMEOUT_S)
         return result if isinstance(result, dict) else {}
 
+    @staticmethod
+    def _turn_digest(session_id: str, turn: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps([session_id, turn], ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        ).hexdigest()
+
     async def _memorize_conversation(self, session_id: str, all_turns: list[dict[str, Any]]) -> bool:
-        batches = sent = written = skipped = 0
+        """Send the window's turns Loom has not taken yet (in this process),
+        in batches; see :meth:`memorize_conversation`.
+
+        A batch Loom keeps failing with its uncoded internal error
+        (``_BATCH_FAULTS_BEFORE_ISOLATING`` sweeps in a row) is cut in halves
+        while the halves fail, down to the one message. That message is left
+        out of the next batch and its context, and recorded as skipped only
+        when that next batch goes through (or, at the end of the window, when
+        a batch went through since the isolation began in this sweep): any
+        failure first raises and skips nothing.
+        """
+        digests = [self._turn_digest(session_id, turn) for turn in all_turns]
+        todo = [n for n, digest in enumerate(digests) if not self._was_accepted(digest)]
+        left_out = {n for n, digest in enumerate(digests) if digest in self._skipped}
+        sent = written = 0
         queue_ids: list[str] = []
-        context: list[dict[str, Any]] = []
-        start = 0
-        # While a batch Loom keeps failing is isolated: at most this many
-        # turns a batch, until past it.
         cap: int | None = None
-        isolating_since: float | None = None
+        isolating = False
         isolate_until = 0
-        while start < len(all_turns):
-            turns = self._next_batch(all_turns[start:], cap)
-            digest = hashlib.sha256(
+        went_through_since_isolating = False
+        pending: tuple[int, Exception] | None = None  # (turn, error) to skip
+        skipped: list[int] = []
+        pos = 0
+        while pos < len(todo):
+            turns = self._next_batch([all_turns[n] for n in todo[pos:]], cap)
+            taken = todo[pos:pos + len(turns)]
+            context = self._context([all_turns[n] for n in range(taken[0]) if n not in left_out])
+            batch_digest = hashlib.sha256(
                 json.dumps([session_id, turns], ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ).hexdigest()
-            if not self._was_accepted(digest):
-                try:
-                    data = await self._send_window(session_id, turns, context)
-                except LoomRequestError as e:
-                    if e.status == 413 and self._shrink_batches(
-                        "The MCP gateway refused an extraction batch as too large",
-                    ):
-                        continue  # the same turns again, in smaller batches
-                    raise
-                except LoomUpstreamTimeout:
-                    # Loom may still finish this batch; the window goes again
-                    # with the next sweep, in batches that fit the gateway's
-                    # call limit.
-                    self._shrink_batches("The MCP gateway gave up waiting for an extraction")
-                    raise
-                except LoomServerFault as e:
-                    since = self._isolation_start(digest, isolating_since)
-                    if since is None:
+            try:
+                data = await self._send_window(session_id, turns, context)
+            except LoomRequestError as e:
+                if e.status == 413 and self._shrink_batches(
+                    "The MCP gateway refused an extraction batch as too large", lasting=True,
+                ):
+                    continue  # the same turns again, in smaller batches
+                raise
+            except LoomUpstreamTimeout:
+                # Loom may still finish this batch; the window goes again
+                # with the next sweep, in batches that fit the call limit.
+                self._shrink_batches("An extraction ran out of time", lasting=False)
+                raise
+            except LoomServerFault as fault:
+                if pending is not None:
+                    raise  # Loom failed again before it was shown working: skip nothing
+                faults = self._note_fault(batch_digest)
+                if not isolating:
+                    if faults < _BATCH_FAULTS_BEFORE_ISOLATING:
                         raise  # the next sweep tries it again
-                    if isolating_since is None:
-                        isolating_since, isolate_until = since, start + len(turns)
-                    if len(turns) > 1:
-                        cap = max(1, len(turns) // 2)
-                        continue  # the same turns again, in halves
-                    if self._extract_ok_at <= isolating_since:
-                        raise  # Loom extracted nothing meanwhile: an outage
-                    await self._skip_turn(session_id, turns[0], e)
-                    skipped += 1
-                    cap = None  # the rest in whole batches again
-                else:
-                    sent += 1
-                    self._extract_ok_at = time.monotonic()
-                    self._batch_faults.pop(digest, None)
-                    written += len(data.get("written") or [])
-                    if data.get("queue_id"):  # queued: by request, or Loom deferred it
-                        queue_ids.append(str(data["queue_id"]))
-                self._remember_accepted(digest)
-            batches += 1
-            context = self._context(turns)
-            start += len(turns)
-            if cap is not None and start >= isolate_until:
-                cap, isolating_since = None, None
+                    isolating, isolate_until = True, pos + len(turns)
+                    went_through_since_isolating = False
+                if len(turns) > 1:
+                    cap = max(1, len(turns) // 2)
+                    continue  # the same turns again, in halves
+                # The one message Loom keeps failing on: leave it out, and
+                # skip it once the next batch shows Loom working.
+                pending = (taken[0], fault)
+                left_out.add(taken[0])
+                cap, isolating = None, False
+                pos += 1
+                continue
+            sent += 1
+            self._batch_faults.pop(batch_digest, None)
+            self._batch_went_through()
+            went_through_since_isolating = True
+            for n in taken:
+                self._remember_accepted(digests[n])
+            written += len(data.get("written") or [])
+            if data.get("queue_id"):  # queued: by request, or Loom deferred it
+                queue_ids.append(str(data["queue_id"]))
+            if pending is not None:
+                await self._skip_turn(session_id, all_turns[pending[0]], digests[pending[0]], pending[1])
+                skipped.append(pending[0])
+                pending = None
+            pos += len(turns)
+            if isolating and pos >= isolate_until:
+                cap, isolating = None, False
+        if pending is not None:
+            if not went_through_since_isolating:
+                raise pending[1]  # nothing shows Loom working: skip nothing
+            await self._skip_turn(session_id, all_turns[pending[0]], digests[pending[0]], pending[1])
+            skipped.append(pending[0])
         details: dict[str, Any] = {
-            "message_count": len(all_turns), "batches": batches, "sent": sent,
-            "facts_written": written,
+            "message_count": len(all_turns), "sent": sent, "facts_written": written,
         }
         if queue_ids:
             details["queue_ids"] = queue_ids
         if skipped:
-            details["skipped"] = skipped
+            details["skipped"] = len(skipped)
         await self._audit("conversation_indexed", "resource", session_id, details)
         return True
 
-    async def _skip_turn(self, session_id: str, turn: dict[str, Any], error: Exception) -> None:
+    async def _skip_turn(
+        self, session_id: str, turn: dict[str, Any], digest: str, error: Exception,
+    ) -> None:
         """Give up on one message Loom keeps failing on, so the rest of the
-        window is extracted: logged, and an audit row names it (not its
-        text)."""
+        window is extracted: not sent again, never context again, logged,
+        and an audit row names it (not its text)."""
+        self._remember_accepted(digest)
+        if len(self._skipped) >= _BATCH_FAULTS_MAX:
+            self._skipped.pop(next(iter(self._skipped)))
+        self._skipped[digest] = None
         logger.warning(
             "Loom keeps failing on one message of session %s (%s); it is skipped", session_id, error,
         )
@@ -1098,13 +1165,12 @@ class LoomMemory:
         return accepted_at is not None and time.monotonic() - accepted_at < _ACCEPTED_TTL_S
 
     def _remember_accepted(self, digest: str) -> None:
-        now = time.monotonic()
-        if len(self._accepted) >= _ACCEPTED_MAX:
-            cutoff = now - _ACCEPTED_TTL_S
-            self._accepted = {k: t for k, t in self._accepted.items() if t > cutoff}
-            if len(self._accepted) >= _ACCEPTED_MAX:
-                self._accepted.pop(next(iter(self._accepted)))
-        self._accepted[digest] = now
+        """Remember ``digest``, newest last; the oldest go first when full
+        (an expired one is ignored on lookup anyway)."""
+        self._accepted.pop(digest, None)
+        while len(self._accepted) >= _ACCEPTED_MAX:
+            self._accepted.pop(next(iter(self._accepted)))
+        self._accepted[digest] = time.monotonic()
 
     # ------------------------------------------------------------------ #
     # Health
