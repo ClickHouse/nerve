@@ -60,6 +60,12 @@ _MISFIRE_GRACE_SECONDS = 30
 _CLOCK_WATCH_SECONDS = 5
 _CLOCK_STEP_SECONDS = 5
 
+# How long the catch-up runs after a pause wait before they start. The machine
+# is back, but its network often is not yet (Wi-Fi rejoining, DNS), and a source
+# runner or an agent turn started into that fails and waits for its next slot.
+# Moving the triggers past the pause does not wait.
+_CATCHUP_SETTLE_SECONDS = 15
+
 # The cron_logs error of a run that came due during a pause of the machine and
 # was not caught up.
 _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: false)"
@@ -1046,12 +1052,13 @@ class CronService:
             step = (paused_to - paused_from).total_seconds()
         logger.info(
             "Clock jumped %.0fs ahead (paused between %s and %s): re-armed %d "
-            "scheduled jobs, catching up %d",
+            "scheduled jobs, catching up %d in %ss",
             step,
             paused_from.astimezone(self.timezone).isoformat(timespec="seconds"),
             paused_to.astimezone(self.timezone).isoformat(timespec="seconds"),
             rearmed,
             len(due),
+            _CATCHUP_SETTLE_SECONDS,
         )
         return due
 
@@ -1059,12 +1066,14 @@ class CronService:
         """Run once each job waiting to be caught up, concurrently, through
         the normal wrappers.
 
-        Waits for any earlier catch-up to finish first, so two never overlap,
-        and only then looks each job up as the scheduler holds it now: a job
-        removed meanwhile does not run, one redefined runs as it is now, and
-        one that has started a run since it was queued is not caught up on top
-        of it. Gates, ``lock`` and the run log apply as for a scheduled run.
+        Waits ``_CATCHUP_SETTLE_SECONDS`` for the network to come back, then
+        for any earlier catch-up to finish, so two never overlap, and only
+        then looks each job up as the scheduler holds it now: a job removed
+        meanwhile does not run, one redefined runs as it is now, and one that
+        has started a run since it was queued is not caught up on top of it.
+        Gates, ``lock`` and the run log apply as for a scheduled run.
         """
+        await asyncio.sleep(_CATCHUP_SETTLE_SECONDS)
         async with self._catchup_lock:
             if not self.scheduler.running:
                 return  # stopped while waiting its turn

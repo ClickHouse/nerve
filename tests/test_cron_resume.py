@@ -225,6 +225,7 @@ async def test_the_watcher_keeps_watching_while_a_catch_up_runs(tmp_path, monkey
     clock = FakeClock()
     monkeypatch.setattr(cron_service, "time", clock)
     monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", 0.01)
+    monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0)
     first = CronJob(id="first", schedule=EVERY_TEN_MINUTES, prompt="p")
     second = CronJob(id="second", schedule=EVERY_TEN_MINUTES, prompt="p")
     svc = _service(tmp_path)
@@ -272,8 +273,10 @@ async def test_the_watcher_keeps_watching_while_a_catch_up_runs(tmp_path, monkey
 @pytest_asyncio.fixture
 async def held_service(tmp_path, monkeypatch):
     """Factory: a started service whose scheduler is held and whose watcher
-    stays idle, so a test stages a pause and hands it to ``_on_clock_step``."""
+    stays idle, so a test stages a pause and hands it to ``_on_clock_step``.
+    Catch-ups start without waiting for the network."""
     monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", HOUR)
+    monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0)
     started: list[CronService] = []
 
     async def make(jobs=(), runners=(), db=None) -> CronService:
@@ -352,6 +355,24 @@ async def test_only_catch_up_jobs_run_but_every_trigger_moves_on(held_service):
         assert svc.scheduler.get_job(job_id).next_run_time > resumed, job_id
     assert svc.scheduler.get_job("yearly").next_run_time == not_due
     assert svc.scheduler.get_job("foreign").next_run_time == came_due
+
+
+@pytest.mark.asyncio
+async def test_the_catch_up_gives_the_network_time_to_come_back(held_service, monkeypatch):
+    monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0.3)
+    job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([job])
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("every-ten", next_run_time=resumed - timedelta(hours=1))
+
+    catch_up = svc._on_clock_step(paused, resumed)
+
+    # The trigger moved at once; the run waits.
+    assert svc.scheduler.get_job("every-ten").next_run_time > resumed
+    await asyncio.sleep(0.1)
+    svc.engine.run_cron.assert_not_awaited()
+    await catch_up
+    svc.engine.run_cron.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -730,6 +751,7 @@ async def _stage_ten_minute_job(tmp_path, db, monkeypatch, *, watch_seconds):
     clock = FakeClock(wall_offset=-3 * HOUR)
     monkeypatch.setattr(cron_service, "time", clock)
     monkeypatch.setattr(cron_service, "_CLOCK_WATCH_SECONDS", watch_seconds)
+    monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0)
     svc = _service(tmp_path, db)
     job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="check")
     return svc, job, clock

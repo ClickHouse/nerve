@@ -503,8 +503,11 @@ them start late or be dropped as [late runs](#late-runs):
   [Interval alignment](#interval-alignment)), not a full interval after the
   resume.
 - Jobs with `catchup: true` (the default), source runners and the daily cleanup
-  then run **once**, however many runs the pause swallowed, concurrently. Run
-  gates and `lock` apply as for a scheduled run, and the run is logged as usual.
+  then run **once**, however many runs the pause swallowed, concurrently. They
+  start 15 seconds after the resume is noticed, because the network is often not
+  back yet the moment a laptop wakes, and a run that starts without it fails.
+  Run gates and `lock` apply as for a scheduled run, and the run is logged as
+  usual.
 - Jobs with `catchup: false` only move on; the run each one skipped is recorded
   in `cron_logs` with status `missed`. The wakeup sweep only moves on too:
   session wakeups (`ScheduleWakeup`) that came due fire on its next pass, within
