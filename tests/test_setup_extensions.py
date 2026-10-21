@@ -13,7 +13,7 @@ contracts those files pin stay untouched:
   whose ``start()`` raises never takes the gateway down and its token never
   reaches the log or the state file, the startup notice is skipped when
   Telegram is off;
-* the worker onboarding session is identifiable by the derivation.
+* the onboarding conversation opens once, in a web session.
 """
 
 from __future__ import annotations
@@ -506,14 +506,15 @@ async def _no_lifespan(_app):
 
 
 # --------------------------------------------------------------------------- #
-#  Worker onboarding is identifiable                                           #
+#  The onboarding conversation opens once, in a web session                    #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_onboarding_session_is_identifiable(tmp_path, monkeypatch):
-    """The session ``ensure_worker_onboarding`` starts is found as ``running``
-    with its id, through the same naming ``AgentEngine.run_cron`` uses."""
+async def test_the_onboarding_conversation_opens_once_in_a_web_session(tmp_path, monkeypatch):
+    """With the real engine and session manager: one web session titled
+    Onboarding, a hidden first turn, and the setup page reads it as running."""
+    from nerve import onboarding
     from nerve.agent.engine import AgentEngine, TurnOutcome, TurnResult
     from nerve.db import Database
     from nerve.gateway.routes import _deps as deps_module
@@ -528,30 +529,33 @@ async def test_onboarding_session_is_identifiable(tmp_path, monkeypatch):
     await db.connect()
     try:
         engine = AgentEngine(config, db)
-        started = asyncio.Event()
-        release = asyncio.Event()
-        seen: dict = {}
+        turns: list[dict] = []
 
-        async def _run(session_id, user_message, source, model, effort_override, actor, **kw):
-            seen["session_id"] = session_id
-            started.set()
-            await release.wait()
-            return TurnResult("done", TurnOutcome())
+        async def _run_turn(session_id, user_message, source, model, effort_override, actor, **kw):
+            turns.append({"session_id": session_id, "prompt": user_message, "source": source,
+                          "actor": actor, **kw})
+            return TurnResult("Hello", TurnOutcome())
 
-        monkeypatch.setattr(engine, "_run_turn", _run)
-        monkeypatch.setattr(engine, "_teardown_oneshot_client", AsyncMock())
-        monkeypatch.setattr(engine, "_stamp_cron_session_meta", AsyncMock())
+        monkeypatch.setattr(engine, "_run_turn", _run_turn)
         monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=db))
 
-        assert engine.ensure_worker_onboarding() is True
-        assert engine.ensure_worker_onboarding() is False, "idempotent per process"
-        await asyncio.wait_for(started.wait(), 5)
-        status, session_id = await setup_routes._onboarding(config, "worker")
-        assert status == "running"
-        assert session_id == seen["session_id"]
-        row = await db.get_session(session_id)
-        assert row["title"] == "Cron: worker-onboarding" and row["source"] == "cron"
-        release.set()
-        await asyncio.wait_for(engine._onboarding_task, 5)
+        first, second = await asyncio.gather(
+            onboarding.start(engine, ws, actor=db.system_actor, cause=None),
+            onboarding.start(engine, ws, actor=db.system_actor, cause=None),
+        )
+        assert first.status == second.status == "running"
+        assert first.session_id == second.session_id
+        for _ in range(20):
+            if turns:
+                break
+            await asyncio.sleep(0.05)
+        assert len(turns) == 1
+        turn = turns[0]
+        assert turn["session_id"] == first.session_id and turn["source"] == "web"
+        assert turn["internal"] is True and turn["actor"] == db.system_actor
+        assert "> Watch the nightly build for example/repo and propose fixes." in turn["prompt"]
+        row = await db.get_session(first.session_id)
+        assert (row["title"], row["source"]) == ("Onboarding", "web")
+        assert await setup_routes._onboarding(config) == ("running", first.session_id)
     finally:
         await db.close()

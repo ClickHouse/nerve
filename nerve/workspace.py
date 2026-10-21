@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 VALID_MODES = ("personal", "worker")
 
-# The worker guide the first-boot onboarding session is given in full. The
+# The worker guide the onboarding conversation of a worker is given in full. The
 # checkout's ``docs/`` copy is the source of truth; the copy under
 # ``templates/guides/`` ships in the wheel for installs without the repository
 # and must stay byte-identical (``tests/test_worker_onboarding.py`` says so).

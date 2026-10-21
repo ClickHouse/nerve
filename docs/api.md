@@ -669,26 +669,30 @@ reports as `restart_mode`, `restart_message` and `restart_command`.
 
 #### `POST /api/setup/finish`
 
-Body `{}`. Reloads the configuration, recomputes the checklist and, for a
-worker whose `TASK.md` still carries the onboarding marker (the comment on its
-second line, deleted by the onboarding session when the file is complete), a
-provider is configured and nothing waits on a restart, starts the onboarding
-session. Idempotent; allowed under lockdown (it writes nothing).
+Body `{}`. Reloads the configuration and recomputes the checklist. While
+onboarding is `pending`, it opens the onboarding conversation for the caller:
+one web session titled `Onboarding`, whose hidden first message makes the
+agent speak first. When a restart is pending or no model is configured, it
+records the request instead, and the next start of the daemon opens the
+conversation. Idempotent: a second call, also at the same time, names the same
+session. Allowed under lockdown.
 
 ```json
-Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "cron:worker-onboarding:…" } }
+Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d" } }
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_required", "onboarding": { "status": "pending", "session_id": null } }
 ```
 
 `onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
-`not_applicable`, `pending`, `running`, `ended` or `done`. `ended` means the
-onboarding session exists but the engine is no longer driving it while
-`TASK.md` still carries the onboarding marker — it stopped before completing
-the file (a placeholder key, a crash); the session id is carried so the page
-can link to it instead of waiting. Calling `finish` again schedules the session anew; the
-ended row stays in the table, and a session the engine is driving always wins
-over an ended one (among several ended ones the newest is named), so every
-tab reads `running` with the new id.
+`not_applicable` (no mode chosen), `pending`, `running` (the session id is
+carried), `done` or `skipped`. The agent sets `done` with the
+`onboarding_done` tool, from the onboarding session only. A worker whose
+`TASK.md` no longer carries the onboarding marker is `done`. A running
+conversation whose session was deleted reads `pending` again.
+
+#### `POST /api/setup/onboarding/skip`
+
+Body `{}`. Sets onboarding to `skipped` while it is `pending` or `running`; the
+session stays. Answers the `GET /api/setup` body.
 
 #### `POST /api/system/restart`
 

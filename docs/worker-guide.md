@@ -22,14 +22,13 @@ bind address), starts Nerve and prints the setup page with a setup token. The
 worker is configured on that page:
 
 1. **Claim** — your username and password (or keep it passwordless), plus the token
-2. **Mode** — choose **Worker** and describe the task in plain English (three
-   starter templates: monitor a build, review pull requests, watch logs). This
-   writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
-   `MEMORY.md`), `TASK.md` from its template with your description in place
-   (the onboarding session fills the rest), and `config/cron/system.yaml` with
+2. **Mode**: choose **Worker**, and optionally write a note on what it should
+   know. This writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
+   `MEMORY.md`), `TASK.md` from its template with your note in place (the
+   onboarding conversation fills the rest), and `config/cron/system.yaml` with
    `skill-extractor` and `skill-reviser` on and `task-planner` off
-   (`memory-maintenance` is always on; the onboarding session enables
-   `task-planner` when the worker should plan through the approval loop)
+   (`memory-maintenance` is always on; the onboarding conversation turns
+   `task-planner` on when the worker should plan through the approval loop)
 3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
    Code login found on the server, or AWS Bedrock; test it, pick a model
 4. **Operator** — who runs this worker, in which time zone it should plan its
@@ -38,8 +37,8 @@ worker is configured on that page:
    skipped. Sources and external agents are not offered to a worker
 5. **Review and finish** — the server check-up, then **Restart Nerve** (the
    mode's memory settings are read at startup) or **Finish**. The ending reads
-   "Your worker is ready" with **Onboarding session starting** and a link to
-   that session
+   "Your worker is ready" with **Start the conversation**, which opens the
+   onboarding conversation
 
 The same choice from a terminal is `nerve init --terminal`, which asks for the
 mode and the task description itself and does not start the daemon (`nerve
@@ -52,29 +51,27 @@ off on every path until onboarding enables it): set `enabled: true` in
 
 ## How Onboarding Works
 
-When Nerve starts — or when the setup page's Finish runs on an instance that needs no restart — and `TASK.md` still carries the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line), it runs a **setup agent session** with full tool access. The session's prompt is your task description, the full [Worker Best Practices](worker-best-practices.md) guide, and the steps below. The setup page shows it as "Onboarding session starting" and then links to the running session:
+After setup, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first; a worker whose `TASK.md` still carries the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line) also gets it when the daemon starts. The agent's hidden instruction holds your note, the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first and asks which kinds of work apply. Then:
 
-1. **Research** — fetches URLs, searches the web, clones repos, explores CI systems mentioned in the task
-2. **Fill TASK.md in place** — replaces every `_(onboarding fills this in: …)_` placeholder and example line of the template with this worker's content, keeping the headings and the description as given, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link
-3. **Create skills** — writes domain-specific procedures as reusable skills (`skill_create`)
-4. **Configure cron jobs** — adds the worker's jobs to `<workspace>/config/cron/jobs.yaml`, with `run_if` gates where the guide calls for them so a job stays idle until there is work. It also decides on `task-planner`, which ships disabled for workers: when the worker should plan through the approval loop, the session enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag; when a work job with a standing grant covers the routine items, it stays off. `TASK.md` § Approval Required says which
-5. **Create initial tasks** — files setup tasks that need manual work (credentials, access tokens, etc.)
-6. **Walk through everything it did, then give next steps** — saves what it learned to memory, then sends a `high` notification and ends with a final message, both listing every change: the `TASK.md` sections filled, statuses and skills created, cron jobs added or enabled (id, schedule, gate, session mode, whether enabled), the tasks it created for you and what each needs, and what it memorized. Both close with numbered **Next steps for the operator**: access to grant (with the task ids), plans to approve, jobs to review or enable, how to run one by hand (`nerve cron <id>`), and what to watch during the first runs
-7. **Delete the marker** — last, once every section is filled. The marker is how Nerve knows onboarding is still due: the setup page and `nerve doctor` report it as pending while the line stands, and a start before it is gone runs the session again
+1. **Learn the work**: asks which repositories to onboard, clones and studies them, and asks only what it needs: the channels and alert sources to read, schedules, approval rules
+2. **Propose the setup**: cron jobs with schedule and `run_if` gate, whether `task-planner` plans through the approval loop (it ships disabled for workers; the agent turns it on by overriding the job by id in `jobs.yaml`, with a `tasks` gate scoped to the worker's tag), task statuses (the built-in `backlog` and `plan_review`, plus a status for each other kind of wait), tags, skills, and the `TASK.md` sections. It changes nothing before you confirm
+3. **Apply what you confirmed**: fills `TASK.md` in place (every `_(onboarding fills this in: …)_` placeholder and example line, keeping the headings and your note, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link), adds the jobs to `<workspace>/config/cron/jobs.yaml`, creates statuses, skills and the tasks only you can do, and saves what it learned to memory
+4. **Summarize**: lists every change and the next steps for you
+5. **Mark onboarding done**: calls `onboarding_done`, which also removes the marker line from `TASK.md`
 
-A `TASK.md` from an older install (the raw `# Task` form, no marker) is rewritten into the template's shape with its text under "Task description (as given)" when the session starts; such a file counts as onboarded once it has a `## Mission` heading.
+Until onboarding is done or skipped, a banner in the web UI sends you back to the conversation. A `TASK.md` from an older install (the raw `# Task` form, no marker) is rewritten into the template's shape with its text under "Task description (as given)" when the conversation opens; such a file counts as onboarded once it has a `## Mission` heading. A `TASK.md` without its marker counts as onboarded.
 
-After onboarding, the worker operates autonomously on its configured schedule. Start with the session's walkthrough (the notification, or the session's last message): its next steps list what only you can do before the first runs.
+After onboarding, the worker operates on its configured schedule. You can change the setup at any time by asking it in a chat.
 
 ## TASK.md
 
 The task file lives at `workspace/TASK.md` and is injected into every session's system prompt. It is the worker's mission brief. What each section holds, and how to write rules that hold up, is in [Worker Best Practices → TASK.md Anatomy](worker-best-practices.md#taskmd-anatomy).
 
-**Before onboarding.** The Mode step, `nerve init --terminal` and `nerve init --non-interactive` write the worker template with your description in place. The comment on the second line marks the file as not onboarded yet. The example lines the template carries under each heading are left out here:
+**Before onboarding.** The Mode step, `nerve init --terminal` and `nerve init --non-interactive` write the worker template with your description, if any, in place. The comment on the second line marks the file as not onboarded yet. The example lines the template carries under each heading are left out here:
 
 ```markdown
 # Task
-<!-- nerve:onboarding pending — the first-boot onboarding session fills this file in and deletes this line. -->
+<!-- nerve:onboarding pending: the onboarding conversation fills this file in; this line goes when onboarding is done. -->
 
 ## Task description (as given)
 Monitor the CI pipeline for flaky tests. When a test fails intermittently,
@@ -114,7 +111,7 @@ _(onboarding fills this in: endpoints with auth mode (never passwords), schema c
 Read the full guide: https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md
 ```
 
-**After onboarding.** The onboarding session has filled every section in place, kept the headings and the description, and deleted the marker line:
+**After onboarding.** The onboarding conversation has filled every section in place and kept the headings and the description, and `onboarding_done` has deleted the marker line:
 
 ```markdown
 # Task

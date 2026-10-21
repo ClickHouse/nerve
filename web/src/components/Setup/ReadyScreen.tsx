@@ -1,34 +1,33 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
-  api, type PairingStatus, type SetupChannelsDetail, type SetupModeDetail,
+  api, type PairingStatus, type SetupChannelsDetail,
   type SetupOnboarding, type SetupProfileDetail, type SetupProviderDetail, type SetupSourcesDetail,
   type SetupState,
 } from '../../api/client';
 import { useAuthStore } from '../../stores/authStore';
-import { useSetupStore } from '../../stores/setupStore';
+import { onboardingOf, useSetupStore } from '../../stores/setupStore';
 import { Button } from '../ui';
-import { Check, Loader2, PartyPopper } from '../ui/icons';
+import { Check, PartyPopper } from '../ui/icons';
 import {
-  MANAGED_SOURCE_SHORT, ONBOARDING_OPEN, ONBOARDING_SENTENCES, ONBOARDING_TRY_AGAIN, PROVIDER_LAST_TEST_FAILED,
-  READY_STEPS_LEFT, READY_TELEGRAM_SYNC_LINK, READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
+  MANAGED_SOURCE_SHORT, ONBOARDING_START, PROVIDER_LAST_TEST_FAILED, READY_ONBOARDING,
+  READY_ONBOARDING_AFTER_RESTART, READY_STEPS_LEFT, READY_TELEGRAM_SYNC_LINK, READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
 } from './copy';
 import { providerManaged, secretManaged } from './credentialSource';
 import { stepOf, stopPath } from './navigation';
 import { PairingWidget } from './PairingWidget';
 import { personNameFor } from './personName';
 
-const ONBOARDING_POLL_MS = 5000;
-const ONBOARDING_POLL_LIMIT = 120;  // 10 minutes
-
 type OnboardingAnswer = { status: SetupOnboarding; session_id: string | null };
 
 /**
- * The ending. "Nerve is ready", what was set up, and **Say hello**, which
- * opens the chat with a suggested first message. A worker ends with
- * "Onboarding session starting" and a link to that session — or, when the
- * session stopped without writing a plan (`ended`), with the link and a
- * **Try again** that asks the server to schedule it once more. The heading
+ * The ending. "Nerve is ready", what was set up, and the way into the
+ * onboarding conversation, where the agent asks what the person wants it to
+ * do and sets itself up. The conversation is the primary action while it
+ * waits; when a restart comes first, the screen says it opens after the
+ * restart. Without onboarding (done, skipped, or an older backend) a
+ * personal install offers **Say hello**, which opens the chat with a
+ * suggested first message, and a worker offers **Open chat**. The heading
  * takes focus on arrival: the Review's button is gone, and the overlay that
  * may have covered it has closed.
  */
@@ -38,16 +37,10 @@ export function ReadyScreen({ state, onboarding }: {
 }) {
   const navigate = useNavigate();
   const viewer = useAuthStore((s) => s.viewer);
-  const load = useSetupStore((s) => s.load);
-  const finish = useSetupStore((s) => s.finish);
-  const busy = useSetupStore((s) => s.busy);
   const error = useSetupStore((s) => s.error);
   const [pairing, setPairing] = useState<PairingStatus | null>(null);
-  // Try again's answer, and the session it is meant to replace.
-  const [retry, setRetry] = useState<(OnboardingAnswer & { supersedes: string | null }) | null>(null);
 
   const profile = stepOf(state, 'profile')?.detail as SetupProfileDetail | undefined;
-  const mode = stepOf(state, 'mode')?.detail as SetupModeDetail | undefined;
   const channels = stepOf(state, 'channels')?.detail as SetupChannelsDetail | undefined;
   const provider = stepOf(state, 'provider');
   const worker = state.mode === 'worker';
@@ -69,46 +62,13 @@ export function ReadyScreen({ state, onboarding }: {
     return () => { alive = false; };
   }, [offerPairing]);
 
-  // `onboarding` is what finish() answered once; `state` is re-read every
-  // 5 s below. Once the live detail has moved past `pending` it is the
-  // truth — the finish() result would otherwise pin "starting…" for ever.
-  // One exception: right after Try again the checklist may still describe
-  // the session that ended while the answer names the one just scheduled;
-  // the answer is the newer fact until the checklist talks about that
-  // session (running or, if it stopped again, ended).
-  const live = mode?.onboarding;
-  const liveSession = mode?.onboarding_session_id ?? null;
-  let onboardingStatus: SetupOnboarding;
-  let onboardingSession: string | null;
-  if (retry && live === 'ended' && liveSession === retry.supersedes && liveSession !== retry.session_id) {
-    onboardingStatus = retry.status;
-    onboardingSession = retry.session_id;
-  } else {
-    onboardingStatus = live && live !== 'pending' ? live : (onboarding?.status ?? live ?? 'not_applicable');
-    onboardingSession = liveSession ?? onboarding?.session_id ?? null;
-  }
-
-  // A worker's onboarding session is created by the server; poll until it
-  // is running or done, bounded, so the link appears without a reload. An
-  // ended session is not waited for: it has a link and a Try again.
-  const polling = worker && (onboardingStatus === 'pending' || onboardingStatus === 'running');
-  useEffect(() => {
-    if (!polling) return;
-    let count = 0;
-    const timer = setInterval(() => {
-      count += 1;
-      if (count > ONBOARDING_POLL_LIMIT) { clearInterval(timer); return; }
-      void load();
-    }, ONBOARDING_POLL_MS);
-    return () => clearInterval(timer);
-  }, [polling, load]);
-
-  // The server re-schedules the onboarding on an explicit finish.
-  const tryAgain = async () => {
-    const supersedes = onboardingSession;
-    const result = await finish();
-    if (result) setRetry({ ...result.onboarding, supersedes });
-  };
+  // finish() answered with the conversation it opened; the checklist read
+  // afterwards says the same, and is the newer fact once it names a session.
+  const live = onboardingOf(state);
+  const conversation = live.status === 'running' && live.sessionId
+    ? live.sessionId
+    : (onboarding?.status === 'running' ? onboarding.session_id : null);
+  const waitsForRestart = !conversation && live.status === 'pending' && state.restart_pending;
 
   // What was set up, one line each. A credential the operator provided
   // says so (the server's own summary already does for the model); the
@@ -151,8 +111,6 @@ export function ReadyScreen({ state, onboarding }: {
     navigate('/chat', { state: { suggestedMessage: SAY_HELLO(personName) } });
   };
 
-  const starting = busy === 'finish';
-
   return (
     <div className="flex flex-col items-center text-center gap-5 py-6">
       <div className="flex h-16 w-16 items-center justify-center rounded-full bg-success-bg text-success">
@@ -168,9 +126,7 @@ export function ReadyScreen({ state, onboarding }: {
             last test failed, and a source can be on while its tool is
             missing on the server. */}
         <p className="text-sm text-text-muted mt-2 max-w-md">
-          {worker
-            ? 'Setup is complete. The worker reads its task description on first boot and plans its work in an onboarding session.'
-            : 'Setup is complete.'}
+          Setup is complete.
         </p>
         {/* Optional steps can still be open here (another tab, a reload):
             say so rather than let the banner contradict this page. */}
@@ -185,45 +141,23 @@ export function ReadyScreen({ state, onboarding }: {
         </ul>
       )}
 
-      {worker ? (
+      {conversation ? (
         <div className="flex flex-col items-center gap-3">
-          {onboardingStatus === 'running' && onboardingSession ? (
-            <>
-              <p role="status" className="text-sm text-text-muted flex items-center gap-2">
-                <Loader2 size={14} className="animate-spin" />{ONBOARDING_SENTENCES.running}
-              </p>
-              <Button variant="primary" size="md" onClick={() => navigate(`/chat/${onboardingSession}`)}>
-                {ONBOARDING_OPEN}
-              </Button>
-            </>
-          ) : onboardingStatus === 'done' ? (
-            <Button variant="primary" size="md" onClick={() => navigate('/chat')}>Open chat</Button>
-          ) : onboardingStatus === 'ended' ? (
-            <>
-              <p role="status" className="text-sm text-text-muted max-w-md">{ONBOARDING_SENTENCES.ended}</p>
-              <div className="flex flex-wrap items-center justify-center gap-2">
-                {onboardingSession && (
-                  <Button variant="secondary" size="md" onClick={() => navigate(`/chat/${onboardingSession}`)} className="min-h-[44px]">
-                    {ONBOARDING_OPEN}
-                  </Button>
-                )}
-                <Button variant="primary" size="md" onClick={() => void tryAgain()} disabled={busy !== null} aria-busy={starting || undefined} className="min-h-[44px]">
-                  {starting ? 'Starting again…' : ONBOARDING_TRY_AGAIN}
-                </Button>
-              </div>
-            </>
-          ) : (
-            <p role="status" className="text-sm text-text-muted flex items-center gap-2">
-              <Loader2 size={14} className="animate-spin" />Onboarding session starting…
-            </p>
-          )}
-          {error && <p role="alert" className="text-sm text-error">{error}</p>}
+          <p className="text-sm text-text-muted max-w-md">{READY_ONBOARDING}</p>
+          <Button variant="primary" size="md" onClick={() => navigate(`/chat/${conversation}`)} className="min-h-[44px]">
+            {ONBOARDING_START}
+          </Button>
         </div>
+      ) : waitsForRestart ? (
+        <p role="status" className="text-sm text-text-muted max-w-md">{READY_ONBOARDING_AFTER_RESTART}</p>
+      ) : worker ? (
+        <Button variant="primary" size="md" onClick={() => navigate('/chat')} className="min-h-[44px]">Open chat</Button>
       ) : (
         <Button variant="primary" size="md" onClick={sayHello} className="min-h-[44px]">
           Say hello to {agentEmoji ? `${agentEmoji} ` : ''}{agentName}
         </Button>
       )}
+      {error && <p role="alert" className="text-sm text-error">{error}</p>}
 
       {offerPairing && (
         <div className="w-full max-w-md text-left">

@@ -309,7 +309,7 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs). Sources the installer left `enabled: false` are not scheduled. Then the activity reporter, which does nothing unless the platform's local activity socket exists ([platform-activity.md](platform-activity.md))
 7. Start gateway (FastAPI + uvicorn, WebSocket, static files or the "web UI not built" page)
 8. Start Telegram bot if configured. A token Telegram rejects does not stop the boot: the failure is logged with the token scrubbed, recorded for the setup page and `nerve doctor`, and the gateway runs without the bot
-9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session (the setup page's Finish also starts it when no restart is needed)
+9. **Onboarding**: open the onboarding conversation when setup asked for it before a restart, or for a worker whose `TASK.md` still carries the onboarding marker (`nerve/onboarding.py`; the setup page's Finish opens it when no restart is needed)
 
 The gateway boots and serves `/setup` with nothing configured — no mode, no provider — and stays idle rather than failing, so the browser setup can do its work against a running instance.
 

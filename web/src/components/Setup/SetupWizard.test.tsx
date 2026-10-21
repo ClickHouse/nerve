@@ -3,7 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession, TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupFinishResponse, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession,
+  TelegramSyncSessionSummary,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -746,32 +747,37 @@ describe('forms open on server values and send the right payload', () => {
     expect(worker).toBeChecked();
   });
 
-  it('a worker\'s Mode step says what the onboarding is doing in words, never the session id', async () => {
-    const worker = (onboarding: 'pending' | 'ended', id: string | null) => makeState({
-      mode: 'worker',
+  it('the Mode step says what the onboarding is doing in words, never the session id', async () => {
+    const chosen = (onboarding: 'pending' | 'running' | 'skipped', id: string | null) => makeState({
+      mode: 'personal',
       steps: [
         step('claim', { status: 'done' }),
         step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }, {
-          mode: 'worker', task_present: true, onboarding, onboarding_session_id: id,
+          mode: 'personal', onboarding, onboarding_session_id: id,
         }),
-        step('provider', { status: 'done' }), step('profile', { title: 'Operator' }),
+        step('provider', { status: 'done' }),
       ],
     });
-    current = worker('ended', 'sess-1');
+    current = chosen('running', 'onboarding-1');
     const view = renderAt('/setup/mode');
     await heading('Choose a mode');
-    const line = screen.getByText(/ended without writing a plan/);
-    expect(line).not.toHaveTextContent('sess-1');
-    expect(line).not.toHaveTextContent(/Onboarding:/);
-    expect(line).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
-    expect(within(line).getByRole('link', { name: 'Open it' })).toHaveAttribute('href', '/chat/sess-1');
+    const line = screen.getByText(/waits for you in its onboarding conversation/);
+    expect(line).not.toHaveTextContent('onboarding-1');
+    expect(within(line).getByRole('link', { name: 'Continue the conversation' }))
+      .toHaveAttribute('href', '/chat/onboarding-1');
     view.unmount();
 
-    useSetupStore.getState().reset();
-    current = worker('pending', null);
-    renderAt('/setup/mode');
-    await heading('Choose a mode');
-    expect(await screen.findByText('The onboarding session starts after setup finishes.')).toBeInTheDocument();
+    for (const [status, text] of [
+      ['pending', 'The onboarding conversation starts when you finish setup.'],
+      ['skipped', 'Onboarding was skipped.'],
+    ] as const) {
+      useSetupStore.getState().reset();
+      current = chosen(status, null);
+      const again = renderAt('/setup/mode');
+      await heading('Choose a mode');
+      expect(await screen.findByText(text)).toBeInTheDocument();
+      again.unmount();
+    }
   });
 
   it('automation: a done step opens on the file exactly', async () => {
@@ -921,21 +927,28 @@ describe('forms open on server values and send the right payload', () => {
     await waitFor(() => expect(screen.queryByRole('heading', { level: 1, name: 'Choose a mode' })).not.toBeInTheDocument());
   });
 
-  it('a worker needs a task description; a starter template fills one in', async () => {
+  it('a worker\'s note is optional and goes to the server only when given', async () => {
     current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
+    const view = renderAt('/setup/mode');
+    await heading('Choose a mode');
+    expect(screen.queryByText(/one task/i)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
+    expect(screen.getByLabelText('Anything it should know? (optional)'))
+      .toHaveAccessibleDescription('You can also tell it in the first conversation.');
+    expect(screen.queryByRole('button', { name: 'Monitor a build' })).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', { mode: 'worker' }));
+    view.unmount();
+
+    m(api.setupStep).mockClear();
+    useSetupStore.getState().reset();
     renderAt('/setup/mode');
     await heading('Choose a mode');
     await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
-    await userEvent.type(screen.getByLabelText('Task description'), 'x');
-    await userEvent.click(continueButton());
-    expect(screen.getByLabelText('Task description')).toHaveAccessibleDescription(/at least one full sentence/);
-    expect(api.setupStep).not.toHaveBeenCalled();
-
-    await userEvent.click(screen.getByRole('button', { name: 'Monitor a build' }));
-    expect(screen.getByText(/On first boot the worker reads this description/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Anything it should know? (optional)'), 'It works in example/repo.');
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
-      mode: 'worker', task_description: expect.stringContaining('nightly build'),
+      mode: 'worker', task_description: 'It works in example/repo.',
     }));
   });
 });
@@ -2332,101 +2345,48 @@ describe('review and the ending', () => {
     expect(screen.getByRole('button', { name: 'Keep waiting' })).toBeInTheDocument();
   });
 
-  it('a worker ends with the onboarding session', async () => {
-    const worker = makeState({
-      mode: 'worker',
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-1',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator' })],
-    });
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={worker} onboarding={{ status: 'running', session_id: 'sess-1' }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('heading', { level: 1, name: /Your worker is ready/ })).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-1/)).toBeInTheDocument();
+  const withOnboarding = (mode: 'personal' | 'worker', onboarding: 'pending' | 'running' | 'done', id: string | null,
+    overrides: Partial<SetupState> = {}) => makeState({
+    mode, finished: true, steps_left: 0,
+    steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
+      mode, task_present: mode === 'worker', onboarding, onboarding_session_id: id,
+    }), step('provider', { status: 'done' })],
+    ...overrides,
+  });
+  const renderReady = (state: SetupState, onboarding: SetupFinishResponse['onboarding'] | null = null) => render(
+    <MemoryRouter initialEntries={['/setup/review']}>
+      <Routes>
+        <Route path="/setup/review" element={<ReadyScreen state={state} onboarding={onboarding} />} />
+        <Route path="/chat/:sessionId" element={<ChatProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  it('both modes end by leading into the onboarding conversation', async () => {
+    for (const mode of ['personal', 'worker'] as const) {
+      const view = renderReady(withOnboarding(mode, 'running', `onboarding-${mode}`));
+      expect(screen.getByText(/waits for you in its first conversation/)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Say hello/ })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Start the conversation' }));
+      expect(await screen.findByText(`chat page onboarding-${mode}`)).toBeInTheDocument();
+      view.unmount();
+    }
   });
 
-  it('the worker ending follows the live onboarding state over the stale finish() answer', async () => {
-    const running = makeState({
-      mode: 'worker',
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-2',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator' })],
-    });
-    // finish() answered before the session existed; a later load() says it is running.
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={running} onboarding={{ status: 'pending', session_id: null }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
-    expect(screen.queryByText(/Onboarding session starting/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-2/)).toBeInTheDocument();
+  it('follows the conversation that finish() opened while the checklist still reads pending', async () => {
+    renderReady(withOnboarding('personal', 'pending', null), { status: 'running', session_id: 'onboarding-2' });
+    await userEvent.click(screen.getByRole('button', { name: 'Start the conversation' }));
+    expect(await screen.findByText('chat page onboarding-2')).toBeInTheDocument();
   });
 
-  it('a worker whose onboarding ended without a plan gets the link and a Try again, not a spinner', async () => {
-    const ended = makeState({
-      mode: 'worker', finished: true, steps_left: 0,
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'ended', onboarding_session_id: 'sess-9',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator', status: 'done' })],
-    });
-    // Try again: the server schedules the onboarding once more and names the new session.
-    m(api.setupFinish).mockResolvedValue({ state: ended, action: 'reloaded', onboarding: { status: 'running', session_id: 'sess-10' } });
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={ended} onboarding={{ status: 'pending', session_id: null }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('status')).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
-    expect(screen.queryByText(/Onboarding session starting/)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Open the onboarding session' })).toBeInTheDocument();
+  it('says the conversation opens after the restart, and offers chat once onboarding is over', () => {
+    const view = renderReady(withOnboarding('worker', 'pending', null, { finished: false, restart_pending: true }));
+    expect(screen.getByRole('status')).toHaveTextContent('The first conversation with your agent opens after the restart.');
+    expect(screen.queryByRole('button', { name: 'Start the conversation' })).not.toBeInTheDocument();
+    view.unmount();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
-    await waitFor(() => expect(api.setupFinish).toHaveBeenCalledTimes(1));
-    // The checklist still describes the session that ended; the answer names
-    // the one just scheduled, and the page follows that one.
-    expect(await screen.findByText('Onboarding session running')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-10/)).toBeInTheDocument();
-  });
-
-  it('the worker ending reaches "running" through the 5 s poll after finish() answered pending', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const pending = makeState({
-      mode: 'worker', finished: true, steps_left: 0,
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'pending', onboarding_session_id: null,
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator', status: 'done' })],
-    });
-    current = pending;
-    m(api.setupFinish).mockResolvedValue({ state: pending, action: 'reloaded', onboarding: { status: 'pending', session_id: null } });
-    renderAt('/setup/review');
-    await heading('Review and finish');
-    fireEvent.click(screen.getByRole('button', { name: 'Finish' }));
-    expect(await heading('Your worker is ready')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session starting');
-
-    current = withStep(pending, step('mode', { status: 'done', read_only: true }, {
-      mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-3',
-    }));
-    await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
-    expect(await screen.findByRole('button', { name: 'Open the onboarding session' })).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
+    renderReady(withOnboarding('worker', 'done', 'onboarding-3'));
+    expect(screen.getByRole('button', { name: 'Open chat' })).toBeInTheDocument();
   });
 
   it('the ready screen pairing widget degrades to the /pair instruction when the bot has no link', async () => {

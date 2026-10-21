@@ -80,11 +80,11 @@ export interface SetupClaimDetail {
 }
 
 /**
- * A worker's onboarding session. `ended` is a session that stopped without
- * writing a plan into TASK.md (a placeholder key, a crash): the page links
- * to it and offers to try again instead of waiting for it.
+ * The onboarding conversation: `pending` until it opens (setup not finished,
+ * or a restart first), `running` while it waits for the person, then `done`
+ * or `skipped`. `not_applicable` before a mode is chosen.
  */
-export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'ended' | 'done';
+export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' | 'skipped';
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -1134,6 +1134,9 @@ export const api = {
     request<SetupState>(`/setup/${encodeURIComponent(step)}`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+
+  setupSkipOnboarding: () =>
+    request<SetupState>('/setup/onboarding/skip', { method: 'POST', body: '{}' }),
 
   setupSkip: (step: SetupStepId, skipped: boolean) =>
     request<SetupState>(

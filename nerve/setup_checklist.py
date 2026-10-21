@@ -251,9 +251,9 @@ class Facts:
     env_credential: bool = False
     #: The environment carries only an OAuth token (no API key).
     env_oauth_only: bool = False
-    #: ``not_applicable`` | ``pending`` | ``running`` | ``ended`` | ``done``;
-    #: ``ended`` = the onboarding session stopped without writing ``## Mission``
-    #: (resolved by the API, which can ask the engine; doctor never says it).
+    #: ``not_applicable`` | ``pending`` | ``running`` | ``done`` | ``skipped``
+    #: (:func:`nerve.onboarding.read_state`; ``nerve doctor`` reads only the
+    #: worker's ``TASK.md``, see :func:`onboarding_from_task`).
     onboarding: str = "not_applicable"
     onboarding_session_id: str | None = None
     #: The caller's name: an account's display name, or the actor header's.
@@ -451,10 +451,10 @@ def _line_value(lines: list[str], prefix: str) -> str | None:
 
 
 def onboarding_from_task(workspace: Path, mode: str | None) -> str:
-    """``not_applicable`` | ``pending`` | ``done`` from ``TASK.md`` alone.
+    """``not_applicable`` | ``pending`` | ``done`` from a worker's ``TASK.md`` alone.
 
-    The ``running`` state needs the session table and is the caller's to add
-    (:func:`nerve.gateway.routes.setup` does; ``nerve doctor`` does not).
+    For ``nerve doctor``, which reads no database. The full state is
+    :func:`nerve.onboarding.read_state`.
     """
     if mode != "worker":
         return "not_applicable"

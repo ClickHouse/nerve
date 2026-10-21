@@ -19,7 +19,7 @@ import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -42,7 +42,9 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
-from nerve.setup_writer import SetupChoices, apply_mode, merge_settings_paths, write_slim_install
+from nerve.setup_writer import (
+    SetupChoices, apply_mode, merge_settings_paths, task_description_from, write_slim_install,
+)
 from tests.rate_limited_upstream import RateLimitedUpstream
 
 _PASSWORD = "correct horse battery staple"
@@ -417,11 +419,17 @@ class TestModeLock:
             assert other.status_code == 409
             assert "workspace" in other.json()["detail"]
 
-    async def test_worker_needs_a_task_description(self, claimed):
+    async def test_a_worker_needs_no_task_description(self, claimed):
         async with claimed.client() as http:
-            short = await http.put("/api/setup/mode", json={"mode": "worker", "task_description": "x"})
-            assert short.status_code == 400
-            assert short.json() == {"detail": "Describe the task in at least one full sentence (20+ characters).", "field": "task_description"}
+            state = (await http.put("/api/setup/mode", json={"mode": "worker"})).json()
+        assert state["mode"] == "worker"
+        assert step(state, "mode")["detail"]["task_present"] is True
+        task_md = (claimed.workspace / "TASK.md").read_text()
+        assert task_md.startswith("# Task\n<!-- nerve:onboarding pending")
+        assert task_description_from(task_md) == "" and "{{TASK_DESCRIPTION}}" not in task_md
+
+    async def test_worker_with_a_task_description(self, claimed):
+        async with claimed.client() as http:
             state = (await http.put("/api/setup/mode", json={
                 "mode": "worker",
                 "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything.",
@@ -2071,74 +2079,63 @@ class TestFinish:
             body = (await http.post("/api/setup/finish")).json()
         assert body["action"] == "restart_required"
 
-    async def test_an_ended_onboarding_session_is_reported_and_retried(self, claimed, monkeypatch):
-        """The session exists, the engine no longer drives it, TASK.md still
-        has no plan: ``ended`` with the session id (not a forever-spinner),
-        and an explicit Finish schedules it again."""
-        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
-        engine = MagicMock()
-        engine.channel = lambda name: None
-        engine.is_session_running = lambda sid: False
-        engine._onboarding_task = None
-        engine.ensure_worker_onboarding = MagicMock(return_value=True)
-        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
-        await claimed.db.create_session(
-            "cron:worker-onboarding", title="Cron: worker-onboarding", source="cron", actor=None,
-        )
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-            assert step(state, "mode")["detail"]["onboarding"] == "ended"
-            assert step(state, "mode")["detail"]["onboarding_session_id"] == "cron:worker-onboarding"
-            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
-            body = (await http.post("/api/setup/finish")).json()
-        assert engine.ensure_worker_onboarding.call_count == 1
-        assert body["onboarding"]["session_id"] == "cron:worker-onboarding"
-        # Still being driven: running, not ended.
-        engine.is_session_running = lambda sid: True
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "running"
-
-        # "Try again": the engine starts a *new* session; the ended row stays
-        # in the table. Whatever order the table returns them in, the row the
-        # engine drives wins — every tab reads running with the new id — and
-        # while none runs, the latest attempt is the one named as ended.
-        new_id = "cron:worker-onboarding:2"
-        await claimed.db.create_session(new_id, title="Cron: worker-onboarding", source="cron", actor=None)
-        driven: set[str] = set()
-        engine.is_session_running = lambda sid: sid in driven
-        engine.ensure_worker_onboarding = MagicMock(side_effect=lambda: driven.add(new_id))
-        async with claimed.client() as http:
-            idle = (await http.get("/api/setup")).json()
-            assert step(idle, "mode")["detail"]["onboarding"] == "ended"
-            retried = (await http.post("/api/setup/finish")).json()
-            assert retried["onboarding"] == {"status": "running", "session_id": new_id}
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "running"
-        assert step(state, "mode")["detail"]["onboarding_session_id"] == new_id
-        # Neither driven any more: ended again, naming the latest attempt.
-        driven.clear()
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "ended"
-        assert step(state, "mode")["detail"]["onboarding_session_id"] == new_id
-
-    async def test_finish_schedules_worker_onboarding(self, claimed, monkeypatch):
-        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
-        engine = MagicMock()
-        engine.channel = lambda name: None
-        engine.is_session_running = lambda sid: False
-        engine.ensure_worker_onboarding = MagicMock(return_value=True)
+    async def test_finish_opens_one_onboarding_conversation(self, claimed, monkeypatch):
+        """Finish opens one web session for the person who finished setup; a
+        second Finish names the same session; Skip ends the reminders."""
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
         monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
         async with claimed.client() as http:
-            # No provider: nothing is scheduled.
-            body = (await http.post("/api/setup/finish")).json()
-            assert body["onboarding"]["status"] == "pending"
-            assert engine.ensure_worker_onboarding.call_count == 0
             await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            first = (await http.post("/api/setup/finish")).json()
+            second = (await http.post("/api/setup/finish")).json()
+            state = (await http.get("/api/setup")).json()
+        session_id = first["onboarding"]["session_id"]
+        assert first["onboarding"]["status"] == "running" and session_id.startswith("onboarding-")
+        assert second["onboarding"] == first["onboarding"]
+        assert step(state, "mode")["detail"]["onboarding"] == "running"
+        assert step(state, "mode")["detail"]["onboarding_session_id"] == session_id
+        row = await claimed.db.get_session(session_id)
+        assert (row["title"], row["source"]) == ("Onboarding", "web")
+        assert row["caused_by_actor_id"] == row["created_by_actor_id"] is not None
+        await asyncio.sleep(0)
+        assert engine.run.await_count == 1
+        call = engine.run.await_args.kwargs
+        assert call["internal"] is True and call["session_id"] == session_id
+        assert "## Your first message" in call["user_message"]
+
+        async with claimed.client() as http:
+            skipped = (await http.post("/api/setup/onboarding/skip")).json()
+            again = (await http.post("/api/setup/finish")).json()
+        assert step(skipped, "mode")["detail"]["onboarding"] == "skipped"
+        assert again["onboarding"]["status"] == "skipped"
+        assert engine.run.await_count == 1
+
+    async def test_finish_without_a_model_asks_the_next_start(self, claimed, monkeypatch):
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
             body = (await http.post("/api/setup/finish")).json()
-        assert engine.ensure_worker_onboarding.call_count == 1
-        assert body["action"] == "reloaded"
+        assert body["onboarding"] == {"status": "pending", "session_id": None}
+        assert engine.run.await_count == 0
+        assert (await claimed.db.get_onboarding())["status"] == "requested"
+
+
+def _onboarding_engine(db) -> MagicMock:
+    """An engine whose sessions are real rows and whose turns do nothing."""
+    engine = MagicMock()
+    engine.db = db
+    engine.channel = lambda name: None
+    engine.run = AsyncMock(return_value="")
+
+    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
+        await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
+        return await db.get_session(session_id)
+
+    engine.sessions.get_or_create = _get_or_create
+    engine.register_task = lambda session_id, task: None
+    return engine
 
 
 # --------------------------------------------------------------------------- #

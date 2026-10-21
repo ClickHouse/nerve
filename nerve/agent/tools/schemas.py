@@ -643,6 +643,9 @@ SKILL_UPDATE_SCHEMA = {
 
 # ----- Notification tools -----
 
+ONBOARDING_DONE_SCHEMA = {"type": "object", "properties": {}, "required": []}
+
+
 NOTIFY_SCHEMA = {
     "type": "object",
     "properties": {

@@ -1,21 +1,22 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { Link, MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../api/client', async () => {
   const actual = await vi.importActual<typeof import('../../api/client')>('../../api/client');
   return {
     ...actual,
-    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn() },
+    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn(), setupState: vi.fn() },
     setUnauthorizedHandler: vi.fn(),
   };
 });
 vi.mock('../../stores/helpers/draftStorage', () => ({ clearAllDrafts: vi.fn() }));
 vi.mock('../../stores/helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 
+const { api } = await import('../../api/client');
 const { useSetupStore } = await import('../../stores/setupStore');
-const { makeState } = await import('../../test/setupFixtures');
+const { makeState, step } = await import('../../test/setupFixtures');
 const { SetupBanner } = await import('./SetupBanner');
 
 function renderAt(path = '/chat') {
@@ -117,5 +118,63 @@ describe('SetupBanner', () => {
     expect(box.className).toMatch(/\btop-\[calc\(env\(safe-area-inset-top\)\+3\.5rem\)\]/);
     expect(box.className).not.toMatch(/\btop-2\b/);
     expect(box.className).not.toMatch(/\bbottom-4\b/);
+  });
+});
+
+describe('SetupBanner while the onboarding conversation waits', () => {
+  const waiting = (overrides = {}) => makeState({
+    finished: true, steps_left: 0,
+    steps: [step('mode', { status: 'done' }, {
+      mode: 'personal', onboarding: 'running', onboarding_session_id: 'onboarding-1',
+    })],
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    useSetupStore.setState({ state: waiting() });
+    vi.mocked(api.setupState).mockImplementation(async () => useSetupStore.getState().state!);
+  });
+
+  function renderWithLink(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Link to="/tasks">Tasks</Link>
+        <SetupBanner />
+      </MemoryRouter>,
+    );
+  }
+
+  it('sends the person back to the conversation from every page, also after setup', async () => {
+    renderWithLink('/setup');
+    const link = await screen.findByRole('status');
+    expect(link).toHaveTextContent('Your agent waits for you in its onboarding conversation · Continue');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-1');
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+  });
+
+  it('is hidden on the conversation itself', () => {
+    renderWithLink('/chat/onboarding-1');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('hides only until the next page, and reads the state again on each page', async () => {
+    renderWithLink('/chat');
+    await userEvent.click(screen.getByRole('button', { name: 'Hide until the next page' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const reads = vi.mocked(api.setupState).mock.calls.length;
+    await userEvent.click(screen.getByRole('link', { name: 'Tasks' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('onboarding conversation');
+    expect(vi.mocked(api.setupState).mock.calls.length).toBeGreaterThan(reads);
+  });
+
+  it('is gone once onboarding is done or skipped', () => {
+    for (const onboarding of ['done', 'skipped'] as const) {
+      useSetupStore.setState({ state: waiting({
+        steps: [step('mode', { status: 'done' }, { mode: 'personal', onboarding, onboarding_session_id: 'onboarding-1' })],
+      }) });
+      const view = renderWithLink('/chat');
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      view.unmount();
+    }
   });
 });

@@ -1618,7 +1618,7 @@ class SetupWizard:
 
         # 5. Worker: TASK.md from the template with the description in place —
         #    the same writer the web Mode step uses, so every install path
-        #    produces one file for the onboarding session to fill in.
+        #    produces one file for the onboarding conversation to fill in.
         if self.choices.mode == "worker":
             apply_task_md(ws_path, self.choices.task_description)
 
@@ -2618,7 +2618,7 @@ def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) 
 
     # The mode's default optional crons — the set the web Mode step writes too.
     # Personal: inbox-processor and task-planner. Worker: the two skill jobs;
-    # its task-planner stays off until the onboarding session enables it.
+    # its task-planner stays off until the onboarding conversation enables it.
     if choices.mode in DEFAULT_CRONS:
         choices.enabled_crons = list(DEFAULT_CRONS[choices.mode])
 

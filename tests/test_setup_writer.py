@@ -714,12 +714,18 @@ class TestApplyMode:
         )
         # The writer owns the file: the MANIFEST lists it (``nerve doctor``
         # expects it of a worker), the copier leaves it out, and without a
-        # description there is no TASK.md rather than one with a bare token.
+        # description the template gets an empty description section (never
+        # a bare token), which the onboarding conversation fills.
         assert "TASK.md" in [name for name, _ in read_manifest("worker")]
         assert "TASK.md" not in outcome.created
         bare = tmp_path / "bare"
-        assert apply_mode(bare, "worker").task_written is False
-        assert not (bare / "TASK.md").exists()
+        assert apply_mode(bare, "worker").task_written is True
+        written = (bare / "TASK.md").read_text(encoding="utf-8")
+        assert TASK_DESCRIPTION_TOKEN not in written
+        assert task_onboarding_pending(written) and task_description_from(written) == ""
+        # A later call without a description keeps the file as it is.
+        assert apply_mode(ws, "worker").task_written is False
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == description
         assert "TASK.md" in initialize_workspace(tmp_path / "copied", "worker")
         assert TASK_DESCRIPTION_TOKEN in (tmp_path / "copied" / "TASK.md").read_text(encoding="utf-8")
 
@@ -800,7 +806,7 @@ class TestApplyMode:
         assert not (ws / "SOUL.md").exists()
         # Templates arrived from the repository: only TASK.md is written.
         apply_mode(ws, "worker")
-        assert not (ws / "TASK.md").exists()
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == ""
         outcome = apply_mode(ws, "worker", "Watch the nightly build and propose fixes.", locked=True)
         assert outcome.task_written and outcome.created == () and not outcome.cron_written
         # The same template-sourced file as the unlocked path writes.

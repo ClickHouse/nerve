@@ -184,7 +184,7 @@ keep", never read back.
 | Step | Asks | Writes | Takes effect |
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
-| **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
+| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule); a worker takes an optional note (at most 4000 characters) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the note, if any, in place (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time). With `memory.backend: loom` nothing: the step is done and says memory is kept in Loom | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
@@ -276,15 +276,47 @@ live, or **Restart Nerve** when something is read at startup (the time zone, a
 Telegram token, Bedrock's memory models, external agents). The restart
 reasons are listed before you click. Then:
 
-- **Finish** reloads the configuration in place and shows **Nerve is ready**
-  with a "Say hello" button that opens a new chat with a suggested first
-  message.
+- **Finish** reloads the configuration in place, opens the
+  [onboarding conversation](#the-onboarding-conversation) and shows **Nerve
+  is ready** with **Start the conversation**. When onboarding is already done
+  or skipped, a personal install offers "Say hello" (a new chat with a
+  suggested first message) and a worker offers "Open chat".
 - **Restart Nerve** restarts the daemon and waits for the *new* process to
   answer (see [Restarts from the browser](#restarts-from-the-browser)). The
-  page stays where it is, reconnects on its own and ends the same way.
-- A **worker** ends with "Onboarding session starting" and a link to that
-  session: the agent reads your task description, researches it and fills in
-  `TASK.md` — see the [Worker Guide](worker-guide.md#how-onboarding-works).
+  page stays where it is, reconnects on its own and ends the same way. The
+  new process opens the onboarding conversation when it starts.
+
+### The onboarding conversation
+
+After setup, the agent is set up by talking to it. Finish opens one web chat
+session titled **Onboarding** for the person who finished setup, and the agent
+speaks first: its first message is the answer to a hidden instruction, which
+the chat does not show. It says that it is set up by talking to it, offers what
+it can help with (fixing issues through to deployment, flaky CI tests,
+performance regressions, PR reviews, alerts, security notices and dependency
+bumps, channel summaries, research, and personal-assistant work, which a
+personal install lists first) and asks which apply. For engineering work it
+asks which repositories to onboard, clones and studies them, and asks only
+what it needs. Then it proposes the setup: cron jobs with their schedules and
+gates, whether to plan through `task-planner`, task statuses (the built-in
+`backlog` and `plan_review` and any extra waits), tags, skills and, for a
+worker, the `TASK.md` sections. It changes nothing before you confirm, then
+applies what you confirmed, summarizes every change and calls the
+`onboarding_done` tool.
+
+The state is one row in `nerve.db` (`onboarding`): pending, running (with the
+session id), done or skipped. A worker onboarded by an earlier version (the
+`TASK.md` marker is gone) counts as done; a worker whose `TASK.md` still has
+the marker counts as pending and gets the conversation when the daemon
+starts. Until onboarding is done or skipped:
+
+- the Ready screen leads into the conversation;
+- a banner on every page except the conversation says that the agent waits
+  for you, with **Continue**; its close button hides it until the next page.
+  Every signed-in person sees it, because the conversation sets up the shared
+  agent and anyone who can use setup can continue or skip it;
+- the setup page shows the conversation and **Skip onboarding**, behind a
+  confirmation. A skip keeps the session and ends the reminders.
 
 ### Coming back later
 
@@ -431,7 +463,7 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 
 This path writes the same files it always has and starts no daemon; only a
 worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
-empty) and `task-planner` disabled until the onboarding session enables it.
+empty) and `task-planner` disabled until the onboarding conversation enables it.
 The browser checklist afterwards shows what the environment decided as done —
 the mode, the provider, the time zone, a Telegram token — and leaves the rest
 to skip or fill in.

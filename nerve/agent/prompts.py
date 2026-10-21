@@ -70,172 +70,212 @@ def _format_tool_list(excluded_tools: "set[str] | None" = None) -> str:
 PROMPT_FILES = ["SOUL.md", "TASK.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md"]
 
 
-# --- The worker's first-boot onboarding prompt --------------------------------
+# --- The onboarding conversation's prompt -----------------------------------
 
 WORKER_GUIDE_URL = "https://github.com/ClickHouse/nerve/blob/main/docs/worker-best-practices.md"
 
+# What the agent offers in its first message, in this order. A personal
+# install moves the personal-assistant item to the top.
+ONBOARDING_OFFERS = (
+    "Pick up an issue, fix the bug, open a PR, and follow it all the way to deployment",
+    "Hunt down flaky CI tests and propose fixes",
+    "Detect, investigate, and fix performance regressions",
+    "Review PRs",
+    "Watch alerts and do the first round of digging",
+    "Handle security notices and dependency bumps",
+    "Read busy Slack channels and post summaries",
+    "Competitor and product research",
+    "Personal assistant: inbox triage, reminders, planning your week",
+)
+
+_ONBOARDING_RULES = """\
+## Rules
+
+- Speak to the person directly, in short messages. Ask only what you need, a \
+few questions at a time.
+- **Change nothing and start no real work before the person confirms the \
+setup you propose.** Until then you read, clone, study and ask; you do not \
+create cron jobs, skills, statuses, tasks or plans, and you do not edit \
+configuration files.
+- Use placeholders for anything you do not know; never invent a repository, \
+a channel, a person or a credential. Record where a credential lives, never \
+its value.
+- If the person wants to stop, say that they can come back to this \
+conversation at any time, or skip onboarding on the setup page.
+"""
+
 _ONBOARDING_STEPS = """\
-## Steps
+## How the conversation goes
 
-### 1. Research
+### 1. Learn the work
 
-Fetch the URLs the description names (repositories, docs, APIs, dashboards); \
-clone the repositories the worker will work in; look at the CI systems, \
-databases and APIs involved; search the web for what you do not know. Keep \
-notes: the References section, the skills and the cron prompts come from them. \
-Record where each credential lives and how it is passed — never its value.
+For each item the person chose:
 
-### 2. Fill TASK.md in place
+- Engineering work (issues and PRs, CI, performance, reviews, security and \
+dependency bumps): ask which repositories to onboard. Clone each one into the \
+workspace and study it: how to build and test it, its CI, its contribution and \
+review rules, its labels. Ask which account the agent uses on the code host, \
+and which actions need approval first.
+- Alerts and channels: ask which alert sources and which channels to read, \
+how often, and where to post results.
+- Research: ask about the topics, the sources and how often to report.
+- Personal assistant: ask which inboxes and calendars to read, quiet hours, \
+and how to send reminders.
 
-`<workspace>/TASK.md` (already in your system prompt) is the worker template \
-with the description under `## Task description (as given)`. Fill every \
-section where it stands:
+Ask about schedules and approval rules for every item.
 
-- Keep every `##` heading, in its order, and keep the description section as \
-the operator wrote it.
-- Replace each `_(onboarding fills this in: …)_` placeholder and every \
-`Example:` line with this worker's content; the guide's anatomy table says \
-what belongs in each section and how long it may be.
-- Hard rules: one `### ⛔ HARD RULE: <one sentence of rule> [operator directive \
-YYYY-MM-DD]` heading per rule (`[added YYYY-MM-DD]` for a rule you derive), \
-the rule before any why, failing closed by enumeration. Rules the operator \
-stated in the description are operator directives; date them today.
-- Actions: the transition table (`| From | Event | To | Who holds the ball |`) \
-followed by an anti-patterns list. Statuses beyond `pending`, `in_progress`, \
-`done` and `deferred` are created once, with `task_status_create`.
-- Approval Required: the autonomous column is a standing grant; until it says \
-so, `SOUL.md`'s default — ask before anything external — applies.
-- References: pointers (auth mode, schema columns, canonical filters, label \
-vocabulary), never secrets; the long form goes to `TOOLS.md` under a dated \
-heading.
-- Keep the closing `Read the full guide:` link. Keep the file within about 4 KB: \
-rationale, measurements and history go to `memory/contexts/`, not here.
+### 2. Propose the setup, in one message
 
-### 3. Create skills
+Name every change you would make:
 
-`skill_create` one skill per procedure the worker will repeat: the \
-build-and-test routine, querying the failure database or CI API, reproducing \
-a failure class, publishing a PR the way the project expects. Steps, exact \
-commands, gotchas and an example in each; a third-person description with \
-trigger phrases.
+- **Cron jobs**: id, schedule, gate (`run_if`), session mode, and what each \
+run does. A scan job that finds new work runs on its schedule without a gate. \
+A job that works the queue gates on a `tasks` status and tag, so it stays idle \
+when there is no work.
+- **Built-in jobs**: which ones in `config/cron/system.yaml` you turn on or \
+off. The effective state of a built-in job is `system.yaml` with a job of the \
+same id in `config/cron/jobs.yaml` replacing it. Read both files before you \
+say what is on.
+- **The plan-and-approve loop**: whether the `task-planner` job proposes \
+plans that the person approves before an implementation session does the \
+work, or whether a work job has a standing grant for routine items.
+- **Task statuses**: the built-in ones are `backlog` (not ready; no built-in \
+job picks it up), `pending` (ready; the queue), `plan_review` (a plan waits \
+for a decision; `plan_propose` moves the task there and notifies the person), \
+`in_progress`, `done` and `deferred`. Add a status only for another kind of \
+wait, such as a PR in review.
+- **Task tags**: one tag for each kind of work, so that each job selects its \
+own tasks.
+- **Skills**: one for each procedure that runs repeatedly.
+- **Notes**: what you will save to memory.
 
-### 4. Configure cron jobs
+Then ask the person to confirm or to change the proposal.
 
-Append the worker's jobs to `<workspace>/config/cron/jobs.yaml` — Nerve's \
-scheduler (`nerve cron <id>` runs one by hand), not the system crontab. One job \
-per line of `TASK.md` § Triggers. Gate a job with `run_if` where the guide says, \
-so it stays idle until there is work: a `tasks` gate on the status and tag a \
-work job owns, a `messages` gate for inbox-driven \
-work, a `github_pr_activity` gate (with the bot's login as `author`) for a PR \
-monitor. Scan jobs that create the work run on their schedule, ungated. \
-`lock: true` and `catchup: false` on anything that may outrun its interval. \
-Procedure for one job goes in `config/cron/prompts/<job>.md`, loaded with \
-`prompt_file` and opening with "`TASK.md` is the kernel; this file is your \
-charter for the <job> phase." Format:
+### 3. Apply what the person confirmed
+
+Only after the confirmation, and only what they confirmed:
+
+- Add jobs to `<workspace>/config/cron/jobs.yaml` (Nerve's scheduler, not the \
+system crontab). Put a long prompt in `config/cron/prompts/<job>.md` and load \
+it with `prompt_file`. Set `lock: true` and `catchup: false` on a job that \
+claims or moves tasks. To change a built-in job, add a job with its id to \
+`jobs.yaml`. Example:
 
 ```yaml
 jobs:
   - id: work-queue
     schedule: '*/15 * * * *'
-    description: Work one actionable task per run
-    session_mode: isolated          # persistent keeps context across runs
+    description: Work one ready task per run
+    session_mode: isolated
     lock: true
     catchup: false
     run_if:
       - type: tasks
         status: pending
-        tag: source:ci-main
-    enabled: true
-    prompt_file: prompts/work-queue.md   # or an inline `prompt: |`
+        tag: source:ci
+    prompt_file: prompts/work-queue.md
 ```
 
-Then decide on the planner. The built-in jobs are in \
-`<workspace>/config/cron/system.yaml`: for a worker `task-planner` ships \
-disabled (after `nerve init --terminal` the skill jobs are disabled too). When \
-this worker should plan through the approval loop, enable `task-planner` by \
-overriding it by id in `jobs.yaml` (a job there replaces the `system.yaml` job \
-with the same id): `enabled: true`, with a prompt and a `tasks` gate \
-(`status: pending` and this worker's `tag`) scoped to the tasks it plans. Leave \
-it off when a work job with a standing grant covers the routine items. Say \
-which in `TASK.md` § Approval Required.
+- Create statuses with `task_status_create`, skills with `skill_create`, and \
+tasks with `task_create` for what only the person can do (access to grant, \
+accounts to create).
+- `memorize` what you learned about the work and what was decided.
+- When configuration changes arrive by pull request on this instance, use \
+`propose_config_change` instead of editing the files.
 
-### 5. Create initial tasks
+### 4. Summarize
 
-`task_create` one task per thing only the operator can do: credentials to \
-grant, accounts to create, access to request, decisions the description leaves \
-open.
+End with one message that lists every change: jobs (id, schedule, gate, on or \
+off), statuses, tags, skills, tasks with their ids, notes. Then give numbered \
+next steps for the person. Say that they can change the setup at any time by \
+asking you.
 
-### 6. Walk through everything you did, then give next steps
+### 5. Mark onboarding done
 
-First `memorize` what you learned about the domain (`knowledge`) and what you \
-decided (`event`); the next session starts from zero. Then `notify` (priority \
-`high`) a walkthrough, and after step 7 end the session with the same \
-walkthrough as your final message. Both enumerate every change:
+After the summary, call `onboarding_done`. Until you call it, the web UI \
+shows a notice that sends the person back to this conversation.
+"""
 
-- the `TASK.md` sections you filled;
-- the statuses you created;
-- the skills you created, by name;
-- the cron jobs you added or enabled: id, schedule, gate, session mode, and \
-whether it is enabled;
-- the tasks you created: their ids and what the operator must do for each;
-- what you memorized.
+_WORKER_TASK_MD = """\
+## TASK.md
 
-Close both with a numbered **Next steps for the operator**: credentials and \
-access to grant (with the task ids), plans to approve, jobs to review or \
-enable, how to run a job by hand (`nerve cron <id>`), and what to watch during \
-the first runs.
+This agent is a worker. `<workspace>/TASK.md` (already in your system prompt) \
+is the worker template. Fill it as part of step 3:
 
-### 7. Delete the marker — last
+- Keep every `##` heading in its order. Under `## Task description (as \
+given)`, keep what the operator wrote at setup; when it is empty, write the \
+work the person described in this conversation.
+- Replace each `_(onboarding fills this in: …)_` placeholder and every \
+`Example:` line; the guide's anatomy table says what belongs in each section.
+- Hard rules: one `### ⛔ HARD RULE: <one sentence> [operator directive \
+YYYY-MM-DD]` heading per rule, the rule before the reason.
+- Actions: the transition table (`| From | Event | To | Who holds the ball |`) \
+and a list of anti-patterns.
+- Approval Required: what the worker may do on its own; until it says so, \
+`SOUL.md`'s default applies (ask before anything external).
+- Keep the file within about 4 KB. `onboarding_done` removes the marker \
+comment on line 2; do not remove it yourself.
 
-Only when every section of `TASK.md` is filled, delete its second line, the \
-`<!-- nerve:onboarding pending … -->` comment. That line is how Nerve knows \
-onboarding is still due: while it stands, the setup page reports onboarding as \
-pending and the next start runs this session again; once it is gone, the file \
-is the worker's. Do not remove it before the file is complete, and do not add \
-it back.
+The worker guide follows between the two rules. It is the standard for \
+`TASK.md`, the task state machine, cron jobs and boundaries. Read it before \
+you propose the setup.
 """
 
 
-def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: str = "memu") -> str:
-    """The first-boot onboarding session's prompt for a worker.
+def onboarding_prompt(
+    mode: str, task_description: str = "", guide: str = "", *, memory_backend: str = "memu",
+) -> str:
+    """The hidden first message of the onboarding conversation.
 
-    Role line, the operator's description, the worker guide in full (it is
-    the standard the filled ``TASK.md`` is held to, so the session gets the
-    whole text rather than a link), then the steps. ``guide`` is the text of
-    ``docs/worker-best-practices.md`` (:func:`nerve.workspace.read_worker_guide`);
-    when it is empty the prompt points at the published copy instead. Under
-    ``memory_backend`` ``loom`` the step that saves what was learned names
-    Loom's tool.
+    The person who opens the conversation does not see it; the agent's
+    answer is the first message they see. ``mode`` is ``personal`` or
+    ``worker``. A worker's prompt adds the operator's description, if any,
+    the ``TASK.md`` rules and ``guide``, the worker guide in full
+    (:func:`nerve.workspace.read_worker_guide`); when ``guide`` is empty, it
+    points at the published copy. Under ``memory_backend`` ``loom`` the step
+    that saves what was learned names Loom's tool
+    (:data:`nerve.memory.loom_prompts.CONVERSATION_EDITS`).
     """
-    quoted = "\n".join(
-        f"> {line}" if line.strip() else ">" for line in task_description.strip().splitlines()
-    ) or "> (no description was given)"
-    body = guide.strip() or (
-        "(The guide could not be read from this installation. Fetch it from "
-        f"{WORKER_GUIDE_URL} and read it in full before step 2.)"
-    )
-    steps = _ONBOARDING_STEPS
+    offers = list(ONBOARDING_OFFERS)
+    if mode != "worker":
+        offers.insert(0, offers.pop())
+    offer_lines = "\n".join(f"- {item}" for item in offers)
+    kind = "a worker for a team" if mode == "worker" else "a personal assistant"
+    parts = [
+        "This is the **onboarding conversation** of this Nerve agent, which is "
+        f"set up as {kind}. The person who set it up opens this chat. They do "
+        "not see this message: your answer is the first message of the "
+        "conversation, so you speak first.\n\n"
+        "## Your first message\n\n"
+        "Greet the person (by name, if `USER.md` gives it). In two or three "
+        "sentences, say that you are set up by talking to you, now and at any "
+        "time later. Then offer this list, as it is, and ask which items apply; "
+        "they can choose more than one, or describe something else:\n\n"
+        f"{offer_lines}\n\n"
+        "Change nothing in this first message.",
+        _ONBOARDING_RULES,
+        _ONBOARDING_STEPS,
+    ]
+    if mode == "worker":
+        quoted = "\n".join(
+            f"> {line}" if line.strip() else ">"
+            for line in task_description.strip().splitlines()
+        ) or "> (no description was given at setup)"
+        body = guide.strip() or (
+            "(The guide could not be read from this installation. Fetch it from "
+            f"{WORKER_GUIDE_URL} and read it in full before you propose the setup.)"
+        )
+        parts += [
+            f"## What the operator wrote at setup\n\n{quoted}",
+            _WORKER_TASK_MD,
+            f"---\n\n{body}\n\n---",
+        ]
+    prompt = "\n\n".join(part.strip() for part in parts)
     if memory_backend == "loom":
-        steps = loom_prompts.apply_edits(steps, loom_prompts.ONBOARDING_EDITS, name="onboarding steps")
-    return (
-        "You are running the **first-boot onboarding** for this Nerve worker: one "
-        "session with full tool access that turns the operator's description into "
-        "a configured worker. Every later session is short and starts from zero; "
-        "what you write here is what they start from.\n\n"
-        "## The task, as the operator described it\n\n"
-        f"{quoted}\n\n"
-        "## The worker guide — apply it\n\n"
-        "Between the two rules below is `docs/worker-best-practices.md`, in full. "
-        "It is the standard this worker is held to: the `TASK.md` anatomy you are "
-        "about to fill, how to write rules that survive context pressure, the "
-        "plan-approve-execute loop, the task state machine, boundaries, execution "
-        "hygiene, memory, escalation. Read it before you research; before you "
-        "finish, check `TASK.md` against its One-Page Checklist.\n\n"
-        "---\n\n"
-        f"{body}\n\n"
-        "---\n\n"
-        f"{steps}"
-    )
+        prompt = loom_prompts.apply_edits(
+            prompt, loom_prompts.CONVERSATION_EDITS, name="onboarding conversation",
+        )
+    return prompt
 
 
 def current_time_str(timezone_name: str = "America/New_York") -> str:

@@ -47,4 +47,5 @@ ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("cron_logs", "caused_by_actor_id"),
     ("session_agents", "stopped_by_actor_id"),
     ("session_agents", "stopped_caused_by_actor_id"),
+    ("onboarding", "actor_id"),
 )

@@ -106,6 +106,18 @@ ONBOARDING_EDITS: tuple[tuple[str, str], ...] = (
     ("- what you memorized.", "- what you saved to Loom."),
 )
 
+# The onboarding conversation's prompt (nerve.agent.prompts.onboarding_prompt):
+# the memU sentence, then its Loom wording.
+CONVERSATION_EDITS: tuple[tuple[str, str], ...] = (
+    (
+        "- `memorize` what you learned about the work and what was decided.",
+        (
+            "- Save to Loom what you learned about the work and what was decided, "
+            "one fact per `loom_memory_set` call under a readable key."
+        ),
+    ),
+)
+
 # The Codex backend's developer-instructions note: the line naming Nerve's
 # memory tools among Nerve's tools, and its Loom wording.
 CODEX_NOTE_EDIT = (
@@ -326,6 +338,7 @@ def tool_names() -> set[str]:
         SYSTEM_PROMPT_SECTION, EXTERNAL_AGENT_MEMORY, EXTERNAL_AGENT_FOOTER_MEMORY,
         MAINTENANCE_PROMPT, CODEX_NOTE_EDIT[1], INBOX_MEMORIZE_EDIT[1],
         *(new for _, new in ONBOARDING_EDITS),
+        *(new for _, new in CONVERSATION_EDITS),
         *(new for edits in TEMPLATE_EDITS.values() for _, new in edits),
     ]
     names: set[str] = set()
