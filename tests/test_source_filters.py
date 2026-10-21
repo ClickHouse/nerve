@@ -105,6 +105,28 @@ def test_special_source_and_record_type_fields():
 # InboxFilter aggregation
 # ---------------------------------------------------------------------------
 
+# The glob dialect that the hosted GitHub gateway matches with too: Python
+# fnmatch on lower-cased values, where "*" also crosses "/", "?" is one
+# character, [...] is a class, and there is neither "**" nor escaping.
+@pytest.mark.parametrize(("pattern", "value", "matched"), [
+    ("*nerve*", "OWNER/Nerve-Tools", True),
+    ("owner*", "owner/repo", True),
+    ("owner/*", "owner/sub/repo", True),
+    ("*/repo", "a/b/repo", True),
+    ("owner/rep?", "owner/repo", True),
+    ("owner/rep?", "owner/repository", False),
+    ("[ab]*/x", "B/x", True),
+    ("[!a]*/x", "a/x", False),
+    ("exact/name", "exact/name2", False),
+])
+def test_the_glob_vectors_shared_with_the_gateway(pattern, value, matched):
+    assert FieldRule(field="repo_name", allow=[pattern]).passes(_rec(value)) is matched
+
+
+def test_the_list_vector_shared_with_the_gateway():
+    assert FieldRule(field="actors", allow=["codecov"]).passes(_rec(actors=["alice", "Codecov"])) is True
+
+
 def test_inbox_filter_inactive_partition_is_passthrough():
     flt = InboxFilter()
     records = [_rec("a/b"), _rec("c/d")]
