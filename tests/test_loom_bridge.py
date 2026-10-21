@@ -203,7 +203,9 @@ class FakeLoom:
         return [headers for name, _, headers in self.calls if name == op]
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/whoami":
+        path = request.url.path
+        path = path[path.find("/v1/"):]  # a base URL may carry a path
+        if path == "/v1/whoami":
             self.whoami_calls += 1
             if self.whoami_status == 0:
                 raise httpx.ConnectError("connection refused")
@@ -215,7 +217,7 @@ class FakeLoom:
                 "authenticated": True, "subject": "sa:test", "org": ORG,
                 "namespaces": list(self.namespaces),
             })
-        op = request.url.path.removeprefix("/v1/")
+        op = path.removeprefix("/v1/")
         body = json.loads(request.content or b"{}")
         self.calls.append((op, body, request.headers))
         self.sizes.setdefault(op, []).append(len(request.content))
@@ -1204,6 +1206,19 @@ async def test_expand_unknown_category(make_bridge) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_refused_expansion_is_an_error_not_an_unknown_category(make_bridge) -> None:
+    fake = FakeLoom()
+    cat_id = fake.add_category(HOME, "travel", "Trips")
+    bridge = await make_bridge(fake)
+    fake.fail("memory.list", _error(422, "VALIDATION_FAILED", "bad filter"))
+    text = _text(await memory_expand_category_handler(_ctx(bridge), {"category_id": f"cat:{cat_id}"}))
+    assert text == "Error: Loom refused memory.list (HTTP 422 VALIDATION_FAILED): bad filter"
+    fake.fail("namespace.list_categories", _error(403, "POLICY_FORBIDDEN", "paused"))
+    with pytest.raises(LoomRequestError, match="POLICY_FORBIDDEN"):
+        await bridge.expand_category(f"cat:{cat_id}")
+
+
+@pytest.mark.asyncio
 async def test_create_category_registers_once(make_bridge) -> None:
     fake = FakeLoom()
     bridge = await make_bridge(fake)
@@ -2140,6 +2155,13 @@ async def test_health_when_loom_is_down(make_bridge) -> None:
     ("http://localhost:7777", "", ""),
     ("http://169.254.10.1:7777", "", ""),
     ("http://[::1]:7777", "", ""),
+    ("http://100.64.1.2:7777", "", ""),
+    ("http://loom:7777", "", ""),
+    ("http://loom.local:7777", "", ""),
+    ("http://loom.internal:7777", "", ""),
+    ("http://loom.example.svc:7777", "", ""),
+    ("http://loom.example.svc.cluster.local:7777", "", ""),
+    ("https://loom.example.test/dash", "", f"https://loom.example.test/dash/memories?namespace={HOME}"),
     ("http://10.0.0.5:3000", "https://loom.example.test/",
      f"https://loom.example.test/memories?namespace={HOME}"),
     ("https://loom.example.test", "", f"https://loom.example.test/memories?namespace={HOME}"),

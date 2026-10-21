@@ -1845,9 +1845,10 @@ starts normally while Loom is down.
 
 **The dashboard link.** The Memory and Diagnostics pages link to Loom's dashboard at
 `<dashboard>/memories?namespace=<home namespace>`, where `<dashboard>` is
-`memory.loom.dashboard_url`, or else `base_url` unless that is a loopback, private or
-link-local address (a local proxy's, which no browser reaches). With neither, the pages
-show no link.
+`memory.loom.dashboard_url`, or else `base_url` when a browser can reach it: a globally
+routable address, or a dotted name outside `localhost`, `.local`, `.internal`, `.svc`,
+`.cluster.local` and `.home.arpa`. A local proxy's address, a cluster service name or a
+bare host name is no link, and with neither the pages show none.
 
 **What differs from memU.**
 

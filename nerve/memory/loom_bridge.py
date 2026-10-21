@@ -190,6 +190,11 @@ _TIMELINE_MAX_PAGES = 10
 # namespace.search_categories shows the first 280 BYTES of a summary.
 _SUMMARY_EXCERPT_BYTES = 280
 
+# Names only a local network resolves: no link to Loom's dashboard goes there.
+_LOCAL_NAME_SUFFIXES = (
+    "localhost", "local", "internal", "svc", "cluster.local", "home.arpa",
+)
+
 # One item of a context.pack section: `- [<citation> <labels>] <text>`, with
 # continuation lines indented by two spaces. The citation is percent-escaped.
 _PACK_LINE_RE = re.compile(r"- \[(?P<cite>[^\s\]]+)[^\]]*\] ?(?P<text>.*)")
@@ -498,19 +503,22 @@ def _within_bytes(items: list[dict[str, str]], max_bytes: int) -> list[dict[str,
 
 
 def _linkable(url: str) -> bool:
-    """Whether a person's browser can be sent to ``url``: not a loopback,
-    private or link-local address (a local proxy's, say)."""
-    host = urlsplit(url).hostname or ""
-    if not host or host == "localhost" or host.endswith(".localhost"):
+    """Whether a person's browser can be sent to ``url``: a globally routable
+    address, or a dotted name outside the suffixes only a local network
+    resolves. A local proxy's address, a cluster service name or a bare host
+    name is no link."""
+    host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    if not host:
         return False
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return True  # a name
-    return not (
-        ip.is_private or ip.is_loopback or ip.is_link_local
-        or ip.is_reserved or ip.is_unspecified or ip.is_multicast
-    )
+        pass
+    else:
+        return ip.is_global
+    if "." not in host:
+        return False
+    return not any(host == s or host.endswith("." + s) for s in _LOCAL_NAME_SUFFIXES)
 
 
 # One message of a window: the turn sent to Loom, and the message's id in
@@ -1263,7 +1271,7 @@ class LoomBridge:
         ``update_item`` tags what it assigns. A keyword longer than Loom
         matches on is cut to its first 200 characters, and the answer says so
         (``query``, ``query_clipped``). ``name`` is None for an unknown
-        category; an outage raises.
+        category; an outage raises, and so does a request Loom refuses.
         """
         empty: dict[str, Any] = {"name": None, "total": 0, "items": []}
         if not self._available:
@@ -1271,13 +1279,9 @@ class LoomBridge:
         ref = category_id.removeprefix("cat:").strip()
         if not ref:
             return empty
-        try:
-            return await self._tracked(
-                "expand_category", ref, self._expand_category(ref, query, int(limit)),
-            )
-        except LoomRequestError as e:
-            logger.error("Loom expand_category refused for %s: %s", ref, e)
-            return empty
+        return await self._tracked(
+            "expand_category", ref, self._expand_category(ref, query, int(limit)),
+        )
 
     async def _expand_category(self, ref: str, query: str, limit: int) -> dict[str, Any]:
         cat = await self._find_category(ref)
