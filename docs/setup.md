@@ -287,10 +287,12 @@ reasons are listed before you click. Then:
 
 ### Coming back later
 
-The wizard is re-enterable. **Setup** sits in the navigation. An instance
-that has never chosen a mode opens on the setup page: whoever signs in lands
-on `/setup` once per visit (a link straight into the wizard is left where it
-points) and is free to go anywhere else from there. A partially set-up
+The wizard is re-enterable. **Setup** sits in the navigation until setup is
+finished. After that, a gear button labelled **Setup** at the bottom of the
+navigation rail (on a phone: at the bottom of the **More** menu) opens it.
+An instance that has never chosen a mode opens on the setup page: whoever
+signs in lands on `/setup` once per visit (a link straight into the wizard
+is left where it points) and is free to go anywhere else from there. A partially set-up
 instance — Mode chosen, steps left — opens as usual, with a dismissible
 banner that reads "Finish setting up Nerve — N steps left" (or "Restart
 Nerve to apply your setup" when only the restart is left). The count

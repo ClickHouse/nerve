@@ -6,7 +6,7 @@ import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { IconButton } from '../ui';
-import { LogOut } from '../ui/icons';
+import { LogOut, Settings } from '../ui/icons';
 import { useSetupStore } from '../../stores/setupStore';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS, visibleNavItems } from './navItems';
@@ -22,6 +22,7 @@ export function NavRail() {
   // A hook subscription, so the entry appears the moment the checklist is
   // read — not on the next unrelated re-render.
   const setupKnown = useSetupStore(s => s.state !== null);
+  const setupFinished = useSetupStore(s => s.state?.finished === true);
 
   // Load notification count + feature flags on mount
   useEffect(() => {
@@ -31,7 +32,7 @@ export function NavRail() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []);
 
-  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown });
+  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished });
 
   return (
     <div className="w-14 bg-surface border-r border-border flex flex-col items-center py-3 shrink-0">
@@ -83,6 +84,17 @@ export function NavRail() {
         <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
         <ThemeToggle />
+        {/* A finished setup leaves the main list; this keeps it one click away. */}
+        {setupFinished && (
+          <IconButton
+            label="Setup"
+            size="md"
+            active={location.pathname.startsWith('/setup')}
+            onClick={() => navigate('/setup')}
+          >
+            <Settings size={16} />
+          </IconButton>
+        )}
         {!hosted && (
           <IconButton label="Logout" size="md" onClick={logout}>
             <LogOut size={16} />

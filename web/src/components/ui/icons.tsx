@@ -31,7 +31,7 @@ export {
   Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, Monitor,
   Moon, MoreHorizontal, OctagonX, PanelLeftClose, PanelLeftOpen, Paperclip,
   Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Reply, Rocket,
-  RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server,
+  RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server, Settings,
   ShieldCheck, ShieldQuestion, Slack, SlidersHorizontal, Sparkle, Sparkles,
   Square, SquareTerminal, Star, StickyNote, Sun, Tag, Terminal, Timer,
   User, Users,

@@ -241,7 +241,9 @@ restart is left. Bottom-left on desktop, top on phones. Hidden on `/setup`,
 when setup is finished, while the state is unknown, during a restart, and
 after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
 The **Setup** entry in the navigation appears as soon as the checklist has
-been read, in both auth modes, and stays visible when setup is finished. The
+been read, in both auth modes, and leaves the list when setup is finished.
+Then a gear button labelled "Setup" in the footer of the nav rail, and a
+"Setup" row in the footer of the phone's **More** drawer, open `/setup`. The
 chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
 
