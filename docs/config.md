@@ -1814,11 +1814,14 @@ The indexing sweep queues each session window with `memory.set_from_messages`
 (`defer: true`, every fact tagged `source:nerve`), in batches of at most 400 messages
 and `memory.loom.extraction_batch_bytes` (a single message longer than that is cut),
 and Loom extracts the facts in the background. Each queued batch is recorded in
-`nerve.db` with its session and time window, and the next sweep asks
-`memory.extraction_status` about it: a batch Loom finished is forgotten, one Loom gave
-up on is sent again from the stored messages, three sends in all, and after that it is
-logged as an error and counted as failed on the Diagnostics page (the record is kept 30
-days).
+`nerve.db` with its session, the namespace it went to and the ids of its messages, and
+the next sweep asks `memory.extraction_status` about the batches of the namespace in
+use: one Loom finished is forgotten, and one Loom gave up on (or no longer lists a day
+after it was sent) is sent again, exactly those messages, three sends in all. A batch
+whose retries ran out, whose messages are gone or cannot be read back, or whose resend
+Loom refused is logged as an error and counted as failed on the Diagnostics page (the
+record is kept 30 days). A batch queued in another namespace is never sent into the
+one in use; deleting a session deletes its records.
 
 `memory_update`, `memory_delete` and `category_update` use `memory.update_by_id`
 (against the content hash it just read), `memory.assign_category`, `memory.delete` and

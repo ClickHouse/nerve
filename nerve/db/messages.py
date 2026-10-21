@@ -369,6 +369,27 @@ class MessageStore:
                 row["blocks"] = json.loads(row["blocks"])
         return rows
 
+    async def get_messages_by_ids(
+        self, session_id: str, message_ids: list[int],
+    ) -> list[dict]:
+        """The session's messages with these ids, oldest first; ids that no
+        longer exist are skipped."""
+        ids = [int(i) for i in message_ids]
+        rows: list[dict] = []
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"SELECT * FROM messages WHERE session_id = ? AND id IN ({placeholders})",
+                (session_id, *chunk),
+            ) as cursor:
+                rows.extend([dict(row) async for row in cursor])
+        rows.sort(key=lambda r: (str(r.get("created_at") or ""), int(r["id"])))
+        for row in rows:
+            if row.get("blocks"):
+                row["blocks"] = json.loads(row["blocks"])
+        return rows
+
     # --- File snapshot operations ---
 
     async def save_file_snapshot(

@@ -365,6 +365,8 @@ class SessionStore:
             await self.db.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            # The memory backend's record of extraction queued for them.
+            await self.db.execute("DELETE FROM memory_extractions WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if row is not None:
                 await self.db.execute(
