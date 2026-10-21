@@ -16,6 +16,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -71,6 +72,8 @@ class FakeActivitySocket:
         self.delays: dict[str, float] = {}
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[asyncio.StreamWriter] = set()
+        # Set whenever a request arrives (see wait_for_request).
+        self._arrived = asyncio.Event()
 
     async def start(self) -> None:
         self._server = await asyncio.start_unix_server(self._serve, path=self.path)
@@ -106,6 +109,7 @@ class FakeActivitySocket:
                 raw = await reader.readexactly(length) if length else b""
                 body = json.loads(raw) if raw else None
                 self.requests.append(Recorded(method, target, body, loop.time()))
+                self._arrived.set()
                 delay = self.delays.get(f"{method} {target}")
                 if delay:
                     await asyncio.sleep(delay)
@@ -125,7 +129,7 @@ class FakeActivitySocket:
     def _answer(self, method: str, target: str, body: Any) -> tuple[int, dict]:
         status = self.status.get(f"{method} {target}")
         if status is not None and status >= 400:
-            return status, {"error": "invalid_request"}
+            return status, {"error": "not_found" if status == 404 else "invalid_request"}
         if isinstance(body, dict) and self.unknown_fields & body.keys():
             return 400, {"error": "invalid_request"}
         if target == "/v1/activity" and not _TASK_NAME.fullmatch(
@@ -154,6 +158,17 @@ class FakeActivitySocket:
             if loop.time() > deadline:
                 raise AssertionError(f"timed out; requests so far: {self.requests}")
             await asyncio.sleep(0.01)
+
+    async def wait_for_request(self, predicate: Callable[[], bool], timeout: float) -> None:
+        """Like :meth:`wait_for`, without polling: the event loop sleeps until
+        a request arrives, so nothing but the work under test wakes it."""
+        try:
+            async with asyncio.timeout(timeout):
+                while not predicate():
+                    self._arrived.clear()
+                    await self._arrived.wait()
+        except TimeoutError:
+            raise AssertionError(f"timed out; requests so far: {self.requests}") from None
 
 
 # --------------------------------------------------------------------------- #
@@ -713,17 +728,46 @@ async def test_a_lease_can_be_held_from_a_worker_thread(fake_socket, reporters):
     release = threading.Event()
 
     def work() -> None:
+        time.sleep(0.2)  # until the event loop sleeps in the wait below
         with keep_awake(LEASE_CONFIG_SYNC):
             release.wait(5)
 
     worker = asyncio.create_task(asyncio.to_thread(work))
-    await fake_socket.wait_for(
-        lambda: ("POST", "/v1/leases", {"name": "nerve-config-sync", "ttlSeconds": 120})
-        in fake_socket.lease_calls(),
-    )
-    release.set()
-    await worker
+    try:
+        # Nothing polls while this waits, and the reporter would not look on
+        # its own for minutes: the lease request goes out in time only if the
+        # worker thread's wake reaches the sleeping event loop safely.
+        await fake_socket.wait_for_request(
+            lambda: ("POST", "/v1/leases", {"name": "nerve-config-sync", "ttlSeconds": 120})
+            in fake_socket.lease_calls(),
+            timeout=2.0,
+        )
+    finally:
+        release.set()
+        await worker
     await fake_socket.wait_for(lambda: fake_socket.lease_calls()[-1][0] == "DELETE")
+
+
+@pytest.mark.asyncio
+async def test_a_lease_the_socket_no_longer_has_counts_as_released(
+    fake_socket, reporters, monkeypatch,
+):
+    """A 404 to the release means the platform's copy is gone already: the
+    lease is released, not tried again."""
+    monkeypatch.setattr(activity, "LEASE_RETRY_SECONDS", 0.1)
+    fake_socket.status["DELETE /v1/leases/nerve-backup"] = 404
+    reporter = await started(reporters, make_reporter(fake_socket.path))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    with keep_awake(LEASE_BACKUP):
+        await fake_socket.wait_for(lambda: fake_socket.lease_calls())
+    await fake_socket.wait_for(lambda: fake_socket.lease_calls()[-1][0] == "DELETE")
+    await asyncio.sleep(0.5)  # several retry periods
+
+    assert [call[:2] for call in fake_socket.lease_calls()] == [
+        ("POST", "/v1/leases"), ("DELETE", "/v1/leases/nerve-backup"),
+    ]
+    assert LEASE_BACKUP not in reporter._leases
 
 
 @pytest.mark.asyncio
@@ -1253,7 +1297,9 @@ async def test_a_finished_run_is_reported_with_the_task_after_it(fake_socket, re
 
 
 @pytest.mark.asyncio
-async def test_the_engines_turns_and_background_agents_reach_the_socket(fake_socket, reporters):
+async def test_the_engines_turns_and_background_agents_reach_the_socket(
+    fake_socket, reporters, tmp_path,
+):
     """The engine's own session manager and agent registry drive the reports
     and the background lease."""
     from unittest.mock import AsyncMock, MagicMock
@@ -1263,6 +1309,7 @@ async def test_the_engines_turns_and_background_agents_reach_the_socket(fake_soc
     from tests.actor_rows import mock_system_principal
 
     config = MagicMock()
+    config.codex.home_dir = str(tmp_path)  # the Codex backend creates it
     config.sessions.sticky_period_minutes = 5
     config.agent.max_concurrent = 3
     config.mcp_servers = []

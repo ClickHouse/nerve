@@ -175,8 +175,8 @@ For a machine that a platform parks while it is idle. When the platform's
 local activity socket (a Unix socket, `platform.activity_socket`) exists at
 startup, `ActivityReporter` keeps it current: running turns, open web client
 connections, and the next scheduled task the cron service forecasts. These go
-out on every change (coalesced to one post every 250 ms) and on a fixed
-interval. Background work that is not a turn (memorization, workspace sync,
+out on every change (at most one post every 250 ms) and on a fixed interval.
+Background work that is not a turn (memorization, workspace sync,
 backups, background agents) holds keep-awake leases through `keep_awake()`.
 Without the socket nothing is sent. See
 [platform-activity.md](platform-activity.md).

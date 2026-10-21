@@ -83,7 +83,7 @@ expires on its own after its lifetime.
 | `nerve-memorize` | Memorization is queued or running. This covers background memorization of a session (after a client is let go, a turn is stopped or fails, a session is archived or deleted, or a cron session is rotated), the periodic and manual memorization sweeps, and the copy of a memorized conversation to xmemory. |
 | `nerve-config-sync` | A [workspace sync](config.md#git-backed-workspace-sync) cycle pulls and applies, in the periodic loop and in `POST /api/config/sync`. |
 | `nerve-backup` | The scheduled backup (`backup.*`) writes and prunes bundles. |
-| `nerve-background` | Any session has a live background agent or task: sub-agents, background shells, monitors, and workflows that an agent started. The lease is held after the turn that started them has ended. A task that never ends on its own, such as a dev server in a background shell or a monitor, keeps the machine awake until it is stopped. |
+| `nerve-background` | Any session has a live background agent or task, that is anything still starting, running or stopping in the session's [Agents panel](AGENTS.md): sub-agents, workflows, background shells, monitors, teammates, remote agents and MCP tasks that an agent started. The lease is held after the turn that started them has ended. A task that never ends on its own, such as a dev server in a background shell or a monitor, keeps the machine awake until it is stopped. |
 
 Not covered by a lease:
 
