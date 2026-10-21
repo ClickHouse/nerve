@@ -16,10 +16,11 @@ What is sent:
   will actually run, as the cron service forecasts it). Sent when something
   changes (a turn starts or ends, a client connects or leaves, the schedule
   changes, a workflow run finishes), at most once every 250 ms, and every
-  ``platform.activity_interval_seconds``. The forecast is made again when
-  the schedule changes, when a turn ends and for the periodic report, and
-  those reports wait for it; the other reports reuse the last one, so a turn
-  start is never held up by a forecast.
+  ``platform.activity_interval_seconds``. Each of these reports but a turn
+  start waits for a new forecast: what runs next can change without a word
+  to the reporter (a message deferred with "Run later" in the web UI, say).
+  A turn start goes out at once with the last one, so it is never held up by
+  a forecast.
 * Keep-awake leases for background work that is not a turn
   (``POST /v1/leases``, renewed every half ``platform.lease_ttl_seconds``,
   ``DELETE /v1/leases/<name>`` when the work ends). Work takes one with
@@ -430,12 +431,15 @@ class ActivityReporter:
                 await client.aclose()
 
     def notify(self) -> None:
-        """Ask for an activity report soon (coalesced).
+        """Ask for an activity report soon (coalesced), after a new forecast
+        of the next scheduled task.
 
-        The report reuses the last forecast of the next scheduled task. Safe
-        from any thread; never raises; does nothing while inactive.
+        What changed may have changed what runs next without a word to the
+        reporter: a message deferred from the web UI records its wakeup
+        without a turn, and the report sent when that client leaves must name
+        it. Safe from any thread; never raises; does nothing while inactive.
         """
-        self._wake_up(report=True)
+        self._wake_up(forecast=True)
 
     def watch_workflow_runs(self, service: Any) -> None:
         """Report when a workflow run reaches a terminal status.
@@ -546,8 +550,8 @@ class ActivityReporter:
                 if self._report_wanted and self._may_report():
                     spacing = self._last_post + REPORT_MIN_SPACING_SECONDS - loop.time()
                     if spacing > 0:
-                        # Changes that arrive meanwhile join this report; a
-                        # turn that ended meanwhile gets its forecast first.
+                        # Changes that arrive meanwhile join this report, and
+                        # one that asks for a forecast gets it first.
                         await asyncio.sleep(spacing)
                         self._start_forecast()
                     if self._may_report():
@@ -609,9 +613,10 @@ class ActivityReporter:
         turn_started, self._turn_started = self._turn_started, False
         running = await self._running_turns()
         if turn_started and running == 0:
-            # The turn is already over: report it once, then the truth.
+            # The turn is already over: report it once, then the truth. Its
+            # end asked for a forecast already.
             running = 1
-            self.notify()
+            self._wake_up(report=True)
         return self._body(running, self._active_sessions(), self._next_tick)
 
     @staticmethod

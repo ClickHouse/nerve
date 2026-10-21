@@ -565,10 +565,10 @@ async def test_a_turn_start_never_waits_for_a_forecast(fake_socket, reporters):
 
 
 @pytest.mark.asyncio
-async def test_the_forecast_is_made_again_only_when_it_may_have_changed(fake_socket, reporters):
-    """A schedule change and the end of a turn (which may have scheduled a
-    wakeup) forecast again; a turn start or a client connecting reuses the
-    last forecast."""
+async def test_every_report_but_a_turn_start_forecasts_again(fake_socket, reporters):
+    """A turn start goes out with the last forecast. A client connecting, the
+    end of a turn (which may have scheduled a wakeup) and a schedule change
+    each forecast again."""
     engine = FakeEngine()
     cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
     connections: list[str] = []
@@ -580,22 +580,23 @@ async def test_the_forecast_is_made_again_only_when_it_may_have_changed(fake_soc
 
     engine.sessions.mark_running("web:main")
     await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
+    assert cron.calls == 1
     connections.append("browser")
     reporter.notify()
     await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["activeSessions"] == 1)
-    assert cron.calls == 1
+    assert cron.calls == 2
 
     # The turn scheduled a wakeup: the report at its end already names it.
     cron.tick = tick(datetime(2026, 10, 22, 1, 0, tzinfo=UTC), "wakeup:0f3a9c2e", "wakeup")
     engine.sessions.mark_not_running("web:main")
     await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 0)
     assert fake_socket.reports()[-1]["nextScheduledName"] == "wakeup:0f3a9c2e"
-    assert cron.calls == 2
+    assert cron.calls == 3
 
     cron.tick = None
     cron.changed()
     await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["nextScheduledAt"] is None)
-    assert cron.calls == 3
+    assert cron.calls == 4
 
 
 @pytest.mark.asyncio
@@ -663,7 +664,10 @@ async def test_a_burst_of_changes_is_coalesced(fake_socket, reporters):
 @pytest.mark.asyncio
 async def test_a_turn_inside_one_window_is_still_reported(fake_socket, reporters):
     engine = FakeEngine()
-    await started(reporters, make_reporter(fake_socket.path, engine=engine, interval=300))
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    await started(reporters, make_reporter(
+        fake_socket.path, engine=engine, cron=cron, interval=300,
+    ))
     await fake_socket.wait_for(lambda: fake_socket.reports())
 
     # Both inside the coalescing window that follows the first report.
@@ -673,6 +677,8 @@ async def test_a_turn_inside_one_window_is_still_reported(fake_socket, reporters
     await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 3)
     turns = [report["runningTurns"] for report in fake_socket.reports()]
     assert turns[:3] == [0, 1, 0]
+    await asyncio.sleep(0.3)
+    assert cron.calls == 2  # the first report's, then the one the turn's end asked for
 
 
 @pytest.mark.asyncio
@@ -1289,6 +1295,39 @@ async def test_a_finished_run_is_reported_with_the_task_after_it(fake_socket, re
     assert report["nextScheduledName"] == "weekly-review"
     assert report["nextScheduledAt"] == _rfc(now + timedelta(hours=2))
     assert fake_socket.report_times()[before] - finished < 0.2
+
+
+@pytest.mark.asyncio
+async def test_a_message_run_later_is_in_the_report_when_its_client_leaves(
+    fake_socket, reporters, cron_service,
+):
+    """A message deferred with "Run later" in the web UI is a wakeup recorded
+    with no turn and no word to the cron service. The report sent when that
+    client then leaves names it."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    cron_service.scheduler.modify_job("nightly-digest", next_run_time=now + timedelta(hours=1))
+    cron_service.scheduler.modify_job("weekly-review", next_run_time=now + timedelta(hours=2))
+    connections = ["browser"]
+    reporter = await started(reporters, make_reporter(
+        fake_socket.path, cron=cron_service, connections=lambda: len(connections),
+    ))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert fake_socket.reports()[-1]["nextScheduledName"] == "nightly-digest"
+
+    # What POST /api/sessions/run-later leaves behind: a row, nothing else.
+    cron_service.db.list_pending_wakeups.return_value = [{
+        "id": 1, "session_id": "5e1d2c3b9f04", "prompt": "p", "reason": "run-later",
+        "fire_at": (now + timedelta(minutes=30)).isoformat(), "status": "pending",
+    }]
+    before = len(fake_socket.reports())
+    connections.clear()
+    reporter.notify()  # what the gateway does when a client goes
+
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) > before)
+    report = fake_socket.reports()[before]
+    assert report["activeSessions"] == 0
+    assert report["nextScheduledName"] == "wakeup:5e1d2c3b"
+    assert report["nextScheduledAt"] == _rfc(now + timedelta(minutes=30))
 
 
 # --------------------------------------------------------------------------- #

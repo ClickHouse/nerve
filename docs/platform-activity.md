@@ -62,11 +62,14 @@ A report is sent:
 - once more at shutdown, saying nothing runs and nobody is connected. The next
   scheduled task is kept, because it is still due after a restart.
 
-The next scheduled task is forecast again when the cron schedule changes, when
-a turn ends (the turn may have scheduled a wakeup), and for the periodic
-report. Those reports wait for the forecast, which normally takes
-milliseconds. Every other report, such as a turn start or a client connecting,
-reuses the last forecast, so a turn start is never held up by one.
+Every report except a turn start and the last one at shutdown waits for a new
+forecast of the next scheduled task, which normally takes milliseconds: what
+runs next can change without the reporter hearing of it. A turn may have
+scheduled a wakeup, and a message deferred with "Run later" in the web UI adds
+one without any turn, so the report sent when that client leaves names it. If
+a forecast is already under way, a report goes out when it finishes, and
+another follows the new one. A turn start goes out at once with the last
+forecast, so it is never held up by one.
 
 ## Keep-awake leases
 
