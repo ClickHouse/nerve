@@ -250,6 +250,7 @@ class NotificationService:
         channels: list[str] | None = None,
         silent: bool = False,
         force: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Fire-and-forget notification. Returns notification_id.
 
@@ -272,8 +273,14 @@ class NotificationService:
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
+            metadata: Fields to store in the row's metadata and to send
+                with the web event. ``plan_id`` and ``task_id`` name the
+                plan and the task that the notification is about: the web
+                UI shows links to them, and Telegram shows an "Open plan"
+                button.
         """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
+        refs = dict(metadata or {})
         # Render <YYYY-MM-DD[ HH:MM]> placeholders before silence matching
         # so rules can target the human-readable form ("24 June") and so
         # persisted/delivered text matches what the user sees.
@@ -294,6 +301,7 @@ class NotificationService:
                 priority=priority,            # priority UNCHANGED
                 status="silenced",
                 metadata={
+                    **refs,
                     "silenced_by": match["id"],
                     "silence_reason": match["reason"],
                     "silence_action": match["action"],
@@ -303,6 +311,7 @@ class NotificationService:
             )
             await self._broadcast_silenced_web(
                 notification_id, session_id, title, body, priority, match,
+                metadata=refs,
             )
             return notification_id  # no _fanout → no telegram ping
 
@@ -322,12 +331,14 @@ class NotificationService:
             title=title,
             body=body,
             priority=priority,
-            metadata=extra_meta or None,
+            metadata={**refs, **extra_meta} or None,
         )
 
         await self._fanout(
             notification_id, session_id, "notify", title, body, priority,
             channels=channels, silent=silent,
+            extra_web={"metadata": refs} if refs else None,
+            plan_id=refs.get("plan_id"),
         )
 
         return notification_id
@@ -929,6 +940,7 @@ class NotificationService:
         silent: bool = False,
         option_labels: dict[str, str] | None = None,
         extra_web: dict[str, Any] | None = None,
+        plan_id: str | None = None,
     ) -> None:
         """Deliver notification to all configured channels in parallel.
 
@@ -941,6 +953,9 @@ class NotificationService:
         ``extra_web`` merges additional fields into the web broadcast
         payload only — the re-delivery tick uses it to flag
         ``redelivered: true`` so the UI can badge a resurfaced card.
+
+        ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
+        "Open plan" button for it.
         """
         target_channels = channels or self.config.notifications.channels
 
@@ -963,6 +978,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         silent=silent, option_labels=option_labels,
+                        plan_id=plan_id,
                     )
                     if msg_id:
                         await self.db.update_notification(
@@ -1048,6 +1064,7 @@ class NotificationService:
         body: str,
         priority: str,
         match: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Surface a silenced ``notify`` on the web UI without delivering it.
 
@@ -1080,6 +1097,8 @@ class NotificationService:
             message["silence_reason"] = match.get("reason", "")
             message["silence_pattern"] = match.get("pattern", "")
             message["silenced_by"] = match.get("id", "")
+        if metadata:
+            message["metadata"] = metadata
         await broadcaster.broadcast("__global__", message)
 
     def _resolve_telegram_chat_id(self) -> int | None:
@@ -1139,8 +1158,14 @@ class NotificationService:
         options: list[str] | None,
         silent: bool = False,
         option_labels: dict[str, str] | None = None,
+        plan_id: str | None = None,
     ) -> str | None:
-        """Send notification to Telegram, with inline keyboard for questions/approvals."""
+        """Send notification to Telegram, with inline keyboard for questions/approvals.
+
+        A ``notify`` with a ``plan_id`` gets an "Open plan" button. It sends
+        the ``plan:view:`` callback of the ``/plans`` command, which shows the
+        plan in the chat with its review actions.
+        """
         bot = self._get_telegram_bot()
         if not bot:
             logger.warning("Telegram bot not available for notification %s", notification_id)
@@ -1169,7 +1194,16 @@ class NotificationService:
                 chat_id, notification_id, text, button_labels, silent=silent,
             )
         else:
-            msg = await self._send_telegram_html(bot, chat_id, text, silent=silent)
+            markup = None
+            callback_data = f"plan:view:{plan_id}"
+            if plan_id and len(callback_data.encode("utf-8")) <= _CALLBACK_DATA_MAX_BYTES:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Open plan", callback_data=callback_data)]]
+                )
+            msg = await self._send_telegram_html(
+                bot, chat_id, text, reply_markup=markup, silent=silent,
+            )
             msg_id = str(msg.message_id)
 
         # Cache for reaction context lookups

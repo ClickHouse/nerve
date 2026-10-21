@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 import { Button, IconButton, type ButtonVariant } from '../ui';
 import { Bell, HelpCircle, ShieldCheck, X } from '../ui/icons';
+import { NotificationBody, NotificationLinks } from './NotificationParts';
 
 const TOAST_DURATION = 5000;
 
@@ -87,8 +88,13 @@ export function NotificationToast() {
                   </IconButton>
                 </div>
                 {notif.body && (
-                  <p className="text-xs text-text-muted mt-0.5 line-clamp-2">{notif.body}</p>
+                  <NotificationBody
+                    body={notif.body}
+                    className="text-xs text-text-muted mt-0.5 line-clamp-3 [&_p]:my-0"
+                  />
                 )}
+                <NotificationLinks notif={notif} size="xs" onOpen={() => dismissToast(notif.id)} />
+
                 {/* Quick answer buttons for questions */}
                 {isQuestion && options && notif.status === 'pending' && (
                   <div className="flex flex-wrap gap-1.5 mt-2">

@@ -201,7 +201,7 @@ Cron detects issue → Agent proposes plan → Notification sent
 1. **Detection** — A cron job (the built-in `task-planner`, when onboarding enabled it, or a custom monitoring cron) identifies something actionable
 2. **Task creation** — The agent creates a task describing the issue (`task_create`)
 3. **Plan proposal** — The agent researches the issue, explores the codebase, and writes a plan (`plan_propose`)
-4. **Notification** — A notification is sent so you know there's a plan to review
+4. **Notification**: `plan_propose` moves the task to `plan_review` and sends one notification with links to the plan and the task
 5. **Review** — You review the plan in the web UI:
    - **Approve** → An implementation session spawns automatically with the plan as instructions
    - **Decline** → The related task is closed (moved to `done`) with your feedback recorded as the note; reopen or recreate the task if you want a fresh plan

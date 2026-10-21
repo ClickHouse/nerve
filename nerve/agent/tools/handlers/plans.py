@@ -7,7 +7,8 @@ revisions back to the proposer. Cross-domain calls into task handlers
 are direct function imports (per design decision); no registry round-trip.
 
 Each pending plan that ``plan_propose`` or ``plan_update`` writes also moves
-its task to ``plan_review`` (see :func:`_move_to_plan_review`).
+its task to ``plan_review`` (see :func:`_move_to_plan_review`) and sends one
+notification that names the plan and the task (see :func:`_notify_plan_ready`).
 """
 
 from __future__ import annotations
@@ -60,11 +61,40 @@ async def _move_to_plan_review(ctx: ToolContext, task_id: str) -> bool:
     return not result.is_error
 
 
-def _review_summary(plan_id: str, moved: bool) -> str:
+async def _notify_plan_ready(
+    ctx: ToolContext, task: dict, plan_id: str, version: int,
+) -> bool:
+    """Tell the user that a plan waits for review. Returns True when sent.
+
+    The notification stores the plan id and the task id, so the web UI and
+    Telegram can open the plan from it.
+    """
+    if not ctx.notification_service:
+        return False
+    try:
+        await ctx.notification_service.send_notification(
+            session_id=ctx.session_id,
+            title=f"Plan ready for review: {task['title']}",
+            body=f"Version {version} of plan {plan_id} waits for your decision.",
+            priority="high",
+            metadata={"plan_id": plan_id, "task_id": task["id"]},
+        )
+    except Exception:
+        logger.exception("Could not send the notification for plan %s", plan_id)
+        return False
+    return True
+
+
+def _review_summary(plan_id: str, moved: bool, notified: bool) -> str:
     """The lines of a plan tool result that say what else happened."""
     lines = []
     if moved:
         lines.append(f"Task moved to {PLAN_REVIEW_STATUS}.")
+    if notified:
+        lines.append(
+            "The user got a notification with a link to the plan. "
+            "Do not send another notification about this plan."
+        )
     lines.append(f"To link the plan in a message, write {plan_link(plan_id)}.")
     return "\n".join(lines)
 
@@ -126,10 +156,11 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         "task_id": task_id,
         "note": f"Plan proposed: {plan_link(plan_id)} (v{version})",
     })
+    notified = await _notify_plan_ready(ctx, task, plan_id, version)
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review.\n" + _review_summary(plan_id, moved)
+        "Awaiting human review.\n" + _review_summary(plan_id, moved, notified)
     )
 
 
@@ -188,11 +219,13 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         note += f": {feedback}"
     moved = await _move_to_plan_review(ctx, task_id)
     await task_update_handler(ctx, {"task_id": task_id, "note": note})
+    task = await ctx.db.get_task(task_id)
+    notified = bool(task) and await _notify_plan_ready(ctx, task, new_plan_id, new_version)
 
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
         "The new version is pending review.\n"
-        + _review_summary(new_plan_id, moved)
+        + _review_summary(new_plan_id, moved, notified)
     )
 
 

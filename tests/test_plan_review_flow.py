@@ -1,15 +1,19 @@
-"""A pending plan moves its task to ``plan_review``, and task notes link the plan.
+"""A pending plan moves its task to ``plan_review`` and sends one linked notification.
 
 ``plan_propose`` and ``plan_update`` move a ``pending``, ``backlog`` or
 ``in_progress`` task to the built-in ``plan_review`` status and never move a
 task out of a custom status. Approve moves the task to ``in_progress``, a
-revision request keeps ``plan_review``, and decline closes the task. The task
-notes link to the plan and to the implementation session.
+revision request keeps ``plan_review``, and decline closes the task. Each
+pending plan sends one notification that names the plan and the task, and the
+task notes link to the plan and to the implementation session.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -18,6 +22,8 @@ from nerve.agent import tools as tools_mod
 from nerve.agent.plan_service import approve_plan, decline_plan, request_plan_revision
 from nerve.agent.tools.handlers.plans import plan_propose_handler, plan_update_handler
 from nerve.agent.tools.registry import ToolContext
+from nerve.config import NerveConfig, NotificationsConfig
+from nerve.notifications.service import NotificationService
 from tests.actor_rows import ensure_system_principal
 from tests.test_plan_actions import FakeEngine
 
@@ -28,6 +34,31 @@ TASK_ID = "t-review"
 async def db(db):  # noqa: F811 - the conftest database, with an identity
     await ensure_system_principal(db)
     return db
+
+
+@pytest.fixture
+def broadcasts(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    captured: list[dict] = []
+
+    class _FakeBroadcaster:
+        async def broadcast(self, _channel: str, message: dict) -> None:
+            captured.append(message)
+
+    from nerve.agent import streaming
+    monkeypatch.setattr(streaming, "broadcaster", _FakeBroadcaster())
+    return captured
+
+
+def _service(db, tmp_path, *, channels=("web",), engine=None) -> NotificationService:
+    config = NerveConfig()
+    config.workspace = tmp_path
+    config.notifications = NotificationsConfig(
+        channels=list(channels), telegram_chat_id=1001,
+    )
+    if engine is None:
+        engine = MagicMock()
+        engine.router.get_channel.return_value = None
+    return NotificationService(config, db, engine)
 
 
 async def _task(db, tmp_path, status: str = "pending") -> None:
@@ -59,6 +90,13 @@ async def _status(db) -> str:
 
 def _notes(tmp_path) -> str:
     return (tmp_path / "task.md").read_text(encoding="utf-8")
+
+
+async def _plan_notifications(db) -> list[dict]:
+    return [
+        n for n in await db.list_notifications()
+        if n["title"].startswith("Plan ready for review")
+    ]
 
 
 @pytest.mark.asyncio
@@ -169,3 +207,81 @@ class TestTaskStatus:
         assert task["status"] == "done"
         notes = (tmp_path / task["file_path"]).read_text(encoding="utf-8")
         assert f"Plan [{plan_id}](/plans/{plan_id}) declined: Not now." in notes
+
+
+@pytest.mark.asyncio
+class TestNotification:
+    async def test_propose_sends_one_notification_that_names_the_plan(
+        self, db, tmp_path, broadcasts,
+    ):
+        await _task(db, tmp_path)
+        plan_id, text = await _propose(_ctx(db, tmp_path, _service(db, tmp_path)))
+
+        (row,) = await db.list_notifications()
+        assert row["type"] == "notify"
+        assert row["title"] == "Plan ready for review: Fix the encoder"
+        assert row["body"] == f"Version 1 of plan {plan_id} waits for your decision."
+        assert row["priority"] == "high"
+        assert json.loads(row["metadata"]) == {"plan_id": plan_id, "task_id": TASK_ID}
+        (event,) = broadcasts
+        assert event["metadata"] == {"plan_id": plan_id, "task_id": TASK_ID}
+        assert "Do not send another notification about this plan." in text
+
+    async def test_update_notifies_for_the_new_version(self, db, tmp_path, broadcasts):
+        await _task(db, tmp_path)
+        ctx = _ctx(db, tmp_path, _service(db, tmp_path))
+        old_id, _ = await _propose(ctx)
+        await plan_update_handler(ctx, {"plan_id": old_id, "content": "Step two."})
+        (new,) = [p for p in await db.get_plans_for_task(TASK_ID) if p["status"] == "pending"]
+
+        rows = await _plan_notifications(db)
+        assert [json.loads(r["metadata"])["plan_id"] for r in rows] == [new["id"], old_id]
+        assert rows[0]["body"].startswith("Version 2 ")
+
+    async def test_a_silenced_notification_keeps_the_plan(self, db, tmp_path, broadcasts):
+        await _task(db, tmp_path)
+        await db.create_silence("sil-1", pattern="plan ready")
+        plan_id, _ = await _propose(_ctx(db, tmp_path, _service(db, tmp_path)))
+
+        (row,) = await db.list_notifications()
+        assert row["status"] == "silenced"
+        assert json.loads(row["metadata"])["plan_id"] == plan_id
+        assert broadcasts[0]["metadata"] == {"plan_id": plan_id, "task_id": TASK_ID}
+
+    async def test_without_a_notification_service_the_plan_is_still_proposed(
+        self, db, tmp_path,
+    ):
+        await _task(db, tmp_path)
+        plan_id, text = await _propose(_ctx(db, tmp_path))
+        assert plan_id.startswith("plan-")
+        assert "notification" not in text
+        assert f"write [{plan_id}](/plans/{plan_id})" in text
+
+
+@pytest.mark.asyncio
+class TestTelegramButton:
+    @staticmethod
+    def _engine(bot) -> MagicMock:
+        engine = MagicMock()
+        telegram = MagicMock()
+        telegram._app.bot = bot
+        engine.router.get_channel.return_value = telegram
+        return engine
+
+    async def test_a_plan_notification_opens_the_plan(self, db, tmp_path, broadcasts):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=77))
+        service = _service(db, tmp_path, channels=("telegram",), engine=self._engine(bot))
+        await service.send_notification(
+            "s1", title="Plan ready", metadata={"plan_id": "plan-abc", "task_id": "t1"},
+        )
+        markup = bot.send_message.await_args.kwargs["reply_markup"]
+        (button,) = [b for row in markup.inline_keyboard for b in row]
+        assert (button.text, button.callback_data) == ("Open plan", "plan:view:plan-abc")
+
+    async def test_a_plain_notification_has_no_button(self, db, tmp_path, broadcasts):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=78))
+        service = _service(db, tmp_path, channels=("telegram",), engine=self._engine(bot))
+        await service.send_notification("s1", title="Build finished")
+        assert bot.send_message.await_args.kwargs["reply_markup"] is None

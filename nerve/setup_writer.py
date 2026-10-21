@@ -153,12 +153,13 @@ PRODUCTIVITY_CRONS = [
         "run_if": [{"type": "tasks", "status": "pending"}],
         "prompt": (
             "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
-            "1. Use task_list to browse open tasks\n"
+            "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
             "2. Use plan_list to see which tasks already have plans — skip those\n"
             "3. Pick ONE task and explore the relevant codebase\n"
             "4. Call plan_propose(task_id, content) with your plan\n\n"
             "If all tasks have plans or none are actionable, say so and stop.\n\n"
-            "After proposing a plan, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to the plan. "
+            "Do not send another notification about it.\n"
         ),
     },
     {
@@ -178,7 +179,8 @@ PRODUCTIVITY_CRONS = [
             "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
             "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
             "If no candidates found, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n"
         ),
     },
     {
@@ -199,7 +201,8 @@ PRODUCTIVITY_CRONS = [
             "4. Check quality (clear descriptions, good trigger phrases)\n"
             "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
             "If all skills look good, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n"
         ),
     },
 ]
