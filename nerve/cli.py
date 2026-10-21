@@ -1874,7 +1874,12 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             errors.append(f"[ERR] Claude API: {detail}")
 
-    if config.openai_api_key:
+    if config.memory.backend == "loom":
+        # Loom embeds and recalls on its side: no memU key matters here.
+        loom = config.memory.loom
+        token = "token set" if loom.token else "no token"
+        lines.append(f"[OK] Memory backend: Loom at {loom.base_url} ({token})")
+    elif config.openai_api_key:
         lines.append(
             f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
             f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"

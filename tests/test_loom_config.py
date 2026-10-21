@@ -215,6 +215,18 @@ def test_loom_variables_without_the_backend_switch_keep_memu(tmp_path, monkeypat
     assert config.memory.backend == "memu"
 
 
+def test_doctor_names_the_loom_backend_and_never_the_token(tmp_path, monkeypatch) -> None:
+    from nerve import cli
+
+    monkeypatch.setenv("NERVE_MEMORY_BACKEND", "loom")
+    monkeypatch.setenv("LOOM_BASE_URL", "http://loom.internal.test:7777")
+    monkeypatch.setenv("LOOM_API_KEY", "secret-token-value")
+    report = cli.doctor_report(load_config(_workspace_settings(tmp_path, "timezone: UTC\n")))
+    assert "[OK] Memory backend: Loom at http://loom.internal.test:7777 (token set)" in report
+    assert "OpenAI API key not set" not in report
+    assert "secret-token-value" not in report
+
+
 def test_load_config_reads_the_section_from_a_file(tmp_path, monkeypatch, caplog) -> None:
     monkeypatch.setenv("LOOM_API_KEY", "env-token")
     (tmp_path / "config.yaml").write_text(
