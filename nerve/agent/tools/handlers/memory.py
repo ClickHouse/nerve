@@ -173,7 +173,11 @@ async def memory_expand_category_handler(ctx: ToolContext, args: dict) -> ToolRe
             return ToolResult.text(f"Category '{name}' has no items{note}.")
 
         lines = [f"- [{r['type']}] (id:{r['id']}) {r['summary']}" for r in rows]
-        scope = f"matching '{query}'" if query else "most recent"
+        if result.get("query_clipped"):
+            # The backend matches on a shorter keyword than the one asked.
+            scope = f"matching '{result.get('query', '')}', the keyword's first 200 characters"
+        else:
+            scope = f"matching '{query}'" if query else "most recent"
         header = f"Category '{name}' — showing {len(rows)} of {total} items ({scope}):"
         body = _clip_to_budget(header + "\n\n" + "\n".join(lines))
         return ToolResult.text(body)
@@ -252,10 +256,10 @@ async def session_context_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 ]
                 parts.append(
                     f"# Recalled Memories ({len(results)} biased by topic)\n\n"
-                    + "\n".join(lines)
+                    + _clip_to_budget("\n".join(lines))
                 )
             else:
-                parts.append("# Recalled Memories\n\n(none — fresh topic or empty memU)")
+                parts.append("# Recalled Memories\n\n(none — fresh topic or empty memory)")
         except Exception as e:
             logger.warning("session_context recall failed: %s", e)
             parts.append(f"# Recalled Memories\n\n_recall error: {e}_")
@@ -569,7 +573,7 @@ async def category_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
 MEMORY_RECALL_SPEC = ToolSpec(
     name="memory_recall",
-    description="Recall relevant memories via semantic search (memU). Returns matching memory items plus related-topic breadcrumbs (cat:<id>) you can drill into with memory_expand_category.",
+    description="Recall relevant memories via semantic search. Returns matching memory items plus related-topic breadcrumbs (cat:<id>) you can drill into with memory_expand_category.",
     input_schema=MEMORY_RECALL_SCHEMA,
     handler=memory_recall_handler,
 )
@@ -584,7 +588,7 @@ MEMORY_EXPAND_CATEGORY_SPEC = ToolSpec(
 SESSION_CONTEXT_SPEC = ToolSpec(
     name="session_context",
     description=(
-        "Return the dynamic startup context: recalled memU priors biased "
+        "Return the dynamic startup context: recalled memory priors biased "
         "by the supplied topic, a summary of currently active skills, and "
         "session metadata (id, source, current time, workspace). External "
         "MCP clients (Codex, Claude Code) should call this as their first "
@@ -607,9 +611,9 @@ MEMORY_RECORDS_BY_DATE_SPEC = ToolSpec(
     name="memory_records_by_date",
     description=(
         "List ALL memory records created or updated on a given date (or date range). "
-        "Returns every memory type (profile, event, knowledge, behavior) — unlike conversation_history which only returns events.\n\n"
+        "Returns every memory type (profile, event, knowledge, behavior) — unlike conversation_history, which lists memories by the date they happened.\n\n"
         "Use this for memory maintenance and auditing: 'what records were saved today', 'review everything created yesterday'.\n"
-        "Do NOT use this for 'what happened on date X' — use conversation_history for that (it filters by event date, not creation date)."
+        "Do NOT use this for 'what happened on date X' — use conversation_history for that (it filters by the date a memory happened, not when it was saved)."
     ),
     input_schema=MEMORY_RECORDS_BY_DATE_SCHEMA,
     handler=memory_records_by_date_handler,
@@ -618,7 +622,7 @@ MEMORY_RECORDS_BY_DATE_SPEC = ToolSpec(
 MEMORIZE_SPEC = ToolSpec(
     name="memorize",
     description=(
-        "Save an important fact, preference, or instruction to long-term semantic memory (memU).\n\n"
+        "Save an important fact, preference, or instruction to long-term semantic memory.\n\n"
         "Memory types:\n"
         "- profile: Stable personal facts — identity, preferences, relationships, work, living situation. Things that persist over time.\n"
         "- event: Specific occurrences with a date — purchases, meetings, milestones, emails received, tasks completed. Things that happened.\n"
@@ -632,21 +636,21 @@ MEMORIZE_SPEC = ToolSpec(
 
 MEMORY_UPDATE_SPEC = ToolSpec(
     name="memory_update",
-    description="Update an existing memory item in memU. Use when a fact is outdated, needs correction, or should be recategorized.",
+    description="Update an existing memory item. Use when a fact is outdated, needs correction, or should be recategorized.",
     input_schema=MEMORY_UPDATE_SCHEMA,
     handler=memory_update_handler,
 )
 
 MEMORY_DELETE_SPEC = ToolSpec(
     name="memory_delete",
-    description="Delete a memory item from memU. Use when a memory is wrong, duplicate, or no longer relevant.",
+    description="Delete a memory item. Use when a memory is wrong, duplicate, or no longer relevant.",
     input_schema=MEMORY_DELETE_SCHEMA,
     handler=memory_delete_handler,
 )
 
 CATEGORY_UPDATE_SPEC = ToolSpec(
     name="category_update",
-    description="Update a memU category's summary and/or description, then re-embed it. Use after manually editing category summaries to keep embeddings in sync. Get category IDs from memory_recall results (cat:ID format).",
+    description="Update a memory category's summary and/or description, then re-embed it. Use after manually editing category summaries to keep embeddings in sync. Get category IDs from memory_recall results (cat:ID format).",
     input_schema=CATEGORY_UPDATE_SCHEMA,
     handler=category_update_handler,
 )

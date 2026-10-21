@@ -252,7 +252,7 @@ SESSION_CONTEXT_SCHEMA = {
             "type": "string",
             "description": (
                 "Short description of what you're about to work on. "
-                "Used to bias the memU recall query so the priors you "
+                "Used to bias the memory recall query so the priors you "
                 "get back are actually relevant to the task."
             ),
         },
