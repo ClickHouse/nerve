@@ -1747,7 +1747,7 @@ Long-term memory has one backend, chosen with `memory.backend`:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory.backend` | string | `memu` | `memu` runs memU inside the Nerve process (the keys in the next table). `loom` keeps memory in a Loom memory service reached through the MCP gateway (see [Loom memory backend](#loom-memory-backend)). Case does not matter; any other value refuses to load. Not read from the environment. Restart-only. |
+| `memory.backend` | string | `memu` | `memu` runs memU inside the Nerve process (the keys in the next table). `loom` keeps memory in a Loom memory service reached through the MCP gateway (see [Loom memory backend](#loom-memory-backend)). Case does not matter; any other value refuses to load. Nerve reads no environment variable for it on its own (a `${VAR:-default}` reference works as in any setting). Restart-only. |
 
 `memory.fast_model` is read whatever the backend: source condensation and IMAP
 vision use it too.
@@ -1781,8 +1781,8 @@ instance needs.
 | `memory.loom.dashboard_url` | string | *(empty)* | Where people open Loom's dashboard. The Memory page and the Diagnostics card link `<dashboard_url>/memories?namespace=<home namespace>`. An `http://` or `https://` URL with a host and no credentials, query or fragment; a trailing `/` is dropped; anything else refuses to load. Empty: no link. |
 | `memory.loom.defer_extraction` | bool | `false` | Queue conversation extraction in Loom instead of waiting for it. Loom then tries a failed batch three times within about a minute and gives up, and Nerve cannot see that (Loom keeps `memory.extraction_status` off MCP): leave it off unless a lost window is acceptable. |
 
-The `memory.loom` keys are read only while Loom is the backend, never from the
-environment, and need a restart. A namespace name is Loom's: lowercase letters,
+The `memory.loom` keys are read only while Loom is the backend, never from an
+environment variable on their own, and need a restart. A namespace name is Loom's: lowercase letters,
 digits and hyphens, starting with a letter or digit, at most 128 characters;
 an org name has no whitespace or slash. Anything else refuses to load.
 
@@ -1793,6 +1793,24 @@ tools. A platform that switches the instance after its first `nerve init`
 writes `memory.backend: loom` into `config.local.yaml` (which outranks the
 tracked settings) and passes `nerve init --memory-backend loom`, so the
 workspace written at that first init is worded for Loom.
+
+**On a locked instance** no machine-local file is read, so the switch lives in
+the tracked `settings.yaml`, as environment references the platform fills:
+
+```yaml
+mcp_gateway_url: ${NERVE_MCP_BASE_URL:-}
+memory:
+  backend: ${NERVE_MEMORY_BACKEND:-memu}
+  loom:
+    dashboard_url: ${LOOM_DASHBOARD_URL:-}
+```
+
+Always the `${VAR:-default}` form: a bare `${VAR}` that is unset refuses to
+load, which would stop a `nerve` command run from a shell without those
+variables. Empty values mean memU, no gateway and no dashboard link. The
+variables must be in the environment of the Nerve service itself (a systemd
+`EnvironmentFile=` on its unit, for example); an interactive shell does not
+need them.
 
 **The agent uses Loom's tools.** Each catalog server reaches the agent as an
 MCP server, so Loom's tools are `mcp__loom__<tool>` (`loom_search`,
@@ -1854,20 +1872,31 @@ also when the backend did not start at all, and nothing is frozen into it;
 the sweep keeps its watermark, so the window is offered again. Reads are
 tried twice, and wait out a `Retry-After` of up to 2 seconds once (the
 gateway's per-agent limit sends 1); a longer one holds that operation (at
-most 60 seconds). When the gateway is not reached, or a read gets no answer
-in time, calls fail at once for 15 seconds, doubling with each such failure
-in a row up to 5 minutes: the gateway's own circuit does not count calls
-Nerve gave up on. The catalog is read at most every 30 seconds, also while
-none could be read; a policy refusal makes the next call read it again. A
-request Loom refused as invalid is logged, not retried, except a batch the
-gateway refuses as too large (HTTP 413): the byte budget of a batch halves for
-the rest of the process, down to 16 KiB, and the same messages go again. The
+most 60 seconds). When the gateway is not reached, or a call gets no answer
+in time (a read gives up long before the gateway's call limit, extraction a
+little after it), calls fail at once for 15 seconds, doubling with each such
+failure in a row up to 5 minutes: the gateway's own circuit does not count
+calls Nerve gave up on. The catalog is read at most every 30 seconds, also
+while none could be read; a policy refusal makes the next call read it again,
+and the one HTTP client for Loom's URL is kept until the catalog names
+another. A request Loom refused as invalid is logged, not retried, except a
+batch the gateway refuses as too large (HTTP 413): the budget of a batch
+halves for the rest of the process, down to 10 messages in 16 KiB (the
+context turns shrink with it), and the same messages go again. The
 Diagnostics card shows the last error.
 
 **Extraction waits.** A batch is extracted while the call waits (Loom's model
-pass, typically 10 to 15 seconds, inside the gateway's two minutes), so a
-batch Loom could not extract fails the call and the sweep offers the window
-again. Each `conversation_indexed` row of the memory audit log (`GET
+pass, typically 10 to 15 seconds), so a batch Loom could not extract fails the
+call and the sweep offers the window again. This depends on the gateway's call
+limit (`MCP_GATEWAY_CALL_TIMEOUT`, two minutes by default; Nerve waits 130
+seconds): when the gateway gives up first ("MCP server timed out"), Loom may
+still finish the batch, and the window goes again with the next sweep in
+batches half as large. A batch Loom keeps failing on its side (a fault it does
+not name as passing, three sweeps in a row) is halved until the one message
+it fails on is found; that message is skipped, with a
+`conversation_turn_skipped` audit row (its role and time, never its text),
+once Loom has extracted something else since, so a fault on every batch (an
+outage) skips nothing. Each `conversation_indexed` row of the memory audit log (`GET
 /api/memory/memu/audit`) counts the batches sent and the facts Loom wrote, and
 names the `queue_ids` of any batch Loom queued instead (with
 `defer_extraction`, or when Loom defers one itself) for a lookup in Loom's

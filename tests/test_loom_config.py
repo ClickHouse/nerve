@@ -146,3 +146,39 @@ def test_the_switch_in_config_local_yaml_outranks_the_tracked_settings(tmp_path)
         "mcp_gateway_url: http://192.0.2.1:3130\nmemory:\n  backend: loom\n", encoding="utf-8",
     )
     assert load_config(tmp_path).memory.backend == "loom"
+
+
+def test_a_locked_instance_takes_the_switch_from_its_environment(tmp_path, monkeypatch) -> None:
+    """Lockdown reads no machine-local file: the tracked settings name the
+    switch as ${VAR:-default} references the service's environment fills,
+    and empty values mean memU, no gateway and no link."""
+    import subprocess
+
+    workspace = tmp_path / "ws"
+    (workspace / "config").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "remote", "add", "origin", "https://example.com/config.git"],
+        check=True,
+    )
+    (workspace / "config" / "settings.yaml").write_text(
+        "lockdown: true\n"
+        "mcp_gateway_url: ${NERVE_MCP_BASE_URL:-}\n"
+        "memory:\n  backend: ${NERVE_MEMORY_BACKEND:-memu}\n"
+        "  loom:\n    dashboard_url: ${LOOM_DASHBOARD_URL:-}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+    # Ignored under lockdown, like every machine-local file.
+    (tmp_path / "config.local.yaml").write_text("memory:\n  backend: loom\n", encoding="utf-8")
+    for name in ("NERVE_MCP_BASE_URL", "NERVE_MEMORY_BACKEND", "LOOM_DASHBOARD_URL"):
+        monkeypatch.delenv(name, raising=False)
+    config = load_config(tmp_path)
+    assert (config.lockdown, config.memory.backend, config.mcp_gateway_url) == (True, "memu", "")
+    assert config.memory.loom.dashboard_url == ""
+    monkeypatch.setenv("NERVE_MEMORY_BACKEND", "loom")
+    monkeypatch.setenv("NERVE_MCP_BASE_URL", "http://192.0.2.1:3130")
+    monkeypatch.setenv("LOOM_DASHBOARD_URL", "https://loom.example.test/")
+    config = load_config(tmp_path)
+    assert (config.memory.backend, config.mcp_gateway_url) == ("loom", "http://192.0.2.1:3130")
+    assert config.memory.loom.dashboard_url == "https://loom.example.test"
