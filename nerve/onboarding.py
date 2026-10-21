@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -54,6 +55,19 @@ SKIPPED = "skipped"
 REQUESTED = "requested"
 
 SESSION_TITLE = "Onboarding"
+
+# One start at a time in this process, so a second caller sees the session
+# that the first one created. One lock per event loop: tests run many loops.
+_start_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _start_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    if loop not in _start_locks:
+        _start_locks[loop] = asyncio.Lock()
+    return _start_locks[loop]
 
 
 @dataclass(frozen=True)
@@ -123,48 +137,53 @@ async def start(
 ) -> OnboardingState:
     """Open the onboarding conversation if it is pending. Idempotent.
 
-    One caller claims the row (a compare-and-set from the state it read);
-    every other caller, also at the same time, gets the state that the
-    winner wrote. The agent's first turn runs in the background.
+    Starts in this process run one at a time, and the claim of the row is a
+    compare-and-set from the state that was read, so there is one session
+    for each opening. The agent's first turn runs in the background. When
+    that turn fails (a model error), the row goes back to ``requested``:
+    the next Finish or daemon start opens a new conversation.
     """
     from nerve.agent.prompts import onboarding_prompt
 
     db = engine.db
-    state = await read_state(db, workspace)
-    if state.status != PENDING:
-        return state
-    session_id = f"onboarding-{uuid.uuid4().hex[:8]}"
-    claimed = await db.set_onboarding(
-        RUNNING, session_id=session_id, actor_id=actor_id_of(cause), expect=state.stored,
-    )
-    if not claimed:
-        # Another caller claimed it, maybe before its session row exists.
-        row = await db.get_onboarding()
-        if row and row["status"] == RUNNING:
-            return OnboardingState(RUNNING, row["session_id"], (RUNNING, row["session_id"]))
-        return await read_state(db, workspace)
-
-    await engine.sessions.get_or_create(
-        session_id, title=SESSION_TITLE, source="web", actor=actor, cause=cause,
-    )
+    async with _start_lock():
+        state = await read_state(db, workspace)
+        if state.status != PENDING:
+            return state
+        session_id = f"onboarding-{uuid.uuid4().hex[:8]}"
+        actor_id = actor_id_of(cause)
+        if not await db.set_onboarding(
+            RUNNING, session_id=session_id, actor_id=actor_id, expect=state.stored,
+        ):
+            return await read_state(db, workspace)
+        await engine.sessions.get_or_create(
+            session_id, title=SESSION_TITLE, source="web", actor=actor, cause=cause,
+        )
     mode = workspace_mode(Path(workspace)) or "personal"
     description, guide = await asyncio.to_thread(_prompt_inputs, workspace, mode)
 
     async def _first_turn() -> None:
         try:
-            await engine.run(
-                session_id=session_id,
-                user_message=onboarding_prompt(
-                    mode, description, guide, memory_backend=engine.config.memory.backend,
-                ),
-                source="web",
-                # Nerve composes this message; ``internal`` keeps it out of
-                # the transcript, so the agent's answer opens the chat.
-                internal=True,
-                actor=db.system_actor,
-            )
+            with engine.watch_turns(session_id) as turn:
+                await engine.run(
+                    session_id=session_id,
+                    user_message=onboarding_prompt(
+                        mode, description, guide, memory_backend=engine.config.memory.backend,
+                    ),
+                    source="web",
+                    # Nerve composes this message; ``internal`` keeps it out
+                    # of the transcript, so the agent's answer opens the chat.
+                    internal=True,
+                    actor=db.system_actor,
+                )
+            failed = turn.outcome is not None and turn.outcome.status == "failed"
         except Exception:
             logger.exception("Onboarding: the first turn in %s failed", session_id)
+            failed = True
+        if failed and await db.set_onboarding(
+            REQUESTED, session_id=None, actor_id=actor_id, expect=(RUNNING, session_id),
+        ):
+            logger.warning("Onboarding: the first turn in %s failed; asked again", session_id)
 
     task = asyncio.create_task(_first_turn())
     register = getattr(engine, "register_task", None)
@@ -186,24 +205,32 @@ async def start_on_boot(engine: "AgentEngine", workspace: Path) -> OnboardingSta
     """Open the conversation at daemon start when setup asked for it.
 
     That is a ``requested`` row, or a worker whose ``TASK.md`` still carries
-    the marker and that never had a conversation. The session's cause is
-    the person who finished setup, when known.
+    the marker and that never had a conversation. Nothing opens without a
+    model credential, as at Finish. The session's cause is the person who
+    finished setup, when known, else the system actor. The gateway calls
+    this once at start-up; one-shot CLI engines do not.
     """
-    state = await read_state(engine.db, workspace)
-    if state.status != PENDING:
+    try:
+        if not engine.config.credential_available():
+            return None
+        state = await read_state(engine.db, workspace)
+        if state.status != PENDING:
+            return None
+        status = state.stored[0]
+        legacy_worker = (
+            status is None and workspace_mode(Path(workspace)) == "worker"
+            and _task_md(workspace).exists()
+        )
+        if status != REQUESTED and not legacy_worker:
+            return None
+        row = await engine.db.get_onboarding()
+        return await start(
+            engine, workspace, actor=engine.db.system_actor,
+            cause=(row or {}).get("actor_id") or engine.db.system_actor,
+        )
+    except Exception:
+        logger.exception("Onboarding: could not open the conversation at start-up")
         return None
-    status = state.stored[0]
-    legacy_worker = (
-        status is None and workspace_mode(Path(workspace)) == "worker"
-        and _task_md(workspace).exists()
-    )
-    if status != REQUESTED and not legacy_worker:
-        return None
-    row = await engine.db.get_onboarding()
-    return await start(
-        engine, workspace, actor=engine.db.system_actor,
-        cause=(row or {}).get("actor_id"),
-    )
 
 
 def _remove_task_marker(workspace: Path) -> None:

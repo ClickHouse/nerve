@@ -676,7 +676,8 @@ one web session titled `Onboarding`, whose hidden first message makes the
 agent speak first. When a restart is pending or no model is configured, it
 records the request instead, and the next start of the daemon opens the
 conversation. Idempotent: a second call, also at the same time, names the same
-session. Allowed under lockdown.
+session. When the agent's first turn fails, the status goes back to `pending`.
+Allowed under lockdown.
 
 ```json
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d" } }

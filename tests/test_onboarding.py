@@ -9,7 +9,9 @@ worker rule: no ``TASK.md`` marker means done.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -39,13 +41,28 @@ async def db(db):  # noqa: F811 - the conftest database, with an identity
     return db
 
 
-def _engine(db) -> MagicMock:
-    """Real session rows; turns that only record their arguments."""
+def _engine(db, *, outcome: str = "completed", slow: bool = False) -> MagicMock:
+    """Real session rows; turns that only record their arguments and end with ``outcome``."""
     engine = MagicMock()
     engine.db = db
-    engine.run = AsyncMock(return_value="")
+    engine.config.credential_available.return_value = True
+    turn = SimpleNamespace(outcome=None)
+
+    async def _run(**kwargs):
+        turn.outcome = SimpleNamespace(status=outcome)
+        return ""
+
+    engine.run = AsyncMock(side_effect=_run)
+
+    @contextmanager
+    def _watch_turns(session_id):
+        yield turn
+
+    engine.watch_turns = _watch_turns
 
     async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
+        if slow:
+            await asyncio.sleep(0.05)
         await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
         return await db.get_session(session_id)
 
@@ -140,6 +157,32 @@ class TestStart:
         assert turn["user_message"] == onboarding_prompt("personal")
         assert (await db.get_session(states[0].session_id))["title"] == "Onboarding"
 
+    async def test_a_start_during_another_start_sees_its_session(self, db, tmp_path):
+        apply_mode(tmp_path, "personal")
+        engine = _engine(db, slow=True)
+        first, second = await asyncio.gather(
+            onboarding.start(engine, tmp_path, actor=None, cause=None),
+            onboarding.start(engine, tmp_path, actor=None, cause=None),
+        )
+        assert first.session_id == second.session_id
+        await _first_turn(engine)
+        assert engine.run.await_count == 1
+
+    async def test_a_failed_first_turn_asks_again(self, db, tmp_path):
+        apply_mode(tmp_path, "personal")
+        engine = _engine(db, outcome="failed")
+        state = await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        await _first_turn(engine)
+        for _ in range(20):
+            if (await db.get_onboarding())["status"] != "running":
+                break
+            await asyncio.sleep(0)
+        assert (await db.get_onboarding())["status"] == "requested"
+        assert (await onboarding.read_state(db, tmp_path)).status == "pending"
+        # The next start opens a new conversation.
+        again = await onboarding.start(_engine(db), tmp_path, actor=None, cause=None)
+        assert again.status == "running" and again.session_id != state.session_id
+
     async def test_a_worker_without_task_md_gets_the_template_first(self, db, tmp_path):
         apply_mode(tmp_path, "worker")
         (tmp_path / "TASK.md").unlink()
@@ -165,10 +208,20 @@ class TestBoot:
         assert state.status == "running"
         assert (await db.get_session(state.session_id))["caused_by_actor_id"] == person
 
-    async def test_a_pending_worker_from_before_opens_at_start(self, db, tmp_path):
+    async def test_a_pending_worker_from_before_opens_at_start_for_the_system(self, db, tmp_path):
         apply_mode(tmp_path, "worker", DESCRIPTION)
         state = await onboarding.start_on_boot(_engine(db), tmp_path)
         assert state is not None and state.status == "running"
+        session = await db.get_session(state.session_id)
+        assert session["caused_by_actor_id"] == db.system_actor.actor_id
+
+    async def test_nothing_opens_at_start_without_a_model(self, db, tmp_path):
+        apply_mode(tmp_path, "personal")
+        await onboarding.request(db, tmp_path, actor_id=None)
+        engine = _engine(db)
+        engine.config.credential_available.return_value = False
+        assert await onboarding.start_on_boot(engine, tmp_path) is None
+        assert (await db.get_onboarding())["status"] == "requested"
 
     async def test_nothing_opens_without_a_request(self, db, tmp_path):
         apply_mode(tmp_path, "personal")
@@ -229,41 +282,3 @@ class TestEffectiveCronState:
         plan = plan_optional_crons(tmp_path, {"skill-extractor"})
         assert "skill-reviser" not in plan.disabled and "skill-reviser" not in plan.enabled
         assert plan.text is None and system_cron_file(tmp_path).read_text() == before
-
-
-class _NoMemory:
-    available = False
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    async def initialize(self):
-        return False
-
-    async def aclose(self):
-        pass
-
-
-@pytest.mark.asyncio
-async def test_the_engine_asks_for_the_conversation_when_it_starts(db, tmp_path, monkeypatch):
-    from unittest.mock import patch
-
-    from nerve.agent.engine import AgentEngine
-    from nerve.config import NerveConfig
-
-    asked: list[Path] = []
-
-    async def _start_on_boot(engine, workspace):
-        asked.append(workspace)
-
-    monkeypatch.setattr(onboarding, "start_on_boot", _start_on_boot)
-    config = NerveConfig(workspace=tmp_path)
-    config.codex.home_dir = tmp_path / "codex"
-    engine = AgentEngine(config, db)
-    with patch("nerve.memory.memu_bridge.MemUBridge", _NoMemory), \
-         patch("nerve.memory.xmemory_bridge.XmemoryBridge", _NoMemory), \
-         patch("nerve.config.load_claude_code_plugins"):
-        await engine.initialize()
-    await asyncio.wait_for(engine._onboarding_boot, 5)
-    await engine.shutdown()
-    assert asked == [tmp_path]

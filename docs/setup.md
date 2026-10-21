@@ -309,7 +309,9 @@ The state is one row in `nerve.db` (`onboarding`): pending, running (with the
 session id), done or skipped. A worker onboarded by an earlier version (the
 `TASK.md` marker is gone) counts as done; a worker whose `TASK.md` still has
 the marker counts as pending and gets the conversation when the daemon
-starts. Until onboarding is done or skipped:
+starts. Nothing opens without a model credential. When the agent's first turn
+fails (a model error), onboarding goes back to pending, and the next Finish or
+daemon start opens a new conversation. Until onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits

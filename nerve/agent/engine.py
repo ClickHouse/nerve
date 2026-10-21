@@ -895,9 +895,6 @@ class AgentEngine:
         except Exception as e:
             logger.error("Orphaned session recovery failed: %s", e)
 
-        # Open the onboarding conversation when setup asked for it before a
-        # restart (see nerve.onboarding.start_on_boot).
-        self._onboarding_boot = asyncio.ensure_future(self._start_onboarding_on_boot())
 
         logger.info("Agent engine initialized")
 
@@ -944,14 +941,6 @@ class AgentEngine:
             len(self._claude_code_plugins),
         )
         return self._mcp_servers_cache
-
-    async def _start_onboarding_on_boot(self) -> None:
-        from nerve import onboarding
-
-        try:
-            await onboarding.start_on_boot(self, self.config.workspace)
-        except Exception:
-            logger.exception("Onboarding: could not open the conversation at start-up")
 
     @staticmethod
     async def _safe_disconnect(client: Any, timeout: float = 5.0) -> None:
