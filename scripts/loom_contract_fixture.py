@@ -18,12 +18,14 @@ It reads two files of the checkout (with ``git show <ref>:<path>`` when
   synthetic tool of their own.
 
 Only what Nerve uses is written: the ops in LOOM_CALLS, the request fields
-Nerve may send plus the ones Loom requires, the result fields Nerve reads,
+Nerve may send plus the ones Loom requires (a field with a fixed set of
+values lists only the ones Nerve sends), the result fields Nerve reads
+(an object or list of objects without its fields, unless Nerve reads them),
 and the tools the agent-facing wording names
 (``nerve.memory.loom_prompts.tool_names``). It fails, writing nothing, when
 Nerve calls an op Loom does not have or does not serve on MCP, names a field
-Loom does not know, or tells agents about a tool Loom does not list by
-default.
+or a value Loom does not know, or tells agents about a tool Loom does not
+list by default.
 """
 
 from __future__ import annotations
@@ -106,16 +108,20 @@ class Schemas:
             out[item.target.id] = (annotation, required)
         return out
 
-    def schema(self, node: ast.expr, depth: int = 0) -> dict[str, Any]:
-        """A JSON-Schema-like description of a type annotation."""
+    def schema(self, node: ast.expr, depth: int = 0, *, expand: bool = True) -> dict[str, Any]:
+        """A JSON-Schema-like description of a type annotation. Without
+        ``expand`` a TypedDict is an object whose fields are not described."""
         if depth > 6:
             raise SystemExit("type nesting too deep")
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return self.schema(ast.parse(node.value, mode="eval").body, depth + 1)
+            return self.schema(ast.parse(node.value, mode="eval").body, depth + 1, expand=expand)
         if isinstance(node, ast.Constant) and node.value is None:
             return {"type": "null"}
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-            return {"anyOf": [self.schema(node.left, depth + 1), self.schema(node.right, depth + 1)]}
+            return {"anyOf": [
+                self.schema(node.left, depth + 1, expand=expand),
+                self.schema(node.right, depth + 1, expand=expand),
+            ]}
         if isinstance(node, ast.Name):
             simple = {
                 "str": {"type": "string"}, "int": {"type": "integer"},
@@ -124,22 +130,65 @@ class Schemas:
             if node.id in simple:
                 return simple[node.id]
             if node.id in self.classes:
-                return self.object_schema(node.id, None, depth + 1)
+                return self.object_schema(node.id, None, depth + 1) if expand else {"type": "object"}
             raise SystemExit(f"unknown type {node.id}")
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
             args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             kind = node.value.id
             if kind == "Optional":
-                return {"anyOf": [self.schema(args[0], depth + 1), {"type": "null"}]}
+                return {"anyOf": [self.schema(args[0], depth + 1, expand=expand), {"type": "null"}]}
             if kind == "Union":
-                return {"anyOf": [self.schema(a, depth + 1) for a in args]}
+                return {"anyOf": [self.schema(a, depth + 1, expand=expand) for a in args]}
             if kind == "list":
-                return {"type": "array", "items": self.schema(args[0], depth + 1)}
+                return {"type": "array", "items": self.schema(args[0], depth + 1, expand=expand)}
             if kind == "dict":
-                return {"type": "object", "additionalProperties": self.schema(args[1], depth + 1)}
+                return {
+                    "type": "object",
+                    "additionalProperties": self.schema(args[1], depth + 1, expand=expand),
+                }
             if kind == "Literal":
                 return {"enum": [ast.literal_eval(a) for a in args]}
         raise SystemExit(f"unsupported annotation {ast.unparse(node)}")
+
+    def item_class(self, node: ast.expr) -> str | None:
+        """The TypedDict of each item of a ``list[...]`` annotation, or None."""
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "list":
+            item = node.slice
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                item = ast.parse(item.value, mode="eval").body
+            if isinstance(item, ast.Name) and item.id in self.classes:
+                return item.id
+        return None
+
+    def result_schema(
+        self, output: dict[str, tuple[ast.expr, bool]], reads: frozenset[str], op: str,
+        errors: list[str],
+    ) -> dict[str, Any]:
+        """The result fields Nerve reads: ``name``, or ``name[].field`` for a
+        field of each item of a list; objects otherwise undescribed."""
+        nested: dict[str, set[str]] = {}
+        for read in reads:
+            name, _, sub = read.partition("[].")
+            nested.setdefault(name, set())
+            if sub:
+                nested[name].add(sub)
+        properties: dict[str, Any] = {}
+        for name, subs in sorted(nested.items()):
+            if name not in output:
+                errors.append(f"Loom's {op} answers no {name}")
+                continue
+            annotation = output[name][0]
+            if not subs:
+                properties[name] = self.schema(annotation, expand=False)
+                continue
+            item = self.item_class(annotation)
+            fields = self.fields(item) if item else {}
+            missing = sorted(sub for sub in subs if sub not in fields)
+            errors += [f"Loom's {op} answers no {name}[].{sub}" for sub in missing]
+            properties[name] = {"type": "array", "items": {"type": "object", "properties": {
+                sub: self.schema(fields[sub][0], expand=False) for sub in sorted(subs) if sub in fields
+            }}}
+        return {"type": "object", "properties": properties}
 
     def object_schema(self, class_name: str, keep: set[str] | None, depth: int = 0) -> dict[str, Any]:
         """A TypedDict as an object schema: every field, or those in ``keep``
@@ -172,6 +221,25 @@ def frozensets(source: str, names: tuple[str, ...]) -> dict[str, frozenset[str]]
     if missing:
         raise SystemExit(f"{TOOLSETS_FILE} defines no {sorted(missing)}")
     return out
+
+
+def narrow(schema: dict[str, Any], values: frozenset[str]) -> list[str]:
+    """List only ``values`` in the fixed set ``schema`` (or its items)
+    allows; the values Loom does not know, or every value when ``schema``
+    names no fixed set."""
+    if "enum" in schema:
+        unknown = sorted(values - set(schema["enum"]))
+        schema["enum"] = sorted(values)
+        return unknown
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        return narrow(schema["items"], values)
+    options = [option for option in schema.get("anyOf", []) if "enum" in option]
+    if options:
+        unknown = set(values)
+        for option in options:
+            unknown &= set(narrow(option, values))
+        return sorted(unknown)
+    return sorted(values)
 
 
 def listed_tools(sets: dict[str, frozenset[str]]) -> set[str]:
@@ -208,21 +276,19 @@ def build(
         body = schemas.fields(spec["body"])
         output = schemas.fields(spec["output"])
         errors += [f"Loom's {name} takes no {f}" for f in sorted(call.fields - set(body))]
-        errors += [f"Loom's {name} answers no {f}" for f in sorted(call.reads - set(output))]
+        request = schemas.object_schema(spec["body"], set(call.fields) & set(body))
+        for field_name, values in sorted(call.values.items()):
+            prop = request["properties"].get(field_name)
+            if prop is None:
+                continue  # reported above
+            errors += [f"Loom's {name} {field_name} has no value {v}" for v in narrow(prop, values)]
         ops[name] = {
             "tool": tool,
             "listed": listed,
-            "role": spec["role"],
             "idempotent": spec["idempotent"],
-            "read_only": spec["read_only"],
-            "request": schemas.object_schema(spec["body"], set(call.fields) & set(body)),
+            "request": request,
             # What Nerve reads; the rest of the answer is not described here.
-            "result": {
-                "type": "object",
-                "properties": {
-                    f: schemas.schema(output[f][0]) for f in sorted(call.reads & set(output))
-                },
-            },
+            "result": schemas.result_schema(output, call.reads, name, errors),
         }
     listed = listed_tools(sets)
     named = tool_names() if named is None else named

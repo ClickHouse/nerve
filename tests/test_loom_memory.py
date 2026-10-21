@@ -27,6 +27,7 @@ from nerve.agent.prompts import (
     prepend_session_preamble,
 )
 from nerve.config import LoomMemoryConfig, MemoryConfig, NerveConfig
+from nerve.mcp_gateway import McpGatewayServer
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
     create_memory_bridge,
@@ -194,7 +195,10 @@ class FakeGateway:
         if name == "loom_memory_set_from_messages":
             assert 1 <= len(a["messages"]) <= 400
             self.queued.append(a)
-            return {"written": [], "deferred": True, "queue_id": f"q{len(self.queued)}"}
+            if a.get("defer"):
+                return {"written": [], "deferred": True, "queue_id": f"q{len(self.queued)}"}
+            # Extracted while the call waited: one fact per batch here.
+            return {"written": [{"memory_key": f"fact{len(self.queued)}"}], "deferred": False}
         if name == "loom_namespace_summary":
             namespace = a.get("namespace", self.namespace)
             rows = [row for (ns, _), row in self.rows.items() if ns == namespace]
@@ -343,13 +347,29 @@ async def test_no_catalog_is_an_outage(make_memory) -> None:
 async def test_a_policy_refusal_is_an_outage_and_forgets_the_server(make_memory) -> None:
     gateway = FakeGateway()
     memory = await make_memory(gateway)
-    gateway.fail("loom_context_pack", rpc_error(-32001, "MCP server not enabled for this agent"))
-    with pytest.raises(MemoryBackendUnavailable, match="not enabled for this agent"):
-        await memory.startup_recall("anything")
-    assert len(gateway.args("loom_context_pack")) == 1  # a policy decision: not retried
+    gateway.fail("loom_namespace_summary", rpc_error(-32001, "MCP server not enabled for this agent"))
+    health = await memory.get_health()
+    assert "not enabled for this agent" in health["loom"]["error"]
+    assert len(gateway.args("loom_namespace_summary")) == 1  # a policy decision: not retried
     memory._catalog_read_at = 0.0
     await memory.startup_recall("anything")
     assert gateway.catalog_reads == 2  # read again to find the server
+
+
+@pytest.mark.asyncio
+async def test_a_refused_pack_tool_falls_back_to_the_search(make_memory) -> None:
+    """The gateway's policy may leave out loom_context_pack and keep
+    loom_search: the startup recall still gets its priors."""
+    gateway = FakeGateway()
+    gateway.add_row(HOME, "k1", "a prior about the plan")
+    memory = await make_memory(gateway, namespace=HOME)
+    gateway.fail("loom_context_pack", rpc_error(-32001, "tool not allowed for this agent"))
+    assert [m["id"] for m in await memory.startup_recall("plan")] == ["k1"]
+    assert len(gateway.args("loom_search")) == 1
+    gateway.fail("loom_context_pack", rpc_error(-32001, "tool not allowed for this agent"))
+    gateway.fail("loom_search", rpc_error(-32001, "tool not allowed for this agent"))
+    with pytest.raises(MemoryBackendUnavailable, match="not allowed"):
+        await memory.startup_recall("plan")
 
 
 @pytest.mark.asyncio
@@ -381,6 +401,62 @@ async def test_no_answer_opens_the_breaker(make_memory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_breaker_backs_off_while_failures_go_on(make_memory) -> None:
+    """The gateway's circuit never sees a call Nerve gave up on, so Nerve
+    backs off itself: 15 s, then 30 s, then 60 s, until a call succeeds."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    held = []
+    for _ in range(3):
+        gateway.fail("loom_context_pack", httpx.ReadTimeout("slow"))
+        with pytest.raises(MemoryBackendUnavailable, match="did not answer"):
+            await memory.startup_recall("anything")
+        held.append(round(memory._down_until - __import__("time").monotonic()))
+        memory._down_until = 0.0
+    assert held == [15, 30, 60]
+    assert await memory.startup_recall("anything") == []
+    assert memory._breaker_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_the_startup_read_has_five_seconds(make_memory, monkeypatch) -> None:
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    timeouts = []
+    real_call = McpGatewayServer.call_tool
+
+    async def recording(self, name, arguments, *, timeout=None):
+        timeouts.append((name, timeout))
+        return await real_call(self, name, arguments, timeout=timeout)
+
+    monkeypatch.setattr(McpGatewayServer, "call_tool", recording)
+    gateway.fail("loom_context_pack", _structured(1, {"rendered": ""}))
+    await memory.startup_recall("anything")
+    assert timeouts == [("loom_context_pack", 5.0), ("loom_search", 5.0)]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_extraction_leaves_the_reads_alone(make_memory) -> None:
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    gateway.fail("loom_memory_set_from_messages", httpx.ReadTimeout("slow"))
+    with pytest.raises(MemoryBackendUnavailable, match="did not answer"):
+        await memory.memorize_conversation("s", _messages(3, datetime.now(UTC)))
+    assert memory._down_until == 0.0  # no breaker: Loom answered nothing about reads
+    assert await memory.startup_recall("anything") == []
+
+
+@pytest.mark.asyncio
+async def test_without_a_catalog_calls_fail_at_once_between_reads(make_memory) -> None:
+    gateway = FakeGateway(catalog_status=503)
+    memory = await make_memory(gateway)
+    for _ in range(3):
+        with pytest.raises(MemoryBackendUnavailable, match="gave no catalog"):
+            await memory.startup_recall("anything")
+    assert gateway.catalog_reads == 1  # once per 30 seconds, also while there is none
+
+
+@pytest.mark.asyncio
 async def test_a_rate_limited_agent_holds_the_op(make_memory) -> None:
     gateway = FakeGateway()
     memory = await make_memory(gateway)
@@ -392,6 +468,25 @@ async def test_a_rate_limited_agent_holds_the_op(make_memory) -> None:
     assert len(gateway.args("loom_context_pack")) == 1  # not resent inside the wait
     with pytest.raises(MemoryBackendUnavailable, match="held for another"):
         await memory.startup_recall("anything")
+
+
+@pytest.mark.asyncio
+async def test_a_short_retry_after_is_waited_out_once_by_a_read(make_memory) -> None:
+    """The gateway's per-agent limit answers 429 with Retry-After: 1."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    gateway.fail("loom_context_pack", rpc_error(
+        -32002, "too many requests in progress for this agent", status=429, **{"Retry-After": "0"},
+    ))
+    assert await memory.startup_recall("anything") == []
+    assert len(gateway.args("loom_context_pack")) == 2
+    assert "loom_context_pack" not in memory._held
+    gateway.fail("loom_memory_set_from_messages", rpc_error(
+        -32002, "too many requests in progress for this agent", status=429, **{"Retry-After": "0"},
+    ))
+    with pytest.raises(MemoryBackendUnavailable, match="too many requests"):
+        await memory.memorize_conversation("s", _messages(2, datetime.now(UTC)))
+    assert len(gateway.args("loom_memory_set_from_messages")) == 1  # a write is not resent
 
 
 @pytest.mark.asyncio
@@ -632,7 +727,9 @@ async def test_memu_keeps_recall_for_startup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_window_is_queued_in_batches(make_memory) -> None:
+async def test_a_window_is_extracted_in_batches_while_the_call_waits(make_memory) -> None:
+    """Waiting for Loom's extraction, a batch it could not extract fails the
+    call, and the sweep keeps its watermark."""
     gateway = FakeGateway()
     memory = await make_memory(gateway)
     start = datetime(2026, 10, 18, 23, 0, tzinfo=UTC)
@@ -640,10 +737,10 @@ async def test_a_window_is_queued_in_batches(make_memory) -> None:
 
     assert await memory.memorize_conversation("sess-1", messages) is True
 
-    first, second = gateway.queued
-    assert len(first["messages"]) == 400 and len(second["messages"]) == 50
-    for batch in (first, second):
-        assert batch["defer"] is True and batch["extra_tags"] == ["source:nerve"]
+    assert [len(b["messages"]) for b in gateway.queued] == [100, 100, 100, 100, 50]
+    first, second = gateway.queued[:2]
+    for batch in gateway.queued:
+        assert batch["defer"] is False and batch["extra_tags"] == ["source:nerve"]
         assert batch["session_id"] == "sess-1"
         assert "agent" not in batch  # Loom names the writer from the credential
     assert first["messages"][0] == {
@@ -655,30 +752,88 @@ async def test_a_window_is_queued_in_batches(make_memory) -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_audit_log_names_the_queued_batches(make_memory) -> None:
-    """How a queued batch ended is not on Loom's MCP: the audit row keeps the
-    ids a person looks up in Loom's dashboard."""
-
-    class AuditDb:
-        def __init__(self) -> None:
-            self.rows: list[tuple] = []
-
-        async def log_audit(self, *row) -> None:
-            self.rows.append(row)
-
-    audit = AuditDb()
+async def test_extraction_can_be_queued_instead(make_memory) -> None:
+    """memory.loom.defer_extraction: queued, in batches as large as the body
+    limit allows (Loom then retries a batch in the background only)."""
     gateway = FakeGateway()
-    memory = await make_memory(gateway, audit_db=audit)
+    memory = await make_memory(gateway, defer_extraction=True)
     await memory.memorize_conversation("sess-1", _messages(450, datetime(2026, 10, 18, tzinfo=UTC)))
+    assert [len(b["messages"]) for b in gateway.queued] == [400, 50]
+    assert all(b["defer"] is True for b in gateway.queued)
+
+
+@pytest.mark.asyncio
+async def test_extraction_waits_up_to_the_gateway_limit(make_memory, monkeypatch) -> None:
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    timeouts = []
+    real_call = McpGatewayServer.call_tool
+
+    async def recording(self, name, arguments, *, timeout=None):
+        timeouts.append(timeout)
+        return await real_call(self, name, arguments, timeout=timeout)
+
+    monkeypatch.setattr(McpGatewayServer, "call_tool", recording)
+    await memory.memorize_conversation("s", _messages(3, datetime.now(UTC)))
+    assert timeouts == [130.0]  # the gateway gives the upstream call two minutes
+
+
+@pytest.mark.asyncio
+async def test_a_batch_too_large_for_the_gateway_is_halved(make_memory) -> None:
+    """A gateway with a lower body limit answers 413: the batch budget
+    halves and the same turns go again, in smaller batches."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    messages = _messages(60, datetime(2026, 10, 18, tzinfo=UTC), content="w" * 3000)
+    gateway.fail("loom_memory_set_from_messages", httpx.Response(413, json={
+        "jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "request body too large"},
+    }))
+    assert await memory.memorize_conversation("sess-1", messages) is True
+    sizes = [len(a["messages"]) for a in gateway.args("loom_memory_set_from_messages")]
+    assert sizes[0] > sizes[1] and sum(sizes[1:]) == 60
+    assert memory._batch_max_bytes == 64 * 1024
+    memory._batch_max_bytes = 16 * 1024  # at the minimum: the refusal stands
+    gateway.fail("loom_memory_set_from_messages", httpx.Response(413, json={"reason": "too_large"}))
+    with pytest.raises(LoomRequestError, match="PAYLOAD_TOO_LARGE"):
+        await memory.memorize_conversation("sess-2", messages)
+
+
+class AuditDb:
+    def __init__(self) -> None:
+        self.rows: list[tuple] = []
+
+    async def log_audit(self, *row) -> None:
+        self.rows.append(row)
+
+
+@pytest.mark.asyncio
+async def test_the_audit_log_counts_what_loom_extracted(make_memory) -> None:
+    audit = AuditDb()
+    memory = await make_memory(FakeGateway(), audit_db=audit)
+    await memory.memorize_conversation("sess-1", _messages(150, datetime(2026, 10, 18, tzinfo=UTC)))
     assert audit.rows == [("conversation_indexed", "resource", "sess-1", "bridge", {
-        "message_count": 450, "batches": 2, "queued": 2, "queue_ids": ["q1", "q2"],
+        "message_count": 150, "batches": 2, "sent": 2, "facts_written": 2,
     })]
 
 
 @pytest.mark.asyncio
-async def test_batches_stay_within_the_gateway_body_limit(make_memory) -> None:
+async def test_the_audit_log_names_the_queued_batches(make_memory) -> None:
+    """How a queued batch ended is not on Loom's MCP: the audit row keeps the
+    ids a person looks up in Loom's dashboard."""
+    audit = AuditDb()
+    memory = await make_memory(FakeGateway(), audit_db=audit, defer_extraction=True)
+    await memory.memorize_conversation("sess-1", _messages(450, datetime(2026, 10, 18, tzinfo=UTC)))
+    assert audit.rows == [("conversation_indexed", "resource", "sess-1", "bridge", {
+        "message_count": 450, "batches": 2, "sent": 2, "facts_written": 0,
+        "queue_ids": ["q1", "q2"],
+    })]
+
+
+@pytest.mark.parametrize(("defer", "budget"), [(False, 160 * 1024), (True, 1024 * 1024)])
+@pytest.mark.asyncio
+async def test_batches_stay_within_the_gateway_body_limit(make_memory, defer, budget) -> None:
     gateway = FakeGateway()
-    memory = await make_memory(gateway)
+    memory = await make_memory(gateway, defer_extraction=defer)
     messages = _messages(120, datetime(2026, 10, 18, tzinfo=UTC), content="w" * 8000)
     messages.append({"role": "user", "content": "é" * 900_000, "created_at": "2026-10-18 03:00:00"})
     await memory.memorize_conversation("sess-1", messages)
@@ -686,29 +841,29 @@ async def test_batches_stay_within_the_gateway_body_limit(make_memory) -> None:
     for batch in gateway.queued:
         body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "loom_memory_set_from_messages", "arguments": batch}}
-        assert len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()) < 1024 * 1024
+        assert len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()) < budget
     assert gateway.queued[-1]["messages"][-1]["content"].endswith("[…truncated]")
 
 
 @pytest.mark.asyncio
-async def test_a_failure_raises_and_accepted_batches_are_not_queued_again(make_memory) -> None:
+async def test_a_failure_raises_and_extracted_batches_are_not_sent_again(make_memory) -> None:
     gateway = FakeGateway()
     memory = await make_memory(gateway)
-    messages = _messages(450, datetime(2026, 10, 18, tzinfo=UTC))
+    messages = _messages(150, datetime(2026, 10, 18, tzinfo=UTC))
     gateway.fail("loom_memory_set_from_messages",
-                 _structured(1, {"deferred": True, "queue_id": "q-first"}),
+                 _structured(1, {"written": [{"memory_key": "k"}]}),
                  rpc_error(-32002, "MCP server unavailable"))
     with pytest.raises(MemoryBackendUnavailable):
         await memory.memorize_conversation("sess-1", messages)
     assert await memory.memorize_conversation("sess-1", messages) is True
     sizes = [len(a["messages"]) for a in gateway.args("loom_memory_set_from_messages")]
-    assert sizes == [400, 50, 50]
+    assert sizes == [100, 50, 50]
     assert len(gateway.queued) == 1 and len(gateway.queued[0]["messages"]) == 50
 
 
 @pytest.mark.asyncio
 async def test_a_lost_answer_is_not_resent(make_memory) -> None:
-    """A transcript queued for extraction is not idempotent."""
+    """A transcript sent for extraction is not idempotent."""
     gateway = FakeGateway()
     memory = await make_memory(gateway)
     gateway.fail("loom_memory_set_from_messages", httpx.ReadTimeout("slow"))
@@ -777,20 +932,19 @@ async def test_health_when_loom_cannot_answer(make_memory) -> None:
 async def test_identity_from_the_settings_needs_no_probe(make_memory) -> None:
     gateway = FakeGateway()
     memory = await make_memory(gateway, org="acme", namespace="pinned")
-    assert await memory._identity() == memory._ident
-    assert memory._ident.source == "config" and gateway.calls == []
+    assert memory._ident is not None and memory._ident.source == "config"
+    assert (memory._ident.org, memory._ident.namespace) == ("acme", "pinned")
+    assert gateway.calls == []
 
 
 @pytest.mark.asyncio
-async def test_identity_probe_failure_is_remembered(make_memory) -> None:
+async def test_identity_stays_unknown_while_the_probe_fails(make_memory) -> None:
     gateway = FakeGateway()
-    memory = await make_memory(gateway)
+    memory = await make_memory(gateway, dashboard_url="https://loom.example.test")
     gateway.fail("loom_namespace_summary", *[rpc_error(-32002, "MCP server unavailable")] * 2)
-    with pytest.raises(MemoryBackendUnavailable, match="could not name this agent's namespace"):
-        await memory._identity()
-    with pytest.raises(MemoryBackendUnavailable):
-        await memory._identity()
-    assert len(gateway.args("loom_namespace_summary")) == 2  # one probe, tried twice
+    health = await memory.get_health()
+    assert memory._ident is None and health["loom"]["identity_source"] == ""
+    assert memory.dashboard_url == "https://loom.example.test"  # no namespace to point at
 
 
 @pytest.mark.asyncio

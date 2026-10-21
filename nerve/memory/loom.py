@@ -17,12 +17,14 @@ the same agent, so Loom attributes them to that agent's credential:
   failed, while the search fails as long as Loom does, so a failed section
   freezes nothing into the session.
 * **transcript extraction** — at session close, rotation and in the
-  indexing sweep: ``memory.set_from_messages`` with ``defer`` (tool
-  ``loom_memory_set_from_messages``). Loom extracts a queued batch in the
-  background and retries it there; how a batch ended is not on MCP
+  indexing sweep: ``memory.set_from_messages`` (tool
+  ``loom_memory_set_from_messages``), waiting while Loom extracts each
+  batch, so a batch Loom could not extract fails the call and the sweep
+  offers the window again. ``memory.loom.defer_extraction`` queues the
+  batches instead: Loom then tries a failed batch three times within about a
+  minute and gives up, and how a batch ended is not on MCP
   (``memory.extraction_status`` is kept for people and operators), so the
-  memory audit log names each batch's ``queue_id`` for a lookup in Loom's
-  dashboard.
+  memory audit log names each queued batch's ``queue_id``.
 * **identity and health** — ``namespace.summary`` (tool
   ``loom_namespace_summary``) with the namespace Loom resolves for the
   agent: its answer names the org and namespace, and carries the counts the
@@ -34,8 +36,8 @@ make Nerve's calls name them instead.
 
 Failure contract, the part the rest of Nerve depends on: a gateway or Loom
 that cannot answer — no gateway URL, no ``loom`` server in the catalog, a
-policy refusal (``-32001``), a condition that may pass (``-32002``), a
-server fault, a timeout, a rate limit — raises
+policy refusal (``-32001``, :class:`LoomToolRefused`), a condition that may
+pass (``-32002``), a server fault, a timeout, a rate limit — raises
 :class:`~nerve.memory.backend.MemoryBackendUnavailable`, so a session starts
 without priors instead of crashing and the sweep keeps its watermark. A
 request Loom refused as invalid raises :class:`LoomRequestError`.
@@ -55,8 +57,8 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, unquote
@@ -81,13 +83,16 @@ LOOM_OP = "loom_op"
 @dataclass(frozen=True)
 class LoomCall:
     """One Loom operation Nerve calls: the MCP tool that runs it, the
-    arguments Nerve may send, and the result fields it reads.
-    ``tests/test_loom_contract.py`` checks them against Loom's own op schemas
+    arguments Nerve may send, the result fields it reads (``name[].field``
+    for a field of each item of a list), and the values Nerve sends for an
+    argument Loom takes from a fixed set. ``tests/test_loom_contract.py``
+    checks them against Loom's own op schemas
     (``tests/fixtures/loom_lifecycle_ops.json``)."""
 
     tool: str
     fields: frozenset[str]
     reads: frozenset[str]
+    values: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 LOOM_CALLS: dict[str, LoomCall] = {
@@ -98,6 +103,7 @@ LOOM_CALLS: dict[str, LoomCall] = {
             "section_token_budgets", "include_decisions",
         }),
         frozenset({"rendered", "sections"}),
+        {"mode": frozenset({"startup"}), "only_sections": frozenset({"memories"})},
     ),
     "search.query": LoomCall("loom_search", frozenset({"query", "top_k"}), frozenset({"memory"})),
     "memory.set_from_messages": LoomCall(
@@ -106,12 +112,14 @@ LOOM_CALLS: dict[str, LoomCall] = {
             "org", "namespace", "session_id", "messages", "last_messages", "defer",
             "extra_tags", "observation_date",
         }),
-        frozenset({"queue_id"}),
+        frozenset({"queue_id", "written"}),
     ),
     "namespace.summary": LoomCall(
         "loom_namespace_summary",
         frozenset({"org", "namespace", "top_entities_limit"}),
-        frozenset({"org", "namespace", "total_memories", "type_counts"}),
+        frozenset({
+            "org", "namespace", "total_memories", "type_counts[].memory_type", "type_counts[].n",
+        }),
     ),
 }
 
@@ -120,17 +128,25 @@ LOOM_CALLS: dict[str, LoomCall] = {
 _RETRIED_OPS = frozenset({"context.pack", "search.query", "namespace.summary"})
 _MAX_ATTEMPTS = 2
 _BACKOFF_S = 0.5
-# Seconds a lifecycle call may take through the gateway (which gives the
-# upstream call up to two minutes); extraction carries a large body.
-_READ_TIMEOUT_S = 20.0
-_EXTRACT_TIMEOUT_S = 60.0
-# After the gateway did not answer at all, fail fast for this long instead of
-# making every session start wait out the timeout again.
+# Seconds a lifecycle call may take through the gateway, which gives the
+# upstream call up to two minutes: the startup read is on a session's way in
+# and must be quick; extraction waits for Loom's model pass, so it gets a bit
+# more than the gateway's own limit and hears the gateway's answer first.
+_STARTUP_TIMEOUT_S = 5.0
+_READ_TIMEOUT_S = 10.0
+_EXTRACT_TIMEOUT_S = 130.0
+# After the gateway was not reached, or a read got no answer in time, fail
+# fast for this long, doubling with each such failure in a row up to the
+# second figure, instead of making every session start wait out the timeout
+# again. The gateway's own circuit does not see these: a call Nerve gave up
+# on does not count there.
 _BREAKER_S = 15.0
-# The longest Retry-After honoured as a hold on one op.
+_BREAKER_MAX_S = 300.0
+# A Retry-After up to this long (the gateway's per-agent limit sends 1) is
+# waited out once by a read; a longer one holds the op, at most the second
+# figure.
+_RETRY_AFTER_WAIT_S = 2.0
 _HOLD_MAX_S = 60.0
-# How long a failed identity probe is remembered before the next one.
-_IDENTITY_RETRY_S = 30.0
 # A catalog without Loom is read again at most this often.
 _CATALOG_RETRY_S = 30.0
 # The health note: probed this often in the background, and probed again on
@@ -150,12 +166,19 @@ _ITEM_MAX_CHARS = 500
 _STARTUP_MAX_BYTES = 4000
 _STARTUP_SECTION_TOKENS = 1000
 
-# memory.set_from_messages takes at most 400 messages. A window is cut into
-# batches of that size whose messages stay within this many bytes of JSON:
-# the gateway refuses a request body over 1 MiB, and the envelope and the
-# context turns need the rest.
-_BATCH_MAX_MESSAGES = 400
-_BATCH_MAX_BYTES = 768 * 1024
+# A window is cut into batches within a message and a byte budget. Loom
+# extracts a batch while the call waits, so a batch is what one model pass
+# handles well inside the gateway's two minutes. Queued batches
+# (memory.loom.defer_extraction) may be as large as memory.set_from_messages
+# takes (400 messages) and the gateway's 1 MiB body limit allows, with room
+# for the envelope and the context turns. A gateway that refuses a batch as
+# too large (413) halves the byte budget for the rest of the process, down to
+# the minimum.
+_BATCH_MAX_MESSAGES = 100
+_BATCH_MAX_BYTES = 128 * 1024
+_DEFERRED_BATCH_MAX_MESSAGES = 400
+_DEFERRED_BATCH_MAX_BYTES = 768 * 1024
+_BATCH_MIN_BYTES = 16 * 1024
 # Turns of the previous batch handed to the next as context (Loom's cap is
 # 20), each clipped: they only resolve references, they are not extracted.
 _CONTEXT_MESSAGES = 10
@@ -198,6 +221,12 @@ class LoomRequestError(RuntimeError):
         self.status = status
         self.code = code
         self.message = message
+
+
+class LoomToolRefused(MemoryBackendUnavailable):
+    """The gateway's policy refused a tool (JSON-RPC ``-32001``): Loom, or
+    this one tool, is not enabled for the agent, or no credential works.
+    Another Loom tool may still be allowed."""
 
 
 @dataclass(frozen=True)
@@ -426,17 +455,23 @@ class LoomMemory:
         self._error = ""
         self._metrics = LoomMetrics()
         self._ident: LoomIdentity | None = None
-        self._ident_lock = asyncio.Lock()
-        self._ident_retry_at = 0.0
-        self._ident_error = ""
         self._down_until = 0.0
         self._down_reason = ""
+        self._breaker_failures = 0
         self._held: dict[str, tuple[float, str]] = {}
         self._accepted: dict[str, float] = {}
         self._backoff_s = _BACKOFF_S
-        self._catalog_read_at = 0.0
+        # One server object at a time; one a policy refusal retired is
+        # closed at shutdown, since another call may still be using it.
+        self._server_lock = asyncio.Lock()
+        self._retired: list[McpGatewayServer] = []
+        self._catalog_read_at = float("-inf")
         # Set when a call says the catalog may have changed (a policy refusal).
         self._catalog_stale = False
+        # Extraction: wait for it (the default) or queue it in Loom.
+        self._defer = bool(self._cfg.defer_extraction)
+        self._batch_max_messages = _DEFERRED_BATCH_MAX_MESSAGES if self._defer else _BATCH_MAX_MESSAGES
+        self._batch_max_bytes = _DEFERRED_BATCH_MAX_BYTES if self._defer else _BATCH_MAX_BYTES
         # The last health probe: what the Diagnostics page shows.
         self._health: dict[str, Any] = {}
         self._health_at = 0.0
@@ -481,8 +516,9 @@ class LoomMemory:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         server, self._server = self._server, None
-        if server is not None:
-            await server.close()
+        retired, self._retired = self._retired, []
+        for old in [*retired, *([server] if server is not None else [])]:
+            await old.close()
         if self._catalog is not None:
             await self._catalog.close()
         self._available = False
@@ -491,6 +527,11 @@ class LoomMemory:
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def error(self) -> str:
+        """Why the backend did not start, or ""."""
+        return self._error
 
     @property
     def metrics(self) -> LoomMetrics:
@@ -524,34 +565,48 @@ class LoomMemory:
 
     async def _loom_server(self) -> McpGatewayServer:
         """The gateway server that is Loom, from the catalog. A catalog
-        without it, or one a policy refusal may have outdated, is read
-        again, at most every 30 seconds."""
-        if self._server is not None:
-            return self._server
-        assert self._catalog is not None
-        catalog = self._catalog.latest
-        server = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
-        now = time.monotonic()
-        outdated = server is None or self._catalog_stale
-        if outdated and (catalog is None or now - self._catalog_read_at >= _CATALOG_RETRY_S):
-            self._catalog_read_at, self._catalog_stale = now, False
-            catalog = await self._catalog.refresh()
-            server = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
-        if server is None:
-            raise MemoryBackendUnavailable(
-                "memory backend unavailable: "
-                + ("the MCP gateway's catalog lists no 'loom' server for this agent"
-                   if catalog is not None else
-                   f"the MCP gateway at {self._gateway_url} gave no catalog")
-            )
-        self._server = McpGatewayServer(server.url, transport=self._transport)
-        return self._server
-
-    async def _forget_server(self) -> None:
-        self._catalog_stale = True
-        server, self._server = self._server, None
+        without it, one a policy refusal may have outdated, or none at all
+        is read again at most every 30 seconds; in between a call fails at
+        once."""
+        server = self._server
         if server is not None:
-            await server.close()
+            return server
+        async with self._server_lock:
+            if self._server is not None:
+                return self._server
+            assert self._catalog is not None
+            catalog = self._catalog.latest
+            entry = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
+            now = time.monotonic()
+            if (entry is None or self._catalog_stale) and now - self._catalog_read_at >= _CATALOG_RETRY_S:
+                self._catalog_read_at, self._catalog_stale = now, False
+                catalog = await self._catalog.refresh()
+                entry = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
+            if entry is None:
+                raise MemoryBackendUnavailable(
+                    "memory backend unavailable: "
+                    + ("the MCP gateway's catalog lists no 'loom' server for this agent"
+                       if catalog is not None else
+                       f"the MCP gateway at {self._gateway_url} gave no catalog")
+                )
+            self._server = McpGatewayServer(entry.url, transport=self._transport)
+            return self._server
+
+    async def _forget_server(self, server: McpGatewayServer) -> None:
+        """Retire ``server``, the one a call just used, so the next call
+        reads the catalog again; one another call already replaced stays."""
+        async with self._server_lock:
+            self._catalog_stale = True
+            if self._server is server:
+                self._server = None
+                self._retired.append(server)
+
+    def _open_breaker(self, reason: str) -> None:
+        self._breaker_failures += 1
+        self._down_until = time.monotonic() + min(
+            _BREAKER_S * 2 ** (self._breaker_failures - 1), _BREAKER_MAX_S,
+        )
+        self._down_reason = reason
 
     async def _call(self, op: str, arguments: dict[str, Any], *, timeout: float = _READ_TIMEOUT_S) -> Any:
         """Run the Loom op ``op`` through the gateway; the op's structured result.
@@ -588,20 +643,28 @@ class LoomMemory:
                 result = await server.call_tool(name, call_args, timeout=timeout)
             except GatewayCallError as e:
                 failure = self._gateway_failure(op, e)
-                if e.status is None and e.code is None:
-                    # No answer at all: do not make the next caller wait too.
-                    self._down_until = time.monotonic() + _BREAKER_S
-                    self._down_reason = str(e)
+                no_answer = e.status is None and e.code is None
+                if no_answer and (not e.timed_out or op in _RETRIED_OPS):
+                    # The gateway was not reached, or a read got no answer
+                    # in time: do not make the next caller wait too. A slow
+                    # extraction says nothing about the reads.
+                    self._open_breaker(str(e))
                 if e.code == POLICY_REFUSED or e.status == 404:
                     # Loom left the agent's catalog, or the policy changed:
                     # the next call reads the catalog again.
-                    await self._forget_server()
-                if e.retry_after:
-                    self._held[op] = (time.monotonic() + min(e.retry_after, _HOLD_MAX_S), str(e))
-                if not e.retryable or attempt >= attempts or e.status is None or e.retry_after:
+                    await self._forget_server(server)
+                retry = op in _RETRIED_OPS and attempt < attempts and e.retryable and not no_answer
+                wait = e.retry_after
+                if retry and wait is not None and wait <= _RETRY_AFTER_WAIT_S:
+                    await asyncio.sleep(wait)
+                    continue
+                if wait:
+                    self._held[op] = (time.monotonic() + min(wait, _HOLD_MAX_S), str(e))
+                if not retry or wait:
                     raise failure from None
                 await asyncio.sleep(self._backoff_s * attempt)
                 continue
+            self._breaker_failures = 0
             self._down_until = 0.0
             if result.is_error:
                 raise self._refusal(op, result.structured, result.text)
@@ -610,9 +673,15 @@ class LoomMemory:
 
     @staticmethod
     def _gateway_failure(op: str, e: GatewayCallError) -> Exception:
-        """What a failed gateway call means to the caller: Loom unavailable,
-        or (for a call Loom's MCP server rejected as malformed) a refusal."""
-        if e.code is not None and e.code != POLICY_REFUSED and not e.retryable:
+        """What a failed gateway call means to the caller: Loom unavailable
+        (a policy refusal of this tool among the ways), or a refusal of the
+        request itself."""
+        if e.code == POLICY_REFUSED:
+            return LoomToolRefused(f"memory backend unavailable: {e}")
+        if e.status == 413:
+            # A body over the limit of the gateway in front of Loom.
+            return LoomRequestError(op, 413, "PAYLOAD_TOO_LARGE", str(e))
+        if e.code is not None and not e.retryable:
             # A JSON-RPC error the same call gets again (invalid params,
             # method not served): a bug, not an outage.
             return LoomRequestError(op, e.status, f"JSON-RPC {e.code}", str(e))
@@ -656,44 +725,6 @@ class LoomMemory:
             logger.warning("Audit log failed: %s", e)
 
     # ------------------------------------------------------------------ #
-    # Identity
-    # ------------------------------------------------------------------ #
-
-    async def _identity(self) -> LoomIdentity:
-        """The org and namespace Nerve's calls land in: the settings, else
-        what Loom resolves for the agent's credential (``namespace.summary``
-        echoes it). Raises :class:`MemoryBackendUnavailable` when neither
-        can say."""
-        if self._ident is not None:
-            return self._ident
-        async with self._ident_lock:
-            if self._ident is not None:
-                return self._ident
-            if self._cfg.org and self._cfg.namespace:
-                self._ident = LoomIdentity(self._cfg.org, self._cfg.namespace, "config")
-                return self._ident
-            if self._ident_error and time.monotonic() < self._ident_retry_at:
-                raise MemoryBackendUnavailable(f"memory backend unavailable: {self._ident_error}")
-            try:
-                summary = await self._call("namespace.summary", {"top_entities_limit": 0})
-            except (MemoryBackendUnavailable, LoomRequestError) as e:
-                self._ident_error = str(e).removeprefix("memory backend unavailable: ")
-                self._ident_retry_at = time.monotonic() + _IDENTITY_RETRY_S
-                raise MemoryBackendUnavailable(
-                    f"memory backend unavailable: Loom could not name this agent's "
-                    f"namespace ({self._ident_error})"
-                ) from None
-            data = summary if isinstance(summary, dict) else {}
-            org = str(data.get("org") or "").strip()
-            namespace = str(data.get("namespace") or "").strip()
-            if not org or not namespace:
-                self._ident_error = "Loom's namespace.summary named no org or namespace"
-                self._ident_retry_at = time.monotonic() + _IDENTITY_RETRY_S
-                raise MemoryBackendUnavailable(f"memory backend unavailable: {self._ident_error}")
-            self._ident, self._ident_error = LoomIdentity(org, namespace, "loom"), ""
-            return self._ident
-
-    # ------------------------------------------------------------------ #
     # Startup recall
     # ------------------------------------------------------------------ #
 
@@ -704,9 +735,10 @@ class LoomMemory:
 
         ``context.pack`` in startup mode, memories section only: Loom's fast
         search, whose hits it serves even where a search abstains, and no
-        category blurbs. A pack that brings no memories gets ``loom_search``
-        (see the module docstring). Raises when Loom cannot answer, so
-        nothing is frozen.
+        category blurbs. A pack that brings no memories, or one the gateway's
+        policy refuses, gets ``loom_search`` (see the module docstring). Each
+        call has five seconds. Raises when Loom cannot answer, so nothing is
+        frozen.
         """
         if not self._available:
             return []
@@ -725,8 +757,8 @@ class LoomMemory:
                 "top_k": max(1, min(limit, 20)),
                 "section_token_budgets": {"memories": _STARTUP_SECTION_TOKENS},
                 "include_decisions": False,
-            })
-        except LoomRequestError as e:
+            }, timeout=_STARTUP_TIMEOUT_S)
+        except (LoomRequestError, LoomToolRefused) as e:
             logger.info("Loom refused context.pack (%s); the startup recall searches instead", e)
             items: list[dict[str, str]] = []
         else:
@@ -783,7 +815,10 @@ class LoomMemory:
         """The memory hits of ``loom_search``, abstaining or not: a startup
         prior is context, not an answer. Their text is escaped and put on one
         line the way a pack's items are."""
-        result = await self._call("search.query", {"query": query, "top_k": max(1, min(limit, 20))})
+        result = await self._call(
+            "search.query", {"query": query, "top_k": max(1, min(limit, 20))},
+            timeout=_STARTUP_TIMEOUT_S,
+        )
         section = result.get("memory") if isinstance(result, dict) else None
         hits = section.get("results") if isinstance(section, dict) else None
         items: list[dict[str, str]] = []
@@ -809,14 +844,14 @@ class LoomMemory:
     # ------------------------------------------------------------------ #
 
     async def memorize_conversation(self, session_id: str, messages: list[dict]) -> bool:
-        """Queue a session window for extraction (``memory.set_from_messages``
-        with ``defer``): Loom extracts the facts in the background.
+        """Have Loom extract a session window's facts
+        (``memory.set_from_messages``), batch by batch, waiting for each;
+        with ``memory.loom.defer_extraction`` the batches are queued for
+        Loom's background extraction instead.
 
-        Cut into batches of at most 400 messages within the byte budget.
         RAISES on any failure, the backend not running included: the sweep
-        advances its watermark unless this raises, and a window that was not
-        queued must be offered again. False only when there is nothing to
-        send.
+        advances its watermark unless this raises, and a window Loom did not
+        take must be offered again. False only when there is nothing to send.
         """
         if not messages:
             return False
@@ -841,23 +876,34 @@ class LoomMemory:
         if stamp is not None:
             # Loom anchors what a turn says ("yesterday") to when it was said.
             turn["timestamp"] = _iso_utc(stamp)
-        return _fit_turn(turn, _BATCH_MAX_BYTES - 1024)
+        return turn
 
-    @staticmethod
-    def _batches(turns: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        batches: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
+    def _next_batch(self, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The leading turns that make one batch within the current budget,
+        each cut to fit it; never empty."""
+        limit = self._batch_max_bytes
+        batch: list[dict[str, Any]] = []
         size = 0
         for turn in turns:
-            turn_size = _json_size(turn) + 1
-            if current and (len(current) >= _BATCH_MAX_MESSAGES or size + turn_size > _BATCH_MAX_BYTES):
-                batches.append(current)
-                current, size = [], 0
-            current.append(turn)
+            fitted = _fit_turn(turn, limit - 1024)
+            turn_size = _json_size(fitted) + 1
+            if batch and (len(batch) >= self._batch_max_messages or size + turn_size > limit):
+                break
+            batch.append(fitted)
             size += turn_size
-        if current:
-            batches.append(current)
-        return batches
+        return batch
+
+    def _shrink_batches(self) -> bool:
+        """Halve the byte budget of a batch after the gateway refused one as
+        too large; False when it is at the minimum already."""
+        if self._batch_max_bytes <= _BATCH_MIN_BYTES:
+            return False
+        self._batch_max_bytes = max(_BATCH_MIN_BYTES, self._batch_max_bytes // 2)
+        logger.warning(
+            "The MCP gateway refused an extraction batch as too large; batches "
+            "are now at most %d bytes", self._batch_max_bytes,
+        )
+        return True
 
     @staticmethod
     def _context(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -879,7 +925,7 @@ class LoomMemory:
         arguments: dict[str, Any] = {
             "session_id": session_id,
             "messages": turns,
-            "defer": True,
+            "defer": self._defer,
             "extra_tags": [EXTRACTION_TAG],
             "observation_date": self._observation_date(turns),
         }
@@ -889,25 +935,37 @@ class LoomMemory:
         return result if isinstance(result, dict) else {}
 
     async def _memorize_conversation(self, session_id: str, all_turns: list[dict[str, Any]]) -> bool:
-        queued = 0
+        batches = sent = written = 0
         queue_ids: list[str] = []
         context: list[dict[str, Any]] = []
-        batches = self._batches(all_turns)
-        for turns in batches:
+        start = 0
+        while start < len(all_turns):
+            turns = self._next_batch(all_turns[start:])
             digest = hashlib.sha256(
                 json.dumps([session_id, turns], ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ).hexdigest()
             if not self._was_accepted(digest):
-                data = await self._send_window(session_id, turns, context)
+                try:
+                    data = await self._send_window(session_id, turns, context)
+                except LoomRequestError as e:
+                    if e.status == 413 and self._shrink_batches():
+                        continue  # the same turns again, in smaller batches
+                    raise
                 self._remember_accepted(digest)
-                queued += 1
-                if data.get("queue_id"):  # none when Loom extracted it right away
+                sent += 1
+                written += len(data.get("written") or [])
+                if data.get("queue_id"):  # queued: by request, or Loom deferred it
                     queue_ids.append(str(data["queue_id"]))
+            batches += 1
             context = self._context(turns)
-        await self._audit("conversation_indexed", "resource", session_id, {
-            "message_count": len(all_turns), "batches": len(batches), "queued": queued,
-            "queue_ids": queue_ids,
-        })
+            start += len(turns)
+        details: dict[str, Any] = {
+            "message_count": len(all_turns), "batches": batches, "sent": sent,
+            "facts_written": written,
+        }
+        if queue_ids:
+            details["queue_ids"] = queue_ids
+        await self._audit("conversation_indexed", "resource", session_id, details)
         return True
 
     def _was_accepted(self, digest: str) -> bool:

@@ -2206,6 +2206,13 @@ MEMORY_BACKENDS: tuple[str, ...] = ("memu", "loom")
 DEFAULT_MEMORY_BACKEND = "memu"
 
 
+# Loom's names: a namespace is lowercase letters, digits and hyphens, starting
+# with a letter or digit, at most 128 characters; an org name is checked as
+# loosely, without whitespace or a slash.
+_LOOM_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
+_LOOM_ORG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
+
+
 @dataclass
 class LoomMemoryConfig:
     """Optional settings of the Loom memory backend (``memory.backend: loom``).
@@ -2215,12 +2222,15 @@ class LoomMemoryConfig:
     ``namespace`` name the Loom workspace Nerve's own calls address, when it
     should not be the one Loom resolves for the agent's credential;
     ``dashboard_url`` is where people open Loom's dashboard (no link without
-    it).
+    it). ``defer_extraction`` queues conversation extraction in Loom instead
+    of waiting for it: Loom then gives up on a batch after three tries within
+    about a minute, and Nerve cannot see that.
     """
 
     org: str = ""
     namespace: str = ""
     dashboard_url: str = ""
+    defer_extraction: bool = False
 
     @classmethod
     @_coerced
@@ -2229,6 +2239,7 @@ class LoomMemoryConfig:
             org=str(d.get("org") or "").strip(),
             namespace=str(d.get("namespace") or "").strip(),
             dashboard_url=str(d.get("dashboard_url") or "").strip(),
+            defer_extraction=d.get("defer_extraction", False),
         )
 
 
@@ -3988,6 +3999,18 @@ class NerveConfig:
         if backend == "loom":
             loom = self.memory.loom
             loom.dashboard_url = _checked_http_url(loom.dashboard_url, "memory.loom.dashboard_url")
+            if loom.namespace and not _LOOM_NAMESPACE_RE.fullmatch(loom.namespace):
+                raise ConfigError(
+                    "memory.loom.namespace must be a Loom namespace name: lowercase "
+                    "letters, digits and hyphens, starting with a letter or digit, "
+                    "at most 128 characters"
+                )
+            if loom.org and not _LOOM_ORG_RE.fullmatch(loom.org):
+                raise ConfigError(
+                    "memory.loom.org must be a Loom org name: letters, digits and "
+                    "'.', '_', ':', '@' or '-', starting with a letter or digit, "
+                    "at most 128 characters"
+                )
 
     def _validate_anthropic_base_url(self) -> None:
         """Refuse ``anthropic_base_url`` together with another endpoint setting.

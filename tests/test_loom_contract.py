@@ -87,7 +87,12 @@ def test_nerve_names_only_fields_loom_has(op) -> None:
     call = LOOM_CALLS[op]
     assert call.fields <= set(OPS[op]["request"]["properties"]), REGENERATE
     assert set(OPS[op]["request"]["required"]) <= call.fields
-    assert call.reads <= set(OPS[op]["result"]["properties"]), REGENERATE
+    result = OPS[op]["result"]["properties"]
+    for read in call.reads:
+        name, _, sub = read.partition("[].")
+        assert name in result, (read, REGENERATE)
+        if sub:
+            assert sub in result[name]["items"]["properties"], (read, REGENERATE)
 
 
 def test_agents_are_told_only_about_tools_loom_lists() -> None:
@@ -205,6 +210,8 @@ class AReadBody(TypedDict, total=False):
 
 class AReadOutput(TypedDict, total=False):
     found: Required[dict[str, int]]
+    rows: NotRequired[list["Item"]]
+    nested: NotRequired[list["Item"]]
 '''
 
 _TOOLSETS_SOURCE = '''
@@ -232,12 +239,23 @@ def generator(monkeypatch):
 
 def test_the_generator_describes_what_nerve_uses(generator) -> None:
     fixture, errors = generator(
-        a_read=LoomCall("loom_a_read", frozenset({"query", "items"}), frozenset({"found"})),
+        a_read=LoomCall(
+            "loom_a_read", frozenset({"query", "items", "mode"}),
+            frozenset({"found", "rows[].text", "nested"}), {"mode": frozenset({"x"})},
+        ),
         a_unlisted=LoomCall(LOOM_OP, frozenset({"query"}), frozenset()),
     )
     assert errors == []
     read = fixture["ops"]["a.read"]
-    assert read["tool"] == "loom_a_read" and read["listed"] is True and read["role"] == "viewer"
+    assert read["tool"] == "loom_a_read" and read["listed"] is True and read["idempotent"] is True
+    assert "role" not in read and "read_only" not in read
+    # Only the value Nerve sends of a fixed set.
+    assert read["request"]["properties"].pop("mode") == {"enum": ["x"]}
+    # A list of objects Nerve reads only the length of: no fields described.
+    assert read["result"]["properties"].pop("nested") == {"type": "array", "items": {"type": "object"}}
+    assert read["result"]["properties"].pop("rows") == {
+        "type": "array", "items": {"type": "object", "properties": {"text": {"type": "string"}}},
+    }
     assert read["request"] == {
         "type": "object",
         "properties": {
@@ -263,14 +281,19 @@ def test_the_generator_describes_what_nerve_uses(generator) -> None:
 def test_the_generator_refuses_what_loom_does_not_serve(generator) -> None:
     _, errors = generator(
         a_hidden=LoomCall(LOOM_OP, frozenset({"query"}), frozenset()),
-        a_read=LoomCall("loom_a_read", frozenset({"query", "agent"}), frozenset({"gone"})),
+        a_read=LoomCall(
+            "loom_a_read", frozenset({"query", "agent", "mode"}), frozenset({"gone", "rows[].nope"}),
+            {"mode": frozenset({"x", "z"})},
+        ),
         a_missing=LoomCall("loom_a_missing", frozenset(), frozenset()),
     )
     assert errors == [
         "Loom keeps a.hidden off MCP: no tool, loom_op included, runs it",
         "Loom has no op a.missing",
         "Loom's a.read takes no agent",
+        "Loom's a.read mode has no value z",
         "Loom's a.read answers no gone",
+        "Loom's a.read answers no rows[].nope",
     ]
 
 

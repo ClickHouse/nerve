@@ -72,10 +72,28 @@ def test_an_unusable_dashboard_url_refuses_to_load(url) -> None:
         NerveConfig.from_dict({"memory": {"backend": "loom", "loom": {"dashboard_url": url}}})
 
 
+def test_extraction_waits_unless_deferred() -> None:
+    assert LoomMemoryConfig().defer_extraction is False
+    config = NerveConfig.from_dict({"memory": {"backend": "loom", "loom": {"defer_extraction": "true"}}})
+    assert config.memory.loom.defer_extraction is True
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("namespace", "Agent Home"),
+    ("namespace", "-home"),
+    ("namespace", "x" * 129),
+    ("org", "acme corp"),
+    ("org", "acme/east"),
+])
+def test_an_unusable_loom_name_refuses_to_load(key, value) -> None:
+    with pytest.raises(ValueError, match=f"memory.loom.{key}"):
+        NerveConfig.from_dict({"memory": {"backend": "loom", "loom": {key: value}}})
+
+
 def test_the_loom_section_is_inert_under_memu() -> None:
     """A stale Loom value must not stop a memU instance from starting."""
     config = NerveConfig.from_dict({
-        "memory": {"backend": "memu", "loom": {"dashboard_url": "not a url"}},
+        "memory": {"backend": "memu", "loom": {"dashboard_url": "not a url", "namespace": "Not One"}},
     })
     assert config.memory.backend == "memu"
 
@@ -86,7 +104,7 @@ def test_a_non_mapping_loom_section_uses_the_defaults() -> None:
 
 def test_loom_keys_are_known_to_the_validator() -> None:
     merged = {"memory": {"backend": "loom", "loom": {
-        "org": "o", "namespace": "n", "dashboard_url": "https://d",
+        "org": "o", "namespace": "n", "dashboard_url": "https://d", "defer_extraction": True,
     }}}
     assert validate_config_keys(merged) == []
     removed = validate_config_keys({"memory": {"loom": {"base_url": "x", "token": "t"}}})
@@ -114,3 +132,17 @@ def test_a_settings_file_that_names_only_the_backend(tmp_path) -> None:
     assert config.memory.backend == "loom"
     assert config.mcp_gateway_url == "http://192.0.2.1:3130"
     assert config.memory.loom == LoomMemoryConfig()
+
+
+def test_the_switch_in_config_local_yaml_outranks_the_tracked_settings(tmp_path) -> None:
+    """A platform switches the instance after its first `nerve init` by
+    writing memory.backend into config.local.yaml, which outranks the
+    tracked workspace settings."""
+    workspace = tmp_path / "ws"
+    (workspace / "config").mkdir(parents=True)
+    (workspace / "config" / "settings.yaml").write_text("memory:\n  backend: memu\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+    (tmp_path / "config.local.yaml").write_text(
+        "mcp_gateway_url: http://192.0.2.1:3130\nmemory:\n  backend: loom\n", encoding="utf-8",
+    )
+    assert load_config(tmp_path).memory.backend == "loom"

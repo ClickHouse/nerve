@@ -146,15 +146,18 @@ async def test_responses_without_a_jsonrpc_message(status, body, retryable, reas
     assert err.value.retryable is retryable and err.value.code is None
 
 
-@pytest.mark.parametrize("failure", [
-    httpx.ConnectError("refused"),
-    httpx.ReadTimeout("slow"),
+@pytest.mark.parametrize(("failure", "timed_out"), [
+    (httpx.ConnectError("refused"), False),
+    (httpx.ConnectTimeout("no route"), False),
+    (httpx.ReadTimeout("slow"), True),
 ])
 @pytest.mark.asyncio
-async def test_transport_failures_are_retryable(failure) -> None:
+async def test_transport_failures_are_retryable(failure, timed_out) -> None:
     with pytest.raises(GatewayCallError) as err:
         await _server(Recorder(failure)).call_tool("search", {"query": "secret words"})
     assert err.value.retryable is True and err.value.status is None
+    # Sent and unanswered in time, or never sent at all.
+    assert err.value.timed_out is timed_out
     assert "secret words" not in str(err.value)  # arguments never in the message
 
 

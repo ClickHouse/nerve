@@ -8,7 +8,6 @@
     "context.pack": {
       "idempotent": true,
       "listed": true,
-      "read_only": true,
       "request": {
         "properties": {
           "include_decisions": {
@@ -16,10 +15,7 @@
           },
           "mode": {
             "enum": [
-              "startup",
-              "task",
-              "debug",
-              "handoff"
+              "startup"
             ]
           },
           "namespace": {
@@ -28,17 +24,7 @@
           "only_sections": {
             "items": {
               "enum": [
-                "working_memory",
-                "memory_stack",
-                "profile",
-                "memories",
-                "procedures",
-                "decisions",
-                "knowledge",
-                "conversations",
-                "runs",
-                "namespace_health",
-                "mentor"
+                "memories"
               ]
             },
             "type": "array"
@@ -76,13 +62,11 @@
         },
         "type": "object"
       },
-      "role": "viewer",
       "tool": "loom_context_pack"
     },
     "memory.set_from_messages": {
       "idempotent": false,
       "listed": true,
-      "read_only": false,
       "request": {
         "properties": {
           "defer": {
@@ -176,17 +160,21 @@
         "properties": {
           "queue_id": {
             "type": "string"
+          },
+          "written": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
           }
         },
         "type": "object"
       },
-      "role": "writer",
       "tool": "loom_memory_set_from_messages"
     },
     "namespace.summary": {
       "idempotent": true,
       "listed": true,
-      "read_only": true,
       "request": {
         "properties": {
           "namespace": {
@@ -223,10 +211,6 @@
                   "type": "integer"
                 }
               },
-              "required": [
-                "memory_type",
-                "n"
-              ],
               "type": "object"
             },
             "type": "array"
@@ -234,13 +218,11 @@
         },
         "type": "object"
       },
-      "role": "viewer",
       "tool": "loom_namespace_summary"
     },
     "search.query": {
       "idempotent": true,
       "listed": true,
-      "read_only": true,
       "request": {
         "properties": {
           "query": {
@@ -264,7 +246,6 @@
         },
         "type": "object"
       },
-      "role": "viewer",
       "tool": "loom_search"
     }
   },

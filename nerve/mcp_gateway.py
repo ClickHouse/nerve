@@ -238,8 +238,10 @@ class GatewayCallError(Exception):
     ``code`` is the JSON-RPC error code, ``None`` when the call failed below
     JSON-RPC; ``status`` the HTTP status, ``None`` when no response came;
     ``reason`` the gateway's reason code for a response without a JSON-RPC
-    message. ``retryable`` says whether the same call may succeed later.
-    The message never holds an argument or a credential.
+    message. ``retryable`` says whether the same call may succeed later;
+    ``timed_out`` that the request was sent and no answer came in time (the
+    gateway was reached; the upstream may still be working on it). The
+    message never holds an argument or a credential.
     """
 
     def __init__(
@@ -251,6 +253,7 @@ class GatewayCallError(Exception):
         reason: str = "",
         retryable: bool = False,
         retry_after: float | None = None,
+        timed_out: bool = False,
     ):
         super().__init__(message)
         self.code = code
@@ -258,6 +261,7 @@ class GatewayCallError(Exception):
         self.reason = reason
         self.retryable = retryable
         self.retry_after = retry_after
+        self.timed_out = timed_out
 
 
 @dataclass(frozen=True)
@@ -383,6 +387,8 @@ class McpGatewayServer:
             raise GatewayCallError(
                 f"MCP gateway did not answer {name} in time ({type(e).__name__})",
                 retryable=True,
+                # A connection that never opened reached nothing.
+                timed_out=not isinstance(e, httpx.ConnectTimeout),
             ) from None
         except httpx.RequestError as e:
             raise GatewayCallError(
