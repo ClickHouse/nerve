@@ -199,6 +199,17 @@ the hosted channel streams.
   burst; see [Runs on delivery](cron.md#runs-on-delivery). Gate a pull request
   monitor on `messages` with `sources: [github]` rather than on
   `github_pr_activity`, which always passes in hosted mode.
+- **A switched-off hosted Slack holds GitHub back.** Nerve reads the events of
+  every hosted provider from one ordered inbox at the gateway, and it stops
+  reading while a hosted channel cannot take events. With `slack.mode: hosted`
+  and `slack.enabled: false`, Nerve therefore reads nothing from the gateway:
+  the GitHub records wait there too, no delivery starts a job, and past the
+  gateway's limit of stored records the oldest are dropped. They arrive once
+  Slack is switched on again. While GitHub is hosted, keep a hosted Slack
+  switched on, or switch both off; `nerve doctor` warns about this
+  combination. This is a known limitation: reading each provider's events on
+  its own, so that GitHub records arrive while hosted Slack is off, is a
+  follow-up.
 - **Restart-only.** A change of `mode` takes effect at the next restart.
 
 ```yaml

@@ -255,7 +255,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1320,7 +1320,9 @@ latest accepted event.
 reload. The stream endpoint still accepts streams, and events stay in the
 gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
 Nerve sends no notifications and refuses `send_channel_message`. A turn that
-is already running still sends its reply.
+is already running still sends its reply. Nerve reads nothing from the
+gateway's inbox while Slack is paused, so the records of a hosted GitHub
+source wait there too (see below).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1366,6 +1368,15 @@ gateway polls GitHub for the agent and streams the records; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
 [Hosted GitHub source](sources.md#hosted-github-source).
+
+When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
+the events of every hosted provider from one ordered inbox, and it reads
+nothing while hosted Slack is switched off (`slack.enabled: false`): the
+GitHub records wait at the gateway until Slack is switched on again, and past
+the gateway's limit of stored records the oldest are dropped. Keep a hosted
+Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
+This is a known limitation: a read for each provider on its own, which would
+keep GitHub records arriving while hosted Slack is off, is a follow-up.
 
 ### Setting up the Slack app
 

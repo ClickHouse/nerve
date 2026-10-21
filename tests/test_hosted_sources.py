@@ -654,6 +654,27 @@ class TestSharedStreams:
         finally:
             await stop(harness)
 
+    async def test_a_switched_off_hosted_slack_holds_the_github_records_back(self, tmp_path, db, monkeypatch):
+        """One ordered inbox for every provider, which Nerve stops reading
+        while a channel cannot take events: GitHub records wait while hosted
+        Slack is off and arrive once it is on again."""
+        harness = await start(tmp_path, db, monkeypatch, slack=True)
+        try:
+            harness.config.slack.enabled = False
+            stream = await harness.stream()
+            record = harness.gateway.store(source_record_event())
+
+            await stream.nudge("observe")
+            await asyncio.sleep(0.5)
+
+            assert record not in harness.gateway.acknowledged
+            assert await db.read_channel_observations("github") == []
+            harness.config.slack.enabled = True
+            assert (await harness.acknowledged(record))[record] == "accepted"
+            assert len(await db.read_channel_observations("github")) == 1
+        finally:
+            await stop(harness)
+
     async def test_without_hosted_sources_no_subscriptions_are_sent(self, tmp_path, db, monkeypatch):
         harness = await start(tmp_path, db, monkeypatch, slack=True, github=False)
         try:
@@ -801,6 +822,21 @@ class TestDoctor:
         report = doctor_report(doctor_config(tmp_path, enabled=False))
 
         assert "[--] GitHub is hosted but switched off (sync.github.enabled is false)" in report
+
+    @pytest.mark.parametrize(("slack", "github", "warned"), [
+        ({"mode": "hosted", "enabled": False}, {}, True),
+        ({"mode": "hosted"}, {}, False),
+        ({"mode": "socket", "enabled": False}, {}, False),
+        ({"mode": "hosted", "enabled": False}, {"enabled": False}, False),
+        ({"mode": "hosted", "enabled": False}, {"mode": "poll"}, False),
+    ])
+    def test_a_switched_off_hosted_slack_is_said_to_hold_github_back(self, tmp_path, slack, github, warned):
+        config = doctor_config(tmp_path, **github)
+        config.slack = SlackConfig.from_dict(slack)
+
+        report = doctor_report(config)
+
+        assert ("[WARN] Slack is hosted but switched off (slack.enabled is false)" in report) is warned
 
     def test_jobs_on_the_pull_request_gate_are_named(self, tmp_path):
         config = doctor_config(tmp_path)

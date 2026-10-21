@@ -1535,11 +1535,14 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
-def _hosted_github_lines(config, errors: list[str]) -> list[str]:
+def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
     """Doctor lines for ``sync.github.mode: hosted``.
 
     The gateway polls GitHub, so there is no gh login to check; the hosted
     stream settings are, as for hosted Slack, also when the source is off.
+    Nerve reads the gateway's events for every hosted provider in one
+    ordered inbox and stops reading while hosted Slack is switched off, so
+    a switched-off hosted Slack holds the GitHub records back too.
     """
     github = config.sync.github
     if github.mode != "hosted":
@@ -1565,6 +1568,12 @@ def _hosted_github_lines(config, errors: list[str]) -> list[str]:
         lines.append(
             "[OK] GitHub notifications come from the channel gateway: filters "
             f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}"
+        )
+    if github.enabled and config.slack.mode == "hosted" and not config.slack.enabled:
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so the "
+            "hosted GitHub records wait there too"
         )
     return lines
 
@@ -2012,7 +2021,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 )
     else:
         lines.append("[--] Slack disabled")
-    lines.extend(_hosted_github_lines(config, errors))
+    lines.extend(_hosted_github_lines(config, errors, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
