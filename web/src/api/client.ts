@@ -812,6 +812,29 @@ export interface WorkflowRunJournal {
   result: string;
 }
 
+/** The next moment the instance will do work of its own (`GET /api/cron/schedule`). */
+export interface CronScheduledTick {
+  at: string;
+  /** Cron job id, `source:<name>`, or `wakeup:<session id prefix>`. */
+  name: string;
+  kind: 'cron' | 'source' | 'wakeup';
+}
+
+/** What a job's gates say about its next run, judged from what is known now. */
+export interface CronJobForecast {
+  id: string;
+  next_run: string | null;
+  /** `null` when the job has no next run (disabled, or not scheduled). */
+  forecast: 'run' | 'skip' | null;
+  /** Why a `skip`; `null` otherwise. */
+  reason: string | null;
+}
+
+export interface CronSchedule {
+  next: CronScheduledTick | null;
+  jobs: CronJobForecast[];
+}
+
 let authToken: string | null = localStorage.getItem('nerve_token');
 let tokenRevision = 0;
 
@@ -1584,6 +1607,7 @@ export const api = {
 
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
+  getCronSchedule: (signal?: AbortSignal) => request<CronSchedule>('/cron/schedule', { signal }),
   triggerCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>

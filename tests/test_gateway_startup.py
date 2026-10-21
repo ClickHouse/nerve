@@ -324,3 +324,92 @@ async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkey
         assert harness["server"]._hosted_channels is hosted
 
     assert hosted.stops == 1
+
+
+class _Reporter(_Recorder):
+    """An activity reporter that records how the lifespan drives it."""
+
+    def __init__(self, config, engine, db, cron_service, *, connection_count=None, fail=False):
+        super().__init__(fail=fail)
+        self.cron_service = cron_service
+        self.connection_count = connection_count
+        self.watched: list = []
+
+    async def start(self):
+        await super().start()
+        return True
+
+    def watch_workflow_runs(self, service):
+        self.watched.append(service)
+
+
+@pytest.fixture
+def reporter(harness, monkeypatch):
+    """The reporter the lifespan builds, replaced by a recorder."""
+    import nerve.platform.activity as activity_module
+
+    built: list[_Reporter] = []
+
+    def build(*args, **kwargs):
+        built.append(_Reporter(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(activity_module, "ActivityReporter", build)
+    monkeypatch.setattr(harness["server"], "_activity_reporter", None)
+    return built
+
+
+@pytest.mark.asyncio
+async def test_a_reporter_that_fails_to_start_never_stops_the_gateway(harness, monkeypatch):
+    import nerve.platform.activity as activity_module
+
+    def explode(*_args, **_kwargs):
+        return _Reporter(None, None, None, None, fail=True)
+
+    monkeypatch.setattr(activity_module, "ActivityReporter", explode)
+    monkeypatch.setattr(harness["server"], "_activity_reporter", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        assert harness["server"]._activity_reporter is None
+
+    assert harness["closed"] == ["db"]
+    assert harness["engine"].shutdown.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_the_reporter_runs_for_the_life_of_the_gateway(harness, reporter, monkeypatch):
+    """Started with the client connection count and the workflow-run service,
+    stopped at shutdown."""
+    import nerve.workflows as workflows_module
+
+    runs = _Recorder()
+    monkeypatch.setattr(workflows_module, "init_workflow_run_service", lambda *a, **k: runs)
+    monkeypatch.setattr(harness["server"], "_workflow_run_service", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        (built,) = reporter
+        assert harness["server"]._activity_reporter is built
+        assert built.starts == 1 and built.stops == 0
+        assert built.watched == [runs]
+        harness["server"]._live_sockets["c1"] = (MagicMock(), MagicMock())
+        try:
+            assert built.connection_count() == 1
+        finally:
+            harness["server"]._live_sockets.pop("c1")
+
+    assert built.stops == 1
+    assert harness["server"]._activity_reporter is None
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_reporter_started_stops_it(harness, reporter):
+    harness["engine"].resume_enrolled_sessions = MagicMock(
+        side_effect=RuntimeError("late failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="late failure"):
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    (built,) = reporter
+    assert built.starts == 1 and built.stops == 1

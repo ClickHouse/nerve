@@ -728,6 +728,32 @@ async def test_claude_subagent_started_is_noop_when_spawn_known(reg):
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
+async def test_any_live_and_its_listeners_follow_every_session(reg):
+    """Live agents in any session, and a call whenever that may change: what
+    keeps the machine awake while background agents run."""
+    calls: list[None] = []
+    reg.add_live_listener(lambda: calls.append(None))
+    assert reg.any_live() is False
+
+    reg.on_client_connected(SID, 1, backend="claude")
+    rec = await _launched_agent(reg)
+    assert reg.any_live() is True and calls
+    heard = len(calls)
+
+    await reg.on_system_event(SID, _sys("task_notification", task_id=rec.task_id, status="completed"))
+    assert reg.any_live() is False
+    assert len(calls) > heard
+
+    def broken() -> None:
+        raise RuntimeError("listener broke")
+
+    reg.add_live_listener(broken)
+    other = await _launched_agent(reg, tool_use_id="toolu_2", task_id="a2")  # never raises
+    assert other.live and reg.any_live() is True
+    reg.remove_live_listener(broken)
+
+
+@pytest.mark.asyncio
 async def test_ambient_excluded_from_counts_and_views(reg):
     await reg.on_system_event(SID, _started("d0000001", None, task_type="dream", description="housekeeping"))
     await _live_set(reg, "e0000001", ambient=True)

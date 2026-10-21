@@ -18,6 +18,7 @@ from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
 from nerve.identity import Actor, attribution_for
+from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 
 logger = logging.getLogger(__name__)
 
@@ -617,7 +618,10 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
                             if norm >= connected_at:
                                 context_msgs.append(msg)
                     if context_msgs:
-                        await engine._memory_bridge.memorize_conversation(session_id, context_msgs)
+                        with keep_awake(LEASE_MEMORIZE):
+                            await engine._memory_bridge.memorize_conversation(
+                                session_id, context_msgs,
+                            )
                         # Same window to xmemory (opt-in, fire-and-forget).
                         engine.schedule_xmemory_transcript(session_id, context_msgs)
                 except Exception as e:

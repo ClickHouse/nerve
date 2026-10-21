@@ -98,6 +98,7 @@ from nerve.identity import (
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
     publish_text,
@@ -1131,6 +1132,14 @@ class AgentEngine:
     #  Memory bridge                                                       #
     # ------------------------------------------------------------------ #
 
+    @contextlib.asynccontextmanager
+    async def _memorizing(self):
+        """Hold the memorize lock, keeping the machine awake (the
+        ``nerve-memorize`` lease) while waiting for it and while holding it."""
+        with keep_awake(LEASE_MEMORIZE):
+            async with self._memorize_lock:
+                yield
+
     async def _memorize_session(
         self, session_id: str, connected_at_override: str | None = None,
     ) -> None:
@@ -1150,7 +1159,7 @@ class AgentEngine:
         if not self._memory_bridge or not self._memory_bridge.available:
             return
 
-        async with self._memorize_lock:
+        async with self._memorizing():
             # Session state (notably the last_memorized_at watermark) is
             # read inside the lock: queued memorizations for the same
             # session must each see the watermark advanced by the previous
@@ -1270,9 +1279,11 @@ class AgentEngine:
         if bridge is None or not bridge.indexes_conversations or not messages:
             return
 
-        task = asyncio.create_task(
-            bridge.memorize_conversation(session_id, messages),
-        )
+        async def _write() -> None:
+            with keep_awake(LEASE_MEMORIZE):
+                await bridge.memorize_conversation(session_id, messages)
+
+        task = asyncio.create_task(_write())
         self._memorize_bg_tasks.add(task)
 
         def _done(t: asyncio.Task) -> None:
@@ -1350,7 +1361,7 @@ class AgentEngine:
             logger.info("Memorization sweep skipped: another memorize is in progress")
             return {"skipped": "memorize already in progress"}
 
-        async with self._memorize_lock:
+        async with self._memorizing():
             sessions = await self.db.get_sessions_needing_memorization()
             total_messages = 0
             sessions_indexed = 0
