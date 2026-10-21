@@ -384,6 +384,11 @@ def _iso_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _loom_entry(catalog: Any) -> Any:
+    """The catalog's server ``loom``, or None."""
+    return next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
+
+
 def _escape_data(text: str) -> str:
     """Recalled text as Loom escapes it in a context pack: ``<`` and ``>``
     as ``&lt;`` and ``&gt;``, so it can neither close nor open a tag."""
@@ -461,10 +466,11 @@ class LoomMemory:
         self._held: dict[str, tuple[float, str]] = {}
         self._accepted: dict[str, float] = {}
         self._backoff_s = _BACKOFF_S
-        # One server object at a time; one a policy refusal retired is
-        # closed at shutdown, since another call may still be using it.
+        # One client for Loom's URL; one the catalog replaced is closed as
+        # soon as no call uses it.
         self._server_lock = asyncio.Lock()
-        self._retired: list[McpGatewayServer] = []
+        self._inflight: dict[McpGatewayServer, int] = {}
+        self._retired: set[McpGatewayServer] = set()
         self._catalog_read_at = float("-inf")
         # Set when a call says the catalog may have changed (a policy refusal).
         self._catalog_stale = False
@@ -521,9 +527,10 @@ class LoomMemory:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         server, self._server = self._server, None
-        retired, self._retired = self._retired, []
+        retired, self._retired = self._retired, set()
         for old in [*retired, *([server] if server is not None else [])]:
             await old.close()
+        self._inflight.clear()
         if self._catalog is not None:
             await self._catalog.close()
         self._available = False
@@ -569,42 +576,59 @@ class LoomMemory:
     # ------------------------------------------------------------------ #
 
     async def _loom_server(self) -> McpGatewayServer:
-        """The gateway server that is Loom, from the catalog. A catalog
-        without it, one a policy refusal may have outdated, or none at all
-        is read again at most every 30 seconds; in between a call fails at
-        once."""
+        """The gateway server that is Loom, from the catalog.
+
+        One client is kept across calls, refusals included. The catalog is
+        read again, at most every 30 seconds (also while none could be read),
+        when it lacks Loom or a refusal may have outdated it; the client is
+        replaced only when Loom's URL in it changed, and dropped when Loom
+        left it.
+        """
         server = self._server
-        if server is not None:
+        if server is not None and not self._catalog_stale:
             return server
         async with self._server_lock:
-            if self._server is not None:
-                return self._server
             assert self._catalog is not None
             catalog = self._catalog.latest
-            entry = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
+            entry = _loom_entry(catalog)
             now = time.monotonic()
             if (entry is None or self._catalog_stale) and now - self._catalog_read_at >= _CATALOG_RETRY_S:
                 self._catalog_read_at, self._catalog_stale = now, False
                 catalog = await self._catalog.refresh()
-                entry = next((s for s in (catalog.servers if catalog else ()) if s.id == LOOM_SERVER_ID), None)
+                entry = _loom_entry(catalog)
             if entry is None:
+                old, self._server = self._server, None
+                await self._retire(old)
                 raise MemoryBackendUnavailable(
                     "memory backend unavailable: "
                     + ("the MCP gateway's catalog lists no 'loom' server for this agent"
                        if catalog is not None else
                        f"the MCP gateway at {self._gateway_url} gave no catalog")
                 )
-            self._server = McpGatewayServer(entry.url, transport=self._transport)
+            if self._server is None or self._server.url != entry.url:
+                old, self._server = self._server, McpGatewayServer(entry.url, transport=self._transport)
+                await self._retire(old)
             return self._server
 
-    async def _forget_server(self, server: McpGatewayServer) -> None:
-        """Retire ``server``, the one a call just used, so the next call
-        reads the catalog again; one another call already replaced stays."""
-        async with self._server_lock:
-            self._catalog_stale = True
-            if self._server is server:
-                self._server = None
-                self._retired.append(server)
+    async def _retire(self, server: McpGatewayServer | None) -> None:
+        """Close a client the catalog replaced, now or when its last call ends."""
+        if server is None:
+            return
+        if self._inflight.get(server):
+            self._retired.add(server)
+        else:
+            await server.close()
+
+    async def _release(self, server: McpGatewayServer) -> None:
+        """A call on ``server`` ended: close it if it was retired and idle."""
+        count = self._inflight.get(server, 1) - 1
+        if count > 0:
+            self._inflight[server] = count
+            return
+        self._inflight.pop(server, None)
+        if server in self._retired:
+            self._retired.discard(server)
+            await server.close()
 
     def _open_breaker(self, reason: str) -> None:
         self._breaker_failures += 1
@@ -644,20 +668,23 @@ class LoomMemory:
         attempts = _MAX_ATTEMPTS if op in _RETRIED_OPS else 1
         for attempt in range(1, attempts + 1):
             server = await self._loom_server()
+            self._inflight[server] = self._inflight.get(server, 0) + 1
             try:
                 result = await server.call_tool(name, call_args, timeout=timeout)
             except GatewayCallError as e:
                 failure = self._gateway_failure(op, e)
                 no_answer = e.status is None and e.code is None
-                if no_answer and (not e.timed_out or op in _RETRIED_OPS):
-                    # The gateway was not reached, or a read got no answer
-                    # in time: do not make the next caller wait too. A slow
-                    # extraction says nothing about the reads.
+                if no_answer:
+                    # The gateway was not reached, or did not answer in
+                    # time: a read gives up long before the gateway's own
+                    # call limit, and extraction a little after it, so the
+                    # gateway itself is not answering. Do not make the next
+                    # caller wait too.
                     self._open_breaker(str(e))
                 if e.code == POLICY_REFUSED or e.status == 404:
                     # Loom left the agent's catalog, or the policy changed:
                     # the next call reads the catalog again.
-                    await self._forget_server(server)
+                    self._catalog_stale = True
                 retry = op in _RETRIED_OPS and attempt < attempts and e.retryable and not no_answer
                 wait = e.retry_after
                 if retry and wait is not None and wait <= _RETRY_AFTER_WAIT_S:
@@ -669,6 +696,8 @@ class LoomMemory:
                     raise failure from None
                 await asyncio.sleep(self._backoff_s * attempt)
                 continue
+            finally:
+                await self._release(server)
             self._breaker_failures = 0
             self._down_until = 0.0
             if result.is_error:

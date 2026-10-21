@@ -114,6 +114,8 @@ class FakeGateway:
         self.org, self.namespace = ORG, HOME
         self.queued: list[dict] = []
         self.search_memory: dict | None = None
+        # Where the catalog says Loom is served.
+        self.loom_path = "/s/loom/mcp"
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -135,9 +137,10 @@ class FakeGateway:
             if self.catalog_status != 200:
                 return httpx.Response(self.catalog_status, json={"reason": "catalog_unavailable"})
             return httpx.Response(200, json={"revision": "sha256:catalog", "servers": [
-                {"id": s, "url": f"/s/{s}/mcp", "revision": f"sha256:{s}"} for s in sorted(self.servers)
+                {"id": s, "url": self.loom_path if s == "loom" else f"/s/{s}/mcp", "revision": f"sha256:{s}"}
+                for s in sorted(self.servers)
             ]})
-        if request.url.path != "/s/loom/mcp" or request.method != "POST":
+        if request.url.path != self.loom_path or request.method != "POST":
             return httpx.Response(404, json={"reason": "not_found"})
         assert request.headers["MCP-Protocol-Version"] == "2025-06-18"
         assert request.headers["Content-Type"] == "application/json"
@@ -357,6 +360,61 @@ async def test_a_policy_refusal_is_an_outage_and_forgets_the_server(make_memory)
 
 
 @pytest.mark.asyncio
+async def test_policy_refusals_keep_one_client(make_memory, monkeypatch) -> None:
+    """The gateway answers -32001 while the agent's Loom credential is not
+    set yet: every refusal makes the catalog be read again, but the client
+    for Loom's URL stays the one client."""
+    from nerve.memory import loom as loom_module
+
+    created = []
+
+    class Recording(McpGatewayServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(loom_module, "McpGatewayServer", Recording)
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    for _ in range(10):
+        gateway.fail("loom_context_pack", rpc_error(-32001, "no credential set for this MCP server"))
+        gateway.fail("loom_search", rpc_error(-32001, "no credential set for this MCP server"))
+        with pytest.raises(MemoryBackendUnavailable, match="no credential set"):
+            await memory.startup_recall("anything")
+        memory._catalog_read_at = 0.0  # 30 seconds on: the catalog is read again
+    assert gateway.catalog_reads >= 10
+    assert len(created) == 1 and created[0] is memory._server and created[0]._client is not None
+    assert memory._retired == set() and memory._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_a_moved_loom_url_replaces_the_client_and_closes_the_old_one(make_memory) -> None:
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    assert await memory.startup_recall("anything") == []
+    old = memory._server
+    gateway.loom_path = "/s/loom-v2/mcp"  # the old URL answers 404 now
+    with pytest.raises(MemoryBackendUnavailable):
+        await memory.startup_recall("anything")
+    memory._catalog_read_at = 0.0
+    assert await memory.startup_recall("anything") == []
+    assert memory._server is not old and memory._server.url.endswith("/s/loom-v2/mcp")
+    assert old._client is None  # closed: no call was using it
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_client_is_closed_when_its_last_call_ends(make_memory) -> None:
+    memory = await make_memory(FakeGateway())
+    assert await memory.startup_recall("anything") == []
+    old = memory._server
+    memory._inflight[old] = 1  # a call still uses it
+    await memory._retire(old)
+    assert old in memory._retired and old._client is not None
+    await memory._release(old)
+    assert old not in memory._retired and old._client is None
+
+
+@pytest.mark.asyncio
 async def test_a_refused_pack_tool_falls_back_to_the_search(make_memory) -> None:
     """The gateway's policy may leave out loom_context_pack and keep
     loom_search: the startup recall still gets its priors."""
@@ -436,14 +494,18 @@ async def test_the_startup_read_has_five_seconds(make_memory, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_a_slow_extraction_leaves_the_reads_alone(make_memory) -> None:
+async def test_an_extraction_the_gateway_does_not_answer_opens_the_breaker(make_memory) -> None:
+    """Nerve waits past the gateway's own call limit for an extraction: no
+    answer by then means the gateway is stuck, so later calls (the rest of
+    the sweep, session starts) fail at once instead of waiting too."""
     gateway = FakeGateway()
     memory = await make_memory(gateway)
     gateway.fail("loom_memory_set_from_messages", httpx.ReadTimeout("slow"))
     with pytest.raises(MemoryBackendUnavailable, match="did not answer"):
         await memory.memorize_conversation("s", _messages(3, datetime.now(UTC)))
-    assert memory._down_until == 0.0  # no breaker: Loom answered nothing about reads
-    assert await memory.startup_recall("anything") == []
+    with pytest.raises(MemoryBackendUnavailable, match="not retried for another"):
+        await memory.startup_recall("anything")
+    assert len(gateway.calls) == 1
 
 
 @pytest.mark.asyncio
