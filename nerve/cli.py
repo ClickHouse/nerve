@@ -226,18 +226,29 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--serve-next", is_flag=True, hidden=True,
     help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
 )
+@click.option(
+    "--memory-backend", type=click.Choice(["memu", "loom"], case_sensitive=False), default=None,
+    help=(
+        "Word the workspace templates, bundled skills and built-in jobs for this memory "
+        "backend (default: what an existing configuration names, else memu). It does not "
+        "set memory.backend itself"
+    ),
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool, serve_next: bool = False,
+    keep_env: bool, serve_next: bool = False, memory_backend: str | None = None,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
     The default asks only what the browser cannot decide (deployment, paths,
     port), starts Nerve and prints the setup page and token. ``--terminal``
     asks everything here instead; ``--non-interactive`` reads the environment.
+    ``--memory-backend`` is init-only: a platform that switches the instance
+    to Loom afterwards (``memory.backend: loom``) passes ``loom`` so the files
+    written now name Loom's memory tools.
     """
     from nerve.bootstrap import SetupWizard, is_fresh_install, run_non_interactive
 
@@ -252,7 +263,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
-            system_principal=not serve_next,
+            system_principal=not serve_next, memory_backend=memory_backend,
         )
         return
 
@@ -272,9 +283,9 @@ def init(
 
     wizard = None
     if non_interactive:
-        choices = run_non_interactive(config_dir)
+        choices = run_non_interactive(config_dir, memory_backend=memory_backend)
     else:
-        wizard = SetupWizard(config_dir, inside_docker=inside_docker)
+        wizard = SetupWizard(config_dir, inside_docker=inside_docker, memory_backend=memory_backend)
         choices = wizard.run()
 
     # Remember where the config lives so every future `nerve` command
@@ -744,6 +755,7 @@ def _slim_init(
     yes: bool,
     keep_env: bool = False,
     system_principal: bool = True,
+    memory_backend: str | None = None,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -756,6 +768,7 @@ def _slim_init(
     flags = SlimFlags(
         deployment=deployment, workspace=workspace, port=port, bind=bind,
         yes=yes, start=start, browser=browser, clipboard=clipboard,
+        memory_backend=memory_backend,
     )
     with _quiet_console(paths.log_file()):
         result = SlimSetup(config_dir, flags).run()

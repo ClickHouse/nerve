@@ -362,7 +362,7 @@ class TestOtherPathsAreUntouched:
         ran = []
 
         class StubWizard:
-            def __init__(self, cfg_dir, inside_docker=False):
+            def __init__(self, cfg_dir, inside_docker=False, memory_backend=None):
                 self.config_dir = cfg_dir
 
             def run(self):
@@ -763,3 +763,82 @@ class TestHelpers:
         assert bootstrap._build_dockerfile() == bootstrap._DOCKERFILE_TEMPLATE
         assert '"8900:8900"' in bootstrap._build_docker_compose("~/ws")
         assert "127.0.0.1:" not in bootstrap._build_docker_compose("~/ws")
+
+
+class TestMemoryBackendFlag:
+    """``nerve init --memory-backend loom``: a platform that switches the
+    instance to Loom after its first init (the switch itself goes into
+    config.local.yaml) gets init-time files worded for Loom's tools."""
+
+    def test_the_flag_is_listed_in_the_help(self):
+        result = CliRunner().invoke(cli.main, ["init", "--help"])
+        assert "--memory-backend [memu|loom]" in result.output
+
+    def test_the_slim_path_words_the_bundled_skill_for_loom(self, tmp_path, no_daemon):
+        for backend, word in (("loom", "`loom_search`"), (None, "`memory_recall`")):
+            config_dir, ws = tmp_path / f"config-{backend}", tmp_path / f"ws-{backend}"
+            flags = ["--memory-backend", backend] if backend else []
+            result = _init(config_dir, "--workspace", str(ws), "--port", "8977", "--no-start", *_FLAGS, *flags)
+            assert result.exit_code == 0, result.output
+            skill = (ws / "skills" / "nerve-dev" / "SKILL.md").read_text(encoding="utf-8")
+            assert word in skill, backend
+            # The flag words files; it does not switch the backend.
+            assert load_config(config_dir).memory.backend == "memu"
+
+    def test_the_non_interactive_path_words_templates_and_jobs_for_loom(self, tmp_path, no_daemon, monkeypatch):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        monkeypatch.setattr(bootstrap.SetupWizard, "_build_web_ui", lambda self: None)
+        monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
+        ws = tmp_path / "ws"
+        result = _init(
+            config_dir, "--non-interactive", "--memory-backend", "loom",
+            env={"ANTHROPIC_API_KEY": "sk-ant-REPLACE", "NERVE_WORKSPACE": str(ws),
+                 "NERVE_PASSWORD": "x", "NERVE_TIMEZONE": "UTC"},
+        )
+        assert result.exit_code == 0, result.output
+        assert "`loom_memory_set`" in (ws / "AGENTS.md").read_text(encoding="utf-8")
+        assert "`loom_search`" in (ws / "skills" / "nerve-dev" / "SKILL.md").read_text(encoding="utf-8")
+        jobs = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text(encoding="utf-8"))["jobs"]
+        maintenance = next(job for job in jobs if job["id"] == "memory-maintenance")
+        assert "loom_namespace_validate" in maintenance["prompt"]
+
+    def test_the_terminal_path_hands_the_flag_to_the_wizard(self, tmp_path, no_daemon, monkeypatch):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        ws = tmp_path / "ws"
+        seen = []
+
+        class StubWizard:
+            def __init__(self, cfg_dir, inside_docker=False, memory_backend=None):
+                self.config_dir = cfg_dir
+                seen.append(memory_backend)
+
+            def run(self):
+                (self.config_dir / "config.yaml").write_text(f"workspace: {ws}\n", encoding="utf-8")
+                (self.config_dir / "config.local.yaml").write_text("auth:\n  jwt_secret: x\n", encoding="utf-8")
+                return bootstrap.SetupChoices()
+
+            def checkpoint(self):
+                return True
+
+        monkeypatch.setattr("nerve.bootstrap.SetupWizard", StubWizard)
+        result = _init(config_dir, "--terminal", "--memory-backend", "loom")
+        assert result.exit_code == 0, result.output
+        assert seen == ["loom"]
+
+    def test_the_wizard_words_the_workspace_for_its_flag(self, tmp_path, monkeypatch):
+        """The full wizard's apply step (what --terminal ends in): the flag
+        wins over what an existing configuration names."""
+        monkeypatch.setattr(bootstrap.SetupWizard, "_build_web_ui", lambda self: None)
+        ws = tmp_path / "ws"
+        (ws / "config").mkdir(parents=True)
+        (ws / "config" / "settings.yaml").write_text("memory:\n  backend: memu\n", encoding="utf-8")
+        (tmp_path / "config").mkdir()
+        wizard = bootstrap.SetupWizard(tmp_path / "config", memory_backend="loom")
+        wizard.choices = bootstrap.SetupChoices(
+            workspace_path=ws, anthropic_api_key="sk-ant-REPLACE", password="x", timezone="UTC",
+        )
+        wizard._apply()
+        assert wizard.choices.memory_backend == "loom"
+        assert "`loom_search`" in (ws / "TOOLS.md").read_text(encoding="utf-8")

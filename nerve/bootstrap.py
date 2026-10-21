@@ -50,6 +50,7 @@ from nerve.setup_writer import (
     apply_task_md,
     bedrock_geo_prefix,
     build_config_layers,
+    existing_memory_backend,
     # Re-exported under its old private name: this module has been its import
     # site since the wizard was written, and `nerve init` is not the only
     # caller that expands a workspace path the way the loader does.
@@ -424,8 +425,13 @@ def _ensure_docker_files(
 class SetupWizard:
     """Interactive first-run setup wizard."""
 
-    def __init__(self, config_dir: Path, inside_docker: bool = False):
+    def __init__(
+        self, config_dir: Path, inside_docker: bool = False, memory_backend: str | None = None,
+    ):
         self.config_dir = config_dir
+        # ``nerve init --memory-backend``: the backend the workspace is worded
+        # for; None reads it from an existing configuration.
+        self._memory_backend = memory_backend
         self.choices = SetupChoices()
         self._inside_docker = inside_docker
         self._step_counter = 0
@@ -1570,9 +1576,13 @@ class SetupWizard:
     def _apply(self) -> None:
         click.echo()
 
-        # 1. Create workspace from templates (TASK.md is written in step 5)
+        # 1. Create workspace from templates (TASK.md is written in step 5),
+        # worded for the memory backend an existing configuration names.
         click.echo("  Creating workspace...", nl=False)
         ws_path = self._workspace_dir()
+        self.choices.memory_backend = (
+            self._memory_backend or existing_memory_backend(self.config_dir, ws_path)
+        )
         created = initialize_workspace(
             ws_path, self.choices.mode, skip=WRITER_OWNED_TEMPLATES,
             memory_backend=self.choices.memory_backend,
@@ -2097,6 +2107,9 @@ class SlimFlags:
     start: bool = True
     browser: bool | None = None
     clipboard: bool = True
+    # The memory backend the skeleton is worded for (``--memory-backend``);
+    # None reads it from an existing configuration.
+    memory_backend: str | None = None
 
 
 @dataclass
@@ -2451,6 +2464,9 @@ class SlimSetup:
                 self.config_dir, str(self._host_workspace),
                 port=self.choices.gateway_port, bind=self.bind,
             )
+        self.choices.memory_backend = (
+            self.flags.memory_backend or existing_memory_backend(self.config_dir, host_ws)
+        )
         outcome = write_slim_install(
             self.choices, self.config_dir, host_workspace=host_ws if docker else None,
         )
@@ -2499,8 +2515,11 @@ class SlimSetup:
 # --- Non-interactive mode ---
 
 
-def run_non_interactive(config_dir: Path) -> SetupChoices:
-    """Non-interactive setup using environment variables. For Docker."""
+def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) -> SetupChoices:
+    """Non-interactive setup using environment variables. For Docker.
+
+    ``memory_backend`` (``nerve init --memory-backend``) words the workspace
+    for that memory backend."""
     choices = SetupChoices()
 
     # Provider detection — check before API key requirements.
@@ -2625,7 +2644,7 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
     if choices.mode == "worker":
         choices.task_description = os.environ.get("NERVE_TASK", "")
 
-    wizard = SetupWizard(config_dir, inside_docker=is_docker)
+    wizard = SetupWizard(config_dir, inside_docker=is_docker, memory_backend=memory_backend)
     wizard.choices = choices
 
     click.echo("Running non-interactive setup...")

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 import os
 import secrets
 import shutil
@@ -1241,6 +1242,52 @@ def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
 
         return loom_prompts.MAINTENANCE_DESCRIPTION
     return cron["description"]
+
+
+def loom_wording_of_shipped_job(
+    job_id: str, prompt: str, description: str,
+) -> tuple[str, str] | None:
+    """The Loom prompt and description of a built-in job whose prompt is the
+    one Nerve writes for memU, as a ``system.yaml`` written before
+    ``memory.backend`` became ``loom`` holds it; None for an edited prompt or
+    a job with no Loom wording. Run under memU's prompt, ``memory-maintenance``
+    would prune memories through Loom's tools."""
+    shipped = next((c for c in (*CORE_CRONS, *PRODUCTIVITY_CRONS) if c["id"] == job_id), None)
+    if shipped is None or prompt.strip() != shipped["prompt"].strip():
+        return None
+    loom_prompt = _cron_prompt(shipped, "loom")
+    if loom_prompt == shipped["prompt"]:
+        return None
+    if description.strip() == str(shipped["description"]).strip():
+        description = _cron_description(shipped, "loom")
+    return loom_prompt, description
+
+
+def existing_memory_backend(config_dir: Path, workspace: Path | None = None) -> str:
+    """The ``memory.backend`` an existing configuration names, else ``memu``:
+    what ``nerve init`` words the templates, skills and jobs for when no
+    ``--memory-backend`` says (that flag wins: a platform that switches the
+    instance after its first ``nerve init`` passes it). Read from the
+    configuration when one loads, else from the workspace's
+    ``config/settings.yaml`` alone."""
+    from nerve.config import MEMORY_BACKENDS, load_config
+
+    try:
+        if (Path(config_dir) / "config.yaml").exists():
+            backend = load_config(Path(config_dir)).memory.backend
+            return backend if backend in MEMORY_BACKENDS else "memu"
+    except Exception as e:  # noqa: BLE001 — setup goes on with the default
+        logging.getLogger(__name__).warning("Could not read memory.backend from %s: %s", config_dir, e)
+    if workspace is not None:
+        try:
+            raw = yaml.safe_load(workspace_settings_file(Path(workspace)).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            raw = None
+        memory = raw.get("memory") if isinstance(raw, dict) else None
+        backend = str(memory.get("backend") or "").strip().lower() if isinstance(memory, dict) else ""
+        if backend in MEMORY_BACKENDS:
+            return backend
+    return "memu"
 
 
 def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:

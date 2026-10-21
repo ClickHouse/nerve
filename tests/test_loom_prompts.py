@@ -244,3 +244,43 @@ def test_the_mode_step_writes_loom_wording_under_loom(tmp_path: Path) -> None:
     jobs = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text(encoding="utf-8"))["jobs"]
     maintenance = next(job for job in jobs if job["id"] == "memory-maintenance")
     assert maintenance["prompt"] == loom_prompts.MAINTENANCE_PROMPT
+
+
+def test_a_system_yaml_from_before_the_switch_runs_in_loom_wording() -> None:
+    """memory-maintenance written for memU would prune memories through
+    Loom's tools: under Loom, the shipped memU prompt runs as its Loom
+    wording; an edited one is left alone."""
+    from nerve.cron.jobs import CronJob
+    from nerve.cron.service import _reword_for_loom
+    from nerve.setup_writer import loom_wording_of_shipped_job
+
+    memu = _jobs("memu")
+    jobs = [
+        CronJob(id=job_id, schedule=job["schedule"], prompt=job["prompt"], description=job["description"])
+        for job_id, job in memu.items()
+    ]
+    jobs.append(CronJob(id="memory-maintenance-edited", schedule="0 5 * * *", prompt="Tidy up."))
+    edited = CronJob(id="memory-maintenance", schedule="0 5 * * *", prompt="My own tidy-up.")
+    _reword_for_loom([*jobs, edited])
+    by_id = {job.id: job for job in jobs}
+    assert by_id["memory-maintenance"].prompt == loom_prompts.MAINTENANCE_PROMPT
+    assert by_id["memory-maintenance"].description == loom_prompts.MAINTENANCE_DESCRIPTION
+    assert "loom_memory_set" in by_id["inbox-processor"].prompt
+    assert by_id["task-planner"].prompt == memu["task-planner"]["prompt"]
+    assert edited.prompt == "My own tidy-up."
+    assert loom_wording_of_shipped_job("memory-maintenance", "Tidy up.", "") is None
+
+
+def test_nerve_init_words_the_workspace_for_the_configured_backend(tmp_path: Path) -> None:
+    from nerve.setup_writer import existing_memory_backend
+
+    config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
+    assert existing_memory_backend(config_dir, workspace) == "memu"
+    (workspace / "config").mkdir(parents=True)
+    (workspace / "config" / "settings.yaml").write_text("memory:\n  backend: Loom\n", encoding="utf-8")
+    assert existing_memory_backend(config_dir, workspace) == "loom"  # written before nerve init
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text(f"workspace: {workspace}\n", encoding="utf-8")
+    assert existing_memory_backend(config_dir, None) == "loom"  # through the configuration
+    (workspace / "config" / "settings.yaml").write_text("memory:\n  backend: memu\n", encoding="utf-8")
+    assert existing_memory_backend(config_dir, workspace) == "memu"
