@@ -20,11 +20,14 @@ import pytest_asyncio
 from nerve.agent.sessions import SessionManager
 from nerve.db import Database
 
+from tests.actor_rows import ensure_actor_row
+from tests.conftest import TEST_ACTOR
+
 
 @pytest.mark.asyncio
 class TestSessionParentPatch:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database):
+    async def setup(self, db: Database, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -34,8 +37,9 @@ class TestSessionParentPatch:
         from nerve.gateway.routes.sessions import router as sessions_router
 
         cfg = NerveConfig()
-        cfg.auth.jwt_secret = ""      # require_auth becomes a no-op
         cfg_mod._config = cfg
+        # The routes record the signed-in actor on session events.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         sm = SessionManager(db)
         engine = SimpleNamespace(
@@ -47,6 +51,7 @@ class TestSessionParentPatch:
 
         app = FastAPI()
         app.include_router(sessions_router)
+        bypass_auth(app)  # these routes are not about auth
         yield SimpleNamespace(client=TestClient(app), db=db, sm=sm, cfg=cfg)
 
         cfg_mod._config = None
@@ -55,7 +60,7 @@ class TestSessionParentPatch:
         """Create a web session. By default move it out of 'created' so it is
         nestable — mirrors any session that has run at least once (the only
         kind the sidebar exposes as a stable, draggable row)."""
-        await setup.sm.get_or_create(sid, source="web")
+        await setup.sm.get_or_create(sid, source="web", actor=None)
         if started:
             await setup.db.update_session_fields(sid, {"status": "idle"})
 

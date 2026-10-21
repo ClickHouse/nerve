@@ -225,6 +225,8 @@ async def review_loop_start_handler(ctx: ToolContext, args: dict) -> ToolResult:
             implementer=_leg("implementer"),
             verifier_leg=_leg("verifier"),
             created_by=f"mcp:{ctx.session_id}",
+            # The system actor, for the calling session's cause.
+            attribution=ctx.attribution,
         )
     except ReviewLoopError as e:
         return ToolResult.text(str(e), is_error=True)
@@ -286,6 +288,7 @@ async def review_loop_kill_handler(ctx: ToolContext, args: dict) -> ToolResult:
             str(args.get("loop_id") or ""),
             reason=str(args.get("reason") or ""),
             killed_by=f"session:{ctx.session_id}",
+            attribution=ctx.attribution,
         )
     except ReviewLoopError as e:
         return ToolResult.text(str(e), is_error=True)

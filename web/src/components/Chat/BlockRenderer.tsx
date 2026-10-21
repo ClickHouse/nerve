@@ -1,12 +1,14 @@
 import { useMemo } from 'react';
-import { Download, FileText, Clock, RefreshCw, TrendingDown, TrendingUp } from '../ui/icons';
+import { Download, FileText, Clock, TrendingDown, TrendingUp } from '../ui/icons';
 import type { MessageBlock } from '../../types/chat';
+import { AutoTurnDivider } from './agents/AutoTurnDivider';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
-import { getToken } from '../../api/client';
+import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
+import { authUrl } from '../../api/hosted';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -25,6 +27,7 @@ export function BlockRenderer({
   textClassName,
 }: BlockRendererProps) {
   const renderItems = useMemo(() => groupToolCalls(blocks), [blocks]);
+  const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
 
   return (
     <>
@@ -44,16 +47,7 @@ export function BlockRenderer({
               </div>
             );
           case 'auto':
-            return (
-              <div key={i} className="flex items-center gap-1.5 my-1.5 text-xs text-text-muted">
-                <span className="h-px flex-1 bg-border" />
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-surface">
-                  <RefreshCw size={11} />
-                  Background continuation
-                </span>
-                <span className="h-px flex-1 bg-border" />
-              </div>
-            );
+            return <AutoTurnDivider key={i} block={item} />;
           case 'model_change':
             // The API switched the model serving this session — amber when
             // it moved away from the configured model (downgrade), muted
@@ -83,9 +77,9 @@ export function BlockRenderer({
           case 'thinking':
             return <ThinkingBlock key={i} content={item.content} streaming={isLast} />;
           case 'tool_call':
-            return <ToolCallBlock key={i} block={item} />;
+            return <ToolCallBlock key={i} block={item} repeatRunCard={repeatRunCalls.has(item.toolUseId)} />;
           case 'tool_call_group':
-            return <ToolCallGroupBlock key={i} group={item} />;
+            return <ToolCallGroupBlock key={i} group={item} repeatRunCalls={repeatRunCalls} />;
           case 'text': {
             const inner = (
               <>
@@ -104,7 +98,7 @@ export function BlockRenderer({
             );
           }
           case 'image': {
-            const imgUrl = `${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`;
+            const imgUrl = authUrl(item.url);
             return (
               <div key={i} className="my-2">
                 <a href={imgUrl} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
@@ -117,7 +111,7 @@ export function BlockRenderer({
             return (
               <div key={i} className="my-2">
                 <a
-                  href={`${item.url}${item.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                  href={authUrl(item.url)}
                   download={item.filename}
                   className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
                 >

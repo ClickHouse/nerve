@@ -80,8 +80,13 @@ class SessionSpec:
     snapshot: SnapshotFn | None = None
     record_wakeup: WakeupFn | None = None
     cache_ttl: str = "5m"
-    max_turns: int = 100
+    max_turns: int = 1000            # 0 = no cap
     idle_timeout: float = 900.0
+    # Principal ID that each model request of the client names, for a proxy
+    # in front of the model API (nerve.inference_principal): the session's
+    # cause in external mode. None: no principal. A backend that cannot send
+    # it ignores it.
+    inference_principal: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -94,6 +99,11 @@ class BackendCapabilities:
     supports_cache_ttl: bool = True
     interactive_builtins: bool = True
     reports_context_window: bool = False
+    # One background task (sub-agent, shell, workflow) can be stopped on its
+    # own (AgentClient.stop_task).
+    supports_task_stop: bool = False
+    # Sub-agents stream their own transcript (sidechain events) to the host.
+    supports_agent_transcripts: bool = False
 
 
 @runtime_checkable
@@ -122,7 +132,34 @@ class AgentClient(Protocol):
         """
         ...
 
-    async def interrupt(self) -> None: ...
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        """End the current turn.
+
+        ``cancel_queued`` also drops what the runtime queued for later
+        turns (Claude: queued task notifications, so stop-all leaves nothing
+        to wake the orchestrator). Backends without such a queue ignore it.
+        """
+        ...
+
+    async def stop_task(self, task_id: str) -> None:
+        """Stop one background task (sub-agent, shell, workflow) of the
+        runtime without touching the turn. The default: unsupported."""
+        raise BackendError("stop_task unsupported")
+
+    @property
+    def supports_task_stop(self) -> bool:
+        """Whether :meth:`stop_task` works on this client."""
+        return False
+
+    @property
+    def interrupt_spares_background(self) -> bool:
+        """Whether :meth:`interrupt` leaves background agents running.
+
+        ``False`` unless the backend proved it (Claude: the CLI got the
+        per-task stop affordance at its first initialize). Stop asks before
+        it would end background agents when this is ``False``.
+        """
+        return False
 
     async def disconnect(self) -> None:
         """Full teardown, owning every process/transport internal."""
@@ -150,7 +187,8 @@ class AgentClient(Protocol):
         ...
 
     def buffer_used(self) -> int:
-        """Bytes buffered in the native stream (0 when N/A)."""
+        """Messages buffered in the native stream (a count, not bytes; 0
+        when N/A)."""
         ...
 
 
@@ -183,9 +221,30 @@ class AgentBackend(Protocol):
         ...
 
     def excluded_tools(self) -> set[str]:
-        """Nerve-registry tool names NOT to expose for this backend."""
+        """Nerve-registry tool names NOT to expose for this backend.
+
+        Union the runtime's own exclusions with
+        :func:`config_excluded_tools`, which every backend shares.
+        """
         ...
 
     async def validate_model(self, model: str) -> None:
         """Raise :class:`BackendError` when *model* cannot be served."""
         ...
+
+
+def config_excluded_tools(config: Any) -> set[str]:
+    """Registry tools the configuration leaves nothing to serve.
+
+    Separate from a backend's own exclusions, which turn on the runtime
+    rather than the config. Read per session, so a reload takes effect
+    without a restart.
+
+    A tool that is offered but can only refuse costs a turn to find that
+    out. ``send_channel_message`` is the case: outbound is off by default,
+    and with it off no destination is reachable.
+    """
+    excluded: set[str] = set()
+    if not config.outbound_channels:
+        excluded.add("send_channel_message")
+    return excluded

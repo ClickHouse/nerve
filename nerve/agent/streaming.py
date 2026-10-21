@@ -82,12 +82,20 @@ class StreamBroadcaster:
                 if not self._listeners[session_id]:
                     del self._listeners[session_id]
 
-    async def broadcast(self, session_id: str, message: dict[str, Any], exclude: str | None = None) -> None:
+    async def broadcast(
+        self, session_id: str, message: dict[str, Any],
+        exclude: str | None = None, *, buffer: bool = True,
+    ) -> None:
         """Send a message to all listeners of a session. Also buffers if active.
 
         ``exclude`` skips the listener with that callback id — used to echo an
         event to every client except the one that originated it (and already
         rendered it optimistically).
+
+        ``buffer=False`` keeps the message out of the turn replay buffer:
+        state snapshots (agent roster, queue) that a reconnecting client gets
+        from ``session_status`` instead, and that would only crowd the turn's
+        events out of the bounded buffer.
         """
         # Terminal events close the open-turn flag so the engine's
         # backstop in run() knows no synthetic "done" is needed.
@@ -95,7 +103,7 @@ class StreamBroadcaster:
             self._open_turns.discard(session_id)
 
         # Buffer events during active streaming
-        if session_id in self._session_buffers:
+        if buffer and session_id in self._session_buffers:
             buf = self._session_buffers[session_id]
             buf.append(message)
             # Enforce buffer limit — drop oldest events
@@ -112,6 +120,12 @@ class StreamBroadcaster:
                 await callback(session_id, message)
             except Exception as e:
                 logger.warning("Broadcast to %s failed: %s", callback_id, e)
+
+    def has_listeners(self, channel: str) -> bool:
+        """Whether any listener is registered on ``channel`` (a session id,
+        ``__global__``, or a per-agent channel). Lets producers skip building
+        messages nobody would receive."""
+        return bool(self._listeners.get(channel))
 
     # --- Turn tracking (engine backstop) ---
 
@@ -263,38 +277,6 @@ class StreamBroadcaster:
             "interaction_type": interaction_type,
             "tool_name": tool_name,
             "tool_input": tool_input,
-        })
-
-    async def broadcast_subagent_start(
-        self,
-        session_id: str,
-        tool_use_id: str,
-        subagent_type: str,
-        description: str,
-        model: str | None = None,
-    ) -> None:
-        await self.broadcast(session_id, {
-            "type": "subagent_start",
-            "session_id": session_id,
-            "tool_use_id": tool_use_id,
-            "subagent_type": subagent_type,
-            "description": description,
-            "model": model,
-        })
-
-    async def broadcast_subagent_complete(
-        self,
-        session_id: str,
-        tool_use_id: str,
-        duration_ms: int,
-        is_error: bool = False,
-    ) -> None:
-        await self.broadcast(session_id, {
-            "type": "subagent_complete",
-            "session_id": session_id,
-            "tool_use_id": tool_use_id,
-            "duration_ms": duration_ms,
-            "is_error": is_error,
         })
 
     async def broadcast_workflow_progress(

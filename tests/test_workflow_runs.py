@@ -17,6 +17,7 @@ synchronized by awaiting the tasks the service tracks in ``_exec_tasks``
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.agent.tools.handlers.workflow_runs import (
     workflow_run_kill_handler,
     workflow_run_list_handler,
@@ -34,12 +36,28 @@ from nerve.agent.tools.handlers.workflow_runs import (
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig
 from nerve.db.usage import estimate_turn_cost
+from nerve.identity import Actor, attribution_for
 from nerve.workflows.service import (
     ENGINE_CLAUDE,
     ENGINE_CODEX,
     WorkflowRunError,
     WorkflowRunService,
 )
+
+from tests.actor_rows import ensure_actor_row, ensure_system_principal
+
+# The person who started the seeded runs (synthetic).
+_RUN_STARTER = Actor(
+    actor_id="00000000-0000-4000-8000-0000000a11ce", kind="human",
+    display_name="Alice",
+)
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 # --------------------------------------------------------------------------- #
 #  Helpers                                                                     #
@@ -75,7 +93,7 @@ def _make_engine(db) -> MagicMock:
             source=kwargs.get("source", "web"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
         return {"id": session_id}
 
@@ -89,6 +107,7 @@ def _make_engine(db) -> MagicMock:
     engine.has_live_background_tasks = MagicMock(return_value=False)
     engine.get_codex_ultracode_run_ids = MagicMock(return_value=None)
     engine.add_stop_listener = MagicMock()
+    engine.watch_turns = lambda sid: contextlib.nullcontext(TurnWatch(TurnOutcome()))
     engine.notification_service = MagicMock()
     engine.notification_service.send_notification = AsyncMock()
     return engine
@@ -134,7 +153,7 @@ async def test_background_run_result_taken_from_final_auto_turn(db, engine, serv
     while await db.get_session(session_id) is None:
         assert time.monotonic() < deadline, "leg session never appeared"
         await asyncio.sleep(0.01)
-    await db.add_message(session_id, "assistant", "FINAL: the real verdict")
+    await db.add_message(session_id, "assistant", "FINAL: the real verdict", actor=None)
     await _drain(service, timeout=20)
     fresh = await db.get_workflow_run(run["id"])
     assert fresh["status"] == "done"
@@ -144,11 +163,23 @@ async def test_background_run_result_taken_from_final_auto_turn(db, engine, serv
 
 
 async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUDE) -> str:
-    """Insert a running run wired to a real session row; returns session id."""
+    """Insert a running run wired to a real session row; returns session id.
+
+    A person started the run, so the run's cause is that person, and the
+    session is created as ``_execute`` creates it: by the system actor, with
+    the run's cause.
+    """
     session_id = f"workflow:{run_id}"
-    await db.create_workflow_run(run_id, engine_kind, {"prompt": "p"}, budget)
+    await ensure_actor_row(db, _RUN_STARTER)
+    await db.create_workflow_run(
+        run_id, engine_kind, {"prompt": "p"}, budget,
+        attribution=attribution_for(_RUN_STARTER),
+    )
     await db.transition_workflow_run(run_id, "running", expect=("pending",))
-    await db.create_session(session_id, source="workflow")
+    await db.create_session(
+        session_id, source="workflow", actor=db.system_actor,
+        cause=_RUN_STARTER.actor_id,
+    )
     await db.update_workflow_run(run_id, {"session_id": session_id})
     return session_id
 
@@ -309,7 +340,7 @@ class TestWorkflowRunStore:
 
 @pytest.mark.asyncio
 async def test_get_session_effective_cost_billed_plus_estimate_fallback(db):
-    await db.create_session("workflow:wfr-cost", source="workflow")
+    await db.create_session("workflow:wfr-cost", source="workflow", actor=None)
     # Billed turn: cost_usd wins even when an estimate is present.
     await db.record_turn_usage(
         "workflow:wfr-cost", 100, 50, 0, 0, 200000,
@@ -458,7 +489,7 @@ class TestExecute:
     async def test_leg_is_nested_and_named_after_origin_session(self, service, db, engine):
         """The leg nests under the session the run was started from AND is
         titled ``[<origin title>] <slug>`` so the sidebar shows the lineage."""
-        await db.create_session("human-1", source="web", title="Azure 403")
+        await db.create_session("human-1", source="web", title="Azure 403", actor=None)
         run = await service.start_run(
             ENGINE_CLAUDE, {"prompt": "p"}, 5.0, title="fix the thing",
             created_by="session:human-1",
@@ -482,7 +513,7 @@ class TestExecute:
     async def test_origin_session_id_resolves_every_created_by_shape(self, service, db):
         """created_by → origin session: direct (session:/mcp:), review-loop leg
         (→ observer), and None for non-session/dangling origins."""
-        await db.create_session("s1", source="web")
+        await db.create_session("s1", source="web", actor=None)
         await db.create_review_loop(
             "rvl-orig", title="t", session_id="s1", goal_prompt="g",
             verifier_prompt="v", criteria_adoption="no", criteria=[],
@@ -566,7 +597,11 @@ class TestKillRun:
         assert "user request" in out["error"]
 
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            # Nerve's stop, for the session's cause: the run's starter.
+            session_id,
+            attribution=attribution_for(db.system_actor, _RUN_STARTER.actor_id),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )
@@ -610,7 +645,11 @@ class TestBudgetEnforcement:
         )
         # Enforcement is scoped to the run's own session.
         await asyncio.gather(*list(service._kill_tasks))
-        engine.stop_session.assert_awaited_once_with(session_id)
+        engine.stop_session.assert_awaited_once_with(
+            # Nerve's stop, for the session's cause: the run's starter.
+            session_id,
+            attribution=attribution_for(db.system_actor, _RUN_STARTER.actor_id),
+        )
         engine._discard_client.assert_awaited_once_with(
             session_id, background_memorize=True,
         )
@@ -765,7 +804,7 @@ class TestWorkflowRunTools:
     async def test_external_session_rejected_for_start_and_kill_only(
         self, tool_service, db, engine,
     ):
-        await db.create_session("ext-1", source="external")
+        await db.create_session("ext-1", source="external", actor=None)
         ctx = _ctx(db, engine, session_id="ext-1")
 
         start = await workflow_run_start_handler(ctx, {
@@ -968,7 +1007,7 @@ class TestReviewRegressions:
 
         service = WorkflowRunService(_make_config(tmp_path), db, engine)
         monkeypatch.setattr(workflows_mod, "_service", service)
-        await db.create_session("workflow:wfr-parent01", source="workflow")
+        await db.create_session("workflow:wfr-parent01", source="workflow", actor=None)
         ctx = ToolContext(session_id="workflow:wfr-parent01", db=db, engine=engine)
 
         start = await workflow_run_start_handler(ctx, {

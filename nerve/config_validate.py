@@ -105,6 +105,13 @@ def validate_config_bundle(
         if layer is not None and p.exists()
     ]
     base, local = layers[0] or {}, layers[1] or {}
+    # Same per-layer ``auth`` check as _read_config_sources, before the merge,
+    # so a broken tracked section is reported even if a machine layer covers it.
+    for layer, where in ((base, "config.yaml"), (local, "config.local.yaml")):
+        try:
+            cfg._normalise_layer_auth(layer, where)
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
     machine = cfg._deep_merge(base, local)
 
     # An environment anchor forces lockdown regardless of the files, so a run in
@@ -141,6 +148,11 @@ def validate_config_bundle(
         workspace = cfg._expand_path(ws_raw) or cfg.paths.default_workspace()
 
     ws_settings = _read_workspace_settings(workspace, result)
+    if isinstance(ws_settings, dict):
+        try:
+            cfg._normalise_layer_auth(ws_settings, "workspace/config/settings.yaml")
+        except cfg.ConfigError as e:
+            result.errors.append(str(e))
     # Mirror _read_config_sources: when the tracked settings lock the instance,
     # validate the LOCKED view (workspace-only), since that's what production runs.
     # An unreadable flag is refused rather than assumed, exactly as at load time —
@@ -455,6 +467,10 @@ def _is_unresolved(value: Any) -> bool:
 #: tests/test_config_validate.py: a new ``Path`` setting has to be listed here or
 #: exempted there.
 _WORKING_DIR_PATH_KEYS: dict[tuple[str, ...], str] = {
+    ("channels", "hosted", "gateway_jwks_file"): (
+        "hosted channels would try to read a directory as the gateway's public "
+        "key file, so they do not start and every stream upgrade is refused"
+    ),
     ("workspace",): (
         "the entire workspace (settings.yaml, the cron config, memory, "
         "everything nerve syncs) would be read from and written to whatever "

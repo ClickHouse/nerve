@@ -23,10 +23,10 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.db import Database
@@ -37,6 +37,15 @@ from tests.test_notifications_actionable import (
     _MINIMAL_HELPER_SRC,
     read_audit_jsonl,
 )
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 # ----------------------------------------------------------------------
@@ -113,7 +122,7 @@ def _iso(delta_hours: float) -> str:
 
 def _snooze_dispatcher(snooze_until: str):
     """A dispatcher that always answers "snooze until <ts>"."""
-    def dispatch(notification, target_id, decision, config):
+    def dispatch(notification, target_id, decision, config, *, actor):
         return _handlers.DispatchResult(
             ok=True,
             audit_event={
@@ -157,7 +166,7 @@ class TestSchema:
         assert "redelivery_count" in cols
 
         # Old-style insert (no new columns touched) → sane defaults.
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1",
             type="question", title="t",
@@ -165,6 +174,155 @@ class TestSchema:
         notif = await db.get_notification("n1")
         assert notif["redeliver_at"] is None
         assert notif["redelivery_count"] == 0
+
+    async def test_v050_delivery_scope_exists(self, db: Database):
+        async with db.db.execute(
+            "PRAGMA table_info(notification_deliveries)",
+        ) as cur:
+            cols = {row[1] async for row in cur}
+        assert {"notification_id", "channel", "target", "message_id"} <= cols
+
+    async def test_slack_is_a_default_notification_channel(self):
+        # Cards reach nobody unless the transport is in this list, and the
+        # list replaces the default rather than extending it.
+        from nerve.config import NotificationsConfig
+
+        assert NotificationsConfig().channels == ["web", "telegram", "slack"]
+        assert NotificationsConfig.from_dict({}).channels == [
+            "web", "telegram", "slack",
+        ]
+        assert NotificationsConfig.from_dict(
+            {"channels": ["web"]},
+        ).channels == ["web"]
+
+
+@pytest.mark.asyncio
+class TestScopedAnswers:
+    async def test_latest_delivery_can_move_between_targets(
+        self, db: Database,
+    ):
+        await db.create_session("s1", source="external", actor=None)
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0123ABC", message_id="1.0",
+        )
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0456DEF", message_id="2.0",
+        )
+
+        delivery = await db.get_latest_notification_delivery("n1", "slack")
+
+        assert delivery
+        assert delivery["target"] == "C0456DEF"
+        assert delivery["message_id"] == "2.0"
+
+    async def test_latest_question_is_scoped_to_delivery_target(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("wanted-session", source="external", actor=None)
+        await db.create_session("other-session", source="external", actor=None)
+        await db.create_notification(
+            "wanted", "wanted-session", "question", "Wanted question",
+        )
+        await db.record_notification_delivery(
+            "wanted", "telegram", target="100", message_id="1",
+        )
+        await db.create_notification(
+            "newer-other", "other-session", "question", "Other question",
+        )
+        await db.record_notification_delivery(
+            "newer-other", "telegram", target="200", message_id="2",
+        )
+
+        result = await svc.answer_latest_question(
+            "yes", channel="telegram", target="100", actor="42",
+        )
+
+        assert result and result["id"] == "wanted"
+        assert (await db.get_notification("newer-other"))["status"] == "pending"
+        metadata = json.loads(result["metadata"])
+        assert metadata["answered_by_actor"] == "42"
+
+    async def test_explicit_answer_rejects_a_different_delivery_target(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1", source="external", actor=None)
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery("n1", "telegram", target="100")
+
+        result = await svc.answer_delivered_notification(
+            "n1", "yes", channel="telegram", target="200", actor="42",
+        )
+
+        assert result is None
+        assert (await db.get_notification("n1"))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+class TestSlackDeliveryBoundary:
+    async def test_service_records_the_reference_returned_by_the_channel(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        await db.create_session("s1", source="external", actor=None)
+        await db.create_notification("n1", "s1", "question", "Question")
+        channel = MagicMock(is_available=True)
+        channel.post_notification = AsyncMock(
+            return_value=("C0456DEF", "1.0"),
+        )
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        message_id = await service._deliver_slack(
+            "n1", "s1", "question", "Question", "Body", "normal", ["yes"],
+        )
+
+        assert message_id == "1.0"
+        delivery = await db.get_notification_delivery(
+            "n1", "slack", "C0456DEF",
+        )
+        assert delivery and delivery["message_id"] == "1.0"
+        options = channel.post_notification.await_args.args[2]
+        assert options == [("yes", "yes")]
+
+    async def test_quiescing_channel_is_not_used(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        channel = MagicMock(is_available=False)
+        channel.post_notification = AsyncMock()
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        message_id = await service._deliver_slack(
+            "n1", "s1", "notify", "Notice", "Body", "normal", None,
+        )
+
+        assert message_id is None
+        channel.post_notification.assert_not_awaited()
+
+    async def test_expiry_uses_the_latest_recorded_target(
+        self, db: Database, fake_config, fake_engine,
+    ):
+        await db.create_session("s1", source="external", actor=None)
+        await db.create_notification("n1", "s1", "question", "Question")
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0123ABC", message_id="1.0",
+        )
+        await db.record_notification_delivery(
+            "n1", "slack", target="C0456DEF", message_id="2.0",
+        )
+        channel = MagicMock(is_available=True)
+        channel.expire_notification = AsyncMock()
+        fake_engine.router.get_channel.return_value = channel
+        service = NotificationService(fake_config, db, fake_engine)
+
+        await service._edit_slack_expired(await db.get_notification("n1"))
+
+        channel.expire_notification.assert_awaited_once()
+        args = channel.expire_notification.await_args.args
+        assert args[:2] == ("C0456DEF", "2.0")
+        assert args[2].endswith("⏰ Expired unanswered")
 
 
 # ----------------------------------------------------------------------
@@ -182,7 +340,7 @@ class TestSnooze:
         snooze_until = _iso(24)
         _handlers.register("lifecycle-test", _snooze_dispatcher(snooze_until))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db, expiry_hours=2)
 
         ok = await svc.handle_answer(nid, "snooze_24h", "web")
@@ -206,7 +364,7 @@ class TestSnooze:
         assert answered[0]["snooze_until"] == snooze_until
 
     async def test_db_snooze_rejects_non_pending(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1", type="approval", title="t",
         )
@@ -226,7 +384,7 @@ class TestRedelivery:
     ):
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-0.5)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
         await svc.handle_answer(nid, "snooze_24h", "web")
         patch_broadcaster.clear()
@@ -259,7 +417,7 @@ class TestRedelivery:
     ):
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(24)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
         await svc.handle_answer(nid, "snooze_24h", "web")
 
@@ -274,7 +432,7 @@ class TestRedelivery:
         """Snooze is repeatable: each click buys another cycle."""
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-1)))
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
 
         await svc.handle_answer(nid, "snooze_24h", "web")
@@ -298,7 +456,7 @@ class TestRedelivery:
         _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(-1)))
         fake_config.notifications.max_redeliveries = 2
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         nid = await _make_approval(svc, db)
 
         for cycle in range(2):
@@ -343,7 +501,7 @@ class TestRedelivery:
         """Ordering guarantee: redeliver-before-expire means a row whose
         redeliver_at AND expires_at both passed gets its last chance."""
         svc = NotificationService(fake_config, db, fake_engine)
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         await db.create_notification(
             notification_id="n1", session_id="s1", type="approval",
             title="both due", options=["approve", "decline", "snooze_24h"],
@@ -383,7 +541,7 @@ class TestExpiryReporting:
     async def test_expired_question_injected_into_origin_session(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc)
         # The origin session is mid-turn: injection must STILL be
@@ -414,7 +572,7 @@ class TestExpiryReporting:
     async def test_multiple_questions_same_session_single_injection(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await self._expired_question(db, svc, title="first question")
         await self._expired_question(db, svc, title="second question")
@@ -430,7 +588,7 @@ class TestExpiryReporting:
     async def test_external_session_broadcast_only(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("sat-1", source="external")
+        await db.create_session("sat-1", source="external", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc, session_id="sat-1")
 
@@ -447,7 +605,7 @@ class TestExpiryReporting:
     async def test_archived_and_missing_sessions_broadcast_only(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1", status="archived")
+        await db.create_session("s1", status="archived", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await self._expired_question(db, svc, session_id="s1")
         # A question whose session row vanished entirely.
@@ -470,7 +628,7 @@ class TestExpiryReporting:
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
         audit_workspace: Path,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await _make_approval(svc, db)
         await db.update_notification(nid, expires_at=_iso(-1))
@@ -493,7 +651,7 @@ class TestExpiryReporting:
     async def test_notify_kind_expiry_stays_silent(
         self, db: Database, fake_config, fake_engine, patch_broadcaster,
     ):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         await db.create_notification(
             notification_id="fyi-1", session_id="s1",
@@ -522,7 +680,7 @@ class TestExpiryReporting:
         channel._app.bot = bot
         fake_engine.router.get_channel.return_value = channel
 
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc, title="tg question")
         await db.update_notification(
@@ -548,7 +706,7 @@ class TestExpiryReporting:
         channel._app.bot = bot
         fake_engine.router.get_channel.return_value = channel
 
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         svc = NotificationService(fake_config, db, fake_engine)
         nid = await self._expired_question(db, svc)
         await db.update_notification(
@@ -560,3 +718,209 @@ class TestExpiryReporting:
         assert notif["status"] == "expired"
         # HTML attempt + plain-text fallback, both swallowed.
         assert bot.edit_message_text.await_count == 2
+
+
+# ----------------------------------------------------------------------
+#  Concurrent presses
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestConcurrentPresses:
+    """An approval card in a shared channel has many pressers.
+
+    Every Socket Mode envelope is dispatched as its own task, so two
+    members pressing inside the same second run two answers at once.
+    """
+
+    async def test_two_presses_dispatch_the_action_once(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace,
+    ):
+        decisions: list[str] = []
+
+        async def dispatch(notification, target_id, decision, config, *, actor):
+            decisions.append(decision)
+            # Hold the dispatch open, which is where the second press
+            # arrives: a real one runs a shell script.
+            await asyncio.sleep(0.05)
+            return _handlers.DispatchResult(
+                ok=True,
+                audit_event={
+                    "event": "approval-acted",
+                    "notification_id": notification.get("id", ""),
+                    "target_kind": "concurrency-test",
+                    "target_id": target_id,
+                    "decision": decision,
+                    "ok": True,
+                },
+            )
+
+        _handlers.register("concurrency-test", dispatch)
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1", actor=None)
+        nid = await _make_approval(svc, db, target_kind="concurrency-test")
+
+        alice, bob = await asyncio.gather(
+            svc.handle_answer(nid, "approve", "slack", actor="U-alice"),
+            svc.handle_answer(nid, "approve", "slack", actor="U-bob"),
+        )
+
+        assert sorted([alice, bob]) == [False, True]
+        assert decisions == ["approve"]
+        records = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        acted = [r for r in records if r.get("event") == "approval-acted"]
+        assert len(acted) == 1
+        assert (await db.get_notification(nid))["status"] == "answered"
+
+    async def test_a_snooze_leaves_the_card_answerable(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # A snooze releases the claim, so the claim refuses a press for one
+        # round only, not for the life of the card.
+        def dispatch(notification, target_id, decision, config, *, actor):
+            return _handlers.DispatchResult(
+                ok=True,
+                audit_event={
+                    "event": "approval-acted",
+                    "target_kind": "claim-release-test",
+                    "decision": decision,
+                    "ok": True,
+                },
+                snooze_until=_iso(24) if decision.startswith("snooze") else None,
+            )
+
+        _handlers.register("claim-release-test", dispatch)
+        svc = NotificationService(fake_config, db, fake_engine)
+        await db.create_session("s1", actor=None)
+        nid = await _make_approval(
+            svc, db, target_kind="claim-release-test", expiry_hours=2,
+        )
+
+        assert await svc.handle_answer(nid, "snooze_24h", "web") is True
+        assert await svc.handle_answer(nid, "approve", "web") is True
+        notif = await db.get_notification(nid)
+        assert notif["status"] == "answered"
+        assert notif["answer"] == "approve"
+
+
+# ----------------------------------------------------------------------
+#  Answer attribution
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestAnswerAttribution:
+    """A shared workspace needs to know which member approved an action.
+
+    ``answered_by`` names the transport and the injection path routes on
+    it, so the person travels beside it in the row's metadata rather than
+    inside the same string.
+    """
+
+    async def test_a_question_answer_records_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        assert await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        notif = await db.get_notification(result["notification_id"])
+        assert notif["answered_by"] == "slack"
+        assert json.loads(notif["metadata"])["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_transport_still_names_the_channel_on_its_own(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # engine.run is handed answered_by as the channel name, so folding
+        # the member id into that string would route the reply nowhere.
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        await asyncio.sleep(0)
+        kwargs = fake_engine.run.call_args.kwargs
+        assert kwargs["channel"] == "slack"
+        assert kwargs["source"] == "notification:slack"
+
+    async def test_an_answer_with_no_actor_leaves_the_metadata_alone(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(result["notification_id"], "yes", "web")
+        notif = await db.get_notification(result["notification_id"])
+        assert "answered_by_actor" not in json.loads(notif["metadata"])
+
+    async def test_existing_metadata_survives_the_answer(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        # The column also carries option_labels, which the Telegram and web
+        # renderers read after the row is answered.
+        await db.create_session("s1", actor=None)
+        await db.create_notification(
+            notification_id="n1", session_id="s1", type="question",
+            title="t", metadata={"option_labels": {"yes": "Ship it"}},
+        )
+        svc = NotificationService(fake_config, db, fake_engine)
+
+        await svc.handle_answer("n1", "yes", "slack", actor="U0123ABC")
+        metadata = json.loads((await db.get_notification("n1"))["metadata"])
+        assert metadata["option_labels"] == {"yes": "Ship it"}
+        assert metadata["answered_by_actor"] == "U0123ABC"
+
+    async def test_the_actor_reaches_the_web_broadcast(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        result = await svc.ask_question(session_id="s1", title="pick one")
+
+        await svc.handle_answer(
+            result["notification_id"], "yes", "slack", actor="U0123ABC",
+        )
+        answered = [
+            m for _, m in patch_broadcaster
+            if m.get("type") == "notification_answered"
+        ]
+        assert answered
+        assert answered[-1]["answered_by"] == "slack"
+        assert answered[-1]["answered_by_actor"] == "U0123ABC"
+
+    async def test_an_approval_audit_record_names_the_actor(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace,
+    ):
+        await db.create_session("s1", actor=None)
+        _handlers.register("attribution-test", lambda *a, **k: _handlers.DispatchResult(
+            ok=True,
+            audit_event={
+                "event": "approval-acted",
+                "target_kind": "attribution-test",
+                "decision": "approve",
+                "ok": True,
+            },
+        ))
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(
+            svc, db, target_kind="attribution-test",
+        )
+
+        await svc.handle_answer(nid, "approve", "slack", actor="U0123ABC")
+        records = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        acted = [r for r in records if r.get("event") == "approval-acted"]
+        assert acted
+        assert acted[-1]["answered_by"] == "slack"
+        assert acted[-1]["answered_by_actor"] == "U0123ABC"

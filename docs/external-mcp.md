@@ -30,8 +30,11 @@ request as either:
 * `?token=<jwt>` query parameter (handy for clients that don't let you
   set headers, e.g. some Codex configs).
 
-If `auth.jwt_secret` is empty (dev mode), the endpoint accepts all
-requests — mirrors the gateway's existing dev-mode behaviour.
+There is no unauthenticated mode. If `auth.jwt_secret` is unset, the
+gateway generates a signing secret on its first start and keeps it in
+`nerve.db`; tokens from `POST /api/auth/login` (and `nerve codex token`)
+are signed with it, and the endpoint checks against it. See
+[Accounts and identity](accounts.md).
 
 ## Configuring Codex CLI
 
@@ -56,7 +59,9 @@ and MCP session id. The id format is
 `external:<client_name>:<client_session_id>` if the client supplies a
 stable id). The session shows up in the Nerve UI session list, and
 every tool call is recorded in `session_events` as an
-`external_tool_call` event for audit and diagnostics.
+`external_tool_call` event for audit and diagnostics. The event records the
+system actor as actor and the session's cause as cause (none for a satellite
+session).
 
 External `ask_user` calls are **fire-and-forget**: the user is notified
 on Telegram / web as usual, but Nerve does **not** try to inject the

@@ -7,6 +7,7 @@ as APScheduler jobs. Centralizes all source construction and config extraction.
 from __future__ import annotations
 
 import logging
+import shutil
 from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.sources.runner import SourceRunner
@@ -171,7 +172,7 @@ def build_source_runners(
             FieldRule(field="reason", allow=gh.allow_reasons, deny=gh.deny_reasons),
             FieldRule(field="ci_branch", deny=gh.deny_ci_branches),
         ])
-        runners.append(SourceRunner(
+        gh_runner = SourceRunner(
             source=source,
             db=db,
             batch_size=gh.batch_size,
@@ -180,20 +181,36 @@ def build_source_runners(
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
             inbox_filter=gh_filter,
-        ))
+            drop_hook=gh.drop_hook,
+        )
+        runners.append(gh_runner)
+        # The runner's copy is validated (a wrong-shaped value turns it off).
+        hook = gh_runner.drop_hook
         if gh_filter.active:
             logger.info(
                 "Registered source: github (batch=%d, guardrail: "
                 "repos allow=%s deny=%s; actors allow=%s deny=%s; "
-                "reasons allow=%s deny=%s; ci_branches deny=%s)",
+                "reasons allow=%s deny=%s; ci_branches deny=%s; drop_hook=%s)",
                 gh.batch_size,
                 gh.allow_repos or "*", gh.deny_repos or [],
                 gh.allow_actors or "*", gh.deny_actors or [],
                 gh.allow_reasons or "*", gh.deny_reasons or [],
                 gh.deny_ci_branches or [],
+                hook[0] if hook else "off",
             )
+            if hook and shutil.which(hook[0]) is None:
+                logger.warning(
+                    "sync.github.drop_hook: %r is not an executable on PATH or "
+                    "a path to one, so the hook will fail to start",
+                    hook[0],
+                )
         else:
             logger.info("Registered source: github (batch=%d)", gh.batch_size)
+            if hook:
+                logger.warning(
+                    "sync.github.drop_hook is set but no guardrail is, so "
+                    "nothing is ever dropped and the hook never runs",
+                )
 
     # GitHub Events (user's own activity)
     gh_events = config.sync.github_events
@@ -238,6 +255,63 @@ def build_source_runners(
         logger.info(
             "Registered source: github_repos (batch=%d, repos=%s)",
             gh_repos.batch_size, gh_repos.repos or "none",
+        )
+
+    # Channel source drains. Not a poll: the channel transport already
+    # delivered and buffered these events. This only moves them into the
+    # inbox. What to watch is a property of the channel, so the config lives at
+    # slack.source / telegram.source rather than under sync.*, and the
+    # runner carries its own schedule instead of being looked up there.
+    for channel_name, channel_config in (
+        ("slack", config.slack),
+        ("telegram", config.telegram),
+    ):
+        source_cfg = getattr(channel_config, "source", None)
+        if source_cfg is None or not source_cfg.enabled:
+            continue
+        if not source_cfg.allow_conversations:
+            # ChannelSourceConfig.from_dict already warned. Don't build a
+            # runner whose policy can never approve anything to drain.
+            continue
+        from nerve.sources.channel import ChannelSource
+        from nerve.sources.filters import FieldRule, InboxFilter
+
+        # Re-apply the deny rules at drain time. The channel already ran the
+        # full policy before buffering, so this is a second net, not the gate:
+        # it catches rows written before a conversation was added to the deny
+        # list, which the buffer would otherwise deliver minutes or a TTL
+        # later under the old policy.
+        #
+        # Deny-only on purpose. These rules match the id field, so a
+        # name-based pattern simply will not match — harmless for a deny rule
+        # (the row passes, exactly as it does today) but fail-closed for an
+        # allow rule, which would drop every message from a policy written
+        # against channel names. The allow decision stays where it can be
+        # made correctly, at the channel, which knows which of a
+        # conversation's names are grantable.
+        source_filter = InboxFilter(rules=[
+            FieldRule(
+                field="conversation_id", deny=list(source_cfg.deny_conversations),
+            ),
+            FieldRule(field="sender_id", deny=list(source_cfg.deny_senders)),
+        ])
+
+        runners.append(SourceRunner(
+            source=ChannelSource(channel_name, db),
+            db=db,
+            batch_size=source_cfg.batch_size,
+            condense=source_cfg.condense,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
+            ttl_days=ttl_days,
+            inbox_filter=source_filter,
+            schedule=source_cfg.schedule,
+        ))
+        logger.info(
+            "Registered source: %s observations (batch=%d, schedule=%s, "
+            "conversations allow=%s deny=%s)",
+            channel_name, source_cfg.batch_size, source_cfg.schedule,
+            source_cfg.allow_conversations, source_cfg.deny_conversations or [],
         )
 
     return runners

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
-import io
 import html as _html
 import logging
 import re
@@ -18,23 +17,32 @@ import socket
 import subprocess
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
+from nerve.channels.archives import (
+    IMAGE_EXT_TO_MIME,
+    MAX_TEXT_SIZE,
+    TEXT_EXTENSIONS,
+    extract_zip,
+)
+from nerve.channels.access import Identity, PatternGate
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     ChannelConstraints,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
 )
+from nerve.channels.observation import ObservationPolicy
+from nerve.channels.router import turn_stop_note
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -222,6 +230,23 @@ def _format_reply_context(message: Any) -> str:
     return "\n".join(parts)
 
 
+def _describe_telegram_attachment(message: Any) -> str:
+    """Name a message's attachment without downloading it.
+
+    An uncaptioned photo or sticker still says something. ``_extract_sticker``
+    and ``_extract_document`` say more but fetch the file to do it.
+    """
+    sticker = getattr(message, "sticker", None)
+    if sticker:
+        return f"[Sticker: {sticker.emoji}]" if sticker.emoji else "[Sticker]"
+    document = getattr(message, "document", None)
+    if document:
+        return f"[File: {document.file_name or 'unnamed'}]"
+    if getattr(message, "photo", None):
+        return "[Photo]"
+    return ""
+
+
 # Inline-keyboard /sessions rendering ------------------------------------- #
 _SESSIONS_PAGE_SIZE = 10        # sessions shown per /sessions page; ⬅️/➡️ page the rest
 _SESSION_LABEL_MAX = 40         # Telegram wraps long button labels poorly
@@ -359,6 +384,23 @@ def _clip(text: str, cap: int) -> str:
     return _html.escape(t) if t else "(no text)"
 
 
+# Telegram's limit for a callback-query toast (answerCallbackQuery text).
+_TOAST_MAX_LEN = 200
+
+
+def _fit_text(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters; '…' appended if cut."""
+    # Count UTF-16 code units (an emoji is two), which never undercounts.
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return text
+    units = 0
+    for end, char in enumerate(text):
+        units += 2 if ord(char) > 0xFFFF else 1
+        if units >= limit:  # no room for this char and the ellipsis
+            break
+    return text[:end] + "…"
+
+
 def _fmt_local(iso: str, tz) -> "tuple[str, str]":
     """Return (day label, HH:MM) for an ISO timestamp in the user's timezone."""
     try:
@@ -457,6 +499,214 @@ def build_session_tail_view(
     return text, InlineKeyboardMarkup(rows)
 
 
+# Inline-keyboard /plans rendering ---------------------------------------- #
+# The plan review queue (WebUI parity for chat): list → detail → approve /
+# decline / revise, all tap-driven so nothing needs a copy-pasted plan id.
+_PLANS_PAGE_SIZE = 8            # plans shown per /plans page; ⬅️/➡️ page the rest
+_PLAN_LABEL_MAX = 40           # Telegram wraps long button labels poorly
+_PLAN_TITLE_MAX = 200          # task title clip on the detail card
+_PLAN_BODY_MAX = 3400          # plan body clip on the detail card, in displayed characters
+_PLAN_REVISE_TTL = 24 * 3600   # seconds an unanswered ✍️ Revise prompt stays valid
+_TG_TEXT_MAX = 4096            # Telegram's message limit, counted on the displayed text
+_PLAN_STATUS_EMOJI = {
+    "pending": "🟠",           # awaiting your review — the actionable state
+    "implementing": "⚙️",      # approved, an impl session is running
+    "declined": "🚫",
+    "superseded": "🗂",
+    "failed": "⚠️",
+}
+
+
+def _tg_len(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _tg_visible_len(html_text: str) -> int:
+    """Telegram length of an HTML message as displayed (tags dropped, entities decoded)."""
+    return _tg_len(_html.unescape(re.sub(r"<[^>]*>", "", html_text)))
+
+
+def _clip_tg(text: str, cap: int) -> str:
+    """Like ``_clip``, but ``cap`` counts UTF-16 code units, as Telegram does."""
+    t = (text or "").strip()
+    if not t:
+        return "(no text)"
+    if _tg_len(t) > cap:
+        kept: list[str] = []
+        used = 0
+        for ch in t:
+            used += 2 if ord(ch) > 0xFFFF else 1
+            if used > cap - 1:         # leave room for the ellipsis
+                break
+            kept.append(ch)
+        t = "".join(kept).rstrip() + "…"
+    return _html.escape(t)
+
+
+def _plan_label(plan: dict) -> str:
+    """Button label for one plan: status emoji + task title, version if > 1."""
+    emoji = _PLAN_STATUS_EMOJI.get(plan.get("status") or "", "•")
+    title = (plan.get("task_title") or plan.get("task_id") or "?").strip()
+    ver = plan.get("version") or 1
+    suffix = f"  v{ver}" if int(ver) > 1 else ""
+    room = _PLAN_LABEL_MAX - len(suffix) - 2   # 2 ≈ emoji + space
+    if len(title) > room:
+        title = title[: room - 1] + "…"
+    return f"{emoji} {title}{suffix}"
+
+
+def build_plans_view(
+    plans: list[dict],
+    *,
+    offset: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render the /plans review queue (pure, sync — unit-testable).
+
+    One tap-to-open button per plan (the plan id rides in ``callback_data``
+    as ``plan:view:<id>``), pending listed ahead of implementing. ``⬅️``/``➡️``
+    page via ``plan:list:<offset>`` when more exist, and a trailing
+    ``🔄 Refresh`` button (``plan:list:0``) is always present so the keyboard
+    is never empty and the queue can be re-pulled after acting on a plan.
+    Returns ``(message_text, keyboard)``.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in plans[:_PLANS_PAGE_SIZE]:
+        pid = p.get("id")
+        cb = f"plan:view:{pid}"
+        # callback_data is capped at 64 bytes by Telegram; plan ids are short
+        # (``plan-xxxxxxxx``) but guard defensively so a button always works.
+        if not pid or len(cb.encode("utf-8")) > 64:
+            continue
+        rows.append([InlineKeyboardButton(_plan_label(p), callback_data=cb)])
+    shown = len(rows)
+
+    # Pager row — only the arrows that lead somewhere.
+    nav: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Prev",
+            callback_data=f"plan:list:{max(0, offset - _PLANS_PAGE_SIZE)}",
+        ))
+    if has_next:
+        nav.append(InlineKeyboardButton(
+            "➡️ More",
+            callback_data=f"plan:list:{offset + _PLANS_PAGE_SIZE}",
+        ))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="plan:list:0")])
+
+    if shown:
+        text = "🗒 Plans awaiting your review — tap one to read, approve, or decline."
+        if offset or has_next:
+            text += f"\nPage {offset // _PLANS_PAGE_SIZE + 1}"
+        text += "\n🟠 pending · ⚙️ implementing"
+    elif has_prev:
+        text = "No more plans — tap ⬅️ Prev to go back."
+    else:
+        text = "✅ No plans awaiting review — nothing to approve right now."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_plan_detail_view(
+    plan: dict,
+    *,
+    tzname: str | None = None,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Render one plan (HTML) with its review actions.
+
+    The plan body is an *expandable blockquote* — long plans collapse to a
+    few lines and expand in place on tap. The title and body are clipped
+    before escaping, so the markup stays intact and the displayed card fits
+    Telegram's 4096-character limit. A ``pending`` plan gets Approve /
+    Decline / Revise buttons; any other status is read-only (with its impl
+    session shown when present). Send/edit with ``ParseMode.HTML``. Returns
+    ``(html_text, keyboard)``.
+    """
+    tz = _safe_zone(tzname)
+    pid = str(plan.get("id") or "?")
+    status = plan.get("status") or "?"
+    emoji = _PLAN_STATUS_EMOJI.get(status, "•")
+    task_title = _clip(
+        str(plan.get("task_title") or plan.get("task_id") or "?"), _PLAN_TITLE_MAX,
+    )
+    version = plan.get("version") or 1
+    ptype = plan.get("plan_type") or "generic"
+
+    header = (
+        f"🗒 <b>{task_title}</b>\n"
+        f"{emoji} {status} · plan <code>{_html.escape(pid)}</code> v{version}"
+    )
+    if ptype and ptype != "generic":
+        header += f" · {_html.escape(str(ptype))}"
+    created = plan.get("created_at") or ""
+    if created:
+        day, hm = _fmt_local(created, tz)
+        if day:
+            header += f"\n<i>proposed {day} {hm}</i>"
+    if plan.get("impl_session_id"):
+        header += f"\nimpl: <code>{_html.escape(str(plan['impl_session_id']))}</code>"
+    if plan.get("feedback"):
+        header += f"\n<b>Revision feedback:</b> {_clip(str(plan['feedback']), 300)}"
+
+    head = f"{header}\n\n"
+    # Telegram applies its limit to the displayed text, so the body gets
+    # whatever room the displayed header leaves.
+    budget = min(_PLAN_BODY_MAX, _TG_TEXT_MAX - _tg_visible_len(head))
+    body = _clip_tg(str(plan.get("content") or ""), budget)
+    text = f"{head}<blockquote expandable>{body}</blockquote>"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if status == "pending":
+        rows.append([
+            InlineKeyboardButton("✅ Approve", callback_data=f"plan:approve:{pid}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"plan:decline:{pid}"),
+        ])
+        rows.append([InlineKeyboardButton("✍️ Revise", callback_data=f"plan:revise:{pid}")])
+    rows.append([InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def build_plan_confirm_view(
+    plan: dict, action: str,
+) -> "tuple[str, InlineKeyboardMarkup]":
+    """Confirmation card for a consequential action (approve/decline).
+
+    Both actions are one-way (approve spawns an implementation session;
+    decline closes the task), so a fat-finger tap gets a second step. Plain
+    text (no parse mode). ``◀️ Back`` returns to the plan detail. Returns
+    ``(message_text, keyboard)``.
+    """
+    pid = str(plan.get("id") or "?")
+    title = (plan.get("task_title") or plan.get("task_id") or "?")
+    if action == "approve":
+        text = (
+            f"✅ Approve the plan for “{title}”?\n\n"
+            "This starts an implementation session that carries out the plan."
+        )
+        rows = [
+            [InlineKeyboardButton(
+                "✅ Yes, approve & implement", callback_data=f"plan:approveok:{pid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"plan:view:{pid}")],
+        ]
+    else:  # decline
+        text = (
+            f"❌ Decline the plan for “{title}”?\n\n"
+            "This closes the task as done. To ask for a new version instead, "
+            "go back and use ✍️ Revise."
+        )
+        rows = [
+            [InlineKeyboardButton(
+                "🗑 Yes, decline & close", callback_data=f"plan:declineok:{pid}")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"plan:view:{pid}")],
+        ]
+    return text, InlineKeyboardMarkup(rows)
+
+
 class TelegramChannel(BaseChannel):
     """Telegram bot channel.
 
@@ -485,10 +735,38 @@ class TelegramChannel(BaseChannel):
         self._message_cache_max = 200
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
+        # /plans revise flow: (chat_id, prompt_message_id) ->
+        # (plan_id, user_id, monotonic ts). A reply to one of these ForceReply
+        # prompts from the user who tapped Revise is revision feedback, not a
+        # message for the agent (see _handle_message).
+        self._plan_revise_prompts: dict[tuple[int, int], tuple[str, int, float]] = {}
 
     def set_notification_service(self, service) -> None:
         """Wire the notification service for callback query handling."""
         self._notification_service = service
+
+    @property
+    def bot_username(self) -> str | None:
+        """The bot's ``@username`` once ``Application.initialize()`` ran, else ``None``.
+
+        Read by the setup page so the process that comes up after the restart
+        can offer the ``t.me`` pairing link without a second ``getMe``. Never
+        raises: a half-built application answers ``None``.
+        """
+        app = self._app
+        if app is None:
+            return None
+        try:
+            bot = app.bot
+            name = getattr(bot, "username", None)
+        except Exception:  # noqa: BLE001 — python-telegram-bot raises before initialize()
+            return None
+        return str(name) if name else None
+
+    @property
+    def allowed_users(self) -> frozenset[int]:
+        """The allow-list the running bot honours (a frozen copy)."""
+        return frozenset(self._allowed_users)
 
     @property
     def config(self) -> NerveConfig:
@@ -554,18 +832,45 @@ class TelegramChannel(BaseChannel):
         )
         app = builder.build()
 
-        # Register handlers
-        app.add_handler(CommandHandler("start", self._handle_start))
-        app.add_handler(CommandHandler("pair", self._handle_pair))
-        app.add_handler(CommandHandler("session", self._handle_session))
-        app.add_handler(CommandHandler("sessions", self._handle_sessions))
-        app.add_handler(CommandHandler("star", self._handle_star))
-        app.add_handler(CommandHandler("unstar", self._handle_unstar))
-        app.add_handler(CommandHandler("new", self._handle_new_session))
-        app.add_handler(CommandHandler("stop", self._handle_stop))
-        app.add_handler(CommandHandler("restart", self._handle_restart))
-        app.add_handler(CommandHandler("doctor", self._handle_doctor))
-        app.add_handler(CommandHandler("reply", self._handle_reply))
+        # A CommandHandler wins over the generic MessageHandler in this group,
+        # so commands need the source hook on their own callback.
+        app.add_handler(CommandHandler(
+            "start", self._source_routed_command(self._handle_start),
+        ))
+        # Never persist a one-time pairing code in the source buffer.
+        app.add_handler(CommandHandler(
+            "pair", self._source_routed_command(self._handle_pair, collect=False),
+        ))
+        app.add_handler(CommandHandler(
+            "session", self._source_routed_command(self._handle_session),
+        ))
+        app.add_handler(CommandHandler(
+            "sessions", self._source_routed_command(self._handle_sessions),
+        ))
+        app.add_handler(CommandHandler(
+            "plans", self._source_routed_command(self._handle_plans),
+        ))
+        app.add_handler(CommandHandler(
+            "star", self._source_routed_command(self._handle_star),
+        ))
+        app.add_handler(CommandHandler(
+            "unstar", self._source_routed_command(self._handle_unstar),
+        ))
+        app.add_handler(CommandHandler(
+            "new", self._source_routed_command(self._handle_new_session),
+        ))
+        app.add_handler(CommandHandler(
+            "stop", self._source_routed_command(self._handle_stop),
+        ))
+        app.add_handler(CommandHandler(
+            "restart", self._source_routed_command(self._handle_restart),
+        ))
+        app.add_handler(CommandHandler(
+            "doctor", self._source_routed_command(self._handle_doctor),
+        ))
+        app.add_handler(CommandHandler(
+            "reply", self._source_routed_command(self._handle_reply),
+        ))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
@@ -636,7 +941,8 @@ class TelegramChannel(BaseChannel):
             code = pairing.get_or_create_pairing_code()
             logger.info(
                 "Telegram: no allowed_users configured — pairing mode active. "
-                "Send the bot:  /pair %s  to authorize your account "
+                "In a private chat, send the bot:  /pair %s  to authorize "
+                "your account "
                 "(code valid for 1h; run `nerve pair` to get a fresh one).",
                 code,
             )
@@ -848,8 +1154,16 @@ class TelegramChannel(BaseChannel):
         msg = await self._app.bot.send_message(chat_id=chat_id, text="⏳")
         return str(msg.message_id)
 
-    async def edit_message(self, target: str, message_id: str, text: str) -> None:
-        """Edit a previously sent message (for streaming updates)."""
+    async def edit_message(
+        self, target: str, message_id: str, text: str,
+        *, throttle: bool = False,
+    ) -> None:
+        """Edit a previously sent message (for streaming updates).
+
+        Telegram limits edits per chat and one chat is one session here, so
+        the caller's per-adapter interval already covers it and ``throttle``
+        needs no extra shedding.
+        """
         if self._app is None:
             return
         chat_id = int(target)
@@ -1007,6 +1321,31 @@ class TelegramChannel(BaseChannel):
         """Record that we received an update from Telegram."""
         self._last_update_time = time.monotonic()
 
+    def _source_routed_command(
+        self,
+        callback: Callable[[Update, Any], Awaitable[None]],
+        *,
+        collect: bool = True,
+    ) -> Callable[[Update, Any], Awaitable[None]]:
+        """Add source routing to a command without changing PTB precedence."""
+
+        async def wrapped(update: Update, context: Any) -> None:
+            chat = update.effective_chat
+            user = update.effective_user
+            message = update.message
+            if chat is None or user is None or message is None:
+                return
+
+            source = self.config.telegram.source
+            if collect and source.enabled and source.allow_conversations:
+                await self._observe(
+                    update,
+                    handled=self._is_authorized(user.id),
+                )
+            await callback(update, context)
+
+        return wrapped
+
     async def _handle_start(self, update: Update, context: Any) -> None:
         """Handle /start command."""
         self._touch()
@@ -1022,7 +1361,8 @@ class TelegramChannel(BaseChannel):
                 await update.message.reply_text(
                     "This Nerve instance isn't paired with your account.\n"
                     f"Your Telegram ID: {user_id}\n\n"
-                    "To pair, run `nerve pair` on the server, then send me:\n"
+                    "To pair, run `nerve pair` on the server, then open a "
+                    "private chat with me and send:\n"
                     "/pair <code>"
                 )
             return
@@ -1031,9 +1371,21 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _handle_pair(self, update: Update, context: Any) -> None:
-        """Handle /pair <code> — authorize a user via a one-time pairing code."""
+        """Authorize a user who sends /pair <code> in a private chat."""
         self._touch()
-        user_id = update.effective_user.id
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if (
+            chat.type != "private"
+            or user.is_bot
+            or getattr(message, "sender_chat", None) is not None
+        ):
+            logger.warning("Ignoring /pair outside a private human chat")
+            return
+        user_id = user.id
 
         if self._is_authorized(user_id):
             await update.message.reply_text("Already paired — you're authorized.")
@@ -1081,6 +1433,26 @@ class TelegramChannel(BaseChannel):
         self._allowed_users.add(user_id)
         try:
             append_telegram_allowed_user(self.config.config_dir, user_id)
+            # The running bot honours the new id already, so the next config
+            # reload must not report telegram.allowed_users as waiting on a
+            # restart: tell the restart bookkeeping this value is live.
+            #
+            # Recorded exactly as it landed on disk — the startup list with
+            # the id appended — because the bookkeeping compares lists with
+            # ``!=``: a sorted set would read as a change whenever the file's
+            # order is not ascending (a hand-written [333, 111], or pairing an
+            # id smaller than one already present).
+            from nerve import config_reload
+
+            started = config_reload.startup_config()
+            base = list(
+                started.telegram.allowed_users if started is not None
+                else self.config.telegram.allowed_users
+            )
+            config_reload.note_applied(
+                "telegram.allowed_users",
+                base if user_id in base else [*base, user_id],
+            )
         except LockdownError:
             # Belt-and-suspenders: config was locked between the check and here.
             self._allowed_users.discard(user_id)
@@ -1089,6 +1461,8 @@ class TelegramChannel(BaseChannel):
             )
             return
         except Exception:
+            # Includes paths.InsecureFileError (nothing was saved). The user is
+            # paired only until restart, and the reply says so.
             logger.exception("Paired user %d but failed to persist to config", user_id)
             await update.message.reply_text(
                 "Paired for this run, but saving to config failed — check "
@@ -1165,6 +1539,277 @@ class TelegramChannel(BaseChannel):
         text, markup = await self._sessions_view_for(channel_key)
         await update.message.reply_text(text, reply_markup=markup)
 
+    # ------------------------------------------------------------------ #
+    #  /plans — review queue (approve / decline / revise from chat)        #
+    # ------------------------------------------------------------------ #
+
+    async def _plans_view_for(
+        self, offset: int = 0,
+    ) -> "tuple[str, InlineKeyboardMarkup]":
+        """Build the /plans review-queue view for the given page.
+
+        Plans are global (not chat-scoped), matching the WebUI: pending ones
+        (the actionable state) are listed ahead of implementing ones, each
+        newest-first from the store. Rows are fetched up to the end of the
+        requested page plus one more, which tells whether a further page
+        exists, so every page is reachable however long the queue grows.
+        """
+        offset = max(0, offset)
+        need = offset + _PLANS_PAGE_SIZE + 1
+        plans = await self.router.list_plans(status="pending", limit=need)
+        if len(plans) < need:
+            plans = plans + await self.router.list_plans(
+                status="implementing", limit=need - len(plans),
+            )
+        page = plans[offset:offset + _PLANS_PAGE_SIZE]
+        has_next = len(plans) > offset + _PLANS_PAGE_SIZE
+        return build_plans_view(
+            page, offset=offset, has_prev=offset > 0, has_next=has_next,
+        )
+
+    async def _handle_plans(self, update: Update, context: Any) -> None:
+        """Handle /plans — native inline keyboard to review pending plans.
+
+        Each plan is a tap-to-open button; the plan id rides in the button's
+        callback_data, so approving/declining never needs a copy-pasted id.
+        """
+        self._touch()
+        if not self._is_authorized(update.effective_user.id):
+            return
+        text, markup = await self._plans_view_for()
+        await update.message.reply_text(text, reply_markup=markup)
+
+    async def _edit_plans_list(self, query: Any, offset: int = 0) -> None:
+        """Replace the current card with the plans list at ``offset``."""
+        text, markup = await self._plans_view_for(offset)
+        await self._safe_edit(query, text, markup)
+
+    async def _edit_plan_detail(self, query: Any, plan_id: str) -> None:
+        """Render a plan's detail (HTML) into the card in place."""
+        plan = await self.router.get_plan(plan_id)
+        if not plan:
+            await self._edit_plans_list(query)
+            return
+        text, markup = build_plan_detail_view(plan, tzname=self.config.timezone)
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _handle_plan_button(self, query: Any) -> None:
+        """Handle /plans inline-keyboard presses.
+
+        callback_data forms:
+          ``plan:list:<offset>``   — (re)show the review queue at a page
+          ``plan:view:<id>``       — show a plan's detail + action buttons
+          ``plan:approve:<id>``    — confirm-approve card
+          ``plan:approveok:<id>``  — approve (spawns an implementation session)
+          ``plan:decline:<id>``    — confirm-decline card
+          ``plan:declineok:<id>``  — decline (closes the task as done)
+          ``plan:revise:<id>``     — prompt (ForceReply) for revision feedback
+        """
+        if not query.message:
+            await query.answer()
+            return
+        parts = query.data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        arg = parts[2] if len(parts) > 2 else ""
+
+        if action == "list":
+            try:
+                off = max(0, int(arg))
+            except ValueError:
+                off = 0
+            await query.answer()
+            await self._edit_plans_list(query, off)
+            return
+
+        if action == "view":
+            await query.answer()
+            await self._edit_plan_detail(query, arg)
+            return
+
+        if action in ("approve", "decline"):
+            plan = await self.router.get_plan(arg)
+            if not plan:
+                await query.answer("That plan is no longer available", show_alert=True)
+                await self._edit_plans_list(query)
+                return
+            if plan.get("status") != "pending":
+                await query.answer(
+                    f"Plan is {plan.get('status')} — no longer actionable",
+                    show_alert=True,
+                )
+                await self._edit_plan_detail(query, arg)
+                return
+            await query.answer()
+            text, markup = build_plan_confirm_view(plan, action)
+            await self._safe_edit(query, text, markup)
+            return
+
+        if action == "approveok":
+            await self._do_plan_approve(query, arg)
+            return
+        if action == "declineok":
+            await self._do_plan_decline(query, arg)
+            return
+        if action == "revise":
+            await self._start_plan_revise(query, arg)
+            return
+
+        await query.answer()
+
+    async def _do_plan_approve(self, query: Any, plan_id: str) -> None:
+        """Approve via the shared service, then confirm on the card."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            approve_plan,
+        )
+        try:
+            result = await approve_plan(
+                db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+                # Telegram users are not mapped to local identities yet, so
+                # the approval stays unattributed, like other Telegram input.
+                actor=None, cause=None,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await query.answer("That plan is no longer available", show_alert=True)
+            await self._edit_plans_list(query)
+            return
+        except PlanNotPending as exc:
+            await query.answer(str(exc), show_alert=True)
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer("Approved — implementation started")
+        impl = _html.escape(str(result.get("impl_session_id") or "?"))
+        text = (
+            "✅ <b>Plan approved.</b>\n"
+            f"Implementation session <code>{impl}</code> started."
+        )
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")]]
+        )
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _do_plan_decline(self, query: Any, plan_id: str) -> None:
+        """Decline via the shared service, then confirm on the card."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            decline_plan,
+        )
+        try:
+            await decline_plan(
+                db=self.router.engine.db, engine=self.router.engine, plan_id=plan_id,
+                # Telegram users have no local identity yet: unattributed.
+                actor=None, cause=None,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await query.answer("That plan is no longer available", show_alert=True)
+            await self._edit_plans_list(query)
+            return
+        except PlanNotPending as exc:
+            await query.answer(str(exc), show_alert=True)
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer("Declined — task closed")
+        text = "🗑 <b>Plan declined.</b>\nThe related task was closed as done."
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗒 Plans", callback_data="plan:list:0")]]
+        )
+        await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
+
+    async def _start_plan_revise(self, query: Any, plan_id: str) -> None:
+        """Ask for revision feedback via a ForceReply prompt.
+
+        A message that *replies to* this prompt, from the user who tapped
+        Revise and within ``_PLAN_REVISE_TTL``, is captured as feedback in
+        ``_handle_message`` and dispatched to the planner — Telegram's native
+        way to collect a text argument after a button press.
+        """
+        plan = await self.router.get_plan(plan_id)
+        if not plan or plan.get("status") != "pending":
+            await query.answer(
+                "Only pending plans can be revised", show_alert=True,
+            )
+            await self._edit_plan_detail(query, plan_id)
+            return
+        await query.answer()
+        title = plan.get("task_title") or plan.get("task_id") or plan_id
+        prompt = await query.message.reply_text(
+            f"✍️ Reply to this message with revision feedback for the plan "
+            f"“{title}”.\nThe planner will produce a new version from your notes.",
+            reply_markup=ForceReply(input_field_placeholder="What should change?"),
+        )
+        self._prune_plan_revise_prompts()
+        self._plan_revise_prompts[(query.message.chat.id, prompt.message_id)] = (
+            plan_id, query.from_user.id, time.monotonic(),
+        )
+
+    async def _submit_plan_revision(
+        self, update: Update, plan_id: str, feedback: str,
+    ) -> None:
+        """Dispatch captured revision feedback to the planner session."""
+        from nerve.agent.plan_service import (
+            PlanNotFound,
+            PlanNotPending,
+            TaskNotFound,
+            request_plan_revision,
+        )
+        try:
+            result = await request_plan_revision(
+                db=self.router.engine.db, engine=self.router.engine,
+                plan_id=plan_id, feedback=feedback,
+                # Telegram users have no local identity yet: unattributed.
+                actor=None, cause=None,
+            )
+        except (PlanNotFound, TaskNotFound):
+            await update.message.reply_text("That plan no longer exists.")
+            return
+        except (PlanNotPending, ValueError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(
+            f"✍️ Revision requested for plan {plan_id}. Feedback sent to the "
+            f"planner ({result['session_id']}); a new version will appear in /plans."
+        )
+
+    def _prune_plan_revise_prompts(self) -> None:
+        """Forget Revise prompts left unanswered for longer than the TTL."""
+        cutoff = time.monotonic() - _PLAN_REVISE_TTL
+        for key, (_plan_id, _user_id, started) in list(self._plan_revise_prompts.items()):
+            if started < cutoff:
+                del self._plan_revise_prompts[key]
+
+    async def _maybe_consume_plan_revision(self, update: Update) -> bool:
+        """Consume a reply to a /plans revise prompt as revision feedback.
+
+        Returns True (message handled — do not route to the agent) only when
+        the message replies to an open Revise prompt in this chat and comes
+        from the user who tapped Revise. Several prompts can be open at once;
+        each reply goes to the plan of the prompt it answers. Any other
+        message falls through to normal routing.
+        """
+        chat = update.effective_chat
+        msg = update.message
+        user = update.effective_user
+        reply_to = getattr(msg, "reply_to_message", None) if msg else None
+        if not chat or not user or not reply_to:
+            return False
+        self._prune_plan_revise_prompts()
+        key = (chat.id, reply_to.message_id)
+        pending = self._plan_revise_prompts.get(key)
+        if not pending or pending[1] != user.id:
+            return False
+        del self._plan_revise_prompts[key]
+        plan_id = pending[0]
+        feedback = (msg.text or "").strip()
+        if not feedback:
+            await msg.reply_text("No feedback given — revision cancelled.")
+            return True
+        await self._submit_plan_revision(update, plan_id, feedback)
+        return True
+
     async def _handle_star(self, update: Update, context: Any) -> None:
         """Handle /star — star the current session so it never auto-closes."""
         await self._set_current_starred(update, True)
@@ -1207,7 +1852,7 @@ class TelegramChannel(BaseChannel):
         # Stop the current session before creating a new one
         prev = await self.router.get_last_session(channel_key)
         if prev:
-            stopped = await self.router.engine.stop_session(prev)
+            stopped = await self.router.stop_session(prev)
             if stopped:
                 await update.message.reply_text(
                     f"Stopped session `{prev}`.",
@@ -1236,8 +1881,13 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("No active session.")
             return
 
-        stopped = await self.router.engine.stop_session(session_id)
-        if stopped:
+        # The turn only: background agents keep running. A runtime that
+        # cannot spare them is not stopped, and the answer says why.
+        result = await self.router.stop_turn(session_id)
+        note = turn_stop_note(result, session_id)
+        if note:
+            await update.message.reply_text(note, parse_mode=ParseMode.MARKDOWN)
+        elif result.get("turn") in ("stopped", "killed"):
             await update.message.reply_text(
                 f"Stopped session `{session_id}`.",
                 parse_mode=ParseMode.MARKDOWN,
@@ -1356,26 +2006,18 @@ class TelegramChannel(BaseChannel):
         "application/csv",
     }
 
-    # Extensions treated as text when MIME type is missing or generic
-    _TEXT_EXTENSIONS: set[str] = {
-        ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
-        ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
-        ".md", ".rst", ".csv", ".tsv", ".sql", ".sh", ".bash", ".zsh",
-        ".rb", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
-        ".swift", ".lua", ".r", ".m", ".pl", ".php", ".env", ".ini", ".cfg",
-        ".conf", ".log", ".diff", ".patch", ".vue", ".svelte",
-    }
+    # Extensions treated as text when MIME type is missing or generic. Shared
+    # with the Slack channel and with the archive unpacker, so a file type
+    # read inline here is read inline everywhere.
+    _TEXT_EXTENSIONS = TEXT_EXTENSIONS
 
     _IMAGE_MIMES: set[str] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
     _ARCHIVE_MIMES: set[str] = {"application/zip", "application/x-zip-compressed"}
 
-    _IMAGE_EXT_TO_MIME: dict[str, str] = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
-    }
+    _IMAGE_EXT_TO_MIME = IMAGE_EXT_TO_MIME
 
-    _MAX_TEXT_SIZE: int = 512 * 1024       # 512 KB — inline text cap
+    _MAX_TEXT_SIZE: int = MAX_TEXT_SIZE    # 512 KB — inline text cap
     _MAX_DOWNLOAD_SIZE: int = 20_000_000   # ~20 MB — Telegram Bot API limit
 
     async def _extract_document(
@@ -1469,7 +2111,12 @@ class TelegramChannel(BaseChannel):
     async def _extract_zip(
         self, doc: Any, file_name: str, meta_line: str,
     ) -> tuple[list[dict[str, str]], str]:
-        """Extract ZIP archive contents — text inline, images/PDFs as blocks."""
+        """Extract ZIP archive contents — text inline, images/PDFs as blocks.
+
+        The 20 MB download cap is on the compressed archive, so the bounds on
+        what it expands to live in :mod:`nerve.channels.archives`, shared with
+        the Slack channel.
+        """
         try:
             tg_file = await doc.get_file()
             data = await tg_file.download_as_bytearray()
@@ -1477,84 +2124,186 @@ class TelegramChannel(BaseChannel):
             logger.warning("Failed to download ZIP %s: %s", file_name, e)
             return [], meta_line
 
-        buf = io.BytesIO(bytes(data))
-        if not zipfile.is_zipfile(buf):
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        buf.seek(0)
+        return extract_zip(bytes(data), meta_line)
 
-        blocks: list[dict[str, str]] = []
-        parts: list[str] = [meta_line]
+    def _is_delivery_only_sink(self, chat: Any) -> bool:
+        """True when ``chat`` is an opted-in group/supergroup notification sink.
 
-        try:
-            with zipfile.ZipFile(buf) as zf:
-                entries = [
-                    i for i in zf.infolist()
-                    if not i.is_dir() and not i.filename.startswith("__MACOSX/")
-                ]
-                parts.append(f"Archive contains {len(entries)} file(s):")
+        ``notifications.telegram_chat_id`` can be pointed at a dedicated group
+        so pushes (the notify tool, async questions/approvals) land there
+        instead of the owner's DM. When ``notifications.delivery_only_sink`` is
+        enabled, such a group is delivery-only: an inbound update must not start
+        an agent turn.
 
-                total_text = 0
-                for info in entries:
-                    ename = info.filename
-                    esize = info.file_size
-                    eext = ""
-                    if "." in ename.rsplit("/", 1)[-1]:
-                        eext = "." + ename.rsplit(".", 1)[-1].lower()
+        Gated behind the opt-in flag (default off) so an existing install that
+        used a group as the sink and still chatted there is unaffected. Only
+        groups and supergroups qualify: a DM sink (chat id == the user's own
+        private chat) stays interactive regardless. Inline-button callbacks are
+        handled separately, so questions/approvals delivered here stay
+        answerable.
+        """
+        notif = self.config.notifications
+        if not getattr(notif, "delivery_only_sink", False):
+            return False
+        notif_chat = notif.telegram_chat_id
+        return bool(notif_chat) and chat.id == notif_chat and chat.type in ("group", "supergroup")
+    @property
+    def observation(self) -> ObservationPolicy:
+        """The source grant, rebuilt per read so reloads apply at once."""
+        source = self.config.telegram.source
+        return ObservationPolicy(
+            enabled=source.enabled,
+            conversations=PatternGate(
+                "chat",
+                allow=list(source.allow_conversations),
+                deny=list(source.deny_conversations),
+            ),
+            senders=PatternGate(
+                "sender",
+                allow=list(source.allow_senders),
+                deny=list(source.deny_senders),
+            ),
+        )
 
-                    is_text = eext in self._TEXT_EXTENSIONS
-                    is_image = eext in self._IMAGE_EXT_TO_MIME
-                    is_pdf = eext == ".pdf"
+    async def _observe(self, update: Update, handled: bool = False) -> None:
+        """Buffer a group message for the source inbox, if the grant allows.
 
-                    if is_text and total_text + esize <= self._MAX_TEXT_SIZE:
-                        try:
-                            raw = zf.read(info.filename)
-                            total_text += len(raw)
-                            text_content = raw.decode("utf-8", errors="replace")
-                            parts.append(
-                                f"--- {ename} ({esize} bytes) ---\n"
-                                f"```\n{text_content}\n```"
-                            )
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_text:
-                        parts.append(f"- {ename} ({esize} bytes) [text, too large to inline]")
-                    elif is_image:
-                        try:
-                            raw = zf.read(info.filename)
-                            img_mime = self._IMAGE_EXT_TO_MIME.get(eext, "image/png")
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": img_mime,
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [image]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    elif is_pdf:
-                        try:
-                            raw = zf.read(info.filename)
-                            blocks.append({
-                                "type": "base64",
-                                "media_type": "application/pdf",
-                                "data": base64.b64encode(raw).decode("utf-8"),
-                            })
-                            parts.append(f"- {ename} ({esize} bytes) [PDF]")
-                        except Exception:
-                            parts.append(f"- {ename} ({esize} bytes) [read error]")
-                    else:
-                        parts.append(f"- {ename} ({esize} bytes)")
-        except zipfile.BadZipFile:
-            return [], f"{meta_line}\n(Invalid or corrupted ZIP archive)"
-        except RuntimeError as e:
-            # Password-protected archives
-            return [], f"{meta_line}\n(Cannot extract: {e})"
+        Asked of every group message, whatever ``telegram.allowed_users``
+        decided: the source is its own grant, so a sender being authorized
+        neither earns nor forfeits a place in the inbox. ``handled`` says the
+        live route accepted this message, and by default that is where it
+        stops — one message should not arrive twice.
+        ``include_handled_messages`` turns the copy back on for a source
+        meant as a record.
 
-        return blocks, "\n".join(parts)
+        Private chats are never a source. A stranger's DM is a refusal, and
+        filing it away is not what the silence led them to expect; a group an
+        operator listed is a different matter.
+
+        The bot must be a group administrator, or have privacy mode disabled
+        via BotFather, for Telegram to deliver ordinary group traffic at all.
+        Without that it only sees commands and replies to itself, and this
+        collects almost nothing however the grant is written.
+        """
+        # Cheapest gates first: this runs on every message now, not only the
+        # ones from a sender the allowlist refused.
+        source = self.config.telegram.source
+        if not source.enabled:
+            return
+        if handled and not source.include_handled_messages:
+            return
+        policy = self.observation
+        if not policy.active:
+            return
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        if chat.type == "private":
+            return
+        # Pairing codes are credentials. A command addressed to another bot
+        # bypasses our CommandHandler and reaches the generic message handler,
+        # so enforce this exclusion at the source gate too.
+        text = message.text or message.caption or ""
+        words = text.split(maxsplit=1)
+        command = words[0].partition("@")[0].casefold() if words else ""
+        if command == "/pair":
+            return
+        # Telegram delivers other bots' messages to group handlers under
+        # bot-to-bot mode. Slack drops them via _is_another_app_talking, and
+        # two agents feeding each other's inboxes is no better than two
+        # agents answering each other.
+        if user.is_bot:
+            return
+
+        # Only the numeric id is stable. A chat title is set by whoever runs
+        # the group, so treating it as allow-eligible would let anyone create
+        # a group called "ops-room" and walk into a grant meant for someone
+        # else's; a @username is claimable and movable for the same reason.
+        # Both stay deny-eligible, where a spoofable name can only ever
+        # subtract access.
+        conversation = Identity(
+            id=str(chat.id),
+            self_set_names=tuple(n for n in (chat.username, chat.title) if n),
+        )
+        sender = Identity(
+            id=str(user.id),
+            self_set_names=tuple(
+                n for n in (
+                    user.username, user.full_name, user.first_name, user.last_name,
+                ) if n
+            ),
+        )
+
+        verdict = policy.check(conversation, sender)
+        if not verdict.allowed:
+            logger.debug("Telegram did not observe a message: %s", verdict.reason)
+            return
+
+        text = message.text or message.caption or ""
+        attachment = _describe_telegram_attachment(message)
+        if attachment:
+            text = f"{attachment}\n\n{text}" if text else attachment
+        # Neither text nor an attachment is nothing worth a row.
+        if not text:
+            return
+
+        sent_at = message.date or datetime.now(timezone.utc)
+        observed = ObservedMessage(
+            channel_name="telegram",
+            channel_key=f"telegram:{chat.id}",
+            conversation_id=str(chat.id),
+            sender_id=str(user.id),
+            text=text,
+            message_id=str(message.message_id),
+            timestamp=sent_at.isoformat(),
+            conversation_title=chat.title or chat.username or "",
+            sender_name=user.username or user.full_name or "",
+            metadata={
+                "chat_type": chat.type or "",
+                "reply_to_message_id": (
+                    str(message.reply_to_message.message_id)
+                    if message.reply_to_message
+                    else ""
+                ),
+            },
+        )
+        await self.router.observe(
+            observed,
+            ttl_days=self.config.sync.message_ttl_days,
+            max_stored_messages=source.max_stored_messages,
+        )
 
     async def _handle_message(self, update: Update, context: Any) -> None:
         """Handle incoming text and photo messages — delegate to router."""
         self._touch()
-        if not self._is_authorized(update.effective_user.id):
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.message
+        if chat is None or user is None or message is None:
+            return
+        # Two independent routes, as on Slack. Authorization decides the live
+        # one; the source has its own grant and is asked either way, so a
+        # group can feed the inbox whether or not its members may also drive
+        # the agent.
+        handled = self._is_authorized(user.id)
+        await self._observe(update, handled=handled)
+        if not handled:
+            return
+
+        # Delivery-only notification sink: never start an agent turn on a
+        # message that arrives in the notifications group (a one-way channel).
+        if self._is_delivery_only_sink(update.effective_chat):
+            logger.info(
+                "Ignoring inbound message in delivery-only notification chat %s",
+                update.effective_chat.id,
+            )
+            return
+
+        # A reply to a /plans "Revise" ForceReply prompt is revision feedback,
+        # not a message for the agent. Intercept before any routing.
+        if await self._maybe_consume_plan_revision(update):
             return
 
         # Media group (album) — collect all parts before processing
@@ -1654,6 +2403,15 @@ class TelegramChannel(BaseChannel):
 
         user = reaction_update.user
         if user is None or not self._is_authorized(user.id):
+            return
+
+        # Delivery-only notification sink: never start an agent turn on a
+        # reaction that arrives in the notifications group (a one-way channel).
+        if self._is_delivery_only_sink(reaction_update.chat):
+            logger.info(
+                "Ignoring reaction in delivery-only notification chat %s",
+                reaction_update.chat.id,
+            )
             return
 
         chat_id = reaction_update.chat.id
@@ -1826,13 +2584,18 @@ class TelegramChannel(BaseChannel):
     async def _safe_edit(
         self, query: Any, text: str, markup: Any, parse_mode: Any = None,
     ) -> None:
-        """edit_message_text, swallowing the benign 'not modified'/transient errors."""
+        """edit_message_text that never raises.
+
+        "Message is not modified" (re-showing the same view) is expected and
+        ignored; any other failure is logged, since the card then stays stale.
+        """
         try:
             await query.edit_message_text(
                 text=text, reply_markup=markup, parse_mode=parse_mode,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            if "not modified" not in str(exc).lower():
+                logger.warning("Telegram message edit failed: %s", exc)
 
     async def _edit_session_tail(
         self, query: Any, session_id: str, window: int,
@@ -1940,69 +2703,78 @@ class TelegramChannel(BaseChannel):
             await self._handle_session_button(query)
             return
 
+        # /plans inline keyboard: list/view/approve/decline/revise.
+        if query.data.startswith("plan:"):
+            await self._handle_plan_button(query)
+            return
+
         # Parse callback_data: "notif:{notification_id}:{answer}"
+        # or, from a question button, "notifopt:{notification_id}:{option index}".
         parts = query.data.split(":", 2)
-        if len(parts) < 3 or parts[0] != "notif":
+        if len(parts) < 3 or parts[0] not in ("notif", "notifopt"):
             await query.answer()
             return
 
         notification_id = parts[1]
-        answer = parts[2]
 
         if not self._notification_service:
             await query.answer("Service unavailable", show_alert=True)
             return
 
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer,
-            answered_by="telegram",
+        answer = await self._notification_service.resolve_telegram_answer(
+            notification_id, parts[2], by_index=parts[0] == "notifopt",
+        )
+        if answer is None:
+            await query.answer("Already answered or expired", show_alert=True)
+            return
+
+        result = await self._notification_service.answer_delivered_notification(
+            notification_id,
+            answer,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(query.from_user.id),
         )
 
-        if success:
+        if result:
             status_line = f"\u2705 Answered: {answer}"
             toast = f"Answered: {answer}"
             # A snooze keeps the row pending with redeliver_at stamped \u2014
             # confirm on the card that it will come back, instead of the
             # generic answered state (which read as "handled, gone").
-            snoozed_until = await self._get_snoozed_until(notification_id)
+            snoozed_until = self._snoozed_until(result)
             if snoozed_until:
                 status_line = (
                     f"\U0001F4A4 Snoozed until {snoozed_until} \u2014 will resurface"
                 )
                 toast = f"Snoozed until {snoozed_until}"
-            await query.answer(toast)
+            await query.answer(_fit_text(toast, _TOAST_MAX_LEN))
             try:
                 original = query.message.text or ""
                 await query.edit_message_text(
-                    text=f"{original}\n\n{status_line}",
+                    text=_fit_text(f"{original}\n\n{status_line}", MAX_MSG_LEN),
                     reply_markup=None,
                 )
             except Exception:
-                pass
+                # Remove the buttons anyway: the tap has been handled.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
         else:
             await query.answer("Already answered or expired", show_alert=True)
 
-    async def _get_snoozed_until(self, notification_id: str) -> str | None:
-        """Return a human-readable re-delivery time if the row was snoozed.
-
-        After ``handle_answer`` succeeds, a snoozed approval is the only
-        outcome that leaves the row ``pending`` with ``redeliver_at``
-        set. Rendered in the host's local timezone. None when the answer
-        was a final decision (or anything fails \u2014 this is cosmetic).
-        """
+    @staticmethod
+    def _snoozed_until(notification: dict[str, Any]) -> str | None:
+        """Render the next delivery time when an answer snoozed the row."""
         try:
-            notif = await self._notification_service.db.get_notification(
-                notification_id,
-            )
             if (
-                not notif
-                or notif.get("status") != "pending"
-                or not notif.get("redeliver_at")
+                notification.get("status") != "pending"
+                or not notification.get("redeliver_at")
             ):
                 return None
             from datetime import datetime
-            dt = datetime.fromisoformat(notif["redeliver_at"])
+            dt = datetime.fromisoformat(notification["redeliver_at"])
             return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
         except Exception:
             return None
@@ -2021,21 +2793,16 @@ class TelegramChannel(BaseChannel):
 
         answer_text = " ".join(context.args)
 
-        pending = await self._notification_service.db.list_notifications(
-            status="pending", type="question", limit=1,
-        )
-        if not pending:
-            await update.message.reply_text("No pending questions.")
-            return
-
-        notification_id = pending[0]["id"]
-        success = await self._notification_service.handle_answer(
-            notification_id=notification_id,
-            answer=answer_text,
-            answered_by="telegram",
+        result = await self._notification_service.answer_latest_question(
+            answer_text,
+            channel="telegram",
+            target=str(update.effective_chat.id),
+            actor=str(update.effective_user.id),
         )
 
-        if success:
-            await update.message.reply_text(f"Answer recorded for: {pending[0]['title']}")
+        if result:
+            await update.message.reply_text(
+                f"Answer recorded for: {result['title']}",
+            )
         else:
-            await update.message.reply_text("Failed to record answer.")
+            await update.message.reply_text("No pending questions in this chat.")

@@ -2,106 +2,394 @@
 
 ## Quick Start
 
-The fastest way to get Nerve running:
+```bash
+curl -fsSL https://raw.githubusercontent.com/ClickHouse/nerve/main/install.sh | bash
+```
+
+The installer puts the dependencies in place (Python, Node.js, uv), clones
+the repository and runs `nerve init`. From a checkout the same thing is:
 
 ```bash
 git clone https://github.com/ClickHouse/nerve.git nerve
 cd nerve
 uv sync                       # creates .venv from uv.lock
 source .venv/bin/activate     # puts `nerve` on PATH
-cd web && npm install && npm run build && cd ..
-nerve init                    # Interactive wizard — handles everything
-nerve start
+nerve init
 ```
 
-`uv sync` creates `.venv` but does not activate it, so `nerve` is not on `PATH` until
-you do. If you'd rather not activate, prefix commands with `uv run` instead —
+`uv sync` creates `.venv` but does not activate it, so `nerve` is not on `PATH`
+until you do. If you'd rather not activate, prefix commands with `uv run` instead —
 `uv run nerve init`.
 
-The `nerve init` wizard walks you through deployment, mode selection, API keys, workspace setup, and cron configuration. Nothing is written until you confirm.
+`nerve init` asks three things in the terminal — how Nerve runs here, where
+its files live, which port and address it listens on — writes the
+machine-local files, builds the web UI if it is not built yet, starts Nerve,
+and prints the address of the setup page together with a **setup token**:
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Finish setup in your browser                                │
+  │                                                              │
+  │  Setup page   http://127.0.0.1:8900/setup                    │
+  │  Setup token  <token>                                        │
+  │               (copied to your clipboard)                     │
+  │                                                              │
+  │  The token is a one-time credential. It is pasted into       │
+  │  the page and never part of the URL. To see it again:        │
+  │  nerve status                                                │
+  └──────────────────────────────────────────────────────────────┘
+
+  Open the setup page in your browser now? [Y/n]:
+```
+
+Everything else — your account, personal assistant or worker, the model
+provider, your time zone, memory, Telegram or Slack, sources, scheduled jobs —
+is decided on that page. Three decisions get you to a working assistant:
+claim the account, choose a mode, connect a model. The rest can be skipped
+and finished later.
+
+Prefer to answer everything in the terminal? `nerve init --terminal` is the
+full wizard, unchanged. Have no terminal at all? See
+[Unattended installation](#unattended-installation).
 
 ## Prerequisites
 
 ### Server deployment
 - Python 3.13+
-- Node.js 22.12+ (for web UI build)
-- Anthropic API key **or** Claude subscription (via CLIProxyAPI proxy)
+- Node.js 22.12+ (to build the web UI; `nerve init` builds it for you)
+- A way to reach Claude: an Anthropic API key, a Claude subscription, or AWS
+  Bedrock — asked for on the setup page, not in the terminal
 
 ### Docker deployment
 - Docker with Compose V2 (`docker compose`)
-- Anthropic API key **or** Claude subscription (via CLIProxyAPI proxy)
+- The same choice of credential, asked for on the setup page
 
-## Installation
+## What `nerve init` decides on the host
 
-### Option A: Server (bare metal)
+Only what the browser cannot: the shape of the install on this machine.
 
-```bash
-git clone https://github.com/ClickHouse/nerve.git nerve
-cd nerve
+```
+  Nerve setup
+  Most of the setup happens in your browser. This terminal only decides what the
+  browser cannot: how Nerve runs on this machine and where it keeps its files.
+  Ctrl+C is safe; answers are saved.
 
-# Create .venv and install Nerve at the locked versions
-uv sync
-source .venv/bin/activate
+  Step 1 of 3 · How do you want to run Nerve?
+    server   Run directly on this machine. Recommended on a server or your own laptop.
+    docker   Run in a container. Isolated, easy to remove. Needs Docker.
+  Choose [server/docker] (server):
 
-# Build web UI
-cd web && npm install && npm run build && cd ..
+  Step 2 of 3 · Where things live
+    Config files   /home/alice/nerve   (config.yaml, config.local.yaml)
+    State          /home/alice/.nerve  (database, logs; set NERVE_HOME before running nerve to move it)
+  Workspace — the agent's files: memory, skills, settings [~/nerve-workspace]:
 
-# Run the setup wizard
-nerve init
+  Step 3 of 3 · Network
+  Gateway port [8900]:
+  Who should be able to open the web UI?
+    localhost   Only this computer. Open it here, or through an SSH tunnel from elsewhere.
+    lan         Other devices on your network too. You will set a password on the setup page.
+  Reachable from [localhost]:
 ```
 
-`uv sync` installs the exact versions in `uv.lock` — see
-[Dependency versions](#dependency-versions) for how that is maintained.
+- **Deployment** — `server` or `docker`. Docker adds one question, see
+  [Docker](#docker).
+- **Paths** — the config directory and the state directory are *shown*, not
+  asked: they are decided by `-c`/`NERVE_CONFIG_DIR` and `NERVE_HOME` before
+  `nerve init` runs. The workspace is asked, default `~/nerve-workspace`.
+- **Port** — default 8900. If it is already taken, `nerve init` says so and
+  proposes the first free port between 8901 and 8999 as the new default.
+- **Reachable from** — `localhost` binds the gateway to `127.0.0.1`; `lan`
+  binds to `0.0.0.0`. The default is `localhost`: nothing listens beyond this
+  machine until you decide it should, and the setup page is where you set the
+  password that makes `lan` safe. (`nerve init --terminal` and
+  `--non-interactive` keep their previous default of `0.0.0.0`.)
 
-### Option B: Docker
+Answers are saved after every question (`NERVE_HOME/init-state.json`), so
+Ctrl+C and a later `nerve init` resumes where you stopped. The file is removed
+once the configuration is written.
+
+What it writes:
+
+| File | Keys |
+|---|---|
+| `config.yaml` (machine-local) | `workspace`, `deployment`, `telegram.enabled: false`, `sync.gmail.accounts: []`; Docker also gets `docker.extra_mounts: []` and `gateway.host`/`port` so host-side commands know the published port |
+| `<workspace>/config/settings.yaml` (tracked) | `gateway.host`/`port`; every sync source explicitly `enabled: false` |
+| `config.local.yaml` (owner-only, `0600`) | the session-signing secret `auth.jwt_secret` — written **only if the file does not exist**, so a re-run never signs anybody out; Docker also gets a forwarded credential, see below |
+| `<workspace>/` | directories, the `config/` scaffold, the bundled skills, `config/cron/gates/` |
+
+Deliberately **not** written here: the mode templates (`SOUL.md` and friends),
+`config/cron/system.yaml`, time zone, model, memory settings. Those depend on
+decisions made in the browser, and the matching step writes them.
+
+Then `nerve init`:
+
+1. Builds the web UI if `web/dist` is missing and Node.js is installed
+   (`npm ci && npm run build`; first time only, about a minute). A failed or
+   skipped build is a warning, not an error: the gateway serves a plain page
+   at `/` and `/setup` that says how to build it, and `/api/*` works regardless.
+2. Starts Nerve (`nerve start --foreground`, detached, logging to
+   `NERVE_HOME/nerve.log`) and waits up to 60 s for `/health`.
+3. Prints the setup page and the setup token, once. The token is copied to the
+   clipboard when `pbcopy`, `wl-copy`, `xclip` or `xsel` is on `PATH` (always
+   through stdin, never as a command argument), and a terminal offers to open
+   the page.
+
+If Nerve does not answer within 60 s: `Nerve did not answer within 60 s.
+Logs: nerve logs. Re-run nerve init after fixing the cause.`
+
+### Flags
+
+| Flag | Effect |
+|---|---|
+| `--deployment server\|docker`, `--workspace PATH`, `--port N`, `--bind localhost\|lan` | Answer a question from the command line instead of the prompt |
+| `--yes`, `-y` | Accept every default without asking |
+| `--no-start` | Write the files but do not start Nerve (prints what to do next) |
+| `--no-browser` | Do not offer to open the setup page |
+| `--no-clipboard` | Do not copy the setup token to the clipboard |
+| `--terminal` | The full terminal wizard — see [The terminal wizard](#the-terminal-wizard-nerve-init---terminal) |
+| `--non-interactive` | Read everything from the environment — see [Unattended installation](#unattended-installation) |
+| `--if-needed` | Exit silently unless this is a fresh install (used by the Docker entrypoint) |
+
+A non-TTY stdin still answers the prompts line by line; only `--yes` skips
+them. Scripted example:
 
 ```bash
-git clone https://github.com/ClickHouse/nerve.git nerve
-cd nerve
-uv sync                    # Needed to run the wizard on the host
-uv run nerve init          # Choose "docker" at the deployment step
+nerve init --deployment server --workspace ~/nerve-workspace --port 8900 \
+           --bind localhost --no-browser --no-clipboard --yes
 ```
 
-The wizard handles everything: generates Dockerfile + docker-compose.yml, builds the image, starts the container, and continues setup inside it. You never write Docker files manually.
+### Re-running `nerve init`
 
-**What happens under the hood:**
-1. `nerve init` asks "How do you want to run Nerve?" → choose `docker`
-2. Generates `Dockerfile`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore`
-3. Runs `docker compose build`
-4. Runs `docker compose run nerve nerve init --inside-docker` (seamless transition)
-5. The rest of the wizard (mode, API keys, workspace, crons) continues inside the container
-6. After setup, Nerve starts automatically inside the container
+On an already configured install, `nerve init` changes nothing. It prints
+`Nerve is already configured.`, whether Nerve is running, the setup page and
+token while the instance is still unclaimed, `Setup checklist: N steps left —
+http://…/setup` while the browser checklist is unfinished, and
+`Reconfigure everything: nerve init --terminal`. Exit code 0. The signing
+secret in `config.local.yaml` is never regenerated by this path.
 
-**Subsequent starts:**
-```bash
-docker compose up        # Start
-docker compose up -d     # Start in background
-docker compose down      # Stop
-docker compose logs -f   # Follow logs
-```
+`nerve init --terminal` on a configured install asks before regenerating; see
+[the terminal wizard](#the-terminal-wizard-nerve-init---terminal) for what it
+overwrites and what it keeps.
 
-**Non-interactive Docker setup** (CI / automation):
-```bash
-cp .env.example .env
-# Edit .env with your ANTHROPIC_API_KEY (or set NERVE_USE_PROXY=1)
-docker compose up
-```
+## Finishing setup in the browser
 
-The entrypoint runs `nerve init --if-needed --non-interactive` before starting, using environment variables from `.env`.
+`/setup` is one wizard with a progress rail on the left, Back / Continue /
+Skip for now in the footer, and a Review step at the end. It works on a phone.
+Each step is saved as you continue; forms open on what the instance already
+has, and a stored secret is shown as "Configured · …ab12 — leave blank to
+keep", never read back.
 
-**Using CLIProxyAPI instead of an API key:**
-Set `NERVE_USE_PROXY=1` in your environment (no `ANTHROPIC_API_KEY` required). The proxy authenticates via Claude Code's OAuth — requires a Claude Max/Pro subscription at claude.ai. See [config.md](config.md#proxy-cliproxyapi) for details.
+| Step | Asks | Writes | Takes effect |
+|---|---|---|---|
+| **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
+| **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
+| **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
+| **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
+| **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
+| **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
+| **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash, then a one-time sign-in to your own Telegram account: phone, the code Telegram sends, your two-step password if you have one) as toggle cards, each with a server-side check of its tool (`gh`, `gog`). On an [instance that keeps no credentials](#instances-that-keep-no-credentials) only the GitHub toggle, and only when the operator provides the token from the environment | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml`; the Telegram session → `NERVE_HOME/telegram_sync.session` (owner-only, written by Telethon) | live |
+| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. For a worker `task-planner` starts off: the onboarding session enables it when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
+| **Agents** (personal) | which coding agents on this server (Codex, Claude Code) get a connection to Nerve; what to do with an existing config | the agents' own config files; `external_agents.*` and `mcp_endpoint.enabled` → `config.yaml` | restart |
+| **Review and finish** | a server check-up (Claude CLI, Node, `gh`, `gog`, disk, time zone, web build), what was written where, and the apply button | nothing new | hot reload, or a restart when something above needs one |
 
-**Volumes:**
-| Mount | Purpose |
-|-------|---------|
-| `.:/nerve` | Application code (bind mount) |
-| `nerve-data:/root/.nerve` | Databases, logs, PID, sessions |
-| `nerve-workspace:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills, `config/`) |
+A few things worth knowing per step:
 
-The container paths are not conventions — the generated Dockerfile sets
-`NERVE_HOME=/root/.nerve` and `NERVE_WORKSPACE=/root/nerve-workspace`
-explicitly. Point them elsewhere and the mounts must follow.
+- **Mode is chosen once.** Afterwards the step is read-only with the reason:
+  changing it means a new workspace (stop Nerve, point `workspace:` in
+  `config.yaml` at an empty directory, run setup again). Steps that depend on
+  the mode (About you, Sources, Automation, Agents) are shown but locked until
+  it is chosen.
+- **Model.** "Test connection" runs on the server (not in your browser) and
+  reports precisely: a rejected key, a region where Claude is not enabled, no
+  network, a timeout. Subscription tokens cannot be tested against the API and
+  say so. A subscription token drives chat only: memory, titles and scheduled
+  jobs call the API directly and need an Anthropic API key. Paste one on the
+  Model step instead (it replaces the token), set `ANTHROPIC_API_KEY` in the
+  server's environment, or use the proxy from `nerve init --terminal`, the one
+  route that runs those jobs on the subscription; the page says so when it
+  applies. "Claude Code login on this server" is
+  offered only when the server actually has one; on a Mac, opening the Model
+  step may show a Keychain prompt **on the server's screen** once — Deny keeps
+  the option hidden. Choosing it copies that credential into
+  `config.local.yaml`, exactly as the terminal wizard does. The model you
+  pick — or confirm with Continue after saving a credential, the preselected
+  default included — also becomes `agent.cron_model`, so scheduled jobs run
+  on it; to run them on a cheaper model, set `agent.cron_model` in
+  `settings.yaml` afterwards (a later save that picks nothing leaves it
+  alone; a switch into or out of Bedrock resets both to the installer's
+  defaults, as before).
+- **About you** prefills the time zone from your browser. Quiet hours are
+  optional: on a personal install the switch starts on with 22:00–07:00 while
+  the instance still has the defaults; a worker's starts off. Continuing
+  accepts what the form shows; the step counts as decided. Nerve records quiet
+  hours for the agent and does not hold messages back itself (see
+  [Configuration → Quiet Hours](config.md#quiet-hours)).
+- **Channels.** A Telegram token is checked with Telegram before anything is
+  written: a well-formed but revoked token would otherwise take the bot — and
+  the next start — down. The bot itself starts with the new token after the
+  restart at the end of setup, which is why pairing is offered on the final
+  "Nerve is ready" screen: it shows the `t.me/<bot>` link and a pairing code,
+  and notices when your `/pair <code>` arrives. You can also paste your numeric
+  Telegram user id in the step. Slack behind a shared channel gateway
+  (`slack.mode: hosted`) shows only the on/off switch.
+- **Sources** that are turned on while their tool is missing on the server
+  are saved and stay idle until the tool is set up; the card says so.
+- **Telegram message sync** reads the chats of your *own* Telegram account,
+  so API credentials alone do nothing: after the API id and hash are saved,
+  the card offers a sign-in — your phone number, the code Telegram sends,
+  and your two-step password if you have one. The sign-in stays on this
+  server: Telethon writes the session file under `NERVE_HOME`, owner-only;
+  the page shows the phone masked and never stores the code or the
+  password. One sign-in is pending at a time, for ten minutes; a new one
+  replaces it. **Sign out** revokes the session and removes the file. On the
+  server, `nerve setup-telegram` runs the same sign-in in the terminal. While
+  the sync is on but nobody is signed in, the Sources summary, the Ready
+  screen and `nerve doctor` say so.
+- **Automation** lists the core jobs as always-on and the optional ones as
+  checkboxes with their schedule rendered in the chosen time zone. A worker's
+  `task-planner` is unchecked by default; leave it for the onboarding session,
+  which turns it on (scoped to the worker's tasks) when the worker should plan
+  through the approval loop.
+- **Review and finish** shows an HTTPS warning when the page is served over
+  plain HTTP from an address other than loopback, and a warning when the
+  instance is passwordless and listening beyond localhost.
+
+Step status is **derived**, never stored: a step is done because a fact in the
+configuration, the workspace or the database says so. That is why an instance
+configured at the terminal, from environment variables or from a config
+repository shows the same checklist as one configured here, with the parts
+already decided marked done. The only stored decisions are *skipped* and
+"answered with a value that equals the default", kept in
+`NERVE_HOME/setup-state.json` — a file that never contains a configuration
+value or a secret.
+
+Several people or tabs can have the wizard open. State lives on the server
+only; every save returns the whole checklist and the page refreshes rather
+than trusting what it had. The last writer wins per step.
+
+### The ending
+
+The Review step's button reads **Finish** when everything you changed applies
+live, or **Restart Nerve** when something is read at startup (the time zone, a
+Telegram token, Bedrock's memory models, external agents). The restart
+reasons are listed before you click. Then:
+
+- **Finish** reloads the configuration in place and shows **Nerve is ready**
+  with a "Say hello" button that opens a new chat with a suggested first
+  message.
+- **Restart Nerve** restarts the daemon and waits for the *new* process to
+  answer (see [Restarts from the browser](#restarts-from-the-browser)). The
+  page stays where it is, reconnects on its own and ends the same way.
+- A **worker** ends with "Onboarding session starting" and a link to that
+  session: the agent reads your task description, researches it and fills in
+  `TASK.md` — see the [Worker Guide](worker-guide.md#how-onboarding-works).
+
+### Coming back later
+
+The wizard is re-enterable. **Setup** sits in the navigation. An instance
+that has never chosen a mode opens on the setup page: whoever signs in lands
+on `/setup` once per visit (a link straight into the wizard is left where it
+points) and is free to go anywhere else from there. A partially set-up
+instance — Mode chosen, steps left — opens as usual, with a dismissible
+banner that reads "Finish setting up Nerve — N steps left" (or "Restart
+Nerve to apply your setup" when only the restart is left). The count
+includes the steps that are waiting for the Mode step, so it only ever goes
+down; steps a lockdown makes read-only are never counted. The
+chat page's empty state points at the Model step until a provider is
+configured. On the Overview every done step has a **Change** link; a skipped
+step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
+prints `Setup checklist: N steps left — http://…/setup`, and `nerve doctor`
+prints `[OK] Setup checklist complete` or
+`[WARN] Setup checklist incomplete (steps: provider, profile) — finish at /setup`.
+
+## The setup token
+
+The first browser step — claiming the account — is the only write Nerve
+accepts without a signed-in person, so it is guarded by the setup token
+`nerve init` prints:
+
+- It is generated once, kept in `nerve.db` across restarts, and deleted the
+  moment the claim succeeds.
+- It is sent only in the body of the claim request. Nerve never puts it in a
+  URL, a response, a server log or browser storage, and `nerve init` never
+  passes it as a command-line argument (the clipboard copy goes through
+  stdin).
+- `nerve status` prints it again while the instance is unclaimed. `nerve
+  doctor` deliberately never does: that report is also relayed by chat
+  commands, and a live credential does not belong in a chat log.
+- It is a bearer credential. For a remote claim, use HTTPS or a protected
+  tunnel; the Review step warns when the page is served over plain HTTP from
+  a non-loopback address.
+
+"Keep this installation passwordless" is an explicit choice: anyone who can
+reach the gateway is then the owner. It is safe only when access is already
+restricted — the `localhost` bind, or a tunnel. A password can be added later
+on the Accounts page; it cannot be removed.
+
+Every other setup endpoint requires a signed-in person. System and MCP tokens
+are refused (`403`): setup is driven by a human, never by an agent talking to
+its own API. Until the claim, those endpoints answer `409`. See
+[Accounts and identity](accounts.md) for the account model.
+
+## Restarts from the browser
+
+Most of what the wizard writes is applied by a hot reload, the same one
+`nerve reload` performs. A handful of keys are read only at startup —
+`timezone`, `telegram.*`, `memory.*`, `external_agents.enabled`,
+`mcp_endpoint.*` — and the full list is the restart table in
+[Config](config.md#what-still-needs-a-restart); the wizard adds no entry to
+it. Whether a restart is pending is computed by comparing the configuration
+the running process started with against what is on disk now, so a value you
+change and change back disappears from the list, and the list is empty after
+a restart by construction.
+
+When a restart is needed, the Review step's **Restart Nerve** calls
+`POST /api/system/restart`, which does what `nerve restart` does, from inside
+the daemon:
+
+| Where Nerve runs | What happens |
+|---|---|
+| plain `nerve start` | a detached helper stops the old process and starts a new one; the page polls `/health` until its `generation` changes, up to 2 minutes |
+| the generated Docker container | the process exits and Compose brings it back (`restart: unless-stopped`); up to 3 minutes. If you had stopped the container with `docker compose stop`, run `docker compose up -d` |
+| systemd | refused, on purpose — the browser cannot see whether the unit says `Restart=`. The page shows the exact command (`systemctl restart nerve.service`, with the unit name read from the process's own cgroup leaf; `systemctl --user restart …` when a systemd user manager started it) and keeps waiting up to 5 minutes for the operator to run it |
+
+`NERVE_SUPERVISOR=exit` or `NERVE_SUPERVISOR=refuse` in the daemon's
+environment overrides the detection for other supervisors. The wait is never
+unbounded: the overlay offers **Not now** after ten seconds, and "did not
+come back" with **Keep waiting** and a `nerve logs` / `nerve start` hint at
+the end. Your session survives the restart — the signing secret is pinned and
+persisted, and nothing in the wizard rotates it.
+
+## The terminal wizard (`nerve init --terminal`)
+
+The previous `nerve init`, unchanged: it asks everything the browser would —
+deployment, credential, mode, OpenAI key, workspace, password or passwordless,
+your name and time zone, Telegram, sources, cron jobs, a worker's task,
+external agents — and writes it all at the end. It never starts the daemon;
+run `nerve start` afterwards. For a Docker deployment it continues inside the
+container (`docker compose run nerve nerve init --inside-docker`). Its network
+default is still `0.0.0.0`.
+
+Use it when no browser can reach the gateway, or to reconfigure an install
+from scratch. Two differences from before: your name is now actually written
+into `USER.md` (it used to leave the placeholder), and it is the only path
+that regenerates files. On an existing install it asks first:
+
+**What gets overwritten:**
+- `config.yaml` and `config.local.yaml` — regenerated from your choices (each
+  is copied to `*.bak` first unless it holds nothing)
+- `<workspace>/config/cron/system.yaml` — regenerated (picks up new built-in
+  cron prompts from Nerve updates)
+
+**What's preserved:**
+- All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)
+- `<workspace>/config/cron/jobs.yaml` — your custom crons are never touched
+- `<workspace>/config/settings.yaml` — only the keys the wizard generates are rewritten; anything else you added stays
+- `~/.nerve/nerve.db` and `~/.nerve/memu.sqlite` — databases are preserved
+
+The browser checklist reads a terminal-configured install exactly as it reads
+its own work: the steps you answered there are done.
 
 ## Unattended installation
 
@@ -123,51 +411,320 @@ Dependency installation adapts to the environment: as root (a plain `ubuntu:24.0
 
 The daemon is not started: unattended installs are normally followed by a service manager that owns the process (see [systemd Service](#systemd-service-optional)). Set `NERVE_START=1` to start it from the installer instead.
 
-Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards.
+Anything the setup wizard would ask comes from the environment. Authentication is required — set `NERVE_PROVIDER=bedrock` (IAM, no key), or `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `NERVE_USE_PROXY=1`. Everything else has a default. `NERVE_PASSWORD` is read once here and stored only as a bcrypt hash in `config.local.yaml`, so it does not need to stay in the environment afterwards. `NERVE_PASSWORDLESS` is also read once here: the choice is recorded in `nerve.db`, and changing the variable later has no effect.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NERVE_MODE` | `personal` | `personal` or `worker` |
+| `NERVE_MODE` | `personal` | `personal` or `worker` — this is how an unattended install chooses the mode |
 | `NERVE_WORKSPACE` | `~/nerve-workspace` | Workspace directory |
 | `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
-| `NERVE_PASSWORD` | unset | Web UI password; unset means no authentication |
+| `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
+| `NERVE_PASSWORDLESS` | unset | `1` completes setup without a password: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)). Not allowed with `NERVE_PASSWORD`. With neither, setup stays incomplete until the browser claim (`nerve status` prints the token once the gateway runs) |
 | `NERVE_TASK` | unset | Worker mode task description |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
 
+This path writes the same files it always has and starts no daemon; only a
+worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
+empty) and `task-planner` disabled until the onboarding session enables it.
+The browser checklist afterwards shows what the environment decided as done —
+the mode, the provider, the time zone, a Telegram token — and leaves the rest
+to skip or fill in.
+
 A re-run over an existing install keeps the configuration and only upgrades the code.
 
-## Re-running `nerve init`
+## Docker
 
-You can re-run `nerve init` at any time — it's safe on existing installations.
+Choose `docker` at the first question. The workspace question then reads
+"Workspace on this computer (mounted into the container)", and one more
+question follows when this machine has a Claude Code login:
 
-**What gets overwritten:**
-- `config.yaml` and `config.local.yaml` — regenerated from your choices
-- `<workspace>/config/cron/system.yaml` — regenerated (picks up new built-in cron prompts from Nerve updates)
+```
+  Found a Claude Code login in this machine's keychain (macOS Keychain (OAuth)). Forward it to the container? [Y/n]
+```
 
-**What's preserved:**
-- All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)
-- `<workspace>/config/cron/jobs.yaml` — your custom crons are never touched
-- `<workspace>/config/settings.yaml` — only the keys `nerve init` generates are rewritten; anything else you added stays
-- `~/.nerve/nerve.db` and `~/.nerve/memu.sqlite` — databases are preserved
+Yes writes it into `config.local.yaml` as `claude_oauth_token` or
+`anthropic_api_key` (the same classification the terminal wizard uses). A
+`gh auth` token gets the same question (`Found a GitHub login (gh CLI).
+Forward it to the container? [Y/n]`) and is written as `github_token` only on
+yes; `--yes` accepts both. Each forward is announced (`✓ Forwarding the GitHub
+token (gh CLI) as github_token in config.local.yaml`) — the values themselves
+are never printed. The Model step in the browser then shows the credential as
+configured. Nothing from `~/.claude` is mounted into the container.
 
-When you run `nerve init` on an existing install, it prompts: *"Nerve is already configured. Re-run setup?"* The `--if-needed` flag skips setup entirely if already configured (useful in Docker entrypoints).
+On the host, `config.yaml` names the *container* workspace path
+(`/root/nerve-workspace`). `nerve status` and `nerve doctor` derive the setup
+checklist from the same files at their bind-mounted host path, read from the
+volume in `docker-compose.yml`; when that file or the mount cannot be read,
+`status` prints `Setup checklist: open http://…/setup` instead of a count.
 
-## Docker Credential Forwarding
+Then `nerve init` generates `Dockerfile`, `docker-compose.yml`,
+`docker-entrypoint.sh` and `.dockerignore` — carrying the port you chose
+(`EXPOSE`, the health check, and the compose `ports:` line, which publishes
+on `127.0.0.1:` only when you chose `localhost`) — runs
+`docker compose up -d --build`, waits up to 300 s for `/health`, and prints
+the same setup block. Existing Docker files are never overwritten; if they
+publish a different port, the two lines to edit are printed.
 
-When deploying via Docker, `nerve init` needs to pass authentication credentials from the host into the container. It resolves credentials using a priority waterfall:
+```
+    ✓ Nerve started in Docker — ready in 12.0 s
+    Container restarts are automatic (restart: unless-stopped). nerve stop is docker compose down.
+```
 
-1. **macOS Keychain — `Claude Code-credentials`** — extracts OAuth access token from the JSON stored by Claude Code
+`config.yaml` records the container paths (`workspace: /root/nerve-workspace`)
+and, for Docker only, the published `gateway.host`/`port`, so `nerve status`
+on the host prints the right address. The tracked `settings.yaml` and the
+workspace skeleton are written under the host directory that is bind-mounted
+into the container.
+
+**Subsequent starts:**
+```bash
+docker compose up        # Start
+docker compose up -d     # Start in background
+docker compose down      # Stop
+docker compose logs -f   # Follow logs
+```
+
+The entrypoint is unchanged: `nerve init --if-needed --non-interactive`, then
+`exec nerve start -f`. With the files the host wrote, `--if-needed` is a
+no-op and the container boots straight into an instance that waits for the
+browser.
+
+**Non-interactive Docker setup** (CI / automation):
+```bash
+cp .env.example .env
+# Edit .env with your ANTHROPIC_API_KEY (or set NERVE_USE_PROXY=1)
+docker compose up
+```
+
+The entrypoint's `nerve init --if-needed --non-interactive` then configures
+the instance from `.env`, exactly as before.
+
+**Using CLIProxyAPI instead of an API key:**
+Set `NERVE_USE_PROXY=1` in your environment (no `ANTHROPIC_API_KEY` required). The proxy authenticates via Claude Code's OAuth — requires a Claude Max/Pro subscription at claude.ai. See [config.md](config.md#proxy-cliproxyapi) for details. The proxy is enabled by `nerve init --terminal` or by hand, not from the browser.
+
+**Volumes:**
+| Mount | Purpose |
+|-------|---------|
+| `.:/nerve` | Application code (bind mount) |
+| `<NERVE_HOME>:/root/.nerve` | Databases, logs, PID, sessions (`~/.nerve` by default) |
+| `<NERVE_HOME>/claude:/root/.claude` | The container's own Claude Code conversation files, so sessions survive `docker compose down`; kept apart from the host user's `~/.claude` |
+| `<workspace>:/root/nerve-workspace` | Workspace files (SOUL.md, tasks, skills, `config/`) |
+
+The container paths are not conventions — the generated Dockerfile sets
+`NERVE_HOME=/root/.nerve` and `NERVE_WORKSPACE=/root/nerve-workspace`
+explicitly. Point them elsewhere and the mounts must follow.
+
+A restart asked for from the browser makes the container exit, and Compose
+starts it again; the page waits for the new process. `nerve restart` on the
+host runs `docker compose restart`.
+
+### Docker credential forwarding
+
+`nerve init` resolves a credential on the host and writes it into
+`config.local.yaml` for the container, using a priority waterfall:
+
+1. **macOS Keychain — `Claude Code-credentials`** — extracts the OAuth access token from the JSON stored by Claude Code
 2. **macOS Keychain — `Claude Code`** — raw API key
 3. **`CLAUDE_CODE_OAUTH_TOKEN` env var**
 4. **`~/.claude/.credentials.json` file** — where Linux stores Claude credentials
 5. **`ANTHROPIC_API_KEY` env var**
 
-The first match wins. The extracted credential is passed to `docker compose run` as an environment variable, then written into `config.local.yaml` inside the container during setup.
+The first match wins. The slim flow asks before forwarding; `nerve init
+--terminal` passes the same credential to `docker compose run` as an
+environment variable and writes it inside the container. Either way the
+`~/.claude` directory is NOT mounted into the container — this avoids file
+permission issues and macOS Keychain access from within Docker.
 
-> **Note:** The `~/.claude` directory is NOT mounted into the container. Instead, credentials are resolved on the host and injected via environment variables. This avoids file permission issues and macOS Keychain access from within Docker.
+The browser's "Claude Code login on this server" option looks in a
+different order — the environment variables and the credentials file first,
+the Keychain last — because it runs on the gateway host at the click of a
+button and a Keychain lookup can raise a prompt there (see the Model step
+notes above).
+
+## Pre-configuring connections
+
+An operator can provide a connection before anyone opens the setup page —
+from the service environment, from `config.local.yaml` written by
+provisioning, from a `settings.yaml` that arrives from a configuration
+repository, or by running Slack behind a shared channel gateway. The setup
+page then shows that connection as **done and read-only**: the card reads
+"Configured by your operator (environment)", "Managed from the configuration
+repository" or "Managed by your organisation's channel gateway", with no
+Replace or Remove. The page never asks for a value the operator already
+provided, and a save that would overwrite one is refused (`409`, naming the
+field).
+
+| Connection | Setting(s) and layer | Environment-reference example | How the setup page reports it |
+|---|---|---|---|
+| Model provider | `anthropic_api_key` or `claude_oauth_token` in `config.local.yaml`; or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in the service environment; Bedrock: `provider.type`, `provider.aws_region` in `settings.yaml` | `anthropic_api_key: "${ANTHROPIC_API_KEY}"` in `settings.yaml` from a configuration repository, or `Environment=ANTHROPIC_API_KEY=…` in the service unit | Model: done · "Configured by your operator (environment)"; the model and effort picker stays open |
+| Memory (vector search) | `openai_api_key` in `config.local.yaml` | `openai_api_key: "${OPENAI_API_KEY}"` | Memory: done, read-only |
+| Telegram bot | `telegram.bot_token` in `config.local.yaml`; `telegram.enabled` in `config.yaml` | `telegram: {bot_token: "${TELEGRAM_BOT_TOKEN}"}` in `settings.yaml`, or `config.local.yaml` written by provisioning | Channels: done; the Telegram card is read-only, pairing still works |
+| Slack with your own app | `slack.bot_token`, `slack.app_token` in `config.local.yaml`; `slack.enabled` in `config.yaml`; allow-lists in `settings.yaml` | `slack: {bot_token: "${SLACK_BOT_TOKEN}", app_token: "${SLACK_APP_TOKEN}"}` | Channels: done; token fields read-only |
+| Slack behind a shared channel gateway | `slack.mode: hosted` and `channels.hosted.*` in `settings.yaml` ([config.md](config.md#hosted-mode)) — no tokens on this machine | — | Channels: done · "Managed by your organisation's channel gateway · connected" or "· waiting for the gateway"; the on/off switch is the only control |
+| Telegram message sync | `sync.telegram.api_id`, `sync.telegram.api_hash` in `config.local.yaml`; `sync.telegram.enabled` in `settings.yaml`. The signed-in session is runtime state (`NERVE_HOME/telegram_sync.session`), created on the setup page or with `nerve setup-telegram` | `sync: {telegram: {api_id: "${TG_API_ID}", api_hash: "${TG_API_HASH}"}}` | Sources: the credentials read as managed; the sign-in is still offered until a session exists |
+| GitHub | `gh auth login` on the server; or `github_token` in `config.local.yaml` (forwarded to a container as `GH_TOKEN`); or `GH_TOKEN` / `GITHUB_TOKEN` in the environment | `GH_TOKEN` in the service environment | Sources: the card shows the login the server-side check found; a token from the environment reads "(environment)" — and on an [instance that keeps no credentials](#instances-that-keep-no-credentials) it is what keeps the GitHub toggle on offer |
+| Gmail | `sync.gmail.accounts` in `config.yaml`; `sync.gmail.enabled` in `settings.yaml`; `gog gmail setup <account>` on the server | `sync: {gmail: {accounts: "${GMAIL_ACCOUNTS}"}}` | Sources: done; the addresses are read-only |
+
+How the origin is detected: Nerve reads the configuration files as written,
+before `${VAR}` references are resolved, and judges the layer the loader
+takes the value from (`config.local.yaml` over `config.yaml` over
+`settings.yaml`; under lockdown `settings.yaml` alone). Every masked value in
+`GET /api/setup` carries a `source`: `file` (a file on this machine — the
+page may replace or remove it), `environment` (a variable Nerve reads
+directly, or a `${VAR}` reference in any layer), `config-repo` (the tracked
+`settings.yaml` under [lockdown](#lockdown)) or `gateway` (held by the
+channel gateway). Secrets stay masked whatever their source.
+
+`nerve doctor` prints the source of every configured connection:
+
+```
+[OK] Anthropic API key: configured (environment)
+[OK] Telegram bot token: ...ab12 (environment)
+[OK] Slack hosted by the channel gateway: agent …, 2 gateway key(s) from …
+[OK] Telegram sync: API credentials configured (config-repo)
+[WARN] Telegram sync: no signed-in session at ~/.nerve/telegram_sync.session — sign in on the setup page (Sources → Telegram) or run 'nerve setup-telegram' on the server
+```
+
+Nothing is appended for a value that came from a file on this machine.
+
+## Instances with external authentication
+
+When a front gateway signs people in and names them to Nerve
+(`NERVE_AUTH_MODE=external`, see [Accounts and identity](accounts.md#external-mode)),
+the setup page works the same way with these differences:
+
+- **There is no claim step.** There are no local accounts, no password and no
+  setup token in this mode; the gateway deletes any token left from an earlier
+  local mode at startup. `nerve init` in a shell with `NERVE_AUTH_MODE=external`
+  prints the setup page without a token block — "Sign in through your
+  gateway." / "No setup token is used in external mode." — and its last line
+  reads "Later: `nerve status` prints the page again."
+- **The Claude Code login on the server is not offered.** That login is the
+  personal credential of whoever runs the server, and here every signed-in
+  person may run setup, so the Model step does not offer to import it (the
+  server does not even look it up). Paste an API key or a subscription token
+  instead, or provision the credential from the environment. An operator who
+  wants the option anyway sets `NERVE_SETUP_HOST_LOGIN=1` in the service
+  environment.
+- **The wizard starts at Mode**, with an overview that says who you are
+  ("Signed in as Alice Example through your organisation's sign-in"), what the
+  wizard does, and what is already configured. It configures the instance for
+  everyone who uses it; nothing in it is personal to your account.
+- **Any signed-in person may run setup.** There is no owner. Several people
+  may have it open; the state is server-side, every save returns the whole
+  checklist, and the last writer wins per step.
+- **About you** takes your name from the gateway's sign-in, read-only for the
+  account, and uses what you type only for the workspace notes (`USER.md`).
+  No account or password control is shown, and nothing in the wizard calls an
+  account endpoint.
+- **Step status** comes from configuration, workspace files and the state
+  file alone — the same facts as in local mode. An instance provisioned from
+  the environment (`nerve init --non-interactive`, a credential in the
+  process environment) or from a config repository reads as done where those
+  decided; a connection the operator provided shows as configured and
+  managed, read-only, and the page never asks for it again — see
+  [Pre-configuring connections](#pre-configuring-connections) for the
+  settings per connection and how each is reported. Slack behind your
+  organisation's channel gateway shows the gateway's connection state and an
+  on/off switch only.
+- **Finish** prefers a hot reload. When a restart is unavoidable, the page
+  says what will happen for the supervisor it detects — the process exits and
+  the supervisor starts it again, or an operator must run the command shown —
+  and reconnects through the gateway's own sign-in; no login form can appear.
+  The wait is time-boxed with a clear message and a retry.
+- The **Setup** entry and the "Finish setting up" banner render in this mode
+  too, and so does the landing: an instance that has never chosen a mode
+  opens on the setup page once the gateway has signed the person in; a
+  partially set-up one shows the banner.
+
+## Lockdown
+
+Under [lockdown](config.md#lockdown-remote-only-read-only) configuration
+arrives by pull request, so the wizard is read-only for anything it would
+write to configuration or to a reviewed workspace file. Such steps read
+**blocked**, each with the reason ("Configuration is managed from the config
+repository on this instance; changes arrive by PR and sync. Configure this
+step from the config repository."), and are not counted as "left to do" —
+a locked instance that has everything provisioned reads as finished and the
+banner stays quiet. What still works: the claim (it writes to `nerve.db`), a
+worker's `TASK.md` once the templates have arrived from the repository, your
+display name (local mode), skipping, finishing and restarting.
+
+## Instances that keep no credentials
+
+Some instances never hold a credential on the machine Nerve runs on: the model
+credential arrives from the service environment, Slack runs through a channel
+gateway, and nothing a person pastes into the setup page should end up in
+`config.local.yaml`. For those, set `setup.local_secrets: false` in the
+tracked `workspace/config/settings.yaml`:
+
+```yaml
+setup:
+  local_secrets: false
+```
+
+or `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment. The variable
+works like `NERVE_LOCKDOWN`, one way only: it can turn the storage off over a
+file that allows it, never back on over a file that forbids it. The value must
+be `true` or `false`: anything else (a typo, a `${VAR}` that resolves to
+something else) stops the configuration from loading, as it does for
+`lockdown`, and a bare `local_secrets:` reads as `false`. The setting is read
+on every request, so a reload applies it. The wizard then says so instead of
+offering the fields:
+
+- **Memory**, **Sources** and **Agents** read "Not available on this
+  instance", with the reason: *This instance does not store credentials
+  entered here. Connections are provided by the operator of this
+  deployment.* They are not counted as left to do, so the checklist can
+  finish without them.
+  Recall is LLM-ranked, as it is on any instance without an OpenAI key.
+- **Sources** stays open for one toggle when the operator provides the
+  GitHub token from the environment (`GH_TOKEN` or `GITHUB_TOKEN` in the
+  service environment, or `github_token: "${VAR}"` in a configuration file):
+  switching the GitHub source on stores nothing here. The step then offers
+  GitHub alone, with the note *GitHub is provided by the operator of this
+  deployment; Gmail and Telegram are not available on this instance.* It
+  counts as left to do until it is answered or skipped, and reads done — with
+  the switch still open, like the hosted Slack's — once GitHub is on or the
+  answer was "no". A Gmail or Telegram field in the same save is refused
+  (`409`, naming the field). `GET /api/setup` says which sources are on offer
+  in the step's detail (`available`, with `unavailable_reason`).
+- **Channels** reads the same way — unless Slack runs through a channel
+  gateway (`slack.mode: hosted`), which stores no token on this machine: the
+  step is done and the on/off switch stays its one control, as before.
+- **Model** still has to be answered. A credential from the environment (or a
+  `${VAR}` reference) reads as configured and managed, exactly as under
+  [Pre-configuring connections](#pre-configuring-connections); AWS Bedrock
+  can be chosen (an IAM role, no secret on disk); the model and effort picker
+  stays open. Pasting an API key or a subscription token is refused (`409`,
+  naming the field), and so is copying the Claude Code login found on the
+  server.
+- A step the operator provided — an OpenAI key or a bot token as a `${VAR}`
+  reference, a source switched on in the tracked settings — stays done and
+  reads read-only.
+- The writes behind those steps answer `409` with the same two sentences:
+  the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
+  mode and the GitHub switch with a token from the environment excepted), the
+  OpenAI key test and the bot-token tests, Telegram pairing, the Telegram
+  sign-in, and skipping one of the closed steps (there is nothing to decide).
+  The Model step's connection test is not among them: Bedrock and a
+  credential from the environment are still worth testing.
+
+What stays available: the model provider from the environment, Slack through
+a channel gateway, the GitHub source when its token comes from the
+environment, the model and effort choice, About you, Automation, the account
+(local mode), skipping the steps that are offered, finishing and restarting.
+`GET /api/setup` carries `local_secrets: false`, and `nerve doctor` prints one
+line about it — naming the Gmail and Telegram sources rather than the whole
+Sources step when the GitHub token comes from the environment.
+
+Unlike [lockdown](#lockdown), this does not change which configuration files
+are read or what the agent may edit; it only governs what the setup page
+stores. `nerve init --non-interactive` is not affected either: what the
+environment provides at install time is written as before.
 
 ## Manual Configuration
 
@@ -177,17 +734,25 @@ The wizard handles all of this automatically, but you can also configure manuall
 # Create secrets file (gitignored)
 cat > config.local.yaml << 'EOF'
 anthropic_api_key: sk-ant-...
+# claude_oauth_token: sk-ant-oat01-...   # alternative: a Claude subscription token (chat only)
 openai_api_key: sk-...           # Optional — enables vector-based memory search
 
 telegram:
   bot_token: "123456:ABC..."
 
 auth:
-  password_hash: "$2b$12$..."    # Generate below
-  jwt_secret: "..."              # Generate below
+  password_hash: "$2b$12$..."    # Generate below — see the note under this block
+  jwt_secret: "..."              # Optional; if omitted, generated into nerve.db on first start
   jwt_expiry_hours: 720          # Optional — web-session idle timeout (default 30 days)
 EOF
 ```
+
+`auth.password_hash` here is a **starting** password, not where the password
+lives. The first start copies it onto the local account and removes the key from
+this file; after that, passwords are managed on the accounts screen in the web
+UI and this key does nothing. If you leave it out, setup is not complete until
+you claim the instance from the browser (the first step of `/setup`).
+See [Accounts and identity](accounts.md).
 
 `jwt_expiry_hours` is an **idle** timeout, not a cap on a working session: the
 gateway re-mints the token whenever a request arrives past half its lifetime,
@@ -208,10 +773,17 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ## First Run
 
 ```bash
-nerve doctor             # Verify everything is set up
-nerve start              # Start the server
-# Open http://localhost:8900
+nerve status             # Running? Setup page and token while unclaimed; checklist while unfinished
+nerve doctor             # Verify everything is set up (never prints the token)
+nerve logs               # Tail the daemon log
 ```
+
+The gateway boots with nothing configured — no provider, no mode — and stays
+idle rather than failing: memory warm-up and sync sources wait for their
+configuration, the chat page shows "Connect a model to start a conversation",
+and a Telegram bot whose token is rejected at startup is logged (token
+scrubbed), reported on the Channels step and by `nerve doctor`, and never
+stops the gateway from starting.
 
 ## HTTPS Setup
 
@@ -254,10 +826,10 @@ sudo security add-trusted-cert -d -r trustRoot \
 Nerve has built-in daemon management. No systemd required for basic usage.
 
 ```bash
-nerve start           # Start as background daemon
+nerve start           # Start as background daemon (nerve init already did this once)
 nerve stop            # Stop the daemon (graceful, 15s timeout)
 nerve restart         # Stop + start
-nerve status          # Show PID, memory, uptime
+nerve status          # Show PID, memory, uptime, setup state
 nerve status -f       # Show status then tail logs
 nerve logs            # Tail the daemon log
 
@@ -265,7 +837,12 @@ nerve start -f        # Run in foreground (for debugging)
 ```
 
 **PID file:** `~/.nerve/nerve.pid`
+**Lock file:** `~/.nerve/nerve.lock` (the daemon locks it while it runs)
 **Log file:** `~/.nerve/nerve.log`
+
+`nerve restart` and the setup page's **Restart Nerve** use the same detached
+helper, so a restart typed here and one clicked in the browser are the same
+restart.
 
 ### systemd Service (optional)
 
@@ -290,6 +867,8 @@ WantedBy=multi-user.target
 ```
 
 Note: Use `--foreground` with systemd since it manages the process lifecycle.
+If you set up the instance with `nerve init` first, stop the daemon it
+started (`nerve stop`) before enabling the unit.
 
 ```bash
 sudo systemctl daemon-reload
@@ -300,6 +879,11 @@ sudo systemctl start nerve
 sudo systemctl status nerve
 journalctl -u nerve -f
 ```
+
+Under systemd the setup page does not restart Nerve itself; it shows
+`systemctl restart <unit>` for you to run (`systemctl --user restart <unit>`
+when a systemd user manager started it) and waits for the new process.
+`nerve restart` on the box still stops the process and lets the unit respawn it.
 
 ## Dependency versions
 
@@ -347,6 +931,14 @@ nerve restart
 ```
 
 Subsequent `nerve upgrade` runs install from the lock automatically.
+
+### Going back to an older Nerve
+
+Going back to an older Nerve after an upgrade is refused by default: the
+database schema is then newer than the code, and older code on a newer schema
+fails quietly later rather than loudly at start. Restore the backup taken
+before the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start
+anyway and accept that risk.
 
 ### Changing a dependency
 
@@ -399,7 +991,7 @@ host-created one may not be Linux-compatible).
 >
 > ```bash
 > rm Dockerfile docker-entrypoint.sh
-> nerve init                       # choose "docker" again; regenerates both
+> nerve init --terminal            # choose "docker" again; regenerates both
 > docker compose build --no-cache
 > ```
 >
@@ -412,6 +1004,38 @@ upgrading. If uv is missing, or the checkout has no `uv.lock`, it falls back to 
 previous `pip install -e .` behaviour.
 
 ## Troubleshooting
+
+### Setup
+
+**I lost the setup token.** `nerve status` prints it again while the instance
+is unclaimed. Nothing else does.
+
+**`/setup` says the web UI has not been built.** Node.js was missing or the
+build failed when `nerve init` ran. On the server: `cd web && npm ci && npm run
+build` (or `nerve upgrade`), then reload the page. The API — and the rest of
+the checklist, once the UI exists — was working the whole time.
+
+**"Port 8900 is already in use by another program."** Accept the proposed
+port, or pass `--port`. The address `nerve init` prints carries the port it
+actually used; `nerve status` repeats it.
+
+**"Nerve did not answer within 60 s."** Read `nerve logs`, fix the cause, and
+run `nerve init` again — it resumes with your saved answers, or prints the
+status block if the files were already written.
+
+**"Telegram bot failed to start at the last boot."** The saved token was
+rejected by Telegram when the gateway started. The gateway is running without
+the bot; replace the token on the Channels step (it is verified before it is
+saved) or in `config.local.yaml`, then restart.
+
+**The page says "Nerve did not come back".** The restart was requested but no
+new process answered within the time box. On the server, check `nerve logs`
+and run `nerve start` if nothing is running, then **Keep waiting** or reload
+the page.
+
+**A Keychain prompt appeared on the server's screen (macOS).** Opening the
+Model step looks for a Claude Code login once per process; Deny keeps the
+option hidden and nothing else changes.
 
 ### Database Schema Issues
 

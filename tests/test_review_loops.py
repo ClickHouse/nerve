@@ -20,6 +20,7 @@ amounts.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import subprocess
 import time
@@ -29,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.agent.tools.handlers.review_loops import (
     review_loop_kill_handler,
     review_loop_list_handler,
@@ -45,6 +47,15 @@ from nerve.workflows.review_loop import (
     gate_verdict,
 )
 from nerve.workflows.service import ENGINE_CLAUDE, WorkflowRunService
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 # --------------------------------------------------------------------------- #
 #  Helpers                                                                     #
@@ -107,7 +118,7 @@ def _make_engine(db) -> MagicMock:
             source=kwargs.get("source", "web"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
         return {"id": session_id}
 
@@ -132,6 +143,7 @@ def _make_engine(db) -> MagicMock:
     engine.has_live_background_tasks = MagicMock(return_value=False)
     engine.get_codex_ultracode_run_ids = MagicMock(return_value=None)
     engine.add_stop_listener = MagicMock()
+    engine.watch_turns = lambda sid: contextlib.nullcontext(TurnWatch(TurnOutcome()))
     engine.notification_service = MagicMock()
     engine.notification_service.send_notification = AsyncMock()
     engine.notification_service.propose_action = AsyncMock(
@@ -196,7 +208,7 @@ async def services(db, engine, tmp_path):
 
 
 async def _mk_observer(db, session_id: str = "obs00001") -> str:
-    await db.create_session(session_id, source="web")
+    await db.create_session(session_id, source="web", actor=None)
     return session_id
 
 
@@ -591,9 +603,13 @@ class TestReviewLoopService:
             goal="g", verifier="- a", session_id=obs, budget_usd=0.04,
         )
         await _wait_status(db, loop["id"], ("awaiting_user",))
-        result = await rls.handle_decision(loop["id"], "remind_4h")
-        assert result["ok"] and result.get("snooze_until")
+        # A reminder is an answer on the decision card; the card dispatcher
+        # asks the notification service for the snooze.
+        result = await rls._dispatch_decision({}, loop["id"], "remind_4h", None)
+        assert result.ok and result.snooze_until and result.after_snooze
         assert (await db.get_review_loop(loop["id"]))["status"] == "awaiting_user"
+        direct = await rls.handle_decision(loop["id"], "remind_4h")
+        assert not direct["ok"] and "decision card" in direct["message"]
 
     async def test_kill_loop_kills_current_leg(self, db, engine, services):
         runs, rls = services
@@ -775,7 +791,7 @@ class TestRecovery:
             created_by=f"review-loop:{loop['id']}",
         )
         await db.transition_workflow_run(run_id, "running", expect=("pending",))
-        await db.create_session(session_id, source="workflow")
+        await db.create_session(session_id, source="workflow", actor=None)
         await db.update_workflow_run(run_id, {"session_id": session_id})
         await db.transition_workflow_run(
             run_id, "done", expect=("running",), result="did it",
@@ -878,7 +894,7 @@ class TestRecovery:
             created_by=f"review-loop:{loop['id']}",
         )
         await db.transition_workflow_run(run_id, "running", expect=("pending",))
-        await db.create_session(session_id, source="workflow")
+        await db.create_session(session_id, source="workflow", actor=None)
         await db.update_workflow_run(run_id, {"session_id": session_id})
         await db.transition_workflow_run(
             run_id, "done", expect=("running",), result="did it",
@@ -953,7 +969,7 @@ class TestReviewLoopTools:
         assert not killed.is_error
 
     async def test_start_rejected_for_workflow_sessions(self, db, engine, wired):
-        await db.create_session("workflow:wfr-x", source="workflow")
+        await db.create_session("workflow:wfr-x", source="workflow", actor=None)
         result = await review_loop_start_handler(
             self._ctx(db, engine, session_id="workflow:wfr-x"),
             {"goal": "g", "verifier": "- a"},

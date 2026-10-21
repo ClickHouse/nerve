@@ -33,8 +33,15 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
+from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.tools import ToolContext, ToolRegistry
-from nerve.gateway.auth import MCP_WORKER_CLAIM
+from nerve.gateway.auth import (
+    MCP_WORKER_CLAIM,
+    effective_jwt_secret,
+    identity_store,
+    resolve_actor_from_claims,
+)
+from nerve.identity import ActorResolutionError
 from nerve.mcp_server.audit import build_audit_writer
 from nerve.mcp_server.auth import (
     McpAuthError,
@@ -52,7 +59,6 @@ if TYPE_CHECKING:
     from nerve.config import NerveConfig
 
 logger = logging.getLogger(__name__)
-
 
 async def _send_status(send: Send, status: int, message: str) -> None:
     """Emit a small ASGI error response with a JSON body."""
@@ -122,10 +128,12 @@ def _bound_identity_from_request(
     notify/ask_user/memorize/task_* behave exactly like the in-process
     Claude MCP. Ordinary tokens return ``None`` → satellite attribution.
 
-    The signature was already verified at the ASGI mount; this re-decode
-    only extracts the (signed) claim — cheap HS256, per tool call.
+    The signature was already verified at the ASGI mount; this re-decode only
+    extracts the signed claim — cheap HS256, per tool call. Actor resolution
+    at the mount is an admission check; tool handling does not consume it.
     """
-    if not config.auth.jwt_secret:
+    secret = effective_jwt_secret(config)
+    if not secret:
         return None, {}
     if rctx is None:
         return None, {}
@@ -144,7 +152,7 @@ def _bound_identity_from_request(
     if not token:
         return None, {}
     try:
-        payload = decode_mcp_token(token, config.auth.jwt_secret)
+        payload = decode_mcp_token(token, secret)
     except Exception:
         return None, {}
     runtime: dict[str, str] = {}
@@ -180,7 +188,6 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
         session_id, runtime_metadata = _bound_identity_from_request(
             engine.config, rctx
         )
-
         if session_id is None:
             client_name, mcp_session_id, _ = _resolve_client_info(rctx)
 
@@ -198,6 +205,9 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
                 "mcp_session_id": mcp_session_id,
             }
 
+        # The call is the agent's change for the session's stored cause. A
+        # satellite session stores none: its agent runs outside this instance.
+        session = await engine.db.get_session(session_id)
         return ToolContext(
             session_id=session_id,
             workspace=engine.config.workspace,
@@ -209,6 +219,8 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             engine=engine,
             notification_service=engine.notification_service,
             runtime_metadata=runtime_metadata,
+            actor=engine.db.system_actor,
+            cause=(session or {}).get("caused_by_actor_id"),
         )
 
     return _resolve
@@ -234,6 +246,11 @@ def build_manager(
         ctx_resolver=ctx_resolver,
         audit_writer=audit_writer,
         include_hoa=config.mcp_endpoint.include_hoa,
+        # Read off the engine's live config, not the snapshot above: a
+        # Codex session takes its nerve tools from this endpoint, and its
+        # tool list has to agree with the system prompt the same config
+        # builds. Satellite clients read one list per connection.
+        excluded=lambda: config_excluded_tools(engine.config),
     )
     return StreamableHTTPSessionManager(
         app=server,
@@ -266,8 +283,24 @@ def mount_deferred(
             await _send_status(send, 400, "MCP endpoint requires HTTP")
             return
         try:
-            authenticate_mcp(scope, config)
+            claims = authenticate_mcp(scope, config)
         except McpAuthError as e:
+            await _send_status(send, 401, str(e))
+            return
+
+        # Who the frames that follow are attributed to. MCP and backend-agent
+        # credentials are the agent acting on its own behalf, so they resolve
+        # to the system principal; a person's own session token resolves to
+        # them — and is refused here once their account is disabled, which a
+        # signature check alone would never notice. In external mode, every
+        # session token is refused here.
+        store = identity_store()
+        if store is None:
+            await _send_status(send, 503, "MCP server is starting up")
+            return
+        try:
+            await resolve_actor_from_claims(store, claims)
+        except ActorResolutionError as e:
             await _send_status(send, 401, str(e))
             return
 

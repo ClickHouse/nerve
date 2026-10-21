@@ -18,6 +18,7 @@ from nerve.config import (
     CronConfig,
     NerveConfig,
     ProxyConfig,
+    SlackConfig,
     SSLConfig,
     TelegramConfig,
     WorkflowRunsConfig,
@@ -157,11 +158,52 @@ class TestValidateConfigKeys:
                 "dm_policy": "pairing",
                 "allowed_users": [1],
                 "stream_mode": "partial",
+                "source": {"enabled": True, "allow_chats": [-100123]},
+            },
+            "slack": {
+                "enabled": True,
+                "allow_channels": ["C0123ABC"],
+                "source": {
+                    "enabled": True,
+                    "allow_channels": ["C0123ABC"],
+                    "deny_channels": ["*-social"],
+                    "deny_senders": ["*-bot"],
+                },
             },
             "agent": {"model": "claude-opus-4-8"},
             "auth": {"jwt_secret": "s"},
         }
         assert validate_config_keys(merged) == []
+
+    def test_channel_source_subject_keys_are_not_unknown(self):
+        """``<channel>.source`` names the conversations in the transport's own
+        noun, so the working keys are not the dataclass field names.
+
+        Reported as unknown, they told an operator following the docs that a
+        key Nerve does read was being ignored — while
+        ``allow_conversations``, which no transport reads, passed silently.
+        """
+        assert validate_config_keys(
+            {"slack": {"source": {"allow_channels": ["*"], "deny_channels": []}}},
+        ) == []
+        assert validate_config_keys(
+            {"telegram": {"source": {"allow_chats": [1], "deny_chats": []}}},
+        ) == []
+
+    def test_a_typo_in_a_channel_source_is_still_reported(self):
+        """The allowance is per key, not per subtree: the near-misses these
+        keys invite are exactly what the validator exists to catch."""
+        warnings = validate_config_keys(
+            {"slack": {"source": {"allow_channel": ["*"]}}},   # singular
+        )
+        assert len(warnings) == 1
+        assert "slack.source.allow_channel" in warnings[0]
+
+        warnings = validate_config_keys(
+            {"telegram": {"source": {"allow_channels": [1]}}},  # Slack's noun
+        )
+        assert len(warnings) == 1
+        assert "telegram.source.allow_channels" in warnings[0]
 
     def test_unknown_top_level_key(self):
         warnings = validate_config_keys({"workspaec": "~/ws"})
@@ -200,6 +242,102 @@ class TestTelegramDmPolicy:
         assert cfg.allowed_users == [123, 456]
 
 
+class TestSlackIsOptIn:
+    """Slack must not switch itself on for installations that predate it.
+
+    Every existing config has no ``slack`` section. Reading that as enabled
+    made ``nerve doctor`` report missing tokens and exit 1 on all of them.
+    """
+
+    def test_a_config_with_no_slack_section_is_disabled(self):
+        assert NerveConfig.from_dict({"model": "x"}).slack.enabled is False
+
+    def test_an_empty_slack_section_is_disabled(self):
+        assert SlackConfig.from_dict({}).enabled is False
+
+    def test_a_section_without_tokens_is_disabled(self):
+        assert SlackConfig.from_dict({"allow_users": ["U0123ABC"]}).enabled is False
+
+    def test_both_tokens_turn_it_on_without_an_enabled_key(self):
+        cfg = SlackConfig.from_dict({"bot_token": "xoxb-1", "app_token": "xapp-1"})
+        assert cfg.enabled is True
+
+    def test_one_token_alone_is_not_enough(self):
+        assert SlackConfig.from_dict({"bot_token": "xoxb-1"}).enabled is False
+
+    def test_an_explicit_false_wins_over_the_tokens(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": False, "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_an_explicit_true_is_honoured_without_tokens(self):
+        # Someone who asks for Slack and forgets the tokens should be told
+        # so by the doctor, not silently left with the channel off.
+        assert SlackConfig.from_dict({"enabled": True}).enabled is True
+
+    def test_lockdown_keeps_a_token_bearing_section_off(self):
+        # Lockdown drops the machine-local layer that decides whether this
+        # box answers Slack, so shared settings alone must not start it.
+        cfg = SlackConfig.from_dict(
+            {"bot_token": "xoxb-1", "app_token": "xapp-1"}, locked=True,
+        )
+        assert cfg.enabled is False
+
+    def test_an_unreadable_value_falls_back_to_off(self):
+        cfg = SlackConfig.from_dict({
+            "enabled": "${SLACK_ON}", "bot_token": "xoxb-1", "app_token": "xapp-1",
+        })
+        assert cfg.enabled is False
+
+    def test_direct_messages_are_an_explicit_opt_in(self):
+        assert SlackConfig.from_dict({}).allow_direct_messages is False
+        cfg = SlackConfig.from_dict({"allow_direct_messages": "true"})
+        assert cfg.allow_direct_messages is True
+
+    def test_the_doctor_says_nothing_about_an_unconfigured_slack(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"model": "x"}))
+        assert "Slack enabled but" not in report
+        assert "[--] Slack disabled" in report
+
+    def test_the_doctor_still_reports_missing_tokens_when_asked_for(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({"slack": {"enabled": True}}))
+        assert "[ERR] Slack enabled but bot_token, app_token not set" in report
+
+    def test_the_doctor_counts_direct_messages_as_a_guardrail(self):
+        from nerve.cli import doctor_report
+
+        report = doctor_report(NerveConfig.from_dict({
+            "slack": {
+                "enabled": True,
+                "bot_token": "xoxb-test",
+                "app_token": "xapp-test",
+                "allow_direct_messages": True,
+            },
+        }))
+        assert "direct messages allowed" in report
+        assert "bot refuses every message" not in report
+
+
+class TestSlackDefaultCommands:
+    def test_only_globally_scoped_session_listing_is_off_by_default(self):
+        from nerve.config import SLACK_DEFAULT_COMMANDS
+
+        assert "sessions" not in SLACK_DEFAULT_COMMANDS
+        assert "reply" in SLACK_DEFAULT_COMMANDS
+
+    def test_they_are_still_available_on_request(self):
+        from nerve.config import SLACK_ALL_COMMANDS
+
+        cfg = SlackConfig.from_dict({"commands": ["sessions", "reply"]})
+        assert cfg.commands == ["sessions", "reply"]
+        assert {"sessions", "reply"} <= set(SLACK_ALL_COMMANDS)
+
+
 class TestAppendTelegramAllowedUser:
     def test_creates_file_when_missing(self, tmp_path):
         assert append_telegram_allowed_user(tmp_path, 42) is True
@@ -236,13 +374,33 @@ class TestAppendTelegramAllowedUser:
         mode = stat.S_IMODE(os.stat(tmp_path / "config.local.yaml").st_mode)
         assert mode == 0o600
 
+    def test_it_raises_rather_than_rewrite_the_secrets_file_wide(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the file cannot be kept owner-only, nothing is written and the
+        call raises. ``False`` means only "this id was already there"."""
+        from nerve import paths as paths_mod
+
+        (tmp_path / "config.local.yaml").write_text(
+            "auth:\n  password_hash: keep-me\ntelegram:\n  bot_token: '1:x'\n"
+        )
+        os.chmod(tmp_path / "config.local.yaml", 0o600)
+        monkeypatch.setattr(paths_mod, "_mode_is_private", lambda st_mode: False)
+
+        with pytest.raises(paths_mod.InsecureFileError):
+            append_telegram_allowed_user(tmp_path, 42)
+        data = yaml.safe_load((tmp_path / "config.local.yaml").read_text())
+        assert data["auth"]["password_hash"] == "keep-me"  # untouched
+        assert "allowed_users" not in data.get("telegram", {})
+        assert not (tmp_path / "config.local.yaml.tmp").exists()
+
 
 class TestModelDefaultsAndAliases:
-    def test_default_model_is_opus_5(self):
-        from nerve.config import AgentConfig
+    def test_default_model_is_the_one_constant(self):
+        from nerve.config import DEFAULT_MODEL, AgentConfig
 
         cfg = AgentConfig.from_dict({})
-        assert cfg.model == "claude-opus-5"
+        assert cfg.model == DEFAULT_MODEL == "claude-opus-5-5"
         assert cfg.model_aliases == {}
 
     def test_model_aliases_parsed_and_normalized(self):
@@ -347,6 +505,147 @@ class TestClaudeModels:
     def test_models_key_recognized_by_validator(self):
         # Guard: agent.models must not trip unknown-key warnings.
         merged = {"agent": {"models": ["claude-opus-5"]}}
+        assert validate_config_keys(merged) == []
+
+
+class TestModelDiscoveryExclusions:
+    """agent.model_discovery_excluded_models — prune stale/unservable IDs that
+    discovery advertises but the serving route cannot use, without a denylist
+    that rots. Exercised through selectable_claude_models(discovered=...)."""
+
+    def _cfg(self, *, model="claude-opus-5", excluded=None, models=None):
+        from nerve.config import AgentConfig, NerveConfig
+
+        agent = {"model": model}
+        if excluded is not None:
+            agent["model_discovery_excluded_models"] = excluded
+        if models is not None:
+            agent["models"] = models
+        return NerveConfig(agent=AgentConfig.from_dict(agent))
+
+    def test_substring_prunes_matching_discovered_id(self):
+        # The concrete case: a retired haiku the proxy still advertises.
+        cfg = self._cfg(excluded=["claude-3-5-haiku"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_exact_id_prunes_only_that_id(self):
+        cfg = self._cfg(excluded=["claude-3-5-haiku-20241022"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022",
+        ])
+        assert got == ["claude-opus-5"]
+
+    def test_matching_is_case_insensitive(self):
+        cfg = self._cfg(excluded=["CLAUDE-3-5-HAIKU"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-3-5-haiku-20241022",
+        ])
+        assert got == ["claude-opus-5"]
+
+    def test_empty_and_whitespace_patterns_match_nothing(self):
+        # An empty pattern must never be treated as "contained in everything".
+        cfg = self._cfg(excluded=["", "   ", None])
+        discovered = ["claude-opus-5", "claude-fable-5", "claude-sonnet-4-6"]
+        assert cfg.selectable_claude_models(discovered) == discovered
+
+    def test_no_patterns_is_a_noop(self):
+        cfg = self._cfg(excluded=[])
+        discovered = ["claude-opus-5", "claude-fable-5"]
+        assert cfg.selectable_claude_models(discovered) == discovered
+
+    def test_malformed_mapping_value_matches_nothing(self):
+        # Regression: a YAML mapping is invalid for this list-typed field, and
+        # the coercion layer leaves it in place (with a warning). Its keys must
+        # NOT become active exclusion patterns — {haiku: false} once pruned the
+        # haiku model because the matcher iterated the dict by key.
+        from nerve.config import AgentConfig, NerveConfig
+
+        agent = AgentConfig.from_dict({
+            "model": "claude-opus-5",
+            "model_discovery_excluded_models": {"haiku": False},
+        })
+        cfg = NerveConfig(agent=agent)
+        discovered = [
+            "claude-opus-5", "claude-haiku-4-5-20251001", "claude-sonnet-4-6",
+        ]
+        assert cfg.selectable_claude_models(discovered) == discovered
+        assert agent.is_model_discovery_excluded(
+            "claude-haiku-4-5-20251001"
+        ) is False
+
+    def test_configured_default_is_never_pruned(self):
+        # The default leads the picker even when it matches an exclusion.
+        cfg = self._cfg(model="claude-opus-5", excluded=["opus"])
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_all_discovered_excluded_keeps_only_default(self):
+        # Not a discovery failure: must NOT fall back to the built-in list
+        # (which would re-introduce IDs) — just the configured default.
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        cfg = self._cfg(model="claude-opus-5", excluded=["claude"])
+        got = cfg.selectable_claude_models([
+            "claude-3-5-haiku-20241022", "claude-2.1",
+        ])
+        assert got == ["claude-opus-5"]
+        assert not (set(DEFAULT_CLAUDE_MODELS) - {"claude-opus-5"}) & set(got)
+
+    def test_explicit_models_are_not_filtered(self):
+        # An explicit agent.models list is authoritative: exclusions do not
+        # apply, so config can intentionally override an exclusion.
+        cfg = self._cfg(
+            model="claude-opus-5",
+            models=["claude-3-5-haiku-20241022"],
+            excluded=["claude-3-5-haiku"],
+        )
+        got = cfg.selectable_claude_models([
+            "claude-opus-5", "claude-sonnet-4-6",
+        ])
+        assert got == ["claude-opus-5", "claude-3-5-haiku-20241022"]
+
+    def test_builtin_fallback_is_not_filtered(self):
+        # With no discovery (discovered=None), the built-in list stands
+        # untouched — exclusions target discovery only.
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        cfg = self._cfg(excluded=["haiku"])
+        assert cfg.claude_models == cfg.selectable_claude_models()
+        for model_id in DEFAULT_CLAUDE_MODELS:
+            assert model_id in cfg.claude_models
+
+    def test_bedrock_configured_models_are_not_filtered(self):
+        from nerve.config import AgentConfig, NerveConfig, ProviderConfig
+
+        cfg = NerveConfig(
+            provider=ProviderConfig(type="bedrock"),
+            agent=AgentConfig.from_dict({
+                "model": "us.anthropic.claude-opus-5",
+                "models": ["us.anthropic.claude-3-5-haiku-20241022"],
+                "model_discovery_excluded_models": ["haiku"],
+            }),
+        )
+        assert cfg.claude_models == [
+            "us.anthropic.claude-opus-5",
+            "us.anthropic.claude-3-5-haiku-20241022",
+        ]
+
+    def test_order_and_dedup_preserved_after_filtering(self):
+        cfg = self._cfg(model="claude-opus-5", excluded=["fable"])
+        got = cfg.selectable_claude_models([
+            "claude-sonnet-4-6", "claude-fable-5", "claude-opus-5",
+            "claude-sonnet-4-6",  # duplicate
+        ])
+        # Default first; discovery order otherwise; fable pruned; deduped.
+        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+
+    def test_key_recognized_by_validator(self):
+        merged = {"agent": {"model_discovery_excluded_models": ["haiku"]}}
         assert validate_config_keys(merged) == []
 
 

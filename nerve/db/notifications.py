@@ -5,6 +5,19 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from nerve.identity import UNATTRIBUTED, Attribution
+
+
+def _loads_object(raw: object) -> dict:
+    """Parse a JSON column into a dict, tolerating NULL and bad values."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 
 class NotificationStore:
     """Mixin providing notification CRUD operations."""
@@ -96,9 +109,157 @@ class NotificationStore:
             return [dict(row) async for row in cursor]
 
     async def answer_notification(
-        self, notification_id: str, answer: str, answered_by: str,
+        self,
+        notification_id: str,
+        answer: str,
+        answered_by: str,
+        actor: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
+        """Record an answer and retain the transport actor in metadata.
+
+        ``actor`` is the user ID within the transport (a Telegram or Slack
+        user ID). ``attribution.actor_id`` is the person who answered, written
+        to ``answered_by_actor_id``. An answer names its own person, so the
+        cause is not stored.
+        """
         now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            async with self.db.execute(
+                """SELECT metadata FROM notifications
+                   WHERE id = ? AND status = 'pending'""",
+                (notification_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return False
+                metadata = _loads_object(row[0])
+            if actor:
+                metadata["answered_by_actor"] = actor
+            await self.db.execute(
+                """UPDATE notifications
+                   SET answer = ?, answered_by = ?, answered_at = ?,
+                       status = 'answered', metadata = ?,
+                       answered_by_actor_id = ?
+                   WHERE id = ?""",
+                (
+                    answer,
+                    answered_by,
+                    now,
+                    json.dumps(metadata),
+                    attribution.actor_id,
+                    notification_id,
+                ),
+            )
+        return True
+
+    async def claim_pending_approval(
+        self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Take a pending approval, so one presser acts on it.
+
+        An approval runs its dispatcher before the row is settled, and that
+        can take seconds, so reading the status first cannot decide who
+        acts: two presses arriving together both see a pending row. This
+        write decides. It stamps ``answered_at`` only while the row is
+        pending and unstamped, so exactly one caller sees a row change and
+        the action behind the card runs once.
+
+        The row stays pending, because the dispatcher may answer with a
+        snooze and keep it that way. ``answered_at`` alone is the claim, so
+        :meth:`snooze_notification` clears it and the card that resurfaces
+        can be pressed again. A claim left behind by a process that died
+        mid-dispatch refuses later presses until the expiry sweep takes the
+        row, which is what an approval nobody answers does in any case.
+
+        The same write stores ``attribution.actor_id`` (the person who
+        decides) in ``answered_by_actor_id``. The expiry sweep can take the
+        row while the dispatcher runs; the action then runs, the row is
+        expired, and it still names who decided.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        result = await self._write(
+            """UPDATE notifications SET answered_at = ?, answered_by_actor_id = ?
+               WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
+            (now, attribution.actor_id, notification_id),
+        )
+        return result.rowcount == 1
+
+    async def record_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+        target: str = "",
+        message_id: str = "",
+    ) -> None:
+        """Record or replace a delivery within one transport target."""
+        now = datetime.now(timezone.utc).isoformat()
+        await self._write(
+            """INSERT INTO notification_deliveries
+                   (notification_id, channel, target, message_id, delivered_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(notification_id, channel, target) DO UPDATE SET
+                   message_id = excluded.message_id,
+                   delivered_at = excluded.delivered_at""",
+            (notification_id, channel, target, message_id, now),
+        )
+
+    async def get_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+        target: str,
+    ) -> dict | None:
+        """Return a notification's delivery in one exact channel target."""
+        async with self.db.execute(
+            """SELECT * FROM notification_deliveries
+               WHERE notification_id = ? AND channel = ? AND target = ?""",
+            (notification_id, channel, target),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_latest_notification_delivery(
+        self,
+        notification_id: str,
+        channel: str,
+    ) -> dict | None:
+        """Return the most recent delivery through one transport."""
+        async with self.db.execute(
+            """SELECT * FROM notification_deliveries
+               WHERE notification_id = ? AND channel = ?
+               ORDER BY delivered_at DESC, rowid DESC
+               LIMIT 1""",
+            (notification_id, channel),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def find_pending_question_for_delivery(
+        self,
+        channel: str,
+        target: str,
+    ) -> dict | None:
+        """Find the newest pending question delivered to one exact target."""
+        async with self.db.execute(
+            """SELECT n.*, s.title AS session_title
+               FROM notification_deliveries d
+               JOIN notifications n ON n.id = d.notification_id
+               LEFT JOIN sessions s ON n.session_id = s.id
+               WHERE d.channel = ? AND d.target = ?
+                 AND n.status = 'pending' AND n.type = 'question'
+               ORDER BY n.created_at DESC
+               LIMIT 1""",
+            (channel, target),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def dismiss_notification(
+        self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it."""
         async with self._atomic():
             async with self.db.execute(
                 "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
@@ -108,30 +269,24 @@ class NotificationStore:
                     return False
             await self.db.execute(
                 """UPDATE notifications
-                   SET answer = ?, answered_by = ?, answered_at = ?, status = 'answered'
+                   SET status = 'dismissed', dismissed_by_actor_id = ?
                    WHERE id = ?""",
-                (answer, answered_by, now, notification_id),
+                (attribution.actor_id, notification_id),
             )
         return True
 
-    async def dismiss_notification(self, notification_id: str) -> bool:
-        async with self._atomic():
-            async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
-                (notification_id,),
-            ) as cursor:
-                if not await cursor.fetchone():
-                    return False
-            await self.db.execute(
-                "UPDATE notifications SET status = 'dismissed' WHERE id = ?",
-                (notification_id,),
-            )
-        return True
+    async def dismiss_all_notifications(
+        self, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
+        """Dismiss all pending non-question notifications. Returns count dismissed.
 
-    async def dismiss_all_notifications(self) -> int:
-        """Dismiss all pending non-question notifications. Returns count dismissed."""
+        ``attribution.actor_id`` is who dismissed them.
+        """
         result = await self._write(
-            "UPDATE notifications SET status = 'dismissed' WHERE status = 'pending' AND type = 'notify'",
+            """UPDATE notifications
+               SET status = 'dismissed', dismissed_by_actor_id = ?
+               WHERE status = 'pending' AND type = 'notify'""",
+            (attribution.actor_id,),
         )
         return result.rowcount
 
@@ -212,6 +367,7 @@ class NotificationStore:
 
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
         """Queue a pending notification for re-delivery.
 
@@ -224,6 +380,13 @@ class NotificationStore:
         ``redeliver_at`` again — each snooze buys another cycle, up to
         ``config.notifications.max_redeliveries``.
 
+        Clearing ``answered_at`` releases the claim
+        :meth:`claim_pending_approval` took, so the card that resurfaces
+        can be pressed again.
+
+        ``attribution.actor_id`` is who snoozed it, written to
+        ``answered_by_actor_id``. A later decision replaces it.
+
         Returns True on success, False if the row is not pending.
         """
         async with self._atomic():
@@ -234,9 +397,12 @@ class NotificationStore:
                 if not await cursor.fetchone():
                     return False
             await self.db.execute(
-                """UPDATE notifications SET redeliver_at = ?, expires_at = ?
+                """UPDATE notifications
+                   SET redeliver_at = ?, expires_at = ?, answered_at = NULL,
+                       answered_by_actor_id = ?
                    WHERE id = ?""",
-                (redeliver_at, new_expires_at, notification_id),
+                (redeliver_at, new_expires_at, attribution.actor_id,
+                 notification_id),
             )
         return True
 
@@ -324,19 +490,25 @@ class NotificationStore:
         action: str = "silence",
         created_by: str = "",
         expires_at: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Insert a silence rule.
 
         ``pattern`` is a case-insensitive regex the notification service
         matches against ``title + "\\n" + body``. ``expires_at`` NULL =
-        permanent. Returns the freshly-inserted row.
+        permanent. ``created_by`` is the origin (``web`` or a session ID);
+        ``attribution`` is who created the rule and on whose behalf.
+        Returns the freshly-inserted row.
         """
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
             """INSERT INTO notification_silences
-               (id, pattern, action, reason, created_by, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (silence_id, pattern, action, reason, created_by, now, expires_at),
+               (id, pattern, action, reason, created_by, created_at, expires_at,
+                created_by_actor_id, caused_by_actor_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (silence_id, pattern, action, reason, created_by, now, expires_at,
+             attribution.actor_id, attribution.caused_by_actor_id),
         )
         row = await self.get_silence(silence_id)
         return row or {"id": silence_id, "pattern": pattern}

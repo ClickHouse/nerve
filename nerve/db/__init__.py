@@ -30,12 +30,16 @@ async def init_db(db_path: Path | None = None, workspace: Path | None = None) ->
         db_path: Path to the SQLite file. Defaults to ``~/.nerve/nerve.db``.
         workspace: Workspace root for resolving task file paths during FTS
             reseed. When omitted, the DB falls back to the DB's parent dir.
+
+    The global is set only after ``connect()`` succeeds, so ``get_db()`` never
+    returns a database that failed to open or migrate.
     """
     global _db
     if db_path is None:
         db_path = paths.db_path()
-    _db = Database(db_path, workspace=workspace)
-    await _db.connect()
+    db = Database(db_path, workspace=workspace)
+    await db.connect()
+    _db = db
     return _db
 
 
@@ -47,10 +51,27 @@ async def close_db() -> None:
         _db = None
 
 
+def global_system_actor_id() -> str | None:
+    """The system actor ID of the global database.
+
+    ``None`` before :func:`init_db` and after the database closes. Reads the
+    connection's cache, so a system actor that startup re-keyed gives its
+    new ID.
+    """
+    db = _db
+    if db is None:
+        return None
+    try:
+        return db.system_actor_id
+    except RuntimeError:  # closed without close_db()
+        return None
+
+
 __all__ = [
     "Database",
     "SCHEMA_VERSION",
     "get_db",
     "init_db",
     "close_db",
+    "global_system_actor_id",
 ]

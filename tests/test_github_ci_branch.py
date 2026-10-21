@@ -121,7 +121,7 @@ async def test_fetch_populates_ci_branch_metadata(monkeypatch):
     ]
 
     async def fake_exec(*args, **kwargs):
-        return _FakeProc(json.dumps(notifications).encode())
+        return _FakeProc("\n".join(json.dumps(n) for n in notifications).encode())
 
     monkeypatch.setattr(
         "nerve.sources.github.asyncio.create_subprocess_exec", fake_exec,

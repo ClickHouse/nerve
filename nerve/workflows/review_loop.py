@@ -46,6 +46,7 @@ from nerve.db.review_loops import (
     RL_RUNNING_STATUSES,
 )
 from nerve.db.workflow_runs import TERMINAL_STATUSES
+from nerve.identity import UNATTRIBUTED, Attribution, attribution_for
 from nerve.notifications import handlers as _handlers
 from nerve.utils.time import utc_now_iso
 from nerve.workflows.service import ENGINE_BACKENDS, ENGINE_CODEX, WorkflowRunError
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig, ReviewLoopConfig
     from nerve.db import Database
+    from nerve.identity import Actor
     from nerve.workflows.service import WorkflowRunService
 
 logger = logging.getLogger(__name__)
@@ -337,8 +339,14 @@ class ReviewLoopService:
         verifier_leg: dict | None = None,
         created_by: str = "user",
         autostart: bool = True,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
-        """Validate config, persist the loop, and kick the first leg."""
+        """Validate config, persist the loop, and kick the first leg.
+
+        ``created_by`` is the origin text. ``attribution`` names who created
+        the loop and on whose behalf: the person for a REST request, the
+        system actor and the calling session's cause for a tool call. Every
+        leg is a run with that cause, so its session has that cause."""
         goal = (goal or "").strip()
         verifier = (verifier or "").strip()
         if not goal:
@@ -405,6 +413,7 @@ class ReviewLoopService:
             max_iterations=iters,
             budget_usd=round(budget, 2),
             created_by=created_by,
+            attribution=attribution,
         )
         if session_id:
             # Name the observer chat after the goal (Haiku title model) —
@@ -439,7 +448,19 @@ class ReviewLoopService:
             self._spawn(self._kick(loop_id), f"review-loop-kick-{loop_id}")
         return loop
 
-    async def kill_loop(self, loop_id: str, reason: str = "", killed_by: str = "") -> dict:
+    async def kill_loop(
+        self,
+        loop_id: str,
+        reason: str = "",
+        killed_by: str = "",
+        *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """Kill a loop and its current leg.
+
+        ``killed_by`` is the origin text. ``attribution`` names who killed
+        the loop and on whose behalf; the current leg's run records the
+        same kill."""
         loop = await self.db.get_review_loop(loop_id)
         if loop is None:
             raise ReviewLoopError(f"no such review loop: {loop_id}")
@@ -449,7 +470,7 @@ class ReviewLoopService:
         async with self._lock(loop_id):
             flipped = await self.db.transition_review_loop(
                 loop_id, "killed", expect=RL_OPEN_STATUSES,
-                failure_reason=detail,
+                failure_reason=detail, kill_attribution=attribution,
             )
             loop = await self.db.get_review_loop(loop_id) or loop
             if flipped:
@@ -458,7 +479,7 @@ class ReviewLoopService:
                     with contextlib.suppress(Exception):
                         await self.runs.kill_run(
                             run_id, reason=f"review loop {loop_id} killed",
-                            killed_by=killed_by,
+                            killed_by=killed_by, attribution=attribution,
                         )
                 await self._milestone(
                     loop, f"🛑 **Review loop {loop_id} killed** — {detail}",
@@ -477,6 +498,9 @@ class ReviewLoopService:
     async def list_attempts(self, loop_id: str) -> list[dict]:
         return await self.db.list_loop_attempts(loop_id)
 
+    async def list_decisions(self, loop_id: str) -> list[dict]:
+        return await self.db.list_review_loop_decisions(loop_id)
+
     def public_loop(self, loop: dict) -> dict:
         out = dict(loop)
         for key in ("goal_prompt", "verifier_prompt"):
@@ -490,66 +514,92 @@ class ReviewLoopService:
     # ------------------------------------------------------------------ #
 
     async def handle_decision(
-        self, loop_id: str, decision: str, decided_by: str = "user",
+        self,
+        loop_id: str,
+        decision: str,
+        decided_by: str = "user",
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
         """Apply a user decision to a parked loop. Returns
-        ``{ok, message, snooze_until?}``; stale decisions are recorded but
-        not applied (never crash the answer route)."""
+        ``{ok, applied, message, snooze_until?}``; stale decisions are recorded but
+        not applied (never crash the answer route).
+
+        ``decided_by`` is the origin text (``api``, ``approval-card``).
+        ``attribution`` names who decided. Each decision on an existing loop
+        is appended to ``review_loop_decisions``. A decision that changes the
+        loop is written in the same transaction as the change, with
+        ``applied`` true; ``ok`` can still be false when the leg that it
+        resumes does not start. A decision on a loop that is not parked is
+        recorded with ``applied`` false. An unknown decision string is not
+        recorded. ``remind_4h`` is refused and not recorded: a reminder
+        snoozes the decision card, so it is an answer on the card (see
+        :meth:`_card_reminder`)."""
         decision = (decision or "").strip()
         iterate = _ITERATE_RE.match(decision)
         budget_grant = _BUDGET_RE.match(decision)
         if decision not in _DECISIONS and not iterate and not budget_grant:
-            return {"ok": False, "message": f"unknown decision: {decision!r}"}
+            return {
+                "ok": False, "applied": False,
+                "message": f"unknown decision: {decision!r}",
+            }
+        if decision == "remind_4h":
+            return {
+                "ok": False, "applied": False,
+                "message": "remind_4h is an answer on the decision card",
+            }
         loop = await self.db.get_review_loop(loop_id)
         if loop is None:
-            return {"ok": False, "message": f"no such review loop: {loop_id}"}
-
-        if decision == "remind_4h":
-            snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-            return {"ok": True, "message": "snoozed 4h", "snooze_until": snooze}
+            return {
+                "ok": False, "applied": False,
+                "message": f"no such review loop: {loop_id}",
+            }
 
         async with self._lock(loop_id):
             loop = await self.db.get_review_loop(loop_id)
             if loop is None or loop["status"] != "awaiting_user":
-                return {
-                    "ok": False,
-                    "message": (
-                        f"review loop {loop_id} is "
-                        f"{(loop or {}).get('status', 'gone')} — decision "
-                        "recorded but not applied"
-                    ),
-                }
+                return await self._decision_not_applied(
+                    loop_id, decision, decided_by, attribution,
+                )
 
             if decision == "accept":
-                flipped = await self.db.transition_review_loop(
-                    loop_id, "passed", expect=("awaiting_user",),
-                    failure_reason=None,
-                )
-                if flipped:
-                    loop = await self.db.get_review_loop(loop_id) or loop
-                    await self._resolve_cards(loop_id, f"decided:{decision}")
-                    await self._milestone(
-                        loop,
-                        f"✅ **Review loop {loop_id} accepted as done** by {decided_by} "
-                        f"(spent ${loop.get('spent_usd') or 0.0:.2f}).",
-                        notify=True,
+                if not await self.db.apply_review_loop_decision(
+                    loop_id, decision, to_status="passed",
+                    fields={"failure_reason": None},
+                    message="accepted as done",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    return await self._decision_not_applied(
+                        loop_id, decision, decided_by, attribution,
                     )
-                return {"ok": bool(flipped), "message": "accepted as done"}
+                loop = await self.db.get_review_loop(loop_id) or loop
+                await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
+                await self._milestone(
+                    loop,
+                    f"✅ **Review loop {loop_id} accepted as done** by {decided_by} "
+                    f"(spent ${loop.get('spent_usd') or 0.0:.2f}).",
+                    notify=True,
+                )
+                return {"ok": True, "applied": True, "message": "accepted as done"}
 
             if decision == "abandon":
-                flipped = await self.db.transition_review_loop(
-                    loop_id, "failed", expect=("awaiting_user",),
-                    failure_reason="abandoned",
-                )
-                if flipped:
-                    loop = await self.db.get_review_loop(loop_id) or loop
-                    await self._resolve_cards(loop_id, f"decided:{decision}")
-                    await self._milestone(
-                        loop,
-                        f"❌ **Review loop {loop_id} abandoned** by {decided_by}.",
-                        notify=True,
+                if not await self.db.apply_review_loop_decision(
+                    loop_id, decision, to_status="failed",
+                    fields={"failure_reason": "abandoned"},
+                    message="abandoned",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    return await self._decision_not_applied(
+                        loop_id, decision, decided_by, attribution,
                     )
-                return {"ok": bool(flipped), "message": "abandoned"}
+                loop = await self.db.get_review_loop(loop_id) or loop
+                await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
+                await self._milestone(
+                    loop,
+                    f"❌ **Review loop {loop_id} abandoned** by {decided_by}.",
+                    notify=True,
+                )
+                return {"ok": True, "applied": True, "message": "abandoned"}
 
             reason = str(loop.get("failure_reason") or "")
             updates: dict = {"failure_reason": None, "discovery_rounds": 0}
@@ -573,23 +623,31 @@ class ReviewLoopService:
                 updates["max_iterations"] = new_max
                 note = f"max_iterations={new_max}"
 
+            adopted: list[dict] = []
             if decision == "adopt_and_continue":
                 verdict = await self._last_verdict(loop_id)
                 if verdict:
-                    loop, adopted = await self._adopt_proposals(
-                        loop, verdict, force=True,
-                    )
+                    # Adopted criteria are written with the decision below.
+                    adopted = self._select_adoptions(loop, verdict, force=True)
                     if adopted:
-                        await self._milestone(
-                            loop,
-                            f"➕ Adopted {len(adopted)} proposed criteria by "
-                            f"{decided_by}: "
-                            + ", ".join(a["id"] for a in adopted),
-                        )
+                        updates["criteria"] = loop["criteria"]
 
-            await self.db.update_review_loop(loop_id, updates)
+            if not await self.db.apply_review_loop_decision(
+                loop_id, decision, fields=updates, message=note,
+                decided_by=decided_by, attribution=attribution,
+            ):
+                return await self._decision_not_applied(
+                    loop_id, decision, decided_by, attribution,
+                )
             loop = await self.db.get_review_loop(loop_id) or loop
-            await self._resolve_cards(loop_id, f"decided:{decision}")
+            if adopted:
+                await self._milestone(
+                    loop,
+                    f"➕ Adopted {len(adopted)} proposed criteria by "
+                    f"{decided_by}: "
+                    + ", ".join(a["id"] for a in adopted),
+                )
+            await self._resolve_cards(loop_id, f"decided:{decision}", attribution)
             # Resume where the loop actually stopped: an unverified
             # implementation resumes at the VERIFIER (re-dispatching the
             # implementer would waste a paid iteration), everything else at
@@ -601,9 +659,35 @@ class ReviewLoopService:
                 ok = await self._dispatch_implementer(loop, expect=("awaiting_user",))
             return {
                 "ok": ok,
+                "applied": True,
                 "message": f"resumed ({note}, next leg: {role})"
                 if ok else "resume dispatch lost a race — check loop status",
             }
+
+    async def _decision_not_applied(
+        self,
+        loop_id: str,
+        decision: str,
+        decided_by: str,
+        attribution: Attribution,
+        *,
+        reason: str = "",
+    ) -> dict:
+        """Record a decision that found the loop in a state it does not
+        apply to, or that ``reason`` says did not apply, and return the
+        result. Caller holds the loop lock."""
+        loop = await self.db.get_review_loop(loop_id)
+        status = (loop or {}).get("status", "gone")
+        message = reason or (
+            f"review loop {loop_id} is {status}; decision recorded but "
+            "not applied"
+        )
+        if loop is not None:
+            await self.db.record_review_loop_decision(
+                loop_id, decision, applied=False, message=message,
+                decided_by=decided_by, attribution=attribution,
+            )
+        return {"ok": False, "applied": False, "message": message}
 
     async def _resume_role(self, loop_id: str, reason: str) -> str:
         """Which leg a decision-resume should dispatch: the verifier when
@@ -622,11 +706,16 @@ class ReviewLoopService:
             return "verifier"
         return "implementer"
 
-    async def _resolve_cards(self, loop_id: str, resolution: str) -> None:
+    async def _resolve_cards(
+        self, loop_id: str, resolution: str, attribution: Attribution,
+    ) -> None:
         """Flip any still-pending decision cards for this loop to answered —
         decisions can arrive via REST/the loop card, which bypasses the
         notification route; without this, stale live cards accumulate and an
-        old card can decide a NEWER park episode."""
+        old card can decide a NEWER park episode.
+
+        ``attribution`` names who resolved the cards: the person who decided,
+        or the system actor when a new park episode supersedes them."""
         for _ in range(5):  # defensive bound
             card = None
             with contextlib.suppress(Exception):
@@ -638,6 +727,7 @@ class ReviewLoopService:
             try:
                 await self.db.answer_notification(
                     card["id"], resolution, "review-loop",
+                    attribution=attribution,
                 )
                 await broadcaster.broadcast("__global__", {
                     "type": "notification_answered",
@@ -645,6 +735,7 @@ class ReviewLoopService:
                     "session_id": card.get("session_id"),
                     "answer": resolution,
                     "answered_by": "review-loop",
+                    "actor_id": attribution.actor_id,
                 })
             except Exception:  # noqa: BLE001
                 logger.exception("review loop card resolution failed for %s", loop_id)
@@ -652,11 +743,23 @@ class ReviewLoopService:
 
     async def _dispatch_decision(
         self, notif: dict, target_id: str, decision: str, config: Any,
+        *, actor: Actor | None = None,
     ) -> _handlers.DispatchResult:
-        """Async approval dispatcher (registered as 'review-loop')."""
-        result = await self.handle_decision(
-            target_id, decision, decided_by="approval-card",
-        )
+        """Async approval dispatcher (registered as 'review-loop').
+
+        ``actor`` is the person who answered the card, ``None`` for a
+        channel answer (see :class:`nerve.notifications.handlers.Dispatcher`).
+        The decision records that person as actor and cause.
+        """
+        attribution = attribution_for(actor)
+        after_snooze = None
+        if (decision or "").strip() == "remind_4h":
+            result, after_snooze = await self._card_reminder(target_id, attribution)
+        else:
+            result = await self.handle_decision(
+                target_id, decision, decided_by="approval-card",
+                attribution=attribution,
+            )
         return _handlers.DispatchResult(
             ok=bool(result.get("ok")),
             audit_event={
@@ -668,7 +771,57 @@ class ReviewLoopService:
                 "message": str(result.get("message") or ""),
             },
             snooze_until=result.get("snooze_until"),
+            after_snooze=after_snooze,
         )
+
+    async def _card_reminder(
+        self, loop_id: str, attribution: Attribution,
+    ) -> tuple[dict, Callable[[bool], Any] | None]:
+        """A "Remind me in 4h" answer on the loop's decision card.
+
+        A reminder changes no loop column; the notification service snoozes
+        the card after the dispatcher returns. So the decision row waits for
+        that write: the returned callback (``DispatchResult.after_snooze``)
+        records the reminder as applied when the card was snoozed, and as not
+        applied, with the reason, when the card was no longer pending. A
+        reminder on a loop that is not parked is recorded as not applied at
+        once and asks for no snooze.
+        """
+        decided_by = "approval-card"
+        if await self.db.get_review_loop(loop_id) is None:
+            return {
+                "ok": False, "applied": False,
+                "message": f"no such review loop: {loop_id}",
+            }, None
+        async with self._lock(loop_id):
+            loop = await self.db.get_review_loop(loop_id)
+            if loop is None or loop["status"] != "awaiting_user":
+                result = await self._decision_not_applied(
+                    loop_id, "remind_4h", decided_by, attribution,
+                )
+                return result, None
+
+        async def record(snoozed: bool) -> None:
+            async with self._lock(loop_id):
+                if not snoozed:
+                    await self._decision_not_applied(
+                        loop_id, "remind_4h", decided_by, attribution,
+                        reason="the decision card was no longer pending, so "
+                        "it was not snoozed",
+                    )
+                elif not await self.db.apply_review_loop_decision(
+                    loop_id, "remind_4h", message="snoozed 4h",
+                    decided_by=decided_by, attribution=attribution,
+                ):
+                    await self._decision_not_applied(
+                        loop_id, "remind_4h", decided_by, attribution,
+                    )
+
+        snooze = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+        return {
+            "ok": True, "applied": False, "message": "snooze for 4h requested",
+            "snooze_until": snooze,
+        }, record
 
     # ------------------------------------------------------------------ #
     #  Leg dispatch                                                       #
@@ -741,6 +894,11 @@ class ReviewLoopService:
 
     def _settled(self, loop: dict) -> float:
         return float(loop.get("spent_usd") or 0.0)
+
+    def _leg_attribution(self, loop: dict) -> Attribution:
+        """A leg's run: created by the system actor, on behalf of the
+        loop's cause. A NULL loop cause stays NULL."""
+        return attribution_for(self.db.system_actor, loop.get("caused_by_actor_id"))
 
     def _reserve(self, loop: dict) -> float:
         return float(loop["budget_usd"]) * float(self.rl.verifier_reserve_fraction)
@@ -857,6 +1015,7 @@ class ReviewLoopService:
                 title=f"{loop['title']} · {'impl' if role == 'implementer' else 'verify'} #{iteration}",
                 created_by=f"{_LOOP_PREFIX}{loop_id}",
                 run_id=run_id,
+                attribution=self._leg_attribution(loop),
             )
             await self.db.mark_attempt_running(run_id)
         except WorkflowRunError as e:
@@ -887,6 +1046,7 @@ class ReviewLoopService:
             with contextlib.suppress(Exception):
                 await self.runs.kill_run(
                     run_id, reason=f"review loop {loop_id} ended during dispatch",
+                    attribution=self._leg_attribution(loop),
                 )
             return False
         await self._broadcast(fresh)
@@ -984,10 +1144,15 @@ class ReviewLoopService:
                     await self._after_verifier(loop, attempt, run)
                 return
             if status == "killed":
-                # A directly-stopped leg session is user intent: abort.
+                # A directly-stopped leg session is user intent: abort. The
+                # loop records who killed the leg, when the run knows it.
                 flipped = await self.db.transition_review_loop(
                     loop_id, "killed", expect=RL_RUNNING_STATUSES,
                     failure_reason=f"{role} leg killed",
+                    kill_attribution=Attribution(
+                        actor_id=run.get("killed_by_actor_id"),
+                        caused_by_actor_id=run.get("killed_caused_by_actor_id"),
+                    ),
                 )
                 if flipped:
                     loop = await self.db.get_review_loop(loop_id) or loop
@@ -1239,6 +1404,17 @@ class ReviewLoopService:
         """Append-only adoption of blocking proposals with caps + dedup.
         ``force`` (adopt_and_continue decision) ignores the per-iteration
         cap but never the total cap."""
+        adopted = self._select_adoptions(loop, verdict, force=force)
+        if adopted:
+            await self.db.update_review_loop(loop["id"], {"criteria": loop["criteria"]})
+            loop = await self.db.get_review_loop(loop["id"]) or loop
+        return loop, adopted
+
+    def _select_adoptions(
+        self, loop: dict, verdict: dict, force: bool = False,
+    ) -> list[dict]:
+        """The blocking proposals that :meth:`_adopt_proposals` adopts,
+        appended to ``loop["criteria"]`` in place. Writes nothing."""
         existing = {
             " ".join(c["statement"].lower().split()) for c in loop["criteria"]
         }
@@ -1269,10 +1445,7 @@ class ReviewLoopService:
             existing.add(key)
             budget_slots -= 1
             next_idx += 1
-        if adopted:
-            await self.db.update_review_loop(loop["id"], {"criteria": loop["criteria"]})
-            loop = await self.db.get_review_loop(loop["id"]) or loop
-        return loop, adopted
+        return adopted
 
     async def _no_progress(self, loop: dict, attempt: dict, verdict: dict) -> bool:
         attempts = await self.db.list_loop_attempts(loop["id"])
@@ -1603,7 +1776,9 @@ class ReviewLoopService:
         # Supersede any earlier still-pending card — a new park episode must
         # have exactly ONE live card, or a stale action decides a state it
         # was never about.
-        await self._resolve_cards(loop["id"], "superseded")
+        await self._resolve_cards(
+            loop["id"], "superseded", attribution_for(self.db.system_actor),
+        )
         await self._milestone(
             loop,
             f"⏸️ **Review loop {loop['id']} needs a decision** ({reason}) — "
@@ -1792,6 +1967,7 @@ class ReviewLoopService:
                         title=f"{loop['title']} · {role} #{attempt['iteration']} (recovered)",
                         created_by=f"{_LOOP_PREFIX}{loop_id}",
                         run_id=run_id,
+                        attribution=self._leg_attribution(loop),
                     )
                     await self.db.mark_attempt_running(run_id)
                 except Exception as e:  # noqa: BLE001
@@ -1910,6 +2086,12 @@ class ReviewLoopService:
             try:
                 await self.db.add_message(
                     session_id, "assistant", text, channel="review-loop",
+                    # A milestone is written in the assistant's voice into
+                    # the observer's chat, so it is unattributed like every
+                    # other assistant row. The loop's own sessions (its legs)
+                    # carry the system principal, stamped where they are
+                    # created in nerve/workflows/service.py.
+                    actor=None,
                 )
                 message = {
                     "role": "assistant", "content": text,

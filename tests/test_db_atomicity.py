@@ -220,24 +220,72 @@ class TestWriteSerialization:
 
 
 @pytest.mark.asyncio
+class TestAtomicBeginsBeforeReading:
+    """A read inside _atomic() and the write that depends on it are one
+    transaction, even against another connection."""
+
+    async def test_transaction_is_open_before_the_first_statement(
+        self, db: Database,
+    ):
+        async with db._atomic():
+            assert db.db.in_transaction
+        assert not db.db.in_transaction
+
+    async def test_other_connection_cannot_commit_between_read_and_write(
+        self, db: Database,
+    ):
+        await db.set_sync_cursor("counter", "1")
+        async with db._atomic():
+            async with db.db.execute(
+                "SELECT cursor FROM sync_cursors WHERE source = 'counter'",
+            ) as cur:
+                value = int((await cur.fetchone())[0])
+            ext = sqlite3.connect(str(db.db_path), timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    ext.execute(
+                        "UPDATE sync_cursors SET cursor = '100' "
+                        "WHERE source = 'counter'"
+                    )
+            finally:
+                ext.close()
+            await db.db.execute(
+                "UPDATE sync_cursors SET cursor = ? WHERE source = 'counter'",
+                (str(value + 1),),
+            )
+        assert await db.get_sync_cursor("counter") == "2"
+        # The lock ends with the transaction.
+        _external_commit(db.db_path)
+
+    async def test_read_only_body_error_leaves_connection_clean(
+        self, db: Database,
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            async with db._atomic():
+                raise RuntimeError("boom")
+        assert not db.db.in_transaction
+        _external_commit(db.db_path)
+
+
+@pytest.mark.asyncio
 class TestWriteResultPlumbing:
     """lastrowid/rowcount survive the migration to _write()."""
 
     async def test_lastrowid_via_log_session_event(self, db: Database):
-        await db.create_session("s1")
+        await db.create_session("s1", actor=None)
         first = await db.log_session_event("s1", "created")
         second = await db.log_session_event("s1", "connected")
         assert isinstance(first, int) and isinstance(second, int)
         assert second > first
 
     async def test_rowcount_via_claim_wakeup(self, db: Database):
-        await db.create_session("s2")
+        await db.create_session("s2", actor=None)
         wid = await db.add_wakeup("s2", "wake", "2999-01-01T00:00:00+00:00")
         assert await db.claim_wakeup(wid) is True
         assert await db.claim_wakeup(wid) is False  # already fired
 
     async def test_rowcount_via_cancel_wakeups(self, db: Database):
-        await db.create_session("s3")
+        await db.create_session("s3", actor=None)
         await db.add_wakeup("s3", "wake", "2999-01-01T00:00:00+00:00")
         assert await db.cancel_wakeups_for_session("s3") == 1
         assert await db.cancel_wakeups_for_session("s3") == 0

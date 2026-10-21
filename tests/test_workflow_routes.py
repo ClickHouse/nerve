@@ -9,6 +9,7 @@ so the routes exercise genuine validation/lifecycle against a fake engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -16,7 +17,18 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.db import Database
+
+from tests.actor_rows import ensure_actor_row, ensure_system_principal
+from tests.conftest import TEST_ACTOR
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 class FakeSessionManager:
@@ -38,7 +50,7 @@ class FakeSessionManager:
             source=kwargs.get("source", "workflow"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
 
 
@@ -70,6 +82,9 @@ class FakeEngine:
     def add_stop_listener(self, callback) -> None:
         pass
 
+    def watch_turns(self, session_id: str):
+        return contextlib.nullcontext(TurnWatch(TurnOutcome()))
+
 
 async def _drain(setup) -> None:
     """Execute spawned run payloads on the current (test) event loop.
@@ -90,7 +105,7 @@ async def _drain(setup) -> None:
 @pytest.mark.asyncio
 class TestWorkflowRunRoutes:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database, tmp_path, monkeypatch):
+    async def setup(self, db: Database, tmp_path, monkeypatch, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -101,14 +116,13 @@ class TestWorkflowRunRoutes:
         from nerve.gateway.routes.workflow_runs import router as wf_router
         from nerve.workflows.service import WorkflowRunService
 
-        # Auth dependency reads get_config().auth.jwt_secret — install a
-        # config with no secret so require_auth is a no-op.
         cfg = NerveConfig()
         cfg.workspace = tmp_path
-        cfg.auth.jwt_secret = ""
         cfg.workflows.runs_dir = tmp_path
         cfg.workflows.kill_grace_seconds = 0
         cfg_mod._config = cfg
+        # Create and kill record the signed-in person, a foreign key.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         engine = FakeEngine(db)
         init_deps(engine=engine, db=db)  # type: ignore[arg-type]
@@ -123,6 +137,7 @@ class TestWorkflowRunRoutes:
 
         app = FastAPI()
         app.include_router(wf_router)
+        bypass_auth(app)  # these routes are not about auth
         client = TestClient(app)
 
         ns = SimpleNamespace(
@@ -152,6 +167,8 @@ class TestWorkflowRunRoutes:
         assert body["status"] in ("pending", "running")
         assert body["budget_usd"] == 5.0
         assert body["created_by"] == "api"
+        assert body["created_by_actor_id"] == TEST_ACTOR.actor_id
+        assert body["caused_by_actor_id"] == TEST_ACTOR.actor_id
         assert body["spec"]["prompt"] == "fix issue #12 in myorg/myrepo"
 
         await _drain(setup)

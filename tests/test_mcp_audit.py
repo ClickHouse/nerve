@@ -20,7 +20,7 @@ from nerve.mcp_server.audit import build_audit_writer
 async def test_audit_writer_records_tool_call(db):
     await db.create_session(
         session_id="external:codex:t-audit",
-        source="external",
+        source="external", actor=None,
     )
     write = build_audit_writer(db)
     await write(
@@ -53,7 +53,7 @@ async def test_audit_writer_records_tool_call(db):
 async def test_audit_writer_truncates_large_payload(db):
     await db.create_session(
         session_id="external:codex:t-big",
-        source="external",
+        source="external", actor=None,
     )
     write = build_audit_writer(db)
     big_text = "X" * 10_000

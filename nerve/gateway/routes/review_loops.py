@@ -14,10 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 
 class ReviewLoopKillRequest(BaseModel):
@@ -42,7 +43,6 @@ def _service():
 async def list_review_loops(
     status: str = "",
     limit: int = 50,
-    user: dict = Depends(require_auth),
 ):
     """List loops (newest first). ``status``: 'open', an exact status, or empty."""
     service = _service()
@@ -51,22 +51,24 @@ async def list_review_loops(
 
 
 @router.get("/api/review-loops/{loop_id}")
-async def get_review_loop(loop_id: str, user: dict = Depends(require_auth)):
-    """Full loop detail: state, criteria, and the attempt ledger with
-    verdicts — everything the loop card renders."""
+async def get_review_loop(loop_id: str):
+    """Full loop detail: state, criteria, the attempt ledger with verdicts
+    (everything the loop card renders), and the decisions made on the loop,
+    with who made each one."""
     service = _service()
     loop = await service.get_loop(loop_id)
     if loop is None:
         raise HTTPException(status_code=404, detail="Review loop not found")
     attempts = await service.list_attempts(loop_id)
-    return {"loop": loop, "attempts": attempts}
+    decisions = await service.list_decisions(loop_id)
+    return {"loop": loop, "attempts": attempts, "decisions": decisions}
 
 
 _STATE_MAX_BYTES = 256 * 1024
 
 
 @router.get("/api/review-loops/{loop_id}/state")
-async def get_review_loop_state(loop_id: str, user: dict = Depends(require_auth)):
+async def get_review_loop_state(loop_id: str):
     """The implementer's handoff file (STATE.md) — the loop's primary
     artifact. Path is derived server-side from the loop row (never from
     the client), read bounded (tail)."""
@@ -102,13 +104,16 @@ async def get_review_loop_state(loop_id: str, user: dict = Depends(require_auth)
 async def kill_review_loop(
     loop_id: str,
     req: ReviewLoopKillRequest = ReviewLoopKillRequest(),
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     service = _service()
     from nerve.workflows.review_loop import ReviewLoopError
 
     try:
-        loop = await service.kill_loop(loop_id, reason=req.reason, killed_by="api")
+        loop = await service.kill_loop(
+            loop_id, reason=req.reason, killed_by="api",
+            attribution=attribution_for(actor),
+        )
     except ReviewLoopError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return service.public_loop(loop)
@@ -118,12 +123,26 @@ async def kill_review_loop(
 async def decide_review_loop(
     loop_id: str,
     req: ReviewLoopDecisionRequest,
-    user: dict = Depends(require_auth),
+    actor: Actor = Depends(require_auth),
 ):
     """Apply a decision to a parked loop — the same handler the approval
-    card's dispatcher awaits, so the card is never the only path."""
+    card's dispatcher awaits, so the card is never the only path. The loop's
+    decision history records the person who sends the request.
+
+    ``remind_4h`` is refused: it snoozes the decision card, which only the
+    card's own answer does. A decision that was not applied gives 409. An
+    applied decision whose resumed leg did not start gives 200 with ``ok``
+    false."""
+    if req.decision.strip() == "remind_4h":
+        raise HTTPException(
+            status_code=400,
+            detail="remind_4h snoozes the decision card; answer the card to use it",
+        )
     service = _service()
-    result = await service.handle_decision(loop_id, req.decision, decided_by="api")
-    if not result.get("ok"):
+    result = await service.handle_decision(
+        loop_id, req.decision, decided_by="api",
+        attribution=attribution_for(actor),
+    )
+    if not result.get("applied"):
         raise HTTPException(status_code=409, detail=result.get("message", "not applied"))
     return result

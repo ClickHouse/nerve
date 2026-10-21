@@ -18,9 +18,10 @@ export type { LucideIcon as Icon } from 'lucide-react';
 
 export {
   Activity, AlertCircle, AlertTriangle, Archive, ArchiveRestore, ArrowLeft,
-  ArrowRight, Ban, BarChart3, Bell, BellOff, BookOpen, Bot, Brain,
+  ArrowRight, ArrowUpRight, Ban, BarChart3, Bell, BellOff, BookOpen, Bot, Brain,
   Calendar, Check, CheckCheck, CheckCircle, CheckCircle2, CheckSquare,
-  ChevronDown, ChevronLeft, ChevronRight, Circle, CircleCheck,
+  ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Circle, CircleCheck, Cloud,
+  KeyRound, ListChecks, ListTree, LocateFixed, PartyPopper,
   CircleDashed, CircleDollarSign, CircleHelp, CircleX, Clock, Clock3,
   Columns3, Copy, CornerDownLeft, Cpu, Database, DollarSign, Download,
   Edit3, ExternalLink, Eye, EyeOff, File, FileCheck, FileDiff, FileEdit,
@@ -29,10 +30,11 @@ export {
   Hourglass, Inbox, Lightbulb, List, ListTodo, Loader2, Lock, LogOut, Mail,
   Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, Monitor,
   Moon, MoreHorizontal, OctagonX, PanelLeftClose, PanelLeftOpen, Paperclip,
-  Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Rocket,
+  Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Reply, Rocket,
   RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server,
-  ShieldCheck, ShieldQuestion, SlidersHorizontal, Sparkle, Sparkles,
+  ShieldCheck, ShieldQuestion, Slack, SlidersHorizontal, Sparkle, Sparkles,
   Square, SquareTerminal, Star, StickyNote, Sun, Tag, Terminal, Timer,
+  User, Users,
   Trash2, TrendingDown, TrendingUp, Unlink, Workflow, WrapText, Wrench, X,
   XCircle, Zap
 } from 'lucide-react';

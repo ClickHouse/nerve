@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 
+from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
 ACTIVE_STATUSES = ("pending", "running")
@@ -57,17 +58,27 @@ class WorkflowRunStore:
         title: str = "",
         created_by: str = "user",
         journal_dir: str | None = None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
     ) -> dict:
-        """Insert a new run in status ``pending`` and return the row."""
+        """Insert a new run in status ``pending`` and return the row.
+
+        ``created_by`` is the origin text. ``attribution`` names who created
+        the run (``created_by_actor_id``) and on whose behalf
+        (``caused_by_actor_id``); the run's session is created with that
+        cause.
+        """
         now = utc_now_iso()
         await self._write(
             """INSERT INTO workflow_runs
                (id, engine, title, spec, status, budget_usd, spent_usd,
-                created_by, journal_dir, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'pending', ?, 0.0, ?, ?, ?, ?)""",
+                created_by, journal_dir, created_at, updated_at,
+                created_by_actor_id, caused_by_actor_id)
+               VALUES (?, ?, ?, ?, 'pending', ?, 0.0, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id, engine, title, json.dumps(spec), budget_usd,
                 created_by, journal_dir, now, now,
+                attribution.actor_id, attribution.caused_by_actor_id,
             ),
         )
         run = await self.get_workflow_run(run_id)
@@ -168,6 +179,8 @@ class WorkflowRunStore:
         run_id: str,
         to_status: str,
         expect: tuple[str, ...] = ACTIVE_STATUSES,
+        *,
+        kill_attribution: Attribution | None = None,
         **fields,
     ) -> bool:
         """Atomically move a run to ``to_status`` iff its current status is
@@ -177,11 +190,19 @@ class WorkflowRunStore:
 
         Extra ``fields`` (whitelisted) are applied in the same UPDATE.
         Terminal transitions stamp ``finished_at`` unless provided.
+        ``kill_attribution`` is only for ``killed``: it names who killed the
+        run and on whose behalf, written in the same UPDATE. Without it the
+        two kill columns stay NULL (not known).
         """
         if to_status not in ALL_STATUSES:
             raise ValueError(f"unknown workflow run status: {to_status}")
+        if kill_attribution is not None and to_status != "killed":
+            raise ValueError("kill_attribution is only for the 'killed' status")
         now = utc_now_iso()
         cols = {k: v for k, v in fields.items() if k in _UPDATABLE}
+        if kill_attribution is not None:
+            cols["killed_by_actor_id"] = kill_attribution.actor_id
+            cols["killed_caused_by_actor_id"] = kill_attribution.caused_by_actor_id
         if to_status in TERMINAL_STATUSES and "finished_at" not in cols:
             cols["finished_at"] = now
         if to_status == "running" and "started_at" not in cols:

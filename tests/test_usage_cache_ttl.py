@@ -35,7 +35,7 @@ class TestSchema:
     async def test_v027_columns_default_zero(self, db: Database):
         # Schema was rolled forward by the fixture — the new columns
         # must be addable to existing rows with a 0 default.
-        await db.create_session("sess-default", source="web")
+        await db.create_session("sess-default", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-default",
             input_tokens=100,
@@ -93,7 +93,7 @@ class TestExtractSplit:
 @pytest.mark.asyncio
 class TestPersistence:
     async def test_record_persists_split(self, db: Database):
-        await db.create_session("sess-split", source="web")
+        await db.create_session("sess-split", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-split",
             input_tokens=200,
@@ -116,7 +116,7 @@ class TestPersistence:
         assert row[1] == 100
 
     async def test_session_totals_include_split(self, db: Database):
-        await db.create_session("sess-totals", source="web")
+        await db.create_session("sess-totals", source="web", actor=None)
         await db.record_turn_usage(
             session_id="sess-totals",
             input_tokens=200, output_tokens=80,
@@ -207,6 +207,31 @@ class TestPricing:
         # key — not any 4.x key, and not the silent DEFAULT fallback.
         from nerve.db.usage import MODEL_PRICING, _get_pricing
         assert _get_pricing("claude-opus-5-20260720") == MODEL_PRICING["opus-5"]
+
+    def test_opus_5_5_does_not_resolve_to_opus_5(self):
+        # "opus-5" is a substring of "opus-5-5", so "opus-5-5" must be
+        # checked first.
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        assert _get_pricing("claude-opus-5-5") == MODEL_PRICING["opus-5-5"]
+        assert (
+            _get_pricing("us.anthropic.claude-opus-5-5")
+            == MODEL_PRICING["opus-5-5"]
+        )
+        assert _get_pricing("claude-opus-5") == MODEL_PRICING["opus-5"]
+
+    def test_sonnet_5_5_does_not_resolve_to_sonnet_5(self, monkeypatch):
+        # "sonnet-5" is a substring of "sonnet-5-5", so "sonnet-5-5" must be
+        # checked first. The two tiers can have the same rates, so a marker
+        # value shows which key matched.
+        from nerve.db import usage
+        marker = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        monkeypatch.setitem(usage.MODEL_PRICING, "sonnet-5-5", marker)
+        assert usage._get_pricing("claude-sonnet-5-5") == marker
+        assert usage._get_pricing("us.anthropic.claude-sonnet-5-5") == marker
+        assert (
+            usage._get_pricing("claude-sonnet-5")
+            == usage.MODEL_PRICING["sonnet-5"]
+        )
 
     def test_opus_4_5_does_not_bleed_into_opus_5(self):
         # "opus-5" must not substring-match claude-opus-4-5 (or vice versa).

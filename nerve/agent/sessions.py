@@ -13,14 +13,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, Callable, Literal
 
 from nerve.db import Database
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def new_cron_run_id() -> str:
+    """A unique run ID for a cron session ID ``cron:<job>:<run ID>``.
+
+    The UTC start time (``YYYYmmdd-HHMMSS``) keeps the IDs in time order;
+    eight random hex digits make two runs that start in the same second
+    (for example two people who use "Run now") get two sessions, each with
+    its own cause. ``nerve/db/usage.py`` matches this shape.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{secrets.token_hex(4)}"
+
 
 # Cleanup defaults
 DEFAULT_ARCHIVE_AFTER_DAYS = 30
@@ -39,6 +61,24 @@ class SessionStatus(StrEnum):
     ERROR = "error"
 
 
+# Why a session's runtime client went away (``remove_client``). The agent
+# registry maps it to the end reason of the agents that ran on the client.
+ClientGoneReason = Literal[
+    "process_exit", "process_ended", "model_switch", "force_stop", "archived",
+    "deleted", "hung_runtime", "idle_reap", "gateway_restart",
+]
+# What ``interrupt_turn`` did.
+InterruptOutcome = Literal["stopped", "not_running", "not_stopped", "killed"]
+
+# The reason an archive refuses a session whose agents still run.
+BUSY_AGENTS_REASON = "background agents running"
+
+
+class SessionBusyError(RuntimeError):
+    """The session cannot be archived now: background agents still run in
+    it (archiving would stop them). Pass ``force=True`` to archive anyway."""
+
+
 class SessionManager:
     """Manages agent sessions with full lifecycle tracking.
 
@@ -51,6 +91,15 @@ class SessionManager:
     - Automatic archival and cleanup
     - Orphan recovery on startup
     """
+
+    # Called as ``on_client_removed(session_id, reason)`` when
+    # ``remove_client`` actually removed a client (the engine wires the agent
+    # registry's ``on_client_gone``: agents die with their runtime). Never
+    # raises into the caller. Class-level defaults for ``__new__`` doubles.
+    on_client_removed: Callable[[str, str], None] | None = None
+    # ``has_live_agents(session_id)``: background agents still run in the
+    # session (the archive guard). Wired to the agent registry.
+    has_live_agents: Callable[[str], bool] | None = None
 
     def __init__(
         self,
@@ -75,6 +124,10 @@ class SessionManager:
         self._last_activity: dict[str, float] = {}
         # Running task tracking
         self._running_tasks: dict[str, asyncio.Task] = {}
+        # The task that runs the session's current orchestrator turn: a
+        # framed autonomous drain (and, later, run() once it holds the run
+        # lock). It is the Stop target; a registered task is the fallback.
+        self._turn_tasks: dict[str, asyncio.Task] = {}
         self._running_sessions: set[str] = set()
         # Stop-requested flag: set when /stop arrives before the SDK client
         # is registered.  _run_inner() checks this after creating the client.
@@ -98,13 +151,23 @@ class SessionManager:
         backend: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
+        *,
+        actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
-        """Get an existing session or create a new one."""
+        """Get an existing session or create a new one.
+
+        ``actor`` and ``cause`` are only used when a row is actually created.
+        An existing session keeps the creator and the cause it was stamped
+        with, so re-resolving a session someone else started never
+        re-attributes it. ``actor`` is required keyword-only, like the store
+        method underneath it; ``cause`` defaults to the actor.
+        """
         session = await self.db.get_session(session_id)
         if not session:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
-                backend=backend, model=model, cwd=cwd,
+                backend=backend, model=model, cwd=cwd, actor=actor, cause=cause,
             )
         return session
 
@@ -119,6 +182,9 @@ class SessionManager:
         backend: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
+        *,
+        actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -142,11 +208,12 @@ class SessionManager:
             backend=backend,
             model=model,
             cwd=cwd,
+            actor=actor,
+            cause=cause,
+            # The event names the creator and the session's cause only when
+            # this insert made the row.
+            created_event=attribution_for(actor, cause),
         )
-        await self.db.log_session_event(session_id, "created", {
-            "source": source,
-            "parent": parent_session_id,
-        })
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
         )
@@ -159,14 +226,22 @@ class SessionManager:
     async def transition(
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
-    ) -> None:
-        """Atomically transition a session's status and log the event."""
+        *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Atomically transition a session's status and log the event.
+
+        ``attribution`` is for a transition that a principal asks for (a
+        resume). A transition that records the state of the runtime keeps it
+        unattributed. A session that has ``new_status`` already stays as it
+        is and records nothing, so of two callers that make the same
+        transition at the same time only one is recorded. Returns ``True``
+        when the status changed.
+        """
         async with self._transition_lock:
-            await self.db.update_session_fields(
-                session_id, {"status": new_status.value},
-            )
-            await self.db.log_session_event(
-                session_id, new_status.value, details or {},
+            return await self.db.change_session_status(
+                session_id, new_status.value,
+                event_type=new_status.value, details=details,
+                attribution=attribution,
             )
 
     async def mark_active(
@@ -250,13 +325,17 @@ class SessionManager:
         return None
 
     async def get_active_session(
-        self, channel_key: str, source: str = "web",
+        self, channel_key: str, source: str = "web", *, actor: Actor | None,
     ) -> str:
         """Get or create the active session for a channel.
 
         Reuses the channel's mapped session when it is currently active
         (a turn is in flight) or when its last activity falls within the
         sticky period. Otherwise creates a fresh session and remaps.
+
+        ``actor`` is stamped on the fresh session only — the person whose
+        message rolled the channel over to a new conversation. A reused
+        session keeps whoever started it.
         """
         row = await self.db.get_channel_session(channel_key)
         if row:
@@ -266,7 +345,7 @@ class SessionManager:
 
         # Create a fresh session
         session_id = self._generate_session_id()
-        await self._create_session(session_id, source=source)
+        await self._create_session(session_id, source=source, actor=actor)
         await self.db.set_channel_session(channel_key, session_id)
         return session_id
 
@@ -342,11 +421,44 @@ class SessionManager:
         """Register an SDK client for a session."""
         self._clients[session_id] = client
 
-    def remove_client(self, session_id: str) -> Any | None:
-        """Remove and return the SDK client for a session."""
+    def remove_client(
+        self, session_id: str, *, reason: str = "process_ended",
+    ) -> Any | None:
+        """Remove and return the SDK client for a session.
+
+        Every runtime teardown passes through here, so this is where the
+        agents that ran on the client are reconciled: when a client was
+        actually removed, ``on_client_removed(session_id, reason)`` runs (the
+        agent registry marks the session's live agents interrupted with the
+        reason's end reason). Its failures are logged, never raised.
+        """
         self._client_locks.pop(session_id, None)
         self._last_activity.pop(session_id, None)
-        return self._clients.pop(session_id, None)
+        client = self._clients.pop(session_id, None)
+        if client is not None:
+            self._notify_client_removed(session_id, reason)
+        return client
+
+    def _notify_client_removed(self, session_id: str, reason: str) -> None:
+        hook = self.on_client_removed
+        if hook is None:
+            return
+        try:
+            hook(session_id, reason)
+        except Exception:  # noqa: BLE001 — a teardown hook never breaks teardown
+            logger.exception(
+                "client-removed hook failed for %s (%s)", session_id, reason,
+            )
+
+    def _agents_live(self, session_id: str) -> bool:
+        check = self.has_live_agents
+        if check is None:
+            return False
+        try:
+            return bool(check(session_id))
+        except Exception:  # noqa: BLE001
+            logger.exception("live-agents check failed for %s", session_id)
+            return False
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
         """Get or create a per-session lock for client creation."""
@@ -419,6 +531,48 @@ class SessionManager:
         """Check if a session has a running agent task."""
         return session_id in self._running_sessions
 
+    def set_turn_task(self, session_id: str, task: asyncio.Task | None) -> None:
+        """Record the task that runs the session's current turn.
+
+        ``None`` clears it. Only a turn sets it: ``run()`` once it holds the
+        run lock, and an autonomous drain once it framed a real main-chain
+        turn (never one that only ingests sub-agent traffic), so Stop reaches
+        the turn rather than a queued message.
+        """
+        if task is None:
+            self._turn_tasks.pop(session_id, None)
+        else:
+            self._turn_tasks[session_id] = task
+
+    def clear_turn_task(self, session_id: str, task: asyncio.Task | None) -> None:
+        """Clear the turn task if it is still ``task`` (identity-checked, so a
+        later turn's registration survives an earlier one finishing)."""
+        if self._turn_tasks.get(session_id) is task:
+            self._turn_tasks.pop(session_id, None)
+
+    def turn_task(self, session_id: str) -> asyncio.Task | None:
+        """The live turn task of the session, or ``None`` (missing or done)."""
+        task = self._turn_tasks.get(session_id)
+        if task is None or task.done():
+            return None
+        return task
+
+    def registered_task(self, session_id: str) -> asyncio.Task | None:
+        """The live task registered with :meth:`register_task`, or ``None``."""
+        task = self._running_tasks.get(session_id)
+        if task is None or task.done():
+            return None
+        return task
+
+    def has_running_work(self, session_id: str) -> bool:
+        """True while a turn of the session runs or its registered task lives."""
+        task = self._running_tasks.get(session_id)
+        return (
+            self.is_running(session_id)
+            or self.turn_task(session_id) is not None
+            or (task is not None and not task.done())
+        )
+
     def get_running_ids(self) -> set[str]:
         """Return the set of currently running session IDs."""
         return set(self._running_sessions)
@@ -435,57 +589,86 @@ class SessionManager:
         except KeyError:
             return False
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop the current turn of a running session.
+    async def interrupt_turn(
+        self, session_id: str, *, allow_hard_cancel: bool, lock_held: bool,
+        wait_s: float = 5.0,
+    ) -> InterruptOutcome:
+        """Stop the session's current turn, and only the turn.
 
-        Sends SDK interrupt first — this gracefully ends the current turn
-        while keeping the client alive for the next message.  Falls back
-        to asyncio task cancellation (which disconnects the client) only
-        if the interrupt doesn't complete within a timeout.
+        * With no turn task, no interrupt is sent (without the CLI's per-task
+          stop affordance an interrupt would end every background agent): a
+          legacy-registered task that has not reached the run lock yet
+          (``lock_held`` False: a workflow or plan task before its run, never
+          a run queued behind the lock) is cancelled; a session that is
+          running but has no turn task yet gets the deferred-stop flag;
+          otherwise ``"not_running"``.
+        * With a turn task, the client is interrupted and the task gets
+          ``wait_s`` seconds to end (``"stopped"``). When it does not end (or
+          there was nothing to interrupt), ``allow_hard_cancel`` cancels it
+          (``"killed"``; its cancel path discards the client), otherwise
+          ``"not_stopped"`` (the caller offers a force stop). The interrupt
+          itself counts against ``wait_s``: a wedged runtime that never
+          answers it (the SDK would wait a minute) gets the same answer in
+          time.
         """
+        task = self.turn_task(session_id)
+        if task is None:
+            legacy = self._running_tasks.get(session_id)
+            if legacy is not None and not legacy.done() and not lock_held:
+                legacy.cancel()
+                logger.info("Cancelled the pre-lock task of session %s", session_id)
+                return "stopped"
+            if self.is_running(session_id):
+                self.request_stop(session_id)
+                logger.info("Deferred stop requested for session %s", session_id)
+                return "stopped"
+            return "not_running"
+
         client = self._clients.get(session_id)
         interrupted = False
-        if client:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        if client is not None:
             try:
-                await client.interrupt()
+                await asyncio.wait_for(client.interrupt(), timeout=wait_s)
                 interrupted = True
-                logger.info("Interrupted SDK client for session %s", session_id)
-            except Exception as e:
+                logger.info("Interrupted the turn of session %s", session_id)
+            except asyncio.TimeoutError:
                 logger.warning(
-                    "SDK interrupt failed for %s: %s",
-                    session_id, e,
+                    "Interrupt of session %s got no answer in %.0fs", session_id, wait_s,
                 )
-
-        task = self._running_tasks.get(session_id)
-        if task and not task.done():
-            if interrupted:
-                # Give interrupt time to complete the turn gracefully.
-                # When it works, receive_response() yields a ResultMessage,
-                # _run_inner exits via the normal path, and the client
-                # stays alive for the next message.
-                done, _ = await asyncio.wait({task}, timeout=5.0)
-                if done:
-                    logger.info(
-                        "Session %s stopped gracefully via interrupt",
-                        session_id,
-                    )
-                    return True
-
-            # Interrupt failed or timed out — force cancel.
-            # The CancelledError handler in _run_inner disconnects the
-            # client since its state is inconsistent.
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Interrupt failed for %s: %s", session_id, e)
+        if interrupted:
+            # When the interrupt works the runtime ends the turn, its task
+            # exits through the normal path and the client stays alive.
+            done, _ = await asyncio.wait(
+                {task}, timeout=max(0.0, deadline - loop.time()),
+            )
+            if done:
+                logger.info("Session %s stopped gracefully via interrupt", session_id)
+                return "stopped"
+        if allow_hard_cancel:
+            # The CancelledError path of the turn discards the client: its
+            # state is inconsistent after a cancel mid-turn.
             task.cancel()
-            logger.info("Cancelled task for session %s (interrupt timed out)", session_id)
-            return True
+            logger.info("Cancelled the turn of session %s (interrupt did not end it)", session_id)
+            return "killed"
+        logger.info(
+            "Turn of session %s did not stop after %.0fs; not cancelling it "
+            "(background agents would die with the runtime)", session_id, wait_s,
+        )
+        return "not_stopped"
 
-        # Session is running but client/task not registered yet — set a
-        # deferred stop flag that _run_inner() will check after client init.
-        if self.is_running(session_id):
-            self.request_stop(session_id)
-            logger.info("Deferred stop requested for session %s", session_id)
-            return True
-
-        return client is not None  # interrupt was sent even if no task
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop the current turn of a running session (compatibility wrapper:
+        interrupt, then hard-cancel when the interrupt does not end it).
+        The engine's ``stop_turn`` is the Stop of the product; it keeps
+        background agents alive."""
+        outcome = await self.interrupt_turn(
+            session_id, allow_hard_cancel=True, lock_held=False,
+        )
+        return outcome in ("stopped", "killed")
 
     # ------------------------------------------------------------------ #
     #  Fork & resume                                                       #
@@ -497,6 +680,8 @@ class SessionManager:
         at_message_id: str | None = None,
         title: str | None = None,
         source: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Create a forked session from an existing one.
 
@@ -512,6 +697,10 @@ class SessionManager:
 
         Args:
             source: Override the source field (default: inherit from parent).
+            actor: Who asked for the fork — stamped on the new session. The
+                copied messages keep their own senders (see
+                ``copy_messages_to_session``), so forking someone else's chat
+                never rewrites who said what in it.
         """
         parent = await self.db.get_session(source_session_id)
         if not parent:
@@ -549,6 +738,7 @@ class SessionManager:
             backend=parent.get("backend") or "claude",
             model=parent.get("model"),
             cwd=parent.get("cwd"),
+            actor=actor,
         )
         copied = await self.db.copy_messages_to_session(
             source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
@@ -578,28 +768,35 @@ class SessionManager:
     # ------------------------------------------------------------------ #
 
     async def create_cron_session(
-        self, job_id: str, run_id: str | None = None,
+        self, job_id: str, run_id: str | None = None, *, actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
     ) -> dict:
         """Create an isolated session for a single cron run.
 
         When run_id is provided, each run gets its own session to prevent
         unbounded message accumulation.
+
+        ``actor`` is the agent's system principal in production because a
+        scheduled run is the instance's own work, regardless of who wrote the
+        schedule. ``cause`` is the session's cause: by default the actor; the
+        person for a run that a person started.
         """
         if run_id:
             session_id = f"cron:{job_id}:{run_id}"
         else:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
-            session_id, title=f"Cron: {job_id}", source="cron",
+            session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
 
     async def create_hook_session(
-        self, hook_name: str, hook_id: str,
+        self, hook_name: str, hook_id: str, *, actor: Actor | None,
     ) -> dict:
         """Create an isolated session for a webhook."""
         session_id = f"hook:{hook_name}:{hook_id}"
         return await self.get_or_create(
-            session_id, title=f"Hook: {hook_name}", source="hook",
+            session_id, title=f"Hook: {hook_name}", source="hook", actor=actor,
         )
 
     # ------------------------------------------------------------------ #
@@ -616,8 +813,14 @@ class SessionManager:
         blocks: list | None = None,
         native_turn_id: str | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
     ) -> int:
         """Add a message to a session's history.
+
+        ``actor`` is the principal whose input this row records, or ``None``
+        for assistant and tool output. See
+        :meth:`nerve.db.messages.MessageStore.add_message`.
 
         ``bump_updated_at=False`` records the message without moving the
         session's place in the sidebar — see
@@ -628,6 +831,7 @@ class SessionManager:
             thinking=thinking, blocks=blocks,
             native_turn_id=native_turn_id,
             bump_updated_at=bump_updated_at,
+            actor=actor,
         )
 
     async def get_conversation_history(
@@ -667,34 +871,43 @@ class SessionManager:
             limit=limit, offset=offset, sources=sources, current_id=current_id,
         )
 
-    async def set_starred(self, session_id: str, starred: bool) -> bool:
+    async def set_starred(
+        self, session_id: str, starred: bool, *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Star or unstar a session.
 
         Starred sessions are exempt from every auto-archival path (the idle
         cutoff, the age backstop, and the overflow eviction), so they stay
         resumable until explicitly unstarred or deleted. Returns the new
         starred state; raises ``ValueError`` if the session does not exist.
+        A change records a ``starred`` or ``unstarred`` event with
+        ``attribution``.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if starred else 0},
+            attribution=attribution,
         )
         return starred
 
-    async def toggle_starred(self, session_id: str) -> bool:
+    async def toggle_starred(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
         """Flip a session's starred flag.
 
         Returns the new starred state; raises ``ValueError`` if the session
-        does not exist.
+        does not exist. The change records an event, as :meth:`set_starred`.
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         new_starred = not session.get("starred")
-        await self.db.update_session_fields(
+        await self.db.change_session_fields(
             session_id, {"starred": 1 if new_starred else 0},
+            attribution=attribution,
         )
         return new_starred
 
@@ -702,8 +915,32 @@ class SessionManager:
     #  Archive & cleanup                                                   #
     # ------------------------------------------------------------------ #
 
-    async def archive_session(self, session_id: str) -> None:
-        """Archive a session: memorize, disconnect client, update status."""
+    async def archive_session(
+        self, session_id: str, *,
+        attribution: Attribution = UNATTRIBUTED,
+        details: dict | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Archive a session: memorize, disconnect client, update status.
+
+        The ``archived`` event takes ``attribution`` and ``details``. A
+        session that is archived already stays as it is and records nothing;
+        of two archives at the same time, only the one that changes the
+        status is recorded. Returns ``True`` when this call archived the
+        session; raises ``ValueError`` if the session does not exist.
+
+        Archiving ends the session's runtime, and with it every background
+        agent still running in it. Unless ``force``, a session with live
+        agents is refused with :class:`SessionBusyError`; with ``force`` its
+        agents end as interrupted (``archived``).
+        """
+        session = await self.db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        if session.get("status") == SessionStatus.ARCHIVED.value:
+            return False
+        if not force and self._agents_live(session_id):
+            raise SessionBusyError(BUSY_AGENTS_REASON)
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -714,21 +951,29 @@ class SessionManager:
                     logger.warning("Background memorize for %s failed: %s", sid, e)
             asyncio.create_task(_memorize_bg())
 
-        client = self.remove_client(session_id)
+        client = self.remove_client(session_id, reason="archived")
+        if client is None and self._agents_live(session_id):
+            # Records still live without a runtime: nothing runs them any
+            # more, so settle them with the archive.
+            self._notify_client_removed(session_id, "archived")
         if client:
             try:
                 await client.disconnect()
             except Exception:
                 pass
         now = datetime.now(timezone.utc).isoformat()
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.ARCHIVED.value,
-            "archived_at": now,
-            "connected_at": None,
-            "sdk_session_id": None,
-        })
-        await self.db.log_session_event(session_id, "archived", {})
-        logger.info("Archived session %s", session_id)
+        archived = await self.db.change_session_status(
+            session_id, SessionStatus.ARCHIVED.value,
+            fields={
+                "archived_at": now,
+                "connected_at": None,
+                "sdk_session_id": None,
+            },
+            event_type="archived", details=details, attribution=attribution,
+        )
+        if archived:
+            logger.info("Archived session %s", session_id)
+        return archived
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
         """Every session in ``root_id``'s subtree, discovery order (root first).
@@ -753,7 +998,10 @@ class SessionManager:
                     queue.append(cid)
         return order
 
-    async def archive_session_cascade(self, session_id: str) -> dict:
+    async def archive_session_cascade(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+        force: bool = False,
+    ) -> dict:
         """Archive a session and its ENTIRE descendant subtree, bottom-up.
 
         The default archive behavior. Resolves the full descendant set up front,
@@ -763,7 +1011,15 @@ class SessionManager:
         ancestors are left alone — never producing an archived parent over an
         active child. Fully-archivable sibling subtrees still complete.
 
+        A node whose background agents still run is skipped with the reason
+        ``"background agents running"`` unless ``force`` (archiving it ends
+        them).
+
         Returns ``{"archived": [ids], "skipped": [{"id", "reason"}]}``.
+
+        Each ``archived`` event takes ``attribution``; the event of a
+        descendant names the root in ``cascade_root``. A session that is
+        archived already counts as archived and records no event.
         """
         # Compute the whole subtree BEFORE mutating anything.
         order = await self._resolve_descendants(session_id)
@@ -788,9 +1044,18 @@ class SessionManager:
             if self.is_running(sid):
                 skipped[sid] = "session is running"
                 continue
+            if not force and self._agents_live(sid):
+                skipped[sid] = BUSY_AGENTS_REASON
+                continue
             try:
-                await self.archive_session(sid)
+                await self.archive_session(
+                    sid, attribution=attribution,
+                    details={"cascade_root": session_id} if sid != session_id else None,
+                    force=force,
+                )
                 archived.append(sid)
+            except SessionBusyError:  # agents started meanwhile
+                skipped[sid] = BUSY_AGENTS_REASON
             except Exception as e:  # keep going; sibling subtrees still complete
                 logger.warning("Cascade archive failed for %s: %s", sid, e)
                 skipped[sid] = str(e)
@@ -799,19 +1064,30 @@ class SessionManager:
             "skipped": [{"id": sid, "reason": reason} for sid, reason in skipped.items()],
         }
 
-    async def unarchive_session(self, session_id: str) -> None:
-        """Restore an archived session to ``idle`` so it's resumable again."""
+    async def unarchive_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Restore an archived session to ``idle`` so it's resumable again.
+
+        The ``unarchived`` event takes ``attribution``. A session that is not
+        archived stays as it is and records nothing. Returns ``True`` when
+        this call restored the session; raises ``ValueError`` if the session
+        does not exist.
+        """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        await self.db.update_session_fields(session_id, {
-            "status": SessionStatus.IDLE.value,
-            "archived_at": None,
-        })
-        # Bump updated_at so the unarchived session sorts to the top of the feed.
-        await self.db.touch_session(session_id)
-        await self.db.log_session_event(session_id, "unarchived", {})
-        logger.info("Unarchived session %s", session_id)
+        # touch: updated_at moves, so the session sorts to the top of the feed.
+        restored = await self.db.change_session_status(
+            session_id, SessionStatus.IDLE.value,
+            fields={"archived_at": None},
+            only_from=(SessionStatus.ARCHIVED.value,),
+            touch=True,
+            event_type="unarchived", attribution=attribution,
+        )
+        if restored:
+            logger.info("Unarchived session %s", session_id)
+        return restored
 
     async def list_starred_sessions(self) -> list[dict]:
         """Starred, non-archived sessions — always returned, never truncated."""
@@ -870,6 +1146,22 @@ class SessionManager:
         cleanup statistics.
         """
         now = datetime.now(timezone.utc)
+        # Automatic archives are Nerve's own work.
+        system = attribution_for(self.db.system_actor)
+
+        async def _archive(sid: str, reason: str) -> bool:
+            """Archive one session; a session whose background agents still
+            run is skipped (an automatic archive never ends them)."""
+            try:
+                await self.archive_session(
+                    sid, attribution=system, details={"reason": reason},
+                )
+                return True
+            except SessionBusyError:
+                logger.info(
+                    "Session cleanup: skipping %s (%s)", sid, BUSY_AGENTS_REASON,
+                )
+                return False
 
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
         # when interactive_archive_after_hours == 0, so default behavior is unchanged.
@@ -880,22 +1172,29 @@ class SessionManager:
                 icutoff, INTERACTIVE_SOURCES,
             )
             for s in interactive:
+                if self._agents_live(s["id"]):
+                    logger.info(
+                        "Session cleanup: skipping %s (%s)", s["id"], BUSY_AGENTS_REASON,
+                    )
+                    continue
                 try:
                     await self.db.expire_pending_questions_for_session(s["id"])
                 except Exception as e:
                     logger.warning(
                         "Expire pending questions failed for %s: %s", s["id"], e,
                     )
-                await self.archive_session(s["id"])
-            archived_interactive = len(interactive)
+                if await _archive(s["id"], "idle_interactive"):
+                    archived_interactive += 1
 
         # Long backstop cutoff for everything (incl. non-interactive).
         cutoff = (now - timedelta(days=archive_after_days)).isoformat()
 
         # Archive idle/stopped sessions older than cutoff
         stale = await self.db.get_stale_sessions(cutoff)
+        archived_stale = 0
         for s in stale:
-            await self.archive_session(s["id"])
+            if await _archive(s["id"], "stale"):
+                archived_stale += 1
 
         # Enforce max session count (archive oldest beyond limit). Starred
         # sessions are off-budget: excluded from the count and never evicted,
@@ -907,15 +1206,15 @@ class SessionManager:
                 count - max_sessions,
             )
             for s in excess:
-                await self.archive_session(s["id"])
-            overflow = len(excess)
+                if await _archive(s["id"], "overflow"):
+                    overflow += 1
 
         stats = {
             "archived_interactive": archived_interactive,
-            "archived_stale": len(stale),
+            "archived_stale": archived_stale,
             "archived_overflow": overflow,
         }
-        if archived_interactive or stale or overflow:
+        if archived_interactive or archived_stale or overflow:
             logger.info("Session cleanup: %s", stats)
         return stats
 

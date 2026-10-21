@@ -23,6 +23,9 @@ import pytest_asyncio
 from nerve.agent.backends.base import BackendError
 from nerve.db import Database
 
+from tests.actor_rows import ensure_actor_row
+from tests.conftest import TEST_ACTOR
+
 
 class FakeClaudeBackend:
     """Accepts any model — no validate_model, like the real claude backend."""
@@ -59,12 +62,12 @@ class FakeSessionManager:
             metadata=kwargs.get("metadata"),
             backend=kwargs.get("backend", "claude"),
             model=kwargs.get("model"),
-            cwd=kwargs.get("cwd"),
+            cwd=kwargs.get("cwd"), actor=None,
         )
 
 
 @pytest_asyncio.fixture
-async def setup(db: Database, tmp_path):
+async def setup(db: Database, tmp_path, bypass_auth):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -75,8 +78,9 @@ async def setup(db: Database, tmp_path):
 
     cfg = NerveConfig()
     cfg.workspace = tmp_path
-    cfg.auth.jwt_secret = ""  # require_auth becomes a no-op
     cfg_mod._config = cfg
+    # The routes record the signed-in actor on session events.
+    await ensure_actor_row(db, TEST_ACTOR)
 
     engine = SimpleNamespace(
         _backends={
@@ -90,6 +94,7 @@ async def setup(db: Database, tmp_path):
 
     app = FastAPI()
     app.include_router(sessions_router)
+    bypass_auth(app)  # these routes are not about auth
     yield SimpleNamespace(client=TestClient(app), db=db)
 
     cfg_mod._config = None

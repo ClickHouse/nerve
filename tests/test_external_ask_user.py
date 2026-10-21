@@ -15,9 +15,19 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from nerve.config import NerveConfig
 from nerve.notifications.service import NotificationService
+
+from tests.actor_rows import ensure_system_principal
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 — the conftest database, with an identity
+    """The conftest database after local bootstrap."""
+    await ensure_system_principal(db)
+    return db
 
 
 def _make_service(db, engine) -> NotificationService:
@@ -31,7 +41,7 @@ async def test_external_session_answer_does_not_call_engine_run(db):
     await db.create_session(
         session_id="external:codex:t1",
         source="external",
-        metadata={"client_name": "codex"},
+        metadata={"client_name": "codex"}, actor=None,
     )
     await db.create_notification(
         notification_id="ask-ext-1",
@@ -59,7 +69,7 @@ async def test_native_session_answer_still_injects(db):
     behaviour: spawn an ``engine.run()`` task to inject the answer."""
     await db.create_session(
         session_id="native-session-1",
-        source="web",
+        source="web", actor=None,
     )
     await db.create_notification(
         notification_id="ask-native-1",
@@ -85,6 +95,7 @@ async def test_native_session_answer_still_injects(db):
     engine.run.assert_called_once()
     _args, kwargs = engine.run.call_args
     assert kwargs["session_id"] == "native-session-1"
+    assert (await db.get_notification("ask-native-1"))["status"] == "answered"
 
 
 @pytest.mark.asyncio
@@ -95,7 +106,7 @@ async def test_external_session_answer_broadcasts_to_global(db):
     await db.create_session(
         session_id="external:codex:t2",
         source="external",
-        metadata={"client_name": "codex"},
+        metadata={"client_name": "codex"}, actor=None,
     )
     await db.create_notification(
         notification_id="ask-ext-2",

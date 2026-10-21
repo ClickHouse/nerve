@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
+from nerve.agent.agents import AgentRegistry
+from nerve.agent.backends import SystemEvent
 from nerve.agent.engine import AgentEngine
 from nerve.agent.sessions import SessionManager
 from nerve.db import Database
@@ -41,14 +43,14 @@ def _future(minutes: int = 10) -> str:
 class TestUpdatedAtFreeze:
     @pytest_asyncio.fixture
     async def seeded(self, db: Database):
-        await db.create_session("s1", source="web")
-        await db.add_message("s1", "user", "hello")
+        await db.create_session("s1", source="web", actor=None)
+        await db.add_message("s1", "user", "hello", actor=None)
         return db
 
     @pytest.mark.asyncio
     async def test_default_bumps_updated_at(self, seeded):
         before = (await seeded.get_session("s1"))["updated_at"]
-        await seeded.add_message("s1", "assistant", "hi")
+        await seeded.add_message("s1", "assistant", "hi", actor=None)
         after = await seeded.get_session("s1")
         assert after["updated_at"] >= before
         assert after["message_count"] == 2
@@ -57,7 +59,7 @@ class TestUpdatedAtFreeze:
     async def test_frozen_message_keeps_sidebar_position(self, seeded):
         before = await seeded.get_session("s1")
         await seeded.add_message(
-            "s1", "assistant", "woke up on my own", bump_updated_at=False,
+            "s1", "assistant", "woke up on my own", bump_updated_at=False, actor=None,
         )
         after = await seeded.get_session("s1")
         # The row is real (it counts) but the "last activity" clock is untouched.
@@ -70,8 +72,8 @@ class TestUpdatedAtFreeze:
         """The whole point: a continuation must not jump the queue."""
         sm = SessionManager(db)
         for sid in ("older", "newer"):
-            await sm.get_or_create(sid, source="web")
-            await db.add_message(sid, "user", "hi")
+            await sm.get_or_create(sid, source="web", actor=None)
+            await db.add_message(sid, "user", "hi", actor=None)
 
         def ids() -> list[str]:
             return [s["id"] for s in order]
@@ -81,13 +83,13 @@ class TestUpdatedAtFreeze:
 
         # A fired wakeup continues "older" — it stays put...
         await db.add_message(
-            "older", "assistant", "loop tick", bump_updated_at=False,
+            "older", "assistant", "loop tick", bump_updated_at=False, actor=None,
         )
         order = await db.list_conversation_sessions()
         assert ids() == ["newer", "older"]
 
         # ...while a turn the user actually asked for still floats it up.
-        await db.add_message("older", "assistant", "answer")
+        await db.add_message("older", "assistant", "answer", actor=None)
         order = await db.list_conversation_sessions()
         assert ids() == ["older", "newer"]
 
@@ -101,8 +103,8 @@ class TestEnginePendingWork:
     async def engine(self, db: Database):
         eng = AgentEngine.__new__(AgentEngine)
         eng.db = db
-        eng._bg_task_registry = {}
-        await db.create_session("s1", source="web")
+        eng.agents = AgentRegistry.for_tests()
+        await db.create_session("s1", source="web", actor=None)
         return eng
 
     @pytest.mark.asyncio
@@ -132,9 +134,9 @@ class TestEnginePendingWork:
     @pytest.mark.asyncio
     async def test_broadcast_carries_pending_work(self, engine):
         await engine.db.add_wakeup("s1", prompt="tick", fire_at=_future())
-        engine._bg_task_registry["s1"] = {
-            "t1": {"task_id": "t1", "status": "running"},
-        }
+        await engine.agents.on_system_event("s1", SystemEvent("task_started", {
+            "task_id": "t1", "task_type": "local_bash", "description": "build",
+        }))
         events: list[dict] = []
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast = AsyncMock(side_effect=lambda ch, m: events.append((ch, m)))
@@ -146,6 +148,7 @@ class TestEnginePendingWork:
         assert msg["is_running"] is False
         assert msg["pending_wakeup_at"] is not None
         assert msg["has_background_tasks"] is True
+        assert msg["background_count"] == 1
 
     @pytest.mark.asyncio
     async def test_broadcast_reports_idle_when_nothing_pending(self, engine):
@@ -156,12 +159,17 @@ class TestEnginePendingWork:
 
         assert events[0]["pending_wakeup_at"] is None
         assert events[0]["has_background_tasks"] is False
+        assert events[0]["background_count"] == 0
 
     @pytest.mark.asyncio
     async def test_settled_background_task_is_not_live(self, engine):
-        engine._bg_task_registry["s1"] = {
-            "t1": {"task_id": "t1", "status": "completed"},
-        }
+        await engine.agents.on_system_event("s1", SystemEvent("task_started", {
+            "task_id": "t1", "task_type": "local_bash", "description": "build",
+        }))
+        assert engine.has_live_background_tasks("s1") is True
+        await engine.agents.on_system_event("s1", SystemEvent(
+            "task_notification", {"task_id": "t1", "status": "completed"},
+        ))
         assert engine.has_live_background_tasks("s1") is False
 
     @pytest.mark.parametrize("func", ["run", "_run_inner", "_finalize_turn"])
@@ -186,7 +194,7 @@ class TestEnginePendingWork:
 @pytest.mark.asyncio
 class TestSidebarParkedFields:
     @pytest_asyncio.fixture
-    async def setup(self, db: Database):
+    async def setup(self, db: Database, bypass_auth):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -196,7 +204,6 @@ class TestSidebarParkedFields:
         from nerve.gateway.routes.sessions import router as sessions_router
 
         cfg = NerveConfig()
-        cfg.auth.jwt_secret = ""      # require_auth becomes a no-op
         cfg_mod._config = cfg
 
         sm = SessionManager(db)
@@ -209,6 +216,7 @@ class TestSidebarParkedFields:
 
         app = FastAPI()
         app.include_router(sessions_router)
+        bypass_auth(app)  # these routes are not about auth
         yield SimpleNamespace(
             client=TestClient(app), db=db, sm=sm, cfg=cfg, live_bg=live_bg,
         )
@@ -216,13 +224,13 @@ class TestSidebarParkedFields:
         cfg_mod._config = None
 
     async def test_rows_report_no_pending_work_by_default(self, setup):
-        await setup.sm.get_or_create("plain", source="web")
+        await setup.sm.get_or_create("plain", source="web", actor=None)
         row = setup.client.get("/api/sessions").json()["sessions"][0]
         assert row["pending_wakeup_at"] is None
         assert row["has_background_tasks"] is False
 
     async def test_scheduled_wakeup_rides_on_the_row(self, setup):
-        await setup.sm.get_or_create("looping", source="web")
+        await setup.sm.get_or_create("looping", source="web", actor=None)
         fire_at = _future()
         await setup.db.add_wakeup("looping", prompt="tick", fire_at=fire_at)
 
@@ -232,14 +240,14 @@ class TestSidebarParkedFields:
         assert rows["looping"]["is_running"] is False
 
     async def test_background_task_rides_on_the_row(self, setup):
-        await setup.sm.get_or_create("busy", source="web")
+        await setup.sm.get_or_create("busy", source="web", actor=None)
         setup.live_bg.add("busy")
 
         rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
         assert rows["busy"]["has_background_tasks"] is True
 
     async def test_search_results_carry_the_same_bits(self, setup):
-        await setup.sm.get_or_create("findme", source="web")
+        await setup.sm.get_or_create("findme", source="web", actor=None)
         await setup.db.update_session_title("findme", "findme")
         await setup.db.add_wakeup("findme", prompt="tick", fire_at=_future())
 
@@ -248,7 +256,7 @@ class TestSidebarParkedFields:
         assert rows[0]["has_background_tasks"] is False
 
     async def test_system_sessions_carry_the_same_bits(self, setup):
-        await setup.sm.get_or_create("cron-1", source="cron")
+        await setup.sm.get_or_create("cron-1", source="cron", actor=None)
         await setup.db.add_wakeup("cron-1", prompt="tick", fire_at=_future())
 
         rows = setup.client.get("/api/sessions/system").json()["sessions"]

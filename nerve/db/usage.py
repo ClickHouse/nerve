@@ -15,8 +15,10 @@ from __future__ import annotations
 # cache_write_5m, cache_write_1h, web_search_per_req)
 MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
     "fable-5":    (10,  50, 1.00, 12.50, 20.00, 0.01),  # Fable 5 (Mythos-class, ~2x Opus)
+    "opus-5-5":   (4,   20, 0.20,  5.00,  8.00, 0.01),  # Opus 5.5 standard (verified 2026-09-22)
     "opus-5":     (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 5 standard (verified 2026-07-28)
-    "sonnet-5":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 5 standard (verified 2026-07-28)
+    "sonnet-5-5": (2,   10, 0.10,  2.50,  4.00, 0.01),  # Sonnet 5.5 standard (verified 2026-10-13)
+    "sonnet-5":   (2,   10, 0.20,  2.50,  4.00, 0.01),  # Sonnet 5 standard (verified 2026-09-28)
     "opus-4-8":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.8 standard
     "opus-4-7":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.7 standard
     "opus-4-6":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.6 standard
@@ -24,12 +26,30 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
     "opus-4-1":   (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4.1
     "opus-4":     (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4
     "sonnet-4":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 4.x
+    # Haiku 5.5 prompts over 100k tokens cost 5x these rates. Usage is summed
+    # per turn, not per request, so the estimate uses the lower rates.
+    "haiku-5-5":  (0.1, 0.5, 0.01, 0.125, 0.20, 0.01),  # Haiku 5.5, prompts up to 100k (verified 2026-10-13)
     "haiku-4-5":  (1,    5, 0.10,  1.25,  2.00, 0.01),  # Haiku 4.5
     "haiku-3-5":  (0.8,  4, 0.08,  1.00,  1.60, 0.01),  # Haiku 3.5
 }
 
 # Default fallback when model is unknown or None
 DEFAULT_PRICING = (5, 25, 0.50, 6.25, 10.00, 0.01)  # Opus 4.6 standard
+
+# Cron session ids (see ``SessionManager.create_cron_session``,
+# ``CronService._start_new_generation`` and ``new_cron_run_id``):
+#   cron:<job>                            legacy stable persistent session
+#   cron:<job>:<YYYYmmdd-HHMMSS>-<8 hex>  isolated run / persistent generation
+#   cron:<job>:<YYYYmmdd-HHMMSS>          the same, from older versions
+# The run globs match the last two forms, so the job id can be cut out of
+# them even when the job id itself contains ``:``.
+_CRON_RUN_STAMP_GLOB = "[0-9]" * 8 + "-" + "[0-9]" * 6
+_CRON_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB + "-" + "[0-9a-f]" * 8
+# len("cron:") + len(":YYYYmmdd-HHMMSS-xxxxxxxx")
+_CRON_RUN_SESSION_OVERHEAD = 5 + 25
+_CRON_OLD_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB
+# len("cron:") + len(":YYYYmmdd-HHMMSS")
+_CRON_OLD_RUN_SESSION_OVERHEAD = 5 + 16
 
 
 def _get_pricing(
@@ -233,6 +253,125 @@ class UsageStore:
             ORDER BY COALESCE(SUM(cost_usd), 0) DESC
             """,
             (f"-{days} days",),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def get_usage_by_cron_job(self, days: int = 7) -> list[dict]:
+        """Usage aggregated by the cron job that caused it, past N days.
+
+        A turn belongs to a job when its session is one of:
+
+        * a session of the job — ``cron:<job>`` or
+          ``cron:<job>:<YYYYmmdd-HHMMSS>``; the job id is read from the
+          session id. (A legacy stable ``cron:<job>`` session of a job whose
+          id itself ends in ``:<YYYYmmdd-HHMMSS>`` cannot be told apart from
+          a run session of the shorter id and is attributed to the latter.)
+        * the ``workflow:<run>`` session of a workflow run that the job
+          started, either as a workflow-run job (``created_by`` is
+          ``cron:<job>``, which holds the exact job id) or through a tool
+          call in one of its sessions (``created_by`` is
+          ``session:<cron session id>``). Only this one hop is followed:
+          review-loop legs and runs started from another workflow run are
+          not attributed.
+
+        These links are permanent, so attribution does not depend on
+        ``cron_logs`` retention. Every turn in a job's session counts,
+        including wakeups and messages a user sends in the cron chat.
+        Workflow-run turns have source ``workflow``, so the per-job totals
+        can exceed the ``cron`` row of :meth:`get_usage_by_source`.
+
+        ``runs`` counts the job's ``cron_logs`` rows in the same window
+        that did agent work: rows linked to a cron session, and rows linked
+        to a workflow run that began execution (``started_at`` is set at
+        dispatch, so a run still queued or cancelled in the queue does not
+        count). Rows for runs that did no work (missed, lock-skipped,
+        workflow runs disabled or refused by ``start_run``, failed before a
+        session was chosen, source runners) have no session link, and
+        gate-skipped runs are not logged, so ``cost_usd / runs`` is the
+        average spend per run. Jobs without usage are omitted.
+        """
+        window = f"-{days} days"
+        async with self.db.execute(
+            """
+            WITH workflow_origins AS (
+                -- The cron job or cron session that started each workflow
+                -- run. workflow_runs.session_id is not UNIQUE, so collapse
+                -- to one row per session to rule out join fan-out.
+                SELECT session_id, MIN(created_by) AS created_by
+                FROM workflow_runs
+                WHERE session_id IS NOT NULL
+                  AND (created_by GLOB 'cron:?*'
+                       OR created_by GLOB 'session:cron:?*')
+                GROUP BY session_id
+            ),
+            usage_origin AS (
+                -- origin_job: an exact job id. origin_session: a cron
+                -- session id, which still carries any run suffix.
+                SELECT
+                    CASE WHEN u.session_id NOT GLOB 'cron:?*'
+                              AND w.created_by GLOB 'cron:?*'
+                         THEN substr(w.created_by, 6) END AS origin_job,
+                    CASE WHEN u.session_id GLOB 'cron:?*' THEN u.session_id
+                         WHEN w.created_by GLOB 'session:cron:?*'
+                         THEN substr(w.created_by, 9) END AS origin_session,
+                    u.*
+                FROM session_usage u
+                LEFT JOIN workflow_origins w ON w.session_id = u.session_id
+                WHERE u.created_at >= DATE('now', ?)
+            ),
+            attributed AS (
+                SELECT
+                    CASE WHEN origin_job IS NOT NULL THEN origin_job
+                         WHEN origin_session GLOB ? THEN substr(
+                             origin_session, 6, length(origin_session) - ?)
+                         WHEN origin_session GLOB ? THEN substr(
+                             origin_session, 6, length(origin_session) - ?)
+                         ELSE substr(origin_session, 6) END AS job_id,
+                    *
+                FROM usage_origin
+                WHERE origin_job IS NOT NULL
+                   OR origin_session GLOB 'cron:?*'
+            ),
+            runs AS (
+                -- Cron links a workflow-run job's log row to
+                -- 'workflow:<run-id>' right after start_run, while the run
+                -- can still be queued; count it only once it was dispatched.
+                SELECT c.job_id, COUNT(*) AS runs
+                FROM cron_logs c
+                LEFT JOIN workflow_runs wr
+                       ON c.session_id GLOB 'workflow:?*'
+                      AND wr.id = substr(c.session_id, 10)
+                WHERE c.started_at >= DATE('now', ?)
+                  AND c.session_id IS NOT NULL
+                  AND (c.session_id NOT GLOB 'workflow:?*'
+                       OR wr.started_at IS NOT NULL)
+                GROUP BY c.job_id
+            )
+            SELECT
+                a.job_id,
+                COALESCE(MAX(r.runs), 0) as runs,
+                COUNT(DISTINCT a.session_id) as sessions,
+                COUNT(*) as turns,
+                SUM(a.input_tokens) as input_tokens,
+                SUM(a.output_tokens) as output_tokens,
+                SUM(a.cache_creation_input_tokens) as cache_creation,
+                SUM(a.cache_creation_5m_input_tokens) as cache_creation_5m,
+                SUM(a.cache_creation_1h_input_tokens) as cache_creation_1h,
+                SUM(a.cache_read_input_tokens) as cache_read,
+                COALESCE(SUM(a.cost_usd), 0) as cost_usd,
+                COALESCE(SUM(a.estimated_cost_usd), 0) as estimated_cost_usd,
+                COALESCE(SUM(a.web_search_requests), 0) as web_searches
+            FROM attributed a
+            LEFT JOIN runs r ON r.job_id = a.job_id
+            GROUP BY a.job_id
+            ORDER BY COALESCE(SUM(a.cost_usd), 0) DESC, a.job_id
+            """,
+            (
+                window,
+                _CRON_RUN_SESSION_GLOB, _CRON_RUN_SESSION_OVERHEAD,
+                _CRON_OLD_RUN_SESSION_GLOB, _CRON_OLD_RUN_SESSION_OVERHEAD,
+                window,
+            ),
         ) as cursor:
             return [dict(row) async for row in cursor]
 

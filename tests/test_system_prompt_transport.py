@@ -34,6 +34,7 @@ def _backend(tmp_path: Path) -> ClaudeBackend:
     return ClaudeBackend(SimpleNamespace(
         config=lambda: cfg,
         claude_plugins=lambda: [],
+        managed_mcp=False,
     ))
 
 

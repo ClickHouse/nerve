@@ -1,0 +1,59 @@
+# Nerve — Shared configuration
+# Git-tracked and portable: this is the layer that syncs between machines and
+# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
+# which overrides this file. Secrets belong in config.local.yaml or behind an
+# ${ENV_VAR} reference — never here.
+#
+# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
+# does not generate are left alone.
+
+timezone: UTC
+gateway:
+  host: 0.0.0.0
+  port: 8900
+agent:
+  model: eu.anthropic.claude-opus-5-5
+  cron_model: eu.anthropic.claude-sonnet-5-5
+  max_turns: 1000
+  max_concurrent: 32
+  thinking: max
+  effort: xhigh
+  context_1m: true
+  title_model: eu.anthropic.claude-haiku-5-5
+quiet_start: ''
+quiet_end: ''
+memory:
+  recall_model: eu.anthropic.claude-sonnet-5-5
+  memorize_model: eu.anthropic.claude-sonnet-5-5
+  fast_model: eu.anthropic.claude-haiku-5-5
+  embed_model: text-embedding-3-small
+  categories:
+  - name: task_domain
+    description: 'Domain-specific knowledge: CI systems, APIs, database schemas, repo
+      structure'
+  - name: patterns
+    description: 'Recurring patterns: common failure modes, root causes, known flaky
+      tests, seasonal issues'
+  - name: procedures
+    description: 'How to do things: reproduction steps, debug workflows, fix templates
+      that worked'
+  - name: decisions
+    description: 'Past decisions and outcomes: what was tried, what worked, why approach
+      X over Y'
+  - name: approvals
+    description: What got approved/rejected, approval preferences, risk thresholds
+  - name: contacts
+    description: 'People involved: who owns what, who to notify, escalation paths'
+  - name: infrastructure
+    description: Systems, endpoints, service dependencies, deployment details
+  - name: agent_ops
+    description: 'Operational lessons about the worker itself: tool gotchas, performance
+      observations'
+sessions:
+  sticky_period_minutes: 120
+  archive_after_days: 30
+  max_sessions: 500
+  memorize_interval_minutes: 30
+provider:
+  type: bedrock
+  aws_region: eu-central-1

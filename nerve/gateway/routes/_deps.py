@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from nerve.agent.tools import ToolContext, ToolRegistry
     from nerve.db import Database
     from nerve.external_agents.sync_service import SyncService
+    from nerve.identity import Actor
     from nerve.notifications.service import NotificationService
 
 
@@ -71,7 +72,9 @@ def get_tool_registry() -> "ToolRegistry":
     return get_deps().engine.registry
 
 
-def build_route_tool_context(session_id: str = "system") -> "ToolContext":
+def build_route_tool_context(
+    session_id: str = "system", *, actor: "Actor | None" = None,
+) -> "ToolContext":
     """Construct a :class:`ToolContext` for an HTTP-route-initiated tool call.
 
     Routes don't belong to an LLM session, so we use a stable
@@ -79,6 +82,10 @@ def build_route_tool_context(session_id: str = "system") -> "ToolContext":
     reads ``ctx.session_id``. Notification-style tools are *not* invoked
     from routes today, but if they ever are they'll attribute to that
     well-known sentinel.
+
+    ``actor`` is the request's actor. A person who calls a route makes the
+    change for themselves, so it is both the actor and the cause of the
+    handler's writes.
     """
     from nerve.agent.tools import ToolContext  # local import to avoid cycle
 
@@ -94,4 +101,6 @@ def build_route_tool_context(session_id: str = "system") -> "ToolContext":
         skill_manager=engine._skill_manager,
         engine=engine,
         notification_service=deps.notification_service,
+        actor=actor,
+        cause=actor,
     )

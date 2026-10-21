@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron.jobs import CronJob
 from nerve.cron.service import (
     CronService,
@@ -19,6 +21,11 @@ from nerve.cron.service import (
     _parse_interval,
     _parse_timestamp,
 )
+from nerve.identity import Attribution, attribution_for
+from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
+
+# A person's actor ID (synthetic), distinct from the system actor.
+_ALICE_ID = "00000000-0000-4000-8000-0000000a11ce"
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +72,8 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     config.sessions.cron_session_mode = "per_run"
 
     engine = AsyncMock()
-    engine.run_cron = AsyncMock(return_value="ok")
-    engine.run_persistent_cron = AsyncMock(return_value="ok")
+    engine.run_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
+    engine.run_persistent_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
 
     db = AsyncMock()
     db.log_cron_start = AsyncMock(return_value=1)
@@ -81,6 +88,10 @@ def _make_cron_service(timezone_name: str = "UTC") -> CronService:
     db.cancel_wakeups_for_session = AsyncMock(return_value=0)
     db.update_session_metadata = AsyncMock()
     db.update_session_title = AsyncMock()
+    # A cron generation is attributed to the agent's system principal and the
+    # lookup happens before the row is written, so the mock has to answer it
+    # the way a bootstrapped database would.
+    mock_system_principal(db)
 
     return CronService(config, engine, db)
 
@@ -496,7 +507,10 @@ class TestCatchupMissedJobs:
 
         await cron_service._catchup_missed_jobs()
 
-        cron_service.db.log_cron_start.assert_called_once_with("overdue-job")
+        # A catch-up run is the instance's own work.
+        cron_service.db.log_cron_start.assert_called_once_with(
+            "overdue-job", attribution=attribution_for(FAKE_SYSTEM_ACTOR),
+        )
         cron_service.engine.run_cron.assert_called_once()
 
     @pytest.mark.asyncio
@@ -685,7 +699,7 @@ class TestJobLock:
             call_order.append("start")
             await asyncio.sleep(0.1)
             call_order.append("end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job = _make_job(id="locked-job", lock=True)
@@ -707,7 +721,7 @@ class TestJobLock:
             call_order.append("start")
             await asyncio.sleep(0.1)
             call_order.append("end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job = _make_job(id="unlocked-job", lock=False)
@@ -729,7 +743,7 @@ class TestJobLock:
             call_order.append(f"start")
             await asyncio.sleep(0.1)
             call_order.append(f"end")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = slow_cron
         job_a = _make_job(id="job-a", lock=True)
@@ -785,6 +799,10 @@ class TestRotation:
         # New chat is created and becomes the job's current session.
         cron_service.engine.sessions.get_or_create.assert_awaited_once_with(
             session_id, title="Cron: pers", source="cron",
+            # Who a cron generation belongs to, and its cause, have their
+            # own tests (test_attribution.py, test_schedule_attribution.py);
+            # this one is about rotation.
+            actor=ANY, cause=ANY,
         )
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", session_id,
@@ -811,12 +829,17 @@ class TestRotation:
 
     @pytest.mark.asyncio
     async def test_rotation_stamps_and_cancels_wakeups(self, cron_service):
-        """The retired chat is stamped rotated_at, retitled, wakeups cancelled."""
+        """The retired chat is stamped rotated_at, retitled, wakeups cancelled.
+
+        The generation has a person as its cause (a "Run now" created it), so
+        the retitle is Nerve's change for that person.
+        """
         _map_current(cron_service, "cron:pers", {
             "connected_at": _hours_ago(30),
             "status": "idle",
             "title": "Cron: pers",
             "metadata": "{}",
+            "caused_by_actor_id": _ALICE_ID,
         })
         job = _pers_job(context_rotate_hours=24)
 
@@ -831,6 +854,11 @@ class TestRotation:
         title_args = cron_service.db.update_session_title.call_args.args
         assert title_args[0] == "cron:pers"
         assert title_args[1].startswith("Cron: pers (until ")
+        # The retitle is Nerve's change for the session's cause.
+        assert cron_service.db.update_session_title.call_args.kwargs == {
+            "attribution": Attribution(FAKE_SYSTEM_ACTOR.actor_id, _ALICE_ID),
+            "reason": "cron_rotation",
+        }
 
     @pytest.mark.asyncio
     async def test_no_rotation_keeps_current_chat(self, cron_service):
@@ -868,11 +896,13 @@ class TestRotation:
                     return fixed.replace(tzinfo=None)
                 return fixed.astimezone(tz)
 
-        with patch("nerve.cron.service.datetime", FixedDateTime):
+        with patch("nerve.cron.service.datetime", FixedDateTime), \
+                patch("nerve.agent.sessions.datetime", FixedDateTime):
             session_id, rotated = await svc._resolve_persistent_session(job)
 
         assert rotated is True
-        assert session_id == "cron:pers:20260101-150000"
+        # The run ID is the UTC start second and eight random hex digits.
+        assert re.fullmatch(r"cron:pers:20260101-150000-[0-9a-f]{8}", session_id)
         svc.engine.schedule_memorize.assert_awaited_once_with("cron:pers")
         svc.engine.sessions.mark_idle.assert_not_called()
 
@@ -1046,7 +1076,9 @@ class TestRunGates:
 
         await cron_service._run_job_inner(job)
 
-        cron_service.db.log_cron_start.assert_called_once_with("planner")
+        cron_service.db.log_cron_start.assert_called_once_with(
+            "planner", attribution=attribution_for(FAKE_SYSTEM_ACTOR),
+        )
         cron_service.engine.run_cron.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1244,7 +1276,7 @@ class TestRunLogOutput:
     @pytest.mark.asyncio
     async def test_stores_tail_of_long_response(self, cron_service):
         long = "begin " + ("x" * 3000) + " THE END"
-        cron_service.engine.run_cron = AsyncMock(return_value=long)
+        cron_service.engine.run_cron = AsyncMock(return_value=TurnResult(long, TurnOutcome()))
         job = _make_job()
 
         await cron_service._run_job_inner(job)
@@ -1257,7 +1289,7 @@ class TestRunLogOutput:
 
     @pytest.mark.asyncio
     async def test_stores_short_response_verbatim(self, cron_service):
-        cron_service.engine.run_cron = AsyncMock(return_value="all done")
+        cron_service.engine.run_cron = AsyncMock(return_value=TurnResult("all done", TurnOutcome()))
         job = _make_job()
 
         await cron_service._run_job_inner(job)
@@ -1315,7 +1347,7 @@ class TestLiveSessionLink:
 
         async def _run(**kwargs):
             order.append("run")
-            return "ok"
+            return TurnResult("ok", TurnOutcome())
 
         cron_service.engine.run_cron = AsyncMock(side_effect=_run)
         job = _make_job(id="live-job")

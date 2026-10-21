@@ -2,9 +2,12 @@
 
 ## Overview
 
-Sources are cursor-based data streams that pull records from external services and persist them to a local inbox (`source_messages` table). The architecture follows a **producer/consumer** pattern inspired by Kafka:
+Sources are cursor-based data streams that persist records to a local inbox
+(`source_messages` table). Most fetch an external service. Channel sources
+drain records that Slack or Telegram already delivered to a local buffer. The
+architecture follows a **producer/consumer** pattern inspired by Kafka:
 
-- **Producers** (source runners) — Fetch records from external APIs, preprocess and condense them, persist to the inbox, and advance the source cursor. No agent processing happens here.
+- **Producers** (source runners) — Fetch or drain records, preprocess them, persist them to the inbox, condense long ones, and advance the source cursor. No agent processing happens here.
 - **Consumers** (agent tools) — Read from the inbox using independent persistent cursors. Multiple consumers can read the same messages without interfering with each other.
 
 ```
@@ -19,6 +22,8 @@ PRODUCERS (sources):
       ↓
   SourceRunner._condense_long_content ← LLM condensation via Haiku (if condense: true)
       ↓
+  SourceRunner._run_drop_hook         ← dropped records to the drop hook (if drop_hook is set)
+      ↓
   Advance source cursor in SQLite     ← always, no processing dependency
 
 CONSUMERS (agent tools):
@@ -31,13 +36,12 @@ CONSUMERS (agent tools):
 
 ### Ingestion (Producer Side)
 
-1. **Fetch** — The source adapter calls an external API (gh CLI, gog CLI, Telethon) and returns normalized `SourceRecord` objects with an opaque cursor
-2. **Preprocess** — Two-stage content cleanup:
-   - **Source-specific** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
-   - **LLM condensation** (`condense: true`) — Records still over 800 chars are sent to a fast model (Haiku) that extracts only essential information. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
+1. **Fetch** — The source adapter reads an external service (gh CLI, gog CLI, Telethon) or a local channel buffer and returns normalized `SourceRecord` objects with an opaque cursor
+2. **Preprocess** (`source.preprocess()`) — Each source can override this for programmatic cleanup. Gmail strips boilerplate paragraphs (legal disclaimers, unsubscribe blocks, tracking URLs). Default: no-op
 3. **Guardrail** — An optional `InboxFilter` drops records that fail the source's allow/deny rules (see [Guardrails](#guardrails-inbox-filtering)). Dropped records are never persisted
-4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL
-5. **Advance** — Source cursor is saved to SQLite after successful persistence
+4. **Persist** — Records are saved to the `source_messages` table with a configurable TTL. A record identical to the stored one is skipped: it is not condensed and not counted as ingested.
+5. **LLM condensation** (`condense: true`) — Stored records over 800 chars are sent to a fast model (Haiku) that extracts only essential information, saved as `processed_content`. Configurable per source, runs concurrently with a 30s timeout per record, falls back to original content on failure
+6. **Advance** — Source cursor is saved to SQLite after successful persistence
 
 ### Consumption (Consumer Side)
 
@@ -139,9 +143,10 @@ visible rather than failing the fetch.
 
 ### GitHub
 - **Adapter:** `nerve/sources/github.py` — uses `gh api notifications` CLI
-- **Cursor:** ISO 8601 timestamp of the newest notification's `updated_at`
+- **Cursor:** ISO 8601 `updated_at` of the first notification in the last listing (GitHub lists the most recently notified thread first)
+- **Paging:** every page since the cursor is read in one run (`gh api --paginate`), so a backlog after downtime is ingested in full; `batch_size` does not cap this source
 - **First run:** Fetches from the last 24 hours
-- **Subsequent runs:** Uses `since=<cursor + 1s>` with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
+- **Subsequent runs:** Uses `since=<cursor>` (inclusive: the cursor's own second is listed again, and an unchanged re-listed thread is skipped by storage) with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
 - **Filter:** `participating=true` (assigned, review requested, mentioned). Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` with `all=true`, 0 with `participating=true`)
 - **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
 - **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
@@ -159,8 +164,10 @@ visible rather than failing the fetch.
 - **Note:** GitHub's Events API returns truncated payloads (e.g., PR titles and URLs may be missing). The source constructs URLs from repo name + number and handles missing fields gracefully
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 
-### Telegram
-- **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API)
+### Telegram account sync
+- **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
+  This is the pull sync for your own Telegram account, and is separate from the
+  `telegram:observed` bot-channel source below
 - **Mechanism:** Telegram's native `updates.getDifference` API — asks "what's new since this state?" using PTS/QTS/date
 - **Cursor:** JSON-encoded Telegram state `{pts, qts, date, seq}` — the server's own update tracking
 - **First run:** Calls `updates.getState()` to snapshot current position, returns 0 records (prevents flooding the agent with history)
@@ -168,9 +175,132 @@ visible rather than failing the fetch.
 - **Default schedule:** `*/5 * * * *` (every 5 min)
 - **Requires setup:** Run `nerve sync telegram` interactively once to authenticate with Telethon (phone number + code). The session is stored at `~/.nerve/telegram_sync.session`
 
+### Chat channels (Slack, Telegram)
+
+A chat channel can feed the inbox with the group traffic it already receives.
+
+- **Adapter:** `nerve/sources/channel.py` — one `ChannelSource` per enabled
+  channel source
+- **Mechanism:** for each message delivered by the channel transport, matching
+  messages are written to the `channel_observations` buffer. `ChannelSource`
+  drains that buffer into the inbox; it does not poll the chat service.
+- **Source name:** `<channel>:observed` — `slack:observed`,
+  `telegram:observed` — so a cron gate reads `sources: [slack:observed]`.
+  Compound like `gmail:<account>`, and deliberately not the bare channel name:
+  `telegram` is already the Telethon pull source for your *user* account, and
+  sharing a name would mean sharing a cron job id and a cursor key.
+- **Config:** `slack.source.*` / `telegram.source.*`, not `sync.*` — see
+  [config.md](config.md). The runner carries its own `schedule` because there
+  is no `config.sync.<name>` section to look one up in.
+- **Default schedule:** `*/5 * * * *`
+- **Cursor:** the buffer's autoincrement row id. `AUTOINCREMENT` is
+  load-bearing: the buffer is pruned, and a plain SQLite rowid is reused after
+  the highest row is deleted, which would reissue ids the cursor has already
+  passed and skip everything after them.
+- **Idempotent:** the record id is `<conversation>:<message_id>`, so the same
+  message collected twice collapses on the inbox's `(source, id)` key.
+- **Buffer target:** `max_stored_messages` (default 10 000) is one budget per
+  *transport*, covering all of its watched conversations together, not one per
+  conversation. Every 100 writes, Nerve drops the oldest rows back to that
+  target and logs a warning. The buffer can therefore exceed it by up to 99
+  rows. Values below 100 are refused and 100 used instead: `0` reads like "no
+  limit" but tells the trim to keep nothing. Daily cleanup removes rows after
+  `sync.message_ttl_days`.
+- **Backlog:** one run keeps fetching while the buffer reports more, up to 20
+  batches, so a chat busier than one `batch_size` per tick still drains. Each
+  batch is persisted before the next starts, so a run that stops at the bound
+  resumes there and logs a warning. Raise `batch_size` if that repeats.
+- **Requires setup (Telegram only):** with privacy mode enabled, a non-admin bot
+  does not receive ordinary group messages. Make it an admin or disable privacy
+  mode with BotFather. See Telegram's
+  [privacy-mode documentation](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get).
+
+#### Routing: which messages get collected
+
+For eligible shared-channel and group-chat messages, the live route and source
+route use separate rules. Access rules (`slack.allow_users`,
+`telegram.allowed_users`, …) decide who may drive the agent.
+`<channel>.source.*` decides whose traffic may reach the inbox. A message can
+take either route, both routes, or neither.
+
+| Live route | Source grant | `include_handled_messages` | Result |
+|---|---|---|---|
+| accepts | no match | — | channel only |
+| accepts | matches | `false` (default) | channel only |
+| accepts | matches | `true` | channel **and** source |
+| refuses | matches | — | source only |
+| refuses | no match | — | dropped |
+
+By default, a message accepted by the live route is not also copied to the
+source. Set `include_handled_messages: true` only when source consumers should
+receive the same message later. "Handled" means accepted for live routing, not
+that the agent produced a reply.
+
+Whether the live route accepts differs by transport, and only affects which row
+of that table you land in:
+
+- **Slack** accepts a shared-channel message for live routing when it mentions
+  the bot or continues a thread with an active session, and the sender passes
+  the access policy. A matching source can still collect a message that fails
+  the live access policy.
+- **Telegram** has no "addressed to me" test: authorization alone decides.
+- **Hosted Slack** (`slack.mode: hosted`): the gateway sends a separate
+  observation for each message it admits for observation, and a message that
+  also starts a turn arrives twice. The live route accepts the turn copy, and
+  the table above decides the observation copy. The gateway gives no trusted
+  names, so only a channel ID or member ID can grant; a name matches only the
+  display name in the event, which can deny but never grant. Nerve
+  acknowledges an observation to the gateway only after the buffer row is
+  written.
+
+**Never collected, whatever the config says:** direct and group DMs, the
+agent's own messages, other bots and apps, join/leave and similar service
+events, malformed events, and Telegram `/pair` commands. Duplicate buffered
+records collapse to one inbox record on the `(source, id)` key.
+
+**The source is off by default and fail-closed.** An empty allow list collects
+nothing rather than everything — the inverse of the access rules, because this
+is a standing grant to record other people's messages. `enabled: true` with
+nothing listed logs a warning and registers no drain.
+
+#### Threat model
+
+**Everything collected is untrusted input.** Most of it comes from people not
+authorized to instruct the agent — that is the usual reason to watch a room —
+so treat a buffered message as attacker-controlled text an agent will later
+read. What actually protects you:
+
+- `<channel>.source.*` decides **whose messages are collected** before anything
+  is written.
+- At drain time, Nerve rechecks conversation and sender deny rules against raw
+  IDs. Name-based denies apply only before buffering.
+- Inbox filters inspect metadata, not content. They cannot distinguish a report
+  from an instruction. Polling advances a cursor; it does not delete inbox
+  records. Daily cleanup removes them after their TTL expires. Agents see them
+  only through explicit source reads or cron gates, never in a live turn.
+
+So scope the grant to conversations whose participants you would already trust
+to file a ticket, and treat any workflow that acts on collected content without
+review as accepting prompt injection.
+
+**Slack lookup cost.** Names and globs use cached `conversations.info` or
+`users.info` lookups. An ID skips the lookup, but only in uppercase. A
+lowercase pattern could equally be a name, so it is resolved rather than
+assumed. A channel the grant does not name is refused before any sender is
+resolved.
+
+**Reply context is not expanded.** Slack stores `thread_ts`; Telegram stores
+`reply_to_message_id`. The parent message is not fetched.
+
+**Attachments are named, not fetched.** An upload contributes `[File: <name>]`,
+`[Photo]`, or `[Sticker: <emoji>]` ahead of any caption. A message with neither
+text nor an attachment is not collected.
+
 ## Configuration
 
-Sources are configured under the `sync:` key in `config.yaml` / `config.local.yaml`:
+Pull sources are configured under the `sync:` key in `config.yaml` /
+`config.local.yaml`. Channel sources use `slack.source.*` and
+`telegram.source.*` instead.
 
 ```yaml
 sync:
@@ -226,6 +356,7 @@ sync:
     allow_reasons: []             # Guardrail allowlist of GitHub reasons — empty = all. Example: ["mention"]
     deny_reasons: []              # Guardrail denylist of reasons. Example: ["comment", "subscribed"]
     deny_ci_branches: []          # Drop CI runs on these branches. Example: ["main", "master"]
+    drop_hook: []                 # Command (argv) that gets the dropped records. See "Drop hook"
 
   github_events:
     enabled: true
@@ -243,7 +374,7 @@ sync:
 | `enabled` | bool | `true` | Enable/disable this source |
 | `schedule` | string | varies | Crontab expression or interval (`2h`, `30m`) |
 | `batch_size` | int | `50` | Max records per fetch cycle |
-| `condense` | bool | `false` | LLM-condense long records via `memory.fast_model` before storing |
+| `condense` | bool | `false` | LLM-condense long stored records via `memory.fast_model` |
 | `message_ttl_days` | int | `7` | How long to keep inbox messages |
 | `consumer_cursor_ttl_days` | int | `2` | Consumer cursors expire after N days of inactivity |
 
@@ -256,9 +387,10 @@ attack surface, which matters most in **worker mode** where the agent acts on in
 content without a human in the loop.
 
 Filtering happens at the choke point in `SourceRunner` (after `source.preprocess()`,
-before persist). The source cursor still advances normally, so dropped records are not
-re-fetched on the next run. The number of dropped records is reported in the run summary
-(visible in the **Runs** tab and `nerve sync` output).
+before persist). The source cursor still advances normally. A source with an inclusive
+cursor (GitHub) can list a dropped record again on the next run, and the guardrail drops
+it again. The number of dropped records is reported in the run summary (visible in the
+**Runs** tab and `nerve sync` output).
 
 ### How it works
 
@@ -393,6 +525,85 @@ Source github: guardrail dropped 3/5 records (e.g. '[owner/repo] CI workflow run
 Source github: dropped 19542… on ci_branch='main' — [owner/repo] CI workflow run failed …
 ```
 
+### Drop hook
+
+A guardrail drop is silent by design: the agent never sees the record, and nothing
+answers the person who sent it. A drop hook lets you act on a drop without letting
+the content in front of the agent. Typical uses: acknowledge the dropped message
+(for example, react to a GitHub comment from an account that is not on
+`allow_actors`), or keep an audit trail of drops.
+
+```yaml
+sync:
+  github:
+    allow_actors: ["alice", "bob"]
+    drop_hook: ["/usr/local/bin/my-drop-hook", "--source", "github"]
+```
+
+`drop_hook` is an argv list. Nerve runs it directly, never through a shell. A bare
+string is one program path, not a command line. The hook runs once per batch that
+dropped at least one record, and reads one JSON object per dropped record on stdin:
+
+```json
+{"source": "github", "id": "1234", "record_type": "github_notification",
+ "summary": "[owner/repo] Some issue (mention)", "timestamp": "2026-01-01T00:00:00Z",
+ "metadata": {"reason": "mention", "repo_name": "owner/repo", "actors": ["mallory"], "...": "..."},
+ "dropped_on": "actors"}
+```
+
+`dropped_on` is the field of the rule that fired. The record's `content` is not
+sent: the guardrail exists to keep untrusted content away from automation, and the
+identifiers and metadata are enough to act on a drop. Do not use a hook to pass
+dropped records to an agent. That reopens the hole the guardrail closes.
+
+**Every field is untrusted input**, not only the content that is left out. A GitHub
+`summary` carries the issue or PR title, which whoever opened it chose. Never put a
+field into a shell command (`sh -c`, `eval`), a templated argument, or an LLM prompt.
+Read the JSON and pass values as data.
+
+For GitHub, `id` is the notification **thread** id. It stays the same when new activity
+arrives on the thread, so key idempotency on `id` + `timestamp`, not on `id` alone. The
+record does not name the comment that triggered it. A hook that needs it can look it up
+with `gh api notifications/threads/<id>` (`subject.latest_comment_url`) or by listing
+the thread's comments.
+
+Rules a hook can rely on:
+
+- **Best effort.** If the command is missing, cannot start, exits non-zero, or runs
+  longer than 60 seconds, Nerve logs a warning (with the tail of the hook's stderr) and
+  the sync continues. A hook never fails a sync and never holds back the cursor.
+- **At least one attempt, no retry.** The hook runs after the batch is persisted and
+  before the cursor advances. A batch whose persist fails is fetched again, and the hook
+  gets its drops on that run. A hook that *fails* is not retried. If every drop must be
+  handled, spool the records inside the hook and retry from there.
+- **Once per `id` + `timestamp`.** A source can list a dropped record again. GitHub
+  queries `since=<cursor>` inclusively, so the newest thread comes back on every run
+  until a newer one notifies. Nerve remembers the last 4096 `id` + `timestamp` pairs it
+  passed to the hook and does not pass them again. New activity on a thread changes its
+  `timestamp`, so that reaches the hook. This memory is in the process only. After a
+  restart, a source reload, a CLI `nerve sync`, or a crash between the hook and the
+  cursor advance, the hook can get a record again. Make the hook idempotent.
+- **Own process group.** The hook starts in a new session. On timeout, Nerve kills the
+  whole process group, so a child process (a `gh` or `curl` call from a shell script)
+  does not keep running. A process that leaves the group (`setsid`, a daemon) is out of
+  reach; Nerve then waits at most 5 more seconds. stdout is discarded and stderr goes to
+  a temporary file, so a background job the hook leaves behind does not hold the sync.
+  That job keeps running, and it is the hook's own business. Read all of stdin before
+  you exit, or start background jobs with stdin from `/dev/null`: a job that inherits
+  an unread stdin holds the batch until the timeout.
+- **Daemon context.** The hook inherits the daemon's environment (including any API
+  keys in it), working directory, and privileges. A `gh` call uses the daemon's GitHub
+  login, and its API quota: anyone who can trigger drops (for example, by @-mentioning
+  the account) can make the hook run, so rate-limit expensive work inside the hook.
+- **Validated at startup.** Without a guardrail nothing is dropped, so the hook never
+  runs, and Nerve logs a warning. A program that is not an executable (on `PATH` or by
+  path) also logs a warning. A value that is not a list of strings, or has an empty
+  program name, turns the hook off with a warning.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.drop_hook` | list | `[]` | argv of a command that gets each dropped record as a JSON line on stdin. Passed as is: no shell, nothing stripped. Empty = off |
+
 ### Extending to other sources
 
 Adding a guardrail to another source is a config field plus one registry line. In
@@ -406,6 +617,8 @@ from nerve.sources.filters import InboxFilter
 flt = InboxFilter.from_field("labels", allow=cfg.allow_labels, deny=cfg.deny_labels)
 runners.append(SourceRunner(..., inbox_filter=flt))
 ```
+
+A drop hook is one more argument: `SourceRunner(..., inbox_filter=flt, drop_hook=cfg.drop_hook)`.
 
 (Telegram already filters by folder/chat inside `fetch()` via `monitored_folders` /
 `exclude_chats`; those remain source-specific.)
@@ -480,6 +693,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
+- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints
@@ -640,7 +854,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 |------|---------|
 | `nerve/sources/models.py` | `SourceRecord`, `FetchResult`, `IngestResult` dataclasses |
 | `nerve/sources/base.py` | `Source` abstract base class |
-| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → advance) |
+| `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → drop hook → advance) |
 | `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` — declarative allow/deny guardrails applied before persist |
 | `nerve/sources/processor.py` | Legacy agent prompt building (unused by runner, may be used by tools) |
 | `nerve/sources/registry.py` | Config → `list[SourceRunner]` factory |
@@ -657,7 +871,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 
 **Consumer cursors**: Stored in `consumer_cursors` table with composite key `(consumer, source)`. Each consumer has an independent cursor per source, using the implicit `rowid` of `source_messages` as the offset. New cursors initialize to `MAX(rowid)` (no backlog). Cursors expire after `consumer_cursor_ttl_days` of inactivity.
 
-**Inclusive APIs:** Both GitHub and Gmail APIs use inclusive cursor semantics (returning records `>= cursor`). Sources handle this by advancing the cursor at query time (+1s) and applying client-side dedup as a safety net.
+**Inclusive APIs:** Both GitHub and Gmail APIs use inclusive cursor semantics (returning records `>= cursor`). Gmail advances the cursor at query time (+1s) and applies client-side dedup as a safety net. GitHub queries the cursor itself, because a notification can land in the cursor's own second; storage skips the unchanged thread listed again.
 
 **Concurrency safety:** Each `SourceRunner` holds an `asyncio.Lock` to prevent concurrent execution of the same source. If a cron schedule fires while a manual sync is in progress, the second call returns immediately with 0 records.
 

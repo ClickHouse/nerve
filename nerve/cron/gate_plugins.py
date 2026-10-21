@@ -57,6 +57,13 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
   rule holds for it: only a change that is actually applied reaches the live
   registry.
 
+**No bytecode cache.** Each file is compiled from source on every load; the
+loader never reads or writes ``__pycache__/``. The gate-plugins directory is in
+the reviewed workspace surface, and config sync refuses to merge while that
+surface holds an untracked file (on a locked instance, also a gitignored one —
+see :func:`nerve.sync_service._local_config_divergence`). A cache written by the
+import would block every sync after the first load.
+
 **Trust model.** Files in the gate-plugins directory are imported (i.e.
 executed) at daemon startup. This is the same trust model as ``config.yaml``,
 configured MCP servers, and cron prompt files — all user-controlled code/config
@@ -65,6 +72,7 @@ the daemon already loads. Only place files you trust in this directory.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import inspect
 import logging
@@ -73,6 +81,21 @@ from pathlib import Path
 from nerve.cron.gates import GATE_REGISTRY, CronGate
 
 logger = logging.getLogger(__name__)
+
+
+class _SourceOnlyLoader(importlib.machinery.SourceFileLoader):
+    """A source loader that never reads or writes a bytecode cache.
+
+    ``SourceLoader.get_code`` is the only place the stock loader reads or writes
+    ``__pycache__``; this override compiles the source directly (see "No
+    bytecode cache" above). It also removes a stale-code risk on hot-reload: a
+    cache entry is validated only by the source's whole-second mtime and its
+    size, so a same-size edit within that second would load the old code.
+    """
+
+    def get_code(self, fullname):
+        source_path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(source_path), source_path)
 
 #: Module-name prefix stamped on every plugin-loaded module (see
 #: :func:`_import_module`). It's how we tell a plugin-registered gate class apart
@@ -243,12 +266,15 @@ def _import_module(path: Path):
     mod_name = f"{_PLUGIN_MODULE_PREFIX}{path.stem}"
     try:
         spec = importlib.util.spec_from_file_location(mod_name, path)
-        if spec is None or spec.loader is None:
+        if spec is None or spec.origin is None:
             logger.warning(
                 "Cron gate plugin %s: could not create an import spec; skipping",
                 path.name,
             )
             return None
+        # ``spec.origin`` is the absolute path ``__file__`` gets, so tracebacks
+        # name the same file even when the plugins dir was configured relative.
+        spec.loader = _SourceOnlyLoader(spec.name, spec.origin)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module

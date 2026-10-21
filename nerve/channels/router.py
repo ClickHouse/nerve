@@ -13,22 +13,53 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
 
 from nerve.agent.interactive import get_handler
 from nerve.agent.streaming import broadcaster
+from nerve.channels.access import Decision
 from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     InboundMessage,
+    ObservedMessage,
     OutboundMessage,
+    OutboundRefused,
 )
 from nerve.channels.stream_adapter import StreamAdapter
+from nerve.db.observations import DEFAULT_MAX_ROWS
+from nerve.identity import UNATTRIBUTED
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
 
 logger = logging.getLogger(__name__)
+
+
+def turn_stop_note(result: dict[str, Any], session_id: str) -> str | None:
+    """What a channel answers when ``/stop`` could not stop the turn, or
+    ``None`` when it stopped one (``stopped`` / ``killed``) or nothing ran.
+
+    ``/stop`` stops the turn only. A runtime that cannot spare background
+    agents is never told to stop (``needs_confirmation``): the answer says
+    so instead of "nothing running". A turn that did not end within the
+    graceful wait while agents run is left running (``not_stopped``).
+    """
+    outcome = result.get("turn")
+    if outcome == "needs_confirmation":
+        n = len(result.get("would_end") or [])
+        agents = "1 background agent" if n == 1 else f"{n} background agents"
+        return (
+            f"Couldn't stop `{session_id}` without stopping its {agents}. "
+            f"Stop {'it' if n == 1 else 'them'} from the web UI."
+        )
+    if outcome == "not_stopped":
+        return (
+            f"`{session_id}` didn't stop within 5 s. Force stop it from the "
+            "web UI; that also ends its background agents."
+        )
+    return None
 
 
 class ChannelRouter:
@@ -71,6 +102,14 @@ class ChannelRouter:
             channel.name, channel.capabilities,
         )
 
+    def unregister(self, channel: BaseChannel) -> bool:
+        """Remove *channel* only if it is still the registered instance."""
+        if self._channels.get(channel.name) is not channel:
+            return False
+        del self._channels[channel.name]
+        logger.info("Unregistered channel: %s", channel.name)
+        return True
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a registered channel by name."""
         return self._channels.get(name)
@@ -111,7 +150,7 @@ class ChannelRouter:
             )
         else:
             session_id = await self.engine.sessions.get_active_session(
-                msg.channel_key, source=msg.channel_name,
+                msg.channel_key, source=msg.channel_name, actor=None,
             )
 
         # Store message context for reaction support
@@ -198,6 +237,10 @@ class ChannelRouter:
                 source=msg.channel_name,
                 channel=msg.channel_name,
                 images=images,
+                # Provider-person mapping is not available yet, so external
+                # human input remains unidentified rather than guessed.
+                actor=None,
+                origin=msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -259,6 +302,8 @@ class ChannelRouter:
                 source=last_msg.channel_name,
                 channel=last_msg.channel_name,
                 images=all_images or None,
+                actor=None,
+                origin=last_msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -358,6 +403,44 @@ class ChannelRouter:
         return await chan_obj.send_file(target, file_path)
 
     # ------------------------------------------------------------------ #
+    #  Observation buffer                                                    #
+    # ------------------------------------------------------------------ #
+
+    async def observe(
+        self,
+        msg: ObservedMessage,
+        ttl_days: int = 7,
+        max_stored_messages: int = DEFAULT_MAX_ROWS,
+    ) -> bool:
+        """Buffer a message a channel collected for the source inbox.
+
+        Channels reach the database through the router, never through the
+        engine directly, so this is the seam. Returns True if the record was
+        buffered.
+
+        A failure is swallowed and logged. This sits on a channel's dispatch
+        path, ahead of any live handling, so a database hiccup must not take
+        down message handling for the sake of a buffered copy.
+        """
+        db = getattr(self.engine, "db", None)
+        if db is None:
+            return False
+        try:
+            await db.insert_channel_observation(
+                channel=msg.channel_name,
+                channel_key=msg.channel_key,
+                payload=asdict(msg),
+                ttl_days=ttl_days,
+                max_rows=max_stored_messages,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to buffer an observation from %s: %s", msg.channel_name, e,
+            )
+            return False
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 
@@ -393,9 +476,9 @@ class ChannelRouter:
     async def get_active_session(
         self, channel_key: str, source: str,
     ) -> str:
-        """Get or create the active session for a channel."""
+        """Get or create the active session for an unidentified channel user."""
         return await self.engine.sessions.get_active_session(
-            channel_key, source=source,
+            channel_key, source=source, actor=None,
         )
 
     async def get_last_session(self, channel_key: str) -> str | None:
@@ -420,6 +503,7 @@ class ChannelRouter:
         session_id = str(uuid.uuid4())[:8]
         await self.engine.sessions.get_or_create(
             session_id, title=title, source=source,
+            actor=None,
         )
         await self.engine.sessions.set_active_session(
             channel_key, session_id,
@@ -441,9 +525,40 @@ class ChannelRouter:
             limit=limit, offset=offset, current_id=current_id,
         )
 
+    async def list_conversation_sessions(
+        self, channel_key: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List live mappings for one exact conversation and its children."""
+        return await self.engine.db.list_channel_sessions_for_conversation(
+            channel_key,
+            limit=limit,
+            exclude_statuses=("archived", "stopped"),
+        )
+
+    # Channel commands come from a channel user that names no person, so
+    # the session changes that they make are unattributed.
+
+    async def stop_session(self, session_id: str) -> bool:
+        """Stop a session through the engine lifecycle boundary."""
+        return await self.engine.stop_session(session_id, attribution=UNATTRIBUTED)
+
+    async def stop_turn(self, session_id: str) -> dict[str, Any]:
+        """Stop the session's turn (background agents keep running) and
+        return the engine's ``StopTurnResult``, so ``/stop`` can say why a
+        turn was left running (see :func:`turn_stop_note`)."""
+        return await self.engine.stop_turn(session_id, attribution=UNATTRIBUTED)
+
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
-        return await self.engine.sessions.set_starred(session_id, starred)
+        return await self.engine.sessions.set_starred(
+            session_id, starred, attribution=UNATTRIBUTED,
+        )
+
+    async def toggle_session_starred(self, session_id: str) -> bool:
+        """Toggle a session's starred state."""
+        return await self.engine.sessions.toggle_starred(
+            session_id, attribution=UNATTRIBUTED,
+        )
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""
@@ -459,6 +574,16 @@ class ChannelRouter:
         """Total message count for a session (to know if more history exists)."""
         return await self.engine.db.count_messages(session_id)
 
+    async def list_plans(
+        self, status: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List plans (optionally filtered by status), newest first."""
+        return await self.engine.db.list_plans(status=status, limit=limit)
+
+    async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        """Fetch a plan row (joined with its task title), or None if gone."""
+        return await self.engine.db.get_plan(plan_id)
+
     # ------------------------------------------------------------------ #
     #  Outbound: engine → channel (cron delivery, etc.)                    #
     # ------------------------------------------------------------------ #
@@ -472,19 +597,60 @@ class ChannelRouter:
     ) -> None:
         """Deliver a complete message to a channel target.
 
-        Used by cron jobs and other non-interactive output delivery.
+        Used by cron jobs and other non-interactive output delivery, which
+        have no return value to read — see :meth:`deliver_addressed` for the
+        same send with the refusal reason attached.
+        """
+        await self.deliver_addressed(channel_name, target, message, session_id)
+
+    async def deliver_addressed(
+        self,
+        channel_name: str,
+        target: str,
+        message: str,
+        session_id: str | None = None,
+    ) -> Decision:
+        """Deliver to a target the caller names, reporting why if refused.
+
+        The target is always supplied by the caller and never inferred from
+        ``_message_context``, so a cron run cannot spill into whatever chat
+        last touched the session — the same reasoning as :meth:`send_file`.
+
+        The channel authorizes the destination first, because only it knows
+        what a target means; see :meth:`BaseChannel.authorize_outbound`.
+        Returning the :class:`~nerve.channels.access.Decision` lets a caller
+        say why nothing was sent instead of only that nothing was.
+
+        A transport failure propagates rather than becoming a refusal: "the
+        policy said no" and "Slack was down" are different answers. A channel
+        whose policy is checked at delivery raises
+        :class:`~nerve.channels.base.OutboundRefused`, which becomes a refusal.
         """
         channel = self._channels.get(channel_name)
         if not channel:
             logger.warning("Cannot deliver to unknown channel: %s", channel_name)
-            return
+            return Decision(False, f"unknown channel {channel_name!r}")
+
+        verdict = await channel.authorize_outbound(target)
+        if not verdict.allowed:
+            logger.info(
+                "Refused addressed delivery to %s: %s", channel_name, verdict.reason,
+            )
+            return verdict
 
         formatted = channel.format_response(message)
-        await channel.send(OutboundMessage(
-            target=target,
-            text=formatted,
-            session_id=session_id or "",
-        ))
+        try:
+            await channel.send(OutboundMessage(
+                target=target,
+                text=formatted,
+                session_id=session_id or "",
+            ))
+        except OutboundRefused as refusal:
+            logger.info(
+                "Refused addressed delivery to %s at delivery: %s", channel_name, refusal.reason,
+            )
+            return Decision(False, refusal.reason)
+        return verdict
 
     # ------------------------------------------------------------------ #
     #  Streaming adapter lifecycle                                         #

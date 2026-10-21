@@ -1,24 +1,17 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Bot, Search, Lightbulb, Wrench, Loader2, ArrowRight } from '../../ui/icons';
+import { ChevronRight, ChevronDown, Loader2, ArrowRight } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { MarkdownContent } from '../MarkdownContent';
 import { useChatStore } from '../../../stores/chatStore';
 import { extractResultText } from '../../../utils/extractResultText';
 import { Button, IconButton } from '../../ui';
+import { identityVisual } from '../agents/agentVisuals';
 
-const AGENT_ICONS: Record<string, typeof Bot> = {
-  Explore: Search,
-  Plan: Lightbulb,
-  'general-purpose': Wrench,
-};
-
-/** Agent identity, not status — which sub-agent ran, at a glance. */
-const AGENT_COLORS: Record<string, string> = {
-  Explore: 'text-hue-cyan',
-  Plan: 'text-hue-amber',
-  'general-purpose': 'text-link',
-};
-
+/**
+ * The sub-agent card of old history: an `Agent`/`Task` call with no agent
+ * record behind it (AgentLine renders the live line when there is one). Its
+ * "View" opens a result-only tab built from the call itself.
+ */
 export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
@@ -30,8 +23,8 @@ export function SubagentToolBlock({ block }: { block: ToolCallBlockData }) {
   const prompt = String(block.input.prompt || '');
   const model = block.input.model ? String(block.input.model) : null;
 
-  const Icon = AGENT_ICONS[subagentType] || Bot;
-  const color = AGENT_COLORS[subagentType] || 'text-text-muted';
+  // Agent identity, not status — which sub-agent ran, at a glance.
+  const { Icon, className: color } = identityVisual(subagentType);
 
   const resultText = block.result ? extractResultText(block.result) : '';
   const displayText = resultText.length > 3000 ? resultText.slice(0, 3000) + '\n\n...(truncated)' : resultText;

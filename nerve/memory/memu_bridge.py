@@ -12,6 +12,7 @@ import gc
 import json
 import logging
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,9 @@ import numpy as np
 
 from nerve import paths
 from nerve.config import NerveConfig
+from nerve.inference_principal import system_principal_headers
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.utils.llm import response_text
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +47,12 @@ class MemoryBackendUnavailable(RuntimeError):
     never mistakes "memory is DOWN" for "no relevant memories"."""
 
 
-def _is_transient_llm_error(exc: BaseException) -> bool:
-    """True if ``exc`` looks like a transient proxy/auth failure — worth
-    retrying, and worth surfacing as backend-down — vs a permanent/logic error.
+def _llm_error_status(exc: BaseException) -> int | None:
+    """The HTTP status of an LLM SDK error, or None if it has none.
 
-    Detects the OpenAI-SDK ``APIStatusError`` family by HTTP status (429 / 5xx)
-    plus the proxy's ``auth_unavailable`` / revoked-OAuth signatures on 401/403.
-    Status is read from ``status_code`` (or ``response.status_code``), falling
-    back to parsing ``"Error code: NNN"`` from the message so this stays
-    decoupled from the ``openai`` import."""
+    Read from ``status_code`` (or ``response.status_code``), falling back to
+    parsing ``"Error code: NNN"`` from the message so this stays decoupled
+    from the ``openai`` and ``anthropic`` imports."""
     msg = str(exc)
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -62,14 +62,56 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
             status = int(msg.split("Error code: ", 1)[1].strip()[:3])
         except (ValueError, IndexError):
             status = None
+    return status
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a transient proxy/auth failure — worth
+    retrying, and worth surfacing as backend-down — vs a permanent/logic error.
+
+    Detects the OpenAI-SDK ``APIStatusError`` family by HTTP status (429 / 5xx)
+    plus the proxy's ``auth_unavailable`` / revoked-OAuth signatures on 401/403.
+    The status comes from :func:`_llm_error_status`."""
+    status = _llm_error_status(exc)
     if status in (429, 500, 502, 503, 504):
         return True
-    low = msg.lower()
+    low = str(exc).lower()
     if status in (401, 403) and ("auth_unavailable" in low or "revoked" in low):
         return True
     # Belt-and-suspenders: the proxy's stuck-cooldown signature regardless of
     # how the status surfaced.
     return "auth_unavailable" in low
+
+
+# The generation of a Claude model id: the major version after the family
+# name. A search, not a full match, so bare, dated, ``[1m]`` and Bedrock
+# geo-prefixed ids all match.
+_CLAUDE_GENERATION_RE = re.compile(r"claude-[a-z]+-(\d+)")
+
+# Model ids that rejected ``temperature`` although :func:`_sends_temperature`
+# allowed it, for example a Bedrock application inference profile ARN.
+_TEMPERATURE_REJECTED: set[str] = set()
+
+
+def _sends_temperature(model: str) -> bool:
+    """Whether memU calls to ``model`` may carry ``temperature``.
+
+    Claude 5 and later models reject sampling parameters with a 400
+    ("`temperature` is deprecated for this model"). Older models accept it.
+    An id with no readable generation (an inference profile ARN, a gateway
+    alias) keeps it until the API rejects it once; the chat wrapper in
+    :meth:`MemUBridge._instrument_llm_timeouts` then records the id in
+    :data:`_TEMPERATURE_REJECTED`.
+    """
+    if model in _TEMPERATURE_REJECTED:
+        return False
+    match = _CLAUDE_GENERATION_RE.search(model.lower())
+    return match is None or int(match.group(1)) < 5
+
+
+def _is_temperature_rejected(exc: BaseException) -> bool:
+    """True if ``exc`` is the 400 a model returns when it does not accept ``temperature``."""
+    return _llm_error_status(exc) == 400 and "temperature" in str(exc).lower()
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -437,10 +479,13 @@ class _BedrockLLMClient:
 
     def __init__(self, *, chat_model: str, aws_region: str = "", aws_profile: str = "",
                  aws_access_key_id: str = "", aws_secret_access_key: str = "",
-                 timeout: float = 120.0):
+                 timeout: float = 120.0,
+                 default_headers: dict[str, str] | None = None):
         from anthropic import AsyncAnthropicBedrock
 
         kwargs: dict[str, Any] = {"timeout": timeout}
+        if default_headers:
+            kwargs["default_headers"] = default_headers
         if aws_region:
             kwargs["aws_region"] = aws_region
         if aws_profile:
@@ -459,14 +504,16 @@ class _BedrockLLMClient:
         *,
         max_tokens: int | None = None,
         system_prompt: str | None = None,
-        temperature: float = 0.2,
+        temperature: float | None = 0.2,
     ) -> tuple[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.chat_model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens or 4096,
-            "temperature": temperature,
         }
+        # None leaves temperature out, and so does a model that rejects it.
+        if temperature is not None and _sends_temperature(self.chat_model):
+            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         # Tag the OTEL spans emitted by AnthropicInstrumentor so memU calls
@@ -474,8 +521,7 @@ class _BedrockLLMClient:
         # when Langfuse is disabled.
         with lf_attrs(tags=["component:memu", f"model:{self.chat_model}"]):
             response = await self._bedrock.messages.create(**kwargs)
-        text = response.content[0].text if response.content else ""
-        return text, response
+        return response_text(response), response
 
     async def summarize(
         self,
@@ -1652,7 +1698,10 @@ class MemUBridge:
             # inside memU's LLMConfig.  It will never be used because we
             # replace the clients immediately after init.
             chat_base_url = self.config.anthropic_api_base_url or "https://placeholder.invalid/v1"
-            chat_api_key = self.config.effective_api_key or "placeholder"
+            # The configured key, else ANTHROPIC_API_KEY from the environment
+            # (an env-provisioned instance), else a placeholder that passes
+            # memU's validation on an instance that has no provider yet.
+            chat_api_key = self.config.resolve_anthropic_api_key() or "placeholder"
 
             llm_profiles: dict[str, Any] = {
                 "default": {
@@ -1672,6 +1721,7 @@ class MemUBridge:
                 }
 
             resources_dir = paths.nerve_path("memu-resources")
+            paths.ensure_nerve_home()  # create the state dir owner-only
             resources_dir.mkdir(parents=True, exist_ok=True)
 
             # Fast model for category summaries and date resolution (Haiku).
@@ -1782,10 +1832,13 @@ class MemUBridge:
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
-            # Bedrock-backed clients.  Must happen before any LLM call
+            # Bedrock-backed clients, or give the OpenAI clients the
+            # principal header.  Must happen before any LLM call
             # (warmup, category sync, etc.).
             if is_bedrock:
                 self._inject_bedrock_clients()
+            else:
+                self._name_system_principal()
 
             await self._ensure_categories()
 
@@ -1912,7 +1965,19 @@ class MemUBridge:
             # connection can hang (HTTP/2 negotiation issue with Cloudflare,
             # or cold Bedrock endpoint).  A cheap throwaway call here forces
             # the connection open so real memorize calls don't stall.
-            for profile in ("memorize", "fast", "default"):
+            #
+            # Not without a credential: an instance that has not finished setup
+            # would otherwise make three 401s against the API on every boot.
+            warm_profiles = (
+                ("memorize", "fast", "default")
+                if self.config.credential_available() else ()
+            )
+            if not warm_profiles:
+                logger.info(
+                    "memU: no model provider configured yet — skipping LLM "
+                    "warm-up; memory works once setup is finished at /setup",
+                )
+            for profile in warm_profiles:
                 try:
                     client = self._service._get_llm_base_client(profile)
                     if isinstance(client, _BedrockLLMClient):
@@ -2068,9 +2133,14 @@ class MemUBridge:
             logger.error("Failed to initialize memU: %s", e, exc_info=True)
             return False
 
-    async def _ensure_categories(self) -> None:
-        """Create seed categories from config that don't already exist in the DB."""
-        if not self._service or not self.config.memory.categories:
+    async def _ensure_categories(self, categories: list[Any] | None = None) -> None:
+        """Create seed categories that don't already exist in the DB.
+
+        ``categories`` defaults to the configured set this bridge was built
+        with; :meth:`apply_categories` passes the freshly reloaded one.
+        """
+        wanted = list(categories) if categories is not None else list(self.config.memory.categories)
+        if not self._service or not wanted:
             return
 
         existing: set[str] = set()
@@ -2081,7 +2151,7 @@ class MemUBridge:
         except Exception:
             pass
 
-        for cat_cfg in self.config.memory.categories:
+        for cat_cfg in wanted:
             if cat_cfg.name in existing:
                 continue
             try:
@@ -2102,14 +2172,34 @@ class MemUBridge:
         pass
 
     @staticmethod
-    def _release_memory() -> None:
-        """Force Python GC and return freed pages to the OS."""
-        gc.collect()
+    def _malloc_trim() -> None:
+        """Hand freed glibc arenas back to the OS. Cheap; never raises."""
         if MemUBridge._libc is not None:
             try:
                 MemUBridge._libc.malloc_trim(0)
             except Exception:
                 pass
+
+    @staticmethod
+    def _release_memory() -> None:
+        """Force a full Python GC and return freed pages to the OS.
+
+        The full collection walks the whole heap and stops every Python thread
+        for the duration, so callers must be rare or tolerate a pause. Use
+        :meth:`_trim_memory` on hot paths.
+        """
+        gc.collect()
+        MemUBridge._malloc_trim()
+
+    @staticmethod
+    def _trim_memory() -> None:
+        """Collect the young generations and return freed pages to the OS.
+
+        Reclaims the cycles a just-finished memorize leaves behind without
+        walking the long-lived heap, so it is cheap enough to run per file.
+        """
+        gc.collect(1)
+        MemUBridge._malloc_trim()
 
     _MEMORIZE_TIMEOUT = 300
     # Number of retry attempts after a timeout.
@@ -2134,13 +2224,17 @@ class MemUBridge:
     _DATE_SWEEP_COMMIT_EVERY = 500
 
     def _make_bedrock_client(self, chat_model: str) -> _BedrockLLMClient:
-        """Create a _BedrockLLMClient using Nerve's provider config."""
+        """Create a _BedrockLLMClient using Nerve's provider config.
+
+        In external mode its requests name the system actor as principal.
+        """
         return _BedrockLLMClient(
             chat_model=chat_model,
             aws_region=self.config.provider.aws_region,
             aws_profile=self.config.provider.aws_profile,
             aws_access_key_id=self.config.provider.aws_access_key_id,
             aws_secret_access_key=self.config.provider.aws_secret_access_key,
+            default_headers=system_principal_headers(),
         )
 
     def _inject_bedrock_clients(self) -> None:
@@ -2160,6 +2254,25 @@ class MemUBridge:
         for name, model in profiles_to_replace.items():
             self._service._llm_clients[name] = self._make_bedrock_client(model)
             logger.info("Injected Bedrock LLM client for profile '%s' (model=%s)", name, model)
+
+    def _name_system_principal(self) -> None:
+        """Make memU's OpenAI chat clients name the system actor.
+
+        memU makes these clients and gives them no headers. In external mode
+        their requests name the system actor as principal, as the Bedrock
+        clients do. The embedding profile calls the OpenAI API directly and
+        gets no header.
+        """
+        headers = system_principal_headers()
+        if not headers:
+            return
+        for name in self._service.llm_profiles.profiles:
+            if name == "embedding":
+                continue
+            client = self._service._get_llm_base_client(name)
+            inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
+            if inner is not None:
+                client.client = inner.with_options(default_headers=headers)
 
     def _instrument_llm_timeouts(self) -> None:
         """Configure per-call timeouts on LLM clients (two layers).
@@ -2202,15 +2315,53 @@ class MemUBridge:
                 if getattr(client.chat, "_nerve_timeout_wrapped", False):
                     continue
                 original_chat = client.chat
+                # The temperature value that leaves the field out of the
+                # request. memU's OpenAI client sends None as JSON null, so it
+                # needs the SDK's ``omit`` sentinel.
+                if isinstance(client, _BedrockLLMClient):
+                    no_temperature: Any = None
+                else:
+                    from openai import omit as no_temperature
 
                 async def _timeout_chat(
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,
                     _orig=original_chat, _prof=profile,
+                    _model=str(getattr(client, "chat_model", "") or ""),
+                    _omit=no_temperature,
                 ):
                     # Anthropic API requires max_tokens >= 1; memU sometimes
                     # omits it.  Default to 4096 to prevent 400 errors.
                     if max_tokens is None:
                         max_tokens = 4096
+
+                    async def _chat_once():
+                        # Claude 5 and later reject temperature (see
+                        # _sends_temperature). A model whose id the check
+                        # cannot read may reject it too: on that 400, record
+                        # the id and send the same request without it.
+                        temp = temperature if _sends_temperature(_model) else _omit
+                        try:
+                            return await _orig(
+                                prompt,
+                                max_tokens=max_tokens,
+                                system_prompt=system_prompt,
+                                temperature=temp,
+                            )
+                        except Exception as exc:
+                            if temp is _omit or not _is_temperature_rejected(exc):
+                                raise
+                        _TEMPERATURE_REJECTED.add(_model)
+                        logger.warning(
+                            "memU LLM [%s]: model %s rejects temperature; "
+                            "sending without it from now on", _prof, _model,
+                        )
+                        return await _orig(
+                            prompt,
+                            max_tokens=max_tokens,
+                            system_prompt=system_prompt,
+                            temperature=_omit,
+                        )
+
                     # memU otherwise fails fast with SDK retries disabled
                     # (see max_retries=0 above), so a transient proxy/auth blip
                     # (503/429/auth_unavailable) that the agent SDK rides out via
@@ -2226,12 +2377,7 @@ class MemUBridge:
                         t0 = time.monotonic()
                         try:
                             return await asyncio.wait_for(
-                                _orig(
-                                    prompt,
-                                    max_tokens=max_tokens,
-                                    system_prompt=system_prompt,
-                                    temperature=temperature,
-                                ),
+                                _chat_once(),
                                 timeout=self._LLM_CALL_TIMEOUT,
                             )
                         except asyncio.TimeoutError:
@@ -2391,8 +2537,11 @@ class MemUBridge:
 
         # For Bedrock, re-inject fresh Bedrock clients (memU's default
         # _get_llm_base_client would recreate broken OpenAISDK ones).
+        # memU recreates the OpenAI clients without the principal header.
         if is_bedrock:
             self._inject_bedrock_clients()
+        else:
+            self._name_system_principal()
 
         # Re-apply per-call timeouts on the fresh clients
         self._instrument_llm_timeouts()
@@ -2478,9 +2627,9 @@ class MemUBridge:
                             name=f"filter-knowledge-{Path(file_path).name}",
                         )
 
-                # gc.collect + malloc_trim can take 100ms+ on a large heap
-                # — run off the event loop.
-                await asyncio.to_thread(self._release_memory)
+                # A full collection holds the GIL, so it stalls the event loop
+                # even from a worker thread; only the young generations go here.
+                await asyncio.to_thread(self._trim_memory)
                 return True
 
             except asyncio.TimeoutError:
@@ -2621,6 +2770,7 @@ class MemUBridge:
         def _write_conversation() -> int:
             """JSON-encode and write the conversation (off the event loop —
             10K messages serialize to multiple MB)."""
+            paths.ensure_nerve_home()
             conv_dir.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(entries, ensure_ascii=False)
             conv_path.write_text(payload, encoding="utf-8")
@@ -2834,7 +2984,7 @@ class MemUBridge:
         result: dict[str, str | None] = {}
         try:
             import re
-            text = response.content[0].text
+            text = response_text(response)
             json_match = re.search(r"\[.*\]", text, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -2959,12 +3109,14 @@ class MemUBridge:
         client = self._get_anthropic_client()
         response = client.messages.create(
             model=model,
-            max_tokens=512,
+            # Thinking counts toward max_tokens, and the 5.5 models think by
+            # default.
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
 
         try:
-            text = response.content[0].text
+            text = response_text(response)
             json_match = _re.search(r"\[.*?\]", text, _re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -2996,6 +3148,16 @@ class MemUBridge:
             category_limit: max category breadcrumbs to return.
         """
         if not self._available or not self._service:
+            return []
+        if not self.config.credential_available():
+            # Quietly, once per process: a recall with no provider can only
+            # fail, and failing on every turn is noise.
+            if not getattr(self, "_said_no_credential", False):
+                self._said_no_credential = True
+                logger.info(
+                    "memU recall skipped: no model provider configured; finish "
+                    "setup at /setup",
+                )
             return []
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
@@ -3209,6 +3371,51 @@ class MemUBridge:
         except Exception as e:
             logger.error("delete_item failed for %s: %s", memory_id, e)
             return False
+
+    async def apply_categories(self, categories: list[Any]) -> bool:
+        """Make the running service use ``categories`` now — what a restart
+        would do with ``memory.categories``, without the restart.
+
+        The setup page's Mode step is the caller: on a fresh install memU was
+        built with no categories (memU's own defaults), and the step writes
+        the mode's set into ``settings.yaml``. ``memory.*`` is restart-only in
+        the reload table, so without this the Review step would demand a
+        restart for the one thing every browser setup does. Returns whether
+        the set was applied; ``False`` when memU is not running (the restart
+        debt then stays, truthfully). Idempotent; no LLM call without an
+        embedding provider.
+        """
+        if not self._available or not self._service:
+            return False
+        return await self._submit(self._apply_categories_impl(list(categories)))
+
+    async def _apply_categories_impl(self, categories: list[Any]) -> bool:
+        """``apply_categories`` on the memU loop; mirrors the tail of
+        :meth:`_initialize_impl` (seed the DB, rebuild the prompt list and the
+        name→id mapping, mark the categories ready)."""
+        from memu.app.service import CategoryConfig
+
+        svc = self._service
+        if svc is None:
+            return False
+        await self._ensure_categories(categories)
+        configs = [CategoryConfig(name=c.name, description=c.description) for c in categories]
+        try:
+            svc.memorize_config.memory_categories = list(configs)
+        except Exception:  # noqa: BLE001 — a frozen model; the lists below are what memorize reads
+            pass
+        svc.category_configs = list(configs)
+        svc.category_config_map = {cfg.name: cfg for cfg in configs}
+        svc._category_prompt_str = svc._format_categories_for_prompt(svc.category_configs)
+        svc._context.categories_ready = True
+        ctx = svc._get_context()
+        ctx.category_ids = []
+        ctx.category_name_to_id = {}
+        for _cat_id, cat in svc.database.memory_category_repo.categories.items():
+            ctx.category_ids.append(cat.id)
+            ctx.category_name_to_id[cat.name.lower()] = cat.id
+        logger.info("memU: applied %d configured categories to the running service", len(configs))
+        return True
 
     async def create_category(self, name: str, description: str, source: str = "bridge") -> bool:
         """Create a new memory category at runtime."""

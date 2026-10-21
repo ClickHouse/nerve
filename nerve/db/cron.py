@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
 
 class CronStore:
-    """Mixin providing cron job logging operations."""
+    """Mixin providing cron job logging operations.
 
-    async def log_cron_start(self, job_id: str) -> int:
+    Each run row records who started the run (``actor_id``) and on whose
+    behalf it happens (``caused_by_actor_id``): the system actor for a
+    scheduled run, the person for a run that they started through the API.
+    """
+
+    async def log_cron_start(
+        self, job_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
         result = await self._write(
-            "INSERT INTO cron_logs (job_id) VALUES (?)", (job_id,)
+            "INSERT INTO cron_logs (job_id, actor_id, caused_by_actor_id) "
+            "VALUES (?, ?, ?)",
+            (job_id, attribution.actor_id, attribution.caused_by_actor_id),
         )
         return result.lastrowid
 
@@ -39,6 +49,29 @@ class CronStore:
             "session_id = COALESCE(?, session_id) WHERE id = ?",
             (now, status, output, error, session_id, log_id),
         )
+
+    async def log_cron_missed(
+        self, job_id: str, scheduled_run_time: str, error: str | None = None,
+        *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
+        """Record a run the scheduler dropped for starting too late.
+
+        Written already closed out: the run never started, so nothing will call
+        log_cron_finish for it. ``started_at`` is when the run was *due*, which
+        is what lines the row up with the runs around it. The ``missed`` status
+        keeps it out of get_last_successful_cron_run, so interval alignment and
+        startup catch-up are unaffected.
+        """
+        now = utc_now_iso()
+        result = await self._write(
+            "INSERT INTO cron_logs (job_id, started_at, finished_at, status, error, "
+            "actor_id, caused_by_actor_id) VALUES (?, ?, ?, 'missed', ?, ?, ?)",
+            (
+                job_id, scheduled_run_time, now, error,
+                attribution.actor_id, attribution.caused_by_actor_id,
+            ),
+        )
+        return result.lastrowid
 
     async def get_cron_logs(
         self, job_id: str | None = None, limit: int = 50, offset: int = 0,

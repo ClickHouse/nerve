@@ -20,6 +20,7 @@ attribute to the real session exactly like the in-process Claude MCP.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import logging
@@ -28,9 +29,11 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from nerve import paths
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
     AgentClient,
@@ -39,6 +42,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    config_excluded_tools,
 )
 from nerve.agent.backends.codex import lifecycle
 from nerve.agent.backends.codex.appserver import (
@@ -173,6 +177,7 @@ class CodexBackend:
 
     def __init__(self, deps: Any):
         self._deps = deps
+        paths.ensure_nerve_home()  # the default CODEX_HOME is under the state dir
         Path(self._home_dir()).mkdir(parents=True, exist_ok=True)
         self._preflight_cache: tuple[float, dict[str, Any]] | None = None
         self._preflight_lock = asyncio.Lock()
@@ -236,7 +241,7 @@ class CodexBackend:
         return self.codex.model
 
     def excluded_tools(self) -> set[str]:
-        return set()
+        return config_excluded_tools(self.config)
 
     async def validate_model(self, model: str) -> None:
         """Reject obvious cross-backend model leakage before spawning Codex.
@@ -537,6 +542,13 @@ class CodexBackend:
                 continue
             try:
                 overrides += self._translate_mcp_server(srv)
+                if self._deps.managed_mcp:
+                    # An MCP gateway server. The organization approved its
+                    # tools at the gateway, and Codex refuses an MCP tool that
+                    # it would have to ask about under approval policy never.
+                    overrides.append(
+                        f'mcp_servers.{srv.name}.default_tools_approval_mode="approve"'
+                    )
             except Exception as e:
                 logger.warning(
                     "Skipping MCP server %r for codex: %s", srv.name, e,
@@ -734,6 +746,17 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
+        # Cumulative `total` at the end of the previous turn on this client,
+        # kept across turns; the baseline for the next turn's delta when known.
+        self._prev_total_usage: dict | None = None
+        # Fallback baseline for the first turn on a fresh client (no previous
+        # total yet): (total - last) from the turn's first tokenUsage
+        # notification. Reset per turn.
+        self._turn_total_base: dict[str, int] | None = None
+        # Count of model responses (tokenUsage notifications) in this turn,
+        # reported as num_turns so the context bar can divide the turn-aggregate
+        # usage back down to a single call's context occupancy.
+        self._turn_response_count: int = 0
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -914,7 +937,7 @@ class CodexClient(AgentClient):
     async def start_turn(self, turn: TurnInput) -> None:
         if not self._thread_id:
             raise BackendError("codex client has no thread")
-        self._turn_usage = None
+        self._reset_turn_usage_accounting()
         self._last_error = None
         self._items.clear()
         self._ultracode_usage = None
@@ -1087,6 +1110,8 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
+                self._turn_response_count += 1
+                self._capture_turn_total_base(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
                     self._context_window = window
@@ -1170,6 +1195,26 @@ class CodexClient(AgentClient):
             return str(err.get("message") or err)
         return str(err or params.get("message") or "unknown codex error")
 
+    def _collab_call_id(self, item_id: str) -> str:
+        """The tool-use id of a collab agent call: its item id, or a fresh
+        ``codex-agent-<hex>`` when the item carries none (remembered so the
+        matching completion reuses it; a shared fallback would merge agents)."""
+        if item_id:
+            return item_id
+        call_id = f"codex-agent-{uuid.uuid4().hex[:8]}"
+        self.__dict__.setdefault("_collab_unnamed", collections.deque()).append(call_id)
+        return call_id
+
+    def _collab_result_id(self, item_id: str) -> str:
+        """The tool-use id a collab agent's completion settles (pairs an
+        id-less completion with the oldest id-less start)."""
+        if item_id:
+            return item_id
+        pending = self.__dict__.get("_collab_unnamed")
+        if pending:
+            return pending.popleft()
+        return f"codex-agent-{uuid.uuid4().hex[:8]}"
+
     async def _map_item_started(self, item: dict) -> list[ev.AgentEvent]:
         item_id = str(item.get("id") or "")
         item_type = str(item.get("type") or "")
@@ -1220,11 +1265,30 @@ class CodexClient(AgentClient):
                 input={"query": item.get("query", "")},
             ))
         elif item_type == "collabAgentToolCall":
+            # A collab agent lives inside the turn: an Agent call (so the
+            # spawn persists as a tool_call block and becomes a foreground
+            # agent record), then its start. Its item/completed result
+            # settles it.
+            call_id = self._collab_call_id(item_id)
+            prompt = str(item.get("prompt") or "")
+            model = str(item.get("model")) if item.get("model") else None
+            subagent_type = str(item.get("tool") or "Agent")
+            out.append(ev.ToolUse(
+                tool_use_id=call_id,
+                name="Agent",
+                input={
+                    "description": prompt[:200],
+                    "prompt": prompt,
+                    "model": model,
+                    "subagent_type": subagent_type,
+                    "run_in_background": False,
+                },
+            ))
             out.append(ev.SubagentStarted(
-                tool_use_id=item_id or "codex-subagent",
-                subagent_type=str(item.get("tool") or "Agent"),
-                description=str(item.get("prompt") or "Codex subagent"),
-                model=str(item.get("model")) if item.get("model") else None,
+                tool_use_id=call_id,
+                subagent_type=subagent_type,
+                description=prompt or "Codex subagent",
+                model=model,
             ))
         elif item_type == "dynamicToolCall":
             out.append(ev.ToolUse(
@@ -1296,7 +1360,7 @@ class CodexClient(AgentClient):
         elif item_type == "collabAgentToolCall":
             status = str(item.get("status") or "").lower()
             out.append(ev.ToolResult(
-                tool_use_id=item_id or None,
+                tool_use_id=self._collab_result_id(item_id),
                 content=json.dumps({
                     "receivers": item.get("receiverThreadIds") or [],
                     "agents": item.get("agentsStates") or {},
@@ -1371,7 +1435,12 @@ class CodexClient(AgentClient):
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
 
-        usage = self._normalize_usage(self._turn_usage)
+        baseline = (
+            self._prev_total_usage
+            if self._prev_total_usage is not None
+            else self._turn_total_base
+        )
+        usage = self._normalize_usage(self._turn_usage, baseline)
         if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
             # notification. Child usage is still authoritative and must not
@@ -1398,7 +1467,7 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(self._turn_usage)
+            parent_usage = self._normalize_usage(self._turn_usage, baseline)
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1422,6 +1491,13 @@ class CodexClient(AgentClient):
             cost = None
             cost_basis = "unknown"
             estimated_cost = estimate
+        # Carry this turn's ending cumulative total as the next turn's baseline.
+        # A ContextWindowExceeded error resets total to 0 and later responses
+        # re-accumulate from 0, so the latest total is always the baseline.
+        if isinstance(self._turn_usage, dict) and isinstance(
+            self._turn_usage.get("total"), dict
+        ):
+            self._prev_total_usage = self._turn_usage["total"]
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
@@ -1432,15 +1508,51 @@ class CodexClient(AgentClient):
             estimated_cost_usd=estimated_cost,
             duration_ms=turn.get("durationMs"),
             duration_api_ms=None,
-            num_turns=1,
+            num_turns=max(1, self._turn_response_count),
             context_window=self._context_window,
             status=status,  # type: ignore[arg-type]
             error=error,
         )
 
+    def _reset_turn_usage_accounting(self) -> None:
+        """Clear per-turn token-accounting state (latest tokenUsage payload,
+        turn-start cumulative baseline, response count) at turn start."""
+        self._turn_usage = None
+        self._turn_total_base = None
+        self._turn_response_count = 0
+
+    def _capture_turn_total_base(self, usage: dict) -> None:
+        """Record the fallback turn-start baseline from the turn's first
+        tokenUsage notification, used only when no previous-turn total is
+        carried (the first turn on a fresh client).
+
+        ``tokenUsage.total`` is the per-thread cumulative counter and
+        ``tokenUsage.last`` the most recent single response, so ``total - last``
+        on that first notification is the cumulative total just before the
+        turn's first response.
+        """
+        if self._turn_total_base is not None:
+            return
+        total = usage.get("total")
+        if not isinstance(total, dict):
+            return
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+        self._turn_total_base = {
+            key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
+            for key in ("inputTokens", "cachedInputTokens", "outputTokens")
+        }
+
     @staticmethod
-    def _normalize_usage(usage: dict | None) -> ev.NormalizedUsage | None:
+    def _normalize_usage(
+        usage: dict | None,
+        baseline: dict | None = None,
+    ) -> ev.NormalizedUsage | None:
         """``thread/tokenUsage/updated`` → NormalizedUsage.
+
+        The turn's usage is the cumulative-``total`` delta over the turn:
+        ``total`` minus ``baseline`` (the cumulative counters as of turn start).
+        When no cumulative ``total`` is present, ``last`` — the most recent
+        single response — is used instead.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
@@ -1449,15 +1561,28 @@ class CodexClient(AgentClient):
         """
         if not usage:
             return None
-        last = usage.get("last") or {}
-        if not isinstance(last, dict):
+        total = usage.get("total") if isinstance(usage.get("total"), dict) else None
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else None
+        if total is not None:
+            # Per-turn delta of the cumulative thread total (clamped at zero).
+            base = baseline or {}
+            raw_input = max(0, int(total.get("inputTokens") or 0)
+                            - int(base.get("inputTokens") or 0))
+            raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
+                             - int(base.get("cachedInputTokens") or 0))
+            raw_output = max(0, int(total.get("outputTokens") or 0)
+                             - int(base.get("outputTokens") or 0))
+        elif last is not None:
+            # No cumulative total available: use the single last response.
+            raw_input = int(last.get("inputTokens") or 0)
+            raw_cached = int(last.get("cachedInputTokens") or 0)
+            raw_output = int(last.get("outputTokens") or 0)
+        else:
             return None
-        input_tokens = int(last.get("inputTokens") or 0)
-        cached = int(last.get("cachedInputTokens") or 0)
         return ev.NormalizedUsage(
-            input_tokens=max(0, input_tokens - cached),
-            output_tokens=int(last.get("outputTokens") or 0),
-            cache_read_tokens=cached,
+            input_tokens=max(0, raw_input - raw_cached),
+            output_tokens=raw_output,
+            cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
             raw={"last": last, "total": usage.get("total")},
         )
@@ -1870,7 +1995,9 @@ class CodexClient(AgentClient):
 
     # -- lifecycle -------------------------------------------------------- #
 
-    async def interrupt(self) -> None:
+    async def interrupt(self, *, cancel_queued: bool = False) -> None:
+        # ``cancel_queued`` is accepted for the protocol and ignored: Codex
+        # queues nothing between turns (collab agents live inside the turn).
         if self._thread_id and self._turn_id:
             try:
                 await self._transport.request("turn/interrupt", {
@@ -1879,6 +2006,19 @@ class CodexClient(AgentClient):
                 }, timeout=10.0)
             except (CodexRpcError, TransportDiedError) as e:
                 logger.debug("codex interrupt failed: %s", e)
+
+    async def stop_task(self, task_id: str) -> None:
+        # The app-server has no per-agent stop: collab agents end with the
+        # turn (interrupt).
+        raise BackendError("stop_task unsupported")
+
+    @property
+    def supports_task_stop(self) -> bool:
+        return False
+
+    @property
+    def interrupt_spares_background(self) -> bool:
+        return False
 
     async def disconnect(self) -> None:
         await self._transport.close()

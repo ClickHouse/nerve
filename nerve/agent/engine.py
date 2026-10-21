@@ -13,14 +13,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
 import re
+import secrets
+import time
+from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from nerve.agent.agents import AgentRegistry
+from nerve.agent.agents.errors import (
+    AgentNotFound,
+    AlreadyStarted,
+    NoRuntime,
+    NotOwner,
+    QueueEntryNotFound,
+    Unsupported,
+)
+from nerve.agent.agents.model import brief as agent_brief, iso_z, kind_for_spawn
 from nerve.agent.backends import (
     AgentBackend,
     AgentClient,
@@ -28,6 +43,7 @@ from nerve.agent.backends import (
     ModelObserved,
     SessionSpec,
     SubagentStarted,
+    SubagentUsage,
     SystemEvent,
     TextDelta,
     ThinkingDelta,
@@ -39,6 +55,7 @@ from nerve.agent.backends import (
     TurnInput,
     build_backends,
 )
+from nerve.agent.backends.events import TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
@@ -47,11 +64,14 @@ from nerve.agent.interactive import (
     get_handler,
 )
 from nerve.agent.prompts import (
+    build_session_preamble,
     build_system_prompt,
     current_time_str,
+    prepend_session_preamble,
     set_skill_manager,
+    worker_onboarding_prompt,
 )
-from nerve.agent.sessions import SessionManager, SessionStatus
+from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import (
     ToolContext,
@@ -64,10 +84,30 @@ from nerve.agent.tools import (
 # keep working. The new runtime path uses ``self.registry`` + a
 # per-session ``ToolContext`` and ignores those globals.
 from nerve.agent.tools import init_tools
-from nerve.config import NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
+from nerve.config import McpServerConfig, NerveConfig, RESUME_QUEUE_FILE, load_mcp_servers
 from nerve.db import Database
+from nerve.identity import (
+    CAUSE_FROM_ACTOR,
+    UNATTRIBUTED,
+    Actor,
+    Attribution,
+    CauseArg,
+    attribution_for,
+    resolve_cause,
+)
+from nerve.inference_principal import inference_principal
+from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.setup_writer import (
+    TASK_ONBOARDING_MARKER,
+    publish_text,
+    render_task_md,
+    task_description_from,
+    task_onboarding_pending,
+)
 from nerve.skills.manager import SkillManager
+from nerve.utils.llm import response_text
+from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +196,102 @@ def _model_family(model: str) -> str:
     return m
 
 
+def _is_sidechain(event: Any) -> bool:
+    """Whether a normalized event belongs to a sub-agent, not the orchestrator.
+
+    The CLI forwards sub-agent frames in the parent's stream tagged with
+    ``parent_tool_use_id``; usage of a sub-agent's model call arrives as
+    :class:`SubagentUsage`. Such events go to the agent registry and never
+    open, extend, frame or persist into an orchestrator turn.
+    """
+    return (
+        getattr(event, "parent_tool_use_id", None) is not None
+        or isinstance(event, SubagentUsage)
+    )
+
+
+def _begins_turn(event: Any) -> bool:
+    """Whether a main-chain event shows the model working on the turn: the
+    model, or any content. An ``init`` does not count: a resumed runtime
+    frames its own leftover result with one too."""
+    if _is_sidechain(event):
+        return False
+    return isinstance(
+        event, (ModelObserved, TextDelta, ThinkingDelta, ToolUse, ToolResult, ToolOutputDelta),
+    )
+
+
+def _is_stray_result(event: Any) -> bool:
+    """A successful result that reports zero tokens: what a resumed runtime
+    sends for work of its own (settling the agents the previous process
+    left), never the answer to a user's message, which always calls the
+    model. Only meaningful before the turn began."""
+    if not isinstance(event, TurnCompleted) or event.status != "completed":
+        return False
+    usage = event.usage
+    return usage is not None and not (
+        usage.input_tokens or usage.output_tokens
+        or usage.cache_read_tokens or usage.cache_creation_tokens
+    )
+
+
+def _is_empty_result(event: TurnCompleted) -> bool:
+    """A result of a turn the model never took part in: zero tokens, and it
+    either succeeded or was interrupted (a failure has an error to show)."""
+    if event.status not in ("completed", "interrupted"):
+        return False
+    usage = event.usage
+    return usage is not None and not (
+        usage.input_tokens or usage.output_tokens
+        or usage.cache_read_tokens or usage.cache_creation_tokens
+    )
+
+
+# Turn queue (see docs/agents.md, "The turn queue").
+_QUEUE_PREVIEW_CHARS = 200
+_INTERNAL_QUEUE_LABELS = {"wakeup": "Scheduled wakeup", "cron": "Scheduled run"}
+_RECENT_IDS_KEPT = 64
+_CLIENT_MSG_TTL_SECONDS = 600.0
+
+
+def _iso_now() -> str:
+    return iso_z(time.time())
+
+
+@dataclass
+class QueuedTurn:
+    """A run waiting for the session's run lock (a message sent while a turn
+    streams). Listed in ``queue_update`` and the snapshot until it starts or
+    is cancelled."""
+
+    queue_id: str                 # "q_" + 8 hex
+    session_id: str
+    content: str
+    client_msg_id: str | None
+    source: str                   # origin label: "web", "api", "telegram", ...
+    internal: bool
+    actor_id: str | None
+    created_at: str
+    task: asyncio.Task
+    cancelled_by_request: bool = False
+
+
+def _accepts_cancel_queued(client: Any) -> bool:
+    """Whether ``client.interrupt`` takes the ``cancel_queued`` keyword (the
+    backends do; minimal test doubles may not)."""
+    interrupt = getattr(client, "interrupt", None)
+    if interrupt is None:
+        return False
+    try:
+        params = inspect.signature(interrupt).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "cancel_queued" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
 @dataclass
 class _TurnState:
     """Accumulates one agent turn's worth of streamed content.
@@ -173,12 +309,43 @@ class _TurnState:
     last_usage: dict | None = None
     sdk_session_id: str | None = None
     native_turn_id: str | None = None
-    # tool_use_id -> monotonic start time of an in-flight sub-agent
-    active_subagents: dict[str, float] = field(default_factory=dict)
     result_meta: dict | None = None
     last_model: str | None = None
-    # True once any AssistantMessage was received (gates CLI-crash retry)
+    # True once any main-chain content was received (gates CLI-crash retry);
+    # sub-agent traffic never sets it.
     got_content: bool = False
+    status: TurnStatus = "completed"
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """How one agent turn ended. Independent of session health (``sessions.status``)."""
+
+    status: TurnStatus = "completed"
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "completed"
+
+    def describe(self) -> str:
+        return f"turn {self.status}" + (f": {self.error}" if self.error else "")
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """What one ``run`` invocation produced and how its own turn ended."""
+
+    text: str
+    outcome: TurnOutcome
+
+
+@dataclass(eq=False)
+class TurnWatch:
+    """Latest outcome of a watched session's turns (see ``AgentEngine.watch_turns``)."""
+
+    outcome: TurnOutcome | None = None
 
 
 class AgentEngine:
@@ -187,6 +354,19 @@ class AgentEngine:
     Delegates all session state management to SessionManager.
     Focuses on SDK client creation, message streaming, and orchestration.
     """
+
+    # Set at the top of shutdown(): a drain cancelled by the shutdown records
+    # its partial turn as interrupted by the gateway, not stopped by a user.
+    # Class-level so engines built with ``__new__`` (test doubles) read False.
+    _shutting_down: bool = False
+    # Runtime client generation counter (see _get_or_create_client).
+    _client_gen: int = 0
+    # How long a stop waits for an interrupted turn to end before it cancels
+    # the turn or reports it not stopped.
+    _STOP_WAIT_SECONDS: float = 5.0
+    # After Stop all, how long to wait for the stopped agents to settle before
+    # the runtime's queued notifications about them are dropped (see stop_all).
+    _STOP_ALL_SETTLE_SECONDS: float = 5.0
 
     def __init__(self, config: NerveConfig, db: Database):
         # Prevent "cannot launch inside another Claude Code session" errors
@@ -221,10 +401,30 @@ class AgentEngine:
         # the UI live instead of buffering invisibly (and then desyncing
         # the next receive_response()). See _idle_stream_watcher.
         self._idle_watchers: dict[str, asyncio.Task] = {}
-        # Per-session background-task registry driven by the CLI's
-        # task_started / task_updated / task_notification system messages:
-        # session_id -> task_id -> {task_id, label, tool, status}.
-        self._bg_task_registry: dict[str, dict[str, dict[str, Any]]] = {}
+        # Sub-agents and background tasks (docs/agents.md): a durable roster
+        # fed by spawning tool calls, the CLI's task_* / background_tasks_changed
+        # frames and every sidechain event (anything carrying
+        # parent_tool_use_id), which never enters the orchestrator's turn.
+        # Sidechain tool results still get the shared side effects
+        # (file_changed, plan_update, MCP usage). "Live agents" is its fact;
+        # "the turn is running" is SessionManager's — never derived from
+        # each other.
+        self.agents = AgentRegistry(
+            db,
+            config_fn=lambda: self.config,
+            side_effects=self._tool_result_side_effects,
+            stop_task_fn=self._stop_agent_task,
+            capabilities_fn=self._agent_capabilities,
+        )
+        # Agents die with their runtime: every client teardown (crash, model
+        # switch, force stop, archive, idle reap, ...) goes through
+        # SessionManager.remove_client, which reports it here. The archive
+        # guard asks whether agents still run.
+        self.sessions.on_client_removed = self.agents.on_client_gone
+        self.sessions.has_live_agents = self.agents.has_live
+        # Generation of the live runtime client per build (any session): a
+        # finished agent is resumable only on the client that ran it.
+        self._client_gen = 0
         # Per-session dynamic-workflow registry: session_id -> tool_use_id ->
         # {name, snapshot}. The tool_use_id is captured when a ``Workflow``
         # tool call streams; later task_* system messages carrying a
@@ -237,6 +437,7 @@ class AgentEngine:
         # add_stop_listener) — lets workflow-run lifecycle owners record
         # "this was a stop" before engine.run swallows the interrupt.
         self._stop_listeners: list[Any] = []
+        self._turn_watches: dict[str, list[TurnWatch]] = {}
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
@@ -254,11 +455,29 @@ class AgentEngine:
         # survives restarts without re-firing on every resume.
         self._observed_models: dict[str, str] = {}
         self._router = None  # ChannelRouter — lazy-initialized via .router property
+        self._channel_runtimes: dict[str, Any] = {}
         # Gateways expose an ephemeral plaintext MCP listener on loopback for
         # co-located Codex processes. The gateway fills this after the listener
         # starts; the callable passed to CodexBackend reads it lazily.
         self._mcp_loopback_port: int | None = None
-        self._mcp_servers_cache = list(config.mcp_servers)  # hot-reloadable
+        # External mode: the MCP gateway's catalog is the only source of MCP
+        # servers besides Nerve's own, and Nerve loads no Claude Code plugin.
+        # The mode and the gateway URL change only with a restart.
+        from nerve.gateway.auth import is_external_mode
+
+        self._managed_mcp = is_external_mode()
+        self._mcp_gateway: McpGatewayCatalog | None = None
+        if self._managed_mcp and config.mcp_gateway_url:
+            self._mcp_gateway = McpGatewayCatalog(config.mcp_gateway_url)
+        # The revision of the catalog in _mcp_servers_cache (external mode).
+        self._mcp_catalog_revision: str | None = None
+        # The periodic catalog read, started by initialize().
+        self._mcp_catalog_task: asyncio.Task | None = None
+        # The catalog revision that each session's client was built with.
+        self._client_mcp_revisions: dict[str, str | None] = {}
+        self._mcp_servers_cache = (  # hot-reloadable
+            [] if self._managed_mcp else list(config.mcp_servers)
+        )
         self._claude_code_plugins: list[dict[str, str]] = []  # plugin dirs
 
         # Tool registry — built once at construction. Per-session MCP
@@ -290,9 +509,28 @@ class AgentEngine:
                 claude_plugins=lambda: self._claude_code_plugins,
                 gateway_port=self._gateway_port,
                 mint_session_token=self._mint_mcp_session_token,
+                managed_mcp=self._managed_mcp,
             )
         )
         self._session_backends: dict[str, str] = {}
+        # Per-session context awaiting delivery (static-prompt mode). The
+        # system prompt is byte-identical across sessions, so the session
+        # id and the frozen recall are rendered separately at client build
+        # (_get_or_create_client) and prepended to the FIRST user message
+        # of the native conversation by _run_inner, which pops the entry.
+        # Keyed by session id; an entry survives a client rebuild that
+        # happens before any turn was sent (the rebuild re-renders it).
+        self._pending_preambles: dict[str, str] = {}
+
+    @property
+    def memory_bridge(self) -> Any | None:
+        """The memU bridge once :meth:`initialize` built it, else ``None``.
+
+        The setup page's Mode step applies the chosen memory categories to
+        the running service through it (``apply_categories``), so a browser
+        setup does not end in a restart for that alone.
+        """
+        return self._memory_bridge
 
     @property
     def config(self) -> NerveConfig:
@@ -343,12 +581,33 @@ class AgentEngine:
         """Return the channel name currently driving ``session_id`` (or None)."""
         return self._active_channel.get(session_id)
 
+    def session_cause(self, session_id: str) -> str | None:
+        """The session's stored cause: who all agent work in it runs for.
+
+        That is the person who started the session, the system actor for a
+        session the instance started for itself, or ``None`` when unknown
+        (channel input with no known person, an imported or MCP satellite
+        session). The value is set once when the session is created and never
+        changes. See :meth:`nerve.db.sessions.SessionStore.session_cause`.
+        """
+        return self.db.session_cause(session_id)
+
+    def _agent_attribution(self, session_id: str) -> Attribution:
+        """The attribution of a change that the agent or Nerve makes in a
+        session: the system actor, for the session's cause."""
+        return attribution_for(self.db.system_actor, self.session_cause(session_id))
+
     # ------------------------------------------------------------------ #
     #  Backend resolution (sticky per session)                            #
     # ------------------------------------------------------------------ #
 
     def _build_tool_context(self, session_id: str) -> ToolContext:
-        """Fresh per-session ToolContext for backend MCP servers."""
+        """Fresh per-session ToolContext for backend MCP servers.
+
+        The agent's tool calls are the system actor's changes, made for the
+        session's stored cause. The value never changes, so the context
+        keeps the one read here (the client build has just read the row).
+        """
         return ToolContext(
             session_id=session_id,
             workspace=self.config.workspace,
@@ -359,6 +618,8 @@ class AgentEngine:
             skill_manager=self._skill_manager,
             engine=self,
             notification_service=self.notification_service,
+            actor=self.db.system_actor,
+            cause=self.session_cause(session_id),
         )
 
     def _gateway_port(self) -> int | None:
@@ -371,13 +632,95 @@ class AgentEngine:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
 
+    async def _refresh_mcp_catalog(self) -> None:
+        """External mode: read the catalog and give its servers to new clients.
+
+        Running sessions get a new client at their next turn
+        (:meth:`_mcp_catalog_rebuild_due`). A failed read keeps the servers of
+        the last catalog read. A catalog server with the name of Nerve's own
+        server is not used.
+        """
+        if self._mcp_gateway is None:
+            return
+        catalog = await self._mcp_gateway.refresh()
+        if catalog is None or catalog.revision == self._mcp_catalog_revision:
+            return
+        servers = [server for server in catalog.servers if server.id != "nerve"]
+        if len(servers) != len(catalog.servers):
+            logger.warning(
+                "MCP gateway catalog names a server 'nerve'; Nerve's own server "
+                "has that name, so the catalog server is not used",
+            )
+        self._mcp_servers_cache = [
+            McpServerConfig(name=server.id, type="http", url=server.url)
+            for server in servers
+        ]
+        self._mcp_catalog_revision = catalog.revision
+        logger.info(
+            "MCP gateway catalog %s: %d server(s) (%s). New sessions get these "
+            "servers, running sessions at their next turn.", catalog.revision,
+            len(servers), ", ".join(server.id for server in servers) or "none",
+        )
+        await self._sync_mcp_servers_to_db()
+
+    # The interval of the periodic catalog read in external mode (seconds).
+    _MCP_CATALOG_REFRESH_SECONDS = 30.0
+
+    async def _refresh_mcp_catalog_periodically(self) -> None:
+        """Read the catalog at a fixed interval, until shutdown cancels it.
+
+        This also reads the catalog again after a failed read at startup.
+        """
+        while True:
+            await asyncio.sleep(self._MCP_CATALOG_REFRESH_SECONDS)
+            try:
+                await self._refresh_mcp_catalog()
+            except Exception:  # noqa: BLE001 - the next read tries again
+                logger.exception("Periodic MCP gateway catalog read failed")
+
+    def _mcp_catalog_rebuild_due(
+        self, session_id: str, client: AgentClient, backend: AgentBackend,
+        native_id: str | None, cwd: str,
+    ) -> bool:
+        """External mode: build the client again when the catalog revision
+        differs from the one of its build, except while the session runs a
+        background task, the client has buffered output, or the backend does
+        not find the stored conversation. See docs/config.md, "Catalog
+        changes in running sessions".
+        """
+        # Without a gateway (local mode) both revisions are None.
+        built = self._client_mcp_revisions.get(session_id)
+        if built == self._mcp_catalog_revision:
+            return False
+        if self._has_live_background_tasks(session_id):
+            wait = "a background task runs"
+        elif client.buffer_used() > 0:
+            wait = "the client has buffered output"
+        elif native_id and not backend.validate_resume_target(native_id, cwd):
+            wait = "the conversation to resume is missing on this host"
+        else:
+            logger.info(
+                "Session %s: MCP gateway catalog %s replaces %s; recreating "
+                "the client, which resumes the conversation",
+                session_id, self._mcp_catalog_revision, built,
+            )
+            return True
+        logger.info(
+            "Session %s keeps MCP gateway catalog %s for this turn: %s",
+            session_id, built, wait,
+        )
+        return False
+
     def _mint_mcp_session_token(self, session_id: str) -> str:
         """Session-bound bearer token for a backend-managed agent process."""
-        from nerve.gateway.auth import create_mcp_session_token
+        from nerve.gateway.auth import create_mcp_session_token, effective_jwt_secret
 
-        if not self.config.auth.jwt_secret:
-            return ""  # dev mode — endpoint accepts unauthenticated calls
-        return create_mcp_session_token(self.config.auth.jwt_secret, session_id)
+        secret = effective_jwt_secret(self.config)
+        if not secret:
+            # No secret is pinned before startup completes. The endpoint
+            # refuses every request then, so an empty token is enough.
+            return ""
+        return create_mcp_session_token(secret, session_id)
 
     def _backend_for(self, session: dict | None, source: str) -> AgentBackend:
         """Resolve the backend for a session — STICKY on the stored column.
@@ -424,6 +767,15 @@ class AgentEngine:
         name = self._session_backends.get(session_id, "claude")
         return self._backends.get(name) or self._backends["claude"]
 
+    def _skips_stray_results(self, session_id: str) -> bool:
+        """Whether the session's runtime can finish results between turns
+        (one with an idle stream), so a user turn skips a leftover one."""
+        try:
+            backend = self._backend_for_live_session(session_id)
+            return bool(backend.capabilities.supports_idle_stream)
+        except Exception:  # noqa: BLE001 — no backend known: read as before
+            return False
+
     def _collect_skill_summaries(self) -> list[dict] | None:
         """Skill summaries for the system prompt (moved from _build_options).
 
@@ -452,8 +804,14 @@ class AgentEngine:
             logger.warning("Failed to get skill summaries: %s", e)
             return None
 
-    async def initialize(self) -> None:
-        """Initialize the agent engine — set up tools and main session."""
+    async def initialize(self, *, reconcile_agents: bool = True) -> None:
+        """Initialize the agent engine — set up tools and main session.
+
+        ``reconcile_agents=False`` leaves agent records a previous process
+        left live alone: a one-shot CLI engine (``nerve sync``, ``nerve
+        cron``) started while the gateway runs must not mark the gateway's
+        live agents interrupted.
+        """
         from nerve.memory.memu_bridge import MemUBridge
         self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
@@ -489,15 +847,35 @@ class AgentEngine:
             engine=self,
         )
 
-        # Load Claude Code plugin directories for SDK plugins field
-        from nerve.config import load_claude_code_plugins
-        self._claude_code_plugins = load_claude_code_plugins()
+        if self._managed_mcp:
+            # The first catalog. Without one, sessions start with Nerve's
+            # own MCP server only, and each new session reads it again.
+            if self._mcp_gateway is None:
+                logger.warning(
+                    "External mode without mcp_gateway_url: sessions start "
+                    "without MCP servers other than Nerve's own",
+                )
+            await self._refresh_mcp_catalog()
+            if self._mcp_gateway is not None:
+                self._mcp_catalog_task = asyncio.create_task(
+                    self._refresh_mcp_catalog_periodically(),
+                    name="mcp-gateway-catalog",
+                )
+        else:
+            # Load Claude Code plugin directories for SDK plugins field
+            from nerve.config import load_claude_code_plugins
+            self._claude_code_plugins = load_claude_code_plugins()
 
         # Sync MCP servers to DB for frontend visibility
         await self._sync_mcp_servers_to_db()
 
         # Wire up memorize callback so SessionManager can trigger memU indexing
         self.sessions._on_memorize = self._memorize_session
+
+        # The agent registry: settle records a crash left live (their runtime
+        # died with the last process), then start its writer, emitter and
+        # sweeper. Before orphan recovery, like every other startup reconcile.
+        await self.agents.start(reconcile=reconcile_agents)
 
         # Recover orphaned sessions from previous crash
         try:
@@ -536,7 +914,13 @@ class AgentEngine:
 
         New sessions will automatically use the updated config.
         Returns the list of McpServerConfig.
+
+        External mode reads no file: it reads the MCP gateway's catalog again
+        and returns its servers.
         """
+        if self._managed_mcp:
+            await self._refresh_mcp_catalog()
+            return self._mcp_servers_cache
         from nerve.config import load_claude_code_plugins, load_mcp_servers
         # Read from the daemon's actual config dir (not the process cwd) so a
         # reload sees the same config.yaml + workspace/config/settings.yaml that
@@ -552,14 +936,40 @@ class AgentEngine:
         return self._mcp_servers_cache
 
     def _needs_worker_onboarding(self) -> bool:
-        """Check if this is a worker instance that needs first-boot onboarding."""
+        """Check if this is a worker instance that needs first-boot onboarding.
+
+        Pending while ``TASK.md`` carries the template's onboarding marker —
+        the onboarding session deletes that line last, once every section is
+        filled — and, for files written by older versions, while it is still
+        the raw ``# Task`` form (:func:`nerve.setup_writer.task_onboarding_pending`).
+        """
         task_md = self.config.workspace / "TASK.md"
         if not task_md.exists():
             return False
-        content = task_md.read_text(encoding="utf-8").strip()
-        # Raw task description from init starts with "# Task\n\n"
-        # Structured TASK.md (post-onboarding) has "## Mission"
-        return content.startswith("# Task\n") and "## Mission" not in content
+        try:
+            content = task_md.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Worker onboarding: cannot read %s: %s", task_md, e)
+            return False
+        return task_onboarding_pending(content)
+
+    def ensure_worker_onboarding(self) -> bool:
+        """Start the first-boot onboarding session if it is due and not running.
+
+        The public, idempotent-per-process entry the setup wizard's finish
+        step uses when the mode was chosen in the browser after boot (the
+        start-up check in :meth:`initialize` has already run by then). Returns
+        whether a session was scheduled now. The session it creates is the one
+        :meth:`run_cron` names ``Cron: worker-onboarding`` with
+        ``source="cron"``, which is how the checklist recognises it.
+        """
+        task = getattr(self, "_onboarding_task", None)
+        if task is not None and not task.done():
+            return False
+        if not self._needs_worker_onboarding():
+            return False
+        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
+        return True
 
     async def _run_worker_onboarding(self) -> None:
         """Run the worker onboarding agent session on first boot."""
@@ -567,64 +977,19 @@ class AgentEngine:
 
         task_md = self.config.workspace / "TASK.md"
         raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
-        task_description = raw_task.strip()
-        # Strip the "# Task\n\n" prefix
-        if task_description.startswith("# Task\n\n"):
-            task_description = task_description[len("# Task\n\n"):]
+        task_description = task_description_from(raw_task)
+        if task_description is None:  # completed since the check; nothing to do
+            logger.info("Worker onboarding: TASK.md is already complete")
+            return
+        if TASK_ONBOARDING_MARKER not in raw_task:
+            # A raw ``# Task`` file from an older install. The session is told
+            # to fill the template in place, so give it the template: its text
+            # kept under the description heading, the marker on line 2.
+            await asyncio.to_thread(publish_text, task_md, render_task_md(task_description))
+            logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
 
-        prompt = (
-            "You are running the **first-boot onboarding** for this Nerve worker instance.\n\n"
-            f"The user described the task as:\n\n> {task_description}\n\n"
-            "Your job is to research this task thoroughly and configure the worker.\n\n"
-            "## Step 1: Research\n\n"
-            "Use your tools to understand the task deeply:\n"
-            "- **Fetch URLs** mentioned in the description (repos, docs, APIs)\n"
-            "- **Search the web** for relevant documentation and tools\n"
-            "- **Clone repos** if needed to understand their structure\n"
-            "- **Explore CI systems**, databases, APIs referenced in the task\n"
-            "- Take notes on what you discover — you'll need them for configuration\n\n"
-            "## Step 2: Rewrite TASK.md\n\n"
-            "Replace the raw description in TASK.md with a structured version:\n"
-            "- **## Mission**: What this worker does (1-2 sentences)\n"
-            "- **## Scope**: Repos, services, or systems to monitor\n"
-            "- **## Triggers**: What events to watch for\n"
-            "- **## Actions**: What to do when triggered (step by step)\n"
-            "- **## Approval**: What needs human approval vs autonomous action\n"
-            "- **## References**: Links to docs, APIs, tools discovered during research\n\n"
-            "## Step 3: Create Skills\n\n"
-            "Use `skill_create` to create domain-specific skills the worker will need.\n"
-            "Each skill should have clear step-by-step instructions for a procedure\n"
-            "(e.g., 'how to query the monitoring API', 'how to debug a deployment failure').\n\n"
-            "## Step 4: Configure Cron Jobs\n\n"
-            "Set up monitoring cron jobs by editing `<workspace>/config/cron/jobs.yaml`\n"
-            "(legacy installs may still use `~/.nerve/cron/jobs.yaml`).\n"
-            "This is the Nerve cron system — NOT the Anthropic SDK or system crontab.\n\n"
-            "The YAML format is:\n"
-            "```yaml\n"
-            "jobs:\n"
-            "  - id: my-monitor\n"
-            "    schedule: '*/15 * * * *'  # cron expression\n"
-            "    description: What this job does\n"
-            "    session_mode: persistent  # or 'isolated' for one-shot\n"
-            "    context_rotate_hours: 24  # reset context daily (persistent only)\n"
-            "    enabled: true\n"
-            "    prompt: |\n"
-            "      Instructions for what the agent should do each run.\n"
-            "      Reference Nerve tools: task_create, plan_propose, notify,\n"
-            "      memorize, skill_get, web_fetch, bash, etc.\n"
-            "```\n\n"
-            "Create cron jobs that implement the monitoring/actions described in the task.\n"
-            "Use `persistent` session_mode for jobs that need context across runs.\n\n"
-            "## Step 5: Create Initial Tasks\n\n"
-            "Use `task_create` for any remaining manual setup work the user needs to do.\n\n"
-            "## Step 6: Notify\n\n"
-            "When done, use `notify` to tell the user that onboarding is complete.\n"
-            "Include a summary of what was configured: TASK.md sections, skills created,\n"
-            "cron jobs added, and any tasks that need manual attention.\n\n"
-            "---\n\n"
-            "Be thorough. You have full tool access — bash, web fetch, file read/write,\n"
-            "skill_create, task_create, notify. This is a one-time setup — do it right.\n"
-        )
+        guide = await asyncio.to_thread(read_worker_guide)
+        prompt = worker_onboarding_prompt(task_description, guide)
 
         try:
             await self.run_cron(
@@ -655,8 +1020,25 @@ class AgentEngine:
         No memorization here — the periodic sweep handles that.
         Sessions are marked idle so they can be resumed on next startup.
         """
+        # First: drains cancelled from here on record "gateway shutdown",
+        # not "stopped by user".
+        self._shutting_down = True
         for sid in list(self._idle_watchers):
             self._stop_idle_watcher(sid)
+
+        if self._mcp_catalog_task is not None:
+            self._mcp_catalog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._mcp_catalog_task
+            self._mcp_catalog_task = None
+        if self._mcp_gateway is not None:
+            await self._mcp_gateway.close()
+
+        # The disconnects below bypass remove_client: settle every live agent
+        # first, so it reads "interrupted by a gateway restart" (the CLI dies
+        # with the gateway and will not report them).
+        for sid in list(self.sessions._clients):
+            self.agents.on_client_gone(sid, "gateway_restart")
 
         for sid, client in list(self.sessions._clients.items()):
             try:
@@ -672,6 +1054,13 @@ class AgentEngine:
 
         self.sessions._clients.clear()
         self.sessions._client_locks.clear()
+
+        # Final flush of agent records and transcripts before the database
+        # closes (the gateway closes it right after this returns).
+        try:
+            await self.agents.close()
+        except Exception as e:  # noqa: BLE001 — shutdown must finish
+            logger.warning("Agent registry close failed: %s", e)
 
         # Cancel queued background memorizations — the periodic sweep
         # re-indexes anything they would have covered (the watermark is
@@ -713,6 +1102,20 @@ class AgentEngine:
     def register_channel(self, channel: Any) -> None:
         """Register a channel with the router."""
         self.router.register(channel)
+
+    def channel(self, name: str) -> Any | None:
+        """The registered channel called ``name`` (``"telegram"``), or ``None``."""
+        if self._router is None:
+            return None
+        return self._router.get_channel(name)
+
+    def register_channel_runtime(self, name: str, runtime: Any) -> None:
+        """Publish the lifecycle owner for a dynamically managed channel."""
+        self._channel_runtimes[name] = runtime
+
+    def get_channel_runtime(self, name: str) -> Any | None:
+        """Return a channel lifecycle owner, if one was installed."""
+        return self._channel_runtimes.get(name)
 
     # ------------------------------------------------------------------ #
     #  File snapshot for diff tracking                                     #
@@ -1002,8 +1405,12 @@ class AgentEngine:
     @classmethod
     async def _record_wakeup(
         cls, db: Any, session_id: str, tool_input: dict,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> int | None:
         """Persist a ScheduleWakeup request from its tool input.
+
+        ``attribution`` is that of the tool call: the system actor and the
+        session's cause.
 
         Returns the new wakeup id, or ``None`` when there's no prompt to
         re-inject (in which case nothing is scheduled).
@@ -1015,6 +1422,7 @@ class AgentEngine:
         fire_at = cls._wakeup_fire_at(tool_input.get("delaySeconds"))
         wakeup_id = await db.add_wakeup(
             session_id, prompt=prompt, fire_at=fire_at, reason=reason,
+            attribution=attribution,
         )
         logger.info(
             "Recorded wakeup %s for session %s at %s",
@@ -1056,6 +1464,10 @@ class AgentEngine:
         recall priors, renders the system prompt, and hands a
         :class:`SessionSpec` to the backend. The backend owns everything
         runtime-specific (options, hooks, subprocess).
+
+        A live client is built again when its process is dead, its model
+        changed, or the MCP gateway catalog changed after its build
+        (:meth:`_mcp_catalog_rebuild_due`).
         """
         lock = self.sessions.get_lock(session_id)
         async with lock:
@@ -1072,43 +1484,6 @@ class AgentEngine:
             if validate_model is not None:
                 await validate_model(requested_model)
 
-            if client is not None:
-                bound_model = self._session_models.get(session_id)
-                # Health check: verify the underlying subprocess is alive
-                if not client.is_alive():
-                    logger.warning(
-                        "Client process for session %s is dead, recreating",
-                        session_id,
-                    )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id)
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = None
-                elif bound_model is not None and bound_model != requested_model:
-                    # Model switched mid-session (e.g. the composer's picker
-                    # moved to a different model). Clients bind their model
-                    # at connect time, so tear down and recreate below.
-                    logger.info(
-                        "Session %s model changed (%s → %s), recreating client",
-                        session_id, bound_model, requested_model,
-                    )
-                    self._stop_idle_watcher(session_id)
-                    self.sessions.remove_client(session_id)
-                    self._session_backends.pop(session_id, None)
-                    self._session_models.pop(session_id, None)
-                    unregister_handler(session_id)
-                    await self._safe_disconnect(client)
-                    client = None
-                    # Deliberate switch — drop the observed-model baseline so
-                    # the first message on the new model doesn't fire a
-                    # model_change event for a change the user asked for.
-                    self._observed_models.pop(session_id, None)
-                else:
-                    return client
-
             # Check for stored native session ID for resume
             sdk_resume_id = session.get("sdk_session_id") if session else None
             try:
@@ -1122,6 +1497,57 @@ class AgentEngine:
                 or session_meta.get("codex_cwd")
                 or self.config.workspace
             )
+
+            if client is not None:
+                bound_model = self._session_models.get(session_id)
+                # Health check: verify the underlying subprocess is alive
+                if not client.is_alive():
+                    logger.warning(
+                        "Client process for session %s is dead, recreating",
+                        session_id,
+                    )
+                    reason = "process_exit"
+                elif (
+                    bound_model is not None and bound_model != requested_model
+                    and self.agents.has_live(session_id)
+                ):
+                    # A model switch recreates the runtime, and every
+                    # background agent dies with it: keep the bound client
+                    # (and its model) while agents run. The API refuses the
+                    # switch too (409 live_background_agents).
+                    logger.warning(
+                        "Session %s: model change %s → %s deferred: %d "
+                        "background agent(s) still running on this runtime",
+                        session_id, bound_model, requested_model,
+                        self.agents.live_count(session_id),
+                    )
+                    return client
+                elif bound_model is not None and bound_model != requested_model:
+                    # Model switched mid-session (e.g. the composer's picker
+                    # moved to a different model). Clients bind their model
+                    # at connect time, so tear down and recreate below.
+                    logger.info(
+                        "Session %s model changed (%s → %s), recreating client",
+                        session_id, bound_model, requested_model,
+                    )
+                    reason = "model_switch"
+                    # Deliberate switch — drop the observed-model baseline so
+                    # the first message on the new model doesn't fire a
+                    # model_change event for a change the user asked for.
+                    self._observed_models.pop(session_id, None)
+                elif self._mcp_catalog_rebuild_due(
+                    session_id, client, backend, sdk_resume_id, session_cwd,
+                ):
+                    reason = "process_ended"
+                else:
+                    return client
+                self._stop_idle_watcher(session_id)
+                self.sessions.remove_client(session_id, reason=reason)
+                self._session_backends.pop(session_id, None)
+                self._session_models.pop(session_id, None)
+                unregister_handler(session_id)
+                await self._safe_disconnect(client)
+                client = None
 
             # Seed the serving-model baseline from the last persisted
             # observation so downgrade detection survives restarts without
@@ -1206,12 +1632,31 @@ class AgentEngine:
                 if session_meta.get("cache_ttl") != cache_ttl:
                     meta_updates["cache_ttl"] = cache_ttl
 
+            # Determine if this is a fork
+            is_fork = fork_from is not None
+
+            # Static-prompt mode (agent.static_system_prompt): the session
+            # id and the frozen recall stay OUT of the system prompt so its
+            # bytes are shared across sessions (exact-prefix cache), and
+            # are prepended to the first user message of the native
+            # conversation instead. Deliver when the transcript is fresh
+            # (no resume target), on a fork (new id; the parent's history
+            # carries the parent's), and once for a resumed session that
+            # never received one (created before this mode existed). The
+            # ``preamble_sent`` marker records the delivery so a resume
+            # doesn't repeat it; the transcript replays it on later turns.
+            static_prompt = bool(self.config.agent.static_system_prompt)
+            deliver_preamble = static_prompt and (
+                not sdk_resume_id
+                or is_fork
+                or not session_meta.get("preamble_sent")
+            )
+            if deliver_preamble and session and not session_meta.get("preamble_sent"):
+                meta_updates["preamble_sent"] = True
+
             if meta_updates and session:
                 session_meta.update(meta_updates)
                 await self.db.update_session_metadata(session_id, session_meta)
-
-            # Determine if this is a fork
-            is_fork = fork_from is not None
 
             # Create interactive hub for this session.
             # Non-web sessions (telegram, cron, hook) cannot handle
@@ -1223,12 +1668,14 @@ class AgentEngine:
                 snapshot_fn=self._save_file_snapshot,
                 interactive_capable=is_interactive,
             )
+            self._wire_interaction_hooks(session_id, handler)
             register_handler(session_id, handler)
 
             # Render the system prompt (engine-owned: identity files,
-            # frozen recall, skills; the tool list respects the backend's
-            # exclusions so the prompt never advertises a tool this
-            # session's MCP server doesn't serve).
+            # skills; the tool list respects the backend's exclusions so
+            # the prompt never advertises a tool this session's MCP server
+            # doesn't serve). In static mode the id and the frozen recall
+            # are ignored here and go into the preamble below.
             system_prompt = build_system_prompt(
                 workspace=self.config.workspace,
                 session_id=session_id,
@@ -1237,6 +1684,7 @@ class AgentEngine:
                 recalled_memories=recalled_memories or None,
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
+                static=static_prompt,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1269,7 +1717,21 @@ class AgentEngine:
                     )
 
             async def _record_wakeup_cb(sid: str, tool_input: dict) -> Any:
-                return await self._record_wakeup(self.db, sid, tool_input)
+                # An agent action in a session: the system actor, for the
+                # session's cause.
+                return await self._record_wakeup(
+                    self.db, sid, tool_input,
+                    attribution=attribution_for(
+                        self.db.system_actor, self.session_cause(sid),
+                    ),
+                )
+
+            # External mode: read the catalog again, so that the new client
+            # gets the current servers. A failure keeps the last catalog.
+            await self._refresh_mcp_catalog()
+            # The cache only moves forward, so the client gets this catalog
+            # or a newer one (see _mcp_catalog_rebuild_due).
+            self._client_mcp_revisions[session_id] = self._mcp_catalog_revision
 
             spec = SessionSpec(
                 session_id=session_id,
@@ -1290,6 +1752,13 @@ class AgentEngine:
                 cache_ttl=cache_ttl,
                 max_turns=self.config.agent.max_turns,
                 idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
+                # The session's cause, fixed for the session, so every client
+                # of the session (also after a model change or a crash)
+                # names the same principal. Read from the row, which a fresh
+                # engine has just loaded.
+                inference_principal=inference_principal(
+                    (session or {}).get("caused_by_actor_id"),
+                ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
@@ -1308,8 +1777,20 @@ class AgentEngine:
                     session_id, {"sdk_session_id": None},
                 )
                 sdk_resume_id = None
+                # The transcript is fresh after all — it needs the preamble.
+                deliver_preamble = static_prompt
+            if deliver_preamble:
+                self._pending_preambles[session_id] = build_session_preamble(
+                    session_id, source, recalled_memories or None,
+                )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
+            # A new runtime: agents it starts take its backend, and only
+            # agents it ran can be resumed (SendMessage) on it.
+            self._client_gen += 1
+            self.agents.on_client_connected(
+                session_id, self._client_gen, backend=backend.name,
+            )
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):
@@ -1349,6 +1830,19 @@ class AgentEngine:
             )
             return client
 
+    def _wire_interaction_hooks(
+        self, session_id: str, handler: InteractiveToolHandler,
+    ) -> None:
+        """Let a session's interaction hub name the sub-agent that asks a
+        question and mark it waiting for an answer (attention
+        ``needs_input``) until the pause ends."""
+        handler.describe_agent = (
+            lambda task_id: self.agents.describe_task(session_id, task_id)
+        )
+        handler.on_agent_interaction = (
+            lambda task_id, pending: self.agents.on_interaction(session_id, task_id, pending)
+        )
+
     async def _reset_cost_baseline(self, session_id: str) -> None:
         """Zero the persisted SDK cumulative-cost baseline for a session.
 
@@ -1377,6 +1871,7 @@ class AgentEngine:
     async def _discard_client(
         self, session_id: str, clear_resume: bool = False,
         background_memorize: bool = False,
+        *, reason: str = "process_ended",
     ) -> None:
         """Disconnect and remove a client.
 
@@ -1389,15 +1884,18 @@ class AgentEngine:
                 blocks the caller for the whole queue wait — for cron runs
                 that kept the run log "running" (and APScheduler skipping
                 subsequent fires) long after the agent turn had finished.
+            reason: Why the runtime goes away (``remove_client`` reason):
+                agents still running on it end as interrupted with it.
         """
         self._stop_idle_watcher(session_id)
         if background_memorize:
             await self.schedule_memorize(session_id)
         else:
             await self._memorize_session(session_id)
-        client = self.sessions.remove_client(session_id)
+        client = self.sessions.remove_client(session_id, reason=reason)
         self._session_backends.pop(session_id, None)
         self._session_models.pop(session_id, None)
+        self._client_mcp_revisions.pop(session_id, None)
         unregister_handler(session_id)
 
         if clear_resume:
@@ -1426,21 +1924,357 @@ class AgentEngine:
         anything. Lets run-lifecycle owners (workflow runs) CAS their state
         terminal *before* the stop lands — ``engine.run`` swallows both the
         graceful interrupt and the hard cancel, so callers cannot otherwise
-        distinguish "stopped" from "completed"."""
+        distinguish "stopped" from "completed". The callback also receives
+        the stop's ``attribution``: who asked for the stop, and for whom."""
         self._stop_listeners.append(callback)
 
-    async def stop_session(self, session_id: str) -> bool:
-        """Stop a running session."""
+    @contextlib.contextmanager
+    def watch_turns(self, session_id: str) -> Iterator[TurnWatch]:
+        """Record how each persisted turn of ``session_id`` ends while the block runs.
+
+        For a caller that owns the whole session: autonomous (background-
+        continuation) turns end outside any ``run()``. The latest one wins.
+        """
+        watch = TurnWatch()
+        self._turn_watches.setdefault(session_id, []).append(watch)
+        try:
+            yield watch
+        finally:
+            watches = self._turn_watches.get(session_id, [])
+            watches.remove(watch)
+            if not watches:
+                self._turn_watches.pop(session_id, None)
+
+    def _end_turn(self, session_id: str, outcome: TurnOutcome) -> TurnOutcome:
+        for watch in self._turn_watches.get(session_id, ()):
+            watch.outcome = outcome
+        return outcome
+
+    async def _run_stop_listeners(
+        self, session_id: str, attribution: Attribution,
+    ) -> None:
         for cb in self._stop_listeners:
             try:
-                await cb(session_id)
+                await cb(session_id, attribution)
             except Exception:  # noqa: BLE001 — listeners never block a stop
                 logger.exception("stop listener failed for %s", session_id)
-        # Cancel any pending interactive tool prompts so the handler unblocks
-        handler = get_handler(session_id)
-        if handler:
-            handler.cancel_all()
-        return await self.sessions.stop_session(session_id)
+
+    async def _log_stop_event(
+        self, session_id: str, event_type: str, details: dict,
+        attribution: Attribution,
+    ) -> None:
+        try:
+            await self.db.log_session_event(
+                session_id, event_type, details, attribution=attribution,
+            )
+        except Exception:  # noqa: BLE001 (the record never fails a stop)
+            logger.exception("%s event failed for %s", event_type, session_id)
+
+    @staticmethod
+    def _shell_count(records: list) -> int:
+        return sum(1 for r in records if r.kind in ("shell", "monitor"))
+
+    async def stop_turn(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+        force: bool = False, confirm_kill_background: bool = False,
+    ) -> dict:
+        """Stop the orchestrator's current turn; background agents keep running.
+
+        The red button, Esc, the WebSocket ``stop`` and channel ``/stop``.
+        Returns the ``StopTurnResult``: ``turn`` is ``stopped`` (the turn
+        ended), ``not_running`` (no turn: no interrupt is sent, an interrupt
+        would end background agents on a runtime without the per-task stop
+        affordance), ``killed`` (cancelled; only when no agent is live, or
+        ``force``), ``not_stopped`` (the turn did not end in 5 s and live
+        agents would die with a hard cancel: ``would_end`` lists them) or
+        ``needs_confirmation`` (the runtime cannot spare background agents:
+        nothing was sent, ``would_end`` lists what the stop would end).
+
+        A stop that reached work records ``stop_requested`` with
+        ``attribution`` (who asked, for whom) and details ``{"scope",
+        "outcome", "live_agents"}``; two people who ask at the same time are
+        two events.
+        """
+        await self.agents.ensure_loaded(session_id)
+
+        def _state() -> tuple[list, bool, bool, list]:
+            live = self.agents.live(session_id)
+            has_turn = self.sessions.turn_task(session_id) is not None
+            client = self.sessions.get_client(session_id)
+            spares = bool(
+                client is not None
+                and getattr(client, "interrupt_spares_background", False),
+            )
+            killable = (
+                [r for r in live if r.kind in ("agent", "workflow") and r.background]
+                if has_turn else []
+            )
+            return live, has_turn, spares, killable
+
+        live, has_turn, spares, killable = _state()
+        if killable and not spares and not (confirm_kill_background or force):
+            # Degraded runtime: an interrupt would end these agents. Ask, and
+            # send nothing (stop listeners included: a workflow's listener
+            # kills its run).
+            return {
+                "scope": "turn", "turn": "needs_confirmation",
+                "would_end": [agent_brief(r) for r in killable],
+                "shell_count": self._shell_count(live),
+            }
+        await self._run_stop_listeners(session_id, attribution)
+        live, has_turn, spares, killable = _state()
+        had_work = self.sessions.has_running_work(session_id)
+        if has_turn:
+            # Unblock pending interactive prompts so the turn can end.
+            handler = get_handler(session_id)
+            if handler:
+                handler.cancel_all()
+            self.agents.note_turn_stop(
+                session_id, kills_background=bool(killable) and not spares,
+            )
+        lock = self._session_locks.get(session_id)
+        # A queued run counts as behind the lock even in the instant the lock
+        # passes between runs (released, the next waiter not resumed yet).
+        registered = getattr(self.sessions, "registered_task", lambda _sid: None)(session_id)
+        queued = registered is not None and any(
+            entry.task is registered
+            for entry in self._queue_state()[0].get(session_id, ())
+        )
+        outcome = await self.sessions.interrupt_turn(
+            session_id,
+            allow_hard_cancel=force or not live,
+            lock_held=bool(lock is not None and lock.locked()) or queued,
+            wait_s=self._STOP_WAIT_SECONDS,
+        )
+        if had_work:
+            await self._log_stop_event(
+                session_id, "stop_requested",
+                {"scope": "turn", "outcome": outcome, "live_agents": len(live)},
+                attribution,
+            )
+        if outcome == "not_stopped":
+            return {
+                "scope": "turn", "turn": "not_stopped",
+                "would_end": [agent_brief(r) for r in live],
+                "shell_count": self._shell_count(live),
+            }
+        return {"scope": "turn", "turn": outcome, "would_end": [], "shell_count": 0}
+
+    async def stop_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Stop the session's turn (legacy callers: the WebSocket ``stop``
+        message, a channel's ``/new`` stopping the previous session, workflow
+        kills). Background agents keep running:
+        this is :meth:`stop_turn` without confirmation. Returns whether a
+        turn was stopped or cancelled."""
+        result = await self.stop_turn(session_id, attribution=attribution)
+        return result["turn"] in ("stopped", "killed")
+
+    async def stop_agent(
+        self, session_id: str, agent_id: str, *,
+        attribution: Attribution = UNATTRIBUTED, cascade: bool = True,
+    ) -> tuple[dict, list[str]]:
+        """Stop one agent (and, with ``cascade``, the agents it started,
+        deepest first) through the runtime's per-task stop.
+
+        Takes no run lock, runs no stop listener and sends no interrupt: the
+        turn and every other agent keep going. Returns ``(view, stopping)``:
+        the record's ``AgentView`` and the ids now stopping (empty when it had
+        ended already). The records settle as ``stopped(user)`` when the
+        runtime confirms; without a confirmation in ``stop_confirm_seconds``
+        the record is flagged ``stop_unconfirmed``. A record whose task id is
+        not known yet is stopped as soon as the id binds.
+
+        Raises :class:`AgentNotFound`, :class:`NoRuntime` (the session has no
+        live runtime: its records are reconciled to ``interrupted``) or
+        :class:`Unsupported` (the runtime cannot stop one task).
+        """
+        await self.agents.ensure_loaded(session_id)
+        rec = self.agents.get(session_id, agent_id)
+        if rec is None:
+            owner = await self.agents.owner_session(agent_id)
+            raise AgentNotFound(
+                agent_id,
+                owner_session_id=owner if owner and owner != session_id else None,
+            )
+        if rec.terminal:
+            return self.agents.to_view(rec), []
+        client = self.sessions.get_client(session_id)
+        if client is None:
+            # Nothing runs the agent any more: settle it.
+            self.agents.on_client_gone(session_id, "process_ended")
+            raise NoRuntime("The session's runtime is not running")
+        if not getattr(client, "supports_task_stop", False):
+            raise Unsupported("This runtime cannot stop one agent")
+        targets = self.agents.plan_stop(session_id, agent_id, cascade=cascade)
+        self.agents.mark_stopping(
+            session_id, targets, scope="user", attribution=attribution,
+        )
+        for target in targets:
+            if not target.task_id:
+                continue  # stopped when task_started binds the id
+            try:
+                await client.stop_task(target.task_id)
+            except TransportDiedError:
+                self.agents.on_client_gone(session_id, "process_ended")
+                raise NoRuntime("The session's runtime went away")
+            except Exception as e:  # noqa: BLE001 — the sweeper flags it unconfirmed
+                logger.warning(
+                    "stop_task %s failed for %s: %s", target.task_id, session_id, e,
+                )
+        await self._log_stop_event(
+            session_id, "agent_stop_requested",
+            {
+                "agent_ids": [t.id for t in targets],
+                "task_ids": [t.task_id for t in targets if t.task_id],
+                "cascade": bool(cascade),
+            },
+            attribution,
+        )
+        return self.agents.to_view(rec), [t.id for t in targets]
+
+    async def stop_all(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+        include_shells: bool = True,
+    ) -> dict:
+        """Stop every live agent (shells and monitors too unless
+        ``include_shells`` is False) and the turn.
+
+        Each agent gets the runtime's per-task stop (deepest first, all at
+        once), then the runtime is interrupted with ``cancel_queued`` so task
+        notifications it already queued cannot wake the orchestrator into
+        relaunching them; a running turn gets 5 s to end and is then
+        cancelled. Messages queued in Nerve are not touched. Returns the
+        ``StopAllResult``.
+        """
+        await self._run_stop_listeners(session_id, attribution)
+        await self.agents.ensure_loaded(session_id)
+        live = self.agents.live(session_id)
+        targets = [
+            r for r in live
+            if include_shells or r.kind not in ("shell", "monitor")
+        ]
+        targets.sort(key=lambda r: (-int(r.depth), r.created_at))
+        client = self.sessions.get_client(session_id)
+        stopping: list[str] = []
+        unsupported: list[str] = []
+        if client is None:
+            # Nothing runs these records any more: settle them.
+            if targets:
+                self.agents.on_client_gone(session_id, "process_ended")
+        elif getattr(client, "supports_task_stop", False):
+            self.agents.mark_stopping(
+                session_id, targets, scope="stop_all", attribution=attribution,
+            )
+            stopping = [t.id for t in targets]
+            await asyncio.gather(
+                *(self._stop_one_task(session_id, client, t.task_id)
+                  for t in targets if t.task_id),
+            )
+        else:
+            unsupported = [t.id for t in targets]
+
+        turn = self.sessions.turn_task(session_id)
+        if client is not None:
+            try:
+                if _accepts_cancel_queued(client):
+                    await client.interrupt(cancel_queued=True)
+                elif turn is not None:
+                    await client.interrupt()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("stop-all interrupt failed for %s: %s", session_id, e)
+        if turn is not None:
+            done, _ = await asyncio.wait({turn}, timeout=self._STOP_WAIT_SECONDS)
+            if done:
+                outcome = "stopped"
+            else:
+                # Everything is being stopped anyway.
+                turn.cancel()
+                outcome = "killed"
+        else:
+            outcome = "not_running"
+        await self._log_stop_event(
+            session_id, "agents_stop_all_requested",
+            {"agent_ids": [t.id for t in targets], "include_shells": bool(include_shells)},
+            attribution,
+        )
+        if client is not None and stopping and _accepts_cancel_queued(client):
+            followups: set = self.__dict__.setdefault("_stop_followups", set())
+            task = asyncio.create_task(
+                self._drop_stop_notifications(session_id, client, stopping),
+                name=f"stop-all-followup:{session_id}",
+            )
+            followups.add(task)
+            task.add_done_callback(followups.discard)
+        return {
+            "scope": "all", "turn": outcome,
+            "stopping": stopping, "unsupported": unsupported,
+        }
+
+    async def _drop_stop_notifications(
+        self, session_id: str, client: Any, agent_ids: list[str],
+    ) -> None:
+        """Stop all, continued. The runtime queues a stopped agent's
+        notification once the agent has really ended, which is often after
+        the interrupt above went out; it would wake the orchestrator for a
+        turn about the agents just stopped. When they settled (at most
+        ``_STOP_ALL_SETTLE_SECONDS``), drop what the runtime queued meanwhile
+        and end an autonomous turn it already started for them; a turn of a
+        message someone sent since is left alone."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._STOP_ALL_SETTLE_SECONDS
+        while loop.time() < deadline:
+            records = [self.agents.get(session_id, a) for a in agent_ids]
+            if all(r is None or not r.live for r in records):
+                break
+            await asyncio.sleep(0.1)
+        if self.sessions.get_client(session_id) is not client:
+            return
+        turn = self.sessions.turn_task(session_id)
+        if turn is not None and not turn.get_name().startswith("auto-drain:"):
+            return
+        try:
+            await asyncio.wait_for(client.interrupt(cancel_queued=True), timeout=10.0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("stop-all follow-up interrupt failed for %s: %s", session_id, e)
+
+    async def _stop_one_task(self, session_id: str, client: Any, task_id: str) -> None:
+        try:
+            await client.stop_task(task_id)
+        except Exception as e:  # noqa: BLE001 — the sweeper flags it unconfirmed
+            logger.warning("stop_task %s failed for %s: %s", task_id, session_id, e)
+
+    async def force_stop(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """End the turn by force: cancel it at once (its cancel path discards
+        the client), or discard the client when no turn runs. Everything
+        still running in the runtime ends with it; its agents end as
+        ``interrupted(force_stop)``. Offered only after a stop came back
+        ``not_stopped`` or ``needs_confirmation``. Returns the
+        ``ForceStopResult``."""
+        await self._run_stop_listeners(session_id, attribution)
+        await self.agents.ensure_loaded(session_id)
+        ended = [r.id for r in self.agents.live(session_id)]
+        turn = self.sessions.turn_task(session_id)
+        if turn is not None:
+            turn.cancel()
+            outcome = "killed"
+        else:
+            outcome = "not_running"
+            if self.sessions.get_client(session_id) is not None:
+                await self._discard_client(
+                    session_id, background_memorize=True, reason="force_stop",
+                )
+        # The runtime is going away (the cancelled turn discards it): its
+        # agents end now, not when the cancel path gets to it.
+        self.agents.on_client_gone(session_id, "force_stop")
+        await self._log_stop_event(
+            session_id, "force_stop_requested", {"ended_agent_ids": ended},
+            attribution,
+        )
+        return {"scope": "force", "turn": outcome, "ended": ended}
 
     def is_session_running(self, session_id: str) -> bool:
         return self.sessions.is_running(session_id)
@@ -1451,13 +2285,206 @@ class AgentEngine:
         runs to defer the terminal 'done' until spend-relevant work ends."""
         return self._has_live_background_tasks(session_id)
 
-    async def pending_wakeup_at(self, session_id: str) -> str | None:
-        """``fire_at`` of the session's pending wakeup, or ``None``.
+    def background_agent_count(self, session_id: str) -> int:
+        """How many of the session's agents are live (housekeeping tasks
+        excluded) — the sidebar's background count."""
+        return self.agents.live_count(session_id)
+
+    async def agent_snapshot(self, session_id: str, *, limit: int = 200) -> dict:
+        """The session's ``AgentSnapshot`` (roster, summary, capabilities,
+        turn queue), as REST and ``session_status`` send it."""
+        snap = await self.agents.snapshot(session_id, limit=limit)
+        return {
+            "session_id": snap["session_id"],
+            "agents": snap["agents"],
+            "summary": snap["summary"],
+            "capabilities": snap["capabilities"],
+            "queue": self.queue_view(session_id),
+            "generated_at": snap["generated_at"],
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Turn queue: runs waiting for the run lock, visible to every client #
+    # ------------------------------------------------------------------ #
+
+    def _queue_state(self) -> tuple[dict, dict, dict]:
+        """``(queues, started, client_msgs)`` — created on first use, so
+        engines built with ``__new__`` (test doubles) work too."""
+        d = self.__dict__
+        return (
+            d.setdefault("_turn_queues", {}),
+            d.setdefault("_started_queue_ids", {}),
+            d.setdefault("_recent_client_msgs", {}),
+        )
+
+    def queue_view(self, session_id: str) -> list[dict]:
+        """The session's server-visible turn queue (``QueueEntryView`` list,
+        oldest first). Internal entries never show their prompt: they carry a
+        fixed label by source."""
+        queues, _started, _msgs = self._queue_state()
+        out = []
+        for entry in queues.get(session_id, ()):
+            if entry.internal:
+                preview = _INTERNAL_QUEUE_LABELS.get(entry.source, "Background trigger")
+            else:
+                preview = entry.content[:_QUEUE_PREVIEW_CHARS]
+            out.append({
+                "queue_id": entry.queue_id,
+                "client_msg_id": entry.client_msg_id,
+                "preview": preview,
+                "source": entry.source,
+                "internal": entry.internal,
+                "actor_id": entry.actor_id,
+                "created_at": entry.created_at,
+            })
+        return out
+
+    def _enqueue_turn(
+        self, session_id: str, *, content: str, client_msg_id: str | None,
+        source: str, internal: bool, actor: Actor | None,
+    ) -> QueuedTurn:
+        """List a run that waits for the run lock (captures the current task:
+        a cancel request cancels it)."""
+        queues, _started, _msgs = self._queue_state()
+        task = asyncio.current_task()
+        assert task is not None
+        entry = QueuedTurn(
+            queue_id="q_" + secrets.token_hex(4),
+            session_id=session_id,
+            content=content,
+            client_msg_id=client_msg_id,
+            source=source,
+            internal=internal,
+            actor_id=actor.actor_id if actor is not None else None,
+            created_at=_iso_now(),
+            task=task,
+        )
+        queues.setdefault(session_id, []).append(entry)
+        return entry
+
+    def _dequeue_turn(
+        self, session_id: str, entry: QueuedTurn, *, started: bool = False,
+    ) -> None:
+        queues, started_ids, _msgs = self._queue_state()
+        queue = queues.get(session_id)
+        if queue is not None:
+            with contextlib.suppress(ValueError):
+                queue.remove(entry)
+            if not queue:
+                queues.pop(session_id, None)
+        if started:
+            # Remembered so a late cancel request answers "already started"
+            # rather than "not found".
+            recent = started_ids.setdefault(session_id, OrderedDict())
+            recent[entry.queue_id] = True
+            while len(recent) > _RECENT_IDS_KEPT:
+                recent.popitem(last=False)
+
+    def _is_duplicate_client_msg(self, session_id: str, client_msg_id: str) -> bool:
+        """Whether this ``client_msg_id`` was already seen for the session
+        (the last 64 ids within 10 minutes); records it otherwise. A client
+        that retries a send after a dropped socket must not run it twice."""
+        _queues, _started, msgs = self._queue_state()
+        seen: OrderedDict = msgs.setdefault(session_id, OrderedDict())
+        now = time.monotonic()
+        while seen:
+            oldest_id, at = next(iter(seen.items()))
+            if now - at <= _CLIENT_MSG_TTL_SECONDS:
+                break
+            seen.pop(oldest_id)
+        if client_msg_id in seen:
+            return True
+        seen[client_msg_id] = now
+        while len(seen) > _RECENT_IDS_KEPT:
+            seen.popitem(last=False)
+        return False
+
+    async def _emit_queue_update(
+        self, session_id: str, *, removed: list[dict] | None = None,
+    ) -> None:
+        """Broadcast ``queue_update``: the full queue, plus what just left it
+        (``started`` / ``cancelled`` / ``duplicate``). Never buffered for turn
+        replay: a reconnecting client gets the queue from its snapshot."""
+        message: dict[str, Any] = {
+            "type": "queue_update",
+            "session_id": session_id,
+            "queue": self.queue_view(session_id),
+        }
+        if removed:
+            message["removed"] = removed
+        try:
+            await broadcaster.broadcast(session_id, message, buffer=False)
+        except Exception:  # noqa: BLE001 — the queue never breaks a run
+            logger.debug("queue_update broadcast failed for %s", session_id, exc_info=True)
+
+    def cancel_queued_turn(
+        self, session_id: str, queue_id: str, *, actor: Actor | None,
+    ) -> QueuedTurn:
+        """Cancel a queued message before it runs. Only its own sender may:
+        relays and internal turns can never be cancelled from a client.
+
+        Raises :class:`QueueEntryNotFound`, :class:`AlreadyStarted` (it holds
+        the run lock now: it is the turn) or :class:`NotOwner`. The cancelled
+        run returns ``""`` and persists nothing.
+        """
+        queues, started_ids, _msgs = self._queue_state()
+        entry = next(
+            (e for e in queues.get(session_id, ()) if e.queue_id == queue_id), None,
+        )
+        if entry is None:
+            if queue_id in started_ids.get(session_id, ()):
+                raise AlreadyStarted("The message is already running")
+            raise QueueEntryNotFound("No such queued message")
+        if entry.actor_id is None or entry.actor_id != getattr(actor, "actor_id", None):
+            raise NotOwner("Only its sender can cancel a queued message")
+        if not entry.cancelled_by_request:
+            entry.cancelled_by_request = True
+            entry.task.cancel()
+        return entry
+
+    def _agent_capabilities(self, session_id: str) -> dict:
+        """What the session's runtime can do with agents: from the live client
+        when there is one, else from its backend."""
+        client = self.sessions.get_client(session_id)
+        name = (
+            self._session_backends.get(session_id)
+            or self.agents.session_backend(session_id)
+            or "claude"
+        )
+        backend = self._backends.get(name) or self._backends.get("claude")
+        caps = getattr(backend, "capabilities", None)
+        if client is not None:
+            stop = bool(getattr(client, "supports_task_stop", False))
+            spares = bool(getattr(client, "interrupt_spares_background", False))
+        else:
+            stop = bool(getattr(caps, "supports_task_stop", False))
+            subagents = getattr(self.config.agent, "subagents", None)
+            spares = name == "claude" and bool(
+                getattr(subagents, "per_task_stop_affordance", False),
+            )
+        return {
+            "stop_task": stop,
+            "transcript": bool(getattr(caps, "supports_agent_transcripts", False)),
+            "output": name == "claude",
+            "interrupt_spares_background": spares,
+        }
+
+    async def _stop_agent_task(self, session_id: str, task_id: str) -> None:
+        """Stop one runtime task (the registry's deferred stop, once a stopped
+        agent's task id is known). No-op without a client that can."""
+        client = self.sessions.get_client(session_id)
+        stop_task = getattr(client, "stop_task", None) if client is not None else None
+        if stop_task is None or not getattr(client, "supports_task_stop", False):
+            return
+        await stop_task(task_id)
+
+    async def pending_wakeup(self, session_id: str) -> dict | None:
+        """The session's pending wakeup row, or ``None``.
 
         ``ScheduleWakeup`` keeps at most one pending row per session (a new
-        request supersedes the old one), so this is a single timestamp
-        rather than a list. Never raises — a listing/indicator caller must
-        not fail on an enrichment read.
+        request supersedes the old one), so this is a single row rather
+        than a list. Never raises: a listing or indicator caller must not
+        fail on an enrichment read.
         """
         try:
             rows = await self.db.list_pending_wakeups(session_id)
@@ -1466,7 +2493,12 @@ class AgentEngine:
                 "pending wakeup lookup failed for %s", session_id, exc_info=True,
             )
             return None
-        return rows[0].get("fire_at") if rows else None
+        return rows[0] if rows else None
+
+    async def pending_wakeup_at(self, session_id: str) -> str | None:
+        """``fire_at`` of the session's pending wakeup, or ``None``."""
+        wakeup = await self.pending_wakeup(session_id)
+        return wakeup.get("fire_at") if wakeup else None
 
     async def _broadcast_session_running(
         self, session_id: str, is_running: bool,
@@ -1480,12 +2512,17 @@ class AgentEngine:
         with the transition means the client can redraw the row without a
         follow-up list fetch — which it skips for the active session.
         """
+        wakeup = await self.pending_wakeup(session_id) or {}
         await broadcaster.broadcast("__global__", {
             "type": "session_running",
             "session_id": session_id,
             "is_running": is_running,
-            "pending_wakeup_at": await self.pending_wakeup_at(session_id),
+            "pending_wakeup_at": wakeup.get("fire_at"),
+            # Who scheduled the wakeup, and for whom; see GET /api/sessions.
+            "pending_wakeup_created_by_actor_id": wakeup.get("created_by_actor_id"),
+            "pending_wakeup_caused_by_actor_id": wakeup.get("caused_by_actor_id"),
             "has_background_tasks": self._has_live_background_tasks(session_id),
+            "background_count": self.agents.live_count(session_id),
         })
 
     def get_codex_ultracode_run_ids(self, session_id: str) -> set[str] | None:
@@ -1512,12 +2549,16 @@ class AgentEngine:
         at_message_id: str | None = None,
         title: str | None = None,
         source: str | None = None,
+        *,
+        actor: Actor | None,
     ) -> dict:
         """Fork a session. Returns the new session dict.
 
         Args:
             source: Override the source field on the fork (default: inherit
                     from parent).
+            actor: Who asked for the fork. Stamped on the new session; the
+                   copied messages keep their original senders.
         """
         parent = await self.db.get_session(source_session_id)
         if not parent:
@@ -1525,18 +2566,30 @@ class AgentEngine:
 
         fork = await self.sessions.fork_session(
             source_session_id, at_message_id, title, source=source,
+            actor=actor,
         )
         return fork
 
-    async def resume_session(self, session_id: str) -> dict:
-        """Resume a stopped/idle session."""
+    async def resume_session(
+        self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict:
+        """Resume a stopped/idle session.
+
+        Records a ``created`` status event with reason ``resume`` and
+        ``attribution``, only when the status changes: a session that is
+        resumed already stays as it is, so of two resumes at the same time
+        only one is recorded.
+        """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
             raise ValueError(
                 f"Session {session_id} cannot be resumed (no SDK session)",
             )
         # Mark as created so the next message will reconnect the client
-        await self.sessions.transition(session_id, SessionStatus.CREATED)
+        await self.sessions.transition(
+            session_id, SessionStatus.CREATED, {"reason": "resume"},
+            attribution=attribution,
+        )
         session = await self.db.get_session(session_id)
         return session
 
@@ -1613,6 +2666,11 @@ class AgentEngine:
                     user_message=_RESUME_AFTER_RESTART_PROMPT,
                     source=session.get("source") or "web",
                     internal=True,
+                    # The trigger is the instance's own, and `internal` keeps
+                    # it out of the transcript anyway. Whoever was talking to
+                    # the session keeps their messages; the continuation is
+                    # the assistant's.
+                    actor=self.db.system_actor,
                 )
                 resumed += 1
             except Exception as e:
@@ -1636,10 +2694,10 @@ class AgentEngine:
         tool_results_map: dict[str, dict],
         ordered_blocks: list[dict],
         tool_calls_log: list[dict],
-        active_subagents: dict[str, float],
     ) -> None:
-        """Process a normalized ToolResult event (shared by user runs and
-        autonomous-turn drains)."""
+        """Process a main-chain ToolResult event (shared by user runs and
+        autonomous-turn drains). Sidechain results never get here; the agent
+        registry runs :meth:`_tool_result_side_effects` for them."""
         result_content = (
             event.content
             if isinstance(event.content, str)
@@ -1670,17 +2728,20 @@ class AgentEngine:
             parent_tool_use_id=event.parent_tool_use_id,
         )
 
-        # Sub-agent lifecycle: emit complete event
-        if tool_use_id and tool_use_id in active_subagents:
-            start_time = active_subagents.pop(tool_use_id)
-            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
-            await broadcaster.broadcast_subagent_complete(
-                session_id,
-                tool_use_id=tool_use_id,
-                duration_ms=duration_ms,
-                is_error=is_error or False,
-            )
+        await self._tool_result_side_effects(
+            session_id, tool_use_id, bool(is_error), result_content,
+            tool_calls_log,
+        )
 
+    async def _tool_result_side_effects(
+        self, session_id: str, tool_use_id: str | None, is_error: bool,
+        result_content: str, tool_calls_log: list[dict],
+    ) -> None:
+        """Side effects of a finished tool call, for the orchestrator's own
+        calls and for sub-agents' calls alike: ``plan_update`` and
+        ``file_changed`` broadcasts (when the call succeeded) and MCP tool
+        usage. ``tool_calls_log`` holds the call (``tool``, ``tool_use_id``,
+        ``input``); the registry passes an agent's recent calls."""
         # Auto-broadcast plan/file updates
         if not is_error and tool_use_id:
             _maybe_broadcast_plan_update(session_id, tool_use_id, tool_calls_log)
@@ -1795,8 +2856,17 @@ class AgentEngine:
         their native stream into these events (see
         nerve/agent/backends/events.py).
 
+        Sub-agent (sidechain) events go to the agent registry and never
+        touch ``st``: no blocks, no response text, no ``got_content`` — so a
+        sub-agent's work is never persisted as the orchestrator's message,
+        and a turn that saw only sub-agent traffic can still crash-retry.
+
         Returns True when the event is a TurnCompleted (turn over).
         """
+        if _is_sidechain(event):
+            await self.agents.ingest_sidechain(session_id, event)
+            return False
+
         if isinstance(event, TextDelta):
             st.got_content = True
             st.full_response_text += event.text
@@ -1849,23 +2919,24 @@ class AgentEngine:
                 "input": event.input,
                 "tool_use_id": event.tool_use_id,
             })
+            # A spawning call (Agent/Task/Workflow/Monitor, background Bash)
+            # creates the agent's record; TaskStop marks its target.
+            await self.agents.note_main_tool_use(session_id, event)
 
         elif isinstance(event, SubagentStarted):
-            st.active_subagents[event.tool_use_id] = asyncio.get_event_loop().time()
-            await broadcaster.broadcast_subagent_start(
-                session_id,
-                tool_use_id=event.tool_use_id,
-                subagent_type=event.subagent_type,
-                description=event.description,
-                model=event.model,
-            )
+            # The spawning ToolUse (already processed) carries the agent's
+            # brief; the registry tracks it from there.
+            await self.agents.on_subagent_started(session_id, event)
 
         elif isinstance(event, ToolResult):
             await self._process_tool_result(
                 event, session_id,
                 st.tool_results_map, st.ordered_blocks,
-                st.tool_calls_log, st.active_subagents,
+                st.tool_calls_log,
             )
+            # A spawn's result launches (async receipt), settles (foreground
+            # completion) or fails its agent.
+            await self.agents.on_main_tool_result(session_id, event)
 
         elif isinstance(event, ToolOutputDelta):
             st.got_content = True
@@ -1913,35 +2984,39 @@ class AgentEngine:
                 "context_window": event.context_window,
                 "status": event.status,
             }
-            if event.status == "failed" and event.error:
-                # Failed turns still complete: surface the error inline so
-                # the conversation shows what happened (the runtime's
-                # transport stays healthy — this is a model/API failure).
-                note = f"⚠️ Turn failed: {event.error}"
-                st.full_response_text += (
-                    ("\n\n" + note) if st.full_response_text else note
+            st.status, st.error = event.status, event.error
+            if event.status != "completed":
+                # Abnormal ends still complete: surface them inline so the
+                # conversation shows what happened (the runtime itself stays healthy).
+                logger.warning(
+                    "Turn %s for session %s: %s",
+                    event.status, session_id, event.error or "no detail",
                 )
+                note = f"⚠️ Turn {event.status}" + (f": {event.error}" if event.error else "")
+                st.full_response_text += ("\n\n" + note) if st.full_response_text else note
                 st.ordered_blocks.append({"type": "text", "content": note})
                 await broadcaster.broadcast_token(session_id, note)
             return True
 
         return False
 
-    # CLI task statuses that mean "no longer running".
-    _BG_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
-
     async def _handle_system_event(
         self, session_id: str, event: SystemEvent,
     ) -> None:
-        """Track runtime background-task lifecycle events and update the UI.
+        """Route a runtime system frame.
 
-        The Claude CLI emits ``system`` messages for background work
-        (Bash/Agent ``run_in_background``, Monitor watches):
+        The Claude CLI reports its background work (Agent/Workflow tasks,
+        Bash ``run_in_background``, Monitor watches) as ``system`` frames:
 
-        - ``task_started``  — task spawned (description, task_type)
-        - ``task_progress`` — periodic usage updates
+        - ``task_started``  — task spawned (description, task_type, ...)
+        - ``task_progress`` — usage, activity and summary updates
         - ``task_updated``  — status patches
         - ``task_notification`` — task settled (completed/failed/stopped)
+        - ``background_tasks_changed`` — the full live background set
+
+        The agent registry turns them into agent records. Workflow tasks also
+        drive the workflow-progress panel here, and a change to the legacy
+        chip list is re-broadcast for tabs from before the agent roster.
 
         Backends merge any legacy top-level fields into ``event.data`` so
         this handler reads one dict.
@@ -1962,6 +3037,11 @@ class AgentEngine:
                 session_id, subtype, event.data or {},
             )
             return
+        if subtype == "background_tasks_changed":
+            # REPLACE semantics: the registry reconciles membership (a member
+            # that disappears without a final frame is lost after a grace).
+            await self.agents.on_system_event(session_id, event)
+            return
         if subtype not in (
             "task_started", "task_progress", "task_updated", "task_notification",
         ):
@@ -1972,50 +3052,12 @@ class AgentEngine:
         if not task_id:
             return
 
-        registry = self._bg_task_registry.setdefault(session_id, {})
-        entry = registry.get(task_id)
-        if entry is None:
-            entry = {
-                "task_id": task_id, "label": "", "tool": "Bash",
-                "status": "running",
-            }
-            registry[task_id] = entry
-
-        changed = True
-        if subtype == "task_started":
-            entry["label"] = (
-                data.get("description") or entry["label"] or task_id
-            )
-            task_type = str(data.get("task_type") or "")
-            entry["tool"] = "Agent" if "agent" in task_type else "Bash"
-            entry["status"] = "running"
-        elif subtype == "task_progress":
-            # Only useful for backfilling a label if task_started was missed.
-            desc = data.get("description")
-            if desc and not entry["label"]:
-                entry["label"] = desc
-            else:
-                changed = False
-        elif subtype == "task_updated":
-            patch = data.get("patch") or {}
-            status = str(patch.get("status") or "")
-            if status in self._BG_TERMINAL_STATUSES:
-                entry["status"] = "done" if status in ("completed", "stopped") else "failed"
-            else:
-                changed = False
-        elif subtype == "task_notification":
-            status = str(data.get("status") or "")
-            entry["status"] = (
-                "done" if status in ("completed", "stopped", "") else "failed"
-            )
-            if not entry["label"]:
-                entry["label"] = data.get("summary") or task_id
+        changed = await self.agents.on_system_event(session_id, event)
 
         # Dynamic-workflow progress. A workflow task is recognized either by
         # its tool_use_id (captured when the ``Workflow`` tool streamed) or by
         # the presence of a ``workflow_progress`` tree on the event. We emit
-        # a dedicated event so the UI can render a live phase/agent panel —
-        # independent of the coarse background-task chip above.
+        # a dedicated event so the UI can render a live phase/agent panel.
         tool_use_id = data.get("tool_use_id")
         wf_reg = self._workflows.get(session_id) or {}
         wp = data.get("workflow_progress")
@@ -2026,7 +3068,6 @@ class AgentEngine:
             or "workflow" in task_type
         )
         if is_workflow:
-            entry["tool"] = "Workflow"
             # The CLI reports the workflow name on task_started — authoritative
             # (and better than the tool-input guess for inline scripts).
             wf_name = data.get("workflow_name")
@@ -2039,10 +3080,12 @@ class AgentEngine:
             )
 
         if changed:
+            # Kept for one release: tabs from before the agent roster render
+            # their background-task chip from this list.
             await broadcaster.broadcast(session_id, {
                 "type": "background_tasks_update",
                 "session_id": session_id,
-                "tasks": list(registry.values()),
+                "tasks": self.agents.legacy_task_list(session_id),
             })
 
     async def _emit_workflow_progress(
@@ -2080,6 +3123,8 @@ class AgentEngine:
             snapshot["summary"] = str(summary)[:2000]
 
         cached["snapshot"] = snapshot
+        # The workflow's agent record carries the same snapshot.
+        self.agents.set_workflow_snapshot(session_id, tool_use_id, snapshot)
         await broadcaster.broadcast_workflow_progress(session_id, tool_use_id, snapshot)
 
         if status in ("completed", "failed", "stopped"):
@@ -2157,6 +3202,21 @@ class AgentEngine:
             if snap:
                 ob["workflow"] = snap
 
+    def _stamp_agent_ids(self, session_id: str, ordered_blocks: list | None) -> None:
+        """Set ``agent_id`` on every spawning ``tool_call`` block whose agent
+        record is known (in place)."""
+        if not ordered_blocks:
+            return
+        for block in ordered_blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_call":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if not tool_use_id or kind_for_spawn(block.get("tool"), block.get("input")) is None:
+                continue
+            agent_id = self.agents.agent_id_for_spawn(session_id, tool_use_id)
+            if agent_id:
+                block["agent_id"] = agent_id
+
     @staticmethod
     def _build_workflow_snapshot(wp: list) -> dict:
         """Normalize the CLI's flat ``workflow_progress`` list into a
@@ -2193,27 +3253,21 @@ class AgentEngine:
             "agentCount": len(agents),
         }
 
-    def _prune_bg_tasks(self, session_id: str) -> None:
-        """Drop settled background tasks from the registry.
+    def _prune_turn_state(self, session_id: str) -> None:
+        """A new user turn starts: what settled since the last turn no longer
+        explains the next autonomous turn (and leaves the legacy chip list).
 
-        Called at the start of a new user turn so stale "done" chips don't
-        accumulate forever. Running tasks are kept.
+        Settled workflows are dropped too (terminal snapshot already
+        broadcast + persisted); running ones stay so late progress still
+        maps back.
         """
-        registry = self._bg_task_registry.get(session_id)
-        if registry:
-            for tid in [t for t, e in registry.items() if e.get("status") != "running"]:
-                del registry[tid]
-            if not registry:
-                self._bg_task_registry.pop(session_id, None)
-
-        # Drop settled workflows too (terminal snapshot already broadcast +
-        # persisted); keep running ones so late progress still maps back.
+        self.agents.clear_turn_triggers(session_id)
         self._prune_settled_workflows(session_id)
 
     def _prune_settled_workflows(self, session_id: str) -> None:
         """Drop terminal Workflow snapshots from the live registry.
 
-        Called both at next-turn start (via _prune_bg_tasks) and at the END
+        Called both at next-turn start (via _prune_turn_state) and at the END
         of _finalize_turn: the moment a turn's real cost lands in
         session_usage, settled snapshots must stop counting toward
         get_live_workflow_tokens or budget metering double-counts them.
@@ -2232,6 +3286,26 @@ class AgentEngine:
     async def _finalize_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
         bump_updated_at: bool = True,
+        persist_message: bool = True,
+    ) -> TurnOutcome:
+        """Persist the turn (``_persist_turn``), then publish its outcome."""
+        try:
+            await self._persist_turn(
+                session_id, st, channel, bump_updated_at=bump_updated_at,
+                persist_message=persist_message,
+            )
+        except asyncio.CancelledError:
+            self._end_turn(session_id, TurnOutcome("interrupted", "stopped while saving the turn"))
+            raise
+        except Exception as e:
+            self._end_turn(session_id, TurnOutcome("failed", f"turn not persisted: {e}"))
+            raise
+        return self._end_turn(session_id, TurnOutcome(st.status, st.error))
+
+    async def _persist_turn(
+        self, session_id: str, st: _TurnState, channel: str | None,
+        bump_updated_at: bool = True,
+        persist_message: bool = True,
     ) -> None:
         """Persist a completed turn and emit the terminal ``done`` event.
 
@@ -2244,6 +3318,11 @@ class AgentEngine:
         alone — passed for turns the user never asked for (a fired wakeup,
         a background task settling), which are continuations of work that
         was already visible rather than new activity.
+
+        ``persist_message=False`` stores no assistant message but still
+        records usage and broadcasts ``done``: an autonomous turn that
+        produced nothing visible must not leave an empty "Background
+        continuation" row behind.
         """
         # Merge tool results into tool_calls_log
         self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
@@ -2255,15 +3334,23 @@ class AgentEngine:
         # Longer workflows that settle after finalize are handled by that merge.
         self._fold_workflow_snapshots(st.ordered_blocks, self._workflows.get(session_id))
 
-        # Store assistant message in DB
-        await self.sessions.add_message(
-            session_id, "assistant", st.full_response_text,
-            channel=channel,
-            thinking=st.thinking_text if st.thinking_text else None,
-            blocks=st.ordered_blocks if st.ordered_blocks else None,
-            native_turn_id=st.native_turn_id,
-            bump_updated_at=bump_updated_at,
-        )
+        # Spawning calls name the agent record they started, so the history
+        # links each Agent/Workflow/Monitor card to its live roster entry.
+        self._stamp_agent_ids(session_id, st.ordered_blocks)
+
+        # Assistant output has no actor_id: ``role`` records model authorship,
+        # while actor_id identifies principals that supplied input. Causal
+        # attribution to the prompting actor is not stored.
+        if persist_message:
+            await self.sessions.add_message(
+                session_id, "assistant", st.full_response_text,
+                channel=channel,
+                thinking=st.thinking_text if st.thinking_text else None,
+                blocks=st.ordered_blocks if st.ordered_blocks else None,
+                native_turn_id=st.native_turn_id,
+                bump_updated_at=bump_updated_at,
+                actor=None,
+            )
 
         # Persist SDK session ID and update status
         if st.sdk_session_id:
@@ -2422,10 +3509,35 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
+        client_msg_id: str | None = None,
+        origin: str | None = None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
+        Runs of one session are serialized by its run lock. A run that finds
+        the lock held is listed in the session's turn queue (``queue_update``
+        to every client) until it gets the lock; its sender may cancel it
+        there (:meth:`cancel_queued_turn`), and then it returns ``""`` having
+        persisted nothing. Stop never touches queued runs.
+
         Args:
+            actor: Who supplied ``user_message``. The person who typed it for
+                      a web, WebSocket or API turn; the agent's system
+                      principal when the instance composed the prompt itself
+                      (cron, a wakeup, a plan revision, a workflow leg). It is
+                      stored on the persisted user message and on the session
+                      if this run has to create one — never on the assistant's
+                      reply, whose authorship is its ``role``. Required
+                      keyword-only: an autonomous caller must say so rather
+                      than inherit a person's identity by omission.
+            cause: The session's cause, used only when this run creates the
+                      session: an :class:`Actor`, an actor ID, or ``None``
+                      for unknown. The default is the actor. An existing
+                      session keeps its stored cause (see
+                      :meth:`session_cause`), whoever sends the message.
             internal: If True, the user_message is a system-generated trigger
                       (e.g., background task completion) and won't be stored in
                       DB or shown in the UI.
@@ -2441,68 +3553,197 @@ class AgentEngine:
                       ``internal``: that flag only means "don't persist the
                       trigger message", and plenty of internal turns (a
                       run-later deferral, the star hook) are user-requested.
+            client_msg_id: The sender's id for this message. A repeat (a
+                      client retrying after a dropped socket) within 10
+                      minutes runs nothing and returns ``""``; clients match
+                      the queue entry and the started turn by it.
+            origin: Label of where the message came from, shown on its queue
+                      entry (``"web"``, ``"api"``, a channel name). Defaults
+                      to ``source``.
         """
+        return (await self._run_turn(
+            session_id=session_id,
+            user_message=user_message,
+            source=source,
+            channel=channel,
+            model=model,
+            effort_override=effort_override,
+            internal=internal,
+            images=images,
+            image_refs=image_refs,
+            bump_updated_at=bump_updated_at,
+            actor=actor,
+            cause=cause,
+            client_msg_id=client_msg_id,
+            origin=origin,
+        )).text
+
+    async def _run_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        source: str = "web",
+        channel: str | None = None,
+        model: str | None = None,
+        effort_override: str | None = None,
+        internal: bool = False,
+        images: list[dict[str, Any]] | None = None,
+        image_refs: list[dict[str, Any]] | None = None,
+        bump_updated_at: bool = True,
+        *,
+        actor: Actor | None,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
+        client_msg_id: str | None = None,
+        origin: str | None = None,
+    ) -> TurnResult:
+        """``run()`` plus how the invocation's turn ended."""
+        # Resolved before the lock: an invalid cause fails here, before the
+        # session is marked as running.
+        cause_id = resolve_cause(actor, cause)
+        if client_msg_id and self._is_duplicate_client_msg(session_id, client_msg_id):
+            logger.info(
+                "Session %s: dropped a repeated message (client_msg_id %s)",
+                session_id, client_msg_id,
+            )
+            await self._emit_queue_update(session_id, removed=[{
+                "queue_id": None, "client_msg_id": client_msg_id, "reason": "duplicate",
+            }])
+            return TurnResult("", TurnOutcome("interrupted", "dropped as a repeated message"))
         # Serialize runs per session — messages for the same session wait
-        # in order instead of failing with "already running".
+        # in order instead of failing with "already running", and are listed
+        # while they wait.
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            broadcaster.start_buffering(session_id)
-            async with self._semaphore:
-                # Clear any stale deferred-stop flag left over from a *previous*
-                # turn.  If /stop arrived while the old turn was still cleaning up
-                # (mark_not_running hadn't run yet), the flag lingers and would
-                # immediately kill this brand-new turn.  Flags set *during* this
-                # turn's client init are unaffected — they're created after
-                # mark_running below.
-                self.sessions.pop_stop_request(session_id)
-                self.sessions.mark_running(session_id)
-                if channel is not None:
-                    self._active_channel[session_id] = channel
-                # Mark the turn as in flight so the finally below can
-                # detect "ended without sending done/stopped/error" and
-                # ship a synthetic done.  Clearing happens automatically
-                # when a terminal event is broadcast.
-                broadcaster.mark_turn_open(session_id)
-                # Notify all connected clients that this session started running
-                await self._broadcast_session_running(session_id, True)
-                try:
-                    return await self._run_inner(
-                        session_id, user_message, source, channel, model,
-                        effort_override=effort_override,
-                        internal=internal, images=images,
-                        image_refs=image_refs,
-                        bump_updated_at=bump_updated_at,
+        entry: QueuedTurn | None = None
+        queues, _started, _msgs = self._queue_state()
+        # Behind a held lock, or behind runs still waiting for it (a lock just
+        # released passes to the oldest waiter before it reads as held).
+        if lock.locked() or queues.get(session_id):
+            entry = self._enqueue_turn(
+                session_id, content=user_message, client_msg_id=client_msg_id,
+                source=origin or source, internal=internal, actor=actor,
+            )
+        try:
+            if entry is not None:
+                # Inside the try: a cancel here still dequeues.
+                await self._emit_queue_update(session_id)
+            await lock.acquire()
+        except asyncio.CancelledError:
+            if entry is not None:
+                self._dequeue_turn(session_id, entry)
+                await self._emit_queue_update(session_id, removed=[{
+                    "queue_id": entry.queue_id, "client_msg_id": entry.client_msg_id,
+                    "reason": "cancelled",
+                }])
+                if entry.cancelled_by_request:
+                    # Cancelled from the queue by its sender: nothing ran and
+                    # nothing was persisted. The cancel was for this wait
+                    # only, so the caller's task carries on normally.
+                    task = asyncio.current_task()
+                    if task is not None:
+                        task.uncancel()
+                    return TurnResult("", TurnOutcome("interrupted", "cancelled while queued"))
+            raise
+        turn_task = asyncio.current_task()
+        try:
+            # The Stop target from the moment this run holds the run lock:
+            # Stop reaches the turn, never a message queued behind it.
+            self.sessions.set_turn_task(session_id, turn_task)
+            if entry is not None:
+                self._dequeue_turn(session_id, entry, started=True)
+            if entry is not None or client_msg_id:
+                await self._emit_queue_update(session_id, removed=[{
+                    "queue_id": entry.queue_id if entry is not None else None,
+                    "client_msg_id": client_msg_id, "reason": "started",
+                }])
+            return await self._run_locked(
+                session_id, user_message, source, channel, model,
+                effort_override=effort_override, internal=internal,
+                images=images, image_refs=image_refs,
+                bump_updated_at=bump_updated_at, actor=actor,
+                cause_id=cause_id,
+            )
+        finally:
+            self.sessions.clear_turn_task(session_id, turn_task)
+            lock.release()
+
+    async def _run_locked(
+        self,
+        session_id: str,
+        user_message: str,
+        source: str,
+        channel: str | None,
+        model: str | None,
+        *,
+        effort_override: str | None,
+        internal: bool,
+        images: list[dict[str, Any]] | None,
+        image_refs: list[dict[str, Any]] | None,
+        bump_updated_at: bool,
+        actor: Actor | None,
+        cause_id: str | None,
+    ) -> TurnResult:
+        """The turn of :meth:`run`, with the run lock held: framing
+        (buffering, running state, ``session_running``) around
+        :meth:`_run_inner`."""
+        broadcaster.start_buffering(session_id)
+        async with self._semaphore:
+            # Clear any stale deferred-stop flag left over from a *previous*
+            # turn.  If /stop arrived while the old turn was still cleaning up
+            # (mark_not_running hadn't run yet), the flag lingers and would
+            # immediately kill this brand-new turn.  Flags set *during* this
+            # turn's client init are unaffected — they're created after
+            # mark_running below.
+            self.sessions.pop_stop_request(session_id)
+            self.sessions.mark_running(session_id)
+            if channel is not None:
+                self._active_channel[session_id] = channel
+            # Mark the turn as in flight so the finally below can
+            # detect "ended without sending done/stopped/error" and
+            # ship a synthetic done.  Clearing happens automatically
+            # when a terminal event is broadcast.
+            broadcaster.mark_turn_open(session_id)
+            # Notify all connected clients that this session started running
+            await self._broadcast_session_running(session_id, True)
+            try:
+                return await self._run_inner(
+                    session_id, user_message, source, channel, model,
+                    effort_override=effort_override,
+                    internal=internal, images=images,
+                    image_refs=image_refs,
+                    bump_updated_at=bump_updated_at,
+                    actor=actor,
+                    cause_id=cause_id,
+                )
+            finally:
+                self.sessions.mark_not_running(session_id)
+                self._active_channel.pop(session_id, None)
+                # Backstop: if _run_inner exited without broadcasting
+                # done/stopped/error (post-stream DB exception, hung
+                # CLI cancelled by an outer mechanism, etc.), the
+                # frontend never learned the turn ended and is still
+                # showing "thinking..." even though the server has
+                # cleared is_running.  Ship a synthetic done so the
+                # streaming UI exits cleanly.
+                if broadcaster.is_turn_open(session_id):
+                    logger.warning(
+                        "Session %s ended without a terminal event "
+                        "(done/stopped/error); sending synthetic done "
+                        "so the frontend exits streaming state",
+                        session_id,
                     )
-                finally:
-                    self.sessions.mark_not_running(session_id)
-                    self._active_channel.pop(session_id, None)
-                    # Backstop: if _run_inner exited without broadcasting
-                    # done/stopped/error (post-stream DB exception, hung
-                    # CLI cancelled by an outer mechanism, etc.), the
-                    # frontend never learned the turn ended and is still
-                    # showing "thinking..." even though the server has
-                    # cleared is_running.  Ship a synthetic done so the
-                    # streaming UI exits cleanly.
-                    if broadcaster.is_turn_open(session_id):
+                    try:
+                        await broadcaster.broadcast_done(session_id)
+                    except Exception as e:
                         logger.warning(
-                            "Session %s ended without a terminal event "
-                            "(done/stopped/error); sending synthetic done "
-                            "so the frontend exits streaming state",
-                            session_id,
+                            "Synthetic done broadcast failed for %s: %s",
+                            session_id, e,
                         )
-                        try:
-                            await broadcaster.broadcast_done(session_id)
-                        except Exception as e:
-                            logger.warning(
-                                "Synthetic done broadcast failed for %s: %s",
-                                session_id, e,
-                            )
-                            broadcaster.clear_turn_open(session_id)
-                    broadcaster.stop_buffering(session_id)
-                    # Notify all connected clients that this session stopped.
-                    # Carries pending work, so a session parked on a wakeup or
-                    # a background task stays "running" in the sidebar.
-                    await self._broadcast_session_running(session_id, False)
+                        broadcaster.clear_turn_open(session_id)
+                broadcaster.stop_buffering(session_id)
+                # Notify all connected clients that this session stopped.
+                # Carries pending work, so a session parked on a wakeup or
+                # a background task stays "running" in the sidebar.
+                await self._broadcast_session_running(session_id, False)
 
     async def _run_inner(
         self,
@@ -2516,9 +3757,15 @@ class AgentEngine:
         images: list[dict[str, Any]] | None = None,
         image_refs: list[dict[str, Any]] | None = None,
         bump_updated_at: bool = True,
-    ) -> str:
-        # Ensure session exists in DB
-        await self.sessions.get_or_create(session_id, source=source)
+        *,
+        actor: Actor | None,
+        cause_id: str | None,
+    ) -> TurnResult:
+        # Ensure session exists in DB. ``cause_id`` applies only if the row
+        # is created here.
+        await self.sessions.get_or_create(
+            session_id, source=source, actor=actor, cause=cause_id,
+        )
 
         session = await self.db.get_session(session_id)
 
@@ -2532,7 +3779,13 @@ class AgentEngine:
                         if ' ' in placeholder
                         else placeholder + '...'
                     )
-                await self.db.update_session_title(session_id, placeholder)
+                # Nerve sets the title: the system actor's change for the
+                # session's cause, whoever sent the message.
+                await self.db.update_session_title(
+                    session_id, placeholder,
+                    attribution=self._agent_attribution(session_id),
+                    reason="placeholder",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,
@@ -2553,6 +3806,7 @@ class AgentEngine:
             await self.sessions.add_message(
                 session_id, "user", db_text, channel=channel,
                 blocks=image_refs,
+                actor=actor,
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
@@ -2606,7 +3860,9 @@ class AgentEngine:
             # Check for deferred /stop that arrived while we were setting up
             if self.sessions.pop_stop_request(session_id):
                 logger.info("Stop requested before agent turn — aborting session %s", session_id)
-                return ""
+                return TurnResult("", self._end_turn(
+                    session_id, TurnOutcome("interrupted", "stopped before the turn started"),
+                ))
 
             # Drain autonomous-turn messages that buffered while no run was
             # active (background task settled in the race window before the
@@ -2635,11 +3891,10 @@ class AgentEngine:
             # done backstop still covers THIS turn.
             broadcaster.mark_turn_open(session_id)
 
-            # New user turn: settled background-task chips are stale now.
-            self._prune_bg_tasks(session_id)
+            # New user turn: what settled since the last turn is no longer
+            # news (turn triggers, legacy chips, settled workflows).
+            self._prune_turn_state(session_id)
 
-            # New user turn: settled background-task chips are stale now.
-            # (moved below drain in original flow — kept semantically here)
             # Trailing wall-clock reminder. Precise time deliberately does
             # NOT live in the system prompt (only the date does): a
             # per-build timestamp there changes the prompt bytes on every
@@ -2658,12 +3913,43 @@ class AgentEngine:
                 query_text = (
                     f"{query_text}\n\n{_time_note}" if query_text else _time_note
                 )
+            # Background work that ended outside the orchestrator's control
+            # since its last turn (a gateway restart, the runtime ending, a
+            # force stop, a model switch): the CLI cannot tell the model, so
+            # one reminder goes with this turn. User stops are not noted (the
+            # CLI reports them itself). Like the time note, never persisted.
+            try:
+                _agent_notes = await self.agents.take_orchestrator_notes(session_id)
+            except Exception:  # noqa: BLE001 — a reminder never breaks a turn
+                logger.debug("orchestrator notes failed for %s", session_id, exc_info=True)
+                _agent_notes = None
+            if _agent_notes:
+                query_text = (
+                    f"{query_text}\n\n{_agent_notes}" if query_text else _agent_notes
+                )
 
             # Backend-neutral turn input: attachments pass through raw;
             # each backend converts to its native shape (Anthropic content
             # blocks / codex UserInput items) and applies its own escaping
             # rules (e.g. the Claude CLI's slash-command interception).
             turn_input = TurnInput(text=query_text, images=images)
+
+            def _with_session_preamble(base: TurnInput) -> TurnInput:
+                # Leading session-context block (static-prompt mode): the
+                # session id and the frozen recall that the shared system
+                # prompt leaves out. Rendered at client build; popped here
+                # so it ships exactly once — with the FIRST user message of
+                # the native conversation (later turns replay the
+                # transcript). Rebuilt from ``query_text`` so a retry that
+                # re-renders it never stacks two blocks. Like the time
+                # note, not persisted to the DB message (db_text above).
+                preamble = self._pending_preambles.pop(session_id, None)
+                if not preamble:
+                    return base
+                return TurnInput(
+                    text=prepend_session_preamble(query_text, preamble),
+                    images=images,
+                )
 
             # Send query + read response, with auto-retry on runtime crash.
             # The runtime may die during start_turn (TransportDiedError) or
@@ -2695,6 +3981,9 @@ class AgentEngine:
                 metadata=_lf_metadata,
             ):
                 for _attempt in range(2):
+                    # Re-checked per attempt: a crash-retry that rebuilt the
+                    # client on a fresh transcript re-renders the preamble.
+                    turn_input = _with_session_preamble(turn_input)
                     try:
                         await client.start_turn(turn_input)
                     except TransportDiedError as _qerr:
@@ -2705,7 +3994,7 @@ class AgentEngine:
                             session_id, _qerr,
                         )
                         self._stop_idle_watcher(session_id)
-                        self.sessions.remove_client(session_id)
+                        self.sessions.remove_client(session_id, reason="process_exit")
                         unregister_handler(session_id)
                         await self._safe_disconnect(client)
                         client = await self._get_or_create_client(
@@ -2718,15 +4007,43 @@ class AgentEngine:
                     # mid-stream or hangs idle beyond the per-message idle
                     # timeout (enforced inside the client's receive_turn).
                     try:
-                        async for event in client.receive_turn():
-                            done = await self._process_agent_event(
-                                session_id, event, st,
-                            )
-                            if done:
-                                # receive_turn also stops after the terminal
-                                # event; the explicit break keeps the
-                                # invariant local.
+                        # A runtime that idles between turns can finish a
+                        # result of its own before this query starts (a
+                        # resumed CLI settles the agents the last process
+                        # left behind, then reports an empty result). One
+                        # that arrives before anything of this turn is not
+                        # this turn's end: skip it and keep reading.
+                        skip_strays = self._skips_stray_results(session_id)
+                        turn_began = False
+                        strays = 0
+                        while True:
+                            stray = False
+                            async for event in client.receive_turn():
+                                if not turn_began:
+                                    if (
+                                        skip_strays
+                                        and strays < self._MAX_STRAY_RESULTS
+                                        and _is_stray_result(event)
+                                    ):
+                                        stray = True
+                                        break
+                                    turn_began = _begins_turn(event)
+                                done = await self._process_agent_event(
+                                    session_id, event, st,
+                                )
+                                if done:
+                                    # receive_turn also stops after the
+                                    # terminal event; the explicit break
+                                    # keeps the invariant local.
+                                    break
+                            if not stray:
                                 break
+                            strays += 1
+                            logger.info(
+                                "Skipped a result that came before the turn of "
+                                "session %s started (left over from the runtime)",
+                                session_id,
+                            )
 
                     except asyncio.CancelledError:
                         raise  # propagate to outer handler
@@ -2742,7 +4059,7 @@ class AgentEngine:
                             session_id, _recv_err,
                         )
                         self._stop_idle_watcher(session_id)
-                        self.sessions.remove_client(session_id)
+                        self.sessions.remove_client(session_id, reason="process_exit")
                         unregister_handler(session_id)
                         await self._safe_disconnect(client)
                         client = await self._get_or_create_client(
@@ -2753,6 +4070,9 @@ class AgentEngine:
                     break  # success — exit retry loop
 
         except asyncio.CancelledError:
+            outcome = self._end_turn(session_id, TurnOutcome(
+                "interrupted", "gateway shutdown" if self._shutting_down else "stopped by user",
+            ))
             logger.info("Session %s cancelled by user", session_id)
             partial = st.full_response_text + (
                 "\n\n[Stopped by user]"
@@ -2779,7 +4099,10 @@ class AgentEngine:
             await self.sessions.mark_stopped(session_id)
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
-            client = self.sessions.remove_client(session_id)
+            client = self.sessions.remove_client(
+                session_id,
+                reason="gateway_restart" if self._shutting_down else "force_stop",
+            )
             if client:
                 await self._safe_disconnect(client)
 
@@ -2791,6 +4114,7 @@ class AgentEngine:
                     channel=channel,
                     thinking=st.thinking_text if st.thinking_text else None,
                     blocks=st.ordered_blocks if st.ordered_blocks else None,
+                    actor=None,   # the model's own partial output
                 )
                 await broadcaster.broadcast(session_id, {
                     "type": "stopped", "session_id": session_id,
@@ -2802,7 +4126,7 @@ class AgentEngine:
                 )
             # Memorize in background — don't block the stop path
             await self.schedule_memorize(session_id)
-            return partial
+            return TurnResult(partial, outcome)
 
         except Exception as e:
             error_msg = f"Agent error: {e}"
@@ -2874,22 +4198,26 @@ class AgentEngine:
             # Clear resume — CLI state may be corrupted after error
             self._stop_idle_watcher(session_id)
             unregister_handler(session_id)
-            client = self.sessions.remove_client(session_id)
+            client = self.sessions.remove_client(session_id, reason="process_exit")
             await self.sessions.mark_error(session_id, error_msg)
             if client:
                 await self._safe_disconnect(client)
             st.full_response_text = error_msg
+            st.status, st.error = "failed", error_msg
 
         # Persist the turn (assistant message + usage) and broadcast done.
         # Background-task continuation is handled by the CLI itself: when a
         # run_in_background task settles, the CLI runs an autonomous turn
         # which the idle stream watcher drains to the UI — no Nerve-side
         # output-file polling needed (the old regex watcher lived here).
-        await self._finalize_turn(
+        outcome = await self._finalize_turn(
             session_id, st, channel, bump_updated_at=bump_updated_at,
         )
+        # Codex collab agents end with the turn: one that got no result is
+        # never coming back (it would otherwise hold the session "busy").
+        self.agents.settle_turn_scoped(session_id)
 
-        return st.full_response_text
+        return TurnResult(st.full_response_text, outcome)
 
     # ------------------------------------------------------------------ #
     #  Autonomous turns — CLI activity between run() calls                 #
@@ -2914,6 +4242,15 @@ class AgentEngine:
     # How often the idle watcher probes the SDK buffer (seconds).
     _IDLE_STREAM_POLL_SECONDS = 0.5
 
+    # With no turn open, a drain reads at most this many buffered batches per
+    # call, then returns so a waiting run() gets the run lock (asyncio locks
+    # are FIFO). Sustained sub-agent traffic can no longer starve a user turn.
+    _DRAIN_MAX_IDLE_BATCHES = 200
+
+    # At most this many leftover results are skipped before a user turn's own
+    # (see _run_inner): a runtime that keeps answering empty is not stalled.
+    _MAX_STRAY_RESULTS = 3
+
     async def _drain_pending_messages(
         self,
         session_id: str,
@@ -2932,92 +4269,127 @@ class AgentEngine:
         emitted.  Standalone task lifecycle events update the background-
         task chips without opening a turn.
 
+        Sub-agent (sidechain) events go to the agent registry: they never
+        open, extend, frame or persist a turn, so background agents alone
+        can never make the session look "running".
+
         Never parks while no turn is open (only consumes what's already
         buffered via ``try_receive_idle_events``), so the pre-query call
-        inside ``run()`` cannot hang on an idle runtime.  A buffered
-        ``init`` system event means content IS coming — the drain opens
-        the turn and waits up to ``first_content_timeout`` for the first
-        content event.  If nothing arrives the empty turn is dropped and
-        the watcher's next poll picks the content up instead.  Once
-        content flows, the wait uses the same idle timeout as a normal
-        run; on that timeout the partial turn is persisted and
-        ``asyncio.TimeoutError`` propagates so the caller can apply
-        hung-runtime treatment.
+        inside ``run()`` cannot hang on an idle runtime, and returns after
+        ``_DRAIN_MAX_IDLE_BATCHES`` such batches so a waiting ``run()``
+        gets the lock.  A main-chain ``init`` opens a *tentative* turn: it
+        holds the run lock but frames nothing (no ``mark_running``, no
+        ``session_running``, no ``auto_turn``) and waits until an
+        *absolute* deadline ``first_content_timeout`` after the ``init``
+        for main-chain content or a main-chain ``TurnCompleted``; sidechain
+        traffic never extends that wait.  Only main-chain content (or a
+        main-chain ``TurnCompleted``) frames the turn.  Once content flows,
+        the wait uses the same idle timeout as a normal run; on that
+        timeout the partial turn is persisted and ``asyncio.TimeoutError``
+        propagates so the caller can apply hung-runtime treatment.  While
+        only agents run no turn is open, so agent silence can never trip
+        it.  A framed turn with nothing visible records its usage but
+        stores no message.
 
         Backends without an idle stream (codex) return ``None`` from the
         probe immediately — the drain is a no-op for them.
 
         Caller must hold the per-session run lock.  ``manage_framing``
         controls session-level run framing (mark_running/session_running/
-        buffering): the idle watcher passes True; ``run()`` passes False
-        because its own framing is already open.
+        buffering, and the Stop target): the idle watcher passes True;
+        ``run()`` passes False because its own framing is already open.
 
         Returns the number of completed autonomous turns processed.
         """
         idle_timeout = self.config.agent.cli_idle_timeout_seconds
+        loop = asyncio.get_running_loop()
         turns = 0
+        # An autonomous turn in progress: tentative (after init) or framed.
         st: _TurnState | None = None
+        framed = False                      # auto_turn was broadcast for st
+        tentative_deadline: float | None = None
         session_framing = False
+        pending_model: ModelObserved | None = None
+        idle_batches = 0                    # batches read while st is None
 
-        async def _open_turn() -> None:
-            nonlocal st, session_framing
-            if st is not None:
-                return
-            st = _TurnState()
+        def _new_state() -> _TurnState:
+            s = _TurnState()
             # Leading marker block → "background continuation" chip in the
             # UI, both live (auto_turn event) and after reload (persisted).
-            st.ordered_blocks.append({"type": "auto"})
+            s.ordered_blocks.append({"type": "auto"})
+            return s
+
+        async def _frame() -> None:
+            """Announce a real main-chain autonomous turn."""
+            nonlocal st, framed, session_framing, tentative_deadline, pending_model
+            if st is None:
+                st = _new_state()
+            if framed:
+                return
+            framed, tentative_deadline = True, None
+            # What woke the orchestrator: agents settled since its last turn.
+            triggers, more = self.agents.take_turn_triggers(session_id)
+            marker: dict[str, Any] = {"type": "auto"}
+            if triggers:
+                marker.update(triggers=triggers, more=more)
+            st.ordered_blocks[0] = marker
             if manage_framing and not session_framing:
                 session_framing = True
                 if not broadcaster.is_buffering(session_id):
                     broadcaster.start_buffering(session_id)
                 self.sessions.mark_running(session_id)
+                # The Stop target while this turn runs.
+                self.sessions.set_turn_task(session_id, asyncio.current_task())
                 await self._broadcast_session_running(session_id, True)
             broadcaster.mark_turn_open(session_id)
-            await broadcaster.broadcast(session_id, {
+            auto_turn: dict[str, Any] = {
                 "type": "auto_turn", "session_id": session_id,
-            })
-
-        def _turn_has_content() -> bool:
-            return st is not None and (
-                st.got_content
-                or bool(st.full_response_text)
-                or len(st.ordered_blocks) > 1  # beyond the auto marker
-                or st.last_usage is not None
-            )
+            }
+            if triggers:
+                auto_turn.update(triggers=triggers, more=more)
+            await broadcaster.broadcast(session_id, auto_turn)
+            if pending_model is not None:
+                await self._process_agent_event(session_id, pending_model, st)
+                pending_model = None
 
         async def _close_turn() -> None:
-            nonlocal st, turns
-            if st is None:
-                return
-            if _turn_has_content():
-                # Autonomous turn: the runtime resumed on its own (a
-                # background task settled). Continuation of work already in
-                # the list, so it must not re-sort the sidebar.
-                await self._finalize_turn(
-                    session_id, st, channel, bump_updated_at=False,
-                )
-                turns += 1
-            # Empty turn (init arrived but content never did) — drop it;
-            # the finally backstop ships a synthetic done if framing opened.
-            st = None
+            nonlocal st, framed, turns
+            if st is not None and framed:
+                visible = len(st.ordered_blocks) > 1 or bool(st.full_response_text)
+                if visible or st.last_usage is not None:
+                    # Autonomous turn: the runtime resumed on its own (a
+                    # background task settled). Continuation of work already
+                    # in the list, so it must not re-sort the sidebar.
+                    await self._finalize_turn(
+                        session_id, st, channel, bump_updated_at=False,
+                        persist_message=visible,
+                    )
+                    turns += 1
+                # Nothing at all — dropped; the finally backstop ships a
+                # synthetic done if framing opened.
+            st, framed = None, False
 
         try:
             while True:
                 if st is None:
+                    if idle_batches >= self._DRAIN_MAX_IDLE_BATCHES:
+                        # Yield the run lock to a waiting run(); the watcher's
+                        # next poll resumes the drain.
+                        break
                     # No turn open — only consume what's already buffered.
                     batch = client.try_receive_idle_events()
                     if batch is None:
                         break  # nothing buffered / stream closed
+                    idle_batches += 1
                 else:
-                    # Turn in flight — the runtime is producing; park for
-                    # the next event batch.  Before the first content the
-                    # wait is capped by first_content_timeout (init arrives
-                    # seconds before the model's first output); after that
-                    # it matches a normal run's idle timeout.
-                    waiting_first_content = not st.got_content
-                    if waiting_first_content:
-                        park_timeout: float | None = first_content_timeout
+                    if not framed:
+                        # Tentative turn: absolute deadline from the init;
+                        # sidechain traffic never extends it.
+                        park_timeout: float | None = max(
+                            0.0, tentative_deadline - loop.time(),
+                        )
+                    elif not st.got_content:
+                        park_timeout = first_content_timeout
                     else:
                         park_timeout = (
                             idle_timeout
@@ -3027,14 +4399,18 @@ class AgentEngine:
                     try:
                         batch = await client.receive_idle_events(park_timeout)
                     except asyncio.TimeoutError:
-                        if waiting_first_content:
+                        if not framed:
                             logger.info(
-                                "Autonomous turn for session %s produced no "
-                                "content within %.0fs — deferring to the "
-                                "next drain",
+                                "drain[%s] tentative autonomous turn dropped "
+                                "(no main-chain content within %.0fs)",
                                 session_id, first_content_timeout,
                             )
-                            await _close_turn()  # empty — dropped
+                            st, pending_model = None, None
+                            break
+                        if not st.got_content:
+                            # Framed but empty (as before): drop or record
+                            # usage, defer the rest to the next drain.
+                            await _close_turn()
                             break
                         logger.warning(
                             "Autonomous turn idle timeout (%ss) for session %s "
@@ -3046,6 +4422,7 @@ class AgentEngine:
                             if st.full_response_text
                             else "[Background turn interrupted: runtime went silent]"
                         )
+                        st.status, st.error = "interrupted", "runtime went silent"
                         await _close_turn()
                         raise
                     if batch is None:
@@ -3053,74 +4430,90 @@ class AgentEngine:
                             "Agent stream ended mid-autonomous-turn for session %s",
                             session_id,
                         )
+                        st.status, st.error = "failed", "agent stream ended mid-turn"
                         await _close_turn()
                         break
 
                 if not batch:
                     continue  # unparseable / skip-and-continue payload
 
-                # A ModelObserved that precedes content in the same batch
-                # (autonomous AssistantMessage without init framing) must
-                # not be lost — hold it and replay once the turn opens.
-                pending_model: ModelObserved | None = None
-
                 for event in batch:
-                    if isinstance(event, SystemEvent) and st is None:
-                        if event.subtype == "init":
-                            # The runtime emits ``init`` when it starts
-                            # processing a turn — an autonomous continuation
-                            # is underway; open the turn and park for content.
-                            await _open_turn()
-                        else:
-                            # Task lifecycle events between turns — chips only.
-                            await self._handle_system_event(session_id, event)
+                    if _is_sidechain(event):
+                        await self.agents.ingest_sidechain(session_id, event)
                         continue
-
+                    if isinstance(event, SystemEvent):
+                        if event.subtype == "init":
+                            if st is None:
+                                # The runtime is starting a turn. Hold the
+                                # lock, frame nothing until main-chain
+                                # content proves it is the orchestrator's.
+                                st, framed = _new_state(), False
+                                tentative_deadline = (
+                                    loop.time() + first_content_timeout
+                                )
+                            continue
+                        # Task lifecycle events — chips only.
+                        await self._handle_system_event(session_id, event)
+                        continue
+                    if isinstance(event, ModelObserved) and not framed:
+                        # Replayed once the turn frames; dropped with a turn
+                        # that never does.
+                        pending_model = event
+                        continue
                     if isinstance(event, TurnCompleted) and st is None:
                         # Stray terminal event with no preceding content
                         # (e.g. a prior drain timed out mid-turn).  Consume
-                        # it so it can't desync the next turn; nothing to
-                        # render.
+                        # it so it can't desync the next turn.
                         logger.info(
                             "Consumed stray TurnCompleted during drain for %s",
                             session_id,
                         )
                         continue
-
-                    if st is None and isinstance(event, ModelObserved):
-                        pending_model = event
+                    if (
+                        isinstance(event, TurnCompleted) and not framed
+                        and _is_empty_result(event)
+                    ):
+                        # A turn the runtime began and ended without the
+                        # model (a resumed runtime settling the agents the
+                        # last process left; a turn Stop all interrupted at
+                        # once): nothing to show, so it is never framed.
+                        logger.info(
+                            "drain[%s] empty autonomous turn dropped", session_id,
+                        )
+                        st, pending_model = None, None
                         continue
-
-                    if st is None and isinstance(
+                    if not framed and isinstance(
                         event,
                         (TextDelta, ThinkingDelta, ToolUse, ToolResult,
-                         SubagentStarted),
+                         TurnCompleted),
                     ):
-                        await _open_turn()
-                        if pending_model is not None:
-                            await self._process_agent_event(
-                                session_id, pending_model, st,
-                            )
-                            pending_model = None
-
-                    if st is not None:
-                        turn_done = await self._process_agent_event(
-                            session_id, event, st,
-                        )
-                        if turn_done:
+                        # SubagentStarted is deliberately not here: its
+                        # ToolUse (which precedes it) frames the turn.
+                        await _frame()
+                    if st is not None and framed:
+                        if await self._process_agent_event(session_id, event, st):
                             await _close_turn()
-                    # A ModelObserved whose batch never produced content is
-                    # dropped with it — an empty assistant message carries
-                    # nothing worth persisting.
+                    # Anything else with no framed turn (SubagentStarted,
+                    # ToolOutputDelta) is dropped.
 
         except asyncio.CancelledError:
             # /stop (or teardown) cancelled the drain mid-turn — persist
             # what we have so the partial turn isn't lost.
-            if st is not None and _turn_has_content():
+            if st is not None and framed and (
+                st.got_content
+                or st.full_response_text
+                or len(st.ordered_blocks) > 1
+            ):
+                self._end_turn(session_id, TurnOutcome(
+                    "interrupted",
+                    "gateway shutdown" if self._shutting_down else "stopped by user",
+                ))
+                note = (
+                    "[Interrupted: gateway shutdown]"
+                    if self._shutting_down else "[Stopped by user]"
+                )
                 st.full_response_text += (
-                    "\n\n[Stopped by user]"
-                    if st.full_response_text
-                    else "[Stopped by user]"
+                    f"\n\n{note}" if st.full_response_text else note
                 )
                 with contextlib.suppress(Exception):
                     self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
@@ -3129,6 +4522,7 @@ class AgentEngine:
                         channel=channel,
                         thinking=st.thinking_text or None,
                         blocks=st.ordered_blocks or None,
+                        actor=None,   # the model's own partial output
                     )
                     await broadcaster.broadcast(session_id, {
                         "type": "stopped", "session_id": session_id,
@@ -3136,6 +4530,7 @@ class AgentEngine:
             raise
         finally:
             if manage_framing and session_framing:
+                self.sessions.clear_turn_task(session_id, asyncio.current_task())
                 self.sessions.mark_not_running(session_id)
                 # Backstop: ship a synthetic done if no terminal event was
                 # broadcast (mirrors run()'s finally).
@@ -3203,6 +4598,7 @@ class AgentEngine:
                     continue  # run() owns the stream right now
                 if client.buffer_used() <= 0:
                     if not client.is_alive():
+                        await self._reap_dead_client(session_id, client)
                         return
                     continue
 
@@ -3221,10 +4617,10 @@ class AgentEngine:
                         ),
                         name=f"auto-drain:{session_id}",
                     )
-                    # Register so /stop reaches the drain: interrupt ends the
-                    # CLI turn gracefully (drain finalizes on ResultMessage);
-                    # the hard-cancel fallback cancels the drain task.
-                    self.sessions.register_task(session_id, drain)
+                    # Not registered for /stop here: the drain becomes the
+                    # Stop target only once it frames a real main-chain turn
+                    # (set_turn_task in its _frame). A drain that only
+                    # ingests sub-agent traffic is no turn to stop.
                     try:
                         await drain
                     except asyncio.TimeoutError:
@@ -3236,6 +4632,7 @@ class AgentEngine:
                         )
                         await self._discard_client(
                             session_id, background_memorize=True,
+                            reason="hung_runtime",
                         )
                         return
                     except asyncio.CancelledError:
@@ -3250,6 +4647,10 @@ class AgentEngine:
                             await self.sessions.mark_stopped(session_id)
                             await self._discard_client(
                                 session_id, background_memorize=True,
+                                reason=(
+                                    "gateway_restart" if self._shutting_down
+                                    else "force_stop"
+                                ),
                             )
                             return
                         if not drain.done():
@@ -3264,6 +4665,25 @@ class AgentEngine:
             logger.error(
                 "Idle stream watcher for session %s crashed: %s",
                 session_id, e, exc_info=True,
+            )
+
+    async def _reap_dead_client(self, session_id: str, client: Any) -> None:
+        """The runtime exited between turns: discard its client so the
+        agents that ran on it end as interrupted (``process_ended``) instead
+        of staying live until the next message. A run that holds the lock
+        meets the dead client itself and replaces it."""
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked() or self.sessions.get_client(session_id) is not client:
+            return
+        async with lock:
+            if self.sessions.get_client(session_id) is not client:
+                return
+            logger.info(
+                "Runtime of session %s exited between turns; discarding its client",
+                session_id,
+            )
+            await self._discard_client(
+                session_id, background_memorize=True, reason="process_exit",
             )
 
     # ------------------------------------------------------------------ #
@@ -3341,7 +4761,9 @@ class AgentEngine:
         run_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
-    ) -> str:
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
+    ) -> TurnResult:
         """Run an agent turn for a cron job in an isolated session.
 
         The SDK client is normally discarded immediately after the run
@@ -3349,19 +4771,32 @@ class AgentEngine:
         unless the run yielded with a live ``run_in_background`` task, in which
         case it is kept alive so the agent can resume when the task completes
         (see ``_teardown_oneshot_client``).
+
+        ``cause``: the cause of the run's session: the system actor (the
+        default) for a scheduled run; the person who asked for the run when
+        a person started it.
+
+        Returns the run's text and how its turn ended.
         """
         if run_id is None:
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        session = await self.sessions.create_cron_session(job_id, run_id=run_id)
+            run_id = new_cron_run_id()
+        # A cron run is the instance's own work, regardless of who wrote the
+        # schedule or who started the run. A person who started it is the
+        # cause of the run's session.
+        actor = self.db.system_actor
+        session = await self.sessions.create_cron_session(
+            job_id, run_id=run_id, actor=actor, cause=cause,
+        )
         session_id = session["id"]
         await self._stamp_cron_session_meta(session_id, "isolated", cache_ttl)
         try:
-            return await self.run(
+            return await self._run_turn(
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3374,7 +4809,9 @@ class AgentEngine:
         session_id: str | None = None,
         cache_ttl: str = "",
         effort: str | None = None,
-    ) -> str:
+        *,
+        cause: CauseArg = CAUSE_FROM_ACTOR,
+    ) -> TurnResult:
         """Run a persistent cron job that maintains context across runs.
 
         The caller (CronService) resolves which generation chat session the
@@ -3389,19 +4826,27 @@ class AgentEngine:
         which would collide with the parked task — so a persistent-cron
         background task that outlives its run is not resumed (use an
         isolated cron for long background work).
+
+        ``cause`` is as for :meth:`run_cron`. It applies only when this call
+        creates the session; a session of earlier runs keeps its cause.
+
+        Returns the run's text and how its turn ended.
         """
         session_id = session_id or f"cron:{job_id}"
+        actor = self.db.system_actor
         await self.sessions.get_or_create(
-            session_id, title=f"Cron: {job_id}", source="cron",
+            session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
+            cause=cause,
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:
-            return await self.run(
+            return await self._run_turn(
                 session_id=session_id,
                 user_message=prompt,
                 source="cron",
                 model=model,  # backend default_model(source) fills cron defaults
                 effort_override=effort,
+                actor=actor,
             )
         finally:
             # The session is reused by the next run (until rotation), which
@@ -3423,7 +4868,10 @@ class AgentEngine:
         task, in which case it is kept alive so the agent can resume when the
         task completes (see ``_teardown_oneshot_client``).
         """
-        session = await self.sessions.create_hook_session(hook_name, hook_id)
+        actor = self.db.system_actor
+        session = await self.sessions.create_hook_session(
+            hook_name, hook_id, actor=actor,
+        )
         session_id = session["id"]
         try:
             return await self.run(
@@ -3431,6 +4879,7 @@ class AgentEngine:
                 user_message=prompt,
                 source="hook",
                 model=model,  # backend default_model(source) fills cron defaults
+                actor=actor,
             )
         finally:
             await self._teardown_oneshot_client(session_id)
@@ -3447,11 +4896,11 @@ class AgentEngine:
         discarding tears down the idle-stream watcher (``_idle_stream_watcher``)
         that delivers the task's completion turn, so the session would never
         wake when the task settles.
+
+        Backed by the agent registry: any live (starting, running or stopping)
+        agent record, housekeeping tasks excluded.
         """
-        registry = self._bg_task_registry.get(session_id)
-        return bool(registry) and any(
-            entry.get("status") == "running" for entry in registry.values()
-        )
+        return self.agents.has_live(session_id)
 
     async def run_idle_client_sweep(self) -> int:
         """Disconnect clients that have been idle beyond the configured timeout.
@@ -3472,7 +4921,13 @@ class AgentEngine:
         idle_ids = self.sessions.get_idle_client_ids(timeout_minutes * 60)
         discarded = 0
         for sid in idle_ids:
-            if self._has_live_background_tasks(sid):
+            try:
+                client = self.sessions.get_client(sid)
+                alive = client is None or bool(client.is_alive())
+            except Exception:  # noqa: BLE001 — unknown liveness: keep the old rule
+                alive = True
+            # A dead runtime keeps nothing alive: its agents are gone with it.
+            if alive and self._has_live_background_tasks(sid):
                 logger.info(
                     "Idle sweep: keeping session %s — background task in flight",
                     sid,
@@ -3481,7 +4936,9 @@ class AgentEngine:
             logger.info("Auto-closing idle client for session %s", sid)
             # background_memorize: free the claude subprocess now; indexing
             # follows whenever the memorize queue drains.
-            await self._discard_client(sid, background_memorize=True)
+            await self._discard_client(
+                sid, background_memorize=True, reason="idle_reap",
+            )
             discarded += 1
 
         if discarded:
@@ -3499,28 +4956,45 @@ class AgentEngine:
     async def _generate_session_title(
         self, session_id: str, first_message: str,
     ) -> None:
-        """Generate a meaningful short title for a session using a fast model."""
+        """Generate a meaningful short title for a session using a fast model.
+
+        The title is the system actor's change for the session's cause.
+        """
         try:
-            # Skip if no credentials are configured (neither API key nor Bedrock)
-            if not self.config.provider.is_bedrock and not self.config.effective_api_key:
+            # Skip if no credentials are configured. An OAuth-only credential
+            # cannot drive the API directly either (it is not an API key).
+            if not self.config.provider.is_bedrock and not (
+                self.config.resolve_anthropic_api_key()
+            ):
                 return
 
-            client = self.config.create_anthropic_client(timeout=10.0)
-            response = client.messages.create(
-                model=self.config.agent.title_model,
-                max_tokens=30,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Generate a short title (3-5 words, no quotes)"
-                        " for a conversation that starts with:\n\n"
-                        f"{first_message[:200]}"
-                    ),
-                }],
-            )
-            title = response.content[0].text.strip().strip('"\'').lstrip('#').strip()
+            # The async client: this runs on the gateway's event loop, and the
+            # sync client's retry backoff is a blocking time.sleep that would
+            # stop every stream and channel until the retries are done.
+            async with self.config.create_async_anthropic_client(
+                timeout=10.0,
+            ) as client:
+                response = await client.messages.create(
+                    model=self.config.agent.title_model,
+                    # Thinking counts toward max_tokens, and the 5.5 models
+                    # think by default.
+                    max_tokens=1024,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "Generate a short title (3-5 words, no quotes)"
+                            " for a conversation that starts with:\n\n"
+                            f"{first_message[:200]}"
+                        ),
+                    }],
+                )
+            title = response_text(response).strip().strip('"\'').lstrip('#').strip()
             if title and len(title) < 60:
-                await self.db.update_session_title(session_id, title)
+                await self.db.update_session_title(
+                    session_id, title,
+                    attribution=self._agent_attribution(session_id),
+                    reason="generated",
+                )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,

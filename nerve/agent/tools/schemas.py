@@ -98,6 +98,15 @@ TASK_LIST_SCHEMA = {
     "required": [],
 }
 
+# Presence, not truthiness, like deadline/tags below: no "default".
+_EXPECT_REVISION = {
+    "type": "integer",
+    "description": "Optional fence: apply only if the task's current revision equals this "
+                   "value (from task_read). On a mismatch neither the task row nor its file "
+                   "is written and the conflict is reported; re-read and retry. Omit for "
+                   "last-write-wins.",
+}
+
 TASK_UPDATE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -128,6 +137,7 @@ TASK_UPDATE_SCHEMA = {
             "description": "New task title. Updates the H1 heading in the markdown file and the SQLite index.",
             "default": "",
         },
+        "expect_revision": _EXPECT_REVISION,
     },
     "required": ["task_id"],
 }
@@ -161,6 +171,7 @@ TASK_DONE_SCHEMA = {
             "description": "Completion note",
             "default": "",
         },
+        "expect_revision": _EXPECT_REVISION,
     },
     "required": ["task_id"],
 }
@@ -830,6 +841,32 @@ SEND_FILE_SCHEMA = {
         },
     },
     "required": ["file_path"],
+}
+
+SEND_CHANNEL_MESSAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "channel": {
+            "type": "string",
+            "description": (
+                "Transport to send through, e.g. 'slack'. This is not the "
+                "conversation — that is 'target'."
+            ),
+        },
+        "target": {
+            "type": "string",
+            "description": (
+                "Conversation to post to, in that transport's own addressing. "
+                "Slack: a conversation id such as 'C0123ABCD', or "
+                "'C0123ABCD:1700000000.000100' to reply inside a thread."
+            ),
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body, in Markdown.",
+        },
+    },
+    "required": ["channel", "target", "text"],
 }
 
 # ----- MCP admin tools -----
