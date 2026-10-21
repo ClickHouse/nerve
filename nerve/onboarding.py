@@ -256,12 +256,10 @@ async def request_autonomous(db: "Database", workspace: Path) -> bool:
 
 def request_autonomous_sync(config) -> bool:
     """:func:`request_autonomous` on a new connection, for ``nerve init``."""
-    from nerve import paths
-    from nerve.db import Database
+    from nerve.migrate import open_production_db
 
     async def _request() -> bool:
-        db = Database(paths.db_path(), workspace=config.workspace)
-        await db.connect()
+        db = await open_production_db(config)
         try:
             return await request_autonomous(db, Path(config.workspace))
         finally:
