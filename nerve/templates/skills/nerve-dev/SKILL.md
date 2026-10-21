@@ -92,7 +92,7 @@ Run the commands below from the repository root (wherever you cloned it).
 │   ├── sources/            # inbox sources: telegram, gmail, imap, github, github_events, github_repos,
 │   │                       #   channel (observed chats), codex_threads/; runner.py, filters.py, registry.py
 │   ├── cron/               # APScheduler service, jobs.py, gates.py, gate_plugins.py
-│   ├── memory/             # files.py, memu_bridge.py (memU), xmemory_bridge.py
+│   ├── memory/             # files.py, memu_bridge.py (memU), loom.py (Loom), xmemory_bridge.py
 │   ├── skills/             # SkillManager — filesystem skills + DB index
 │   ├── tasks/              # task markdown files + manager
 │   ├── notifications/      # NotificationService, silences, approval dispatch
@@ -381,7 +381,7 @@ Key paths (under `~/.nerve`, or `$NERVE_HOME` when set):
 | Backend | Python 3.13+, FastAPI, Uvicorn, aiosqlite, Click |
 | Agents | Claude Agent SDK (in-process MCP tools), Codex app-server backend, `mcp` 2.x for the external endpoint |
 | Model access | Anthropic API, Bedrock, or Claude subscription via the CLIProxyAPI proxy |
-| Memory | memU (`memu-py`, pinned), optional xmemory |
+| Memory | memU (`memu-py`, pinned), or Loom through the MCP gateway (`memory.backend: loom`); optional xmemory |
 | Scheduler | APScheduler |
 | Channels | python-telegram-bot + Telethon, slack-sdk (Socket Mode), WebSocket web UI |
 | Auth | JWT (pyjwt) + bcrypt, local accounts with actor attribution |

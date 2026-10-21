@@ -8,6 +8,8 @@ Nerve uses a dual-layer memory system:
 
 The .md files are what you browse to see the agent's organized memory. memU is what the agent searches when it needs to find something from the past.
 
+`memory.backend: loom` replaces the second layer with a Loom memory service, reached through the MCP gateway; see [Loom backend](#loom-backend). The file layer stays as it is.
+
 ## File Memory
 
 ### Workspace Structure
@@ -134,7 +136,7 @@ This uses the `anthropic` Python SDK directly (not the OpenAI-compatible endpoin
 
 ### Agent Tools
 
-Nine tools for interacting with memory:
+Nine tools for interacting with memory (memU only; with the [Loom backend](#loom-backend) the agent uses Loom's tools instead):
 
 ```
 memory_recall(query="user's work preferences", limit=10)
@@ -201,6 +203,19 @@ nerve migrate-openclaw --timeout 180  # longer per-session timeout
 
 Resumes automatically — skips sessions already indexed in the database.
 
+## Loom backend
+
+With `memory.backend: loom` ([configuration](config.md#loom-memory-backend)), long-term memory is kept in a Loom memory service instead of memU. Nothing of it runs in the Nerve process.
+
+- **The agent uses Loom's tools.** The MCP gateway's catalog lists Loom as the server `loom`, so its tools reach the agent as `mcp__loom__<tool>`: `loom_search` to recall (memory, profile, knowledge and past conversations in one call), `loom_memory_set` to save one fact under a readable key, `loom_memory_update` to correct one, and the rest of Loom's default tool list. The nine tools above are not offered. Catalog servers reach the agent in [external mode](config.md#mcp-servers-in-external-mode) only.
+- **Levels.** Writes land in the agent's home namespace. Team and org namespaces are shared: `loom_search` reads them too, and their memories are read-only for the agent, which proposes a change (or tells the human) instead of editing one. The system prompt says so, along with how to read Loom's write verdicts (`clear`, `merge`, `duplicate`, `conflict`, `refines`, `rejected`) and a search that abstains.
+- **What Nerve still does.** It recalls a new session's starting memories from Loom (`context.pack` in startup mode, frozen into the session as with memU) and sends each closed or rotated conversation to Loom, which extracts its facts in the background (`memory.set_from_messages`). A health probe (`namespace.summary`) feeds the Diagnostics card. These calls go through the same gateway, as the same agent.
+- **When Loom cannot answer**, a new session is told that no memories could be recalled, and the sweep keeps its watermark so the conversation is offered again.
+- **Wording.** A workspace, its bundled skills and its built-in jobs set up while Loom is the backend name Loom's tools in place of Nerve's; the `memory-maintenance` job runs Loom's integrity report on the home namespace instead of deduplicating (Loom merges duplicates itself).
+- **Web UI.** The Memory page says memory is kept in Loom and links Loom's dashboard when `memory.loom.dashboard_url` is set; the memU edit routes answer 409. The setup page's Memory step has nothing to ask.
+
+Implementation: `nerve/memory/loom.py` (`LoomMemory`, the lifecycle calls), `nerve/mcp_gateway.py` (`McpGatewayServer`, tool calls through the gateway) and `nerve/memory/loom_prompts.py` (what agents are told).
+
 ## xmemory (optional structured layer)
 
 [xmemory.ai](https://xmemory.ai) is an optional **schema-backed** memory store that can run alongside memU. memU keeps free-form facts in a semantic index; xmemory keeps typed objects/relations defined by a schema and answers natural-language queries from that knowledge graph. The two are complementary and run side by side — xmemory never replaces memU.
@@ -218,7 +233,7 @@ Implementation: `nerve/memory/xmemory_bridge.py` (`XmemoryBridge`), wired into `
 ## Web UI
 
 - **Files tab** (`/files`) — File browser with markdown editing for workspace files
-- **Memory tab** (`/memory`) — memU semantic memory browser with four sub-tabs:
+- **Memory tab** (`/memory`) — memU semantic memory browser (with the Loom backend, a note and a link to Loom's dashboard instead) with four sub-tabs:
   - **Facts** — Category-organized facts with editable category summaries (click to edit inline, saves + re-embeds)
   - **Timeline** — Chronological events with 6-month heatmap calendar (click a day to filter)
   - **Sources** — Resources grouped by day with expandable cards showing extracted items
@@ -229,10 +244,10 @@ Implementation: `nerve/memory/xmemory_bridge.py` (`XmemoryBridge`), wired into `
 - `GET /api/memory/files` — List workspace markdown files
 - `GET /api/memory/file/{path}` — Read a file
 - `PUT /api/memory/file/{path}` — Write a file
-- `GET /api/memory/memu` — Get memU categories, items, and resources for the UI
+- `GET /api/memory/memu` — Get memU categories, items, and resources for the UI (with the Loom backend: `available: false`, `backend: "loom"` and `dashboard_url`)
 - `POST /api/memory/memu/categories` — Create a new category
 - `PATCH /api/memory/memu/categories/{id}` — Update a category (summary, description; re-embeds)
 - `PATCH /api/memory/memu/items/{id}` — Update a memory item (content, type, categories)
 - `DELETE /api/memory/memu/items/{id}` — Delete a memory item
-- `GET /api/memory/memu/health` — memU health metrics and operation stats
+- `GET /api/memory/memu/health` — memory backend health metrics and operation stats; `backend` says which (`memu` or `loom`, the latter with the gateway, org, namespace and last error under `loom`)
 - `GET /api/memory/memu/audit` — Audit log (filterable by action, target_type; paginated)

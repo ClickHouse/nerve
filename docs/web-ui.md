@@ -41,7 +41,7 @@ web/src/
 │   │   └── DiffView.tsx          # GitHub PR-style unified diff renderer
 │   ├── Tasks/          # Task list, search, detail editor
 │   ├── Memory/         # File browser with markdown editor
-│   ├── Memu/           # Semantic memory browser (categories, items, sources)
+│   ├── Memu/           # Semantic memory browser (categories, items, sources); a Loom note under memory.backend: loom
 │   └── Diagnostics/    # System status dashboard
 ├── utils/
 │   ├── dateGroups.ts       # Date grouping (Today/Yesterday/This Week/Older)
@@ -315,6 +315,7 @@ System status dashboard (`/diagnostics`) with:
 - **Usage & Cost** — 7-day totals, daily cost, and cost breakdowns by model, by source, and by cron job (with runs and average cost per run)
 - **Sources** — Per-source sync status: cursor, last run, records fetched/processed, errors
 - **Tasks / FTS Index** — Active/done counts, FTS indexed vs total, in-sync status indicator (green ✓ / red ✗)
+- **Memory service** — memU's status, item counts and operations; with `memory.backend: loom`, Loom's: the gateway it is reached through, the org and namespace, where the namespace came from, the last error and when it was checked, and a link to Loom's dashboard when `memory.loom.dashboard_url` is set
 - **Recent Cron Logs** — Job ID, status, timestamps, errors
 
 ### Reload Resilience

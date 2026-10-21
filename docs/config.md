@@ -286,7 +286,7 @@ reload cannot inspect, and are documented here only.
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
-| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
+| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with, and `memory.backend` picks which memory backend is built at all |
 | `anthropic_base_url` | memU builds its model clients once at startup. New sessions and the other direct calls would follow a reload and memory would not, so they would use different endpoints |
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
@@ -1741,7 +1741,18 @@ hosted delivery starts; a negative value reads as `0`, and a value above `600`
 waits `600` seconds (`nerve config validate` warns). See
 [cron.md](cron.md#runs-on-delivery).
 
-## Memory (memU)
+## Memory
+
+Long-term memory has one backend, chosen with `memory.backend`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.backend` | string | `memu` | `memu` runs memU inside the Nerve process (the keys in the next table). `loom` keeps memory in a Loom memory service reached through the MCP gateway (see [Loom memory backend](#loom-memory-backend)). Case does not matter; any other value refuses to load. Not read from the environment. Restart-only. |
+
+`memory.fast_model` is read whatever the backend: source condensation and IMAP
+vision use it too.
+
+### memU (default)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -1751,7 +1762,87 @@ waits `600` seconds (`nerve config validate` warns). See
 | `memory.embed_model` | string | *(empty)* | Embedding model (only used when `openai_api_key` is set, e.g. `text-embedding-3-small`) |
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
-| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
+| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). The Loom backend does not use them. |
+
+### Loom memory backend
+
+With `memory.backend: loom`, long-term memory is kept in a Loom memory service,
+and both the agent and Nerve reach it through the MCP gateway
+([MCP servers in external mode](#mcp-servers-in-external-mode)): the gateway's
+catalog lists Loom as the server `loom`. Nerve has no Loom URL or credential of
+its own. The gateway knows the agent from its connection and holds its Loom
+credential, so `memory.backend: loom` and `mcp_gateway_url` are all an
+instance needs.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.loom.org` | string | *(empty)* | The Loom org Nerve's own calls name. Empty: Loom uses the org of the agent's credential. |
+| `memory.loom.namespace` | string | *(empty)* | The namespace Nerve's own calls name. Empty: Loom uses the agent's home namespace. |
+| `memory.loom.dashboard_url` | string | *(empty)* | Where people open Loom's dashboard. The Memory page and the Diagnostics card link `<dashboard_url>/memories?namespace=<home namespace>`. An `http://` or `https://` URL with a host and no credentials, query or fragment; a trailing `/` is dropped; anything else refuses to load. Empty: no link. |
+
+The `memory.loom` keys are read only while Loom is the backend, never from the
+environment, and need a restart.
+
+**The agent uses Loom's tools.** Each catalog server reaches the agent as an
+MCP server, so Loom's tools are `mcp__loom__<tool>` (`loom_search`,
+`loom_memory_set`, …; which ones is the gateway's tool policy, by default
+Loom's `core` list). Nerve's nine memory tools (`memorize`, `memory_recall`,
+`memory_update`, `memory_delete`, `conversation_history`,
+`memory_records_by_date`, `memory_expand_category`, `category_update`,
+`session_context`) are not offered: not in the prompt's tool list, not on
+Nerve's MCP server, and not to external MCP clients. The system prompt gets a
+section that names Loom's tools and explains home and shared namespaces
+(shared memories are read-only for the agent, which proposes a change instead
+of editing), write verdicts and abstentions. A workspace, its bundled skills
+and its built-in jobs set up while Loom is the backend are worded for Loom's
+tools (`nerve/memory/loom_prompts.py`). Catalog servers reach the agent only
+in external mode: with the Loom backend in local mode the agent has no memory
+tools, and Nerve says so in its log at startup.
+
+**What Nerve calls itself.** Only the lifecycle calls, as the same agent:
+`tools/call` on the URL the catalog gives for `loom` (`POST
+<mcp_gateway_url>/s/loom/mcp`), without credentials.
+
+| When | Loom op (tool) | What Nerve sends |
+|---|---|---|
+| A new session starts | `context.pack` (`loom_context_pack`) | `mode: startup`, `only_sections: [memories]`, a section budget of 1,000 tokens, `top_k`, `include_decisions: false`, and the query `context for <source> session` |
+| The pack brought no memories | `search.query` (`loom_search`) | the same query and `top_k` |
+| A session closes or rotates, and the indexing sweep | `memory.set_from_messages` (`loom_memory_set_from_messages`) | the window's messages, in batches of at most 400 within 768 KiB, each with its time; `defer: true`; `session_id`; `extra_tags: [source:nerve]`; the day of the last message as `observation_date`; the previous batch's last ten turns as `last_messages` |
+| Health: every five minutes, and on the Diagnostics page | `namespace.summary` (`loom_namespace_summary`) | `top_entities_limit: 0` |
+
+`memory.loom.org` and `memory.loom.namespace` are added to each call that takes
+them. The startup recall freezes at most 8 memories, 500 characters each and
+4,000 bytes in all, into the session, as memU's does. A memory of another
+namespace is shown as `<namespace>/<key>`. `tests/test_loom_contract.py` holds
+these calls, and the tools the agent is told about, to
+`tests/fixtures/loom_lifecycle_ops.json`, which
+`scripts/loom_contract_fixture.py` generates from a Loom checkout.
+
+**Identity.** Loom's MCP has no `whoami`; `namespace.summary` names the org
+and namespace Loom resolved for the agent, and its counts are the Diagnostics
+card's. With both `memory.loom.org` and `memory.loom.namespace` set, those
+are used without a probe.
+
+**When Loom cannot answer.** No `mcp_gateway_url`, no `loom` server in the
+catalog, a refusal by the gateway's policy (JSON-RPC `-32001`: Loom not
+enabled for the agent, no credential), a condition that may pass (`-32002`:
+unavailable, a limit, an open circuit), a server fault, a timeout or HTTP
+429/5xx: memory is unavailable, and nothing crashes. A new session is told in
+its preamble that no memories could be recalled (not that there are none),
+and nothing is frozen into it; the sweep keeps its watermark, so the window is
+offered again. Reads are tried twice. After a call that got no answer at all,
+calls fail at once for 15 seconds; a `Retry-After` holds that operation (at
+most 60 seconds); a policy refusal makes the next call read the catalog again
+(at most every 30 seconds). A request Loom refused as invalid is logged, not
+retried. The Diagnostics card shows the last error.
+
+**Extraction is Loom's.** Loom extracts a queued batch in the background and
+retries it there. How a batch ended is not on MCP (Loom keeps
+`memory.extraction_status` for people and operators), so each
+`conversation_indexed` row of the memory audit log (`GET
+/api/memory/memu/audit`) names the `queue_ids` of its batches for a lookup in
+Loom's dashboard. A window is queued once per process: offered again after a
+failure, the batches Loom already took are skipped.
 
 ## xmemory (optional, alongside memU)
 
@@ -1839,7 +1930,7 @@ change.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode. A change needs a restart. |
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode, and for the [Loom memory backend](#loom-memory-backend), which reaches Loom through it in either mode. A change needs a restart. |
 
 Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
 session, and every 30 seconds. The request has no credential, because the
