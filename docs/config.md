@@ -1361,6 +1361,12 @@ reports this and the local settings that still apply.
 hosted channels reads the key file again. Changing `mode` from `socket` to
 `hosted` stops the Socket Mode connection at once.
 
+The same streams carry hosted sources. With `sync.github.mode: hosted` the
+gateway polls GitHub for the agent and streams the records; the
+`channels.hosted` settings above apply unchanged, and they are enough on their
+own: Slack need not be hosted too. See
+[Hosted GitHub source](sources.md#hosted-github-source).
+
 ### Setting up the Slack app
 
 Socket Mode means the bot dials out to Slack, so Nerve needs no public URL.
@@ -1714,7 +1720,12 @@ the channel transport, matching messages are written to a local buffer.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency |
+| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
+| `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
+| `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a record whenever one of the agent's own open pull requests changes |
+
+`cron.delivery_debounce_seconds` (int, default `60`, `0`–`600`) spaces the job
+runs that a hosted delivery starts; see [cron.md](cron.md#runs-on-delivery).
 
 ## Memory (memU)
 

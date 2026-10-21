@@ -292,6 +292,13 @@ rather than bot autodetection, because bots are not reliably identifiable here:
 direction: an unlisted bot costs one extra wake, whereas a wrong autodetect
 would silently drop human feedback.
 
+With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
+channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
+and delivers a `github_pr_activity` record for each change, which also starts
+the job at once (see [Runs on delivery](#runs-on-delivery)). Gate such a job on
+`messages` with `sources: [github]` instead; `nerve doctor` names the jobs that
+still use this gate.
+
 ### Adding a built-in gate type
 
 Built-in gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`,
@@ -534,6 +541,31 @@ Source runners:
 - Appear in `list_jobs()` alongside regular cron jobs
 
 See [sources.md](sources.md) for full documentation.
+
+### Runs on delivery
+
+A hosted source — GitHub with `sync.github.mode: hosted`, see
+[Hosted GitHub source](sources.md#hosted-github-source) — does not wait for its
+schedule. When the channel gateway delivers records, the source's runner runs
+at once, after any run of it already in progress (which may have fetched
+before the records arrived); deliveries during that drain make it run once
+more. Then every enabled job whose gates include a `messages` gate naming that
+source, or naming no source, runs once `cron.delivery_debounce_seconds` after
+the first delivery of a burst. Later deliveries in that window add nothing:
+one burst, one run.
+
+```yaml
+cron:
+  delivery_debounce_seconds: 60   # default; 0-600, 0 runs the jobs as soon as the records are in
+```
+
+Such a run goes through the job's gates, `lock` and run log like a scheduled
+run, and the schedule listeners hear of it. It waits for a run of the job that
+is already in flight, and while it runs, a scheduled or catch-up fire of the job
+is skipped, as an overlapping scheduled fire is; a job with `lock` waits for it
+instead. Jobs without such a gate keep to their schedule, and the schedules
+stay the fallback for everything. The setting is read for each delivery, so a
+reload applies it.
 
 ## Logging
 
