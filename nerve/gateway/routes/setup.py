@@ -1915,9 +1915,9 @@ def _refuse_closed_sources(ctx: _Context, req: SourcesRequest) -> list[str]:
     any other. Without local secrets every source keeps a credential on this
     machine — a GitHub login or token, the Gmail keyring, the Telegram API
     credentials — so nothing goes through (409, the policy's two sentences),
-    except GitHub when the channel gateway polls it or the operator provides
-    its token from the environment: that switch stores nothing, and the Gmail
-    and Telegram fields alone are refused, by name, with the step's reason."""
+    except GitHub when the channel gateway polls it or its token comes from
+    the environment: that switch stores nothing, and the Gmail and Telegram
+    fields alone are refused, by name, with the step's reason."""
     available, unavailable_reason = sources_available(ctx.facts)
     if not available:
         _refuse_without_local_secrets(ctx)
