@@ -4,6 +4,7 @@ own next, judged from what is known now."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -449,6 +450,46 @@ async def test_async_and_failing_listeners(held, caplog):
     svc.remove_schedule_listener(eager)
     await svc._run_job_wrapper(svc._jobs[0])
     assert calls == ["broken", "async"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_async_listener_is_logged_with_its_traceback(held, caplog):
+    svc = await held([_job("digest")])
+
+    async def broken() -> None:
+        raise RuntimeError("listener bug")
+
+    svc.add_schedule_listener(broken)
+    with caplog.at_level(logging.ERROR, logger="nerve.cron.service"):
+        await svc._run_job_wrapper(svc._jobs[0])
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    [record] = [r for r in caplog.records if "listener" in r.getMessage().lower()]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio
+async def test_listeners_hear_nothing_once_the_service_is_stopping(held):
+    svc = await held([_job("digest")])
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+
+    async def run_until_cancelled(**_kwargs) -> TurnResult:
+        await asyncio.Event().wait()
+
+    svc.engine.run_cron = run_until_cancelled
+    run = asyncio.create_task(svc._run_job_wrapper(svc._jobs[0]))
+    await asyncio.sleep(0)
+    await svc.stop()
+    # The shutdown cancels the runs in flight; each still ends in the wrapper.
+    run.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run
+
+    heard.assert_not_called()
+    assert not svc._listener_tasks
 
 
 # ---------------------------------------------------------------------------

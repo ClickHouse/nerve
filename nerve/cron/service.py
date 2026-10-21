@@ -949,13 +949,15 @@ class CronService:
         }
 
     async def stop(self) -> None:
-        """Stop the clock watcher, the catch-ups it started, and the scheduler.
+        """Stop the clock watcher, the catch-ups it started, the schedule
+        listeners still running, and the scheduler.
 
         Nothing new starts once this begins: the scheduler is paused first, and
-        the clock check and the catch-ups do nothing more. The watcher and the
-        catch-ups are cancelled and given ``_STOP_WAIT_SECONDS`` to wind down;
-        then the scheduler shuts down, which cancels the runs it has in flight.
-        Stopping again does nothing.
+        the clock check, the catch-ups and the schedule listeners do nothing
+        more. The watcher, the catch-ups and the listener tasks are cancelled
+        and given ``_STOP_WAIT_SECONDS`` to wind down; then the scheduler shuts
+        down, which cancels the runs it has in flight. Stopping again does
+        nothing.
         """
         if self._stopping:
             return
@@ -2139,7 +2141,14 @@ class CronService:
             self._schedule_listeners.remove(callback)
 
     def _schedule_changed(self) -> None:
-        """Tell every schedule listener; a failing one never stops the rest."""
+        """Tell every schedule listener; a failing one never stops the rest.
+
+        Nobody is told once the service is stopping: a run that the shutdown
+        cancels still ends here, and a listener task started then would
+        outlive the service.
+        """
+        if self._stopping:
+            return
         for callback in list(self._schedule_listeners):
             try:
                 result = callback()
@@ -2154,7 +2163,7 @@ class CronService:
     def _schedule_listener_done(self, task: asyncio.Future) -> None:
         self._listener_tasks.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
-            logger.error("Schedule listener failed: %r", error)
+            logger.error("Schedule listener failed", exc_info=error)
 
     async def next_scheduled(
         self, now: datetime | None = None, horizon: timedelta = _SCHEDULE_HORIZON,
