@@ -39,6 +39,11 @@ def _ctx(db, job_id: str = "job") -> GateContext:
     return GateContext(job_id=job_id, db=db)
 
 
+@pytest.fixture(autouse=True)
+def _no_forecast_failure_warned_yet(monkeypatch):
+    monkeypatch.setattr(gates_module, "_forecast_warned", {})
+
+
 # ---------------------------------------------------------------------------
 # Gate forecasts
 # ---------------------------------------------------------------------------
@@ -177,6 +182,30 @@ async def test_forecast_gates_fails_open_and_says_so(caplog):
 
     assert decision.should_run is True
     assert any("flaky" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_forecast_is_warned_about_once_per_job_in_ten_minutes(caplog):
+    async def read(job_id: str) -> None:
+        await forecast_gates(
+            [_Gate(raises=True)], _ctx(AsyncMock(), job_id), datetime.now(UTC),
+        )
+
+    def warned() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    with caplog.at_level(logging.DEBUG, logger="nerve.cron.gates"):
+        for _ in range(5):
+            await read("flaky")
+        assert len(warned()) == 1
+        assert sum(r.levelno == logging.DEBUG for r in caplog.records) == 4
+
+        await read("other")  # each job is warned about on its own
+        assert len(warned()) == 2
+
+        gates_module._forecast_warned["flaky"] -= 600  # ten minutes on
+        await read("flaky")
+        assert len(warned()) == 3
 
 
 _PLUGIN = '''

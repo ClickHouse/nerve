@@ -38,6 +38,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -50,6 +51,11 @@ if TYPE_CHECKING:
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
+
+# How often a job whose gate raises while forecasting is warned about, and
+# when each such job last was (time.monotonic()). See forecast_gates.
+_FORECAST_WARN_SECONDS = 600
+_forecast_warned: dict[str, float] = {}
 
 
 class GateConfigError(ValueError):
@@ -697,14 +703,23 @@ async def forecast_gates(
 
     Each gate's :meth:`CronGate.forecast`, with the same AND semantics, the
     same skip reason and the same fail-open rule: a gate that raises while
-    forecasting counts as satisfied, with a warning, just as a run would
-    proceed past a gate that raises while checking.
+    forecasting counts as satisfied, just as a run would proceed past a gate
+    that raises while checking. Forecasts are asked for on every schedule
+    read, so that is a warning once per job in ``_FORECAST_WARN_SECONDS``,
+    and DEBUG in between.
     """
     for gate in gates:
         try:
             ok = await gate.forecast(ctx, at)
         except Exception as e:  # noqa: BLE001 — fail open, as evaluate_gates does
-            logger.warning(
+            now = time.monotonic()
+            last = _forecast_warned.get(ctx.job_id)
+            level = logging.DEBUG
+            if last is None or now - last >= _FORECAST_WARN_SECONDS:
+                _forecast_warned[ctx.job_id] = now
+                level = logging.WARNING
+            logger.log(
+                level,
                 "Cron gate %r for job %s errored while forecasting; assuming "
                 "the run proceeds: %s",
                 gate.type, ctx.job_id, e,

@@ -317,7 +317,9 @@ that check.
   anything.
 
 A forecast that raises counts as the run going ahead, just as a check that
-raises lets the run proceed.
+raises lets the run proceed. Forecasts are read often, so a job whose forecast
+keeps raising is logged as a warning once every 10 minutes, and at DEBUG in
+between.
 
 ### Adding a built-in gate type
 
