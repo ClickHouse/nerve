@@ -304,10 +304,12 @@ that check.
 
 - A forecast has no side effects and never reaches the network: it may be asked
   often.
-- By default a gate forecasts by evaluating itself now. That is exact for a gate
-  over local state, which cannot change on its own — only work the instance does
-  changes it, and that work is scheduled too and is followed by a fresh
-  forecast. `tasks` forecasts this way. `messages` reads the consumer's cursors
+- By default a gate forecasts by evaluating itself now. For a gate over local
+  state that answer holds until something changes the state: mostly work the
+  instance schedules itself, after which the forecast is read afresh, but also a
+  task created or moved from a chat, the web UI or the API, which is only seen
+  the next time the schedule is read (see [What runs next](#what-runs-next)).
+  `tasks` forecasts this way. `messages` reads the consumer's cursors
   without starting one, and takes a cursor that will have expired by `at` as
   expired, since the check will find it so then.
 - `github_pr_activity` always forecasts a run: whether a PR moved is only known
@@ -638,13 +640,18 @@ digits and `._:-` (anything else becomes `_`) and to 64 characters. `next` is
 for a job's next run and `null` for a job without one (a disabled job, say);
 `reason` says why a run is forecast to be skipped.
 
-Forecasts are judged from what is known when you ask. Code that keeps the answer around can register a schedule listener
-(`CronService.add_schedule_listener`) to recompute it when it may have changed:
-after a start, a reload or a source reload; when a job or source run ends,
-including one a gate skipped; when a session wakeup is claimed; and when
-triggers move past a pause. A wakeup that a session records during its turn is
-not one of those events: it counts from the next time the schedule is read, for
-example when the turn ends.
+Forecasts are judged from what is known when you ask. Code that keeps the answer
+around can register a schedule listener (`CronService.add_schedule_listener`) to
+recompute it when it may have changed: after a start, a reload or a source
+reload; when a job or source run ends, including one a gate skipped; when a
+session wakeup is claimed; when triggers move past a pause; and when a source is
+synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
+
+Not every change is announced. A wakeup that a session records during its turn,
+and tasks created, moved or edited from a chat turn, the web UI or the API (which
+can change what a `tasks` gate forecasts), count only from the next time the
+schedule is read. Code that keeps the answer should therefore also refresh it
+periodically, and when a turn ends.
 
 ## Source Runners
 

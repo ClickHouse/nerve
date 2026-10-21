@@ -2131,15 +2131,18 @@ class CronService:
         A plain or async callable taking no arguments. It is called after
         :meth:`start`, :meth:`reload` and :meth:`reload_sources`; whenever a
         job or source run ends, also when a gate skipped it or the scheduler
-        dropped or skipped a fire; when a sweep claims a session wakeup; and
-        when triggers are moved past a pause. An async callback runs as a task
+        dropped or skipped a fire; when a sweep claims a session wakeup; when
+        triggers are moved past a pause; and when a source is synced by hand
+        (see :meth:`notify_schedule_changed`). An async callback runs as a task
         of its own. Errors are logged, never raised.
 
-        It is not called when a session records a wakeup (``ScheduleWakeup``):
-        that happens inside the session's turn, which has no reference to this
-        service. The wakeup counts from the next :meth:`next_scheduled` on —
-        for instance when the turn ends — so a caller that keeps the answer
-        should also refresh it then, or periodically.
+        Not every change is announced. A session that records a wakeup
+        (``ScheduleWakeup``) does so inside its turn, which has no reference to
+        this service; and tasks created, moved or edited from a chat turn, the
+        web UI or the API change what a ``tasks`` gate forecasts without any
+        call here. Those count from the next :meth:`next_scheduled` on, so a
+        caller that keeps the answer should also refresh it periodically, and
+        when a turn ends.
         """
         self._schedule_listeners.append(callback)
 
@@ -2147,6 +2150,11 @@ class CronService:
         """Stop calling *callback*. One that was never added is ignored."""
         with contextlib.suppress(ValueError):
             self._schedule_listeners.remove(callback)
+
+    def notify_schedule_changed(self) -> None:
+        """Tell the schedule listeners that what runs next may have changed,
+        after work done outside this service — a source synced by hand, say."""
+        self._schedule_changed()
 
     def _schedule_changed(self) -> None:
         """Tell every schedule listener; a failing one never stops the rest.

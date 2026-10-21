@@ -118,11 +118,13 @@ class CronGate(ABC):
         So a forecast must have no side effects and must not reach the network.
 
         The default evaluates the gate now. That is right for a gate over local
-        state, which cannot change on its own: only work this instance does
-        changes it, and that work is scheduled itself and is followed by a
-        fresh forecast. A gate whose truth changes with elapsed time — an age
-        threshold, a cooldown — overrides this and reasons about *at*; so does
-        one whose check is not free of side effects.
+        state: the answer holds until something changes that state. Mostly
+        that is work this instance schedules itself, which is followed by a
+        fresh forecast; a task created or moved from a chat, the web UI or the
+        API is not announced, and is seen the next time a forecast is asked
+        for. A gate whose truth changes with elapsed time — an age threshold,
+        a cooldown — overrides this and reasons about *at*; so does one whose
+        check is not free of side effects.
         """
         return await self.is_satisfied(ctx)
 

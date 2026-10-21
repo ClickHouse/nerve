@@ -747,6 +747,43 @@ async def test_the_schedule_route_without_a_cron_service(bypass_auth, monkeypatc
     assert response.json() == {"next": None, "jobs": []}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/sources/mail/sync", "/api/sources/sync-all"])
+async def test_a_source_synced_by_hand_tells_the_schedule_listeners(
+    bypass_auth, monkeypatch, path,
+):
+    """New messages can change what a gated job's next run will do."""
+    from nerve.gateway.routes import sources as source_routes
+
+    runner = _runner("mail")
+    service = SimpleNamespace(
+        _source_runners=[runner], notify_schedule_changed=MagicMock(),
+    )
+    monkeypatch.setattr("nerve.gateway.server._cron_service", service)
+    monkeypatch.setattr(source_routes, "get_deps", lambda: SimpleNamespace(db=AsyncMock()))
+    app = FastAPI()
+    app.include_router(source_routes.router)
+    transport = httpx.ASGITransport(app=bypass_auth(app))
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path)
+
+    assert response.status_code == 200
+    runner.run.assert_awaited_once()
+    service.notify_schedule_changed.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_work_done_elsewhere_reaches_the_listeners(held):
+    svc = await held()
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+
+    svc.notify_schedule_changed()
+
+    heard.assert_called_once_with()
+
+
 def _config_dir(tmp_path):
     config_dir, workspace = tmp_path / "cfg", tmp_path / "ws"
     config_dir.mkdir()
