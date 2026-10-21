@@ -388,12 +388,16 @@ class CronService:
         self._github_mode = github_mode if isinstance(github_mode, str) else None
         # Hosted source deliveries (see on_source_delivered): the sources whose
         # drain is running, those delivered to again meanwhile, the pending
-        # delivery run of each job, the jobs whose delivery run is going, and
-        # the runs each job has in flight with an event for when it has none.
+        # delivery run of each job, the delivery runs that have started and
+        # the jobs they run, whether stop() has begun (no delivery starts
+        # anything after that), and the runs each job has in flight with an
+        # event for when it has none.
         self._draining: set[str] = set()
         self._drain_again: set[str] = set()
         self._delivery_tasks: dict[str, asyncio.Task] = {}
+        self._delivery_started: set[asyncio.Task] = set()
         self._delivery_runs: set[str] = set()
+        self._delivery_stopping = False
         self._job_runs: collections.Counter[str] = collections.Counter()
         self._job_idle: dict[str, asyncio.Event] = {}
 
@@ -913,16 +917,20 @@ class CronService:
         }
 
     async def stop(self) -> None:
-        """Stop the clock watcher, the catch-ups it started, and the scheduler.
+        """Stop the clock watcher, the catch-ups it started, the schedule
+        listeners still running, the runs for delivered source records, and
+        the scheduler.
 
         The scheduler's own shutdown cancels the runs it has in flight; a
-        catch-up after a pause is cancelled the same way.
+        catch-up after a pause is cancelled the same way, and so is a run for
+        delivered source records, pending or already going. A delivery that
+        arrives once this has begun starts nothing.
         """
         watcher, self._clock_watch_task = self._clock_watch_task, None
         pending = [
             t for t in (
                 watcher, *self._catchup_tasks, *self._listener_tasks,
-                *self._delivery_tasks.values(),
+                *self._stop_deliveries(),
             )
             if t is not None
         ]
@@ -1925,19 +1933,19 @@ class CronService:
         for a run of the job already in flight, and goes through the gates,
         ``lock`` and the run log like any other. Jobs without such a gate are
         left to their schedule. A source without a runner (switched off) runs
-        nothing.
+        nothing, and once :meth:`stop` has begun nothing starts.
 
         Never takes the reload lock: it reads the job and runner lists, which a
         reload replaces in one step.
         """
-        if not self.scheduler.running:
+        if self._delivery_stopping or not self.scheduler.running:
             return
         if source in self._draining:
             self._drain_again.add(source)
             return
         self._draining.add(source)
         try:
-            while True:
+            while not self._delivery_stopping:
                 self._drain_again.discard(source)
                 runner = next(
                     (r for r in self._source_runners if r.source.source_name == source), None,
@@ -1972,6 +1980,8 @@ class CronService:
         """Give each job gated on *source* one pending delivery run."""
         from nerve.cron.gates import MessagesGate
 
+        if self._delivery_stopping:
+            return
         delay = self._delivery_debounce()
         for job in self._jobs:
             if not job.enabled or job.id in self._delivery_tasks:
@@ -1996,10 +2006,16 @@ class CronService:
         await self._wait_until_job_idle(job_id)
         # From here on a new delivery schedules a run of its own: this one may
         # already have looked at the inbox by the time those records land.
-        if self._delivery_tasks.get(job_id) is asyncio.current_task():
+        # It moves to the started runs in the same step, so stop() finds it in
+        # one place or the other.
+        task = asyncio.current_task()
+        if self._delivery_tasks.get(job_id) is task:
             del self._delivery_tasks[job_id]
+        self._delivery_started.add(task)
         job = next((j for j in self._jobs if j.id == job_id), None)
         if job is None or not job.enabled or self.scheduler.get_job(job_id) is None:
+            return
+        if self._delivery_stopping:
             return
         logger.info("Running cron job %s for newly delivered source records", job_id)
         self._delivery_runs.add(job_id)
@@ -2011,8 +2027,17 @@ class CronService:
     def _delivery_run_done(self, job_id: str, task: asyncio.Task) -> None:
         if self._delivery_tasks.get(job_id) is task:
             del self._delivery_tasks[job_id]
+        self._delivery_started.discard(task)
         if not task.cancelled() and (error := task.exception()) is not None:
             logger.error("Delivery run of cron job %s failed: %r", job_id, error)
+
+    def _stop_deliveries(self) -> list[asyncio.Task]:
+        """Let no delivery start anything more; the delivery runs to cancel.
+
+        For :meth:`stop`: the pending runs, and those already going.
+        """
+        self._delivery_stopping = True
+        return [*self._delivery_tasks.values(), *self._delivery_started]
 
     async def rotate_session(self, job_id: str) -> dict:
         """Force-rotate a persistent cron to a fresh chat session.

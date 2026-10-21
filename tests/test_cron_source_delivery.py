@@ -324,6 +324,51 @@ class TestJobs:
         assert task.cancelled()
         assert svc.runs.started == []
 
+    async def test_stop_cancels_a_run_that_has_started(self, svc):
+        install(svc, job("pr-monitor", sources=["github"]))
+        svc.runs.hold["pr-monitor"] = asyncio.Event()
+        await svc.on_source_delivered("github")
+        await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
+        assert svc._delivery_tasks == {}
+
+        await svc.stop()
+        svc.runs.hold["pr-monitor"].set()
+        await asyncio.sleep(0.05)
+
+        assert svc.runs.finished == []
+        assert svc._delivery_started == set()
+
+    async def test_a_drain_that_ends_while_stop_winds_down_starts_no_run(self, svc, monkeypatch):
+        """stop() waits for the runs it cancels, with the scheduler still up.
+        A drain that ends meanwhile must not start another run."""
+        runner = FakeRunner()
+        install(svc, job("pr-monitor", sources=["github"]), runners=[runner])
+        started: list[str] = []
+
+        async def winding_down(job: CronJob, attribution: Any = None) -> None:
+            started.append(job.id)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                runner.hold.set()  # the next delivery's drain ends now
+                await asyncio.sleep(0.05)
+                raise
+
+        monkeypatch.setattr(svc, "_run_job_inner", winding_down)
+        await svc.on_source_delivered("github")
+        await eventually(lambda: started == ["pr-monitor"])
+        runner.hold = asyncio.Event()
+        runner.started.clear()
+        delivered = asyncio.create_task(svc.on_source_delivered("github"))
+        await runner.started.wait()
+
+        await svc.stop()
+        await asyncio.wait_for(delivered, timeout=5)
+        await asyncio.sleep(0.05)
+
+        assert started == ["pr-monitor"]
+        assert svc._delivery_tasks == {}
+
     async def test_schedule_listeners_hear_of_the_drain_and_the_run(self, svc):
         install(svc, job("pr-monitor", sources=["github"]))
         heard: list[int] = []
