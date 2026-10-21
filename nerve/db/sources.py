@@ -346,23 +346,34 @@ class SourceStore:
         If no cursor exists or it has expired, initializes to current
         MAX(rowid) for the source. New consumers see only future messages.
         """
+        cursor_seq = await self.peek_consumer_cursor(consumer, source)
+        if cursor_seq is not None:
+            return cursor_seq
+
+        # No cursor or expired: initialize to latest
+        max_seq = await self.get_source_max_rowid(source)
+        await self.set_consumer_cursor(consumer, source, max_seq)
+        return max_seq
+
+    async def peek_consumer_cursor(self, consumer: str, source: str) -> int | None:
+        """The live cursor position for a consumer+source pair, read-only.
+
+        ``None`` when there is no cursor or it has expired — the case in which
+        :meth:`get_consumer_cursor` starts a cursor at the source's newest
+        message. Never writes.
+        """
         now = datetime.now(timezone.utc).isoformat()
         async with self.db.execute(
             "SELECT cursor_seq, expires_at FROM consumer_cursors WHERE consumer = ? AND source = ?",
             (consumer, source),
         ) as cursor:
             row = await cursor.fetchone()
-
-        if row is not None:
-            expires = row[1]
-            if expires is None or expires > now:
-                return row[0]
-            # Expired — fall through to re-initialize
-
-        # No cursor or expired: initialize to latest
-        max_seq = await self.get_source_max_rowid(source)
-        await self.set_consumer_cursor(consumer, source, max_seq)
-        return max_seq
+        if row is None:
+            return None
+        expires = row[1]
+        if expires is not None and expires <= now:
+            return None
+        return row[0]
 
     async def set_consumer_cursor(
         self,
