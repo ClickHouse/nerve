@@ -60,7 +60,11 @@ export type WSMessage =
   // Global (session_id is always null): a task row changed anywhere — the
   // API, another tab, or the agent in an unrelated session. Deliberately
   // NOT view-scoped; the board reflects all of them.
-  | { type: 'task_updated'; session_id: null; event: 'created' | 'updated' | 'moved' | 'done'; task: Task }
+  | {
+      type: 'task_updated'; session_id: null;
+      event: 'created' | 'updated' | 'moved' | 'done' | 'commented' | 'comment_deleted';
+      task: Task;
+    }
   | { type: 'wakeup'; session_id: string }
   // `triggers` names the agents whose settling started the turn (`more` counts the rest).
   | { type: 'auto_turn'; session_id: string; triggers?: AutoTurnTrigger[]; more?: number }
