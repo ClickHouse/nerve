@@ -181,8 +181,29 @@ def _workspace_settings(tmp_path, text: str):
     return tmp_path
 
 
-def test_a_provisioned_settings_file_with_env_references(tmp_path, monkeypatch) -> None:
-    """The shape a provisioning step writes into the tracked settings."""
+def test_a_provisioned_settings_file_names_only_the_backend(tmp_path, monkeypatch) -> None:
+    """What a provisioning step writes into the tracked settings: the switch
+    alone, with the connection supplied by the environment."""
+    monkeypatch.setenv("LOOM_BASE_URL", "http://10.0.0.2:7777")
+    monkeypatch.setenv("LOOM_API_KEY", "placeholder-token")
+    config = load_config(_workspace_settings(tmp_path, "memory:\n  backend: loom\n"))
+    assert config.memory.backend == "loom"
+    assert config.memory.loom.base_url == "http://10.0.0.2:7777"
+    assert config.memory.loom.token == "placeholder-token"
+    assert config.memory.loom.org == "" and config.memory.loom.namespace == ""
+
+
+def test_the_backend_switch_alone_loads_without_the_variables(tmp_path) -> None:
+    """A process that lacks the variables (a shell, an older environment)
+    still loads the config: nothing in the file references them."""
+    config = load_config(_workspace_settings(tmp_path, "memory:\n  backend: loom\n"))
+    assert config.memory.backend == "loom"
+    assert config.memory.loom.base_url == "http://localhost:7777"
+    assert config.memory.loom.token == ""
+
+
+def test_a_settings_file_with_env_references(tmp_path, monkeypatch) -> None:
+    """Loom keys spelled as ``${VAR}`` references in the tracked settings."""
     monkeypatch.setenv("LOOM_BASE_URL", "http://10.0.0.2:7777")
     monkeypatch.setenv("LOOM_API_KEY", "placeholder-token")
     config_dir = _workspace_settings(tmp_path, (

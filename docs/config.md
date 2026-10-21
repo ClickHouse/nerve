@@ -1834,12 +1834,10 @@ Nerve starts normally while Loom is down.
 Two common setups:
 
 ```yaml
-# workspace/config/settings.yaml — a local Loom with a token from the environment
+# workspace/config/settings.yaml — the switch in the tracked settings; the URL
+# and token come from LOOM_BASE_URL and LOOM_API_KEY in the environment
 memory:
   backend: loom
-  loom:
-    base_url: http://localhost:7777
-    token: ${LOOM_API_KEY}
 ```
 
 ```sh
@@ -1848,6 +1846,11 @@ NERVE_MEMORY_BACKEND=loom
 LOOM_BASE_URL=https://loom.example.test
 LOOM_API_KEY=...
 ```
+
+Prefer leaving a key out over writing it as `${LOOM_API_KEY}`: the fallback reads the
+same variable, but a `${VAR}` reference makes it required, so any process that lacks
+it (a shell running `nerve config validate`, an older environment) fails to load the
+whole config.
 
 ## xmemory (optional, alongside memU)
 
