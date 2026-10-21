@@ -1,0 +1,271 @@
+{
+  "from": [
+    "sdk/python/loom/ops.py",
+    "server/operations/toolsets.py"
+  ],
+  "generated_by": "scripts/loom_contract_fixture.py",
+  "ops": {
+    "context.pack": {
+      "idempotent": true,
+      "listed": true,
+      "read_only": true,
+      "request": {
+        "properties": {
+          "include_decisions": {
+            "type": "boolean"
+          },
+          "mode": {
+            "enum": [
+              "startup",
+              "task",
+              "debug",
+              "handoff"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "only_sections": {
+            "items": {
+              "enum": [
+                "working_memory",
+                "memory_stack",
+                "profile",
+                "memories",
+                "procedures",
+                "decisions",
+                "knowledge",
+                "conversations",
+                "runs",
+                "namespace_health",
+                "mentor"
+              ]
+            },
+            "type": "array"
+          },
+          "org": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "section_token_budgets": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "top_k": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "rendered": {
+            "type": "string"
+          },
+          "sections": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "role": "viewer",
+      "tool": "loom_context_pack"
+    },
+    "memory.set_from_messages": {
+      "idempotent": false,
+      "listed": true,
+      "read_only": false,
+      "request": {
+        "properties": {
+          "defer": {
+            "type": "boolean"
+          },
+          "extra_tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "last_messages": {
+            "items": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "observation_date": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "queue_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "role": "writer",
+      "tool": "loom_memory_set_from_messages"
+    },
+    "namespace.summary": {
+      "idempotent": true,
+      "listed": true,
+      "read_only": true,
+      "request": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "top_entities_limit": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "total_memories": {
+            "type": "integer"
+          },
+          "type_counts": {
+            "items": {
+              "properties": {
+                "memory_type": {
+                  "type": "string"
+                },
+                "n": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "memory_type",
+                "n"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "role": "viewer",
+      "tool": "loom_namespace_summary"
+    },
+    "search.query": {
+      "idempotent": true,
+      "listed": true,
+      "read_only": true,
+      "request": {
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "top_k": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "memory": {
+            "additionalProperties": {},
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "role": "viewer",
+      "tool": "loom_search"
+    }
+  }
+}
