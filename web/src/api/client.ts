@@ -1606,7 +1606,7 @@ export const api = {
 
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
-  getCronSchedule: () => request<CronSchedule>('/cron/schedule'),
+  getCronSchedule: (signal?: AbortSignal) => request<CronSchedule>('/cron/schedule', { signal }),
   triggerCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>

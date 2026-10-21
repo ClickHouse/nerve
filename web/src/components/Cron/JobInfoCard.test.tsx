@@ -1,6 +1,7 @@
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CronSchedule } from '../../api/client';
 import type { CronJob } from '../../stores/cronStore';
 
 vi.mock('../../api/client', () => ({
@@ -14,7 +15,7 @@ vi.mock('../../api/client', () => ({
 }));
 
 const { api } = await import('../../api/client');
-const { useCronStore } = await import('../../stores/cronStore');
+const { FORECAST_TIMEOUT_MS, useCronStore } = await import('../../stores/cronStore');
 const { JobInfoCard } = await import('./JobInfoCard');
 
 const listCronJobs = vi.mocked(api.listCronJobs);
@@ -84,11 +85,13 @@ describe('loading the jobs', () => {
 
     await useCronStore.getState().loadJobs();
 
-    expect(useCronStore.getState().jobs.map(j => [j.id, j.forecast, j.forecast_reason])).toEqual([
-      ['planner', 'skip', SKIP_REASON],
-      ['digest', 'run', null],
-      ['source:mail', null, null],
-    ]);
+    await vi.waitFor(() =>
+      expect(useCronStore.getState().jobs.map(j => [j.id, j.forecast, j.forecast_reason])).toEqual([
+        ['planner', 'skip', SKIP_REASON],
+        ['digest', 'run', null],
+        ['source:mail', null, null],
+      ]),
+    );
   });
 
   it('still lists the jobs when the schedule cannot be read', async () => {
@@ -98,7 +101,80 @@ describe('loading the jobs', () => {
 
     await useCronStore.getState().loadJobs();
 
-    expect(useCronStore.getState().jobs.map(j => [j.id, j.forecast])).toEqual([['planner', null]]);
+    await vi.waitFor(() => expect(quiet).toHaveBeenCalled());
+    expect(forecasts()).toEqual([['planner', null]]);
     quiet.mockRestore();
   });
+
+  it('shows the jobs before their forecasts arrive', async () => {
+    const pending = deferred<CronSchedule>();
+    listCronJobs.mockResolvedValue({ jobs: [job()] });
+    getCronSchedule.mockReturnValue(pending.promise);
+
+    await useCronStore.getState().loadJobs();
+    expect(forecasts()).toEqual([['planner', null]]);
+
+    pending.resolve(scheduleSaying('skip'));
+    await vi.waitFor(() => expect(forecasts()).toEqual([['planner', 'skip']]));
+  });
+
+  it('goes on without forecasts that take too long, keeping the last ones meanwhile', async () => {
+    vi.useFakeTimers();
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      useCronStore.setState({ jobs: [job({ forecast: 'run' })] });
+      listCronJobs.mockResolvedValue({ jobs: [job()] });
+      let signal: AbortSignal | undefined;
+      getCronSchedule.mockImplementation((given) => {
+        signal = given;
+        return new Promise<CronSchedule>(() => {});
+      });
+
+      await useCronStore.getState().loadJobs();
+      expect(forecasts()).toEqual([['planner', 'run']]);
+
+      await vi.advanceTimersByTimeAsync(FORECAST_TIMEOUT_MS);
+      await vi.waitFor(() => expect(forecasts()).toEqual([['planner', null]]));
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      quiet.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("never lets an older load's forecasts replace a newer one's", async () => {
+    const older = deferred<CronSchedule>();
+    listCronJobs.mockResolvedValue({ jobs: [job()] });
+    getCronSchedule.mockReturnValueOnce(older.promise).mockResolvedValueOnce(scheduleSaying('run'));
+
+    await useCronStore.getState().loadJobs();
+    await useCronStore.getState().loadJobs();
+    await vi.waitFor(() => expect(forecasts()).toEqual([['planner', 'run']]));
+
+    older.resolve(scheduleSaying('skip'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(forecasts()).toEqual([['planner', 'run']]);
+  });
 });
+
+function forecasts() {
+  return useCronStore.getState().jobs.map(j => [j.id, j.forecast]);
+}
+
+function scheduleSaying(forecast: 'run' | 'skip'): CronSchedule {
+  return {
+    next: null,
+    jobs: [{
+      id: 'planner',
+      next_run: '2030-01-01T09:00:00+00:00',
+      forecast,
+      reason: forecast === 'skip' ? SKIP_REASON : null,
+    }],
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(settle => { resolve = settle; });
+  return { promise, resolve };
+}

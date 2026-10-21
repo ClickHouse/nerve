@@ -603,7 +603,8 @@ machine, more than 30 seconds before it ended, is not a late run: see
 `GET /api/cron/schedule` reports the next moment the instance will start work on
 its own, and what each job's next run is forecast to do. `nerve cron next` prints
 the same from the running daemon, and the Cron page shows each job's forecast in
-its card.
+its card. The page lists the jobs without waiting for the forecasts, fills them
+in when they arrive, and goes on without them after 10 seconds.
 
 ```json
 {
