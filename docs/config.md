@@ -297,6 +297,7 @@ reload cannot inspect, and are documented here only.
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
+| `platform.*` | the activity reporter looks for its socket once, at startup, and keeps the interval and lease lifetime it started with. See [Platform activity reporting](platform-activity.md) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
 | Turning `ollama.enabled` **on** while the proxy is not already running | Ollama routes through the proxy as its translation layer, and that process only starts at startup. With the proxy already up, this is read per use and follows a reload |
 | Turning `workspace_sync.enabled` or `retention.enabled` **on** | their loops are only created at startup, so there is nothing running to see the flag change. Turning either **off** is hot |
@@ -2122,3 +2123,16 @@ active runs `failed` and notifies. See [workflow-runs.md](workflow-runs.md).
 | `workflows.kill_grace_seconds` | int | `30` | After the graceful stop at 100% budget, how long to wait before force-discarding the session's client (kills its subprocess) |
 | `workflows.max_concurrent_runs` | int | `2` | Runs dispatched concurrently; excess queues in status `pending`. Each running workflow occupies one `agent.max_concurrent` slot for its whole turn — keep this well below that limit |
 | `workflows.allow_unbudgeted` | bool | `false` | Permit starting runs without `budget_usd`. Budget enforcement is the point of this surface, so off by default |
+
+## Platform
+
+Activity reporting to the platform's local activity socket, for a machine that
+a platform parks while it is idle. Reporting is on only when the socket exists
+when the gateway starts, so elsewhere these keys do nothing. All of them need a
+restart. See [Platform activity reporting](platform-activity.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `platform.activity_socket` | path | `/run/nerve/guestd.sock` | The platform's local activity socket. `""` switches reporting off |
+| `platform.activity_interval_seconds` | int | `30` | Seconds between reports when nothing changes (held to 5–300) |
+| `platform.lease_ttl_seconds` | int | `120` | Lifetime of a keep-awake lease, renewed every half lifetime (held to 10–3600) |

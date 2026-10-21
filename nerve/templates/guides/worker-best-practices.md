@@ -77,8 +77,8 @@ Gates in one list must all pass and are checked in order, so put the cheap `task
 
 ### Locks, catch-up and session modes
 
-- `lock: true` keeps the daemon's runs of one job from overlapping: a catch-up or web-triggered run waits for the previous run to finish, and a scheduled fire that finds the previous one still going is skipped (lock or not), so two runs never work the same queue at once. `nerve cron <id>` runs in its own process and does not take the lock. Set it on every job that claims or moves tasks.
-- `catchup: false` skips the one catch-up run Nerve fires on startup for a job that missed its schedule; set it where a late run would duplicate the next one.
+- `lock: true` keeps the daemon's runs of one job from overlapping: a web-triggered run waits for the previous run to finish, and a scheduled fire or a catch-up run that finds the previous one still going is skipped (lock or not), so two runs never work the same queue at once. `nerve cron <id>` runs in its own process and does not take the lock. Set it on every job that claims or moves tasks.
+- `catchup: false` skips the one catch-up run Nerve fires on startup, or when the machine resumes from a pause, for a job that missed its schedule; set it where a late run would duplicate the next one.
 - `session_mode: isolated`, the default, starts each run fresh. State comes from the tracker, files and memory, so a run cannot drift on what an earlier run assumed. It suits scan and work jobs.
 - `session_mode: persistent` reuses one chat run after run until it rotates (`context_rotate_hours`, default 24, or a time of day with `context_rotate_at`); the old chat is kept and indexed into long-term memory. It suits jobs that need continuity: a monitor that compares with its last check, and the planner, because `plan_revise` sends the operator's feedback back to the session that proposed the plan. Context grows with every run, so keep rotation on; `reminder_mode: true` sends a short reminder instead of the full prompt after the first run.
 

@@ -61,6 +61,7 @@ _RESTART_ONLY_PATHS = (
     "mcp_endpoint.path",
     "mcp_gateway_url",
     "memory",
+    "platform",
     "proxy",
     "slack.mode",
     "sync.codex",

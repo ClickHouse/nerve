@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
+import nerve.config  # imported so its constants can be re-pointed
 from nerve import paths
 from nerve.db import Database
 from nerve.identity import Actor
@@ -79,6 +79,20 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_platform_activity_socket(monkeypatch):
+    """Keep the gateway's activity reporter off the machine's real socket.
+
+    On a machine that runs on a platform with a local activity socket, the
+    default ``platform.activity_socket`` exists, and every test that starts
+    the gateway lifespan would report its fake turns and connections there.
+    The default is resolved when a config is built, so pointing it at nothing
+    here covers every config a test builds. Tests about the reporter name
+    their own socket.
+    """
+    monkeypatch.setattr(nerve.config, "DEFAULT_PLATFORM_ACTIVITY_SOCKET", "")
 
 
 @pytest.fixture(autouse=True)

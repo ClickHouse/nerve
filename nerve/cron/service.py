@@ -6,13 +6,18 @@ Runs cron jobs and source runners on schedule.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
 import logging
-from datetime import datetime, timezone, tzinfo
-from typing import TYPE_CHECKING
+import re
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
-from apscheduler.events import EVENT_JOB_MISSED
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -29,8 +34,11 @@ from nerve.cron.jobs import (
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterator
+
     from nerve.cron.gates import CronGate
     from nerve.sources.runner import SourceRunner
 
@@ -46,6 +54,129 @@ _WAKEUP_SWEEP_SECONDS = 20
 # Bounded, not None: a run delayed past usefulness should still be discarded.
 # Read when the scheduler is built, so changing it needs a restart.
 _MISFIRE_GRACE_SECONDS = 30
+
+# How often the clock watcher compares the wall clock with the monotonic clock,
+# and how far the wall clock has to get ahead of the monotonic one between two
+# samples to count as a pause of the whole machine (host sleep, suspend, a VM
+# snapshot restore) or a forward step of the clock. NTP slews the wall clock by
+# milliseconds over that time; a pause is minutes or hours.
+# See CronService._watch_clock.
+_CLOCK_WATCH_SECONDS = 5
+_CLOCK_STEP_SECONDS = 5
+
+# How long stop() waits for the tasks it cancels to wind down before it shuts
+# the scheduler down regardless — as long as the gateway gives its own.
+_STOP_WAIT_SECONDS = GRACEFUL_STOP_SECONDS
+
+# How long the catch-up runs after a pause wait before they start. The machine
+# is back, but its network often is not yet (Wi-Fi rejoining, DNS), and a source
+# runner or an agent turn started into that fails and waits for its next slot.
+# Moving the triggers past the pause does not wait.
+_CATCHUP_SETTLE_SECONDS = 15
+
+# The cron_logs error of a run that came due during a pause of the machine and
+# was not caught up.
+_PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: false)"
+
+# How a run of a cron job or source runner was started: by its schedule, as a
+# catch-up for fires missed while the daemon was down or the machine paused,
+# or by hand (the Cron page's "Run now", the trigger API).
+RunOrigin = Literal["schedule", "catchup", "manual"]
+
+
+class _RunsInFlight:
+    """The runs in progress, by job id, and how each was started.
+
+    The scheduler starts a job at most once at a time, but it only counts the
+    runs it started itself. The run wrappers record every run here, so that
+    whatever starts a run can first see what is already going, and whether a
+    run has started since it last looked.
+    """
+
+    def __init__(self) -> None:
+        self._origins: dict[str, list[RunOrigin]] = {}
+        self._started: dict[str, int] = {}
+
+    def running(self, job_id: str, origin: RunOrigin | None = None) -> bool:
+        """Whether a run of *job_id* is in progress — one started as *origin*,
+        if given."""
+        origins = self._origins.get(job_id, [])
+        return origin in origins if origin is not None else bool(origins)
+
+    def started(self, job_id: str) -> int:
+        """How many runs of *job_id* have started so far; a higher count later
+        means a run started in between."""
+        return self._started.get(job_id, 0)
+
+    @contextlib.contextmanager
+    def track(self, job_id: str, origin: RunOrigin) -> Iterator[None]:
+        """Count a run of *job_id*, started as *origin*, as in progress for
+        the duration of the block."""
+        self._origins.setdefault(job_id, []).append(origin)
+        self._started[job_id] = self.started(job_id) + 1
+        try:
+            yield
+        finally:
+            origins = self._origins[job_id]
+            origins.remove(origin)
+            if not origins:
+                del self._origins[job_id]
+
+
+# How far ahead CronService.next_scheduled() looks by default.
+_SCHEDULE_HORIZON = timedelta(days=7)
+
+# How many more of a job's fire times are tried when its next run is forecast
+# to skip, asking only the gates that define their own forecast (see
+# CronService._forecast_job).
+_FORECAST_MORE_FIRES = 8
+
+# A scheduled tick's name is reported to whatever asks for the next tick, so it
+# is kept to a conservative alphabet and length: anything else in a job id
+# becomes "_", and the rest is cut at the limit.
+_TICK_NAME_MAX = 64
+_TICK_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._:-]")
+# How much of a session id names its wakeup.
+_TICK_SESSION_PREFIX = 8
+
+ScheduledKind = Literal["cron", "source", "wakeup"]
+
+
+@dataclass(frozen=True)
+class ScheduledTick:
+    """The next moment the instance has work of its own scheduled, and what.
+
+    ``at`` is in UTC. ``name`` is the cron job id, ``source:<name>`` for a
+    source runner, or ``wakeup:`` and the first characters of the session id
+    for a session wakeup — limited to ``[A-Za-z0-9._:-]`` and 64 characters.
+    """
+
+    at: datetime
+    name: str
+    kind: ScheduledKind
+
+    def as_dict(self) -> dict:
+        return {"at": self.at.isoformat(), "name": self.name, "kind": self.kind}
+
+
+def _tick_name(raw: str) -> str:
+    """*raw* in the alphabet and length a tick name allows."""
+    return _TICK_NAME_DISALLOWED.sub("_", raw)[:_TICK_NAME_MAX]
+
+
+@dataclass(frozen=True)
+class _Forecast:
+    """A scheduled cron job or source runner, its next run, and what its gates
+    forecast for that run (``reason`` is set for a skip). ``runs_at`` is the
+    first run forecast to happen: the next one, a later one when the next is
+    forecast to skip, or ``None`` when none was found."""
+
+    kind: ScheduledKind
+    next_run: datetime | None
+    runs: bool
+    reason: str | None = None
+    runs_at: datetime | None = None
+
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
@@ -254,6 +385,31 @@ def _parse_timestamp(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+class _ClockCheckingScheduler(AsyncIOScheduler):
+    """An ``AsyncIOScheduler`` that has the clock checked before it looks for
+    due jobs.
+
+    The scheduler sleeps on the event loop's timer, which runs on the monotonic
+    clock, and decides what is due by the wall clock. Across a pause the two
+    part ways, and the scheduler's wakeup can arrive before the cron service's
+    clock watcher has looked: it would see every run that came due during the
+    pause as late and drop it. Checking first lets the service move those runs
+    past the pause and catch them up before the scheduler judges them.
+    """
+
+    def __init__(self, *, clock_check: Callable[[], None], **options) -> None:
+        self._clock_check = clock_check
+        super().__init__(**options)
+
+    def _process_jobs(self):
+        try:
+            self._clock_check()
+        except Exception:
+            # Never at the cost of the schedule itself.
+            logger.exception("Clock check before processing cron jobs failed")
+        return super()._process_jobs()
+
+
 class CronService:
     """Manages scheduled cron jobs."""
 
@@ -262,7 +418,8 @@ class CronService:
         self.engine = engine
         self.db = db
         self.timezone = ZoneInfo(config.timezone)
-        self.scheduler = AsyncIOScheduler(
+        self.scheduler = _ClockCheckingScheduler(
+            clock_check=self._check_clock,
             timezone=self.timezone,
             job_defaults={"misfire_grace_time": _MISFIRE_GRACE_SECONDS},
         )
@@ -273,12 +430,30 @@ class CronService:
         self._rejected_job_ids: list[str] = []
         self._source_runners: list[SourceRunner] = []
         self._job_locks: dict[str, asyncio.Lock] = {}
+        # Every run in progress, however it was started (see _may_start).
+        self._runs = _RunsInFlight()
         # Set by the gateway before start() so freshly-(re)built source runners
         # get wired to health-alert notifications, including after a reload.
         self.notification_service = None
         # Serialize reload() so the sync loop and the HTTP routes can't
         # interleave scheduler mutations.
         self._reload_lock = asyncio.Lock()
+        # Pause detection (see _watch_clock): the last (wall, monotonic) clock
+        # sample, the watcher task, the jobs waiting to be caught up (each with
+        # the number of runs it had started when it was queued), and the
+        # catch-ups under way. A catch-up holds the lock while it runs, so the
+        # next one waits its turn.
+        self._clock_sample: tuple[float, float] | None = None
+        self._clock_watch_task: asyncio.Task | None = None
+        self._catchup_due: dict[str, int] = {}
+        self._catchup_lock = asyncio.Lock()
+        self._catchup_tasks: set[asyncio.Task] = set()
+        # Called whenever the schedule may have changed (see
+        # add_schedule_listener), and the async ones still running.
+        self._schedule_listeners: list[Callable[[], object]] = []
+        self._listener_tasks: set[asyncio.Task] = set()
+        # Set when stop() begins; from then on nothing new is started.
+        self._stopping = False
 
     def _own_attribution(self) -> Attribution:
         """Attribution of a run that the instance starts itself: a scheduled
@@ -368,6 +543,11 @@ class CronService:
         )
 
         self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
+        # A fire skipped because the previous run is still going moves the job
+        # on without reaching _run_job_wrapper.
+        self.scheduler.add_listener(
+            lambda _event: self._schedule_changed(), EVENT_JOB_MAX_INSTANCES,
+        )
 
         self.scheduler.start()
         logger.info(
@@ -377,6 +557,10 @@ class CronService:
 
         # Catch up missed jobs in background (don't block startup)
         asyncio.create_task(self._catchup_missed_jobs())
+
+        # From here on, notice when the machine was paused (see _watch_clock).
+        self._clock_watch_task = asyncio.create_task(self._watch_clock())
+        self._schedule_changed()
 
     def _on_job_missed(self, event) -> None:
         """Record a run APScheduler dropped for starting too late.
@@ -389,14 +573,21 @@ class CronService:
         asyncio.create_task(
             self._record_missed_run(event.job_id, event.scheduled_run_time),
         )
+        self._schedule_changed()
 
-    async def _record_missed_run(self, job_id: str, due: datetime) -> None:
-        """Persist one missed run. Logging a drop must not itself break cron."""
+    async def _record_missed_run(
+        self, job_id: str, due: datetime, error: str | None = None,
+    ) -> None:
+        """Persist one missed run. Logging a drop must not itself break cron.
+
+        ``error`` says why the run did not happen; by default, that the
+        scheduler dropped it for starting too late.
+        """
         try:
             await self.db.log_cron_missed(
                 job_id,
                 due.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                error=(
+                error=error or (
                     f"run dropped: not started within "
                     f"{_MISFIRE_GRACE_SECONDS}s of its scheduled time"
                 ),
@@ -447,7 +638,9 @@ class CronService:
         of job that disappears from the reload without the reload mentioning it.
         """
         async with self._reload_lock:
-            return await self._reload_locked()
+            summary = await self._reload_locked()
+        self._schedule_changed()
+        return summary
 
     async def _reload_locked(self) -> dict:
         """Reload under the lock, undoing the one change that isn't local.
@@ -757,15 +950,268 @@ class CronService:
             self._source_runners = new_runners
             self._apply_source_runners(planned)
             new_ids = {runner.job_id for runner, _, _ in planned}
-            return {
-                "sources": sorted(new_ids),
-                "removed": sorted(old_ids - new_ids),
-            }
+        self._schedule_changed()
+        return {
+            "sources": sorted(new_ids),
+            "removed": sorted(old_ids - new_ids),
+        }
 
     async def stop(self) -> None:
-        """Stop the scheduler."""
-        self.scheduler.shutdown(wait=False)
+        """Stop the clock watcher, the catch-ups it started, the schedule
+        listeners still running, and the scheduler.
+
+        Nothing new starts once this begins: the scheduler is paused first, and
+        the clock check, the catch-ups and the schedule listeners do nothing
+        more. The watcher, the catch-ups and the listener tasks are cancelled
+        and given ``_STOP_WAIT_SECONDS`` to wind down; then the scheduler shuts
+        down, which cancels the runs it has in flight. Stopping again does
+        nothing.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        if self.scheduler.running:
+            self.scheduler.pause()
+        watcher, self._clock_watch_task = self._clock_watch_task, None
+        pending = {
+            t for t in (watcher, *self._catchup_tasks, *self._listener_tasks)
+            if t is not None
+        }
+        for task in pending:
+            task.cancel()
+        if pending:
+            _, unfinished = await asyncio.wait(pending, timeout=_STOP_WAIT_SECONDS)
+            if unfinished:
+                logger.warning(
+                    "%d cron task(s) did not stop within %gs of being cancelled; "
+                    "stopping the scheduler anyway",
+                    len(unfinished), _STOP_WAIT_SECONDS,
+                )
+        self._clock_sample = None
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         logger.info("Cron service stopped")
+
+    # -- Pauses of the machine -------------------------------------------------
+    #
+    # The scheduler waits for its next run on the event loop's timer, which runs
+    # on the monotonic clock, and decides what is due by the wall clock. While
+    # the whole machine is paused (host sleep, suspend, a VM snapshot restore)
+    # the monotonic clock stands still and the wall clock is stepped forward on
+    # resume, so the timer comes back late by the length of the pause. A run
+    # that came due during the pause would then start late — and be dropped as
+    # missed when it is later than the misfire grace — or wait out the rest of
+    # a timer armed before the pause. Instead the service notices the step,
+    # moves every trigger the scheduler would drop as late past the pause, and
+    # runs the jobs that want a catch-up once, as the startup catch-up does for
+    # downtime.
+
+    async def _watch_clock(self) -> None:
+        """Check the clock now and every ``_CLOCK_WATCH_SECONDS`` until the
+        scheduler or the service stops.
+
+        Prompt detection. The scheduler checks the clock too, right before it
+        looks for due jobs (see :class:`_ClockCheckingScheduler`), so whichever
+        of the two runs first after a pause handles it. A catch-up runs as a
+        task of its own, so the watcher goes on sampling while it runs.
+        """
+        while self.scheduler.running and not self._stopping:
+            try:
+                self._check_clock()
+            except Exception:
+                logger.exception("Handling a pause of the machine failed")
+            await asyncio.sleep(_CLOCK_WATCH_SECONDS)
+
+    def _sample_clock(self) -> tuple[datetime, datetime, float] | None:
+        """Take a clock sample and compare it with the previous one.
+
+        Returns ``(paused_from, paused_to, step)`` when the wall clock got at
+        least ``_CLOCK_STEP_SECONDS`` further ahead than the monotonic clock in
+        between: the pause lies after the previous sample's wall time and ends
+        now, and ``step`` is how much further the wall clock went. ``None``
+        otherwise, and for the first sample. A wall clock set back is not a
+        pause and is left to the scheduler, as before.
+        """
+        wall, mono = time.time(), time.monotonic()
+        previous, self._clock_sample = self._clock_sample, (wall, mono)
+        if previous is None:
+            return None
+        step = (wall - previous[0]) - (mono - previous[1])
+        if step < _CLOCK_STEP_SECONDS:
+            return None
+        return (
+            datetime.fromtimestamp(previous[0], tz=UTC),
+            datetime.fromtimestamp(wall, tz=UTC),
+            step,
+        )
+
+    def _check_clock(self) -> None:
+        """Take a clock sample, and handle the pause it shows, if any.
+
+        The watcher's check, and the scheduler's hook right before it looks for
+        due jobs. Runs on the event loop and never waits: the triggers move at
+        once, and the catch-up runs start as a task (see :meth:`_on_clock_step`).
+        Does nothing once the service is stopping.
+        """
+        if self._stopping:
+            return
+        step = self._sample_clock()
+        if step is not None:
+            self._on_clock_step(*step)
+
+    def _on_clock_step(
+        self, paused_from: datetime, paused_to: datetime, step: float | None = None,
+    ) -> asyncio.Task | None:
+        """Move the triggers past a pause now, and start running once what came
+        due during it.
+
+        ``paused_from`` and ``paused_to`` bound the pause; ``step`` is how far
+        the wall clock jumped, for the log line (default: the whole window).
+        The jobs join those still waiting from an earlier pause, once each, and
+        run in a task of their own, which waits its turn behind any catch-up
+        still running. Returns that task, or ``None`` when nothing that came
+        due wants a catch-up.
+        """
+        due = self._rearm_after_pause(paused_from, paused_to, step)
+        if not due:
+            return None
+        for job_id in due:
+            # Counted now, so the catch-up can tell whether the job has run by
+            # the time its turn comes.
+            self._catchup_due[job_id] = self._runs.started(job_id)
+        task = asyncio.get_running_loop().create_task(self._catch_up_after_pause())
+        self._catchup_tasks.add(task)
+        task.add_done_callback(self._catch_up_done)
+        return task
+
+    def _catch_up_done(self, task: asyncio.Task) -> None:
+        self._catchup_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Catching up after a pause failed", exc_info=error)
+
+    def _rearm_after_pause(
+        self, paused_from: datetime, paused_to: datetime, step: float | None = None,
+    ) -> list[str]:
+        """Move every trigger that came due during a pause to its next fire time.
+
+        Covers what this service scheduled — cron jobs, source runners, cleanup
+        and the wakeup sweep — whose next run time came more than the misfire
+        grace before ``paused_to``: it came due during the pause, has not run,
+        and the scheduler would drop it as late. Each moves to the first fire
+        time of its own trigger after ``paused_to``, so the scheduler neither
+        runs it again nor reports it missed, and an interval job stays on the
+        cadence its trigger was anchored to. A run that came due within the
+        grace stays where it is: the scheduler runs it late, as it would have
+        without the pause. Anything else on the scheduler keeps the scheduler's
+        own handling.
+
+        Synchronous, so that nothing gets to look at the old fire times in
+        between. Returns the ids to run once now: the cron jobs with
+        ``catchup``, the source runners and cleanup — except one with a run
+        still going, which the fire that came due would have found going too
+        (see :meth:`_may_start`). A job with ``catchup: false`` only moves on,
+        with a ``missed`` row for the run it skips; the wakeup sweep (which
+        fires every due session wakeup on its next pass) only moves on. Jobs
+        are handled one by one: one that cannot be moved is logged and left to
+        the scheduler, and the rest still move.
+        """
+        after = paused_to + timedelta(microseconds=1)
+        grace = timedelta(seconds=_MISFIRE_GRACE_SECONDS)
+        rearmed = 0
+        due: list[str] = []
+        for sched_job in self.scheduler.get_jobs():
+            try:
+                func = sched_job.func
+                if func == self._run_job_wrapper:
+                    catchup = sched_job.args[0].catchup
+                elif func in (self._run_source_wrapper, self._cleanup_expired):
+                    catchup = True
+                elif func == self._sweep_wakeups:
+                    catchup = False
+                else:
+                    continue
+                missed = getattr(sched_job, "next_run_time", None)
+                if missed is None or missed > paused_to or paused_to - missed <= grace:
+                    continue  # not due, or the scheduler still runs it late
+                upcoming = sched_job.trigger.get_next_fire_time(None, after)
+                if upcoming is None:
+                    continue  # the trigger is done; the scheduler retires the job
+                self.scheduler.modify_job(sched_job.id, next_run_time=upcoming)
+                rearmed += 1
+                if catchup:
+                    if self._may_start(sched_job.id, "catchup"):
+                        due.append(sched_job.id)
+                elif func == self._run_job_wrapper:
+                    # Recorded like a run the scheduler drops for being late.
+                    asyncio.create_task(self._record_missed_run(
+                        sched_job.id, missed, error=_PAUSED_MISS,
+                    ))
+            except Exception:
+                logger.exception("Could not move %s past the pause", sched_job.id)
+        # Re-arm the scheduler's own timer against the stepped clock too.
+        if self.scheduler.running:
+            self.scheduler.wakeup()
+        if step is None:
+            step = (paused_to - paused_from).total_seconds()
+        logger.info(
+            "Clock jumped %.0fs ahead (paused between %s and %s): re-armed %d "
+            "scheduled jobs, catching up %d in %ss",
+            step,
+            paused_from.astimezone(self.timezone).isoformat(timespec="seconds"),
+            paused_to.astimezone(self.timezone).isoformat(timespec="seconds"),
+            rearmed,
+            len(due),
+            _CATCHUP_SETTLE_SECONDS,
+        )
+        if rearmed:
+            self._schedule_changed()
+        return due
+
+    async def _catch_up_after_pause(self) -> None:
+        """Run once each job waiting to be caught up, concurrently, through
+        the normal wrappers.
+
+        Waits ``_CATCHUP_SETTLE_SECONDS`` for the network to come back, then
+        for any earlier catch-up to finish, so two never overlap, and only
+        then looks each job up as the scheduler holds it now: a job removed
+        meanwhile does not run, one redefined runs as it is now, and one that
+        has started a run since it was queued is not caught up on top of it.
+        Gates, ``lock`` and the run log apply as for a scheduled run.
+        """
+        await asyncio.sleep(_CATCHUP_SETTLE_SECONDS)
+        async with self._catchup_lock:
+            if self._stopping or not self.scheduler.running:
+                return  # stopped while waiting its turn
+            queued, self._catchup_due = self._catchup_due, {}
+            runs = {
+                job_id: run
+                for job_id, started in queued.items()
+                if (run := self._catch_up_run(job_id, started)) is not None
+            }
+            results = await asyncio.gather(*runs.values(), return_exceptions=True)
+        for job_id, result in zip(runs, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.error("Catch-up run of %s after a pause failed: %s", job_id, result)
+
+    def _catch_up_run(self, job_id: str, started: int) -> Awaitable[None] | None:
+        """The catch-up run of *job_id*, which had started *started* runs when
+        it was queued — or ``None`` when it is gone or has run since."""
+        sched_job = self.scheduler.get_job(job_id)
+        if sched_job is None:
+            logger.info("Not catching up %s: it is no longer scheduled", job_id)
+            return None
+        if self._runs.started(job_id) != started:
+            logger.info("Not catching up %s: it has run since the pause", job_id)
+            return None
+        if sched_job.func == self._run_job_wrapper:
+            return self._run_job_wrapper(sched_job.args[0], origin="catchup")
+        if sched_job.func == self._run_source_wrapper:
+            return self._run_source_wrapper(sched_job.args[0], origin="catchup")
+        if sched_job.func == self._cleanup_expired:
+            # Once a day at a fixed time, which a machine that is mostly paused
+            # may never be awake for; running it twice does no harm.
+            return self._cleanup_expired()
+        return None
 
     # -- Persistent timers -------------------------------------------------
 
@@ -807,7 +1253,8 @@ class CronService:
         """Fire jobs that should have run while the server was down.
 
         Each overdue job fires exactly once regardless of how many runs
-        were missed.  Jobs run concurrently.
+        were missed.  Jobs run concurrently, and a catch-up after a pause of
+        the machine waits for them (see :meth:`_catch_up_after_pause`).
         """
         now = datetime.now(timezone.utc)
         overdue: list[CronJob] = []
@@ -831,9 +1278,10 @@ class CronService:
             "Catching up %d missed jobs: %s",
             len(overdue), [j.id for j in overdue],
         )
-        await asyncio.gather(
-            *(self._run_job_wrapper(job) for job in overdue),
-        )
+        async with self._catchup_lock:
+            await asyncio.gather(
+                *(self._run_job_wrapper(job, origin="catchup") for job in overdue),
+            )
 
     @staticmethod
     def _is_overdue(
@@ -1134,18 +1582,53 @@ class CronService:
 
     async def _run_job_wrapper(
         self, job: CronJob, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule",
     ) -> None:
         """Wrapper to run a cron job with logging and optional lock.
 
         ``attribution`` names who started the run and its cause. ``None``
-        (the scheduler's call) is the instance's own run.
+        (the scheduler's call) is the instance's own run. ``origin`` says how
+        the run was started; the scheduler's call is ``"schedule"``. A run that
+        would overlap another run of the job is skipped as :meth:`_may_start`
+        says; otherwise it counts as in progress until it ends.
+
+        However the run ends — done, failed, skipped by a gate or for
+        overlapping another run — the schedule listeners hear about it: it can
+        change what runs next.
         """
-        if job.lock:
-            lock = self._job_locks.setdefault(job.id, asyncio.Lock())
-            async with lock:
-                await self._run_job_inner(job, attribution)
-        else:
-            await self._run_job_inner(job, attribution)
+        try:
+            if not self._may_start(job.id, origin):
+                return
+            with self._runs.track(job.id, origin):
+                if job.lock:
+                    lock = self._job_locks.setdefault(job.id, asyncio.Lock())
+                    async with lock:
+                        await self._run_job_inner(job, attribution)
+                else:
+                    await self._run_job_inner(job, attribution)
+        finally:
+            self._schedule_changed()
+
+    def _may_start(self, job_id: str, origin: RunOrigin) -> bool:
+        """Whether a run of *job_id* started as *origin* may start now.
+
+        The scheduler never starts a job while its previous scheduled run is
+        still going; it skips that fire. A catch-up stands in for a scheduled
+        fire, so the same rule holds between the two: a catch-up is skipped
+        while any run of the job is going, and a scheduled fire while a
+        catch-up of the job is going. Each skip is logged. A manual run always
+        starts (with ``lock`` it waits for the run before it).
+        """
+        if origin == "catchup" and self._runs.running(job_id):
+            logger.info("Not catching up %s: a run of it is still going", job_id)
+            return False
+        if origin == "schedule" and self._runs.running(job_id, "catchup"):
+            logger.info(
+                "Skipping the scheduled run of %s: its catch-up run is still going",
+                job_id,
+            )
+            return False
+        return True
 
     async def _run_job_inner(
         self, job: CronJob, attribution: Attribution | None = None,
@@ -1363,11 +1846,26 @@ class CronService:
 
     async def _run_source_wrapper(
         self, runner: SourceRunner, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule",
     ) -> None:
         """Wrapper to run a source ingestion with cron and source logging.
 
-        ``attribution`` is as for :meth:`_run_job_wrapper`.
+        ``attribution`` and ``origin`` are as for :meth:`_run_job_wrapper`, and
+        so are skipping a run that would overlap another and telling the
+        schedule listeners when the run is over.
         """
+        try:
+            if not self._may_start(runner.job_id, origin):
+                return
+            with self._runs.track(runner.job_id, origin):
+                await self._run_source_inner(runner, attribution)
+        finally:
+            self._schedule_changed()
+
+    async def _run_source_inner(
+        self, runner: SourceRunner, attribution: Attribution | None = None,
+    ) -> None:
+        """The body of :meth:`_run_source_wrapper`."""
         log_id = await self.db.log_cron_start(
             runner.job_id, attribution=attribution or self._own_attribution(),
         )
@@ -1431,6 +1929,7 @@ class CronService:
             logger.error("Wakeup sweep query failed: %s", e, exc_info=True)
             return
 
+        claimed_any = False
         for wakeup in due:
             session_id = wakeup["session_id"]
             # Skip sessions mid-turn; a still-running turn may itself be
@@ -1446,7 +1945,11 @@ class CronService:
                 continue
             if not claimed:
                 continue
+            claimed_any = True
             self._dispatch_wakeup(session_id, wakeup)
+        if claimed_any:
+            # A claimed wakeup is no longer pending, so the next tick may move.
+            self._schedule_changed()
 
     def _dispatch_wakeup(self, session_id: str, wakeup: dict) -> None:
         """Spawn the engine run for a claimed wakeup with error logging."""
@@ -1508,7 +2011,7 @@ class CronService:
         if not job:
             raise ValueError(f"Job not found: {job_id}")
 
-        await self._run_job_wrapper(job, attribution)
+        await self._run_job_wrapper(job, attribution, origin="manual")
 
     async def rotate_session(self, job_id: str) -> dict:
         """Force-rotate a persistent cron to a fresh chat session.
@@ -1619,3 +2122,213 @@ class CronService:
             })
 
         return result
+
+    # -- What runs next --------------------------------------------------------
+
+    def add_schedule_listener(self, callback: Callable[[], object]) -> None:
+        """Call *callback* whenever what runs next may have changed.
+
+        A plain or async callable taking no arguments. It is called after
+        :meth:`start`, :meth:`reload` and :meth:`reload_sources`; whenever a
+        job or source run ends, also when a gate skipped it or the scheduler
+        dropped or skipped a fire; when a sweep claims a session wakeup; when
+        triggers are moved past a pause; and when a source is synced by hand
+        (see :meth:`notify_schedule_changed`). An async callback runs as a task
+        of its own. Errors are logged, never raised.
+
+        Not every change is announced. A session that records a wakeup
+        (``ScheduleWakeup``) does so inside its turn, which has no reference to
+        this service; and tasks created, moved or edited from a chat turn, the
+        web UI or the API change what a ``tasks`` gate forecasts without any
+        call here. Those count from the next :meth:`next_scheduled` on, so a
+        caller that keeps the answer should also refresh it periodically, and
+        when a turn ends.
+        """
+        self._schedule_listeners.append(callback)
+
+    def remove_schedule_listener(self, callback: Callable[[], object]) -> None:
+        """Stop calling *callback*. One that was never added is ignored."""
+        with contextlib.suppress(ValueError):
+            self._schedule_listeners.remove(callback)
+
+    def notify_schedule_changed(self) -> None:
+        """Tell the schedule listeners that what runs next may have changed,
+        after work done outside this service — a source synced by hand, say."""
+        self._schedule_changed()
+
+    def _schedule_changed(self) -> None:
+        """Tell every schedule listener; a failing one never stops the rest.
+
+        Nobody is told once the service is stopping: a run that the shutdown
+        cancels still ends here, and a listener task started then would
+        outlive the service.
+        """
+        if self._stopping:
+            return
+        for callback in list(self._schedule_listeners):
+            try:
+                result = callback()
+            except Exception:
+                logger.exception("Schedule listener %r failed", callback)
+                continue
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
+                self._listener_tasks.add(task)
+                task.add_done_callback(self._schedule_listener_done)
+
+    def _schedule_listener_done(self, task: asyncio.Future) -> None:
+        self._listener_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Schedule listener failed", exc_info=error)
+
+    async def next_scheduled(
+        self, now: datetime | None = None, horizon: timedelta = _SCHEDULE_HORIZON,
+    ) -> ScheduledTick | None:
+        """The earliest work the instance will start on its own within *horizon*.
+
+        The earliest of: the first run of each scheduled cron job that its
+        gates forecast to happen (judged from what is known now, see
+        :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
+        is forecast to skip, one of its next few runs (see
+        :meth:`_forecast_job`); the next run of each source runner; the
+        earliest pending session wakeup. Cleanup and the wakeup sweep are
+        housekeeping and never count. ``None`` when nothing falls within
+        *horizon* of *now* (default: the current time), which must be
+        timezone-aware: a naive *now* raises ``ValueError``.
+
+        The tick can lie before *now*: a session wakeup that came due but has
+        not fired yet — the sweep runs every ``_WAKEUP_SWEEP_SECONDS`` and
+        waits while its session is in a turn — is reported at its due time.
+        """
+        if now is None:
+            now = datetime.now(UTC)
+        elif now.utcoffset() is None:
+            raise ValueError(f"next_scheduled() needs a timezone-aware now, not {now!r}")
+        return self._earliest(
+            await self._forecast_scheduled(now + horizon),
+            await self._next_wakeup(),
+            now,
+            horizon,
+        )
+
+    async def schedule_report(self) -> dict:
+        """The next tick and each job's forecast, for the API and the CLI.
+
+        ``{"next": tick or None, "jobs": [{"id", "next_run", "forecast",
+        "reason"}]}``, with the jobs :meth:`list_jobs` lists, in its order.
+        ``forecast`` is ``"run"`` or ``"skip"`` for a job with a next run and
+        ``None`` for one without (disabled, or not scheduled); ``reason`` says
+        why a run is forecast to be skipped.
+        """
+        now = datetime.now(UTC)
+        forecasts = await self._forecast_scheduled(now + _SCHEDULE_HORIZON)
+        tick = self._earliest(
+            forecasts, await self._next_wakeup(), now, _SCHEDULE_HORIZON,
+        )
+        job_ids = [job.id for job in self._jobs]
+        job_ids += [runner.job_id for runner in self._source_runners]
+        jobs = []
+        for job_id in job_ids:
+            forecast = forecasts.get(job_id)
+            if forecast is None or forecast.next_run is None:
+                jobs.append(
+                    {"id": job_id, "next_run": None, "forecast": None, "reason": None},
+                )
+                continue
+            jobs.append({
+                "id": job_id,
+                "next_run": forecast.next_run.isoformat(),
+                "forecast": "run" if forecast.runs else "skip",
+                "reason": None if forecast.runs else forecast.reason,
+            })
+        return {"next": tick.as_dict() if tick else None, "jobs": jobs}
+
+    async def _forecast_scheduled(self, limit: datetime) -> dict[str, _Forecast]:
+        """Every cron job and source runner on the scheduler, by id, with
+        what its gates forecast for its next run, looking no further than
+        *limit* for a later one."""
+        forecasts: dict[str, _Forecast] = {}
+        for sched_job in self.scheduler.get_jobs():
+            next_run = getattr(sched_job, "next_run_time", None)
+            if sched_job.func == self._run_source_wrapper:
+                forecasts[sched_job.id] = _Forecast(
+                    "source", next_run, runs=True, runs_at=next_run,
+                )
+            elif sched_job.func == self._run_job_wrapper:
+                forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
+        return forecasts
+
+    async def _forecast_job(self, sched_job, limit: datetime) -> _Forecast:
+        """What the gates of a scheduled cron job forecast for its next run.
+
+        A gate that keeps the default forecast answers from what it sees now,
+        whatever the time, so it is asked once; if it says no, no later run
+        will differ. When those gates let the job through but a gate with a
+        forecast of its own skips the next run, a later run may still happen —
+        an age threshold reached, a cooldown over — so up to
+        ``_FORECAST_MORE_FIRES`` more of the job's fire times, up to *limit*,
+        are tried, asking only the gates with a forecast of their own: a
+        gate's real check never runs more than once per forecast.
+        """
+        from nerve.cron.gates import GateContext, forecast_gates, has_own_forecast
+
+        job = sched_job.args[0]  # the job the scheduler will run, gates included
+        next_run = getattr(sched_job, "next_run_time", None)
+        if next_run is None or not job.gates:
+            return _Forecast("cron", next_run, runs=True, runs_at=next_run)
+        ctx = GateContext(job_id=job.id, db=self.db)
+        steady = [gate for gate in job.gates if not has_own_forecast(gate)]
+        timed = [gate for gate in job.gates if has_own_forecast(gate)]
+        decision = await forecast_gates(steady, ctx, next_run)
+        if not decision.should_run:
+            return _Forecast("cron", next_run, runs=False, reason=decision.reason or None)
+        decision = await forecast_gates(timed, ctx, next_run)
+        if decision.should_run:
+            return _Forecast("cron", next_run, runs=True, runs_at=next_run)
+        at, runs_at = next_run, None
+        for _ in range(_FORECAST_MORE_FIRES):
+            later = sched_job.trigger.get_next_fire_time(at, at + timedelta(microseconds=1))
+            if later is None or later.timestamp() <= at.timestamp() or later > limit:
+                break
+            at = later
+            if (await forecast_gates(timed, ctx, at)).should_run:
+                runs_at = at
+                break
+        return _Forecast(
+            "cron", next_run, runs=False, reason=decision.reason or None, runs_at=runs_at,
+        )
+
+    async def _next_wakeup(self) -> ScheduledTick | None:
+        """The earliest pending session wakeup, as a tick."""
+        try:
+            pending = await self.db.list_pending_wakeups()
+        except Exception as e:  # noqa: BLE001 — the rest of the schedule stands
+            logger.warning("Could not read pending wakeups for the schedule: %s", e)
+            return None
+        ticks = []
+        for row in pending:
+            try:
+                at = _parse_timestamp(row["fire_at"]).astimezone(UTC)
+            except (KeyError, TypeError, ValueError):
+                continue
+            prefix = str(row.get("session_id") or "")[:_TICK_SESSION_PREFIX]
+            ticks.append(ScheduledTick(at, _tick_name(f"wakeup:{prefix}"), "wakeup"))
+        return min(ticks, key=lambda tick: tick.at, default=None)
+
+    @staticmethod
+    def _earliest(
+        forecasts: dict[str, _Forecast],
+        wakeup: ScheduledTick | None,
+        now: datetime,
+        horizon: timedelta,
+    ) -> ScheduledTick | None:
+        """The earliest run forecast to happen, or *wakeup*, up to *horizon*."""
+        limit = now + horizon
+        ticks = [
+            ScheduledTick(forecast.runs_at.astimezone(UTC), _tick_name(job_id), forecast.kind)
+            for job_id, forecast in forecasts.items()
+            if forecast.runs_at is not None and forecast.runs_at <= limit
+        ]
+        if wakeup is not None and wakeup.at <= limit:
+            ticks.append(wakeup)
+        return min(ticks, key=lambda tick: tick.at, default=None)

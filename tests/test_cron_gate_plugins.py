@@ -546,6 +546,7 @@ class TestHotReloadReplace:
         before = dict(GATE_REGISTRY)
 
         f.unlink()
+        caplog.clear()  # the load's note that the gate keeps the default forecast
         with caplog.at_level(logging.WARNING):
             load_gate_plugins(tmp_path, replace=True, warn_vanished=False)
         assert "always_test" not in GATE_REGISTRY   # dropped all the same
@@ -571,6 +572,7 @@ class TestHotReloadReplace:
         assert "tasks" in before, "expected a built-in in the snapshot"
 
         load_gate_plugins(tmp_path, replace=True, warn_vanished=False)
+        caplog.clear()  # the loads' notes that the gate keeps the default forecast
         with caplog.at_level(logging.WARNING):
             warn_vanished_gates(before)
         assert caplog.text == ""

@@ -170,6 +170,17 @@ Optional local HTTP proxy that routes Anthropic API calls through Claude Code's 
 - OAuth tokens refreshed automatically
 - Configured via `proxy.*` settings in config — see [config.md](config.md#proxy-cliproxyapi)
 
+### Platform activity (`nerve/platform/`)
+For a machine that a platform parks while it is idle. When the platform's
+local activity socket (a Unix socket, `platform.activity_socket`) exists at
+startup, `ActivityReporter` keeps it current: running turns, open web client
+connections, and the next scheduled task the cron service forecasts. These go
+out on every change (at most one post every 250 ms) and on a fixed interval.
+Background work that is not a turn (memorization, workspace sync,
+backups, background agents) holds keep-awake leases through `keep_awake()`.
+Without the socket nothing is sent. See
+[platform-activity.md](platform-activity.md).
+
 ### Tasks (`nerve/tasks/`)
 Markdown + SQLite task system:
 - Task files in `workspace/memory/tasks/`
@@ -295,7 +306,7 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 3. Initialize memory system (memU SQLite, load categories). With no model credential yet the warm-up is skipped and recall answers empty; nothing calls out
 4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
 5. Recover orphan sessions (active in DB but no live client → idle or stopped)
-6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs). Sources the installer left `enabled: false` are not scheduled
+6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs). Sources the installer left `enabled: false` are not scheduled. Then the activity reporter, which does nothing unless the platform's local activity socket exists ([platform-activity.md](platform-activity.md))
 7. Start gateway (FastAPI + uvicorn, WebSocket, static files or the "web UI not built" page)
 8. Start Telegram bot if configured. A token Telegram rejects does not stop the boot: the failure is logged with the token scrubbed, recorded for the setup page and `nerve doctor`, and the gateway runs without the bot
 9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session (the setup page's Finish also starts it when no restart is needed)

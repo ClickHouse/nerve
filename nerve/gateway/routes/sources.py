@@ -24,7 +24,11 @@ async def trigger_single_source_sync(source_name: str):
         available = [r.source.source_name for r in runners]
         raise HTTPException(status_code=404, detail=f"Source not found: {source_name}. Available: {available}")
 
-    result = await runner.run()
+    try:
+        result = await runner.run()
+    finally:
+        # New messages can change what a gated job's next run will do.
+        _cron_service.notify_schedule_changed()
 
     # Log it
     await deps.db.log_source_run(
@@ -52,19 +56,23 @@ async def trigger_all_sources_sync():
 
     runners = getattr(_cron_service, "_source_runners", [])
     results = {}
-    for runner in runners:
-        name = runner.source.source_name
-        result = await runner.run()
-        await deps.db.log_source_run(
-            source=name,
-            records_fetched=result.records_ingested,
-            records_processed=result.records_ingested,
-            error=result.error,
-        )
-        results[name] = {
-            "records_ingested": result.records_ingested,
-            "error": result.error,
-        }
+    try:
+        for runner in runners:
+            name = runner.source.source_name
+            result = await runner.run()
+            await deps.db.log_source_run(
+                source=name,
+                records_fetched=result.records_ingested,
+                records_processed=result.records_ingested,
+                error=result.error,
+            )
+            results[name] = {
+                "records_ingested": result.records_ingested,
+                "error": result.error,
+            }
+    finally:
+        # New messages can change what a gated job's next run will do.
+        _cron_service.notify_schedule_changed()
 
     return {"results": results}
 

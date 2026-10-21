@@ -395,6 +395,17 @@ memory:
 #   notify_on_failure: true     # high-priority notify if a scheduled backup fails
 #   notify_on_success: false    # low-priority digest line on success
 
+# Platform activity reporting — for a machine that a platform parks while it
+# is idle. When the platform's local activity socket exists at startup, the
+# gateway reports running turns, client connections and the next scheduled
+# task to it, and holds keep-awake leases for background work (memorization,
+# workspace sync, backups, background agents). Elsewhere it does nothing.
+# Restart to apply changes. See docs/platform-activity.md.
+# platform:
+#   activity_socket: /run/nerve/guestd.sock  # "" switches reporting off
+#   activity_interval_seconds: 30            # report at least this often (5-300)
+#   lease_ttl_seconds: 120                   # keep-awake lease lifetime (10-3600)
+
 # External MCP server (optional) — expose Nerve's tool registry to
 # external MCP clients (Codex, Claude Code, Cursor) over Streamable HTTP.
 # Off by default. Authentication reuses the gateway JWT

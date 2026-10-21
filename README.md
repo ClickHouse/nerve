@@ -308,6 +308,7 @@ See [docs/config.md](docs/config.md) for all options.
 | [Tasks](docs/tasks.md) | Task file format, escalation rules |
 | [Memory](docs/memory.md) | Memory file conventions, memU integration |
 | [Cron](docs/cron.md) | Job format, session modes, built-in crons |
+| [Platform Activity](docs/platform-activity.md) | Reporting turns, connections, the next scheduled task and keep-awake leases to a platform that parks idle machines |
 | [Plans](docs/plans.md) | Plan proposal, approval, and implementation workflow |
 | [Web UI](docs/web-ui.md) | Frontend architecture, building, development |
 
