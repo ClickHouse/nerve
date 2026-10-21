@@ -292,12 +292,40 @@ rather than bot autodetection, because bots are not reliably identifiable here:
 direction: an unlisted bot costs one extra wake, whereas a wrong autodetect
 would silently drop human feedback.
 
+### Forecasts
+
+A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
+answers "would this gate let the job run at `at`?" from what is known now. Nerve
+asks it to show what each job's next run will do — `GET /api/cron/schedule`,
+`nerve cron next`, and the **Forecast** column on the Cron page — and to work out
+when the instance next has work of its own (see [What runs next](#what-runs-next)).
+The gate is still checked for real when the run comes; a forecast only predicts
+that check.
+
+- A forecast has no side effects and never reaches the network: it may be asked
+  often.
+- By default a gate forecasts by evaluating itself now. That is exact for a gate
+  over local state, which cannot change on its own — only work the instance does
+  changes it, and that work is scheduled too and is followed by a fresh
+  forecast. `tasks` forecasts this way, and so does `messages`, which reads the
+  consumer's cursors without starting one.
+- `github_pr_activity` always forecasts a run: whether a PR moved is only known
+  by polling GitHub, which a forecast must not do.
+- A gate whose answer changes with elapsed time — an age threshold, a cooldown —
+  overrides `forecast` and reasons about `at`. So does a gate whose check writes
+  anything.
+
+A forecast that raises counts as the run going ahead, just as a check that
+raises lets the run proceed.
+
 ### Adding a built-in gate type
 
 Built-in gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`,
-set its `type`, implement `is_satisfied`, `describe`, and `from_config`, then
-register the class in `GATE_REGISTRY`. It becomes usable from `run_if`
-immediately. This is the right path for gates that ship with Nerve.
+set its `type`, implement `is_satisfied`, `describe`, and `from_config` (and
+`forecast`, when evaluating the gate now is not a side-effect-free, offline
+answer for a later run — see [Forecasts](#forecasts)), then register the class
+in `GATE_REGISTRY`. It becomes usable from `run_if` immediately. This is the
+right path for gates that ship with Nerve.
 
 ### Custom gate plugins (drop-in)
 
@@ -311,6 +339,8 @@ don't conflict when you pull Nerve upstream.
 
 ```python
 # <workspace>/config/cron/gates/stale_tasks.py
+from datetime import datetime
+
 from nerve.cron.gates import CronGate, GateContext
 
 
@@ -322,6 +352,10 @@ class StaleTasksGate(CronGate):
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
         # ctx exposes {job_id, db} — DB-only (see note below).
+        ...
+
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        # Tasks age: one too young now may be old enough at `at`.
         ...
 
     def describe(self) -> str:
@@ -340,7 +374,9 @@ run_if:
 ```
 
 A gate must implement the same three methods as a built-in (`is_satisfied`,
-`describe`, `from_config`).
+`describe`, `from_config`). It inherits `forecast`, which evaluates
+`is_satisfied` now; override it, as the example does, when the answer depends on
+elapsed time or the check writes anything (see [Forecasts](#forecasts)).
 
 **Rules** (a bad plugin never crashes the daemon — though it does cost the jobs
 that name its gate, see below):
@@ -425,6 +461,15 @@ nerve cron
 
 # Run a specific job manually
 nerve cron morning-briefing
+
+# What the running daemon will run next (see "What runs next"). A job that is
+# itself called "next" is run from the Cron page, or with
+# POST /api/cron/jobs/next/trigger.
+nerve cron next
+#   Next: 2026-03-02 09:00:00 UTC — digest (cron)
+#     JOB      NEXT RUN                 FORECAST
+#     planner  2026-03-02 08:00:00 UTC  skip — gate 'tasks' not satisfied (pending tasks exist)
+#     digest   2026-03-02 09:00:00 UTC  run
 
 # Check cron status
 nerve doctor
@@ -522,6 +567,53 @@ A run delayed beyond that is dropped rather than run very late, and recorded in
 A `missed` row never counts as a successful run, so it does not affect interval
 alignment or startup catch-up. A pause of the whole machine is not a late run:
 see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore).
+
+## What runs next
+
+`GET /api/cron/schedule` reports the next moment the instance will start work on
+its own, and what each job's next run is forecast to do. `nerve cron next` prints
+the same from the running daemon, and the Cron page shows each job's forecast in
+its card.
+
+```json
+{
+  "next": {"at": "2026-03-02T09:00:00+00:00", "name": "digest", "kind": "cron"},
+  "jobs": [
+    {"id": "planner", "next_run": "2026-03-02T08:00:00+00:00", "forecast": "skip",
+     "reason": "gate 'tasks' not satisfied (pending tasks exist)"},
+    {"id": "digest", "next_run": "2026-03-02T09:00:00+00:00", "forecast": "run", "reason": null},
+    {"id": "source:mail", "next_run": "2026-03-02T09:15:00+00:00", "forecast": "run", "reason": null}
+  ]
+}
+```
+
+`next` is the earliest of these, within the next 7 days:
+
+- the next run of each enabled cron job whose gates forecast that the run will
+  happen (see [Forecasts](#forecasts)) — a job forecast to skip its next run does
+  not count;
+- the next run of each source runner;
+- the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
+  with "Run later").
+
+Cleanup and the wakeup sweep are housekeeping and never count. `at` is in UTC;
+`kind` is `cron`, `source` or `wakeup`; `name` is the job id, `source:<name>`, or
+`wakeup:` with the first 8 characters of the session id — limited to letters,
+digits and `._:-` (anything else becomes `_`) and to 64 characters. `next` is
+`null` when nothing is due within 7 days.
+
+`jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
+for a job with a next run and `null` for one without (a disabled job, say);
+`reason` says why a run is forecast to be skipped.
+
+The forecast looks at each job's next run only, judged from what is known when
+you ask. Code that keeps the answer around can register a schedule listener
+(`CronService.add_schedule_listener`) to recompute it when it may have changed:
+after a start, a reload or a source reload; when a job or source run ends,
+including one a gate skipped; when a session wakeup is claimed; and when
+triggers move past a pause. A wakeup that a session records during its turn is
+not one of those events: it counts from the next time the schedule is read, for
+example when the turn ends.
 
 ## Source Runners
 

@@ -16,6 +16,8 @@ pulling Nerve upstream; the loader itself is generic and upstreamable.
 A plugin file looks like any other module defining a gate::
 
     # <workspace>/config/cron/gates/stale_tasks.py
+    from datetime import datetime
+
     from nerve.cron.gates import CronGate, GateContext
 
     class StaleTasksGate(CronGate):
@@ -26,6 +28,9 @@ A plugin file looks like any other module defining a gate::
 
         async def is_satisfied(self, ctx: GateContext) -> bool:
             ...                       # ctx gives {job_id, db} — DB-only
+
+        async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+            ...                       # a task too young now may be old enough at `at`
 
         def describe(self) -> str:
             return f"stale tasks older than {self.min_age_minutes}m"
@@ -45,6 +50,14 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
 * A gate gets only ``GateContext{job_id, db}`` (DB-only). A liveness/registry
   based gate is out of scope for this loader — it would need the context
   widened, a separate change.
+* A gate also answers ``forecast(ctx, at)``: what it would decide for a run at
+  ``at``, judged from what is known now. The cron service asks it to tell what
+  a job's next run will do and when the instance next has work of its own.
+  The inherited default evaluates ``is_satisfied`` now, which is right when the
+  check only reads local state. Override it when the answer changes with
+  elapsed time, like the age threshold above, or when ``is_satisfied`` writes
+  anything: a forecast must have no side effects and must not reach the
+  network.
 * Hot-reload: ``load_gate_plugins(dir, replace=True)`` (used by
   :meth:`nerve.cron.service.CronService.reload`) re-reads the directory from
   scratch — a *new* file is registered, an *edited* file's new code replaces the

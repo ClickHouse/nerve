@@ -1557,6 +1557,30 @@ person. Returns 404 for an unknown job.
 Response: { "job_id": "morning-briefing", "triggered": true }
 ```
 
+#### `GET /api/cron/schedule`
+The next moment the instance will start work on its own, and what each job's
+gates forecast for its next run, judged from what is known now. `next` is the
+earliest, within 7 days, of: the next run of each enabled cron job whose gates
+forecast that it will run, the next run of each source runner, and the earliest
+pending session wakeup — never the cleanup job or the wakeup sweep; `null` when
+nothing is due. `at` is UTC; `kind` is `cron`, `source` or `wakeup`; `name` is
+the job id, `source:<name>` or `wakeup:<first 8 characters of the session id>`,
+limited to `[A-Za-z0-9._:-]` and 64 characters. `jobs` has the jobs of
+`GET /api/cron/jobs`: `forecast` is `run` or `skip` for a job with a next run and
+`null` otherwise, and `reason` says why a skip. See
+[What runs next](cron.md#what-runs-next).
+
+```json
+Response: {
+  "next": { "at": "2026-03-02T09:00:00+00:00", "name": "digest", "kind": "cron" },
+  "jobs": [
+    { "id": "planner", "next_run": "2026-03-02T08:00:00+00:00", "forecast": "skip",
+      "reason": "gate 'tasks' not satisfied (pending tasks exist)" },
+    { "id": "digest", "next_run": "2026-03-02T09:00:00+00:00", "forecast": "run", "reason": null }
+  ]
+}
+```
+
 ### Health
 
 #### `GET /health`
