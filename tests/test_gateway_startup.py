@@ -269,6 +269,46 @@ async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, mon
 
 
 @pytest.mark.asyncio
+async def test_hosted_source_deliveries_are_handed_to_the_cron_service(harness, monkeypatch):
+    """With GitHub hosted, the runtime's source consumer calls the cron
+    service's delivery hook, which drains the records and runs the jobs
+    gated on them."""
+    import nerve.cron.service as cron_module
+    from nerve.config import GitHubSyncConfig, HostedChannelsConfig
+    from tests.fake_channel_gateway import FakeChannelGateway
+    from tests.test_hosted_channel_config import HOSTED
+
+    class Cron:
+        def __init__(self, config, engine, db):
+            self._jobs = []
+            self.notification_service = None
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def on_source_delivered(self, source):
+            pass
+
+    gateway = FakeChannelGateway(jwks_file=harness["config"].workspace.parent / "gateway-jwks.json")
+    harness["config"].sync.github = GitHubSyncConfig(mode="hosted")
+    harness["config"].channels.hosted = HostedChannelsConfig.from_dict(
+        {**HOSTED, "gateway_jwks_file": str(gateway.jwks_file)},
+    )
+    monkeypatch.setattr(cron_module, "CronService", Cron)
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        runtime = harness["server"]._hosted_channels
+        cron = harness["server"]._cron_service
+        assert runtime is not None and set(runtime.sources) == {"github"}
+        assert isinstance(cron, Cron)
+        assert runtime.sources["github"]._listener == cron.on_source_delivered
+
+
+@pytest.mark.asyncio
 async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkeypatch):
     """A reload can switch hosted Slack on only if its runtime exists."""
     import nerve.channels.hosted.runtime as hosted_module

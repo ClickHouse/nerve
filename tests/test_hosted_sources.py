@@ -9,12 +9,14 @@ service; only the agent turn is a stand-in.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -432,7 +434,12 @@ class Harness:
         return runner
 
 
-async def start(tmp_path, db, monkeypatch, *, slack: bool = False, github: bool = True, **settings: Any) -> Harness:
+async def start(
+    tmp_path, db, monkeypatch, *, slack: bool = False, github: bool = True,
+    config_getter: Callable[[], NerveConfig] | None = None, **settings: Any,
+) -> Harness:
+    """A hosted runtime on real streams. Its config getter returns this config
+    object unless *config_getter* is given (``get_config`` follows a reload)."""
     config = slack_hosted_config(tmp_path)
     if not slack:
         config.slack = SlackConfig()
@@ -446,7 +453,8 @@ async def start(tmp_path, db, monkeypatch, *, slack: bool = False, github: bool 
     engine.router = router
     gateway = FakeChannelGateway(jwks_file=config.channels.hosted.gateway_jwks_file)
     runtime = HostedChannelRuntime(
-        config, router, lambda: config, stream_timing=FAST_STREAM, reader_settings=FAST_READER, db=db,
+        config, router, config_getter or (lambda: config),
+        stream_timing=FAST_STREAM, reader_settings=FAST_READER, db=db,
     )
     await runtime.start()
     monkeypatch.setattr(gateway_server, "_hosted_channels", runtime)
@@ -607,6 +615,32 @@ class TestStreams:
         latest = (await hosted.subscriptions(4))[-1]
         assert latest["sources"][0]["filters"]["deny_reasons"] == ["subscribed", "comment"]
         assert "pr_watch" not in latest["sources"][0]
+
+    async def test_a_config_reload_publishes_the_reloaded_settings(self, tmp_path, db, monkeypatch):
+        harness = await start(
+            tmp_path, db, monkeypatch, config_getter=config_module.get_config, **GITHUB_DENY,
+        )
+        try:
+            await harness.stream()
+            await harness.subscriptions(1)
+            reloaded = copy.deepcopy(harness.config)
+            reloaded.sync.github.deny_reasons = ["subscribed", "comment"]
+            reloaded.sync.github.pr_watch = False
+            monkeypatch.setattr(config_module, "load_config", lambda config_dir=None: reloaded)
+            engine = SimpleNamespace(
+                get_channel_runtime={"hosted": harness.runtime}.get,
+                reload_mcp_config=AsyncMock(return_value=[]),
+            )
+
+            summary = await config_reload.reload_all(engine, None, tmp_path)
+
+            assert summary["subscriptions"] == "published on 1 stream(s)"
+            assert config_reload.reload_failures(summary) == {}
+            latest = (await harness.subscriptions(2))[-1]
+            assert latest["sources"][0]["filters"]["deny_reasons"] == ["subscribed", "comment"]
+            assert "pr_watch" not in latest["sources"][0]
+        finally:
+            await stop(harness)
 
     async def test_a_stalled_stream_does_not_hold_up_a_republish(self, hosted, monkeypatch, caplog):
         monkeypatch.setattr("nerve.channels.hosted.stream._SUBSCRIPTIONS_SEND_SECONDS", 0.2)
