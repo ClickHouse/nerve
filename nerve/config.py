@@ -2398,19 +2398,6 @@ class BackupConfig:
 
 
 DEFAULT_PLATFORM_ACTIVITY_SOCKET = "/run/nerve/guestd.sock"
-PLATFORM_ACTIVITY_INTERVAL_RANGE = (5, 300)
-PLATFORM_LEASE_TTL_RANGE = (10, 3600)
-
-
-def _int_within(value: object, default: int, bounds: tuple[int, int], label: str) -> int:
-    """Coerce an int setting and hold it inside ``bounds``, saying so when it moves."""
-    low, high = bounds
-    number = _lenient_int(value, default, label=label)
-    if low <= number <= high:
-        return number
-    held = min(max(number, low), high)
-    logger.warning("%s is %d, outside %d-%d. Using %d.", label, number, low, high, held)
-    return held
 
 
 @dataclass
@@ -2422,8 +2409,9 @@ class PlatformConfig:
     Nerve says how many turns run, how many clients are connected, when the
     next scheduled task is due, and which background work must keep the
     machine awake. Reporting is on only when ``activity_socket`` exists when
-    the gateway starts; ``""`` switches it off. Read once at startup. See
-    docs/platform-activity.md.
+    the gateway starts; ``""`` switches it off. Read once at startup. The
+    reporter holds the interval to 5-300 s and the lease lifetime to
+    10-3600 s. See docs/platform-activity.md.
     """
 
     # Resolved when the config is built, not when the class is defined, so a
@@ -2440,16 +2428,8 @@ class PlatformConfig:
         socket = str(d.get("activity_socket", DEFAULT_PLATFORM_ACTIVITY_SOCKET) or "").strip()
         return cls(
             activity_socket=os.path.expanduser(socket) if socket else "",
-            activity_interval_seconds=_int_within(
-                d.get("activity_interval_seconds"), 30,
-                PLATFORM_ACTIVITY_INTERVAL_RANGE,
-                "platform.activity_interval_seconds",
-            ),
-            lease_ttl_seconds=_int_within(
-                d.get("lease_ttl_seconds"), 120,
-                PLATFORM_LEASE_TTL_RANGE,
-                "platform.lease_ttl_seconds",
-            ),
+            activity_interval_seconds=d.get("activity_interval_seconds", 30),
+            lease_ttl_seconds=d.get("lease_ttl_seconds", 120),
         )
 
 

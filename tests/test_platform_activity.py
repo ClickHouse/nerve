@@ -266,16 +266,15 @@ def make_reporter(
     lease_ttl: int = 120,
 ) -> ActivityReporter:
     config = NerveConfig()
-    # Built directly: from_dict would hold the interval to its 5 s floor.
-    config.platform = PlatformConfig(
-        activity_socket=socket_path,
-        activity_interval_seconds=interval,
-        lease_ttl_seconds=lease_ttl,
-    )
-    return ActivityReporter(
+    config.platform = PlatformConfig(activity_socket=socket_path)
+    reporter = ActivityReporter(
         config, engine or FakeEngine(), db or FakeDb(), cron,
         connection_count=connections,
     )
+    # Faster than the settings allow, so the tests take seconds.
+    reporter.interval = interval
+    reporter.lease_ttl = lease_ttl
+    return reporter
 
 
 @pytest_asyncio.fixture
@@ -841,20 +840,28 @@ def test_an_empty_socket_setting_stays_empty(monkeypatch):
     assert home.activity_socket == os.path.expanduser("~/activity.sock")
 
 
-def test_platform_numbers_are_held_inside_their_bounds(caplog):
-    with caplog.at_level(logging.WARNING, logger="nerve.config"):
-        low = PlatformConfig.from_dict({"activity_interval_seconds": 1, "lease_ttl_seconds": 2})
-        high = PlatformConfig.from_dict(
-            {"activity_interval_seconds": 9000, "lease_ttl_seconds": 99999},
-        )
-    assert (low.activity_interval_seconds, low.lease_ttl_seconds) == (5, 10)
-    assert (high.activity_interval_seconds, high.lease_ttl_seconds) == (300, 3600)
-    assert any("platform.lease_ttl_seconds is 99999" in r.getMessage() for r in caplog.records)
-
+def test_platform_numbers_are_coerced_like_every_setting():
     from_env = PlatformConfig.from_dict(
         {"activity_interval_seconds": "60", "lease_ttl_seconds": "soon"},
     )
     assert (from_env.activity_interval_seconds, from_env.lease_ttl_seconds) == (60, 120)
+
+
+def test_the_reporter_holds_its_numbers_inside_their_bounds(caplog):
+    def built(interval: int, ttl: int) -> ActivityReporter:
+        config = NerveConfig()
+        config.platform = PlatformConfig.from_dict(
+            {"activity_socket": "", "activity_interval_seconds": interval, "lease_ttl_seconds": ttl},
+        )
+        return ActivityReporter(config, FakeEngine(), FakeDb(), None)
+
+    with caplog.at_level(logging.WARNING, logger="nerve.platform.activity"):
+        low, high, fine = built(1, 2), built(9000, 99999), built(60, 600)
+    assert (low.interval, low.lease_ttl) == (5, 10)
+    assert (high.interval, high.lease_ttl) == (300, 3600)
+    assert (fine.interval, fine.lease_ttl) == (60, 600)
+    assert sum("outside" in r.getMessage() for r in caplog.records) == 4
+    assert any("platform.lease_ttl_seconds is 99999" in r.getMessage() for r in caplog.records)
 
 
 def test_changing_the_platform_section_needs_a_restart():
@@ -1056,3 +1063,52 @@ async def test_a_finished_run_is_reported_with_the_task_after_it(fake_socket, re
     assert report["nextScheduledName"] == "weekly-review"
     assert report["nextScheduledAt"] == _rfc(now + timedelta(hours=2))
     assert fake_socket.report_times()[before] - finished < 0.2
+
+
+# --------------------------------------------------------------------------- #
+#  With the real engine                                                       #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_engines_turns_and_background_agents_reach_the_socket(fake_socket, reporters):
+    """The engine's own session manager and agent registry drive the reports
+    and the background lease."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from nerve.agent.backends import SystemEvent
+    from nerve.agent.engine import AgentEngine
+    from tests.actor_rows import mock_system_principal
+
+    config = MagicMock()
+    config.sessions.sticky_period_minutes = 5
+    config.agent.max_concurrent = 3
+    config.mcp_servers = []
+    engine_db = AsyncMock()
+    mock_system_principal(engine_db)
+    engine = AgentEngine(config, engine_db)
+
+    await started(reporters, make_reporter(fake_socket.path, engine=engine))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    engine.sessions.mark_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
+
+    await engine.agents.on_system_event("web:main", SystemEvent("task_started", {
+        "task_id": "bg1", "task_type": "local_bash", "description": "a long build",
+    }))
+    await fake_socket.wait_for(
+        lambda: ("POST", "/v1/leases", {"name": "nerve-background", "ttlSeconds": 120})
+        in fake_socket.lease_calls(),
+    )
+
+    engine.sessions.mark_not_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 0)
+    assert fake_socket.lease_calls()[-1][0] == "POST"  # the agent outlives the turn
+
+    await engine.agents.on_system_event("web:main", SystemEvent("task_notification", {
+        "task_id": "bg1", "status": "completed",
+    }))
+    await fake_socket.wait_for(lambda: fake_socket.lease_calls()[-1][:2] == (
+        "DELETE", "/v1/leases/nerve-background",
+    ))

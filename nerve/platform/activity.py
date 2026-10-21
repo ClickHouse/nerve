@@ -68,6 +68,10 @@ LEASE_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 NEXT_TASK_NAME_MAX_BYTES = 64
 _NEXT_TASK_NAME_REFUSED = re.compile(r"[^A-Za-z0-9._:-]")
 
+# Where platform.activity_interval_seconds and platform.lease_ttl_seconds
+# are held.
+ACTIVITY_INTERVAL_RANGE = (5, 300)
+LEASE_TTL_RANGE = (10, 3600)
 # Activity reports are coalesced: a burst of changes costs one post.
 REPORT_MIN_SPACING_SECONDS = 0.25
 # The socket is local; a request that takes longer is treated as failed.
@@ -211,6 +215,15 @@ class _FailureLog:
             logger.info("Platform activity socket: %s works again", self._what)
 
 
+def _held_within(value: int, bounds: tuple[int, int], setting: str) -> int:
+    """*value* held inside *bounds*, with a warning when it had to move."""
+    low, high = bounds
+    held = min(max(value, low), high)
+    if held != value:
+        logger.warning("%s is %d, outside %d-%d; using %d", setting, value, low, high, held)
+    return held
+
+
 def _rfc3339(at: datetime) -> str:
     """UTC, second precision. A naive time is taken as UTC."""
     if at.tzinfo is None:
@@ -283,8 +296,13 @@ class ActivityReporter:
     ) -> None:
         platform = config.platform
         self.socket_path = platform.activity_socket
-        self.interval = float(platform.activity_interval_seconds)
-        self.lease_ttl = int(platform.lease_ttl_seconds)
+        self.interval = float(_held_within(
+            platform.activity_interval_seconds, ACTIVITY_INTERVAL_RANGE,
+            "platform.activity_interval_seconds",
+        ))
+        self.lease_ttl = _held_within(
+            platform.lease_ttl_seconds, LEASE_TTL_RANGE, "platform.lease_ttl_seconds",
+        )
         self._engine = engine
         self._db = db
         self._cron = cron_service
