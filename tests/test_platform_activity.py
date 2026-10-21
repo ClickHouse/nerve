@@ -210,8 +210,15 @@ class FakeCron:
         self.tick = tick
         self.listeners: list[Callable[[], Any]] = []
         self.fail = False
+        # Forecasts asked for so far.
+        self.calls = 0
+        # While set to an event, a forecast does not finish before it is set.
+        self.hold: asyncio.Event | None = None
 
     async def next_scheduled(self, now: datetime | None = None, horizon: timedelta | None = None):
+        self.calls += 1
+        if self.hold is not None:
+            await self.hold.wait()
         if self.fail:
             raise RuntimeError("forecast broke")
         return self.tick
@@ -449,15 +456,20 @@ async def test_next_scheduled_task_is_reported_in_utc(fake_socket, reporters):
 
 
 @pytest.mark.asyncio
-async def test_a_failing_forecast_keeps_the_last_known_task(fake_socket, reporters):
+async def test_a_failing_forecast_keeps_the_last_known_task(fake_socket, reporters, caplog):
     cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
-    reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron))
     await fake_socket.wait_for(lambda: fake_socket.reports())
 
     cron.fail = True
-    reporter.notify()
-    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 2)
+    with caplog.at_level(logging.INFO, logger="nerve.platform.activity"):
+        cron.changed()
+        await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 2)
+    assert cron.calls == 2
     assert fake_socket.reports()[-1]["nextScheduledName"] == "digest"
+    # The forecast is the cron service's, not the socket's, and the log says so.
+    (failed,) = [r.getMessage() for r in caplog.records if "failed" in r.getMessage()]
+    assert failed.startswith("Activity reporter: forecast of the next scheduled task failed")
 
 
 @pytest.mark.asyncio
@@ -507,6 +519,112 @@ async def test_a_turn_start_is_reported_promptly(fake_socket, reporters):
     engine.sessions.mark_running("web:main")
     await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
     assert fake_socket.report_times()[-1] - began < 0.2
+
+
+@pytest.mark.asyncio
+async def test_a_turn_start_never_waits_for_a_forecast(fake_socket, reporters):
+    """A turn start goes out at once with the last forecast, even while a new
+    forecast is under way; the report with the new one follows it."""
+    engine = FakeEngine()
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    await started(reporters, make_reporter(fake_socket.path, engine=engine, cron=cron))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    await asyncio.sleep(0.3)  # past the coalescing window of the first report
+
+    cron.hold = asyncio.Event()  # forecasts take until the test lets them finish
+    cron.tick = tick(datetime(2026, 10, 22, 5, 0, tzinfo=UTC), "weekly-review")
+    cron.changed()
+    await fake_socket.wait_for(lambda: cron.calls == 2)
+
+    began = asyncio.get_running_loop().time()
+    engine.sessions.mark_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
+    assert fake_socket.report_times()[-1] - began < 0.2
+    assert fake_socket.reports()[-1]["nextScheduledName"] == "digest"
+
+    cron.hold.set()
+    await fake_socket.wait_for(
+        lambda: fake_socket.reports()[-1]["nextScheduledName"] == "weekly-review",
+    )
+    assert fake_socket.reports()[-1]["runningTurns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_forecast_is_made_again_only_when_it_may_have_changed(fake_socket, reporters):
+    """A schedule change and the end of a turn (which may have scheduled a
+    wakeup) forecast again; a turn start or a client connecting reuses the
+    last forecast."""
+    engine = FakeEngine()
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    connections: list[str] = []
+    reporter = await started(reporters, make_reporter(
+        fake_socket.path, engine=engine, cron=cron, connections=lambda: len(connections),
+    ))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert cron.calls == 1
+
+    engine.sessions.mark_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
+    connections.append("browser")
+    reporter.notify()
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["activeSessions"] == 1)
+    assert cron.calls == 1
+
+    # The turn scheduled a wakeup: the report at its end already names it.
+    cron.tick = tick(datetime(2026, 10, 22, 1, 0, tzinfo=UTC), "wakeup:0f3a9c2e", "wakeup")
+    engine.sessions.mark_not_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 0)
+    assert fake_socket.reports()[-1]["nextScheduledName"] == "wakeup:0f3a9c2e"
+    assert cron.calls == 2
+
+    cron.tick = None
+    cron.changed()
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["nextScheduledAt"] is None)
+    assert cron.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_report_forecasts_again(fake_socket, reporters):
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron, interval=0.3))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    # What runs next changed, and nobody said so.
+    cron.tick = tick(datetime(2026, 10, 22, 4, 0, tzinfo=UTC), "weekly-review")
+    await fake_socket.wait_for(
+        lambda: fake_socket.reports()[-1]["nextScheduledName"] == "weekly-review",
+    )
+
+
+@pytest.mark.asyncio
+async def test_changes_during_a_slow_forecast_cannot_hold_reports_back(fake_socket, reporters):
+    """A report waits for the forecast under way. When that finishes, the
+    report goes out before a forecast wanted meanwhile starts."""
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    connections: list[str] = []
+    reporter = await started(reporters, make_reporter(
+        fake_socket.path, cron=cron, connections=lambda: len(connections),
+    ))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    held = cron.hold = asyncio.Event()
+    cron.changed()
+    await fake_socket.wait_for(lambda: cron.calls == 2)
+    connections.append("browser")
+    reporter.notify()
+    cron.changed()  # wants another forecast while this one is under way
+    await asyncio.sleep(0.3)
+    assert len(fake_socket.reports()) == 1  # the report waits for the forecast
+
+    cron.hold = asyncio.Event()  # the next forecast is slow too
+    cron.tick = tick(datetime(2026, 10, 22, 4, 0, tzinfo=UTC), "weekly-review")
+    held.set()
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) == 2)
+    assert fake_socket.reports()[-1]["activeSessions"] == 1
+    assert fake_socket.reports()[-1]["nextScheduledName"] == "weekly-review"
+    await fake_socket.wait_for(lambda: cron.calls == 3)  # started after that report
+    cron.hold.set()
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) == 3)
 
 
 @pytest.mark.asyncio
@@ -653,6 +771,41 @@ async def test_a_pause_renews_leases_at_the_next_wake(fake_socket, reporters, mo
         )
 
 
+def test_one_failed_renewal_cannot_let_the_shortest_lease_lapse():
+    """A renewal falls due at half the lifetime. If it times out, its retry
+    still reaches the socket before the platform's copy runs out, even for
+    the shortest lifetime allowed."""
+    shortest = activity.LEASE_TTL_RANGE[0]
+    reporter = make_reporter("", lease_ttl=shortest)
+    retried_at = shortest / 2 + activity.REQUEST_TIMEOUT_SECONDS + reporter._retry_delay()
+    assert retried_at < shortest
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_that_times_out_is_retried_before_the_lease_runs_out(
+    fake_socket, reporters, monkeypatch,
+):
+    """The same, scaled down: a 4 s lease is renewed after 2 s, the renewal
+    has no answer within 0.5 s, and its retry reaches the socket before the
+    4 s are up."""
+    monkeypatch.setattr(activity, "REQUEST_TIMEOUT_SECONDS", 0.5)
+    await started(reporters, make_reporter(fake_socket.path, lease_ttl=4))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    def upserts() -> list[float]:
+        return [r.at for r in fake_socket.requests if (r.method, r.path) == ("POST", "/v1/leases")]
+
+    with keep_awake(LEASE_BACKUP):
+        await fake_socket.wait_for(lambda: len(upserts()) == 1)
+        fake_socket.delays["POST /v1/leases"] = 1.0  # the renewal is answered too late
+        await fake_socket.wait_for(lambda: len(upserts()) == 2, timeout=4)
+        fake_socket.delays.clear()  # and its retry at once
+        await fake_socket.wait_for(lambda: len(upserts()) == 3, timeout=4)
+    taken, renewed, retried = upserts()[:3]
+    assert renewed - taken == pytest.approx(2, abs=0.3)
+    assert retried - taken < 4  # before the platform's copy ran out
+
+
 def test_keep_awake_refuses_a_name_the_socket_would_refuse():
     with pytest.raises(ValueError), keep_awake("has space"):
         pass
@@ -715,6 +868,35 @@ async def test_a_socket_that_refuses_the_task_name_gets_reports_without_it(fake_
         ]
         assert len(said) == 1 and said[0].levelno == logging.INFO
         assert not [r for r in caplog.records if "activity report failed" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_a_socket_that_refuses_every_report_gets_each_one_once(fake_socket, reporters):
+    """A report refused without the task's name too is not refused for the
+    name: later reports go out once each until the socket takes one."""
+    fake_socket.status["POST /v1/activity"] = 400
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    # The first report, then once more without the name.
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 2)
+
+    for count in range(3, 8):
+        reporter.notify()
+        await fake_socket.wait_for(lambda count=count: len(fake_socket.reports()) >= count)
+    await asyncio.sleep(0.3)
+    assert len(fake_socket.reports()) == 7  # two for the first report, one for each other
+
+    # Once the socket takes a report, the one after it has the name again.
+    fake_socket.status.clear()
+    for count in (8, 9):
+        reporter.notify()
+        await fake_socket.wait_for(lambda count=count: len(fake_socket.reports()) >= count)
+    await asyncio.sleep(0.3)
+    reports = fake_socket.reports()
+    assert len(reports) == 9
+    assert reports[0]["nextScheduledName"] == "digest"
+    assert not any("nextScheduledName" in report for report in reports[1:8])
+    assert reports[8]["nextScheduledName"] == "digest"
 
 
 @pytest.mark.asyncio
@@ -1037,7 +1219,7 @@ async def test_reports_follow_the_cron_services_forecast(fake_socket, reporters,
     )
 
     await reporter.stop()
-    assert reporter.notify not in cron_service._schedule_listeners
+    assert reporter._on_schedule_changed not in cron_service._schedule_listeners
 
 
 @pytest.mark.asyncio

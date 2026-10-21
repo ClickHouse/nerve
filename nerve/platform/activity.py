@@ -16,7 +16,10 @@ What is sent:
   will actually run, as the cron service forecasts it). Sent when something
   changes (a turn starts or ends, a client connects or leaves, the schedule
   changes, a workflow run finishes), at most once every 250 ms, and every
-  ``platform.activity_interval_seconds``.
+  ``platform.activity_interval_seconds``. The forecast is made again when
+  the schedule changes, when a turn ends and for the periodic report, and
+  those reports wait for it; the other reports reuse the last one, so a turn
+  start is never held up by a forecast.
 * Keep-awake leases for background work that is not a turn
   (``POST /v1/leases``, renewed every half ``platform.lease_ttl_seconds``,
   ``DELETE /v1/leases/<name>`` when the work ends). Work takes one with
@@ -80,8 +83,9 @@ REQUEST_TIMEOUT_SECONDS = 2.0
 SCHEDULE_TIMEOUT_SECONDS = 5.0
 # Bound on releasing leases and the last report at shutdown.
 STOP_TIMEOUT_SECONDS = 3.0
-# A lease request that failed is tried again after this long (or half the
-# lease lifetime, if that is shorter).
+# A lease request that failed is tried again after this long, or after a
+# quarter of the lease lifetime if that is shorter: a renewal (due at half the
+# lifetime) that times out still gets its retry in before the lease runs out.
 LEASE_RETRY_SECONDS = 5.0
 # A failure that keeps happening is logged at DEBUG at most this often.
 REPEAT_FAILURE_LOG_SECONDS = 300.0
@@ -189,10 +193,11 @@ def held_leases() -> set[str]:
 class _FailureLog:
     """Logs a kind of request that fails: at INFO the first time, then at
     DEBUG at most every :data:`REPEAT_FAILURE_LOG_SECONDS`, and at INFO
-    again once it works."""
+    again once it works. Each line starts with *source*, what failed."""
 
-    def __init__(self, what: str) -> None:
+    def __init__(self, what: str, source: str = "Platform activity socket") -> None:
         self._what = what
+        self._source = source
         self._failing = False
         self._last_logged = -math.inf
 
@@ -202,17 +207,17 @@ class _FailureLog:
             self._failing = True
             self._last_logged = now
             logger.info(
-                "Platform activity socket: %s failed (%s); repeats are logged "
-                "at debug level", self._what, detail,
+                "%s: %s failed (%s); repeats are logged at debug level",
+                self._source, self._what, detail,
             )
         elif now - self._last_logged >= REPEAT_FAILURE_LOG_SECONDS:
             self._last_logged = now
-            logger.debug("Platform activity socket: %s failed (%s)", self._what, detail)
+            logger.debug("%s: %s failed (%s)", self._source, self._what, detail)
 
     def succeeded(self) -> None:
         if self._failing:
             self._failing = False
-            logger.info("Platform activity socket: %s works again", self._what)
+            logger.info("%s: %s works again", self._source, self._what)
 
 
 def _held_within(value: int, bounds: tuple[int, int], setting: str) -> int:
@@ -320,18 +325,31 @@ class ActivityReporter:
         # A turn started since the last report. A turn that starts and ends
         # inside one coalescing window is still reported as running once.
         self._turn_started = False
-        # The cron service's last answer, kept for when it fails.
+        # What runs next may have changed: forecast it again, then report.
+        self._forecast_wanted = False
+        # The forecast under way, if any (see _start_forecast).
+        self._forecast: asyncio.Task | None = None
+        # A forecast finished and no report has gone out since.
+        self._forecast_unreported = False
+        # The cron service's last answer. Every report sends it; a failed
+        # forecast leaves it as it was.
         self._next_tick: ScheduledTick | None = None
         # Leases the socket may hold, by name.
         self._leases: dict[str, _Lease] = {}
         self._last_post = -math.inf
         # Whether the socket takes nextScheduledName (see _post_activity).
         self._send_task_name = True
+        # The socket refused a report even without the name, and has taken
+        # none since (see _post_activity).
+        self._refused_without_name = False
 
         self._activity_failures = _FailureLog("activity report")
         self._lease_failures = _FailureLog("keep-awake lease")
-        self._schedule_failures = _FailureLog("next scheduled task")
-        self._loop_failures = _FailureLog("reporting")
+        # Neither of these is the socket's doing.
+        self._schedule_failures = _FailureLog(
+            "forecast of the next scheduled task", "Activity reporter",
+        )
+        self._loop_failures = _FailureLog("reporting", "Activity reporter")
 
     @property
     def active(self) -> bool:
@@ -370,7 +388,6 @@ class ActivityReporter:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         self._subscribe()
-        self._report_wanted = True  # the first report goes out at once
         self._task = asyncio.create_task(self._run(), name="platform-activity-reporter")
         logger.info(
             "Reporting activity to the platform's local activity socket at %s "
@@ -397,6 +414,10 @@ class ActivityReporter:
         task, self._task = self._task, None
         if task is not None:
             await stop_background_task(task, None, "Activity reporter", timeout=1.0)
+        forecast = self._forecast
+        if forecast is not None:
+            # The last report keeps the last forecast that finished.
+            await stop_background_task(forecast, None, "Activity reporter forecast", timeout=1.0)
         if self._client is None:
             return
         try:
@@ -411,7 +432,8 @@ class ActivityReporter:
     def notify(self) -> None:
         """Ask for an activity report soon (coalesced).
 
-        Safe from any thread; never raises; does nothing while inactive.
+        The report reuses the last forecast of the next scheduled task. Safe
+        from any thread; never raises; does nothing while inactive.
         """
         self._wake_up(report=True)
 
@@ -439,7 +461,7 @@ class ActivityReporter:
     #  Triggers                                                           #
     # ------------------------------------------------------------------ #
 
-    def _wake_up(self, *, report: bool) -> None:
+    def _wake_up(self, *, report: bool = False, forecast: bool = False) -> None:
         loop, wake = self._loop, self._wake
         if loop is None or wake is None or self._stopped:
             return
@@ -447,6 +469,8 @@ class ActivityReporter:
         def _set() -> None:
             if report:
                 self._report_wanted = True
+            if forecast:
+                self._forecast_wanted = True
             wake.set()
 
         try:
@@ -481,13 +505,22 @@ class ActivityReporter:
 
         cron = self._cron
         if cron is not None:
-            cron.add_schedule_listener(self.notify)
-            self._undo.append(lambda: cron.remove_schedule_listener(self.notify))
+            cron.add_schedule_listener(self._on_schedule_changed)
+            self._undo.append(lambda: cron.remove_schedule_listener(self._on_schedule_changed))
 
     def _on_running_changed(self, _session_id: str, running: bool) -> None:
         if running:
+            # Reported at once, with the last forecast: the platform derives
+            # "something ran" from a turn start.
             self._turn_started = True
-        self.notify()
+            self._wake_up(report=True)
+        else:
+            # The turn may have scheduled a wakeup: forecast again, then report.
+            self._wake_up(forecast=True)
+
+    def _on_schedule_changed(self) -> None:
+        """The cron service's schedule listener: forecast again, then report."""
+        self._wake_up(forecast=True)
 
     # ------------------------------------------------------------------ #
     #  The loop                                                           #
@@ -497,25 +530,68 @@ class ActivityReporter:
         loop = asyncio.get_running_loop()
         wake = self._wake
         assert wake is not None
-        next_report = loop.time()
+        next_report = loop.time()  # the first report, with a forecast, at once
         while True:
             await self._wait(wake, min(next_report, self._next_lease_request()) - loop.time())
             wake.clear()
             try:
                 await self._sync_leases()
-                if self._report_wanted or loop.time() >= next_report:
+                if loop.time() >= next_report:
+                    # The periodic report goes out with a fresh forecast: a
+                    # new one, unless one is under way or has just finished.
+                    if self._forecast is None and not self._forecast_unreported:
+                        self._forecast_wanted = True
+                    next_report = loop.time() + self.interval
+                self._start_forecast()
+                if self._report_wanted and self._may_report():
                     spacing = self._last_post + REPORT_MIN_SPACING_SECONDS - loop.time()
                     if spacing > 0:
-                        # Changes that arrive meanwhile join this report.
+                        # Changes that arrive meanwhile join this report; a
+                        # turn that ended meanwhile gets its forecast first.
                         await asyncio.sleep(spacing)
-                    self._report_wanted = False
-                    await self._post_activity(await self._snapshot())
-                    next_report = loop.time() + self.interval
+                        self._start_forecast()
+                    if self._may_report():
+                        self._report_wanted = False
+                        self._forecast_unreported = False
+                        await self._post_activity(await self._snapshot())
+                        next_report = loop.time() + self.interval
+                        self._start_forecast()  # one wanted since the last began
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — the loop outlives any one report
                 self._loop_failures.failed(f"{type(e).__name__}: {e}")
                 next_report = loop.time() + self.interval
+
+    def _may_report(self) -> bool:
+        """A report waits for the forecast under way, unless a turn started
+        since the last report: that goes out at once."""
+        return self._turn_started or self._forecast is None
+
+    def _start_forecast(self) -> None:
+        """Forecast the next scheduled task, if wanted and none is under way.
+
+        The forecast runs beside the loop, so a slow one never holds up the
+        report of a turn start. The report that waits for it follows it, and
+        goes out before the next forecast starts: a stream of changes cannot
+        hold reports back for longer than one forecast.
+        """
+        if not self._forecast_wanted or self._forecast is not None or self._forecast_unreported:
+            return
+        self._forecast_wanted = False
+        if self._cron is None:
+            self._report_wanted = True  # nothing to forecast
+            return
+        self._forecast = asyncio.create_task(
+            self._refresh_forecast(), name="platform-activity-forecast",
+        )
+
+    async def _refresh_forecast(self) -> None:
+        try:
+            await self._next_scheduled()
+        finally:
+            self._forecast = None
+            self._forecast_unreported = True
+            self._wake_up(report=True)
 
     @staticmethod
     async def _wait(wake: asyncio.Event, timeout: float) -> None:
@@ -529,15 +605,14 @@ class ActivityReporter:
     # ------------------------------------------------------------------ #
 
     async def _snapshot(self) -> dict[str, Any]:
-        """The activity report to send now."""
+        """The activity report to send now, with the last forecast."""
         turn_started, self._turn_started = self._turn_started, False
         running = await self._running_turns()
         if turn_started and running == 0:
             # The turn is already over: report it once, then the truth.
             running = 1
             self.notify()
-        tick = await self._next_scheduled()
-        return self._body(running, self._active_sessions(), tick)
+        return self._body(running, self._active_sessions(), self._next_tick)
 
     @staticmethod
     def _body(running: int, sessions: int, tick: ScheduledTick | None) -> dict[str, Any]:
@@ -549,7 +624,7 @@ class ActivityReporter:
         }
 
     async def _post_activity(self, body: dict[str, Any]) -> bool:
-        if not self._send_task_name:
+        if not self._send_task_name or self._refused_without_name:
             body = {key: value for key, value in body.items() if key != _TASK_NAME_KEY}
         self._last_post = asyncio.get_running_loop().time()
         response = await self._request("POST", ACTIVITY_ROUTE, body, self._activity_failures)
@@ -569,7 +644,13 @@ class ActivityReporter:
                     "reporting times only (%s)", _error_detail(response),
                 )
                 return True
+            # Not taken without the name either, so the name is not what the
+            # socket refuses. Until it takes a report, each report goes out
+            # once, without the name (the form any socket takes); the report
+            # after the one it takes carries the name again.
+            self._refused_without_name = True
         if response.is_success:
+            self._refused_without_name = False
             self._activity_failures.succeeded()
             return True
         self._activity_failures.failed(_error_detail(response))
@@ -644,7 +725,7 @@ class ActivityReporter:
         return asyncio.get_running_loop().time() >= lease.due or _wall_time() >= lease.due_wall
 
     def _retry_delay(self) -> float:
-        return min(LEASE_RETRY_SECONDS, self.lease_ttl / 2)
+        return min(LEASE_RETRY_SECONDS, self.lease_ttl / 4)
 
     async def _sync_leases(self) -> None:
         wanted = self._wanted_leases()

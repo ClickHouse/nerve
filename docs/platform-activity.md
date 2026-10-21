@@ -62,6 +62,12 @@ A report is sent:
 - once more at shutdown, saying nothing runs and nobody is connected. The next
   scheduled task is kept, because it is still due after a restart.
 
+The next scheduled task is forecast again when the cron schedule changes, when
+a turn ends (the turn may have scheduled a wakeup), and for the periodic
+report. Those reports wait for the forecast, which normally takes
+milliseconds. Every other report, such as a turn start or a client connecting,
+reuses the last forecast, so a turn start is never held up by one.
+
 ## Keep-awake leases
 
 Background work that is not a turn holds a named lease while it runs. The
@@ -116,8 +122,9 @@ two-second timeout). The first failure of each kind (reports, leases, the
 forecast) is logged at INFO. Repeats are logged at DEBUG at most every five
 minutes, and recovery is logged at INFO again. Nothing is raised into the work
 being reported on. If the reporter itself fails to start, the gateway keeps
-running without it. A failed lease request is tried again after a few
-seconds.
+running without it. A failed lease request is tried again after five seconds,
+or after a quarter of the lease lifetime if that is shorter. So a renewal that
+fails, even by timing out, is retried before the lease runs out.
 
 If the cron forecast fails, the last known next task is reported again.
 
@@ -125,7 +132,9 @@ A socket that does not know `nextScheduledName` refuses the field with a 400,
 and with it the whole report. On a 400 the report is sent once more without
 the name. If that is taken, every later report leaves the name out until the
 gateway restarts, and one INFO line says so ("activity socket does not accept
-task names; reporting times only").
+task names; reporting times only"). If it is refused as well, the name was not
+the reason. Each later report is then sent once, without the name, until the
+socket takes one, and the report after that has the name again.
 
 ## Switching it off
 
