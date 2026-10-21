@@ -117,6 +117,8 @@ class FakeLoom:
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/whoami":
             self.whoami_calls += 1
+            if self.whoami_status == 0:
+                raise httpx.ConnectError("connection refused")
             if self.whoami_status != 200:
                 return httpx.Response(self.whoami_status, json={"detail": "Not Found"})
             if not self.authenticated:
@@ -418,6 +420,17 @@ async def test_unresolvable_identity_is_an_outage_naming_each_step(make_bridge) 
         await bridge.recall("again")
     assert fake.whoami_calls == calls  # remembered, not looked up on every call
     assert fake.bodies("memory.search") == []
+
+
+@pytest.mark.asyncio
+async def test_unreachable_loom_is_reported_as_such(make_bridge) -> None:
+    fake = FakeLoom(whoami_status=0)  # the lookup cannot connect
+    bridge = await make_bridge(fake)
+    assert bridge.available  # boot does not fail on it
+    with pytest.raises(MemoryBackendUnavailable) as err:
+        await bridge.recall("anything")
+    assert "cannot reach Loom at http://loom.test" in str(err.value)
+    assert "ConnectError" in str(err.value)
 
 
 @pytest.mark.asyncio

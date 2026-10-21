@@ -499,7 +499,10 @@ class LoomBridge:
         try:
             ident = await self._identity()
         except MemoryBackendUnavailable as e:
-            logger.warning("Loom memory backend at %s: %s; retrying on first use", base_url, e)
+            logger.warning(
+                "Loom memory backend at %s is not usable yet (retried on first use): %s",
+                base_url, e,
+            )
         else:
             logger.info(
                 "Loom memory backend at %s: org %s, namespace %s (from %s), agent %s",
@@ -583,8 +586,12 @@ class LoomBridge:
         if org and namespace:
             return LoomIdentity(org, namespace, (namespace,), "config")
         tried: list[str] = []
+        unreachable: list[str] = []
         for source in ("whoami", "token"):
-            claims = await self._whoami(tried) if source == "whoami" else self._token_claims(tried)
+            if source == "whoami":
+                claims = await self._whoami(tried, unreachable)
+            else:
+                claims = self._token_claims(tried)
             if claims is None:
                 continue
             names = tuple(n for n in (_usable(x) for x in claims.get("namespaces") or ()) if n)
@@ -596,14 +603,21 @@ class LoomBridge:
                 "GET /v1/whoami named no usable org or namespace"
                 if source == "whoami" else "the token names no usable org or namespace"
             )
+        if unreachable:
+            # Loom is down rather than misconfigured: say that first.
+            raise MemoryBackendUnavailable(
+                f"memory backend unavailable: cannot reach Loom at {self._base_url} to learn "
+                f"the org and namespace ({unreachable[0]}); setting memory.loom.org and "
+                "memory.loom.namespace skips the lookup"
+            )
         raise MemoryBackendUnavailable(
             "memory backend unavailable: cannot tell which Loom org and namespace to use: "
             + "; ".join(tried)
             + f". Set memory.loom.org and memory.loom.namespace (or {LOOM_ORG_ENV} "
-            f"and {LOOM_NAMESPACE_ENV})."
+            f"and {LOOM_NAMESPACE_ENV})"
         )
 
-    async def _whoami(self, tried: list[str]) -> dict[str, Any] | None:
+    async def _whoami(self, tried: list[str], unreachable: list[str]) -> dict[str, Any] | None:
         client = self._client
         if client is None:
             tried.append("the HTTP client is not running")
@@ -615,6 +629,7 @@ class LoomBridge:
             )
         except httpx.RequestError as e:
             tried.append(f"GET /v1/whoami failed ({type(e).__name__})")
+            unreachable.append(type(e).__name__)
             return None
         if resp.status_code != 200:
             tried.append(f"GET /v1/whoami answered HTTP {resp.status_code}")
