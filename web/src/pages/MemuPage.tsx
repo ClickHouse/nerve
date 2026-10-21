@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo } from 'react';
 import {
   Database, Search, Plus, X, Pencil, Trash2, ChevronDown, ChevronRight,
-  FileText, Clock, Circle, History,
+  FileText, Clock, Circle, History, ExternalLink,
 } from '../components/ui/icons';
 import { Badge, Button, IconButton, Select, TextArea, TextField } from '../components/ui';
 import { useMemoryStore, type Category, type MemoryItem, type Resource, type TabView } from '../stores/memoryStore';
@@ -758,8 +758,8 @@ function Sidebar({ inDrawer = false, onSelect }: {
 // --- Main Page ---
 
 export function MemuPage() {
-  const { loading, available, items, categories, resources, activeTab, searchQuery,
-    load, setActiveTab, setSearchQuery } = useMemoryStore();
+  const { loading, available, backend, dashboardUrl, items, categories, resources, activeTab,
+    searchQuery, load, setActiveTab, setSearchQuery } = useMemoryStore();
 
   useEffect(() => { load(); }, [load]);
 
@@ -788,6 +788,30 @@ export function MemuPage() {
   }
 
   if (loading) return <div className="flex-1 flex items-center justify-center text-text-faint">Loading...</div>;
+
+  // This page reads memU's database; with the Loom backend, Loom's own
+  // dashboard is where the memory is browsed.
+  if (!available && backend === 'loom') {
+    return (
+      <div className="flex-1 flex items-center justify-center text-text-faint">
+        <div className="text-center">
+          <Database size={32} className="mx-auto mb-3 text-text-faint" />
+          <div>Memory is kept in Loom</div>
+          <div className="text-xs text-text-faint mt-1">This page browses memU, which this instance does not use</div>
+          {dashboardUrl && (
+            <a
+              href={dashboardUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs mt-3 text-text-secondary underline-offset-2 hover:underline"
+            >
+              Open the Loom dashboard <ExternalLink size={11} />
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (!available) {
     return (
