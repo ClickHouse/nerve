@@ -66,6 +66,9 @@ from urllib.parse import quote, unquote
 from nerve.config import NerveConfig
 from nerve.mcp_gateway import (
     POLICY_REFUSED,
+    RETRY_LATER,
+    SERVER_FAULT,
+    UPSTREAM_TIMEOUT_MESSAGE,
     GatewayCallError,
     McpGatewayCatalog,
     McpGatewayServer,
@@ -179,10 +182,21 @@ _BATCH_MAX_BYTES = 128 * 1024
 _DEFERRED_BATCH_MAX_MESSAGES = 400
 _DEFERRED_BATCH_MAX_BYTES = 768 * 1024
 _BATCH_MIN_BYTES = 16 * 1024
+_BATCH_MIN_MESSAGES = 10
+# A batch Loom keeps failing on its side (a fault, -32000, it does not name as
+# passing) is isolated after this many failures in a row: cut in halves while
+# the halves fail, down to one message, which is skipped (with an audit row)
+# once Loom has extracted something else since: a fault on every batch is an
+# outage, not a bad batch.
+_BATCH_FAULTS_BEFORE_ISOLATING = 3
+_BATCH_FAULTS_MAX = 1024
 # Turns of the previous batch handed to the next as context (Loom's cap is
 # 20), each clipped: they only resolve references, they are not extracted.
+# Each takes at most a 64th of the batch budget (at least 256 bytes), so the
+# context shrinks with the batches.
 _CONTEXT_MESSAGES = 10
 _CONTEXT_MAX_BYTES = 2000
+_CONTEXT_MIN_BYTES = 256
 # Batches Loom accepted, remembered so a retried window does not queue the
 # same extraction twice (in this process).
 _ACCEPTED_TTL_S = 24 * 3600
@@ -227,6 +241,16 @@ class LoomToolRefused(MemoryBackendUnavailable):
     """The gateway's policy refused a tool (JSON-RPC ``-32001``): Loom, or
     this one tool, is not enabled for the agent, or no credential works.
     Another Loom tool may still be allowed."""
+
+
+class LoomServerFault(MemoryBackendUnavailable):
+    """Loom answered with a fault of its own (JSON-RPC ``-32000``) that it
+    does not name as passing: the same request may fail the same way."""
+
+
+class LoomUpstreamTimeout(MemoryBackendUnavailable):
+    """The gateway gave up waiting for Loom (its call limit,
+    ``MCP_GATEWAY_CALL_TIMEOUT``); Loom may still finish the call."""
 
 
 @dataclass(frozen=True)
@@ -483,6 +507,10 @@ class LoomMemory:
         self._defer = bool(self._cfg.defer_extraction)
         self._batch_max_messages = _DEFERRED_BATCH_MAX_MESSAGES if self._defer else _BATCH_MAX_MESSAGES
         self._batch_max_bytes = _DEFERRED_BATCH_MAX_BYTES if self._defer else _BATCH_MAX_BYTES
+        # Batches Loom failed on its side: digest -> (failures, first at).
+        self._batch_faults: dict[str, tuple[int, float]] = {}
+        # When Loom last extracted a batch.
+        self._extract_ok_at = float("-inf")
         # The last health probe: what the Diagnostics page shows.
         self._health: dict[str, Any] = {}
         self._health_at = 0.0
@@ -715,6 +743,10 @@ class LoomMemory:
         if e.status == 413:
             # A body over the limit of the gateway in front of Loom.
             return LoomRequestError(op, 413, "PAYLOAD_TOO_LARGE", str(e))
+        if e.code == RETRY_LATER and e.rpc_message == UPSTREAM_TIMEOUT_MESSAGE:
+            return LoomUpstreamTimeout(f"memory backend unavailable: {e}")
+        if e.code == SERVER_FAULT and not any(code in e.rpc_message for code in _TRANSIENT_CODES):
+            return LoomServerFault(f"memory backend unavailable: {e}")
         if e.code is not None and not e.retryable:
             # A JSON-RPC error the same call gets again (invalid params,
             # method not served): a bug, not an outage.
@@ -912,37 +944,51 @@ class LoomMemory:
             turn["timestamp"] = _iso_utc(stamp)
         return turn
 
-    def _next_batch(self, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """The leading turns that make one batch within the current budget,
-        each cut to fit it; never empty."""
+    def _next_batch(self, turns: list[dict[str, Any]], cap: int | None = None) -> list[dict[str, Any]]:
+        """The leading turns that make one batch within the current budget
+        (and at most ``cap`` turns), each cut to fit it; never empty."""
         limit = self._batch_max_bytes
+        most = min(self._batch_max_messages, cap) if cap else self._batch_max_messages
         batch: list[dict[str, Any]] = []
         size = 0
         for turn in turns:
             fitted = _fit_turn(turn, limit - 1024)
             turn_size = _json_size(fitted) + 1
-            if batch and (len(batch) >= self._batch_max_messages or size + turn_size > limit):
+            if batch and (len(batch) >= most or size + turn_size > limit):
                 break
             batch.append(fitted)
             size += turn_size
         return batch
 
-    def _shrink_batches(self) -> bool:
-        """Halve the byte budget of a batch after the gateway refused one as
-        too large; False when it is at the minimum already."""
-        if self._batch_max_bytes <= _BATCH_MIN_BYTES:
+    def _shrink_batches(self, why: str) -> bool:
+        """Halve the budget of a batch, bytes and messages, for the rest of
+        the process; False when it is at the minimum already."""
+        if self._batch_max_bytes <= _BATCH_MIN_BYTES and self._batch_max_messages <= _BATCH_MIN_MESSAGES:
             return False
         self._batch_max_bytes = max(_BATCH_MIN_BYTES, self._batch_max_bytes // 2)
+        self._batch_max_messages = max(_BATCH_MIN_MESSAGES, self._batch_max_messages // 2)
         logger.warning(
-            "The MCP gateway refused an extraction batch as too large; batches "
-            "are now at most %d bytes", self._batch_max_bytes,
+            "%s; extraction batches are now at most %d messages in %d bytes",
+            why, self._batch_max_messages, self._batch_max_bytes,
         )
         return True
 
-    @staticmethod
-    def _context(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _isolation_start(self, digest: str, isolating_since: float | None) -> float | None:
+        """Count a fault of a batch; when Loom failed it often enough (or a
+        larger batch around it is being isolated already), when its failures
+        began, else None."""
+        count, first = self._batch_faults.get(digest, (0, time.monotonic()))
+        if len(self._batch_faults) >= _BATCH_FAULTS_MAX and digest not in self._batch_faults:
+            self._batch_faults.pop(next(iter(self._batch_faults)))
+        self._batch_faults[digest] = (count + 1, first)
+        if isolating_since is not None:
+            return isolating_since
+        return first if count + 1 >= _BATCH_FAULTS_BEFORE_ISOLATING else None
+
+    def _context(self, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """The context a following batch gets: the last turns, kept short."""
-        return [_fit_turn(turn, _CONTEXT_MAX_BYTES) for turn in turns[-_CONTEXT_MESSAGES:]]
+        each = min(_CONTEXT_MAX_BYTES, max(_CONTEXT_MIN_BYTES, self._batch_max_bytes // 64))
+        return [_fit_turn(turn, each) for turn in turns[-_CONTEXT_MESSAGES:]]
 
     @staticmethod
     def _observation_date(turns: list[dict[str, Any]]) -> str:
@@ -969,12 +1015,17 @@ class LoomMemory:
         return result if isinstance(result, dict) else {}
 
     async def _memorize_conversation(self, session_id: str, all_turns: list[dict[str, Any]]) -> bool:
-        batches = sent = written = 0
+        batches = sent = written = skipped = 0
         queue_ids: list[str] = []
         context: list[dict[str, Any]] = []
         start = 0
+        # While a batch Loom keeps failing is isolated: at most this many
+        # turns a batch, until past it.
+        cap: int | None = None
+        isolating_since: float | None = None
+        isolate_until = 0
         while start < len(all_turns):
-            turns = self._next_batch(all_turns[start:])
+            turns = self._next_batch(all_turns[start:], cap)
             digest = hashlib.sha256(
                 json.dumps([session_id, turns], ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ).hexdigest()
@@ -982,25 +1033,65 @@ class LoomMemory:
                 try:
                     data = await self._send_window(session_id, turns, context)
                 except LoomRequestError as e:
-                    if e.status == 413 and self._shrink_batches():
+                    if e.status == 413 and self._shrink_batches(
+                        "The MCP gateway refused an extraction batch as too large",
+                    ):
                         continue  # the same turns again, in smaller batches
                     raise
+                except LoomUpstreamTimeout:
+                    # Loom may still finish this batch; the window goes again
+                    # with the next sweep, in batches that fit the gateway's
+                    # call limit.
+                    self._shrink_batches("The MCP gateway gave up waiting for an extraction")
+                    raise
+                except LoomServerFault as e:
+                    since = self._isolation_start(digest, isolating_since)
+                    if since is None:
+                        raise  # the next sweep tries it again
+                    if isolating_since is None:
+                        isolating_since, isolate_until = since, start + len(turns)
+                    if len(turns) > 1:
+                        cap = max(1, len(turns) // 2)
+                        continue  # the same turns again, in halves
+                    if self._extract_ok_at <= isolating_since:
+                        raise  # Loom extracted nothing meanwhile: an outage
+                    await self._skip_turn(session_id, turns[0], e)
+                    skipped += 1
+                    cap = None  # the rest in whole batches again
+                else:
+                    sent += 1
+                    self._extract_ok_at = time.monotonic()
+                    self._batch_faults.pop(digest, None)
+                    written += len(data.get("written") or [])
+                    if data.get("queue_id"):  # queued: by request, or Loom deferred it
+                        queue_ids.append(str(data["queue_id"]))
                 self._remember_accepted(digest)
-                sent += 1
-                written += len(data.get("written") or [])
-                if data.get("queue_id"):  # queued: by request, or Loom deferred it
-                    queue_ids.append(str(data["queue_id"]))
             batches += 1
             context = self._context(turns)
             start += len(turns)
+            if cap is not None and start >= isolate_until:
+                cap, isolating_since = None, None
         details: dict[str, Any] = {
             "message_count": len(all_turns), "batches": batches, "sent": sent,
             "facts_written": written,
         }
         if queue_ids:
             details["queue_ids"] = queue_ids
+        if skipped:
+            details["skipped"] = skipped
         await self._audit("conversation_indexed", "resource", session_id, details)
         return True
+
+    async def _skip_turn(self, session_id: str, turn: dict[str, Any], error: Exception) -> None:
+        """Give up on one message Loom keeps failing on, so the rest of the
+        window is extracted: logged, and an audit row names it (not its
+        text)."""
+        logger.warning(
+            "Loom keeps failing on one message of session %s (%s); it is skipped", session_id, error,
+        )
+        await self._audit("conversation_turn_skipped", "resource", session_id, {
+            "role": turn.get("role"), "timestamp": turn.get("timestamp"), "error": str(error)[:300],
+        })
 
     def _was_accepted(self, digest: str) -> bool:
         accepted_at = self._accepted.get(digest)

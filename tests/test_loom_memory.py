@@ -116,6 +116,8 @@ class FakeGateway:
         self.search_memory: dict | None = None
         # Where the catalog says Loom is served.
         self.loom_path = "/s/loom/mcp"
+        # Extraction batches Loom fails with a fault of its own (-32000).
+        self.refuse_batch = None
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -162,6 +164,8 @@ class FakeGateway:
                     "structuredContent": body,
                 })
             return failure
+        if name == "loom_memory_set_from_messages" and self.refuse_batch and self.refuse_batch(arguments):
+            return rpc_error(-32000, "tool execution failed")
         if name == "loom_op":
             return _structured(message["id"], self.op(arguments["op"], arguments.get("arguments") or {}))
         return _structured(message["id"], self.tool(name, arguments))
@@ -412,6 +416,69 @@ async def test_a_replaced_client_is_closed_when_its_last_call_ends(make_memory) 
     assert old in memory._retired and old._client is not None
     await memory._release(old)
     assert old not in memory._retired and old._client is None
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_timeout_shrinks_the_batches(make_memory) -> None:
+    """The gateway gave up after its call limit while Loom may still finish
+    the batch: the window goes again with the next sweep, in batches half as
+    large, so it fits the limit."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    messages = _messages(150, datetime(2026, 10, 18, tzinfo=UTC))
+    gateway.fail("loom_memory_set_from_messages", rpc_error(-32002, "MCP server timed out"))
+    with pytest.raises(MemoryBackendUnavailable, match="timed out"):
+        await memory.memorize_conversation("sess-1", messages)
+    assert (memory._batch_max_messages, memory._batch_max_bytes) == (50, 64 * 1024)
+    assert await memory.memorize_conversation("sess-1", messages) is True
+    assert [len(b["messages"]) for b in gateway.queued] == [50, 50, 50]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_loom_keeps_failing_is_isolated_and_its_message_skipped(make_memory) -> None:
+    """One message Loom always fails on (its model provider refuses it, say)
+    must not hold the rest of the window back forever: after three sweeps
+    the batch is halved down to that message, which is skipped."""
+    audit = AuditDb()
+    gateway = FakeGateway()
+    gateway.refuse_batch = lambda a: any(m["content"] == "message 150" for m in a["messages"])
+    memory = await make_memory(gateway, audit_db=audit)
+    messages = _messages(300, datetime(2026, 10, 18, tzinfo=UTC))
+    for _ in range(2):  # a fault may pass: the window is offered again
+        with pytest.raises(MemoryBackendUnavailable, match="tool execution failed"):
+            await memory.memorize_conversation("sess-1", messages)
+    assert await memory.memorize_conversation("sess-1", messages) is True
+    extracted = {m["content"] for b in gateway.queued for m in b["messages"]}
+    assert extracted == {f"message {n}" for n in range(300)} - {"message 150"}
+    skipped = [row for row in audit.rows if row[0] == "conversation_turn_skipped"]
+    assert [row[4]["timestamp"] for row in skipped] == ["2026-10-18T02:30:00Z"]
+    assert "message 150" not in json.dumps(skipped)  # never the text
+    assert audit.rows[-1][4]["skipped"] == 1
+    calls = len(gateway.args("loom_memory_set_from_messages"))
+    assert calls < 20  # halving, not one message at a time
+
+
+@pytest.mark.asyncio
+async def test_a_fault_on_every_batch_is_an_outage_and_skips_nothing(make_memory) -> None:
+    audit = AuditDb()
+    gateway = FakeGateway()
+    gateway.refuse_batch = lambda a: True
+    memory = await make_memory(gateway, audit_db=audit)
+    messages = _messages(40, datetime(2026, 10, 18, tzinfo=UTC))
+    for _ in range(4):
+        with pytest.raises(MemoryBackendUnavailable, match="tool execution failed"):
+            await memory.memorize_conversation("sess-1", messages)
+    assert not any(row[0] == "conversation_turn_skipped" for row in audit.rows)
+
+
+@pytest.mark.asyncio
+async def test_the_context_turns_shrink_with_the_batches(make_memory) -> None:
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    memory._batch_max_bytes, memory._batch_max_messages = 16 * 1024, 10
+    await memory.memorize_conversation("s", _messages(30, datetime.now(UTC), content="z" * 3000))
+    context = gateway.queued[1]["last_messages"]
+    assert context and all(len(json.dumps(t).encode()) <= 256 for t in context)
 
 
 @pytest.mark.asyncio
@@ -854,7 +921,7 @@ async def test_a_batch_too_large_for_the_gateway_is_halved(make_memory) -> None:
     sizes = [len(a["messages"]) for a in gateway.args("loom_memory_set_from_messages")]
     assert sizes[0] > sizes[1] and sum(sizes[1:]) == 60
     assert memory._batch_max_bytes == 64 * 1024
-    memory._batch_max_bytes = 16 * 1024  # at the minimum: the refusal stands
+    memory._batch_max_bytes, memory._batch_max_messages = 16 * 1024, 10  # the minimum: it stands
     gateway.fail("loom_memory_set_from_messages", httpx.Response(413, json={"reason": "too_large"}))
     with pytest.raises(LoomRequestError, match="PAYLOAD_TOO_LARGE"):
         await memory.memorize_conversation("sess-2", messages)

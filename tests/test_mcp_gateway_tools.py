@@ -118,6 +118,7 @@ async def test_jsonrpc_errors(code, retryable) -> None:
         await _server(recorder).call_tool("search", {"query": "q"})
     assert err.value.code == code and err.value.retryable is retryable
     assert "MCP server unavailable" in str(err.value)
+    assert err.value.rpc_message == "MCP server unavailable"  # as received
 
 
 @pytest.mark.asyncio

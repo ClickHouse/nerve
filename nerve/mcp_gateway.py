@@ -230,6 +230,10 @@ TOOL_CALL_PROTOCOL_VERSION = "2025-06-18"
 POLICY_REFUSED = -32001
 RETRY_LATER = -32002
 SERVER_FAULT = -32000
+# The gateway's fixed message for an upstream call that ran past its call
+# limit (MCP_GATEWAY_CALL_TIMEOUT, two minutes by default); the upstream may
+# still finish the call.
+UPSTREAM_TIMEOUT_MESSAGE = "MCP server timed out"
 
 
 class GatewayCallError(Exception):
@@ -240,8 +244,9 @@ class GatewayCallError(Exception):
     ``reason`` the gateway's reason code for a response without a JSON-RPC
     message. ``retryable`` says whether the same call may succeed later;
     ``timed_out`` that the request was sent and no answer came in time (the
-    gateway was reached; the upstream may still be working on it). The
-    message never holds an argument or a credential.
+    gateway was reached; the upstream may still be working on it);
+    ``rpc_message`` the JSON-RPC error's message as received. The message
+    never holds an argument or a credential.
     """
 
     def __init__(
@@ -254,6 +259,7 @@ class GatewayCallError(Exception):
         retryable: bool = False,
         retry_after: float | None = None,
         timed_out: bool = False,
+        rpc_message: str = "",
     ):
         super().__init__(message)
         self.code = code
@@ -262,6 +268,7 @@ class GatewayCallError(Exception):
         self.retryable = retryable
         self.retry_after = retry_after
         self.timed_out = timed_out
+        self.rpc_message = rpc_message
 
 
 @dataclass(frozen=True)
@@ -407,6 +414,7 @@ class McpGatewayServer:
                 status=response.status_code,
                 retryable=code in (RETRY_LATER, SERVER_FAULT) or response.status_code == 429,
                 retry_after=_retry_after(response),
+                rpc_message=text,
             )
         if response.status_code != 200 or not isinstance(message, dict):
             reason = ""
