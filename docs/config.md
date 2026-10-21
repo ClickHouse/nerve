@@ -1805,7 +1805,8 @@ Nerve's MCP server, and not to external MCP clients. When the session gets the
 `loom` server, the system prompt gets a section that names Loom's tools and
 explains home and shared namespaces (shared memories are read-only for the
 agent, which proposes a change instead of editing), write verdicts and
-abstentions; when it does not, a short section says memory cannot be used.
+abstentions; when it does not, a short section says memory cannot be used,
+and the Codex backend's note names no memory tools either.
 A workspace, its bundled skills and its built-in jobs set up while Loom is the
 backend, or by `nerve init --memory-backend loom`, are worded for Loom's
 tools (`nerve/memory/loom_prompts.py`); a `system.yaml` written for memU runs

@@ -139,6 +139,32 @@ def test_the_codex_note_names_loom_tools_under_loom() -> None:
     loom = _backend_notes("loom")
     assert "memorize" not in loom and "memory_recall" not in loom
     assert "`loom` MCP server" in loom
+    without = _backend_notes("loom", memory_tools=False)
+    assert "memorize" not in without and "loom" not in without
+    assert "Nerve's tools (task_*" in without
+
+
+def test_the_codex_note_follows_the_catalog(tmp_path: Path) -> None:
+    """Loom's tools in the note only for a client that gets the `loom`
+    server from the gateway's catalog (external mode)."""
+    from types import SimpleNamespace
+
+    from nerve.agent.backends.base import SessionSpec
+    from nerve.agent.backends.codex.backend import CodexBackend
+    from nerve.config import McpServerConfig
+
+    config = NerveConfig.from_dict({"workspace": str(tmp_path), "memory": {"backend": "loom"}})
+    servers: list = []
+    deps = SimpleNamespace(config=lambda: config, managed_mcp=True, external_mcp_servers=lambda: servers)
+    spec = SessionSpec(
+        session_id="s1", source="web", model=None, effort="", system_prompt="PROMPT", cwd=str(tmp_path),
+    )
+    backend = CodexBackend(deps)
+    assert "`loom` MCP server" not in backend.thread_params(spec)["developerInstructions"]
+    servers.append(McpServerConfig(name="loom", type="http", url="http://192.0.2.1:3130/s/loom/mcp"))
+    assert "`loom` MCP server" in backend.thread_params(spec)["developerInstructions"]
+    deps.managed_mcp = False  # local mode: no catalog reaches the client
+    assert "`loom` MCP server" not in backend.thread_params(spec)["developerInstructions"]
 
 
 # --------------------------------------------------------------------------- #

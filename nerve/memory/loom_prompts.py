@@ -122,6 +122,13 @@ CODEX_NOTE_EDIT = (
     ),
 )
 
+# The same line for a session that gets no `loom` server: no memory tools.
+CODEX_NOTE_NO_TOOLS = (
+    "- Nerve's tools (task_*, notify, ask_user, skills, schedule_wakeup, ...) are\n"
+    "  provided by the `nerve` MCP server — call them as `mcp__nerve__<name>` /\n"
+    "  however your harness names MCP tools."
+)
+
 # What external agents (Claude Code, Codex on this machine) are told in place
 # of the call to Nerve's session_context, which is not served under Loom.
 EXTERNAL_AGENT_MEMORY = """\
