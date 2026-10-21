@@ -175,16 +175,19 @@ class MessagesGate(CronGate):
         return await ctx.db.consumer_has_unread(self.consumer)
 
     async def forecast(self, ctx: GateContext, at: datetime) -> bool:
-        """:meth:`is_satisfied` without its one write.
+        """:meth:`is_satisfied` at *at*, without its one write.
 
         With explicit ``sources``, the check starts a missing or expired cursor
         at the source's newest message, so that source has nothing unread. The
-        forecast reads the cursor instead and gives the same answer for it.
+        forecast reads the cursor instead and gives the same answer for it —
+        as the cursor will be at *at*: one that is live now but expires before
+        then (``sync.consumer_cursor_ttl_days`` after it last moved) counts as
+        expired.
         """
         if not self.sources:
             return await ctx.db.consumer_has_unread(self.consumer)
         for source in self.sources:
-            cursor_seq = await ctx.db.peek_consumer_cursor(self.consumer, source)
+            cursor_seq = await ctx.db.peek_consumer_cursor(self.consumer, source, as_of=at)
             if cursor_seq is None:
                 continue  # the check would start it at the newest message
             if await ctx.db.get_source_max_rowid(source) > cursor_seq:

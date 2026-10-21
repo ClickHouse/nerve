@@ -99,6 +99,20 @@ async def test_a_messages_gate_forecast_sees_unread_messages(db):
 
 
 @pytest.mark.asyncio
+async def test_a_messages_gate_forecast_sees_its_cursor_expire_before_the_run(db):
+    """When the run comes, an expired cursor starts again at the newest message,
+    so the check finds nothing unread there."""
+    await db.insert_source_messages([_record("m1")], source="mail")
+    await db.set_consumer_cursor("inbox", "mail", 0, ttl_days=1)
+    gate = MessagesGate(sources=["mail"], consumer="inbox")
+    now = datetime.now(UTC)
+
+    assert await gate.forecast(_ctx(db), now + timedelta(hours=3)) is True
+    assert await gate.forecast(_ctx(db), now + timedelta(days=2)) is False
+    assert await db.peek_consumer_cursor("inbox", "mail") == 0  # still live now
+
+
+@pytest.mark.asyncio
 async def test_the_github_gate_forecasts_a_run_without_polling(tmp_path, monkeypatch):
     spawned = AsyncMock(side_effect=AssertionError("no process may be started"))
     monkeypatch.setattr(gates_module.asyncio, "create_subprocess_exec", spawned)

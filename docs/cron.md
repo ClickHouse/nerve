@@ -307,8 +307,9 @@ that check.
 - By default a gate forecasts by evaluating itself now. That is exact for a gate
   over local state, which cannot change on its own — only work the instance does
   changes it, and that work is scheduled too and is followed by a fresh
-  forecast. `tasks` forecasts this way, and so does `messages`, which reads the
-  consumer's cursors without starting one.
+  forecast. `tasks` forecasts this way. `messages` reads the consumer's cursors
+  without starting one, and takes a cursor that will have expired by `at` as
+  expired, since the check will find it so then.
 - `github_pr_activity` always forecasts a run: whether a PR moved is only known
   by polling GitHub, which a forecast must not do.
 - A gate whose answer changes with elapsed time — an age threshold, a cooldown —
