@@ -1,22 +1,27 @@
-"""The onboarding conversation: its state, its start and its end.
+"""The onboarding: its state, its start and its end.
 
-After setup, the agent is set up by talking to it. :func:`start` opens one web
-chat session for that and gives the agent a hidden first message
+After setup in the browser, the agent is set up by talking to it (the
+``conversation`` kind). :func:`start` opens one web chat session for that and
+gives the agent a hidden first message
 (:func:`nerve.agent.prompts.onboarding_prompt`), so the agent speaks first and
 the person sees only its answer. The agent calls the ``onboarding_done`` tool
 after the person confirmed the setup and the agent applied it
 (:func:`complete`). A person can skip onboarding on the setup page
 (:func:`skip`).
 
-The state is the ``onboarding`` row (migration v060) plus two rules for
-installs from before it:
+A worker set up without the browser (``nerve init --terminal`` or
+``--non-interactive``) with a task description gets the ``autonomous`` kind
+(:func:`request_autonomous`): at the next daemon start with a model
+credential, one session without a person reads the description and sets the
+worker up (:func:`nerve.agent.prompts.worker_onboarding_prompt`), then calls
+``onboarding_done`` too.
 
-- A worker whose ``TASK.md`` no longer carries the onboarding marker is done.
-- A worker whose ``TASK.md`` still carries it is pending, and the daemon opens
-  the conversation when it starts.
+The state is the ``onboarding`` row (migration v060). Without a row, the kind
+is ``conversation``, and a worker whose ``TASK.md`` no longer carries the
+onboarding marker is done (installs from before the row).
 
 :func:`read_state` gives one of ``not_applicable`` (no mode chosen), ``pending``,
-``running``, ``done`` or ``skipped``.
+``running``, ``done`` or ``skipped``, and the kind.
 """
 
 from __future__ import annotations
@@ -51,8 +56,11 @@ PENDING = "pending"
 RUNNING = "running"
 DONE = "done"
 SKIPPED = "skipped"
-# Stored only: setup finished while a restart was pending (reads as pending).
+# Stored only: the next daemon start opens the onboarding (reads as pending).
 REQUESTED = "requested"
+
+CONVERSATION = "conversation"
+AUTONOMOUS = "autonomous"
 
 SESSION_TITLE = "Onboarding"
 
@@ -76,6 +84,7 @@ class OnboardingState:
     session_id: str | None = None
     #: The stored ``(status, session_id)``, for a compare-and-set write.
     stored: tuple[str | None, str | None] = (None, None)
+    kind: str = CONVERSATION
 
 
 def _task_md(workspace: Path) -> Path:
@@ -97,14 +106,15 @@ async def read_state(db: "Database", workspace: Path) -> OnboardingState:
         return OnboardingState(NOT_APPLICABLE)
     row = await db.get_onboarding()
     stored = (row["status"], row["session_id"]) if row else (None, None)
+    kind = (row or {}).get("kind") or CONVERSATION
     status, session_id = stored
     if status in (DONE, SKIPPED):
-        return OnboardingState(status, session_id, stored)
+        return OnboardingState(status, session_id, stored, kind)
     if mode == "worker" and not await asyncio.to_thread(_worker_task_pending, workspace):
-        return OnboardingState(DONE, session_id, stored)
+        return OnboardingState(DONE, session_id, stored, kind)
     if status == RUNNING and session_id and await db.get_session(session_id):
-        return OnboardingState(RUNNING, session_id, stored)
-    return OnboardingState(PENDING, None, stored)
+        return OnboardingState(RUNNING, session_id, stored, kind)
+    return OnboardingState(PENDING, None, stored, kind)
 
 
 def _prompt_inputs(workspace: Path, mode: str) -> tuple[str, str]:
@@ -134,16 +144,22 @@ async def start(
     *,
     actor,
     cause: "ActorOrId | None",
+    kind: str = CONVERSATION,
 ) -> OnboardingState:
-    """Open the onboarding conversation if it is pending. Idempotent.
+    """Open the onboarding if it is pending. Idempotent.
+
+    ``kind`` ``conversation`` opens a web chat with a hidden first message;
+    ``autonomous`` runs the worker's onboarding session without a person,
+    with its prompt in the transcript, as a ``cron`` source (the backend and
+    model of scheduled jobs).
 
     Starts in this process run one at a time, and the claim of the row is a
     compare-and-set from the state that was read, so there is one session
     for each opening. The agent's first turn runs in the background. When
     that turn fails (a model error), the row goes back to ``requested``:
-    the next Finish or daemon start opens a new conversation.
+    the next Finish or daemon start opens a new one.
     """
-    from nerve.agent.prompts import onboarding_prompt
+    from nerve.agent.prompts import onboarding_prompt, worker_onboarding_prompt
 
     db = engine.db
     async with _start_lock():
@@ -153,27 +169,33 @@ async def start(
         session_id = f"onboarding-{uuid.uuid4().hex[:8]}"
         actor_id = actor_id_of(cause)
         if not await db.set_onboarding(
-            RUNNING, session_id=session_id, actor_id=actor_id, expect=state.stored,
+            RUNNING, session_id=session_id, actor_id=actor_id, expect=state.stored, kind=kind,
         ):
             return await read_state(db, workspace)
+        source = "web" if kind == CONVERSATION else "cron"
         await engine.sessions.get_or_create(
-            session_id, title=SESSION_TITLE, source="web", actor=actor, cause=cause,
+            session_id, title=SESSION_TITLE, source=source, actor=actor, cause=cause,
         )
     mode = workspace_mode(Path(workspace)) or "personal"
     description, guide = await asyncio.to_thread(_prompt_inputs, workspace, mode)
+    if kind == CONVERSATION:
+        prompt = onboarding_prompt(
+            mode, description, guide, memory_backend=engine.config.memory.backend,
+        )
+    else:
+        prompt = worker_onboarding_prompt(description, guide, engine.config.memory.backend)
 
     async def _first_turn() -> None:
         try:
             with engine.watch_turns(session_id) as turn:
                 await engine.run(
                     session_id=session_id,
-                    user_message=onboarding_prompt(
-                        mode, description, guide, memory_backend=engine.config.memory.backend,
-                    ),
-                    source="web",
-                    # Nerve composes this message; ``internal`` keeps it out
-                    # of the transcript, so the agent's answer opens the chat.
-                    internal=True,
+                    user_message=prompt,
+                    source=source,
+                    # Nerve composes this message. In the conversation,
+                    # ``internal`` keeps it out of the transcript, so the
+                    # agent's answer opens the chat.
+                    internal=kind == CONVERSATION,
                     actor=db.system_actor,
                 )
             failed = turn.outcome is not None and turn.outcome.status == "failed"
@@ -189,47 +211,87 @@ async def start(
     register = getattr(engine, "register_task", None)
     if register:
         register(session_id, task)
-    logger.info("Onboarding: conversation %s opened (%s)", session_id, mode)
-    return OnboardingState(RUNNING, session_id, (RUNNING, session_id))
+    logger.info("Onboarding: %s %s opened (%s)", kind, session_id, mode)
+    return OnboardingState(RUNNING, session_id, (RUNNING, session_id), kind)
 
 
 async def request(db: "Database", workspace: Path, *, actor_id: str | None) -> OnboardingState:
-    """Ask the next daemon start to open the conversation (a restart is pending)."""
+    """Ask the next daemon start to open the conversation (a restart is pending).
+
+    Setup in the browser asks for a conversation, also when ``nerve init``
+    asked for the autonomous kind before.
+    """
     state = await read_state(db, workspace)
-    if state.status == PENDING and state.stored[0] != REQUESTED:
-        await db.set_onboarding(REQUESTED, session_id=None, actor_id=actor_id, expect=state.stored)
+    if state.status == PENDING and (state.stored[0] != REQUESTED or state.kind != CONVERSATION):
+        await db.set_onboarding(
+            REQUESTED, session_id=None, actor_id=actor_id, expect=state.stored, kind=CONVERSATION,
+        )
     return state
 
 
-async def start_on_boot(engine: "AgentEngine", workspace: Path) -> OnboardingState | None:
-    """Open the conversation at daemon start when setup asked for it.
+def _task_description(workspace: Path) -> str:
+    """The description in a worker's pending ``TASK.md``, else ``""``. Blocking file I/O."""
+    try:
+        text = _task_md(workspace).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return (task_description_from(text) or "").strip()
 
-    That is a ``requested`` row, or a worker whose ``TASK.md`` still carries
-    the marker and that never had a conversation. Nothing opens without a
-    model credential, as at Finish. The session's cause is the person who
-    finished setup, when known, else the system actor. The gateway calls
-    this once at start-up; one-shot CLI engines do not.
+
+async def request_autonomous(db: "Database", workspace: Path) -> bool:
+    """Ask the next daemon start for the autonomous onboarding. True when asked.
+
+    For a worker that ``nerve init --terminal`` or ``--non-interactive`` set
+    up with a task description, and only while onboarding has no row. A
+    worker without a description waits for the conversation in the web UI.
+    """
+    if workspace_mode(Path(workspace)) != "worker":
+        return False
+    if not await asyncio.to_thread(_task_description, workspace):
+        return False
+    return await db.set_onboarding(
+        REQUESTED, session_id=None, actor_id=None, expect=(None, None), kind=AUTONOMOUS,
+    )
+
+
+def request_autonomous_sync(config) -> bool:
+    """:func:`request_autonomous` on a new connection, for ``nerve init``."""
+    from nerve import paths
+    from nerve.db import Database
+
+    async def _request() -> bool:
+        db = Database(paths.db_path(), workspace=config.workspace)
+        await db.connect()
+        try:
+            return await request_autonomous(db, Path(config.workspace))
+        finally:
+            await db.close()
+
+    return asyncio.run(_request())
+
+
+async def start_on_boot(engine: "AgentEngine", workspace: Path) -> OnboardingState | None:
+    """Open the onboarding at daemon start when a ``requested`` row asks for it.
+
+    A conversation (setup finished while a restart was pending), or the
+    autonomous onboarding of a worker that ``nerve init`` set up. Nothing
+    opens without a model credential, as at Finish. The session's cause is
+    the person who finished setup, when known, else the system actor. The
+    gateway calls this once at start-up; one-shot CLI engines do not.
     """
     try:
         if not engine.config.credential_available():
             return None
         state = await read_state(engine.db, workspace)
-        if state.status != PENDING:
-            return None
-        status = state.stored[0]
-        legacy_worker = (
-            status is None and workspace_mode(Path(workspace)) == "worker"
-            and _task_md(workspace).exists()
-        )
-        if status != REQUESTED and not legacy_worker:
+        if state.status != PENDING or state.stored[0] != REQUESTED:
             return None
         row = await engine.db.get_onboarding()
         return await start(
             engine, workspace, actor=engine.db.system_actor,
-            cause=(row or {}).get("actor_id") or engine.db.system_actor,
+            cause=(row or {}).get("actor_id") or engine.db.system_actor, kind=state.kind,
         )
     except Exception:
-        logger.exception("Onboarding: could not open the conversation at start-up")
+        logger.exception("Onboarding: could not open the onboarding at start-up")
         return None
 
 
@@ -249,12 +311,14 @@ def _remove_task_marker(workspace: Path) -> None:
 async def complete(
     db: "Database", workspace: Path, session_id: str, *, actor_id: str | None,
 ) -> bool:
-    """Mark onboarding done from its own conversation. False otherwise.
+    """Mark onboarding done from its own session. False otherwise.
 
-    For a worker, also removes the marker line from ``TASK.md``.
+    For a worker, also removes the marker line from ``TASK.md``. The stored
+    row decides, so a session that removed the marker itself can still mark
+    onboarding done.
     """
     state = await read_state(db, workspace)
-    if state.status != RUNNING or state.session_id != session_id:
+    if state.stored != (RUNNING, session_id):
         return False
     if not await db.set_onboarding(
         DONE, session_id=session_id, actor_id=actor_id, expect=state.stored,

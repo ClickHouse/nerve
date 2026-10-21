@@ -20,8 +20,10 @@ import yaml
 from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.backends.codex.backend import _BACKEND_NOTES, _backend_notes
 from nerve.agent.prompts import (
+    _ONBOARDING_STEPS,
     build_system_prompt,
     onboarding_prompt,
+    worker_onboarding_prompt,
 )
 from nerve.config import MemoryConfig, NerveConfig
 from nerve.external_agents.registry import FileTarget
@@ -122,6 +124,15 @@ def test_without_loom_tools_the_prompt_says_memory_cannot_be_used(tmp_path: Path
     )
     assert loom_prompts.NO_TOOLS_SECTION in prompt
     assert loom_prompts.SYSTEM_PROMPT_SECTION not in prompt and "loom_search" not in prompt
+
+
+def test_onboarding_saves_to_loom_under_loom() -> None:
+    memu = worker_onboarding_prompt("Watch the build.", "guide")
+    assert memu == worker_onboarding_prompt("Watch the build.", "guide", "memu")
+    assert _ONBOARDING_STEPS in memu
+    loom = worker_onboarding_prompt("Watch the build.", "guide", "loom")
+    assert "`loom_memory_set`" in loom and "- what you saved to Loom." in loom
+    assert "`memorize`" not in loom and "what you memorized" not in loom
 
 
 def test_the_onboarding_conversation_saves_to_loom_under_loom() -> None:

@@ -256,6 +256,9 @@ class Facts:
     #: worker's ``TASK.md``, see :func:`onboarding_from_task`).
     onboarding: str = "not_applicable"
     onboarding_session_id: str | None = None
+    #: ``conversation`` (a web chat with a person) or ``autonomous`` (one
+    #: session without a person, for a worker set up by ``nerve init``).
+    onboarding_kind: str = "conversation"
     #: The caller's name: an account's display name, or the actor header's.
     display_name: str | None = None
     #: Live channel → process cache → ST → None (resolved by the caller).
@@ -935,6 +938,7 @@ def _mode_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str]:
         "task_present": (ws / "TASK.md").exists(),
         "onboarding": facts.onboarding,
         "onboarding_session_id": facts.onboarding_session_id,
+        "onboarding_kind": facts.onboarding_kind,
     }
     summary = {"personal": "Personal assistant", "worker": "Worker"}.get(mode or "", "")
     return detail, summary

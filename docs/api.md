@@ -260,7 +260,8 @@ Response: {
       "etag": "…", "summary": "Personal assistant",
       "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
       "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
-                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null } },
+                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null,
+                  "onboarding_kind": "conversation" } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
       "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort xhigh",
@@ -690,6 +691,10 @@ carried), `done` or `skipped`. The agent sets `done` with the
 `onboarding_done` tool, from the onboarding session only. A worker whose
 `TASK.md` no longer carries the onboarding marker is `done`. A running
 conversation whose session was deleted reads `pending` again.
+`mode.detail.onboarding_kind` is `conversation`, or `autonomous` for a worker
+that `nerve init` set up with a task description: the next start of the daemon
+runs its onboarding in one session without a person (source `cron`). While
+onboarding is `pending`, Finish opens the conversation for either kind.
 
 #### `POST /api/setup/onboarding/skip`
 

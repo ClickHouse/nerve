@@ -41,17 +41,20 @@ worker is configured on that page:
    onboarding conversation
 
 The same choice from a terminal is `nerve init --terminal`, which asks for the
-mode and the task description itself and does not start the daemon (`nerve
-start` afterwards). Its worker path has no cron step, so it writes
+mode and an optional task description itself and does not start the daemon
+(`nerve start` afterwards). Its worker path has no cron step, so it writes
 `skill-extractor` and `skill-reviser` with `enabled: false` too (`task-planner` is
 off on every path until onboarding enables it): set `enabled: true` in
 `config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
-`NERVE_TASK="…"` for `nerve init --non-interactive` — see
-[Unattended installation](setup.md#unattended-installation).
+`NERVE_TASK="…"` for `nerve init --non-interactive` (see
+[Unattended installation](setup.md#unattended-installation)). On these two
+paths, a worker with a task description sets itself up without a person at its
+first start (see [Without the browser](#without-the-browser)); without one, it
+waits for its onboarding conversation in the web UI.
 
 ## How Onboarding Works
 
-After setup, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first; a worker whose `TASK.md` still carries the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line) also gets it when the daemon starts. The agent's hidden instruction holds your note, the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first and asks which kinds of work apply. Then:
+After setup in the browser, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first. Until onboarding is done, `TASK.md` keeps the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line). The agent's hidden instruction holds your note, the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first and asks which kinds of work apply. Then:
 
 1. **Learn the work**: asks which repositories to onboard, clones and studies them, and asks only what it needs: the channels and alert sources to read, schedules, approval rules
 2. **Propose the setup**: cron jobs with schedule and `run_if` gate, whether `task-planner` plans through the approval loop (it ships disabled for workers; the agent turns it on by overriding the job by id in `jobs.yaml`, with a `tasks` gate scoped to the worker's tag), task statuses (the built-in `backlog` and `plan_review`, plus a status for each other kind of wait), tags, skills, and the `TASK.md` sections. It changes nothing before you confirm
@@ -60,6 +63,20 @@ After setup, you set the worker up by talking to it, in the onboarding conversat
 5. **Mark onboarding done**: calls `onboarding_done`, which also removes the marker line from `TASK.md`
 
 Until onboarding is done or skipped, a banner in the web UI sends you back to the conversation. A `TASK.md` from an older install (the raw `# Task` form, no marker) is rewritten into the template's shape with its text under "Task description (as given)" when the conversation opens; such a file counts as onboarded once it has a `## Mission` heading. A `TASK.md` without its marker counts as onboarded.
+
+### Without the browser
+
+A worker set up by `nerve init --terminal` or `nerve init --non-interactive` with a task description sets itself up without a person, once, at the first start of the daemon with a model credential (see [Setup → A worker set up without the browser](setup.md#a-worker-set-up-without-the-browser)). One session gets your description, the full worker guide and these steps:
+
+1. **Research**: fetches what the description names, clones the repositories, and looks at the CI systems and APIs involved
+2. **Fill `TASK.md` in place**, to the same rules as above
+3. **Create skills** for the procedures the worker repeats
+4. **Configure cron jobs** in `jobs.yaml`, with gates, and decide on `task-planner`
+5. **Create initial tasks** for what only you can do (credentials, access, open decisions)
+6. **Walk through every change**: saves what it learned to memory, then notifies you (priority `high`) with every change and numbered next steps
+7. **Mark onboarding done**: calls `onboarding_done`, which removes the marker line from `TASK.md`
+
+While the session runs, the banner in the web UI links to it. With an empty task description, the worker waits for its onboarding conversation in the web UI instead.
 
 After onboarding, the worker operates on its configured schedule. You can change the setup at any time by asking it in a chat.
 
@@ -306,5 +323,5 @@ Cron run history is stored in the `cron_logs` SQLite table and visible in the we
 | **Quiet hours** | 02:00–08:00 | none |
 | **Sync sources** | Telegram, Gmail, GitHub | None by default (can add custom sources) |
 | **Channels** | Web UI + Telegram bot | Web UI (+ Telegram if configured) |
-| **Onboarding** | Interactive — user configures identity and preferences | Autonomous — agent researches task and self-configures |
+| **Onboarding** | A conversation with the agent | A conversation with the agent; set up without the browser with a task description, the worker sets itself up |
 | **Primary workflow** | Conversational (user asks, agent responds) | Plan-driven (detect → plan → approve → execute) |

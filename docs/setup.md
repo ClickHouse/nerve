@@ -306,12 +306,14 @@ applies what you confirmed, summarizes every change and calls the
 `onboarding_done` tool.
 
 The state is one row in `nerve.db` (`onboarding`): pending, running (with the
-session id), done or skipped. A worker onboarded by an earlier version (the
-`TASK.md` marker is gone) counts as done; a worker whose `TASK.md` still has
-the marker counts as pending and gets the conversation when the daemon
-starts. Nothing opens without a model credential. When the agent's first turn
-fails (a model error), onboarding goes back to pending, and the next Finish or
-daemon start opens a new conversation. Until onboarding is done or skipped:
+session id), done or skipped, and the kind: the conversation, or the
+[autonomous onboarding](#a-worker-set-up-without-the-browser). A worker
+onboarded by an earlier version (the `TASK.md` marker is gone) counts as done.
+An install from before the onboarding state that still has its marker, and a
+personal install from before, count as pending. Nothing opens without a model
+credential. When the agent's first turn fails (a model error), onboarding goes
+back to pending, and the next Finish or daemon start opens a new conversation.
+Until onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits
@@ -320,6 +322,23 @@ daemon start opens a new conversation. Until onboarding is done or skipped:
   agent and anyone who can use setup can continue or skip it;
 - the setup page shows the conversation and **Skip onboarding**, behind a
   confirmation. A skip keeps the session and ends the reminders.
+
+### A worker set up without the browser
+
+`nerve init --terminal` and `nerve init --non-interactive` (`NERVE_TASK`) take
+the worker's task description. With a description, the worker sets itself up
+without a person: at the first start of the daemon with a model credential,
+one session titled **Onboarding** (with the model of scheduled jobs) reads the
+description and the worker guide, researches, fills `TASK.md`, creates
+skills, cron jobs and the tasks only you can do, notifies you with a summary
+and the next steps, and calls `onboarding_done`. It runs once: a restart
+during the session does not start it again, and the banner in the web UI
+links to the session while it runs. When its first turn fails, the next start
+runs it again. Finish on the setup page opens the conversation instead, while
+the session has not started.
+
+With an empty task description, the worker waits for its onboarding
+conversation in the web UI.
 
 ### Coming back later
 
@@ -460,13 +479,13 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
 | `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
 | `NERVE_PASSWORDLESS` | unset | `1` completes setup without a password: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)). Not allowed with `NERVE_PASSWORD`. With neither, setup stays incomplete until the browser claim (`nerve status` prints the token once the gateway runs) |
-| `NERVE_TASK` | unset | Worker mode task description |
+| `NERVE_TASK` | unset | Worker mode task description. With it, the worker sets itself up at its first start; without it, the worker waits for its onboarding conversation in the web UI (see [A worker set up without the browser](#a-worker-set-up-without-the-browser)) |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
 
 This path writes the same files it always has and starts no daemon; only a
 worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
-empty) and `task-planner` disabled until the onboarding conversation enables it.
+empty) and `task-planner` disabled until onboarding enables it.
 The browser checklist afterwards shows what the environment decided as done —
 the mode, the provider, the time zone, a Telegram token — and leaves the rest
 to skip or fill in.

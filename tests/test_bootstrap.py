@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -25,6 +26,7 @@ from nerve.bootstrap import (
     _DOCKER_ENTRYPOINT_TEMPLATE,
     _DOCKERIGNORE_TEMPLATE,
 )
+from nerve import paths
 from nerve.cli import main
 from nerve.config import DEFAULT_MODEL
 
@@ -325,6 +327,29 @@ class TestCliInit:
         )
         assert result.exit_code == 0
         assert (tmp_path / "config.local.yaml").exists()
+
+    @pytest.mark.parametrize("task, rows", [
+        ("Monitor CI and fix flaky tests", [("requested", "autonomous", None)]),
+        ("", []),
+    ])
+    def test_a_worker_with_a_task_sets_itself_up_at_the_next_start(
+        self, tmp_path: Path, task: str, rows: list,
+    ) -> None:
+        """With a task description, the next start runs the autonomous
+        onboarding; without one, the worker waits for the conversation in
+        the web UI (no onboarding row)."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-clitest",
+            "NERVE_MODE": "worker",
+            "NERVE_TASK": task,
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        result = CliRunner().invoke(main, ["-c", str(tmp_path), "init", "--non-interactive"], env=env)
+        assert result.exit_code == 0, result.output
+        with sqlite3.connect(paths.db_path()) as conn:
+            found = conn.execute("SELECT status, kind, session_id FROM onboarding").fetchall()
+        assert found == rows
+        assert ("sets itself up" in result.output) is bool(rows)
 
     def test_reinit_prompt_describes_the_backups_it_actually_makes(
         self, configured_dir: Path
@@ -1569,6 +1594,34 @@ class TestPortableSettingsSplit:
         assert cfg.gateway.port == 8900                     # from config.yaml
         assert cfg.agent.thinking == "max"                  # from settings.yaml
         assert cfg.sessions.max_sessions == 500             # from settings.yaml
+
+
+class TestWizardWorkerStep:
+    """The task description is optional: without one, the worker is set up
+    in the onboarding conversation in the web UI."""
+
+    def _run(self, tmp_path: Path, answer: str, capsys) -> tuple[SetupChoices, dict, str]:
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step = lambda title: title
+        asked: dict = {}
+
+        def prompt(text, **kwargs):
+            asked.update(kwargs, text=text)
+            return answer
+
+        with patch("click.clear"), patch("click.prompt", side_effect=prompt):
+            wizard._step_worker_setup()
+        return wizard.choices, asked, capsys.readouterr().out
+
+    def test_an_empty_answer_leaves_the_setup_to_the_conversation(self, tmp_path: Path, capsys) -> None:
+        choices, asked, out = self._run(tmp_path, "  ", capsys)
+        assert asked["default"] == "" and choices.task_description == ""
+        assert "onboarding conversation" in out and "setup agent" not in out
+
+    def test_a_description_gets_the_setup_agent(self, tmp_path: Path, capsys) -> None:
+        choices, _, out = self._run(tmp_path, "Monitor CI and fix flaky tests", capsys)
+        assert choices.task_description == "Monitor CI and fix flaky tests"
+        assert "setup agent" in out
 
 
 class TestWizardPasswordStep:

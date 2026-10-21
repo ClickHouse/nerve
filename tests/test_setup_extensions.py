@@ -556,6 +556,6 @@ async def test_the_onboarding_conversation_opens_once_in_a_web_session(tmp_path,
         assert "> Watch the nightly build for example/repo and propose fixes." in turn["prompt"]
         row = await db.get_session(first.session_id)
         assert (row["title"], row["source"]) == ("Onboarding", "web")
-        assert await setup_routes._onboarding(config) == ("running", first.session_id)
+        assert await setup_routes._onboarding(config) == ("running", first.session_id, "conversation")
     finally:
         await db.close()

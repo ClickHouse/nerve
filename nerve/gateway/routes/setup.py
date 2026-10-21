@@ -461,8 +461,8 @@ def _bot_username(config: NerveConfig, state: SetupState, live: bool) -> str | N
     return state.telegram_bot_username
 
 
-async def _onboarding(config: NerveConfig) -> tuple[str, str | None]:
-    """The onboarding status and its session id (:func:`nerve.onboarding.read_state`).
+async def _onboarding(config: NerveConfig) -> tuple[str, str | None, str]:
+    """The onboarding status, its session id and its kind (:func:`nerve.onboarding.read_state`).
 
     Without a database (``nerve doctor``, a stand-in) a worker falls back to
     the ``TASK.md`` marker and a personal install reads ``not_applicable``.
@@ -474,9 +474,10 @@ async def _onboarding(config: NerveConfig) -> tuple[str, str | None]:
     if db is None:
         from nerve.setup_checklist import onboarding_from_task
 
-        return onboarding_from_task(config.workspace, workspace_mode(config.workspace)), None
+        status = onboarding_from_task(config.workspace, workspace_mode(config.workspace))
+        return status, None, onboarding_flow.CONVERSATION
     state = await onboarding_flow.read_state(db, Path(config.workspace))
-    return state.status, state.session_id
+    return state.status, state.session_id, state.kind
 
 
 async def _context(actor: Actor) -> _Context:
@@ -498,7 +499,7 @@ async def _context(actor: Actor) -> _Context:
     state = setup_state.load_state()
     setup_state.retire_on_boot(state)
     live = _telegram_live(config)
-    onboarding, onboarding_id = await _onboarding(config)
+    onboarding, onboarding_id, onboarding_kind = await _onboarding(config)
     env_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     env_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
     try:
@@ -526,6 +527,7 @@ async def _context(actor: Actor) -> _Context:
         env_oauth_only=env_oauth and not env_key,
         onboarding=onboarding,
         onboarding_session_id=onboarding_id,
+        onboarding_kind=onboarding_kind,
         display_name=actor.display_name,
         bot_username=_bot_username(config, state, live),
         account_username=username,
@@ -2684,7 +2686,9 @@ async def finish(actor: Actor = Depends(require_person)):
         restart = bool(facts.restart_pending or facts.state.debts)
         if facts.onboarding == onboarding_flow.PENDING:
             # The conversation opens now, for this person, when the agent can
-            # answer; otherwise the next daemon start opens it.
+            # answer; otherwise the next daemon start opens it. Finish always
+            # opens the conversation, also for a worker that waits for its
+            # autonomous onboarding.
             try:
                 deps = get_deps()
                 if restart or not facts.config.credential_available() or deps.engine is None:

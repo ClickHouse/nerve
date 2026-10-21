@@ -1,9 +1,11 @@
-"""The onboarding conversation: its prompt, its state, its start and its end.
+"""The onboarding: its prompts, its state, its start and its end.
 
-After setup the agent is set up by talking to it. The conversation is one web
-session with a hidden first message; the agent ends it with
-``onboarding_done``, and a person can skip it. Installs from before keep their
-worker rule: no ``TASK.md`` marker means done.
+After setup in the browser the agent is set up by talking to it. The
+conversation is one web session with a hidden first message; the agent ends it
+with ``onboarding_done``, and a person can skip it. A worker that ``nerve
+init`` set up with a task description sets itself up once at the next start,
+in one session without a person, and ends it with ``onboarding_done`` too.
+Installs from before keep their worker rule: no ``TASK.md`` marker means done.
 """
 
 from __future__ import annotations
@@ -18,7 +20,12 @@ import pytest
 import pytest_asyncio
 
 from nerve import onboarding
-from nerve.agent.prompts import ONBOARDING_OFFERS, WORKER_GUIDE_URL, onboarding_prompt
+from nerve.agent.prompts import (
+    ONBOARDING_OFFERS,
+    WORKER_GUIDE_URL,
+    onboarding_prompt,
+    worker_onboarding_prompt,
+)
 from nerve.agent.tools.handlers.onboarding import onboarding_done_handler
 from nerve.agent.tools.registry import ToolContext
 from nerve.setup_writer import (
@@ -29,6 +36,7 @@ from nerve.setup_writer import (
     render_task_md,
     system_cron_file,
 )
+from nerve.workspace import read_worker_guide
 from tests.actor_rows import ensure_system_principal
 
 DESCRIPTION = "Watch the nightly build for example/repo and propose fixes."
@@ -208,12 +216,62 @@ class TestBoot:
         assert state.status == "running"
         assert (await db.get_session(state.session_id))["caused_by_actor_id"] == person
 
-    async def test_a_pending_worker_from_before_opens_at_start_for_the_system(self, db, tmp_path):
+    async def test_a_worker_from_nerve_init_sets_itself_up_once(self, db, tmp_path):
+        """``nerve init`` with a task description: one autonomous session at
+        the next start, for the system, with the old prompt in the
+        transcript; it ends with ``onboarding_done``."""
         apply_mode(tmp_path, "worker", DESCRIPTION)
-        state = await onboarding.start_on_boot(_engine(db), tmp_path)
-        assert state is not None and state.status == "running"
+        assert await onboarding.request_autonomous(db, tmp_path)
+        pending = await onboarding.read_state(db, tmp_path)
+        assert (pending.status, pending.kind) == ("pending", "autonomous")
+        engine = _engine(db)
+        state = await onboarding.start_on_boot(engine, tmp_path)
+        assert (state.status, state.kind) == ("running", "autonomous")
+        turn = await _first_turn(engine)
+        assert turn["user_message"] == worker_onboarding_prompt(DESCRIPTION, read_worker_guide())
+        assert turn["internal"] is False and turn["source"] == "cron"
         session = await db.get_session(state.session_id)
+        assert session["source"] == "cron"
         assert session["caused_by_actor_id"] == db.system_actor.actor_id
+        # Once: the next start opens nothing, and nothing asks again.
+        assert await onboarding.start_on_boot(engine, tmp_path) is None
+        assert not await onboarding.request_autonomous(db, tmp_path)
+        assert engine.run.await_count == 1
+
+        ctx = ToolContext(session_id=state.session_id, workspace=tmp_path, db=db, actor=db.system_actor)
+        assert not (await onboarding_done_handler(ctx, {})).is_error
+        assert (await onboarding.read_state(db, tmp_path)).status == "done"
+        assert TASK_ONBOARDING_MARKER not in (tmp_path / "TASK.md").read_text()
+
+    async def test_a_worker_without_a_description_waits_for_the_conversation(self, db, tmp_path):
+        """No task description, or an install from before the row: nothing
+        runs at start; the web UI offers the conversation."""
+        apply_mode(tmp_path, "worker")
+        assert not await onboarding.request_autonomous(db, tmp_path)
+        apply_mode(tmp_path / "old", "worker", DESCRIPTION)
+        for ws in (tmp_path, tmp_path / "old"):
+            state = await onboarding.read_state(db, ws)
+            assert (state.status, state.kind) == ("pending", "conversation")
+            assert await onboarding.start_on_boot(_engine(db), ws) is None
+        assert await db.get_onboarding() is None
+
+    async def test_setup_in_the_browser_asks_for_the_conversation(self, db, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        await onboarding.request_autonomous(db, tmp_path)
+        await onboarding.request(db, tmp_path, actor_id=None)
+        assert (await onboarding.read_state(db, tmp_path)).kind == "conversation"
+        engine = _engine(db)
+        state = await onboarding.start_on_boot(engine, tmp_path)
+        assert state.kind == "conversation"
+        assert (await _first_turn(engine))["internal"] is True
+
+    async def test_finish_opens_the_conversation_instead_of_the_autonomous_run(self, db, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        await onboarding.request_autonomous(db, tmp_path)
+        engine = _engine(db)
+        state = await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        assert (state.status, state.kind) == ("running", "conversation")
+        assert (await _first_turn(engine))["source"] == "web"
 
     async def test_nothing_opens_at_start_without_a_model(self, db, tmp_path):
         apply_mode(tmp_path, "personal")
@@ -247,6 +305,19 @@ class TestEnd:
         assert (await onboarding.read_state(db, tmp_path)).status == "done"
         assert TASK_ONBOARDING_MARKER not in (tmp_path / "TASK.md").read_text()
         assert (await onboarding_done_handler(ctx(state.session_id), {})).is_error
+
+    async def test_a_session_that_removed_the_marker_itself_can_still_end(self, db, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        await onboarding.request_autonomous(db, tmp_path)
+        state = await onboarding.start_on_boot(_engine(db), tmp_path)
+        task = tmp_path / "TASK.md"
+        task.write_text("".join(
+            line for line in task.read_text().splitlines(keepends=True)
+            if TASK_ONBOARDING_MARKER not in line
+        ))
+        ctx = ToolContext(session_id=state.session_id, workspace=tmp_path, db=db, actor=db.system_actor)
+        assert not (await onboarding_done_handler(ctx, {})).is_error
+        assert (await db.get_onboarding())["status"] == "done"
 
     async def test_skip_keeps_the_session_and_ends_the_reminders(self, db, tmp_path):
         apply_mode(tmp_path, "personal")

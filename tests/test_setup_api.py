@@ -27,7 +27,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
-from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
+from nerve import boot, config_reload, daemon, onboarding, setup_checks, setup_state, setup_telegram_login, setup_token
 from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
@@ -2110,6 +2110,23 @@ class TestFinish:
         assert step(skipped, "mode")["detail"]["onboarding"] == "skipped"
         assert again["onboarding"]["status"] == "skipped"
         assert engine.run.await_count == 1
+
+    async def test_finish_opens_the_conversation_for_a_worker_from_nerve_init(self, claimed, monkeypatch):
+        """``nerve init`` asked for the autonomous onboarding; Finish in the
+        browser opens the conversation instead."""
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        assert await onboarding.request_autonomous(claimed.db, claimed.workspace)
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "mode")["detail"]
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            body = (await http.post("/api/setup/finish")).json()
+        assert (before["onboarding"], before["onboarding_kind"]) == ("pending", "autonomous")
+        detail = step(body["state"], "mode")["detail"]
+        assert (detail["onboarding"], detail["onboarding_kind"]) == ("running", "conversation")
+        await asyncio.sleep(0)
+        assert engine.run.await_args.kwargs["internal"] is True
 
     async def test_finish_without_a_model_asks_the_next_start(self, claimed, monkeypatch):
         choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
