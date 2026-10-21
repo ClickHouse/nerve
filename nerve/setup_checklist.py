@@ -231,9 +231,10 @@ class Facts:
     #: ``None`` (:func:`nerve.setup_provenance.credential_sources`). A path
     #: missing here reads as ``file`` when the value is configured.
     credential_sources: dict[str, str | None] = field(default_factory=dict)
-    #: ``slack.mode: hosted`` only: the stream manager's ``status()`` —
-    #: ``{"streams", "connected", "last_event_at"}``; ``None`` otherwise or
-    #: when no process can ask (``nerve doctor``).
+    #: ``slack.mode: hosted`` or ``sync.github.mode: hosted`` only: the
+    #: stream manager's ``status()`` — ``{"streams", "connected",
+    #: "last_event_at"}``; ``None`` otherwise or when no process can ask
+    #: (``nerve doctor``).
     hosted_gateway: dict[str, Any] | None = None
     #: The Telethon session file for the Telegram message sync exists.
     telegram_session_present: bool = False

@@ -177,7 +177,9 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
     try { await loadPreflight(); } finally { setRechecking(false); }
   };
 
-  const githubOk = preflight ? preflight.github.cli && preflight.github.authenticated : null;
+  // Hosted GitHub is polled by the channel gateway: nothing to install or sign in here.
+  const githubHosted = preflight?.github.hosted === true;
+  const githubOk = preflight ? githubHosted || (preflight.github.cli && preflight.github.authenticated) : null;
   const gmailOk = preflight ? preflight.gmail.cli : null;
 
   // A first run turns the inbox job off because nothing was connected; a
@@ -231,8 +233,9 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
           />
           <p className="text-xs text-text-dim" role="status">
             {githubOk === null ? 'Checking…'
-              : githubOk ? `gh is installed and signed in${preflight?.github.login ? ` as ${preflight.github.login}` : ''}`
-                : preflight?.github.hint ?? 'gh is not signed in on the server'}
+              : githubHosted ? preflight?.github.hint
+                : githubOk ? `gh is installed and signed in${preflight?.github.login ? ` as ${preflight.github.login}` : ''}`
+                  : preflight?.github.hint ?? 'gh is not signed in on the server'}
           </p>
           {githubManaged && <p className="text-xs text-text-muted">{managedLine('Token', githubManaged)}</p>}
           {github && githubOk === false && <Notice tone="warning">{SOURCES_IDLE_HINT}</Notice>}

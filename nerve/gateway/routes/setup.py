@@ -587,8 +587,11 @@ async def _context(actor: Actor) -> _Context:
 
 def _hosted_gateway_status(config: NerveConfig) -> dict[str, Any] | None:
     """What the hosted channel runtime reports about the gateway's streams
-    (``slack.mode: hosted`` only); a quiet default when it has not started."""
-    if config.slack.mode != "hosted":
+    (``slack.mode: hosted`` or ``sync.github.mode: hosted`` only); a quiet
+    default when it has not started."""
+    from nerve.channels.hosted.runtime import hosted_providers
+
+    if not hosted_providers(config):
         return None
     try:
         from nerve.gateway import server

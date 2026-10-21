@@ -807,6 +807,24 @@ describe('forms open on server values and send the right payload', () => {
     expect(screen.getByText(/stays idle until the tool is set up/)).toBeInTheDocument();
   });
 
+  it('sources: hosted GitHub needs no gh, says so, and does not warn when enabled', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue({
+      github: {
+        cli: false, authenticated: false, login: null, hosted: true,
+        hint: 'The channel gateway polls GitHub for this agent; gh is not needed on the server.',
+      },
+      gmail: { cli: false, hint: 'Install gog.' },
+      telegram: { credentials_configured: false },
+      checked_at: '2026-10-10T09:12:03Z',
+    });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(await screen.findByText(/gh is not needed on the server/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
+    expect(screen.queryByText(/stays idle until the tool is set up/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/gh is installed and signed in/)).not.toBeInTheDocument();
+  });
+
   it('agents: nothing is pre-checked, the footer line says what Continue writes, and [] is a decision', async () => {
     renderAt('/setup/agents');
     await heading('Connect coding agents');

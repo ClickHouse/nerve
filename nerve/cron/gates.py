@@ -307,6 +307,12 @@ class GitHubPrActivityGate(CronGate):
             force_run_after_hours: 8
             ignore_actors: [codecov, sonarqubecloud]
 
+    With ``sync.github.mode: hosted`` the gate is satisfied without running
+    ``gh``: the gateway watches the agent's open PRs (``sync.github.pr_watch``)
+    and delivers a ``github_pr_activity`` record for every change, so a job
+    that should wake on PR activity is gated on ``messages`` with
+    ``sources: [github]`` instead.
+
     Config:
 
     * ``author`` (required) — GitHub login whose open PRs to watch. Also
@@ -360,6 +366,10 @@ class GitHubPrActivityGate(CronGate):
         return s[:-5] if s.endswith("[bot]") else s
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
+        if github_is_hosted():
+            # No gh here: the gateway's PR watch delivers the changes as
+            # records, which a messages gate sees.
+            return True
         fp = await self._fingerprint()
         if fp is None:
             # gh failed entirely — fail open (run) rather than risk stranding a PR.
@@ -547,6 +557,18 @@ class GitHubPrActivityGate(CronGate):
             )
         except Exception as e:  # noqa: BLE001 — non-fatal; worst case is an extra run
             logger.warning("github_pr_activity: could not persist state: %s", e)
+
+
+def github_is_hosted() -> bool:
+    """Whether GitHub records come from the channel gateway (``sync.github.mode: hosted``).
+
+    Reads the loaded process config and never loads one, so a process
+    without a config (a test, a one-off command) counts as polling.
+    """
+    from nerve.config import loaded_config
+
+    config = loaded_config()
+    return config is not None and config.sync.github.mode == "hosted"
 
 
 #: Maps a gate's ``type`` key to its implementing class. Register new gate
