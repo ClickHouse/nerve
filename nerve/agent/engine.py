@@ -639,6 +639,13 @@ class AgentEngine:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
 
+    def _loom_tools_offered(self) -> bool:
+        """Whether sessions get Loom's tools: the MCP gateway's catalog,
+        read in external mode only, lists the ``loom`` server."""
+        return self._managed_mcp and any(
+            getattr(server, "name", "") == "loom" for server in self._mcp_servers_cache
+        )
+
     async def _refresh_mcp_catalog(self) -> None:
         """External mode: read the catalog and give its servers to new clients.
 
@@ -1625,6 +1632,16 @@ class AgentEngine:
             memory_note: str | None = None
             if isinstance(frozen_recall, list):
                 recalled_memories = [str(m) for m in frozen_recall]
+            elif (
+                self.config.memory.backend == "loom"
+                and self._memory_bridge is not None
+                and not self._memory_bridge.available
+            ):
+                # The Loom backend did not start (no gateway URL): said as
+                # for an outage.
+                memory_note = memory_unavailable_note(
+                    getattr(self._memory_bridge, "error", "") or "the Loom backend is not running",
+                )
             elif self._memory_bridge and self._memory_bridge.available:
                 try:
                     raw = await recall_for_startup(
@@ -1718,6 +1735,7 @@ class AgentEngine:
                 static=static_prompt,
                 memory_note=memory_note,
                 memory_backend=self.config.memory.backend,
+                memory_tools=self._loom_tools_offered(),
             )
 
             # Observer sessions of a review loop get a context block so the

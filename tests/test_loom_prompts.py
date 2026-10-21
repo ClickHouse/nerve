@@ -4,7 +4,9 @@ Every place that names Nerve's memory tools has a Loom branch
 (``nerve/memory/loom_prompts.py``): the system prompt, the worker onboarding
 step, the Codex backend note, the bundles written for external agents, the
 workspace templates and bundled skills, and the built-in cron jobs. Under
-memU each of them is byte for byte what it was.
+memU each of them renders as before (the system prompt is checked against a
+frozen copy of main's rendering); the worker guide the onboarding prompt
+carries, and the ``nerve-dev`` skill's source map, now mention Loom.
 """
 
 from __future__ import annotations
@@ -49,12 +51,46 @@ def _loom_config() -> NerveConfig:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_memu_prompt_has_no_loom_section(tmp_path: Path) -> None:
-    prompt = build_system_prompt(tmp_path, excluded_tools=config_excluded_tools(NerveConfig()))
-    assert prompt == build_system_prompt(
-        tmp_path, excluded_tools=config_excluded_tools(NerveConfig()), memory_backend="memu",
-    )
-    assert "loom" not in prompt.lower()
+# main's memU system prompt for a workspace holding only `SOUL.md` ("Be kind.")
+# and one tool offered, frozen before the Loom backend: the date, the
+# workspace path and the tool's description are normalized away.
+MAIN_STATIC_PROMPT = (
+    "Be kind.\n\n---\n\n# Session Context\n- **Source:** web\n- **Current date:** <date>\n"
+    "- **Workspace:** <workspace>\n\nPer-session details — this session's id and the memories "
+    "recalled at session start — are in the `<session-context>` block at the top of this "
+    "conversation's first user message. `mcp__nerve__session_context` returns them live if "
+    "that message is no longer in context.\n\nYou have access to the following custom tools:\n"
+    "- <tool>"
+)
+MAIN_LEGACY_PROMPT = (
+    "Be kind.\n\n---\n\n# Session Context\n- **Session ID:** s1\n- **Source:** web\n"
+    "- **Current date:** <date>\n- **Workspace:** <workspace>\n\nYou have access to the "
+    "following custom tools:\n- <tool>\n\n---\n\n# Recalled Memories\n\n- a fact"
+)
+
+
+def _normalized(prompt: str, workspace: Path) -> str:
+    prompt = re.sub(r"\*\*Current date:\*\* .*", "**Current date:** <date>", prompt)
+    prompt = re.sub(r"(?m)^- `mcp__nerve__\w+` — .*$", "- <tool>", prompt)
+    return prompt.replace(str(workspace), "<workspace>")
+
+
+def test_the_memu_prompt_is_mains(tmp_path: Path) -> None:
+    """The memU prompt, in both shapes, is the one main rendered."""
+    from nerve.agent.prompts import _get_prompt_tool_registry
+
+    (tmp_path / "SOUL.md").write_text("Be kind.\n", encoding="utf-8")
+    others = {spec.name for spec in _get_prompt_tool_registry().list(include_hoa=True)}
+    others.discard("session_context")
+    for static, expected in ((True, MAIN_STATIC_PROMPT), (False, MAIN_LEGACY_PROMPT)):
+        prompt = build_system_prompt(
+            tmp_path, "s1", "web", ["a fact"], excluded_tools=others, static=static,
+        )
+        assert _normalized(prompt, tmp_path) == expected
+        assert prompt == build_system_prompt(
+            tmp_path, "s1", "web", ["a fact"], excluded_tools=others, static=static,
+            memory_backend="memu", memory_tools=False,
+        )
 
 
 def test_the_loom_prompt_names_loom_tools_and_offers_no_memu_tool(tmp_path: Path) -> None:
@@ -73,9 +109,20 @@ def test_the_loom_section_covers_levels_proposals_and_verdicts() -> None:
     for words in (
         "home namespace", "Team and", "read-only for you", "propose instead",
         "`proposed: true`", "conflict_verdict", "PINNED_CONFLICT", "`abstain: true`",
-        "mcp__loom__<tool>",
+        "mcp__loom__<tool>", "session id: find them with `loom_search`",
     ):
         assert words in section, words
+
+
+def test_without_loom_tools_the_prompt_says_memory_cannot_be_used(tmp_path: Path) -> None:
+    """Loom is the backend but the session gets no `loom` server (local
+    mode, or not provisioned yet): no tool guidance for tools it lacks."""
+    excluded = config_excluded_tools(_loom_config())
+    prompt = build_system_prompt(
+        tmp_path, excluded_tools=excluded, memory_backend="loom", memory_tools=False,
+    )
+    assert loom_prompts.NO_TOOLS_SECTION in prompt
+    assert loom_prompts.SYSTEM_PROMPT_SECTION not in prompt and "loom_search" not in prompt
 
 
 def test_onboarding_saves_to_loom_under_loom() -> None:

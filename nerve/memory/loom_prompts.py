@@ -7,7 +7,10 @@ wording here, kept to the tools Loom's default (``core``) tool list carries:
 the system prompt's memory section, the worker onboarding step that saves
 what it learned, the Codex backend note, the workspace templates, the
 built-in cron prompts and what external agents are told. The memU wording
-stays where it was, unchanged.
+stays where it was. Two texts memU sessions also see did change: the worker
+guide (``docs/worker-best-practices.md``, which the onboarding prompt
+carries in full) has a bullet on Loom, and the bundled ``nerve-dev`` skill's
+source map names the Loom backend.
 """
 
 from __future__ import annotations
@@ -71,8 +74,20 @@ rather than guessing from weak hits. An empty result is no proof of absence \
 either: a conversation Loom is still extracting is not in it yet.
 
 Nerve recalls this session's starting memories from Loom and sends each \
-finished conversation to Loom, which extracts its facts: save decisions, \
-corrections and conclusions as they happen, not the whole exchange."""
+finished conversation to Loom, which extracts its facts under that \
+conversation's session id: find them with `loom_search`, not by key. Save \
+decisions, corrections and conclusions as they happen, not the whole \
+exchange."""
+
+# The memory section when Loom is the backend but its tools do not reach the
+# session: no gateway catalog (local mode), or no `loom` server in it yet.
+NO_TOOLS_SECTION = """\
+# Memory: Loom
+
+Long-term memory on this instance is Loom, but Loom's tools are not \
+available to this session and Nerve's memory tools are not served, so you \
+can neither search nor save memories now. Do not take that for an empty \
+memory, and say so when an answer depends on what you would remember."""
 
 # The worker onboarding prompt's steps (nerve.agent.prompts._ONBOARDING_STEPS):
 # the memU sentence, then its Loom wording.

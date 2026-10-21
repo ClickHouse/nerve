@@ -290,6 +290,7 @@ def build_system_prompt(
     static: bool = True,
     memory_note: str | None = None,
     memory_backend: str = "memu",
+    memory_tools: bool = True,
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -312,8 +313,12 @@ def build_system_prompt(
     :func:`memory_unavailable_note`), in either shape's place for them.
 
     ``memory_backend`` ``loom`` adds the memory section that names Loom's
-    tools in place of Nerve's (:data:`nerve.memory.loom_prompts.SYSTEM_PROMPT_SECTION`);
-    it depends on the configuration only, so the prompt stays static.
+    tools in place of Nerve's (:data:`nerve.memory.loom_prompts.SYSTEM_PROMPT_SECTION`),
+    or, when ``memory_tools`` says Loom's tools do not reach the session, a
+    short section saying memory cannot be used
+    (:data:`nerve.memory.loom_prompts.NO_TOOLS_SECTION`). Either depends on
+    the configuration and the gateway's catalog only, so the prompt stays
+    static across sessions.
     """
     parts: list[str] = []
 
@@ -377,7 +382,9 @@ You have access to the following custom tools:
     parts.append(context)
 
     if memory_backend == "loom":
-        parts.append(loom_prompts.SYSTEM_PROMPT_SECTION)
+        parts.append(
+            loom_prompts.SYSTEM_PROMPT_SECTION if memory_tools else loom_prompts.NO_TOOLS_SECTION,
+        )
 
     # Skills summary (progressive disclosure level 1: name + description only)
     skills_section = _format_skills_list(skill_summaries)

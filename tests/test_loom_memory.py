@@ -1164,7 +1164,7 @@ async def test_a_new_session_starts_from_the_startup_pack(make_memory, tmp_path,
     meta = json.loads((await db.get_session("s-pack")).get("metadata") or "{}")
     assert meta.get("recalled_memories") == ["Lives in Lisbon"]
     assert "- Lives in Lisbon" in engine._pending_preambles["s-pack"]
-    # The session is told to use Loom's tools.
+    # The session is told memory is Loom's (local mode: without Loom's tools).
     assert "# Memory: Loom" in engine._backends["codex"].specs[-1].system_prompt
 
 
@@ -1180,6 +1180,40 @@ async def test_a_session_is_told_when_loom_could_not_recall(make_memory, tmp_pat
     assert "lists no 'loom' server" in preamble
     meta = json.loads((await db.get_session("s-down")).get("metadata") or "{}")
     assert "recalled_memories" not in meta  # nothing frozen: the next build tries again
+
+
+@pytest.mark.asyncio
+async def test_a_session_is_told_when_the_loom_backend_did_not_start(tmp_path, db) -> None:
+    config = _config()
+    config.mcp_gateway_url = ""
+    memory = LoomMemory(config, health_interval=None)
+    assert await memory.initialize() is False
+    engine = await _engine_for(tmp_path, db, memory, "loom")
+    await db.create_session("s-off", source="web", backend="codex", actor=None)
+    await engine._get_or_create_client("s-off", "web", None)
+    preamble = engine._pending_preambles["s-off"]
+    assert "Memory is unavailable right now" in preamble
+    assert "mcp_gateway_url is not set" in preamble
+
+
+@pytest.mark.asyncio
+async def test_the_tool_guidance_follows_the_catalog(make_memory, tmp_path, db) -> None:
+    """Loom's tool guidance only for a session that gets the `loom` server;
+    otherwise the prompt says memory cannot be used."""
+    from nerve.config import McpServerConfig
+    from nerve.memory.loom_prompts import NO_TOOLS_SECTION, SYSTEM_PROMPT_SECTION
+
+    memory = await make_memory(FakeGateway())
+    engine = await _engine_for(tmp_path, db, memory, "loom")
+    await db.create_session("s-local", source="web", backend="codex", actor=None)
+    await engine._get_or_create_client("s-local", "web", None)
+    prompt = engine._backends["codex"].specs[-1].system_prompt
+    assert NO_TOOLS_SECTION in prompt and SYSTEM_PROMPT_SECTION not in prompt  # local mode
+    engine._managed_mcp = True
+    engine._mcp_servers_cache = [McpServerConfig(name="loom", type="http", url=f"{BASE}/s/loom/mcp")]
+    await db.create_session("s-catalog", source="web", backend="codex", actor=None)
+    await engine._get_or_create_client("s-catalog", "web", None)
+    assert SYSTEM_PROMPT_SECTION in engine._backends["codex"].specs[-1].system_prompt
 
 
 @pytest.mark.asyncio
