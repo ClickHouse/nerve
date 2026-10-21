@@ -188,6 +188,22 @@ class TestDrain:
         await eventually(lambda: svc.runs.finished == ["pr-monitor"])
         assert runner.runs == 1
 
+    async def test_a_scheduled_fire_of_the_runner_is_skipped_while_it_drains(self, svc):
+        """The drain is a run of the source runner for delivered records, so
+        the runner's own fire meanwhile is skipped like that of a job."""
+        runner = FakeRunner()
+        runner.hold = asyncio.Event()
+        install(svc, runners=[runner])
+        drained = asyncio.create_task(svc.on_source_delivered("github"))
+        await runner.started.wait()
+
+        await svc._run_source_wrapper(runner)
+
+        assert svc.db.log_cron_start.await_count == 1
+        runner.hold.set()
+        await drained
+        assert runner.runs == 1
+
     async def test_a_source_without_a_runner_runs_nothing(self, svc):
         install(svc, job("pr-monitor", sources=["github"]), runners=[FakeRunner("gmail:me@example.net")])
 
@@ -279,12 +295,53 @@ class TestJobs:
         assert svc.runs.ids() == ["pr-monitor"]
 
         person = attribution_for(FAKE_SYSTEM_ACTOR)
-        manual = asyncio.create_task(svc._run_job_wrapper(monitor, person))
+        manual = asyncio.create_task(svc.run_job("pr-monitor", attribution=person))
         await eventually(lambda: len(svc.runs.started) == 2)
         svc.runs.hold["pr-monitor"].set()
         await manual
         await eventually(lambda: len(svc.runs.finished) == 2)
         assert svc.runs.started[1] == ("pr-monitor", person)
+
+    async def test_a_run_by_hand_starts_while_a_delivery_run_goes_on(self, svc):
+        """How a run was started decides, not who started it: a run by hand
+        always starts, also one without a person's attribution."""
+        install(svc, job("pr-monitor", sources=["github"]))
+        svc.runs.hold["pr-monitor"] = asyncio.Event()
+        await svc.on_source_delivered("github")
+        await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
+
+        by_hand = asyncio.create_task(svc.run_job("pr-monitor"))
+        await eventually(lambda: len(svc.runs.started) == 2)
+        svc.runs.hold["pr-monitor"].set()
+        await by_hand
+
+        assert svc.runs.started[1] == ("pr-monitor", None)
+
+    async def test_a_catch_up_is_skipped_while_a_delivery_run_goes_on(self, svc):
+        """A catch-up stands in for a fire that was missed, so it does not
+        start on top of any run of its job, a delivery run included, and
+        whether or not the job has ``lock``."""
+        monitor = job("pr-monitor", sources=["github"], lock=True)
+        install(svc, monitor)
+        svc.runs.hold["pr-monitor"] = asyncio.Event()
+        await svc.on_source_delivered("github")
+        await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
+
+        await asyncio.wait_for(svc._run_job_wrapper(monitor, origin="catchup"), timeout=1)
+
+        assert svc.runs.ids() == ["pr-monitor"]
+        svc.runs.hold["pr-monitor"].set()
+        await eventually(lambda: svc.runs.finished == ["pr-monitor"])
+
+    async def test_a_delivery_run_counts_for_a_catch_up_queued_before_it(self, svc):
+        """A catch-up does not run a job that has run since it was queued."""
+        install(svc, job("pr-monitor", sources=["github"]))
+        queued = svc._runs.started("pr-monitor")
+
+        await svc.on_source_delivered("github")
+        await eventually(lambda: svc.runs.finished == ["pr-monitor"])
+
+        assert svc._catch_up_run("pr-monitor", queued) is None
 
     async def test_a_locked_job_waits_for_the_delivery_run_instead(self, svc):
         monitor = job("pr-monitor", sources=["github"], lock=True)

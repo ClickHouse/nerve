@@ -140,7 +140,7 @@ prompt definition.
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
 | `catchup` | bool | no | Fire once if the job missed a run while the server was down (on startup) or while the machine was paused (on resume — see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)) (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish. An overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish, and so does a scheduled fire that comes while a run for delivered source records goes on (see [Runs on delivery](#runs-on-delivery)). Any other overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -709,11 +709,14 @@ cron:
 
 Such a run goes through the job's gates, `lock` and run log like a scheduled
 run, and the schedule listeners hear of it. It waits for a run of the job that
-is already in flight, and while it runs, a scheduled or catch-up fire of the job
-is skipped, as an overlapping scheduled fire is; a job with `lock` waits for it
-instead. Jobs without such a gate keep to their schedule, and the schedules
-stay the fallback for everything. The setting is read for each delivery, so a
-reload applies it.
+is already in flight. While it runs, a scheduled fire of the job is skipped, as
+an overlapping scheduled fire is, or waits for it when the job has `lock`; a
+catch-up is skipped, as it is while any run of the job goes on; and a run
+started by hand starts as it always does. A catch-up queued before the run does
+not run the job again, since the job has run since. The drain counts as a run
+of the source's runner in the same way. Jobs without such a gate keep to their
+schedule, and the schedules stay the fallback for everything. The setting is
+read for each delivery, so a reload applies it.
 
 ## Logging
 

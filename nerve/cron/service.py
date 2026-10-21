@@ -7,7 +7,6 @@ delivers records, its runner and the jobs gated on it right away.
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextlib
 import copy
 import functools
@@ -84,8 +83,9 @@ _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: fal
 
 # How a run of a cron job or source runner was started: by its schedule, as a
 # catch-up for fires missed while the daemon was down or the machine paused,
-# or by hand (the Cron page's "Run now", the trigger API).
-RunOrigin = Literal["schedule", "catchup", "manual"]
+# by hand (the Cron page's "Run now", the trigger API), or for source records
+# that a hosted source delivered (see CronService.on_source_delivered).
+RunOrigin = Literal["schedule", "catchup", "manual", "delivery"]
 
 
 class _RunsInFlight:
@@ -93,13 +93,14 @@ class _RunsInFlight:
 
     The scheduler starts a job at most once at a time, but it only counts the
     runs it started itself. The run wrappers record every run here, so that
-    whatever starts a run can first see what is already going, and whether a
-    run has started since it last looked.
+    whatever starts a run can first see what is already going, whether a run
+    has started since it last looked, or wait until no run of a job is left.
     """
 
     def __init__(self) -> None:
         self._origins: dict[str, list[RunOrigin]] = {}
         self._started: dict[str, int] = {}
+        self._idle: dict[str, asyncio.Event] = {}
 
     def running(self, job_id: str, origin: RunOrigin | None = None) -> bool:
         """Whether a run of *job_id* is in progress — one started as *origin*,
@@ -125,6 +126,17 @@ class _RunsInFlight:
             origins.remove(origin)
             if not origins:
                 del self._origins[job_id]
+                idle = self._idle.pop(job_id, None)
+                if idle is not None:
+                    idle.set()
+
+    async def wait_until_idle(self, job_id: str) -> None:
+        """Return once no run of *job_id* is in progress; at once when none is."""
+        while self.running(job_id):
+            idle = self._idle.get(job_id)
+            if idle is None:
+                idle = self._idle[job_id] = asyncio.Event()
+            await idle.wait()
 
 
 # How far ahead CronService.next_scheduled() looks by default.
@@ -462,16 +474,12 @@ class CronService:
         self._github_mode = github_mode if isinstance(github_mode, str) else None
         # Hosted source deliveries (see on_source_delivered): the sources whose
         # drain is running, those delivered to again meanwhile, the pending
-        # delivery run of each job, the delivery runs that have started and
-        # the jobs they run, and the runs each job has in flight with an event
-        # for when it has none.
+        # delivery run of each job, and the delivery runs that have started.
+        # The runs themselves count in _runs like any other.
         self._draining: set[str] = set()
         self._drain_again: set[str] = set()
         self._delivery_tasks: dict[str, asyncio.Task] = {}
         self._delivery_started: set[asyncio.Task] = set()
-        self._delivery_runs: set[str] = set()
-        self._job_runs: collections.Counter[str] = collections.Counter()
-        self._job_idle: dict[str, asyncio.Event] = {}
         # Set when stop() begins; from then on nothing new is started, by the
         # scheduler, a catch-up or a source delivery.
         self._stopping = False
@@ -1641,67 +1649,34 @@ class CronService:
         However the run ends — done, failed, skipped by a gate or for
         overlapping another run — the schedule listeners hear about it: it can
         change what runs next.
-
-        A run of the instance's own (no ``attribution``) is also skipped while
-        a run that a source delivery started for the job is in progress, as
-        the scheduler skips a fire while the job's previous scheduled run goes
-        on. A job with ``lock`` waits for it instead.
         """
         try:
-            if not self._may_start(job.id, origin):
-                return
-            if attribution is None and not job.lock and job.id in self._delivery_runs:
-                logger.info(
-                    "Skipping cron job %s: a run for newly delivered source records is in progress",
-                    job.id,
-                )
+            if not self._may_start(job.id, origin, lock=job.lock):
                 return
             with self._runs.track(job.id, origin):
-                await self._run_job_tracked(job, attribution)
+                if job.lock:
+                    lock = self._job_locks.setdefault(job.id, asyncio.Lock())
+                    async with lock:
+                        await self._run_job_inner(job, attribution)
+                else:
+                    await self._run_job_inner(job, attribution)
         finally:
             self._schedule_changed()
 
-    async def _run_job_tracked(
-        self, job: CronJob, attribution: Attribution | None = None,
-    ) -> None:
-        """Run *job* under its lock, counted among the job's runs in flight."""
-        self._job_runs[job.id] += 1
-        try:
-            if job.lock:
-                lock = self._job_locks.setdefault(job.id, asyncio.Lock())
-                async with lock:
-                    await self._run_job_inner(job, attribution)
-            else:
-                await self._run_job_inner(job, attribution)
-        finally:
-            self._job_run_ended(job.id)
-
-    def _job_run_ended(self, job_id: str) -> None:
-        self._job_runs[job_id] -= 1
-        if self._job_runs[job_id] > 0:
-            return
-        del self._job_runs[job_id]
-        idle = self._job_idle.pop(job_id, None)
-        if idle is not None:
-            idle.set()
-
-    async def _wait_until_job_idle(self, job_id: str) -> None:
-        """Return once *job_id* has no run in flight; at once when it has none."""
-        while self._job_runs.get(job_id):
-            idle = self._job_idle.get(job_id)
-            if idle is None:
-                idle = self._job_idle[job_id] = asyncio.Event()
-            await idle.wait()
-
-    def _may_start(self, job_id: str, origin: RunOrigin) -> bool:
+    def _may_start(self, job_id: str, origin: RunOrigin, *, lock: bool = False) -> bool:
         """Whether a run of *job_id* started as *origin* may start now.
 
         The scheduler never starts a job while its previous scheduled run is
         still going; it skips that fire. A catch-up stands in for a scheduled
         fire, so the same rule holds between the two: a catch-up is skipped
         while any run of the job is going, and a scheduled fire while a
-        catch-up of the job is going. Each skip is logged. A manual run always
-        starts (with ``lock`` it waits for the run before it).
+        catch-up of the job is going. A run for delivered source records goes
+        on in place of the job's scheduled run too, so a scheduled fire is
+        skipped while one is going, except for a job with *lock*, whose fire
+        waits for it on the lock instead. Each skip is logged. A manual run
+        always starts (with ``lock`` it waits for the run before it), and so
+        does a run for delivered records, which waits for the job's runs in
+        flight before it starts.
         """
         if origin == "catchup" and self._runs.running(job_id):
             logger.info("Not catching up %s: a run of it is still going", job_id)
@@ -1709,6 +1684,13 @@ class CronService:
         if origin == "schedule" and self._runs.running(job_id, "catchup"):
             logger.info(
                 "Skipping the scheduled run of %s: its catch-up run is still going",
+                job_id,
+            )
+            return False
+        if origin == "schedule" and not lock and self._runs.running(job_id, "delivery"):
+            logger.info(
+                "Skipping the scheduled run of %s: a run for newly delivered source "
+                "records is still going",
                 job_id,
             )
             return False
@@ -2114,9 +2096,11 @@ class CronService:
         ``cron.delivery_debounce_seconds`` after the first delivery of a
         burst: later deliveries in that window add nothing. That run waits
         for a run of the job already in flight, and goes through the gates,
-        ``lock`` and the run log like any other. Jobs without such a gate are
-        left to their schedule. A source without a runner (switched off) runs
-        nothing, and once :meth:`stop` has begun nothing starts.
+        ``lock`` and the run log like any other; while it goes on, the job's
+        runs are skipped or wait as :meth:`_may_start` says. The drain counts
+        as a run of the source runner in the same way. Jobs without such a
+        gate are left to their schedule. A source without a runner (switched
+        off) runs nothing, and once :meth:`stop` has begun nothing starts.
 
         Never takes the reload lock: it reads the job and runner lists, which a
         reload replaces in one step.
@@ -2136,7 +2120,7 @@ class CronService:
                 if runner is None:
                     return
                 await runner.wait_until_idle()
-                await self._run_source_wrapper(runner)
+                await self._run_source_wrapper(runner, origin="delivery")
                 # The wrapper awaits before the run starts, so another run can
                 # take the runner in between; this run then returns at once,
                 # and the records are in only when that other run ends.
@@ -2186,7 +2170,7 @@ class CronService:
         """The pending delivery run of *job_id*: wait out the window, then run."""
         if delay > 0:
             await asyncio.sleep(delay)
-        await self._wait_until_job_idle(job_id)
+        await self._runs.wait_until_idle(job_id)
         # From here on a new delivery schedules a run of its own: this one may
         # already have looked at the inbox by the time those records land.
         # It moves to the started runs in the same step, so stop() finds it in
@@ -2201,12 +2185,7 @@ class CronService:
         if self._stopping:
             return
         logger.info("Running cron job %s for newly delivered source records", job_id)
-        self._delivery_runs.add(job_id)
-        try:
-            await self._run_job_tracked(job)
-        finally:
-            self._delivery_runs.discard(job_id)
-            self._schedule_changed()
+        await self._run_job_wrapper(job, origin="delivery")
 
     def _delivery_run_done(self, job_id: str, task: asyncio.Task) -> None:
         if self._delivery_tasks.get(job_id) is task:
