@@ -138,7 +138,7 @@ prompt definition.
 | `context_rotate_hours` | int | no | Hours before a persistent job rotates to a fresh chat (default: 24, 0 = never). The old chat is preserved |
 | `context_rotate_at` | string | no | Time of day to rotate (e.g. `"04:00"`, in the configured timezone). Overrides the hours-based rotation |
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
-| `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
+| `catchup` | bool | no | Fire once if the job missed a run while the server was down (on startup) or while the machine was paused (on resume — see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)) (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
 | `lock` | bool | no | Serialize this job's runs inside the daemon: a catch-up or web-triggered run waits for the previous one to finish. An overlapping scheduled fire is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
@@ -479,7 +479,37 @@ Set `catchup: false` on jobs where a late run doesn't make sense:
     catchup: false        # no point running a morning briefing at 3pm
 ```
 
-Interval alignment still applies even with `catchup: false` — only the startup catch-up fire is skipped.
+Interval alignment still applies even with `catchup: false` — only the catch-up fire (at startup, or after a pause) is skipped.
+
+### After a pause (sleep, suspend, snapshot restore)
+
+When the whole machine stops — a laptop sleeps, a host suspends, a virtual
+machine is restored from a snapshot — the scheduler stops with it, and a run
+that comes due in the meantime cannot start on time. On resume Nerve treats
+those runs like the ones missed while the server was down, instead of letting
+them start late or be dropped as [late runs](#late-runs):
+
+- Every 5 seconds the cron service compares the wall clock with the monotonic
+  clock, which stands still while the machine does. A wall clock that got
+  5 seconds or more ahead means a pause (a forward step of the system clock
+  counts too; a clock set back does not).
+- Every scheduled job whose next run came due during the pause moves to its
+  next regular time after the pause, so none of them is run late or reported
+  `missed`. An interval job keeps its cadence: its next run is the next one on
+  the grid it is anchored to (see [Interval alignment](#interval-alignment)),
+  not a full interval after the resume.
+- Jobs with `catchup: true` (the default) and source runners then run **once**,
+  however many runs the pause swallowed, concurrently. Run gates and `lock`
+  apply as for a scheduled run, and the run is logged as usual.
+- Jobs with `catchup: false`, the daily cleanup and the wakeup sweep only move
+  on. Session wakeups (`ScheduleWakeup`) that came due fire on the sweep's next
+  pass, within 20 seconds.
+- The daemon log gets one INFO line per pause, with the size of the jump, the
+  window and the number of jobs caught up.
+
+A catch-up waits for one that is still running — at startup or after an earlier
+pause — instead of overlapping it. Jumps under 5 seconds are ignored; a run that
+starts up to 30 seconds late runs anyway.
 
 ### Late runs
 
@@ -490,7 +520,8 @@ when the scheduler is built, so changing it needs a restart).
 A run delayed beyond that is dropped rather than run very late, and recorded in
 `cron_logs` with status `missed` so the gap is visible next to the runs around it.
 A `missed` row never counts as a successful run, so it does not affect interval
-alignment or startup catch-up.
+alignment or startup catch-up. A pause of the whole machine is not a late run:
+see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore).
 
 ## Source Runners
 
