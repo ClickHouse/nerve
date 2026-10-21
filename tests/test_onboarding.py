@@ -272,6 +272,15 @@ class TestEffectiveCronState:
         assert crons["task-planner"] == (True, True)
         assert crons["skill-extractor"] == (True, False)
 
+    def test_a_job_whose_gate_does_not_build_replaces_nothing(self, tmp_path):
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        self._override(tmp_path, (
+            "jobs:\n  - id: task-planner\n    schedule: '0 */4 * * *'\n"
+            "    prompt: Plan one task.\n    run_if:\n      - type: no-such-gate\n"
+        ))
+        crons = {c.id: (c.enabled, c.overridden) for c in list_optional_crons(tmp_path)}
+        assert crons["task-planner"] == (False, False)
+
     def test_the_automation_step_leaves_an_overridden_job_alone(self, tmp_path):
         apply_mode(tmp_path, "worker", DESCRIPTION)
         self._override(tmp_path, (

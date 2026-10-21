@@ -1475,14 +1475,16 @@ def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str
     return document, raw, ""
 
 
-def _user_cron_jobs(workspace: Path) -> dict[str, Any]:
-    """The jobs of ``jobs.yaml`` beside ``system.yaml``, by id (gates not built)."""
+def _user_cron_jobs(workspace: Path) -> list[Any]:
+    """The jobs of ``jobs.yaml`` beside ``system.yaml`` that the scheduler loads.
+
+    Gates are built, as the scheduler builds them: a job whose gate does not
+    build is left out, and the ``system.yaml`` job with its id runs instead.
+    """
     from nerve.cron.jobs import load_jobs
 
     path = system_cron_file(workspace).parent / "jobs.yaml"
-    if not path.exists():
-        return {}
-    return {job.id: job for job in load_jobs(path, build_gates=False)}
+    return load_jobs(path) if path.exists() else []
 
 
 def list_optional_crons(workspace: Path) -> list[CronToggle]:
@@ -1504,17 +1506,21 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
         for job in document["jobs"]
         if isinstance(job, dict) and job.get("id")
     }
+    from nerve.cron.jobs import load_jobs, merge_jobs
+
     user = _user_cron_jobs(workspace)
+    overridden = {job.id for job in user}
+    effective = {job.id: job for job in merge_jobs(load_jobs(system_cron_file(workspace)), user)}
     known = {cron["id"]: cron for cron in PRODUCTIVITY_CRONS}
     return [
         CronToggle(
             id=cron_id,
             name=str(known[cron_id].get("display_name") or known[cron_id].get("name") or cron_id),
             description=str(known[cron_id].get("description") or ""),
-            enabled=bool(user[cron_id].enabled) if cron_id in user else present[cron_id],
+            enabled=bool(effective[cron_id].enabled) if cron_id in effective else present[cron_id],
             schedule=str(known[cron_id].get("schedule") or ""),
             requires=known[cron_id].get("requires"),
-            overridden=cron_id in user,
+            overridden=cron_id in overridden,
         )
         for cron_id in OPTIONAL_CRON_IDS
         if cron_id in present
@@ -1538,7 +1544,7 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
     changed = False
     # A job that ``jobs.yaml`` replaces keeps its ``system.yaml`` entry: a
     # change there would not change what runs.
-    overridden = set(_user_cron_jobs(workspace))
+    overridden = {job.id for job in _user_cron_jobs(workspace)}
     for job in document["jobs"]:
         if not isinstance(job, dict):
             continue
