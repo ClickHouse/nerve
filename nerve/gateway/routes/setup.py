@@ -1915,9 +1915,9 @@ def _refuse_closed_sources(ctx: _Context, req: SourcesRequest) -> list[str]:
     any other. Without local secrets every source keeps a credential on this
     machine — a GitHub login or token, the Gmail keyring, the Telegram API
     credentials — so nothing goes through (409, the policy's two sentences),
-    except GitHub when the operator provides its token from the environment:
-    that switch stores nothing, and the Gmail and Telegram fields alone are
-    refused, by name, with the step's reason."""
+    except GitHub when the channel gateway polls it or the operator provides
+    its token from the environment: that switch stores nothing, and the Gmail
+    and Telegram fields alone are refused, by name, with the step's reason."""
     available, unavailable_reason = sources_available(ctx.facts)
     if not available:
         _refuse_without_local_secrets(ctx)
@@ -1998,7 +1998,12 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         )
         portable_paths: list[str] = []
         if req.github is not None:
-            portable_paths += ["sync.github.enabled", "sync.github_events.enabled"]
+            portable_paths.append("sync.github.enabled")
+            if live.github.mode != "hosted":
+                # The events source reads with the gh CLI on this machine,
+                # which a GitHub that the channel gateway polls does not set
+                # up, so with hosted GitHub the switch leaves it alone.
+                portable_paths.append("sync.github_events.enabled")
         if req.gmail is not None:
             portable_paths.append("sync.gmail.enabled")
         if req.telegram is not None:
