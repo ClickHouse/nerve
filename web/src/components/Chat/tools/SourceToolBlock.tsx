@@ -26,6 +26,7 @@ function sourceIcon(source: string) {
     case 'gmail': return <Mail size={12} className="text-hue-red" />;
     case 'github': return <Github size={12} className="text-hue-purple" />;
     case 'github_repos': return <Github size={12} className="text-hue-purple" />;
+    case 'github_repo_events': return <Github size={12} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={12} className="text-hue-blue" />;
     case 'slack': return <Slack size={12} className="text-hue-emerald" />;
     default: return <Inbox size={12} className="text-text-dim" />;

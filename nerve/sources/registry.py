@@ -257,6 +257,51 @@ def build_source_runners(
             gh_repos.batch_size, gh_repos.repos or "none",
         )
 
+    # GitHub repo events (one record per issue/PR event, with the real doer)
+    gh_repo_events = config.sync.github_repo_events
+    if gh_repo_events.enabled:
+        from nerve.sources.filters import FieldRule, InboxFilter
+        from nerve.sources.github_repo_events import GitHubRepoEventsSource
+
+        if not gh_repo_events.repos:
+            logger.warning(
+                "Source github_repo_events is enabled but no repos are "
+                "configured — it will be a no-op until "
+                "sync.github_repo_events.repos is set",
+            )
+        source = GitHubRepoEventsSource(config={
+            "repos": gh_repo_events.repos,
+            "events": gh_repo_events.events,
+            "only_targeting_me": gh_repo_events.only_targeting_me,
+            "username": gh_repo_events.username,
+        })
+        # Guardrail on "actor": the single login that acted on the event. Deny
+        # wins; a non-empty allow list is fail-closed.
+        events_filter = InboxFilter(rules=[
+            FieldRule(
+                field="actor",
+                allow=gh_repo_events.allow_actors,
+                deny=gh_repo_events.deny_actors,
+            ),
+        ])
+        runners.append(SourceRunner(
+            source=source,
+            db=db,
+            batch_size=gh_repo_events.batch_size,
+            condense=gh_repo_events.condense,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
+            ttl_days=ttl_days,
+            inbox_filter=events_filter,
+        ))
+        logger.info(
+            "Registered source: github_repo_events (repos=%s, events=%s, "
+            "only_targeting_me=%s, actors allow=%s deny=%s)",
+            gh_repo_events.repos or "none", gh_repo_events.events,
+            gh_repo_events.only_targeting_me,
+            gh_repo_events.allow_actors or "*", gh_repo_events.deny_actors or [],
+        )
+
     # Channel source drains. Not a poll: the channel transport already
     # delivered and buffered these events. This only moves them into the
     # inbox. What to watch is a property of the channel, so the config lives at

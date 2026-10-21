@@ -324,6 +324,15 @@ sync:
     schedule: "*/15 * * * *"
     repos: []                      # Required: ["ClickHouse/clickhouse-go", "owner/repo"]
     batch_size: 50
+  github_repo_events:              # One record per issue/PR event, with the login that acted
+    enabled: false
+    schedule: "*/15 * * * *"
+    repos: []                      # Required: ["owner/repo"]
+    events: [review_requested, assigned]  # Also: review_request_removed, unassigned
+    only_targeting_me: true        # Only events aimed at the authenticated account
+    username: ""                   # Auto-detect from gh auth; set for a GitHub App token
+    allow_actors: []               # Guardrail on the login that acted — empty = all
+    deny_actors: []
 
 # Memory (memU)
 memory:

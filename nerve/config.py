@@ -2044,6 +2044,61 @@ class GitHubReposSyncConfig:
 
 
 @dataclass
+class GitHubRepoEventsSyncConfig:
+    """Config for the GitHub repo events source (one record per issue/PR event).
+
+    Reads each repo's issue-event log and emits one record per event, naming
+    the one login that acted. ``repos`` is required — an empty list makes the
+    source a no-op. ``events`` picks the event types to emit (see
+    ``nerve.sources.github_repo_events.SUPPORTED_EVENTS``); with
+    ``only_targeting_me`` (the default) only events whose target is the
+    authenticated account itself are emitted — "review requested from me",
+    "assigned to me". The account's own actions are never emitted.
+
+    ``allow_actors`` / ``deny_actors`` match the ``actor`` metadata key — the
+    single login that acted, not everyone involved in the thread. Same
+    semantics as the ``github`` source's actor guardrail: case-insensitive
+    globs, deny wins, a non-empty allow list is fail-closed.
+    """
+    enabled: bool = False
+    schedule: str = "*/15 * * * *"
+    repos: list[str] = field(default_factory=list)  # required; empty = no-op
+    events: list[str] = field(
+        default_factory=lambda: ["review_requested", "assigned"],
+    )
+    only_targeting_me: bool = True
+    # The account events are judged against; auto-detected from gh auth when
+    # empty. Set it when the token cannot read /user (a GitHub App token).
+    username: str = ""
+    allow_actors: list[str] = field(default_factory=list)
+    deny_actors: list[str] = field(default_factory=list)
+    batch_size: int = 50
+    condense: bool = False
+    processor: str = "agent"
+    prompt_hint: str = ""
+    model: str = ""
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> GitHubRepoEventsSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            schedule=d.get("schedule", "*/15 * * * *"),
+            repos=d.get("repos", []),
+            events=d.get("events", ["review_requested", "assigned"]),
+            only_targeting_me=d.get("only_targeting_me", True),
+            username=d.get("username", ""),
+            allow_actors=d.get("allow_actors", []),
+            deny_actors=d.get("deny_actors", []),
+            batch_size=d.get("batch_size", 50),
+            condense=d.get("condense", False),
+            processor=d.get("processor", "agent"),
+            prompt_hint=d.get("prompt_hint", ""),
+            model=d.get("model", ""),
+        )
+
+
+@dataclass
 class CodexOriginConfig:
     """A single Codex thread sync origin.
 
@@ -2145,6 +2200,9 @@ class SyncConfig:
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
+    github_repo_events: GitHubRepoEventsSyncConfig = field(
+        default_factory=GitHubRepoEventsSyncConfig,
+    )
     codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
@@ -2159,6 +2217,9 @@ class SyncConfig:
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
+            github_repo_events=GitHubRepoEventsSyncConfig.from_dict(
+                d.get("github_repo_events", {}),
+            ),
             codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),
