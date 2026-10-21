@@ -1725,6 +1725,8 @@ describe('lockdown', () => {
     expect(screen.getAllByRole('status').some((el) => el.textContent?.includes(LOCK))).toBe(true);
     const nav = screen.getByRole('navigation', { name: 'Setup steps' });
     expect(within(nav).getAllByText('Blocked')).toHaveLength(6);
+    // Nothing on the page can complete a locked step, so the count leaves it out.
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
 
     await userEvent.click(within(nav).getByRole('link', { name: /Model/ }));
     await heading('Connect a model');
@@ -1788,6 +1790,26 @@ describe('instances that keep no credentials on disk', () => {
     const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
     expect(nav.getAllByText('Not available')).toHaveLength(4);
     expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+  });
+
+  it('the overview counts only the steps that apply here', async () => {
+    current = keylessState();
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    // Account and Mode, of Account, Mode, Model, About you and Automation.
+    expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
+    view.unmount();
+
+    // Finished: the closed steps stay in the list, and the count is whole.
+    useSetupStore.getState().reset();
+    current = keylessState({
+      finished: true, steps_left: 0,
+      steps: keylessState().steps.map((s) => (s.status === 'blocked' ? s : step(s.id, { status: 'done' }))),
+    });
+    renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText('5 of 5 steps done')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getAllByText('Not available on this instance')).toHaveLength(4);
   });
 
   it('opening a closed step shows the sentence instead of the form and reads Next', async () => {

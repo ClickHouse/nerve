@@ -6,7 +6,7 @@ import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, NOT_AVAILABLE_HERE, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED } from './copy';
 import { stepManaged } from './credentialSource';
-import { closedByPolicy, firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
+import { appliesHere, closedByPolicy, firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
 import { Notice } from './Notice';
 import { StatusBadge } from './StatusBadge';
 import { useWizardNav } from './wizardContext';
@@ -43,7 +43,9 @@ export function Overview({ state }: { state: SetupState }) {
   const name = viewer ? actorName(viewer) : (account?.username ?? 'you');
   const done = state.steps.filter((s) => s.status === 'done');
   const skipped = state.steps.filter((s) => s.status === 'skipped');
-  const total = state.steps.length;
+  // A step closed on this instance stays in the list as "not available",
+  // but a finished setup must read "N of N", so the count leaves it out.
+  const total = state.steps.filter(appliesHere).length;
   const next = firstPendingStop(state);
   const preset = state.steps.filter((s) => preconfigured(s, state)).map((s) => stepTitle(s));
   const count = state.finished && skipped.length > 0

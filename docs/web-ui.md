@@ -168,7 +168,9 @@ Back on a dirty form asks "Leave without saving?" inline (`role="alertdialog"`).
 The **Overview** orients: "Signed in as alice" (in external mode: "Signed in
 as Alice Example through your organisation's sign-in"), what the wizard does,
 N of M steps done, the step list with badges and Change links, a notice when a
-restart is pending, and Continue to the first pending step.
+restart is pending, and Continue to the first pending step. M counts only the
+steps that apply on this instance: a step closed by policy ("Not available on
+this instance") or by a lockdown stays in the list but is not counted.
 
 Step forms (`steps/*.tsx`) open on the server's values and are keyed by
 `${viewer.id}:${step.etag}`, so another person's save — or a restart —
