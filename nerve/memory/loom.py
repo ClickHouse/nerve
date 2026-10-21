@@ -39,6 +39,12 @@ server fault, a timeout, a rate limit — raises
 :class:`~nerve.memory.backend.MemoryBackendUnavailable`, so a session starts
 without priors instead of crashing and the sweep keeps its watermark. A
 request Loom refused as invalid raises :class:`LoomRequestError`.
+
+Recalled text is data from anyone who writes to the namespaces the agent
+reads. It reaches the session inside the ``<session-context>`` block, so the
+startup recall keeps it as Loom escapes it (``<`` and ``>`` as ``&lt;`` and
+``&gt;``), escapes the fallback search's text the same way, and puts each
+item on one line.
 """
 
 from __future__ import annotations
@@ -347,6 +353,18 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _iso_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _escape_data(text: str) -> str:
+    """Recalled text as Loom escapes it in a context pack: ``<`` and ``>``
+    as ``&lt;`` and ``&gt;``, so it can neither close nor open a tag."""
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace, newlines included, as one
+    space: a recalled item cannot start a line of its own."""
+    return " ".join(text.split())
 
 
 def _type_name(loom_type: Any) -> str:
@@ -724,10 +742,13 @@ class LoomMemory:
     def _pack_items(self, rendered: str) -> list[dict[str, str]]:
         """The items of a pack's memories section, in its order.
 
-        Loom escapes ``<`` and ``>`` in recalled text. A section cut to its
-        budget ends in a ``...[truncated]`` line; the item the cut went
-        through is left out, and a cut inside the next item's label costs
-        nothing, since that line is no item.
+        Loom escapes ``<`` and ``>`` in recalled text, and the summaries keep
+        them escaped: they go into the session's ``<session-context>`` block.
+        An item's continuation lines (indented by two spaces) join its first
+        line, so each summary is one line. A section cut to its budget ends
+        in a ``...[truncated]`` line; the item the cut went through is left
+        out, and a cut inside the next item's label costs nothing, since that
+        line is no item.
         """
         lines = rendered.rstrip().splitlines()
         cut = bool(lines) and lines[-1].strip() == _PACK_TRUNCATED
@@ -745,21 +766,23 @@ class LoomMemory:
                     current = {"id": self._display_id(key, namespace), "type": "", "summary": match["text"]}
                     items.append(current)
             elif line.startswith("  ") and current is not None:
-                current["summary"] += "\n" + line[2:]
+                current["summary"] += " " + line
             else:
                 current = None
         if cut and current is not None and items and items[-1] is current:
             items.pop()  # the cut went through it
         out = []
         for item in items:
-            item["summary"] = _clip(item["summary"].replace("&lt;", "<").replace("&gt;", ">"))
+            # Escaped again in case a summary came without Loom's escaping.
+            item["summary"] = _clip(_escape_data(_one_line(item["summary"])))
             if item["summary"]:
                 out.append(item)
         return out
 
     async def _search_items(self, query: str, limit: int) -> list[dict[str, str]]:
         """The memory hits of ``loom_search``, abstaining or not: a startup
-        prior is context, not an answer."""
+        prior is context, not an answer. Their text is escaped and put on one
+        line the way a pack's items are."""
         result = await self._call("search.query", {"query": query, "top_k": max(1, min(limit, 20))})
         section = result.get("memory") if isinstance(result, dict) else None
         hits = section.get("results") if isinstance(section, dict) else None
@@ -769,7 +792,9 @@ class LoomMemory:
             if not isinstance(hit, dict):
                 continue
             key = str(hit.get("parent_memory_key") or hit.get("memory_key") or hit.get("key") or "")
-            summary = _clip(_text(hit.get("content_excerpt") or hit.get("content") or hit.get("value")))
+            summary = _clip(_escape_data(_one_line(
+                _text(hit.get("content_excerpt") or hit.get("content") or hit.get("value")),
+            )))
             if not key or not summary:
                 continue
             item_id = self._display_id(key, str(hit.get("namespace") or ""))
