@@ -409,6 +409,7 @@ def _first_run_waits_for(release: asyncio.Event, order: list[str]):
 def test_runs_in_flight_tracks_each_run_and_how_it_started():
     runs = cron_service._RunsInFlight()
     assert not runs.running("job")
+    assert runs.started("job") == 0
 
     with runs.track("job", "schedule"):
         with runs.track("job", "catchup"):
@@ -419,6 +420,8 @@ def test_runs_in_flight_tracks_each_run_and_how_it_started():
         assert not runs.running("other")
 
     assert not runs.running("job")
+    assert runs.started("job") == 2
+    assert runs.started("other") == 0
 
 
 @pytest.mark.asyncio
@@ -567,6 +570,72 @@ async def test_a_pause_during_the_startup_catch_up_waits_for_it(held_service):
     await asyncio.gather(startup, after_pause)
 
     assert order == ["overdue start", "overdue end", "due start", "due end"]
+
+
+@pytest.mark.asyncio
+async def test_a_queued_catch_up_runs_each_job_as_it_is_now(held_service, caplog):
+    """Jobs are looked up when the catch-up's turn comes, not when it queues."""
+    edited = CronJob(id="edited", schedule=EVERY_TEN_MINUTES, prompt="old prompt")
+    removed = CronJob(id="removed", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([edited, removed])
+    paused, resumed = _pause_window()
+    for job_id in ("edited", "removed"):
+        svc.scheduler.modify_job(job_id, next_run_time=resumed - timedelta(hours=1))
+    await svc._catchup_lock.acquire()  # an earlier catch-up is still running
+    catch_up = svc._on_clock_step(paused, resumed)
+
+    # A reload while it waits: one job is rewritten, the other one goes.
+    svc.scheduler.add_job(
+        svc._run_job_wrapper, svc.scheduler.get_job("edited").trigger,
+        args=[CronJob(id="edited", schedule=EVERY_TEN_MINUTES, prompt="new prompt")],
+        id="edited", replace_existing=True,
+    )
+    svc.scheduler.remove_job("removed")
+    with caplog.at_level(logging.INFO, logger="nerve.cron.service"):
+        svc._catchup_lock.release()
+        await catch_up
+
+    ran = [(c.kwargs["job_id"], c.kwargs["prompt"]) for c in svc.engine.run_cron.await_args_list]
+    assert ran == [("edited", "new prompt")]
+    assert "Not catching up removed: it is no longer scheduled" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_ran_while_its_catch_up_waited_is_not_run_again(
+    held_service, caplog,
+):
+    job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([job])
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("every-ten", next_run_time=resumed - timedelta(hours=1))
+    await svc._catchup_lock.acquire()  # an earlier catch-up is still running
+    catch_up = svc._on_clock_step(paused, resumed)
+
+    # Its next fire comes while the catch-up waits its turn.
+    await svc._run_job_wrapper(job)
+    with caplog.at_level(logging.INFO, logger="nerve.cron.service"):
+        svc._catchup_lock.release()
+        await catch_up
+
+    svc.engine.run_cron.assert_awaited_once()
+    assert "Not catching up every-ten: it has run since the pause" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_job_due_in_two_queued_pauses_runs_once(held_service):
+    job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")
+    svc = await held_service([job])
+    await svc._catchup_lock.acquire()  # an earlier catch-up is still running
+    queued = []
+    for hours_ago in (2, 1):
+        paused, resumed = _pause_window(hours=hours_ago)
+        svc.scheduler.modify_job("every-ten", next_run_time=paused + timedelta(minutes=5))
+        queued.append(svc._on_clock_step(paused, resumed))
+
+    svc._catchup_lock.release()
+    await asyncio.gather(*queued)
+
+    svc.engine.run_cron.assert_awaited_once()
 
 
 @pytest.mark.asyncio

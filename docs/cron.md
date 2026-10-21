@@ -508,7 +508,10 @@ them start late or be dropped as [late runs](#late-runs):
   window and the number of jobs caught up.
 
 A catch-up waits for one that is still running — at startup or after an earlier
-pause — instead of overlapping it. A job whose run is still going when the
+pause — instead of overlapping it, and then runs each job as it is at that
+moment: a job a reload removed meanwhile is skipped, a changed one runs in its
+new form, one that has run since is not run again, and one that came due in
+several pauses runs once. A job whose run is still going when the
 machine resumes is not caught up, just as the scheduler skips a fire that finds
 the job's previous run still going; and a scheduled fire that comes while the
 job's catch-up run is going is skipped. Both are logged. Jumps under 5 seconds
