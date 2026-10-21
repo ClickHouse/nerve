@@ -243,14 +243,22 @@ class StreamManager:
     async def publish_subscriptions(self) -> int:
         """Send the current source subscriptions on every ready stream.
 
-        Returns the number of streams that sent them. A stream that negotiates
+        Returns the number of streams that sent them. Each stream bounds its
+        own send, so a stalled one costs at most that bound; a stream that
+        fails is logged and the others still send. A stream that negotiates
         later sends the settings current at that time.
         """
-        sent = await asyncio.gather(
-            *(stream.publish_subscriptions() for stream in self.streams if stream.ready),
-            return_exceptions=True,
+        streams = [stream for stream in self.streams if stream.ready]
+        outcomes = await asyncio.gather(
+            *(stream.publish_subscriptions() for stream in streams), return_exceptions=True,
         )
-        return sum(1 for outcome in sent if outcome is True)
+        for stream, outcome in zip(streams, outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(
+                    "Channel stream %d: publishing the source subscriptions failed: %r",
+                    stream.id, outcome, exc_info=outcome,
+                )
+        return sum(1 for outcome in outcomes if outcome is True)
 
     def capabilities_for(self, connection_id: uuid.UUID) -> Capabilities | None:
         """The capabilities of *connection_id* on the preferred stream that has them."""

@@ -608,6 +608,60 @@ class TestStreams:
         assert latest["sources"][0]["filters"]["deny_reasons"] == ["subscribed", "comment"]
         assert "pr_watch" not in latest["sources"][0]
 
+    async def test_a_stalled_stream_does_not_hold_up_a_republish(self, hosted, monkeypatch, caplog):
+        monkeypatch.setattr("nerve.channels.hosted.stream._SUBSCRIPTIONS_SEND_SECONDS", 0.2)
+        await hosted.stream()
+        await hosted.stream()
+        await hosted.subscriptions(2)
+        stalled = hosted.runtime.streams.streams[0]
+        caplog.set_level(logging.WARNING, logger="nerve.channels.hosted.stream")
+        await stalled._send_lock.acquire()
+        try:
+            outcome = await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
+        finally:
+            stalled._send_lock.release()
+
+        assert outcome == "published on 1 stream(s)"
+        assert (
+            f"Channel stream {stalled.id}: source subscriptions not sent: the stream could not "
+            "send them within 0.2s"
+        ) in caplog.text
+
+    async def test_a_stream_that_fails_to_publish_is_logged_and_the_others_still_send(
+        self, hosted, monkeypatch, caplog,
+    ):
+        await hosted.stream()
+        await hosted.stream()
+        await hosted.subscriptions(2)
+        failing = hosted.runtime.streams.streams[0]
+
+        async def broken() -> bool:
+            raise RuntimeError("socket gone")
+
+        monkeypatch.setattr(failing, "publish_subscriptions", broken)
+        caplog.set_level(logging.ERROR, logger="nerve.channels.hosted.manager")
+
+        outcome = await hosted.runtime.republish_subscriptions()
+
+        assert outcome == "published on 1 stream(s)"
+        assert f"Channel stream {failing.id}: publishing the source subscriptions failed" in caplog.text
+
+    async def test_a_publish_after_negotiation_that_fails_is_logged_at_once(self, hosted, monkeypatch, caplog):
+        class Unchecked:
+            def validate(self) -> None:
+                raise RuntimeError("cannot check")
+
+        monkeypatch.setattr(
+            "nerve.channels.hosted.runtime.subscriptions_for", lambda config, providers: Unchecked(),
+        )
+        caplog.set_level(logging.ERROR, logger="nerve.channels.hosted.stream")
+
+        stream = await hosted.stream()
+
+        await eventually(lambda: "publishing the source subscriptions failed" in caplog.text)
+        assert stream.sent("subscriptions") == []
+        assert stream.close_code is None
+
     async def test_subscriptions_above_the_gateways_frame_limit_go_without_patterns(self, hosted):
         hosted.config.sync.github.allow_repos = [f"owner/{'r' * 200}-{n}" for n in range(100)]
         stream = await hosted.stream(negotiate=False)

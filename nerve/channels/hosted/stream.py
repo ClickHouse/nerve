@@ -78,6 +78,9 @@ RESPONSE_KIND = {
 _BEFORE_NEGOTIATION = frozenset({"negotiation", "heartbeat", "drain"})
 # A drain is a courtesy; a peer that does not take it quickly is closed anyway.
 _DRAIN_SEND_SECONDS = 2.0
+# How long the subscriptions frame may take to go out, bounded as the drain
+# is: a stream that is stalled must not hold up a reload.
+_SUBSCRIPTIONS_SEND_SECONDS = 2.0
 # Room left in an upload chunk frame for a longer offset or final marker.
 _CHUNK_FRAME_MARGIN = 32
 # How long a cancelled sender still lets its frame finish.
@@ -428,6 +431,7 @@ class ChannelStream:
                 self._publish_task = asyncio.get_running_loop().create_task(
                     self.publish_subscriptions(), name=f"channel-stream-{self.id}-subscriptions",
                 )
+                self._publish_task.add_done_callback(self._publish_done)
             self._listener.stream_ready(self)
         elif kind == "heartbeat":
             pass
@@ -595,7 +599,8 @@ class ChannelStream:
         inbox filter still drops what the patterns would have. Subscriptions
         that it would refuse even so are not sent, since the gateway would
         close the stream over them. A stream that is not ready, or that Nerve
-        is draining, sends nothing.
+        is draining, sends nothing, and one that cannot send the frame within
+        ``_SUBSCRIPTIONS_SEND_SECONDS`` gives up, as the drain does.
         """
         if self._subscriptions is None or not self.ready or self.drain_sent:
             return False
@@ -624,22 +629,40 @@ class ChannelStream:
             )
             body = wide
         try:
-            try:
-                await self._send_one_way("subscriptions", body)
-            except Rejected as error:
-                if error.reason != RejectionReason.FRAME_TOO_LARGE:
-                    raise
-                logger.warning(
-                    "Channel stream %d: source subscriptions exceed the gateway's frame limit; "
-                    "sending them without filter patterns", self.id,
-                )
-                await self._send_one_way("subscriptions", body.without_filters())
+            async with asyncio.timeout(_SUBSCRIPTIONS_SEND_SECONDS):
+                try:
+                    await self._send_one_way("subscriptions", body)
+                except Rejected as error:
+                    if error.reason != RejectionReason.FRAME_TOO_LARGE:
+                        raise
+                    logger.warning(
+                        "Channel stream %d: source subscriptions exceed the gateway's frame "
+                        "limit; sending them without filter patterns", self.id,
+                    )
+                    await self._send_one_way("subscriptions", body.without_filters())
         except StreamClosed:
+            return False
+        except TimeoutError:
+            logger.warning(
+                "Channel stream %d: source subscriptions not sent: the stream could not send "
+                "them within %gs", self.id, _SUBSCRIPTIONS_SEND_SECONDS,
+            )
             return False
         except Rejected as error:
             logger.warning("Channel stream %d: source subscriptions not sent: %s", self.id, error)
             return False
         return True
+
+    def _publish_done(self, task: asyncio.Task) -> None:
+        """Log a failure of the publish that negotiation started, when it happens."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Channel stream %d: publishing the source subscriptions failed: %r",
+                self.id, error, exc_info=error,
+            )
 
     def _check_room(
         self, kind: str, body: Any, connection_id: uuid.UUID | None, upload: bytes | None,
