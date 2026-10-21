@@ -107,7 +107,9 @@ def test_special_source_and_record_type_fields():
 
 # The glob dialect that the hosted GitHub gateway matches with too: Python
 # fnmatch on lower-cased values, where "*" also crosses "/", "?" is one
-# character, [...] is a class, and there is neither "**" nor escaping.
+# character, [...] is a class, and there is neither "**" nor escaping. Each
+# pattern admits its value through an allow list, and drops it through a deny
+# list, exactly when it matches.
 @pytest.mark.parametrize(("pattern", "value", "matched"), [
     ("*nerve*", "OWNER/Nerve-Tools", True),
     ("owner*", "owner/repo", True),
@@ -121,10 +123,13 @@ def test_special_source_and_record_type_fields():
 ])
 def test_the_glob_vectors_shared_with_the_gateway(pattern, value, matched):
     assert FieldRule(field="repo_name", allow=[pattern]).passes(_rec(value)) is matched
+    assert FieldRule(field="repo_name", deny=[pattern]).passes(_rec(value)) is not matched
 
 
 def test_the_list_vector_shared_with_the_gateway():
-    assert FieldRule(field="actors", allow=["codecov"]).passes(_rec(actors=["alice", "Codecov"])) is True
+    record = _rec(actors=["alice", "Codecov"])
+    assert FieldRule(field="actors", allow=["codecov"]).passes(record) is True
+    assert FieldRule(field="actors", deny=["codecov"]).passes(record) is False
 
 
 def test_inbox_filter_inactive_partition_is_passthrough():

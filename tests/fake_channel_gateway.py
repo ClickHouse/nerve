@@ -189,7 +189,8 @@ def source_record_event(
     """A hosted GitHub record in the shape of the contract samples, without a delivery.
 
     The content and summary follow the polling source's layout for a mention
-    on a pull request.
+    on a pull request. With the defaults, the record is the one of the
+    contract's notification sample.
     """
     summary = f"[{repository}] {title} ({reason})"
     content = "\n".join([
@@ -201,6 +202,9 @@ def source_record_event(
         "Author: alice",
         f"Updated: {updated_at}",
         f"URL: https://github.com/{repository}/pull/12",
+        "",
+        "--- Description ---",
+        "The retry test waits on a timer that a busy CI host can starve.",
         "",
         "--- Latest Comment (bob, 2026-09-16T09:59:30Z) ---",
         "@example-agent could you take a look?",
