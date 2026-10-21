@@ -2193,9 +2193,17 @@ class CronService:
         :meth:`_forecast_job`); the next run of each source runner; the
         earliest pending session wakeup. Cleanup and the wakeup sweep are
         housekeeping and never count. ``None`` when nothing falls within
-        *horizon* of *now* (default: the current time).
+        *horizon* of *now* (default: the current time), which must be
+        timezone-aware: a naive *now* raises ``ValueError``.
+
+        The tick can lie before *now*: a session wakeup that came due but has
+        not fired yet — the sweep runs every ``_WAKEUP_SWEEP_SECONDS`` and
+        waits while its session is in a turn — is reported at its due time.
         """
-        now = now or datetime.now(UTC)
+        if now is None:
+            now = datetime.now(UTC)
+        elif now.utcoffset() is None:
+            raise ValueError(f"next_scheduled() needs a timezone-aware now, not {now!r}")
         return self._earliest(
             await self._forecast_scheduled(now + horizon),
             await self._next_wakeup(),

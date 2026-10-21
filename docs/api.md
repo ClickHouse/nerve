@@ -1564,10 +1564,11 @@ earliest, within 7 days, of: the first run of each enabled cron job that its
 gates forecast will happen (its next run, or one of its next few runs when a
 gate that reasons about the time skips the next one), the next run of each
 source runner, and the earliest pending session wakeup — never the cleanup job
-or the wakeup sweep; `null` when
-nothing is due. `at` is UTC; `kind` is `cron`, `source` or `wakeup`; `name` is
-the job id, `source:<name>` or `wakeup:<first 8 characters of the session id>`,
-limited to `[A-Za-z0-9._:-]` and 64 characters. `jobs` has the jobs of
+or the wakeup sweep; `null` when nothing is due. `at` is UTC, and can be a
+little in the past for a session wakeup that came due but has not fired yet;
+`kind` is `cron`, `source` or `wakeup`; `name` is the job id, `source:<name>` or
+`wakeup:<first 8 characters of the session id>`, limited to `[A-Za-z0-9._:-]`
+and 64 characters. `jobs` has the jobs of
 `GET /api/cron/jobs`: `forecast` is `run` or `skip` for a job with a next run and
 `null` otherwise, and `reason` says why a skip. See
 [What runs next](cron.md#what-runs-next).

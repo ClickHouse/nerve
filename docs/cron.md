@@ -634,7 +634,14 @@ Cleanup and the wakeup sweep are housekeeping and never count. `at` is in UTC;
 `kind` is `cron`, `source` or `wakeup`; `name` is the job id, `source:<name>`, or
 `wakeup:` with the first 8 characters of the session id — limited to letters,
 digits and `._:-` (anything else becomes `_`) and to 64 characters. `next` is
-`null` when nothing is due within 7 days.
+`null` when nothing is due within 7 days. `at` can be a little in the past: a
+session wakeup that came due but has not fired yet (the sweep runs every 20
+seconds, and waits while the session is in a turn) is reported at the time it
+came due.
+
+In code, `CronService.next_scheduled(now=None, horizon=...)` returns `next` as a
+`ScheduledTick` (`at`, `name`, `kind`); a `now` you pass must be
+timezone-aware, or it raises `ValueError`.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);

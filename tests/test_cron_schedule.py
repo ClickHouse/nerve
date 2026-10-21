@@ -404,6 +404,27 @@ async def test_nothing_beyond_the_horizon_counts(held):
 
 
 @pytest.mark.asyncio
+async def test_now_must_be_timezone_aware(held):
+    svc = await held([_job("digest")])
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await svc.next_scheduled(now=datetime.now())
+
+
+@pytest.mark.asyncio
+async def test_a_wakeup_due_but_not_yet_fired_keeps_its_due_time(held):
+    now = datetime.now(UTC)
+    db = _mock_db(pending_wakeups=[
+        {"session_id": "0a1b2c3d4e5f", "fire_at": (now - timedelta(seconds=15)).isoformat()},
+    ])
+    svc = await held(db=db)
+
+    tick = await svc.next_scheduled(now=now)
+
+    assert tick.at == now - timedelta(seconds=15)
+
+
+@pytest.mark.asyncio
 async def test_names_are_safe_to_report(held):
     now = datetime.now(UTC)
     long_id = "a-very-long-job-name-" * 5
