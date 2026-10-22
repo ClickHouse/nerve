@@ -411,6 +411,7 @@ def _setup_summary(config) -> dict | None:
             restart_pending=[],
             telegram_live=False,
             credential_sources=setup_provenance.credential_sources(config),
+            machine_switches=setup_provenance.machine_switches(config),
             telegram_session_present=setup_telegram_login.session_present(),
             env_credential=bool(
                 os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")

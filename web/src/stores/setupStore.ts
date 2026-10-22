@@ -38,6 +38,13 @@ export interface SetupFieldError {
   detail: string;
 }
 
+/** What a form held when a 409 refused its save, and the etag of the step it was opened on. */
+export interface UnsavedForm {
+  step: SetupStepId;
+  etag: string | null;
+  values: unknown;
+}
+
 export interface SetupStoreState {
   state: SetupState | null;
   loading: boolean;
@@ -55,13 +62,24 @@ export interface SetupStoreState {
   overlayDismissed: boolean;
   /** A step just saved that wants to say so before the person moves on. */
   savedNotice: SetupStepId | null;
+  /**
+   * What a form held when a 409 refused its save. The store re-reads the
+   * state then, and a read that finds the step changed remounts the form,
+   * which would start again from the server's values; the form mounted in
+   * its place starts from these instead (`unsavedFor`), so the refusal does
+   * not also discard the person's changes. Dropped once taken, by a read that
+   * finds the step unchanged (nothing is remounted), by the next write and by
+   * `reset()`.
+   */
+  unsaved: UnsavedForm | null;
   preflight: SourcesPreflight | null;
   agentsDetected: AgentsDetect | null;
   environment: SetupEnvironment | null;
   models: SetupModelsResponse | null;
   hostLogin: HostLogin | null;
   load: () => Promise<void>;
-  save: (step: SetupStepId, run: () => Promise<SetupState>) => Promise<boolean>;
+  /** One write. `unsaved` is what the form holds, kept for it if a 409 refuses the write. */
+  save: (step: SetupStepId, run: () => Promise<SetupState>, unsaved?: unknown) => Promise<boolean>;
   skip: (step: SetupStepId, skipped: boolean) => Promise<boolean>;
   finish: () => Promise<SetupFinishResponse | null>;
   restart: () => Promise<boolean>;
@@ -77,6 +95,7 @@ export interface SetupStoreState {
   dismissRestartOverlay: () => void;
   noteSaved: (step: SetupStepId) => void;
   clearSavedNotice: () => void;
+  dropUnsaved: () => void;
   clearError: () => void;
   reset: () => void;
 }
@@ -162,6 +181,16 @@ export function stepById(s: SetupStoreState, id: string): SetupStep | undefined 
   return s.state?.steps.find((x) => x.id === id);
 }
 
+/**
+ * What a refused save left for the form now mounted for `step` (`unsaved`),
+ * or `null`. Only a form the read after the refusal remounted takes it: its
+ * step's etag is not the one the refused form was opened on.
+ */
+export function unsavedFor(step: SetupStep): unknown {
+  const kept = useSetupStore.getState().unsaved;
+  return kept && kept.step === step.id && kept.etag !== step.etag ? kept.values : null;
+}
+
 /** Which wait is the current one; an older wait that wakes up stops. */
 let waitToken = 0;
 
@@ -204,6 +233,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   bannerDismissed: false,
   overlayDismissed: false,
   savedNotice: null,
+  unsaved: null,
   preflight: null,
   agentsDetected: null,
   environment: null,
@@ -213,6 +243,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   clearError: () => set({ error: null, fieldError: null }),
   noteSaved: (step) => set({ savedNotice: step }),
   clearSavedNotice: () => set((s) => (s.savedNotice === null ? s : { savedNotice: null })),
+  dropUnsaved: () => set((s) => (s.unsaved === null ? s : { unsaved: null })),
 
   reset: () => {
     waitToken += 1;
@@ -221,7 +252,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       state: null, loading: true, busy: null, error: null, fieldError: null,
       reconnecting: false, reconnectElapsedMs: 0, reconnectFailed: false,
       restartOutcome: null, bannerDismissed: false, overlayDismissed: false,
-      savedNotice: null,
+      savedNotice: null, unsaved: null,
       preflight: null, agentsDetected: null, environment: null, models: null,
       hostLogin: null,
     });
@@ -238,7 +269,11 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       // A mutation started meanwhile: its answer is newer than this read,
       // whichever arrives last. The next load() (step change) re-reads.
       if (seq !== mutationSeq) return;
-      set({ state, loading: false, bannerDismissed: readBannerDismissed() });
+      // What a refused save kept waits for the form this read remounts; a
+      // step found unchanged remounts nothing, so nothing would take it.
+      const kept = get().unsaved;
+      const remounts = kept !== null && state.steps.some((s) => s.id === kept.step && s.etag !== kept.etag);
+      set({ state, loading: false, bannerDismissed: readBannerDismissed(), unsaved: remounts ? kept : null });
     } catch (e) {
       if (!asked()) return;
       if (seq !== mutationSeq) return;
@@ -251,10 +286,10 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     }
   },
 
-  save: async (step, run) => {
+  save: async (step, run, unsaved) => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: step, error: null, fieldError: null });
+    set({ busy: step, error: null, fieldError: null, unsaved: null });
     try {
       const state = await run();
       if (!asked()) return false;
@@ -268,14 +303,18 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     } catch (e) {
       if (!asked()) return false;
       const fieldError = fieldErrorOf(e);
+      const refused = statusOf(e) === 409;
       set({
         fieldError,
         error: fieldError ? null : errorDetail(e, 'Could not save that'),
+        // Kept before the re-read below, which may remount the form.
+        unsaved: refused && unsaved !== undefined
+          ? { step, etag: stepById(get(), step)?.etag ?? null, values: unsaved } : null,
       });
       // Somebody else got there first, or the step is read-only now: show
       // the server's sentence verbatim and re-read, rather than trust the view
       // this form was opened on.
-      if (statusOf(e) === 409) void get().load();
+      if (refused) void get().load();
       return false;
     } finally {
       if (asked()) set({ busy: null });
@@ -285,7 +324,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   skip: async (step, skipped) => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: step, error: null, fieldError: null });
+    set({ busy: step, error: null, fieldError: null, unsaved: null });
     try {
       const state = await api.setupSkip(step, skipped);
       if (!asked()) return false;
@@ -303,7 +342,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   finish: async () => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: 'finish', error: null, fieldError: null });
+    set({ busy: 'finish', error: null, fieldError: null, unsaved: null });
     try {
       const response = await api.setupFinish();
       if (!asked()) return null;
@@ -321,7 +360,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   restart: async () => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: 'restart', error: null, fieldError: null, overlayDismissed: false });
+    set({ busy: 'restart', error: null, fieldError: null, unsaved: null, overlayDismissed: false });
     let outcome: RestartResponse;
     try {
       outcome = await api.restartSystem();

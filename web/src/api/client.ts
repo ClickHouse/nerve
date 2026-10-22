@@ -218,7 +218,17 @@ export interface TelegramSyncSessionSummary {
 export type SetupSourceId = 'github' | 'gmail' | 'telegram';
 
 export interface SetupSourcesDetail {
-  github: { enabled: boolean; source?: CredentialSource | null };
+  github: {
+    enabled: boolean;
+    source?: CredentialSource | null;
+    /**
+     * `true` while the channel gateway polls GitHub and the operator holds
+     * the source's switch in the machine's configuration: the page shows the
+     * source and offers no switch (`available` leaves it out). Absent
+     * otherwise, and from an older backend.
+     */
+    managed?: boolean;
+  };
   gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
   telegram: {
     enabled: boolean;
@@ -232,7 +242,8 @@ export interface SetupSourcesDetail {
    * instance that keeps no credentials on disk (`local_secrets: false`): a
    * GitHub token from the environment keeps the GitHub toggle alone on
    * offer (`['github']`); otherwise nothing is (`[]`, the step is closed).
-   * Absent from an older backend, which offers all three.
+   * GitHub is left out either way while the operator holds its switch
+   * (`github.managed`). Absent from an older backend, which offers all three.
    */
   available?: SetupSourceId[];
   /** Why the others are not offered — the server's sentence, shown on the step. */

@@ -158,10 +158,10 @@ visible rather than failing the fetch.
 With `sync.github.mode: hosted`, this process does not poll GitHub and needs no
 `gh` login. The shared channel gateway (the one that serves
 [hosted Slack](config.md#hosted-mode), set up with the same `channels.hosted`
-settings) polls GitHub for the agent with its own credential, builds each record
-the way the polling source does, enrichment included, and keeps the records
-until Nerve reads them, also while Nerve is not running. Nerve reads them over
-the hosted channel streams.
+settings) polls GitHub for the agent with the GitHub credential connected to
+that agent, builds each record the way the polling source does, enrichment
+included, and keeps the records until Nerve reads them, also while Nerve is not
+running. Nerve reads them over the hosted channel streams.
 
 - **What arrives:** `github_notification` records, one for each notification
   thread whose `updated_at` moved, with the summary, content and metadata of the
@@ -176,6 +176,25 @@ the hosted channel streams.
   `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
   actor, reason and CI branch lists are not checked for it (see
   [Pull request activity records](#github-pull-request-activity-records)).
+- **The credential is the switch.** The gateway polls GitHub for an agent only
+  while a GitHub credential is connected to that agent and Nerve subscribes,
+  which it does while `enabled` is true. Your operator can therefore set
+  `sync.github.enabled: true` in `config.yaml` or `config.local.yaml`, which
+  outrank the `settings.yaml` that the setup page writes. GitHub then arrives
+  once a GitHub credential is connected to the agent and stops when it is
+  removed, with nothing to switch in Nerve. The Sources step of the setup page
+  shows GitHub as managed by the channel gateway, with no switch, and refuses a
+  save that includes it (`409`, naming `github`); Gmail and Telegram work as
+  before. Until a gateway stream opens, the step says that it is waiting for
+  the channel gateway and that a GitHub credential may still need to be
+  connected: Nerve cannot tell those two cases apart. Once a stream is open,
+  it says that the stream is connected and that records arrive once a GitHub
+  credential is connected to the agent, and never that GitHub is connected,
+  also when the page holds the switch: the streams carry every hosted
+  provider, so a hosted Slack opens them too, and Nerve cannot see whether a
+  credential is connected. A `false` in either file keeps GitHub off the same
+  way. Without the key in either file, the Sources step switches GitHub as
+  before.
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,

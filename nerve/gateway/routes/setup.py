@@ -66,6 +66,7 @@ from nerve.gateway.routes.accounts import instance_is_passwordless, setup_requir
 from nerve.identity import Actor
 from nerve.setup_checklist import (
     BLOCKED_POLICY,
+    GITHUB_SWITCH,
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
     NO_LOCAL_SECRETS_TEXT,
@@ -83,6 +84,7 @@ from nerve.setup_checklist import (
     Facts,
     Step,
     derive,
+    managed_switch_reason,
     onboarding_from_task,
     sources_available,
     steps_for_mode,
@@ -559,6 +561,7 @@ async def _context(actor: Actor) -> _Context:
         available = ()
     facts = Facts(
         credential_sources=setup_provenance.credential_sources(config),
+        machine_switches=setup_provenance.machine_switches(config),
         hosted_gateway=_hosted_gateway_status(config),
         telegram_session_present=setup_telegram_login.session_present(),
         config=config,
@@ -621,7 +624,12 @@ def _refuse_managed(ctx: _Context, path: str, field: str) -> None:
     """409 ``{detail, field}`` when the value at ``path`` came from somewhere
     the page may not overwrite: the environment (a variable Nerve reads, or a
     ``${VAR}`` reference in a layer), the configuration repository, or the
-    channel gateway. A value from a file on this machine is replaceable."""
+    channel gateway — or, for a switch, a machine layer the operator holds it
+    in (:func:`nerve.setup_checklist.managed_switch_reason`). A value from a
+    file on this machine is replaceable."""
+    reason = managed_switch_reason(ctx.facts, path)
+    if reason is not None:
+        raise SetupFieldError(field, reason, status_code=409)
     source = ctx.facts.credential_sources.get(path)
     if source in (None, setup_provenance.SOURCE_FILE):
         return
@@ -1928,7 +1936,8 @@ def _refuse_closed_sources(ctx: _Context, req: SourcesRequest) -> list[str]:
     credentials — so nothing goes through (409, the policy's two sentences),
     except GitHub when the channel gateway polls it or its token comes from
     the environment: that switch stores nothing, and the Gmail and Telegram
-    fields alone are refused, by name, with the step's reason."""
+    fields alone are refused, by name, with the step's reason. A GitHub switch
+    the operator holds is never on offer (the handler refuses it first)."""
     available, unavailable_reason = sources_available(ctx.facts)
     if not available:
         _refuse_without_local_secrets(ctx)
@@ -1947,6 +1956,16 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
         _require_writable(ctx)
+        # The GitHub switch while the operator holds it in a machine layer
+        # (hosted, ``sync.github.enabled`` in config.yaml or config.local.yaml):
+        # this page writes settings.yaml, which that layer outranks, so the
+        # save would change nothing the loader reads. A request that names the
+        # field is refused whole, by name, as one that names a credential the
+        # operator provides is: nothing it carries is applied, so no save lands
+        # halfway, and a request without it still writes the other sources.
+        # Ahead of the policy, which would answer without naming the field.
+        if "github" in req.model_fields_set:
+            _refuse_managed(ctx, GITHUB_SWITCH, "github")
         # The policy first, ranked above the wait for a mode as the checklist
         # ranks it: choosing a mode would not open a closed step, so that is
         # not the answer to give.

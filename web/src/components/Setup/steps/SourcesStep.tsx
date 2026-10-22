@@ -4,12 +4,12 @@ import {
   api, type SecretOut, type SetupAutomationDetail, type SetupSourceId, type SetupSourcesDetail, type SetupState,
   type SetupStep,
 } from '../../../api/client';
-import { useSetupStore } from '../../../stores/setupStore';
+import { unsavedFor, useSetupStore } from '../../../stores/setupStore';
 import { Button, Checkbox, TextField } from '../../ui';
 import { Github, Mail, MessageCircle, RefreshCw, X } from '../../ui/icons';
 import {
-  INBOX_JOB_OFF, MANAGED_SOURCE_TEXT, SOURCES_IDLE_HINT, STEP_HEADINGS, TELEGRAM_SIGNIN, TELEGRAM_SYNC_INTRO,
-  TELEGRAM_SYNC_TITLE, managedLine,
+  GITHUB_MANAGED_ON, INBOX_JOB_OFF, MANAGED_SOURCE_TEXT, SOURCES_IDLE_HINT, STEP_HEADINGS, TELEGRAM_SIGNIN,
+  TELEGRAM_SYNC_INTRO, TELEGRAM_SYNC_TITLE, managedLine,
 } from '../copy';
 import { managedSource, secretManaged, type ManagedSource } from '../credentialSource';
 import { CodeText, Field } from '../Field';
@@ -25,8 +25,21 @@ const EMAIL_RE = /^[^\s@-][^\s@]*@[^\s@]+\.[^\s@]+$/;
 const INBOX_JOB = 'inbox-processor';
 /** What an older backend, which says nothing about availability, offers. */
 const ALL_SOURCES: SetupSourceId[] = ['github', 'gmail', 'telegram'];
+/** The sources as the button that switches them off names them. */
+const SOURCE_NAMES: Record<SetupSourceId, string> = { github: 'GitHub', gmail: 'Gmail', telegram: 'Telegram' };
 /** Secondary controls reach the 44 px phone target without changing the desktop density. */
 const TOUCH = 'min-h-[44px] md:min-h-0';
+
+/** What the form holds; a refused save keeps it for the form remounted after it (`unsavedFor`). */
+interface SourcesForm {
+  github: boolean;
+  gmail: boolean;
+  telegram: boolean;
+  accounts: string[];
+  newAccount: string;
+  apiId: string;
+  apiHash: string | null;
+}
 
 /** A value the operator provided, in the place its field would be. */
 function ManagedValue({ label, secret, source }: { label: string; secret?: SecretOut; source: ManagedSource }) {
@@ -54,7 +67,12 @@ function ManagedValue({ label, secret, source }: { label: string; secret?: Secre
  * anything yet. The Ready screen points back here when it is still unsigned.
  *
  * A credential the operator provided (environment, configuration
- * repository) renders as managed: the line says so, there is no field.
+ * repository) renders as managed: the line says so, there is no field. So
+ * does a GitHub source whose switch the operator holds in the machine's
+ * configuration while the channel gateway polls GitHub
+ * (`detail.github.managed`): the card says it is on and who provides it,
+ * with no switch, and the step's reason says what decides. A source held
+ * off that way is not shown; the reason says so.
  *
  * On an instance that keeps no credentials on disk (`local_secrets: false`)
  * the server says which sources the page may switch (`detail.available`):
@@ -67,15 +85,20 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const detail = step.detail as SetupSourcesDetail;
   const available = detail.available ?? ALL_SOURCES;
   const offers = (id: SetupSourceId) => available.includes(id);
+  const fieldError = useSetupStore((s) => s.fieldError);
+  // A refused switch has no field to stand under (a form opened before the
+  // operator took the GitHub switch over still sends it), so it gets a line
+  // of its own, as the other steps give theirs.
+  const switchError = fieldError && (ALL_SOURCES as string[]).includes(fieldError.field) ? fieldError.detail : null;
   // Said once: the frame already shows the sentence when it is the step's
-  // own read-only or blocked reason.
+  // own read-only or blocked reason, and the refusal when it is the same.
   const partial = available.length > 0 && available.length < ALL_SOURCES.length;
   const unavailableReason = partial && detail.unavailable_reason
     && detail.unavailable_reason !== step.read_only_reason && detail.unavailable_reason !== step.blocked_reason
+    && detail.unavailable_reason !== switchError
     ? detail.unavailable_reason : null;
   const save = useSetupStore((s) => s.save);
   const load = useSetupStore((s) => s.load);
-  const fieldError = useSetupStore((s) => s.fieldError);
   const preflight = useSetupStore((s) => s.preflight);
   const loadPreflight = useSetupStore((s) => s.loadPreflight);
   const savedNotice = useSetupStore((s) => s.savedNotice);
@@ -84,16 +107,33 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   // A Telegram sync the operator switched on where the page may not: shown, not editable.
   const telegramLocked = locked || !offers('telegram');
 
-  const [github, setGithub] = useState(detail.github.enabled);
-  const [gmail, setGmail] = useState(detail.gmail.enabled);
-  const [telegram, setTelegram] = useState(detail.telegram.enabled);
-  const [accounts, setAccounts] = useState<string[]>(detail.gmail.accounts);
-  const [newAccount, setNewAccount] = useState('');
-  const [apiId, setApiId] = useState('');
-  const [apiHash, setApiHash] = useState<string | null>('');
+  const githubManaged = managedSource(detail.github.source);
+  // The operator holds the GitHub switch: never offered, so never in the save.
+  const githubSwitchManaged = detail.github.managed === true;
+  const gmailManaged = managedSource(detail.gmail.source);
+  const apiIdManaged = secretManaged(detail.telegram.api_id);
+  const apiHashManaged = secretManaged(detail.telegram.api_hash);
+  const credentialsSaved = detail.telegram.api_id.configured && detail.telegram.api_hash.configured;
+
+  // A save the server refused re-reads the state, which remounts this form
+  // when the step changed (GitHub no longer on offer, say). The form starts
+  // from what the person had chosen wherever it still lets them change it,
+  // so the refusal does not also discard their other changes.
+  const [kept] = useState(() => (locked ? null : (unsavedFor(step) as Partial<SourcesForm> | null)));
+  const keep = <T,>(editable: boolean, mine: T | undefined, server: T): T => (editable && mine !== undefined ? mine : server);
+  const [github, setGithub] = useState(() => keep(offers('github'), kept?.github, detail.github.enabled));
+  const [gmail, setGmail] = useState(() => keep(offers('gmail'), kept?.gmail, detail.gmail.enabled));
+  const [telegram, setTelegram] = useState(() => keep(offers('telegram'), kept?.telegram, detail.telegram.enabled));
+  const [accounts, setAccounts] = useState<string[]>(
+    () => keep(offers('gmail') && !gmailManaged, kept?.accounts, detail.gmail.accounts),
+  );
+  const [newAccount, setNewAccount] = useState(() => keep(offers('gmail') && !gmailManaged, kept?.newAccount, ''));
+  const [apiId, setApiId] = useState(() => keep(offers('telegram') && !apiIdManaged, kept?.apiId, ''));
+  const [apiHash, setApiHash] = useState<string | null>(() => keep(offers('telegram') && !apiHashManaged, kept?.apiHash, ''));
   const [clientError, setClientError] = useState<{ field: string; detail: string } | null>(null);
   const [rechecking, setRechecking] = useState(false);
 
+  useEffect(() => { if (kept) useSetupStore.getState().dropUnsaved(); }, [kept]);
   useEffect(() => { void loadPreflight(); }, [loadPreflight]);
 
   // After credentials are saved the server's answer remounts this form and
@@ -101,12 +141,6 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   useEffect(() => {
     if (savedNotice === 'sources') document.getElementById('setup-telegram-signin-heading')?.focus();
   }, [savedNotice]);
-
-  const githubManaged = managedSource(detail.github.source);
-  const gmailManaged = managedSource(detail.gmail.source);
-  const apiIdManaged = secretManaged(detail.telegram.api_id);
-  const apiHashManaged = secretManaged(detail.telegram.api_hash);
-  const credentialsSaved = detail.telegram.api_id.configured && detail.telegram.api_hash.configured;
 
   const errFor = (field: string) =>
     clientError?.field === field ? clientError.detail
@@ -153,7 +187,8 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
       }
     }
     const credentialsSent = body.telegram_api_id !== undefined || body.telegram_api_hash !== undefined;
-    const ok = await save('sources', () => api.setupStep('sources', body));
+    const form: SourcesForm = { github, gmail, telegram, accounts, newAccount, apiId, apiHash };
+    const ok = await save('sources', () => api.setupStep('sources', body), form);
     if (!ok) return false;
     setApiId('');
     setApiHash('');
@@ -188,6 +223,11 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const automation = stepOf(state, 'automation')?.detail as SetupAutomationDetail | undefined;
   const inboxJobOff = automation?.optional.some((job) => job.id === INBOX_JOB && !job.enabled) ?? false;
   const inboxWarning = (github || gmail || telegram) && inboxJobOff;
+  // "All" only while every source is on offer: one the operator keeps on (a
+  // GitHub held in the machine's configuration) stays on, so the button names
+  // the ones it switches.
+  const turnOffLabel = available.length === ALL_SOURCES.length
+    ? 'Turn all off' : `Turn ${available.map((id) => SOURCE_NAMES[id]).join(' and ')} off`;
   const dirty = github !== detail.github.enabled || gmail !== detail.gmail.enabled
     || telegram !== detail.telegram.enabled || accounts.join() !== detail.gmail.accounts.join()
     || newAccount !== '' || apiId !== '' || (apiHash ?? '') !== '';
@@ -225,18 +265,23 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
 
       {(offers('github') || detail.github.enabled) && (
         <section aria-label="GitHub" className={card}>
-          <Checkbox
-            checked={github}
-            onChange={(e) => setGithub(e.target.checked)}
-            disabled={locked || !offers('github')}
-            label={<span className="flex items-center gap-2 text-text"><Github size={16} />GitHub — notifications, PRs, issues</span>}
-          />
+          {githubSwitchManaged ? (
+            <p className="flex items-center gap-2 text-sm text-text"><Github size={16} />GitHub — notifications, PRs, issues</p>
+          ) : (
+            <Checkbox
+              checked={github}
+              onChange={(e) => setGithub(e.target.checked)}
+              disabled={locked || !offers('github')}
+              label={<span className="flex items-center gap-2 text-text"><Github size={16} />GitHub — notifications, PRs, issues</span>}
+            />
+          )}
           <p className="text-xs text-text-dim" role="status">
             {githubOk === null ? 'Checking…'
               : githubHosted ? preflight?.github.hint
                 : githubOk ? `gh is installed and signed in${preflight?.github.login ? ` as ${preflight.github.login}` : ''}`
                   : preflight?.github.hint ?? 'gh is not signed in on the server'}
           </p>
+          {githubSwitchManaged && <p className="text-xs text-text-muted">{GITHUB_MANAGED_ON}</p>}
           {githubManaged && <p className="text-xs text-text-muted">{managedLine('Token', githubManaged)}</p>}
           {github && githubOk === false && <Notice tone="warning">{SOURCES_IDLE_HINT}</Notice>}
         </section>
@@ -357,10 +402,11 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
             }}
             className={TOUCH}
           >
-            Turn all off
+            {turnOffLabel}
           </Button>
         </div>
       )}
+      {switchError && <p role="alert" tabIndex={-1} className="text-sm text-error outline-none">{switchError}</p>}
       {state.mode === 'worker' && <Notice tone="info">Sources do not apply to a worker instance.</Notice>}
     </StepFrame>
   );

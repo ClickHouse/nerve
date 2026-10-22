@@ -1124,6 +1124,8 @@ class TestSetupPage:
             "cli": False, "authenticated": False, "login": None,
             "hint": setup_checks.GH_HOSTED_HINT, "hosted": True,
         }
+        # The gateway polls for the agent only while a credential is connected to it.
+        assert "once a GitHub credential is connected to it" in result["github"]["hint"]
 
     async def test_the_environment_check_does_not_ask_for_gh_in_hosted_mode(self, monkeypatch):
         from nerve import setup_checks
