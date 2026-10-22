@@ -119,7 +119,7 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   // when the step changed (GitHub no longer on offer, say). The form starts
   // from what the person had chosen wherever it still lets them change it,
   // so the refusal does not also discard their other changes.
-  const [kept] = useState(() => unsavedFor(step) as Partial<SourcesForm> | null);
+  const [kept] = useState(() => (locked ? null : (unsavedFor(step) as Partial<SourcesForm> | null)));
   const keep = <T,>(editable: boolean, mine: T | undefined, server: T): T => (editable && mine !== undefined ? mine : server);
   const [github, setGithub] = useState(() => keep(offers('github'), kept?.github, detail.github.enabled));
   const [gmail, setGmail] = useState(() => keep(offers('gmail'), kept?.gmail, detail.gmail.enabled));
