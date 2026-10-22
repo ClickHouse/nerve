@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import os
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -18,6 +20,7 @@ import aiosqlite
 import pytest
 
 from nerve.db import FORK_SCHEMA_VERSION, SCHEMA_VERSION, Database
+from nerve.db.base import InsecureStateStorage, check_database_file
 from nerve.db.migrations import runner
 
 
@@ -211,6 +214,18 @@ async def test_the_override_runs_on_a_newer_track_with_a_warning(
     )]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "yes", "true", ""])
+async def test_only_the_value_1_overrides_the_refusal(tmp_path, monkeypatch, value):
+    monkeypatch.setenv(runner.ALLOW_NEWER_SCHEMA_ENV, value)
+    upstream = _track(tmp_path, monkeypatch, "u", "schema_version", [1])
+
+    async with _database(tmp_path) as db:
+        await _record(db, "schema_version", 2)
+        with pytest.raises(runner.SchemaNewerThanCodeError):
+            await runner.run_migrations(db, (upstream,))
+
+
 # --------------------------------------------------------------------------- #
 #  The real tracks                                                             #
 # --------------------------------------------------------------------------- #
@@ -259,3 +274,100 @@ async def test_a_nerve_without_the_fork_migrations_refuses_a_database_a_fork_mig
     assert failure.value.track == "fork"
     assert failure.value.database_version == FORK_SCHEMA_VERSION + 1
 
+
+# --------------------------------------------------------------------------- #
+#  check_database_file: the gateway's check before it starts                  #
+# --------------------------------------------------------------------------- #
+
+
+def _sqlite_at(path: Path, table: str, version: int) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"CREATE TABLE {table} (version INTEGER PRIMARY KEY)")
+        conn.execute(f"INSERT INTO {table} (version) VALUES (?)", (version,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("table, track, code", [
+    ("schema_version", "upstream", SCHEMA_VERSION),
+    ("fork_schema_version", "fork", FORK_SCHEMA_VERSION),
+])
+async def test_check_database_file_refuses_without_changing_the_file(
+    tmp_path, table, track, code,
+):
+    path = tmp_path / "nerve state" / "nerve.db"  # a space: the file is opened by URI
+    path.parent.mkdir()
+    _sqlite_at(path, table, code + 1)
+    before = path.read_bytes()
+
+    with pytest.raises(runner.SchemaNewerThanCodeError) as failure:
+        await check_database_file(path)
+    assert (failure.value.track, failure.value.database_version) == (track, code + 1)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_check_database_file_opens_the_database_read_only(tmp_path):
+    """A read-write connection that closes last checkpoints the write-ahead log
+    into the database file and removes the log. The check leaves both as they
+    were."""
+    path = tmp_path / "nerve.db"
+    _sqlite_at(path, "schema_version", SCHEMA_VERSION)
+    writer = sqlite3.connect(path)
+    try:
+        # The newer version stays in the log after this close, as it would
+        # after a crash.
+        writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        writer.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION + 1,))
+        writer.commit()
+    finally:
+        writer.close()
+    wal = Path(f"{path}-wal")
+    before = (path.read_bytes(), wal.read_bytes())
+    assert before[1], "the newer version is in the log"
+
+    with pytest.raises(runner.SchemaNewerThanCodeError):
+        await check_database_file(path)
+    assert (path.read_bytes(), wal.exists() and wal.read_bytes()) == before
+
+
+@pytest.mark.asyncio
+async def test_check_database_file_leaves_everything_else_to_the_real_open(
+    tmp_path, monkeypatch,
+):
+    current = tmp_path / "current.db"
+    _sqlite_at(current, "schema_version", SCHEMA_VERSION)
+    await check_database_file(current)
+
+    await check_database_file(tmp_path / "missing.db")
+    assert not (tmp_path / "missing.db").exists()
+
+    junk = tmp_path / "junk.db"
+    junk.write_text("not a database", encoding="utf-8")
+    await check_database_file(junk)
+
+    newer = tmp_path / "newer.db"
+    _sqlite_at(newer, "fork_schema_version", FORK_SCHEMA_VERSION + 1)
+    monkeypatch.setenv(runner.ALLOW_NEWER_SCHEMA_ENV, "1")
+    await check_database_file(newer)
+
+
+@pytest.mark.asyncio
+async def test_check_database_file_trusts_nothing_in_state_others_can_write(tmp_path):
+    """Another user can write to the state directory, so the version in the
+    database proves nothing. The check reads nothing there, and the real open
+    refuses the storage, as it would without the check."""
+    path = tmp_path / "state" / "nerve.db"
+    path.parent.mkdir()
+    _sqlite_at(path, "fork_schema_version", FORK_SCHEMA_VERSION + 1)
+    os.chmod(path.parent, 0o777)
+    try:
+        await check_database_file(path)
+        with pytest.raises(InsecureStateStorage, match="writable by other users"):
+            await Database(path).connect()
+    finally:
+        os.chmod(path.parent, 0o700)

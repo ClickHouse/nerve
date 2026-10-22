@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 # older build, where staying up matters more and the risk is accepted.
 ALLOW_NEWER_SCHEMA_ENV = "NERVE_ALLOW_NEWER_SCHEMA"
 
+#: Exit status of a process that refused a database newer than its code: the
+#: gateway at start, and every CLI command that opens the database. It is
+#: EX_DATAERR from sysexits.h. It differs from 1 (a failed command), 2 (a
+#: usage error) and 3 (uvicorn's code for any other startup failure), so a
+#: supervisor can tell this failure apart and stop restarting.
+NEWER_SCHEMA_EXIT_CODE = 65
+
 
 class SchemaNewerThanCodeError(RuntimeError):
     """The database was migrated by a newer Nerve than this one."""
@@ -118,7 +125,8 @@ async def get_fork_version(db: aiosqlite.Connection) -> int:
     return await get_current_version(db, FORK_TRACK)
 
 
-def _newer_schema_allowed() -> bool:
+def newer_schema_allowed() -> bool:
+    """Whether ``NERVE_ALLOW_NEWER_SCHEMA=1`` is set (only ``1`` counts)."""
     return os.environ.get(ALLOW_NEWER_SCHEMA_ENV, "").strip() == "1"
 
 
@@ -135,7 +143,7 @@ async def check_schema(
         shipped = code_version(track)
         if current <= shipped:
             continue
-        if not _newer_schema_allowed():
+        if not newer_schema_allowed():
             raise SchemaNewerThanCodeError(current, shipped, track.name)
         logger.warning(
             "Database %s schema version %d is newer than this code's %d; continuing "

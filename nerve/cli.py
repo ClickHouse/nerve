@@ -156,7 +156,40 @@ def _docker_compose(
 _SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init", "migrate"})
 
 
-@click.group()
+class _NerveGroup(click.Group):
+    """The ``nerve`` group. A database newer than this code gets one line, not a
+    traceback.
+
+    Any command that opens the database (``start --foreground``, which runs
+    the gateway, included) can hit the refusal. It prints ``Error: <reason>``
+    and exits with ``NEWER_SCHEMA_EXIT_CODE``, so a supervisor can tell it
+    apart from any other failure.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except (RuntimeError, click.ClickException) as e:
+            # Only the runner raises the refusal, so its module is loaded
+            # whenever there is one. The CLI does not load the database package
+            # to start, and a failure elsewhere must not import it either.
+            runner = sys.modules.get("nerve.db.migrations.runner")
+            if runner is None:
+                raise
+            if isinstance(e, runner.SchemaNewerThanCodeError):
+                refusal = click.ClickException(str(e))
+                refusal.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+                raise refusal from e
+            # A command that puts the refusal in its own message (nerve init)
+            # still exits with the refusal's status.
+            if isinstance(e, click.ClickException) and isinstance(
+                e.__cause__, runner.SchemaNewerThanCodeError,
+            ):
+                e.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+            raise
+
+
+@click.group(cls=_NerveGroup)
 @click.option(
     "--config-dir", "-c", type=click.Path(), default=None,
     help="Config directory (default: auto-detected — see `nerve doctor`)",
@@ -3603,6 +3636,7 @@ def db_vacuum(ctx: click.Context) -> None:
     VACUUM takes a write lock and cannot run while the daemon holds the DB.
     Stop the daemon first (`nerve stop`) for a clean run.
     """
+    from nerve.db.migrations.runner import SchemaNewerThanCodeError
     from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
@@ -3631,6 +3665,8 @@ def db_vacuum(ctx: click.Context) -> None:
 
     try:
         asyncio.run(_run())
+    except SchemaNewerThanCodeError:
+        raise  # _NerveGroup reports it with its own exit status
     except Exception as e:
         click.echo(f"[ERR] VACUUM failed: {e}")
         ctx.exit(1)

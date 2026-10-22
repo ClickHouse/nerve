@@ -28,8 +28,10 @@ from nerve.db.mcp import McpStore
 from nerve.db.messages import MessageStore
 from nerve.db.migrations.runner import (
     FORK_TRACK,
+    check_schema,
     code_version,
     discover_migrations,
+    newer_schema_allowed,
     run_migrations,
 )
 from nerve.db.notifications import NotificationStore
@@ -308,6 +310,34 @@ def _refusal_message(db_path: Path, perms: StatePermissions) -> str:
         f"not repaired automatically. If you trust the contents, fix the modes "
         f"yourself (chmod 700 {db_path.parent}; chmod 600 {files}), then start again."
     )
+
+
+async def check_database_file(db_path: Path) -> None:
+    """The newer-schema guard (:func:`check_schema`) on the database file at
+    ``db_path``, read-only and without migrating it.
+
+    The gateway calls this to refuse before uvicorn starts. Step 1 of the
+    state-file policy (:meth:`Database.connect`) comes first: when another user
+    can write to a database file, a sidecar or the state directory, or a mode
+    cannot be read, nothing in the files is trusted. Then this reads nothing,
+    and the real open refuses the storage. A database that is missing or
+    cannot be read is left to the real open as well, which reports the
+    problem itself. With the override set, there is nothing to refuse, and
+    the real open logs the warning.
+    """
+    if newer_schema_allowed() or not db_path.is_file():
+        return
+    pre = _inspect_state_permissions(db_path)
+    if pre.writable or pre.uninspectable:
+        return
+    try:
+        db = await aiosqlite.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001 — the real open reports it
+        return
+    try:
+        await check_schema(db)
+    finally:
+        await db.close()
 
 
 class Database(

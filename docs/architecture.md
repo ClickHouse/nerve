@@ -272,7 +272,7 @@ Every database open runs the runner: the gateway's start and every CLI command t
 
 **Numbering.** Within a track, the runner skips every version at or below the database's current one. To add a migration upstream, create `nerve/db/migrations/vNNN_your_feature.py` numbered above the highest version on `main`. CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not numbered that way, or that gives two migrations the same number. Upstream never ships a fork migration: `fork/` holds only its package files, and the same check fails on any migration there. A fork of Nerve adds its own migrations only under `fork/`, numbered from `v001` on their own (`nerve/db/migrations/fork/README.md`). A fork's number therefore never shadows an upstream migration that ships later, and the fork runs the check with `--fork`.
 
-**Newer-schema guard.** Before anything is applied, each track's version in the database is compared with the highest migration this code ships for that track. If the database is ahead on either track, a newer Nerve or a fork migrated it, and the database is refused untouched; the error names the track and both versions. `NERVE_ALLOW_NEWER_SCHEMA=1` starts anyway, with a warning. See [Going back to an older Nerve](setup.md#going-back-to-an-older-nerve).
+**Newer-schema guard.** Before anything is applied, each track's version in the database is compared with the highest migration this code ships for that track. If the database is ahead on either track, a newer Nerve or a fork migrated it, and the database is refused untouched. The gateway process (`nerve start --foreground`, which a supervisor runs) and every CLI command that opens the database print one line that names the track and both versions, then exit with status 65 (`NEWER_SCHEMA_EXIT_CODE` in `nerve/db/migrations/runner.py`). That status differs from any other failure, so a supervisor can stop restarting on it (systemd: `RestartPreventExitStatus=65`). The daemonizing `nerve start` does not pass it on: it checks the process it started once, a second later, and exits with status 1 if that process has exited by then. `NERVE_ALLOW_NEWER_SCHEMA=1` starts anyway, with a warning. See [Going back to an older Nerve](setup.md#going-back-to-an-older-nerve).
 
 ### Schema
 
@@ -312,7 +312,7 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 ## Startup Sequence
 
 1. Load config (`settings.yaml` + `config.yaml` + `config.local.yaml` deep merge). The loaded object is remembered as the *startup configuration*: the setup page later compares it with what is on disk to say whether a restart is pending. The previous process's setup notes (restart debts, start-up errors) are retired
-2. Run database migrations (the upstream track, then the fork track; see [Migrations](#migrations)); bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
+2. Run database migrations (the upstream track, then the fork track; see [Migrations](#migrations)). A database newer than the code stops the start before uvicorn runs, with exit status 65. Bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
 3. Initialize memory system (memU SQLite, load categories). With no model credential yet the warm-up is skipped and recall answers empty; nothing calls out
 4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
 5. Recover orphan sessions (active in DB but no live client → idle or stopped)
