@@ -78,7 +78,8 @@ _STOP_WAIT_SECONDS = GRACEFUL_STOP_SECONDS
 _CATCHUP_SETTLE_SECONDS = 15
 
 # The cron_logs error of a run that came due during a pause of the machine and
-# was not caught up.
+# was not caught up, although its gates would have let it run (see
+# CronService._record_paused_run).
 _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: false)"
 
 # How a run of a cron job or source runner was started: by its schedule, as a
@@ -1180,10 +1181,11 @@ class CronService:
         ``catchup``, the source runners and cleanup — except one with a run
         still going, which the fire that came due would have found going too
         (see :meth:`_may_start`). A job with ``catchup: false`` only moves on,
-        with a ``missed`` row for the run it skips; the wakeup sweep (which
-        fires every due session wakeup on its next pass) only moves on. Jobs
-        are handled one by one: one that cannot be moved is logged and left to
-        the scheduler, and the rest still move.
+        with a ``missed`` row for the run it skips unless its gates would have
+        skipped that run (see :meth:`_record_paused_run`); the wakeup sweep
+        (which fires every due session wakeup on its next pass) only moves on.
+        Jobs are handled one by one: one that cannot be moved is logged and
+        left to the scheduler, and the rest still move.
         """
         after = paused_to + timedelta(microseconds=1)
         grace = timedelta(seconds=_MISFIRE_GRACE_SECONDS)
@@ -1212,10 +1214,9 @@ class CronService:
                     if self._may_start(sched_job.id, "catchup"):
                         due.append(sched_job.id)
                 elif func == self._run_job_wrapper:
-                    # Recorded like a run the scheduler drops for being late.
-                    asyncio.create_task(self._record_missed_run(
-                        sched_job.id, missed, error=_PAUSED_MISS,
-                    ))
+                    asyncio.create_task(
+                        self._record_paused_run(sched_job.args[0], missed),
+                    )
             except Exception:
                 logger.exception("Could not move %s past the pause", sched_job.id)
         # Re-arm the scheduler's own timer against the stepped clock too.
@@ -1236,6 +1237,38 @@ class CronService:
         if rearmed:
             self._schedule_changed()
         return due
+
+    async def _record_paused_run(self, job: CronJob, due: datetime) -> None:
+        """Record the run that *job*, a job with ``catchup: false``, skipped by
+        coming due at *due* during a pause of the machine.
+
+        The run is missed, and recorded like a run the scheduler drops for
+        being late, only if the job's gates would have let it run. If they
+        would have skipped it, it is skipped as a scheduled run that its gates
+        skip is: no ``cron_logs`` row, a log line, and the schedule listeners
+        are told. The gates are asked for their forecast for *due*, as
+        :meth:`next_scheduled` asks them about a run to come — the answer that
+        left this run out of the next scheduled tick — and not for their
+        check, which may keep state for a run it lets through (a cursor
+        renewed, a fingerprint stored) when this run never happened. A
+        forecast that raises lets the run through, as a check that raises does.
+        """
+        if job.gates:
+            from nerve.cron.gates import GateContext, forecast_gates
+
+            decision = await forecast_gates(
+                job.gates, GateContext(job_id=job.id, db=self.db), due,
+            )
+            if not decision.should_run:
+                logger.debug(
+                    "Skipping cron job %s, due at %s while the machine was paused: %s",
+                    job.id,
+                    due.astimezone(self.timezone).isoformat(timespec="seconds"),
+                    decision.reason,
+                )
+                self._schedule_changed()
+                return
+        await self._record_missed_run(job.id, due, error=_PAUSED_MISS)
 
     async def _catch_up_after_pause(self) -> None:
         """Run once each job waiting to be caught up, concurrently, through
