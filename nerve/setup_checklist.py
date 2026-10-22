@@ -137,6 +137,31 @@ SOURCES_GITHUB_HOSTED_TEXT = (
     "GitHub comes from the channel gateway of this deployment; "
     "Gmail and Telegram are not available on this instance."
 )
+# The channel gateway polls GitHub and a machine layer (``config.yaml`` or
+# ``config.local.yaml``) states ``sync.github.enabled``: the operator holds
+# that switch, and the settings.yaml the page writes cannot change it, so the
+# GitHub card is shown and not offered. Records then arrive while a GitHub
+# credential is connected to the agent, which is decided where the operator
+# manages it, not here. The Sources step's reason and the detail of a refused
+# GitHub write; on an instance that keeps no credentials the closed Gmail and
+# Telegram sentence follows it.
+SOURCES_GITHUB_MANAGED_TEXT = (
+    "GitHub arrives from the channel gateway of this deployment once a GitHub "
+    "credential is connected to this agent; nothing to switch here."
+)
+# The same switch, held off.
+SOURCES_GITHUB_MANAGED_OFF_TEXT = (
+    "GitHub is switched off for this agent by the operator of this deployment; "
+    "nothing to switch here."
+)
+_GMAIL_TELEGRAM_CLOSED = "Gmail and Telegram are not available on this instance."
+# The summary of a GitHub held on that way while no gateway stream is open.
+# Nerve cannot tell a credential that is not connected from a gateway it
+# cannot reach, so it names both without claiming either.
+GITHUB_GATEWAY_WAITING = (
+    "waiting for the channel gateway — if no GitHub credential is connected to "
+    "this agent yet, connect one where your operator manages it"
+)
 MODE_LOCK_REASON = (
     "Mode was chosen when the workspace was created. Changing it means starting a "
     "new workspace: stop Nerve, point workspace: in config.yaml at an empty "
@@ -237,6 +262,10 @@ class Facts:
     #: ``None`` (:func:`nerve.setup_provenance.credential_sources`). A path
     #: missing here reads as ``file`` when the value is configured.
     credential_sources: dict[str, str | None] = field(default_factory=dict)
+    #: The switches a machine layer states, by dotted path, with the file that
+    #: states each (:func:`nerve.setup_provenance.machine_switches`). The page
+    #: writes them to ``settings.yaml``, which those files outrank.
+    machine_switches: dict[str, str] = field(default_factory=dict)
     #: ``slack.mode: hosted`` or ``sync.github.mode: hosted`` only: the
     #: stream manager's ``status()`` — ``{"streams", "connected",
     #: "last_event_at"}``; ``None`` otherwise or when no process can ask
@@ -698,6 +727,39 @@ def github_hosted(facts: Facts) -> bool:
     return facts.config.sync.github.mode == "hosted"
 
 
+#: The GitHub source's switch: the page writes it to ``settings.yaml``.
+GITHUB_SWITCH = "sync.github.enabled"
+
+
+def github_managed(facts: Facts) -> bool:
+    """Whether the operator holds the GitHub switch: the channel gateway
+    polls GitHub and a machine layer states ``sync.github.enabled``.
+
+    The page writes that switch to ``settings.yaml``, which the machine layer
+    outranks, so a save would change nothing the loader reads; the source is
+    shown, not offered. Switched on there, the agent's GitHub credential is
+    the one control: the gateway polls GitHub for the agent while one is
+    connected. Poll mode is not covered: a switch stated there stays the
+    page's as before.
+    """
+    return github_hosted(facts) and GITHUB_SWITCH in facts.machine_switches
+
+
+def github_managed_reason(facts: Facts) -> str:
+    """Why the GitHub switch is not offered while the operator holds it."""
+    if facts.config.sync.github.enabled:
+        return SOURCES_GITHUB_MANAGED_TEXT
+    return SOURCES_GITHUB_MANAGED_OFF_TEXT
+
+
+def managed_switch_reason(facts: Facts, path: str) -> str | None:
+    """Why the switch at ``path`` is not this page's to change, or ``None``
+    when the page may change it."""
+    if path == GITHUB_SWITCH and github_managed(facts):
+        return github_managed_reason(facts)
+    return None
+
+
 def sources_available(facts: Facts) -> tuple[list[str], str | None]:
     """``(the sources the page may switch here, why the others are not)``.
 
@@ -707,10 +769,18 @@ def sources_available(facts: Facts) -> tuple[list[str], str | None]:
     toggle writes an ``enabled`` flag and nothing else, so it is offered
     alone while Gmail (a keyring, addresses) and Telegram (API credentials,
     a signed-in session) stay closed.
+
+    Either way GitHub is left out while the operator holds its switch
+    (:func:`github_managed`), and the reason says that first.
     """
+    managed = github_managed(facts)
     if facts.config.setup.local_secrets:
+        if managed:
+            return ["gmail", "telegram"], github_managed_reason(facts)
         return ["github", "gmail", "telegram"], None
     if github_hosted(facts):
+        if managed:
+            return [], f"{github_managed_reason(facts)} {_GMAIL_TELEGRAM_CLOSED}"
         return ["github"], SOURCES_GITHUB_HOSTED_TEXT
     if github_from_environment(facts):
         return ["github"], SOURCES_GITHUB_ONLY_TEXT
@@ -734,6 +804,10 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
         # step's etag.
         gateway = facts.hosted_gateway or {"streams": 0, "connected": False, "last_event_at": None}
         github.update(mode="hosted", gateway=gateway)
+        if github_managed(facts):
+            # The operator holds the switch: the card shows the source with
+            # no switch (``available`` leaves it out). Absent otherwise.
+            github["managed"] = True
     detail = {
         "github": github,
         "gmail": {
@@ -755,10 +829,12 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     }
     on = []
     if sync.github.enabled and gateway is not None:
-        on.append(
-            "GitHub from the channel gateway · "
-            + ("connected" if gateway.get("connected") else "waiting for the gateway")
-        )
+        if gateway.get("connected"):
+            on.append("GitHub from the channel gateway · connected")
+        elif github.get("managed"):
+            on.append(f"GitHub · {GITHUB_GATEWAY_WAITING}")
+        else:
+            on.append("GitHub from the channel gateway · waiting for the gateway")
     elif sync.github.enabled:
         on.append("GitHub")
     if sync.gmail.enabled:
@@ -885,15 +961,17 @@ def derive(facts: Facts) -> list[Step]:
     keyless = not config.setup.local_secrets
     # GitHub polled by the channel gateway, or with its token from the
     # environment: the one source whose switch stores nothing, so the policy
-    # leaves that toggle open.
-    github_open = github_hosted(facts) or github_from_environment(facts)
+    # leaves that toggle open — unless the operator holds the switch on the
+    # machine (``github_managed``), which leaves nothing on offer.
+    offered_sources, sources_reason = sources_available(facts)
+    github_open = "github" in offered_sources
     steps: list[Step] = []
 
     def _lockdown(reason: str) -> tuple[str, str, str]:
         return STATUS_BLOCKED, reason, BLOCKED_LOCKDOWN
 
-    def _policy() -> tuple[str, str, str]:
-        return STATUS_BLOCKED, NO_LOCAL_SECRETS_TEXT, BLOCKED_POLICY
+    def _policy(reason: str = NO_LOCAL_SECRETS_TEXT) -> tuple[str, str, str]:
+        return STATUS_BLOCKED, reason, BLOCKED_POLICY
 
     def _until_mode(reason: str) -> tuple[str, str, str]:
         # Waiting for the Mode step is work left to do — unless the instance
@@ -906,6 +984,8 @@ def derive(facts: Facts) -> list[Step]:
         blocked_kind: str | None = None
         read_only = False
         read_only_reason: str | None = None
+        # Why the policy closes this step, or keeps it read-only once done.
+        policy_reason = NO_LOCAL_SECRETS_TEXT
         detail: dict[str, Any]
         summary: str
 
@@ -1008,6 +1088,9 @@ def derive(facts: Facts) -> list[Step]:
 
         elif step_id == STEP_SOURCES:
             detail, summary = _sources_detail(facts)
+            # The policy's two sentences, or what is said instead while the
+            # operator holds the GitHub switch.
+            policy_reason = sources_reason or NO_LOCAL_SECRETS_TEXT
             sync = config.sync
             done = bool(
                 sync.github.enabled or sync.gmail.enabled or sync.telegram.enabled
@@ -1022,8 +1105,8 @@ def derive(facts: Facts) -> list[Step]:
                 # API credentials and the signed-in session. With GitHub
                 # hosted, or its token in the environment, the step stays
                 # open for that one toggle (``detail["available"]``), to
-                # answer or to skip.
-                status, blocked_reason, blocked_kind = _policy()
+                # answer or to skip — not while the operator holds it.
+                status, blocked_reason, blocked_kind = _policy(policy_reason)
             elif mode is None:
                 status, blocked_reason, blocked_kind = _until_mode(_CHOOSE_MODE_FIRST)
             else:
@@ -1072,13 +1155,13 @@ def derive(facts: Facts) -> list[Step]:
         # already on disk, an answer) is not replaced from here. A Slack the
         # channel gateway holds keeps its one control, the on/off switch —
         # and so does GitHub while the gateway polls it or its token comes
-        # from the environment.
+        # from the environment, unless the operator holds that switch too.
         if keyless and status == STATUS_DONE and step_id in _POLICY_STEPS and not (
             (step_id == STEP_CHANNELS and config.slack.mode == "hosted")
             or (step_id == STEP_SOURCES and github_open)
         ):
             if not read_only:
-                read_only, read_only_reason = True, NO_LOCAL_SECRETS_TEXT
+                read_only, read_only_reason = True, policy_reason
         if status == STATUS_BLOCKED:
             read_only = True
             read_only_reason = read_only_reason or blocked_reason

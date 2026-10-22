@@ -504,7 +504,12 @@ def reset_caches() -> None:
 # (taken at, GitHub hosted, result)
 _sources_cache: tuple[float, bool, dict[str, Any]] | None = None
 
-GH_HOSTED_HINT = "The channel gateway polls GitHub for this agent; gh is not needed on the server."
+# The gateway polls GitHub for an agent only while a GitHub credential is
+# connected to it, so the hint says that is what GitHub waits for here.
+GH_HOSTED_HINT = (
+    "The channel gateway polls GitHub for this agent once a GitHub credential "
+    "is connected to it; gh is not needed on the server."
+)
 
 
 def gh_needed(config: NerveConfig) -> bool:

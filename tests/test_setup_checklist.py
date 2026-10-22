@@ -663,6 +663,107 @@ class TestNoLocalSecrets:
         assert len({every, github_only, none}) == 3
 
 
+# The operator states ``sync.github.enabled`` in a machine layer.
+GITHUB_HELD = {"sync.github.enabled": "config.local.yaml"}
+_QUIET_GATEWAY = {"streams": 0, "connected": False, "last_event_at": None}
+_GMAIL_TELEGRAM_CLOSED = " Gmail and Telegram are not available on this instance."
+
+
+class TestGitHubSwitchHeldOnTheMachine:
+    """Hosted GitHub with ``sync.github.enabled`` in config.yaml or
+    config.local.yaml: those outrank the settings.yaml the page writes, so the
+    switch is the operator's. The card is shown and not offered, and the step
+    says that a GitHub credential connected to the agent is what decides."""
+
+    def test_shown_not_offered_beside_the_other_sources(self, personal):
+        """Where the page may store credentials, Gmail and Telegram stay on
+        offer and the step stays open for them."""
+        on = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        s = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert s["detail"]["available"] == ["gmail", "telegram"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_MANAGED_TEXT
+        assert s["detail"]["github"] == {
+            "enabled": True, "source": None, "mode": "hosted", "gateway": _QUIET_GATEWAY, "managed": True,
+        }
+        assert s["status"] == "done" and s["read_only"] is False and s["read_only_reason"] is None
+
+    def test_the_summary_names_the_credential_while_no_stream_is_open(self, personal):
+        """Nerve cannot tell a credential that is not connected from a gateway
+        it cannot reach, so the waiting line names both."""
+        on = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        waiting = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert waiting["summary"] == (
+            "GitHub · waiting for the channel gateway — if no GitHub credential is connected "
+            "to this agent yet, connect one where your operator manages it"
+        )
+        live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+        connected = step(facts(personal, on, machine_switches=GITHUB_HELD, hosted_gateway=live), "sources")
+        assert connected["summary"] == "GitHub from the channel gateway · connected"
+        assert connected["etag"] == waiting["etag"], "the gateway's state is volatile: never remounts the form"
+
+    def test_without_local_secrets_nothing_is_on_offer_and_the_done_step_is_read_only(self, personal):
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        f = facts(personal, on, machine_switches=GITHUB_HELD)
+        s = step(f, "sources")
+        reason = checklist.SOURCES_GITHUB_MANAGED_TEXT + _GMAIL_TELEGRAM_CLOSED
+        assert s["detail"]["available"] == [] and s["detail"]["unavailable_reason"] == reason
+        assert s["status"] == "done" and s["blocked_kind"] is None
+        assert s["read_only"] is True and s["read_only_reason"] == reason
+        assert checklist.summarize(f)["steps_left"] == 3  # provider, profile, automation
+
+    def test_held_off_says_so(self, personal):
+        """Not claimed to arrive: the operator switched it off there."""
+        off = keyless(personal, sync={"github": {"enabled": False, "mode": "hosted"}})
+        f = facts(personal, off, machine_switches=GITHUB_HELD)
+        s = step(f, "sources")
+        reason = checklist.SOURCES_GITHUB_MANAGED_OFF_TEXT + _GMAIL_TELEGRAM_CLOSED
+        assert s["status"] == "blocked" and s["blocked_kind"] == "policy" and s["blocked_reason"] == reason
+        assert s["read_only"] is True and s["read_only_reason"] == reason
+        assert s["detail"]["available"] == [] and s["detail"]["github"]["managed"] is True
+        assert checklist.summarize(f)["steps_left"] == 3, "nothing on the page can open it"
+        # Where the page may store credentials, the step stays open for Gmail and Telegram.
+        local = cfg(personal, sync={"github": {"mode": "hosted"}})
+        s = step(facts(personal, local, machine_switches=GITHUB_HELD), "sources")
+        assert s["status"] == "pending" and s["detail"]["available"] == ["gmail", "telegram"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_MANAGED_OFF_TEXT
+
+    def test_a_hosted_switch_no_machine_layer_states_stays_the_pages(self, personal):
+        """As before: offered and open, with the hosted sentence and no ``managed`` key."""
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        s = step(facts(personal, on, machine_switches={}), "sources")
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_HOSTED_TEXT
+        assert "managed" not in s["detail"]["github"]
+        assert s["status"] == "done" and s["read_only"] is False
+        assert s["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+
+    def test_poll_mode_is_unchanged_by_a_machine_layer_switch(self, personal):
+        on = cfg(personal, sync={"github": {"enabled": True}})
+        s = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert s["detail"]["available"] == ["github", "gmail", "telegram"] and s["detail"]["unavailable_reason"] is None
+        assert s["detail"]["github"] == {"enabled": True, "source": None}
+        assert s["summary"] == "GitHub" and s["read_only"] is False
+        env = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, machine_switches=GITHUB_HELD)
+        s = step(env, "sources")
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_ONLY_TEXT
+
+    def test_the_switch_reason_answers_for_the_held_switch_only(self, personal):
+        hosted = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        held = facts(personal, hosted, machine_switches=GITHUB_HELD)
+        assert checklist.managed_switch_reason(held, "sync.github.enabled") == checklist.SOURCES_GITHUB_MANAGED_TEXT
+        assert checklist.managed_switch_reason(held, "sync.gmail.enabled") is None
+        assert checklist.managed_switch_reason(facts(personal, hosted), "sync.github.enabled") is None
+        poll = facts(personal, cfg(personal, sync={"github": {"enabled": True}}), machine_switches=GITHUB_HELD)
+        assert checklist.managed_switch_reason(poll, "sync.github.enabled") is None
+
+    def test_holding_the_switch_remounts_the_form(self, personal):
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        offered = step(facts(personal, on), "sources")["etag"]
+        held = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")["etag"]
+        assert offered != held
+
+
 class TestMaskingAndEtag:
     def test_a_credential_from_the_environment_reads_as_managed(self, personal):
         env = step(facts(personal, env_credential=True), "provider")["detail"]

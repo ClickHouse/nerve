@@ -3292,6 +3292,41 @@ class TestManagedValues:
         assert claimed.machine_yaml()["slack"] == {"enabled": False}
         assert "slack" not in claimed.local_yaml()
 
+    async def test_a_github_switch_the_operator_holds_is_refused_and_the_other_sources_still_save(self, claimed):
+        """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml, which
+        outranks the settings.yaml the page writes. Gmail and Telegram stay on
+        offer; a save that names the GitHub switch is refused whole, by name,
+        and writes nothing, and the same save without it goes through."""
+        choose(claimed, "personal")
+        _hold_github_on_the_machine(claimed)
+        async with claimed.client() as http:
+            sources = step((await http.get("/api/setup")).json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False
+            assert sources["detail"]["available"] == ["gmail", "telegram"]
+            assert sources["detail"]["unavailable_reason"] == _GITHUB_MANAGED
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["github"]["managed"] is True
+            settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+            machine_before = (claimed.config_dir / "config.yaml").read_bytes()
+            body = {"github": False, "gmail": True, "gmail_accounts": ["alice@example.com"], "telegram": False}
+            refused = await http.put("/api/setup/sources", json=body)
+            assert refused.status_code == 409, refused.text
+            assert refused.json() == {"detail": _GITHUB_MANAGED, "field": "github"}
+            assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+            assert (claimed.config_dir / "config.yaml").read_bytes() == machine_before
+            assert "sources" not in setup_state.load_state().answered
+            del body["github"]
+            saved = await http.put("/api/setup/sources", json=body)
+            assert saved.status_code == 200, saved.text
+            sources = step(saved.json(), "sources")
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["gmail"]["enabled"] is True
+        assert "sources" in setup_state.load_state().answered
+        settings = claimed.settings_yaml()["sync"]
+        assert settings["gmail"]["enabled"] is True and settings["telegram"]["enabled"] is False
+        # The slim install's GitHub switch and the events source are as they were.
+        assert settings["github"]["enabled"] is False and settings["github_events"]["enabled"] is False
+        assert claimed.machine_yaml()["sync"]["gmail"]["accounts"] == ["alice@example.com"]
+        assert claimed.local_yaml()["sync"]["github"] == {"mode": "hosted", "enabled": True}
+
 
 # --------------------------------------------------------------------------- #
 #  Instances that keep no credentials on disk                                  #
@@ -3301,6 +3336,10 @@ class TestManagedValues:
 _NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
 _GITHUB_ONLY = "GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance."
 _GITHUB_HOSTED = "GitHub comes from the channel gateway of this deployment; Gmail and Telegram are not available on this instance."
+_GITHUB_MANAGED = (
+    "GitHub arrives from the channel gateway of this deployment once a GitHub credential is connected "
+    "to this agent; nothing to switch here."
+)
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
@@ -3314,6 +3353,17 @@ def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
 def _keep_no_secrets(install: Install, **settings) -> None:
     """``setup.local_secrets: false`` in the tracked settings."""
     _set_local_secrets(install, False, **settings)
+
+
+def _hold_github_on_the_machine(install: Install, enabled: bool = True) -> None:
+    """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml, as an
+    operator's provisioning writes it, then reloaded."""
+    from nerve.setup_writer import merge_private_paths
+
+    merge_private_paths(
+        install.config_dir / "config.local.yaml", {"sync.github.mode": "hosted", "sync.github.enabled": enabled},
+    )
+    config_reload.remember_startup_config(install.reload())
 
 
 @pytest.mark.asyncio
@@ -3531,6 +3581,47 @@ class TestNoLocalSecrets:
         settings = claimed.settings_yaml()["sync"]
         assert settings["github"] == {"enabled": False, "mode": "hosted"}
         assert settings["github_events"]["enabled"] is False
+
+    async def test_a_github_switch_the_operator_holds_leaves_nothing_on_offer_and_is_refused_by_name(self, claimed):
+        """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml: the
+        settings.yaml the page writes cannot change it, so the step offers
+        nothing and reads done because the operator switched GitHub on. A save
+        that names the switch is refused by name whatever it says, with the
+        reason about that field alone, and nothing is written; one without it
+        gets the policy's answer, as before."""
+        choose(claimed, "personal")
+        _hold_github_on_the_machine(claimed)
+        _keep_no_secrets(claimed)
+        held = _GITHUB_MANAGED + " Gmail and Telegram are not available on this instance."
+        settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            sources = step(state, "sources")
+            assert sources["status"] == "done" and sources["read_only"] is True
+            assert sources["read_only_reason"] == held
+            assert sources["detail"]["available"] == [] and sources["detail"]["unavailable_reason"] == held
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["github"]["managed"] is True
+            assert sources["summary"] == (
+                "GitHub · waiting for the channel gateway — if no GitHub credential is connected "
+                "to this agent yet, connect one where your operator manages it"
+            )
+            assert state["steps_left"] == 3  # provider, profile, automation
+            for body in (
+                {"github": False}, {"github": True}, {"github": None},
+                {"github": False, "gmail": False, "telegram": False},
+            ):
+                refused = await http.put("/api/setup/sources", json=body)
+                assert refused.status_code == 409, (body, refused.text)
+                assert refused.json() == {"detail": _GITHUB_MANAGED, "field": "github"}, body
+            refused = await http.put("/api/setup/sources", json={"gmail": False})
+            assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
+            # Done already: a skip records nothing.
+            skipped = await http.post("/api/setup/steps/sources/skip")
+            assert skipped.status_code == 200 and setup_state.load_state().skipped == set()
+        assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        assert claimed.config.sync.github.enabled is True
 
     async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
         """Open, the step behaves like any other: it waits for the Mode step
