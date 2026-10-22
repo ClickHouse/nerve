@@ -242,7 +242,8 @@ nerve/db/
 │   ├── runner.py      # Discovers and applies vNNN_*.py files in order
 │   ├── v001_initial.py
 │   ├── ...
-│   └── v016_mcp_servers.py
+│   ├── v016_mcp_servers.py
+│   └── fork/          # A fork's own migrations; empty upstream (see Migrations)
 ├── sessions.py        # SessionStore mixin
 ├── messages.py        # MessageStore mixin
 ├── tasks.py           # TaskStore mixin
@@ -260,9 +261,18 @@ The `Database` class in `base.py` inherits all domain mixins, preserving a singl
 
 ### Migrations
 
-Migrations are individual Python files in `nerve/db/migrations/` named `vNNN_description.py`. Each exports an `async def up(db)` function. The runner discovers them by scanning the directory, applies pending ones in version order, and wraps each in a transaction. `SCHEMA_VERSION` is derived dynamically from the highest migration file number.
+Migrations are individual Python files named `vNNN_description.py`. Each exports an `async def up(db)` function. They come in two tracks. Each track is numbered on its own and recorded in its own version table:
 
-To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with an `up()` function, numbered above the highest version on `main`: the runner skips versions at or below the database's current one, and CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not.
+| Track | Files | Version table | Highest shipped |
+|---|---|---|---|
+| upstream | `nerve/db/migrations/vNNN_*.py` | `schema_version` | `SCHEMA_VERSION` |
+| fork | `nerve/db/migrations/fork/vNNN_*.py` | `fork_schema_version`, created when the first fork migration runs | `FORK_SCHEMA_VERSION` (0 upstream) |
+
+Every database open runs the runner: the gateway's start and every CLI command that uses the database. The runner applies the pending upstream migrations in version order, then the pending fork migrations. A migration is recorded in its track's table once `up()` returns. Nothing wraps a migration in a transaction (`executescript()` commits as it goes), so a migration that is interrupted runs again from the start on the next open. Write migrations to be idempotent (`CREATE TABLE IF NOT EXISTS`, check a column before adding it).
+
+**Numbering.** Within a track, the runner skips every version at or below the database's current one. To add a migration upstream, create `nerve/db/migrations/vNNN_your_feature.py` numbered above the highest version on `main`. CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not numbered that way. Upstream never ships a fork migration: `fork/` holds only its package files. A fork of Nerve adds its own migrations only under `fork/`, numbered from `v001` on their own (`nerve/db/migrations/fork/README.md`). A fork's number therefore never shadows an upstream migration that ships later.
+
+**Newer-schema guard.** Before anything is applied, each track's version in the database is compared with the highest migration this code ships for that track. If the database is ahead on either track, a newer Nerve or a fork migrated it, and the database is refused untouched; the error names the track and both versions. `NERVE_ALLOW_NEWER_SCHEMA=1` starts anyway, with a warning. See [Going back to an older Nerve](setup.md#going-back-to-an-older-nerve).
 
 ### Schema
 
@@ -302,7 +312,7 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 ## Startup Sequence
 
 1. Load config (`settings.yaml` + `config.yaml` + `config.local.yaml` deep merge). The loaded object is remembered as the *startup configuration*: the setup page later compares it with what is on disk to say whether a restart is pending. The previous process's setup notes (restart debts, start-up errors) are retired
-2. Run database migrations (file-based migration system in `nerve/db/migrations/`); bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
+2. Run database migrations (the upstream track, then the fork track; see [Migrations](#migrations)); bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
 3. Initialize memory system (memU SQLite, load categories). With no model credential yet the warm-up is skipped and recall answers empty; nothing calls out
 4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
 5. Recover orphan sessions (active in DB but no live client → idle or stopped)

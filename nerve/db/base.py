@@ -26,7 +26,12 @@ from nerve.db.files import FileStore
 from nerve.db.maintenance import MaintenanceStore
 from nerve.db.mcp import McpStore
 from nerve.db.messages import MessageStore
-from nerve.db.migrations.runner import discover_migrations, run_migrations
+from nerve.db.migrations.runner import (
+    FORK_TRACK,
+    code_version,
+    discover_migrations,
+    run_migrations,
+)
 from nerve.db.notifications import NotificationStore
 from nerve.db.observations import ObservationStore
 from nerve.db.plans import PlanStore
@@ -46,6 +51,9 @@ logger = logging.getLogger(__name__)
 # SCHEMA_VERSION is derived from the highest migration file number.
 # This keeps a single source of truth (the migration files themselves).
 SCHEMA_VERSION = max(v for v, _ in discover_migrations()) if discover_migrations() else 0
+# The same for the fork track (migrations/fork/), which is numbered on its own.
+# It is 0 upstream, which ships no fork migration.
+FORK_SCHEMA_VERSION = code_version(FORK_TRACK)
 
 
 class WriteResult(NamedTuple):
