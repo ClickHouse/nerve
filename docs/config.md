@@ -1732,6 +1732,7 @@ the channel transport, matching messages are written to a local buffer.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `sync.github.enabled` | bool | `true` | Enable/disable the source, as for every source. In hosted mode a value in `config.yaml` or `config.local.yaml` is your operator's switch: the setup page shows GitHub as managed and does not change it, and records arrive while a GitHub credential is connected to the agent (see [sources.md](sources.md#hosted-github-source)) |
 | `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
 | `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
 | `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
