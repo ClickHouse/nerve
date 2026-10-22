@@ -1546,6 +1546,28 @@ describe('pre-configured connections', () => {
     await heading(/^Welcome, /);
     expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Sources.');
   });
+
+  it('a save refused for a GitHub switch the operator took over meanwhile says so', async () => {
+    const gmail = { enabled: true, accounts: ['alice@example.com'], source: 'file' as const };
+    // Opened before the operator held the switch, so GitHub is still on offer here.
+    current = withStep(makeState(), step('sources', { status: 'done' }, { github: { enabled: true, source: null }, gmail }));
+    m(api.setupStep).mockImplementationOnce(async () => {
+      // The re-read after the refusal finds the switch held, and the step changed.
+      current = withStep(makeState(), githubHeld({ etag: 'sources-etag-2' }, { gmail }));
+      throw new ApiError(409, JSON.stringify({ detail: GITHUB_HELD, field: 'github' }));
+    });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Gmail/ }));
+    await userEvent.click(continueButton());
+    expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: false, telegram: false });
+    // The form now shows the switch as the operator's, and the refusal is said
+    // once: in place of the step's reason, which is the same sentence.
+    const card = within(await screen.findByRole('region', { name: 'GitHub' }));
+    await waitFor(() => expect(card.queryByRole('checkbox')).not.toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent(GITHUB_HELD);
+    expect(screen.getAllByText(GITHUB_HELD)).toHaveLength(1);
+  });
 });
 
 describe('telegram message sync sign-in', () => {

@@ -72,15 +72,20 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const detail = step.detail as SetupSourcesDetail;
   const available = detail.available ?? ALL_SOURCES;
   const offers = (id: SetupSourceId) => available.includes(id);
+  const fieldError = useSetupStore((s) => s.fieldError);
+  // A refused switch has no field to stand under (a form opened before the
+  // operator took the GitHub switch over still sends it), so it gets a line
+  // of its own, as the other steps give theirs.
+  const switchError = fieldError && (ALL_SOURCES as string[]).includes(fieldError.field) ? fieldError.detail : null;
   // Said once: the frame already shows the sentence when it is the step's
-  // own read-only or blocked reason.
+  // own read-only or blocked reason, and the refusal when it is the same.
   const partial = available.length > 0 && available.length < ALL_SOURCES.length;
   const unavailableReason = partial && detail.unavailable_reason
     && detail.unavailable_reason !== step.read_only_reason && detail.unavailable_reason !== step.blocked_reason
+    && detail.unavailable_reason !== switchError
     ? detail.unavailable_reason : null;
   const save = useSetupStore((s) => s.save);
   const load = useSetupStore((s) => s.load);
-  const fieldError = useSetupStore((s) => s.fieldError);
   const preflight = useSetupStore((s) => s.preflight);
   const loadPreflight = useSetupStore((s) => s.loadPreflight);
   const savedNotice = useSetupStore((s) => s.savedNotice);
@@ -373,6 +378,7 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
           </Button>
         </div>
       )}
+      {switchError && <p role="alert" tabIndex={-1} className="text-sm text-error outline-none">{switchError}</p>}
       {state.mode === 'worker' && <Notice tone="info">Sources do not apply to a worker instance.</Notice>}
     </StepFrame>
   );
