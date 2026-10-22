@@ -1496,7 +1496,7 @@ System health and status, including task/FTS index health.
 
 ```json
 Response: {
-  "system": { "hostname": "...", "memory_mb": 65.2, "disk_free_gb": 180.5 },
+  "system": { "hostname": "...", "commit": "9f2c4e1a7b3d5f60812c4e6a8b0d2f4618a3c5e7", "memory_mb": 65.2, "disk_free_gb": 180.5 },
   "tasks": { "total": 92, "active": 16, "done": 76, "fts_indexed": 92, "fts_ok": true },
   "sync": { "github": { "cursor": "...", "last_run": "...", "records_fetched": 3, "records_processed": 3, "error": null } },
   "recent_cron_logs": [...],
@@ -1506,6 +1506,11 @@ Response: {
   }
 }
 ```
+
+`system.commit` is the git commit of the code the process runs. It is read
+once at start (`git rev-parse HEAD` in the checkout Nerve runs from), so it
+stays the same after a later `git pull` until the restart. It is `null` when
+unknown: the install is not a git checkout, or there is no `git` to ask.
 
 In every usage row, `input_tokens` counts only uncached input. Cache reads
 (`cache_read`) and cache writes (`cache_creation`) are separate fields, so
@@ -1598,6 +1603,10 @@ tells the new process from the old one still answering as it shuts down,
 which is what makes `POST /api/system/restart` observable: the setup page
 polls `/health` until the value changes. Deliberately opaque — an uptime or
 a counter would tell an anonymous caller how long the box has been up.
+
+For the same reason, `/health` does not say which build runs: `version` is
+fixed, and the commit is reported only to signed-in callers, as
+`system.commit` of [`GET /api/diagnostics`](#get-apidiagnostics).
 
 ## WebSocket Protocol
 

@@ -51,7 +51,6 @@ import shutil
 import socket
 import sqlite3
 import stat
-import subprocess
 import tarfile
 import tempfile
 from contextlib import contextmanager
@@ -62,7 +61,7 @@ from typing import IO, Callable, Iterator
 
 import yaml
 
-from nerve import pidfile
+from nerve import boot, pidfile
 
 logger = logging.getLogger(__name__)
 
@@ -268,26 +267,6 @@ def _nerve_version() -> str:
         return version("nerve")
     except Exception:
         return "unknown"
-
-
-def _git_sha() -> str:
-    """Best-effort git SHA of the installed source checkout."""
-    try:
-        source_root = Path(__file__).resolve().parent.parent
-        if not (source_root / ".git").exists():
-            return ""
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source_root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode == 0:
-            return out.stdout.strip()
-    except Exception:
-        pass
-    return ""
 
 
 def _unique_bundle_path(
@@ -1175,7 +1154,7 @@ def create_backup(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "host": host,
             "nerve_version": _nerve_version(),
-            "git_sha": _git_sha(),
+            "git_sha": boot.source_commit(),
             "schema_version": _db_schema_version(state_dir / "nerve.db"),
             "fork_schema_version": _db_schema_version(
                 state_dir / "nerve.db", "fork_schema_version",

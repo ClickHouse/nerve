@@ -18,12 +18,18 @@ Opaque and random rather than a counter or a timestamp: it is published to
 unauthenticated callers on ``/health``, where "this process has been up since
 09:12" is a fact about the box that nobody needs, and where a counter would
 say how often this instance falls over.
+
+Which code is running (:func:`source_commit`) is reported only to signed-in
+callers, by ``GET /api/diagnostics``, and never on ``/health``.
 """
 
 from __future__ import annotations
 
+import functools
 import secrets
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 #: This process's generation. New on every start; never persisted.
 BOOT_ID: str = secrets.token_hex(8)
@@ -36,3 +42,30 @@ STARTED_AT = datetime.now(timezone.utc)
 def boot_id() -> str:
     """The current generation. A function so a test can monkeypatch the module."""
     return BOOT_ID
+
+
+@functools.cache
+def source_commit() -> str:
+    """The git commit of the checkout Nerve runs from, or ``""`` when unknown.
+
+    This is best effort. An install that is not a git checkout, or a machine
+    without ``git``, gives ``""``. The result is cached, so the first call
+    (the gateway makes it at startup) names the code this process loaded,
+    even after the checkout moves on.
+    """
+    try:
+        source_root = Path(__file__).resolve().parent.parent
+        if not (source_root / ".git").exists():
+            return ""
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=source_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return ""

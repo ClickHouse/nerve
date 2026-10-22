@@ -1498,6 +1498,12 @@ def create_app() -> FastAPI:
     # a restart to know when the *new* process is answering.
     from nerve import boot as _boot
 
+    # The git commit of the running code, read once here at startup. It is
+    # cached, so the signed-in diagnostics and the backup manifest name the
+    # code this process loaded, even after a later ``git pull``, and no
+    # request waits on git. /health answers anyone and does not report it.
+    _boot.source_commit()
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "version": "0.1.0", "generation": _boot.boot_id()}
