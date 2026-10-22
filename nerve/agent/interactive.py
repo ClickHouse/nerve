@@ -136,6 +136,11 @@ class InteractiveToolHandler:
         # answer. A question from the orchestrator has no agent.
         self.describe_agent: Callable[[str], dict | None] | None = None
         self.on_agent_interaction: Callable[[str, bool], None] | None = None
+        # Set by the engine: ``on_plan_pending(interaction_id, tool_input)``
+        # hears of each plan that waits for a decision (``plan_exit``), right
+        # after its ``interaction`` event, and writes a summary of it in the
+        # background. Called synchronously: it must not block the pause.
+        self.on_plan_pending: Callable[[str, dict], None] | None = None
 
     # -- snapshot bookkeeping ------------------------------------------- #
 
@@ -208,6 +213,14 @@ class InteractiveToolHandler:
         except Exception:  # noqa: BLE001
             logger.debug("on_agent_interaction failed for %s", task_id, exc_info=True)
 
+    def _plan_pending(self, interaction_id: str, tool_input: dict[str, Any]) -> None:
+        if self.on_plan_pending is None:
+            return
+        try:
+            self.on_plan_pending(interaction_id, tool_input)
+        except Exception:  # noqa: BLE001 — a summary never breaks a pause
+            logger.debug("on_plan_pending failed for %s", interaction_id[:8], exc_info=True)
+
     async def request_approval(
         self, kind: str, payload: dict[str, Any],
     ) -> InteractionOutcome:
@@ -259,6 +272,8 @@ class InteractiveToolHandler:
             "tool_input": tool_input,
             "agent": agent,
         })
+        if interaction_type == "plan_exit":
+            self._plan_pending(interaction_id, tool_input)
         # Tell every connected client this session is now waiting for input,
         # so the sidebar can show the "waiting" indicator (blue dot).
         await self._broadcast_awaiting()

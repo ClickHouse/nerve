@@ -307,3 +307,96 @@ async def test_a_plan_approved_with_the_persons_edits_goes_back_edited():
 async def test_anything_but_an_edited_plan_is_a_plain_approval(answer):
     _interaction, result = await _decide_plan(answer)
     assert isinstance(result, PermissionResultAllow) and result.updated_input is None
+
+
+# ------------------------------------------------------------------ #
+#  The plan summary hook: plan pauses only, never in the pause's way    #
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_a_plan_pause_asks_for_its_summary_once_the_card_is_out():
+    """``on_plan_pending`` hears of the plan right after the ``interaction``
+    event (with its id and the CLI's input) and before anything else; the
+    pause goes on waiting for the person."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-summary", broadcast, interactive_capable=True)
+    heard: list[tuple[str, dict, list[str]]] = []
+    handler.on_plan_pending = lambda interaction_id, tool_input: heard.append(
+        (interaction_id, tool_input, [m["type"] for (_c, m) in messages]),
+    )
+    task = asyncio.create_task(
+        ClaudeToolPermissions(handler).can_use_tool("ExitPlanMode", dict(PLAN_INPUT), None)
+    )
+    await _wait_until_pending(handler)
+    interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
+
+    assert heard == [(interaction["interaction_id"], PLAN_INPUT, ["interaction"])]
+    assert handler.pending_interaction_types() == ["plan_exit"] and not task.done()
+
+    handler.resolve(interaction["interaction_id"], None)
+    assert isinstance(await task, PermissionResultAllow)
+    assert len(heard) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["question", "approval", "plan on a non-interactive channel"])
+async def test_nothing_else_asks_for_a_summary(kind):
+    async def broadcast(channel: str, msg: dict) -> None:
+        pass
+
+    handler = InteractiveToolHandler(
+        "sess-no-summary", broadcast,
+        interactive_capable=kind != "plan on a non-interactive channel",
+    )
+    heard: list[str] = []
+    handler.on_plan_pending = lambda interaction_id, _tool_input: heard.append(interaction_id)
+
+    if kind == "plan on a non-interactive channel":
+        outcome = await handler.request_interaction("ExitPlanMode", dict(PLAN_INPUT))
+        assert outcome.denied
+    else:
+        pause = asyncio.create_task(
+            handler.request_interaction("AskUserQuestion", {"questions": []})
+            if kind == "question"
+            else handler.request_approval("command_approval", {"command": "ls"})
+        )
+        await _wait_until_pending(handler)
+        handler.cancel_all()
+        assert (await pause).denied
+    assert heard == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_summary_hook_does_not_break_the_pause():
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    def broken(_interaction_id: str, _tool_input: dict) -> None:
+        raise RuntimeError("summary hook failed")
+
+    handler = InteractiveToolHandler("sess-summary-broken", broadcast, interactive_capable=True)
+    handler.on_plan_pending = broken
+    task = asyncio.create_task(
+        ClaudeToolPermissions(handler).can_use_tool("ExitPlanMode", dict(PLAN_INPUT), None)
+    )
+    await _wait_until_pending(handler)
+
+    # The pause went on as always: the card, then the waiting indicator.
+    assert [m["type"] for (_c, m) in messages] == ["interaction", "session_awaiting_input"]
+    assert handler.pending_interaction_types() == ["plan_exit"]
+    interaction = messages[0][1]
+    handler.resolve(interaction["interaction_id"], None)
+    result = await task
+    assert isinstance(result, PermissionResultAllow) and result.updated_input is None
+    assert messages[-1][1] == {
+        "type": "interaction_resolved",
+        "session_id": "sess-summary-broken",
+        "interaction_id": interaction["interaction_id"],
+    }

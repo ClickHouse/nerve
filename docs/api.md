@@ -1778,6 +1778,14 @@ those for another session. Events marked *global* go to every socket.
 // For ExitPlanMode the Claude CLI puts the plan into tool_input: plan (the
 // plan file's text, read again at every call) and planFilePath.
 { type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "plan_exit" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
+// ... for a plan_exit interaction, once: a short summary of tool_input.plan for
+// the decision card, written by agent.title_model after the interaction event
+// (within about 20 s; the pause never waits for it). ok: up to six plain
+// sentences of at most 25 words each. unavailable, with no bullets: no
+// credential the server's own model client can use, an empty plan, an error or
+// a timeout. Replayed with the interaction in a running turn's buffered_events;
+// not stored.
+{ type: "plan_summary", session_id: "main", interaction_id: "uuid", bullets: ["Scans org/repo-a for new pull requests every 30 minutes.", "…"], status: "ok" | "unavailable" }
 // ... and settled (any client answered, or it was cancelled)
 { type: "interaction_resolved", session_id: "main", interaction_id: "uuid" }
 // A session waits for input, or no longer does (global)

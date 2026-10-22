@@ -301,8 +301,12 @@ the Mode step:
   reviews, alerts, security notices and dependency bumps, channel summaries,
   research, and personal-assistant work, which a personal install lists
   first) and asks which apply.
-- **With a note** it offers no menu: it greets you, restates the work in one
-  sentence and starts on it in the same message.
+- **With a note that describes the work** it offers no menu and starts on
+  the work in the same message. It explains before it asks: it greets you,
+  restates the work in one sentence, says what it studies and sketches the
+  setup it has in mind, and only then shows its first questions. A note with
+  only rules ("never merge anything") or only repositories gets the list
+  too, and the agent carries the note into its proposal.
 
 Then:
 
@@ -310,16 +314,21 @@ Then:
    (repositories, documentation, data or alert sources, topics), it starts
    one explorer, a background sub-agent, and says in one line what it
    studies; the explorer's progress shows on the agent line below the chat.
-   The explorer clones repositories into `<workspace>/repos/<name>` (with
-   `gh` when it is signed in, else from the public URL), writes nothing
-   elsewhere and returns a short findings report: how to build and test, CI,
-   contribution and review rules, the volume of the work, risks and missing
-   access, a suggested first task. With nothing to clone or fetch (a personal
-   assistant for the inbox and reminders) there is no explorer.
+   The explorer only reads. It clones repositories into
+   `<workspace>/repos/<name>` (with `gh` when it is signed in, else from the
+   public URL) and is told to write nothing else, install nothing, build
+   nothing and run no tests: it learns how to build and test from the CI
+   configuration, scripts and docs, works for about ten minutes and returns a
+   short findings report: how to build and test, CI, contribution and review
+   rules, the volume of the work, risks and missing access, a suggested first
+   task. If it fails or finds only part, the proposal says so. With nothing to
+   clone or fetch (a personal assistant for the inbox and reminders) there is
+   no explorer.
 2. **It asks in the foreground** while the explorer works, and only what
-   neither the explorer nor setup can tell: question cards of up to four
-   questions, each with a few options and its recommendation first, in at
-   most two rounds; **Other…** lets you answer in your own words. Typical
+   neither the explorer nor setup can tell. It explains first, then shows
+   question cards of up to four questions, each saying why it is asked, with
+   a few options that say what they lead to and its recommendation first, in
+   at most two rounds; **Other…** lets you answer in your own words. Typical
    questions: the account it acts as on the code host, what waits for your
    approval (its recommendation: drafts you approve for anything public, on
    its own for reading, cloning and local checks), how often to look for new
@@ -337,14 +346,18 @@ Then:
    only where this work needs them. The chat shows the plan in a decision
    card: **Apply setup**; **Change something…** with what should change, and
    the agent revises the plan and asks again, as often as it takes, without
-   asking what you already wrote; or **Edit** to change the plan text
-   yourself and **Apply edited plan**, which tells the agent the setup was
-   approved with your edits.
-4. **It applies what you approved**, and nothing before: cron jobs in
-   `config/cron/jobs.yaml`, statuses, skills, tasks for what only you can do,
-   notes in memory and, for a worker, the `TASK.md` sections. Then it
-   summarizes every change with numbered next steps and calls the
-   `onboarding_done` tool.
+   asking what you already wrote (a change request never widens what you
+   allowed earlier: when it seems to, the agent keeps the narrower choice and
+   asks); or **Edit** to change the plan text yourself and **Apply edited
+   plan**, which tells the agent the setup was approved with your edits.
+4. **It applies what you approved**: cron jobs in `config/cron/jobs.yaml`
+   (then `nerve reload`, so the instance loads them; on an instance whose
+   configuration arrives by pull request, it proposes the change instead),
+   statuses, skills, tasks for what only you can do, notes in memory and,
+   for a worker, the `TASK.md` sections. It is instructed to change nothing
+   before you approve; the runtime does not enforce that (plan mode does not
+   block file writes here). Then it summarizes every change with numbered
+   next steps and calls the `onboarding_done` tool.
 
 The state is one row in `nerve.db` (`onboarding`): pending, running (with the
 session id), done or skipped, and the kind: the conversation, or the
