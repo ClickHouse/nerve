@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { api, type SetupMemoryDetail, type SetupState, type SetupStep } from '../../../api/client';
 import { useSetupStore } from '../../../stores/setupStore';
 import { ChoiceCards } from '../ChoiceCards';
-import { MEMORY_WITHOUT_EMBEDDINGS, MEMORY_WITH_EMBEDDINGS, STEP_HEADINGS } from '../copy';
+import { MEMORY_LOOM, MEMORY_WITHOUT_EMBEDDINGS, MEMORY_WITH_EMBEDDINGS, STEP_HEADINGS } from '../copy';
 import { secretManaged } from '../credentialSource';
 import { Notice } from '../Notice';
 import { decides, secretPayload } from '../payload';
@@ -18,7 +18,8 @@ type Choice = 'embeddings' | 'without';
  *
  * A key the operator provided (environment, configuration repository) is
  * shown as managed: the choice is fixed on embeddings, the field says who
- * provides the key, and Continue sends nothing.
+ * provides the key, and Continue sends nothing. With the Loom memory backend
+ * there is nothing to choose: the step says so and Continue sends nothing.
  */
 export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupMemoryDetail;
@@ -64,6 +65,20 @@ export function MemoryStep({ step, state }: { step: SetupStep; state: SetupState
 
   const oauthOnly = state.steps.find((s) => s.id === 'provider')?.detail;
   const providerWarning = oauthOnly && 'warning' in oauthOnly ? oauthOnly.warning : null;
+
+  if (detail.backend === 'loom') {
+    return (
+      <StepFrame
+        step={step}
+        heading={STEP_HEADINGS.memory.heading}
+        intro={MEMORY_LOOM}
+        onSubmit={() => true}
+        readOnly={locked}
+      >
+        {null}
+      </StepFrame>
+    );
+  }
 
   return (
     <StepFrame

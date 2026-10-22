@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from nerve.agent.tools import build_default_registry
+from nerve.memory import loom_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -195,14 +196,16 @@ it back.
 """
 
 
-def worker_onboarding_prompt(task_description: str, guide: str) -> str:
+def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: str = "memu") -> str:
     """The first-boot onboarding session's prompt for a worker.
 
     Role line, the operator's description, the worker guide in full (it is
     the standard the filled ``TASK.md`` is held to, so the session gets the
     whole text rather than a link), then the steps. ``guide`` is the text of
     ``docs/worker-best-practices.md`` (:func:`nerve.workspace.read_worker_guide`);
-    when it is empty the prompt points at the published copy instead.
+    when it is empty the prompt points at the published copy instead. Under
+    ``memory_backend`` ``loom`` the step that saves what was learned names
+    Loom's tool.
     """
     quoted = "\n".join(
         f"> {line}" if line.strip() else ">" for line in task_description.strip().splitlines()
@@ -211,6 +214,9 @@ def worker_onboarding_prompt(task_description: str, guide: str) -> str:
         "(The guide could not be read from this installation. Fetch it from "
         f"{WORKER_GUIDE_URL} and read it in full before step 2.)"
     )
+    steps = _ONBOARDING_STEPS
+    if memory_backend == "loom":
+        steps = loom_prompts.apply_edits(steps, loom_prompts.ONBOARDING_EDITS, name="onboarding steps")
     return (
         "You are running the **first-boot onboarding** for this Nerve worker: one "
         "session with full tool access that turns the operator's description into "
@@ -228,7 +234,7 @@ def worker_onboarding_prompt(task_description: str, guide: str) -> str:
         "---\n\n"
         f"{body}\n\n"
         "---\n\n"
-        f"{_ONBOARDING_STEPS}"
+        f"{steps}"
     )
 
 
@@ -282,6 +288,9 @@ def build_system_prompt(
     skill_summaries: list[dict] | None = None,
     excluded_tools: "set[str] | None" = None,
     static: bool = True,
+    memory_note: str | None = None,
+    memory_backend: str = "memu",
+    memory_tools: bool = True,
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -299,7 +308,17 @@ def build_system_prompt(
     into a cache WRITE at every session start.
 
     ``static=False`` restores the legacy shape: session id and recalled
-    memories inline in the system prompt.
+    memories inline in the system prompt. ``memory_note`` takes the place of
+    the memories when none could be recalled (see
+    :func:`memory_unavailable_note`), in either shape's place for them.
+
+    ``memory_backend`` ``loom`` adds the memory section that names Loom's
+    tools in place of Nerve's (:data:`nerve.memory.loom_prompts.SYSTEM_PROMPT_SECTION`),
+    or, when ``memory_tools`` says Loom's tools do not reach the session, a
+    short section saying memory cannot be used
+    (:data:`nerve.memory.loom_prompts.NO_TOOLS_SECTION`). Either depends on
+    the configuration and the gateway's catalog only, so the prompt stays
+    static across sessions.
     """
     parts: list[str] = []
 
@@ -335,6 +354,11 @@ def build_system_prompt(
         # No per-session bytes here (see the docstring): the id and the
         # recall land in the first user message. The pointer below is
         # static text, so it costs nothing cache-wise.
+        live = (
+            " `mcp__nerve__session_context` returns them live if that message "
+            "is no longer in context."
+            if "session_context" not in (excluded_tools or set()) else ""
+        )
         context = f"""# Session Context
 - **Source:** {source}
 - **Current date:** {today}
@@ -342,8 +366,7 @@ def build_system_prompt(
 
 Per-session details — this session's id and the memories recalled at \
 session start — are in the `<{SESSION_CONTEXT_TAG}>` block at the top of \
-this conversation's first user message. `mcp__nerve__session_context` \
-returns them live if that message is no longer in context.
+this conversation's first user message.{live}
 
 You have access to the following custom tools:
 {_format_tool_list(excluded_tools)}"""
@@ -358,35 +381,58 @@ You have access to the following custom tools:
 {_format_tool_list(excluded_tools)}"""
     parts.append(context)
 
+    if memory_backend == "loom":
+        parts.append(
+            loom_prompts.SYSTEM_PROMPT_SECTION if memory_tools else loom_prompts.NO_TOOLS_SECTION,
+        )
+
     # Skills summary (progressive disclosure level 1: name + description only)
     skills_section = _format_skills_list(skill_summaries)
     if skills_section:
         parts.append(skills_section)
 
-    # Recalled memories from memU — legacy (non-static) shape only; the
-    # static prompt delivers them via build_session_preamble.
-    if not static and recalled_memories:
-        parts.append(_format_recalled_memories(recalled_memories))
+    # Recalled memories — legacy (non-static) shape only; the static prompt
+    # delivers them via build_session_preamble.
+    if not static and (recalled_memories or memory_note):
+        parts.append(_format_recalled_memories(recalled_memories, memory_note))
 
     return "\n\n---\n\n".join(parts)
 
 
-def _format_recalled_memories(recalled_memories: list[str]) -> str:
-    memories_text = "\n".join(f"- {m}" for m in recalled_memories)
+def _format_recalled_memories(
+    recalled_memories: list[str] | None, memory_note: str | None = None,
+) -> str:
+    if memory_note:
+        return f"# Recalled Memories\n\n{memory_note}"
+    memories_text = "\n".join(f"- {m}" for m in recalled_memories or [])
     return f"# Recalled Memories\n\n{memories_text}"
+
+
+def memory_unavailable_note(reason: str) -> str:
+    """What a session is told when its memories could not be recalled: an
+    outage is not an empty memory."""
+    reason = reason.removeprefix("memory backend unavailable: ").strip()
+    return (
+        "Memory is unavailable right now, so none was recalled for this session"
+        + (f" ({reason[:300]})" if reason else "")
+        + ". Do not take this for an empty memory: memory tools may fail too. "
+        "Say so when an answer depends on what you would remember."
+    )
 
 
 def build_session_preamble(
     session_id: str,
     source: str = "web",
     recalled_memories: list[str] | None = None,
+    memory_note: str | None = None,
 ) -> str:
     """Render the per-session context the static system prompt leaves out.
 
-    Returns the markdown block (session id, source, recalled memories)
-    that the engine prepends — wrapped by :func:`prepend_session_preamble`
-    — to the FIRST user message of a native conversation. Later turns
-    replay the transcript, so the block reaches the model exactly once.
+    Returns the markdown block (session id, source, recalled memories, or
+    ``memory_note`` in their place) that the engine prepends — wrapped by
+    :func:`prepend_session_preamble` — to the FIRST user message of a
+    native conversation. Later turns replay the transcript, so the block
+    reaches the model exactly once.
     """
     context = (
         "# Session Context\n"
@@ -394,8 +440,8 @@ def build_session_preamble(
         f"- **Source:** {source}"
     )
     parts = [context]
-    if recalled_memories:
-        parts.append(_format_recalled_memories(recalled_memories))
+    if recalled_memories or memory_note:
+        parts.append(_format_recalled_memories(recalled_memories, memory_note))
     return "\n\n".join(parts)
 
 

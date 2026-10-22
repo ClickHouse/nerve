@@ -426,6 +426,22 @@ class _ClockCheckingScheduler(AsyncIOScheduler):
         return super()._process_jobs()
 
 
+def _reword_for_loom(jobs: list[CronJob]) -> None:
+    """Under the Loom memory backend, a built-in job that still carries the
+    prompt Nerve wrote for memU (a ``system.yaml`` from before the switch)
+    runs with its Loom wording: ``memory-maintenance`` would otherwise prune
+    memories through Loom's tools. An edited prompt is left alone."""
+    from nerve.setup_writer import loom_wording_of_shipped_job
+
+    for job in jobs:
+        if job.prompt_file or not job.prompt:
+            continue
+        reworded = loom_wording_of_shipped_job(job.id, job.prompt, job.description)
+        if reworded is not None:
+            job.prompt, job.description = reworded
+            logger.info("Cron job %s: memU's prompt in system.yaml runs in its Loom wording", job.id)
+
+
 class CronService:
     """Manages scheduled cron jobs."""
 
@@ -1609,12 +1625,17 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
+            if self.config.memory.backend == "loom":
+                # The built-in jobs live here too on such an install.
+                _reword_for_loom(user_jobs)
             kept, self._rejected_job_ids = _drop_reserved(user_jobs)
             return kept
 
         # Tag sources for display in CLI
         for j in system_jobs:
             j.metadata["_source"] = "system"
+        if self.config.memory.backend == "loom":
+            _reword_for_loom(system_jobs)
         for j in user_jobs:
             j.metadata["_source"] = "user"
 

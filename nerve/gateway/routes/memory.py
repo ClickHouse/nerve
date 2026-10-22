@@ -1,4 +1,10 @@
-"""Memory file and memU routes."""
+"""Memory file and memory-backend routes.
+
+The ``/api/memory/memu*`` paths predate the Loom backend and keep their names.
+Under ``memory.backend: loom`` there is no memU store to browse or edit: the
+snapshot answers "not available" with the backend and Loom's dashboard link,
+the edits answer 409, and the health route returns the Loom backend's note.
+"""
 
 from __future__ import annotations
 
@@ -120,8 +126,23 @@ async def write_memory_file(file_path: str, req: FileWriteRequest):
 
 # --- memU semantic memory ---
 
+_LOOM_EDIT_REFUSAL = (
+    "Memory is kept in Loom on this instance: change it with Loom's tools or in "
+    "Loom's dashboard."
+)
+
+
+def _loom_bridge():
+    """The Loom backend when it is the engine's memory, else None."""
+    deps = get_deps()
+    bridge = getattr(deps.engine, "_memory_bridge", None) if deps.engine else None
+    return bridge if getattr(bridge, "backend", "") == "loom" else None
+
+
 def _require_memu():
     deps = get_deps()
+    if _loom_bridge() is not None:
+        raise HTTPException(status_code=409, detail=_LOOM_EDIT_REFUSAL)
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
         raise HTTPException(status_code=503, detail="Memory service not available")
     return deps.engine._memory_bridge
@@ -187,6 +208,18 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
 async def get_memu_data():
     """Get memU categories and items for the memory UI."""
     deps = get_deps()
+    loom = _loom_bridge()
+    if loom is not None:
+        # memU's store is not used; Loom's own dashboard browses its memory.
+        return {
+            "available": False,
+            "backend": "loom",
+            "dashboard_url": loom.dashboard_url,
+            "categories": [],
+            "items": [],
+            "resources": [],
+            "category_items": {},
+        }
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
         return {"available": False, "categories": [], "items": [], "resources": []}
 
@@ -287,8 +320,11 @@ async def get_memu_audit_log(
 
 @router.get("/api/memory/memu/health")
 async def memu_health():
-    """memU memory service health and metrics."""
+    """Memory backend health and metrics; ``backend`` says which (memU or Loom)."""
     deps = get_deps()
     if not deps.engine or not deps.engine._memory_bridge:
         return {"service_available": False}
-    return await deps.engine._memory_bridge.get_health()
+    health = await deps.engine._memory_bridge.get_health()
+    if isinstance(health, dict):
+        health.setdefault("backend", "memu")
+    return health

@@ -86,9 +86,11 @@ A session reading a context file cold needs the status, the entry points and how
 - Your own conclusions are hypotheses until the human confirms them. Save them marked that way (`UNCONFIRMED agent analysis, not confirmed by alice: …`) with the source they came from. When the human rejects a claim, find every item it reached with `memory_recall`, fix each with `memory_update` or `memory_delete`, and leave an explicit correction rather than a silent rewording.
 - Volatile facts (prices, quotas, balances, availability) are fetched when needed, never recalled, and quoted with the time you fetched them.
 
+On an instance whose memory is Loom (`memory.backend: loom`), this tier is Loom and the agent uses Loom's tools instead of the ones named in this guide: `loom_search` for every recall, `loom_memory_set` to save, `loom_memory_update` to correct a fact under its key. Memories in team and org namespaces are shared and read-only for the agent: it proposes a change instead of editing one. The system prompt carries the details ([memory.md](memory.md#loom-backend)).
+
 ### Housekeeping
 
-The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs daily and silently over long-term memory: it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
+The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs daily and silently over long-term memory: it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. On a Loom instance it runs Loom's integrity report on the agent's home namespace instead and leaves deduplication to Loom. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
 
 ## Working Discipline
 

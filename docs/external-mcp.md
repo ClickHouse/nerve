@@ -7,6 +7,12 @@ the in-process agent uses — `task_create`, `memory_recall`, `notify`,
 process, attributed to a Nerve "satellite session" so external tool
 calls show up in the UI alongside native ones.
 
+With `memory.backend: loom` the endpoint serves no memory tools (no
+`memory_recall`, `memorize` or `session_context`): memory is Loom's, and an
+external client uses Loom's own MCP server if it has one. The bundles that
+`external_agents` writes for Codex and Claude Code say so in place of the
+`session_context()` first action.
+
 ## Enabling
 
 Add to `config.yaml` (or override in `config.local.yaml`):

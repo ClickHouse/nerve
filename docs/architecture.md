@@ -142,7 +142,7 @@ Cursor-based data ingestion with agent processing:
 ### Memory (`nerve/memory/`)
 Dual-layer memory:
 - **File-based** — MEMORY.md, identity files (curated source of truth, loaded into system prompt)
-- **memU** — Semantic index over conversations and files (SQLite-persisted at `~/.nerve/memu.sqlite`)
+- **memU** — Semantic index over conversations and files (SQLite-persisted at `~/.nerve/memu.sqlite`); with `memory.backend: loom`, a Loom memory service reached through the MCP gateway instead ([memory.md](memory.md#loom-backend))
 - **Knowledge quality filtering** — Custom extraction prompt + post-extraction Haiku filter + semantic deduplication prevent generic CS/DevOps facts from polluting memory
 - **Session rotation** — Main session rotates daily; conversations are indexed into memU on close
 - **Session resume** — SDK session IDs stored as dedicated DB columns; sessions resume with full context via `--resume` flag

@@ -236,7 +236,9 @@ class SyncService:
     def _sync_one(self, target: FileTarget, *, workspace: Path) -> FileSyncStatus:
         renderer = get_renderer(target.style)
         try:
-            rendered = renderer.render(target, workspace=workspace)
+            rendered = renderer.render(
+                target, workspace=workspace, memory_backend=self._config.memory.backend,
+            )
         except Exception as e:
             logger.exception(
                 "Renderer %s failed for %s: %s", target.style, target.output, e,

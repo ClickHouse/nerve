@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 import os
 import secrets
 import shutil
@@ -376,6 +377,10 @@ class SetupChoices:
     # init` asks.
     gateway_host: str = "0.0.0.0"
     gateway_port: int = 8900
+    # The instance's memory.backend (the web setup passes the running
+    # config's). Under "loom" the workspace templates and the built-in jobs
+    # name Loom's memory tools instead of Nerve's.
+    memory_backend: str = "memu"
 
 
 def bedrock_geo_prefix(region: str) -> str:
@@ -1215,6 +1220,76 @@ def write_cron_jobs(choices: SetupChoices) -> CronOutcome:
     )
 
 
+def _cron_prompt(cron: dict[str, Any], memory_backend: str) -> str:
+    """A built-in job's prompt; under Loom, worded for Loom's memory tools."""
+    prompt = cron["prompt"]
+    if memory_backend != "loom":
+        return prompt
+    from nerve.memory import loom_prompts
+
+    if cron["id"] == "memory-maintenance":
+        return loom_prompts.MAINTENANCE_PROMPT
+    if cron["id"] == "inbox-processor":
+        return loom_prompts.apply_edits(
+            prompt, (loom_prompts.INBOX_MEMORIZE_EDIT,), name="the inbox-processor prompt",
+        )
+    return prompt
+
+
+def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
+    if memory_backend == "loom" and cron["id"] == "memory-maintenance":
+        from nerve.memory import loom_prompts
+
+        return loom_prompts.MAINTENANCE_DESCRIPTION
+    return cron["description"]
+
+
+def loom_wording_of_shipped_job(
+    job_id: str, prompt: str, description: str,
+) -> tuple[str, str] | None:
+    """The Loom prompt and description of a built-in job whose prompt is the
+    one Nerve writes for memU, as a ``system.yaml`` written before
+    ``memory.backend`` became ``loom`` holds it; None for an edited prompt or
+    a job with no Loom wording. Run under memU's prompt, ``memory-maintenance``
+    would prune memories through Loom's tools."""
+    shipped = next((c for c in (*CORE_CRONS, *PRODUCTIVITY_CRONS) if c["id"] == job_id), None)
+    if shipped is None or prompt.strip() != shipped["prompt"].strip():
+        return None
+    loom_prompt = _cron_prompt(shipped, "loom")
+    if loom_prompt == shipped["prompt"]:
+        return None
+    if description.strip() == str(shipped["description"]).strip():
+        description = _cron_description(shipped, "loom")
+    return loom_prompt, description
+
+
+def existing_memory_backend(config_dir: Path, workspace: Path | None = None) -> str:
+    """The ``memory.backend`` an existing configuration names, else ``memu``:
+    what ``nerve init`` words the templates, skills and jobs for when no
+    ``--memory-backend`` says (that flag wins: a platform that switches the
+    instance after its first ``nerve init`` passes it). Read from the
+    configuration when one loads, else from the workspace's
+    ``config/settings.yaml`` alone."""
+    from nerve.config import MEMORY_BACKENDS, load_config
+
+    try:
+        if (Path(config_dir) / "config.yaml").exists():
+            backend = load_config(Path(config_dir)).memory.backend
+            return backend if backend in MEMORY_BACKENDS else "memu"
+    except Exception as e:  # noqa: BLE001 — setup goes on with the default
+        logging.getLogger(__name__).warning("Could not read memory.backend from %s: %s", config_dir, e)
+    if workspace is not None:
+        try:
+            raw = yaml.safe_load(workspace_settings_file(Path(workspace)).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            raw = None
+        memory = raw.get("memory") if isinstance(raw, dict) else None
+        backend = str(memory.get("backend") or "").strip().lower() if isinstance(memory, dict) else ""
+        if backend in MEMORY_BACKENDS:
+            return backend
+    return "memu"
+
+
 def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
     """The ``system.yaml`` job list this install's answers produce."""
     jobs: list[dict[str, Any]] = []
@@ -1224,8 +1299,8 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
         jobs.append({
             "id": cron["id"],
             "schedule": cron["schedule"],
-            "prompt": cron["prompt"],
-            "description": cron["description"],
+            "prompt": _cron_prompt(cron, choices.memory_backend),
+            "description": _cron_description(cron, choices.memory_backend),
             "model": cron.get("model", ""),
             "session_mode": cron.get("session_mode", "isolated"),
             "enabled": True,
@@ -1238,7 +1313,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             job: dict[str, Any] = {
                 "id": cron["id"],
                 "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
+                "prompt": _cron_prompt(cron, choices.memory_backend),
                 "description": cron["description"],
                 "model": cron.get("model", ""),
                 "session_mode": cron.get("session_mode", "isolated"),
@@ -1263,7 +1338,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             job = {
                 "id": cron["id"],
                 "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
+                "prompt": _cron_prompt(cron, choices.memory_backend),
                 "description": cron["description"],
                 "model": cron.get("model", ""),
                 "session_mode": cron.get("session_mode", "isolated"),
@@ -1571,7 +1646,7 @@ def write_slim_install(
     # W: directories, scaffold, bundled skills, cron gates dir.
     workspace.mkdir(parents=True, exist_ok=True)
     install_config_scaffold(workspace)
-    install_bundled_skills(workspace)
+    install_bundled_skills(workspace, memory_backend=choices.memory_backend)
     (workspace / "config" / "cron" / "gates").mkdir(parents=True, exist_ok=True)
 
     # M: this box.
@@ -1744,6 +1819,7 @@ def apply_mode(
     *,
     in_container: bool = False,
     locked: bool = False,
+    memory_backend: str = "memu",
 ) -> ModeOutcome:
     """Choose the mode: templates, ``TASK.md``, settings defaults, ``system.yaml``.
 
@@ -1758,6 +1834,10 @@ def apply_mode(
     templates are already present the one remaining effect — a worker's
     ``TASK.md`` — is still applied, because ``TASK.md`` is runtime state the
     agent itself maintains.
+
+    ``memory_backend`` is the instance's ``memory.backend``: under ``loom``
+    the templates, the bundled skills and ``system.yaml`` name Loom's memory
+    tools.
     """
     if mode not in ("personal", "worker"):
         raise ValueError(f"mode must be personal or worker, got {mode!r}")
@@ -1778,8 +1858,10 @@ def apply_mode(
         )
 
     ws.mkdir(parents=True, exist_ok=True)
-    created = tuple(initialize_workspace(ws, mode, skip=WRITER_OWNED_TEMPLATES))
-    install_bundled_skills(ws)
+    created = tuple(initialize_workspace(
+        ws, mode, skip=WRITER_OWNED_TEMPLATES, memory_backend=memory_backend,
+    ))
+    install_bundled_skills(ws, memory_backend=memory_backend)
     install_config_scaffold(ws)
 
     task_written = mode == "worker" and apply_task_md(ws, task_description)
@@ -1819,6 +1901,7 @@ def apply_mode(
     if not system_cron_file(ws).exists():
         write_cron_jobs(SetupChoices(
             mode=mode, workspace_path=ws, enabled_crons=list(DEFAULT_CRONS[mode]),
+            memory_backend=memory_backend,
         ))
         cron_written = True
 

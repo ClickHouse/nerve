@@ -1103,6 +1103,7 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
         try:
             outcome = apply_mode(
                 ws, mode, task, in_container=daemon.in_container(), locked=locked,
+                memory_backend=ctx.config.memory.backend,
             )
         except ModeRefused as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
@@ -1607,6 +1608,15 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
 # --------------------------------------------------------------------------- #
 
 
+# Under memory.backend: loom the Memory step has nothing to store.
+_LOOM_MEMORY_REFUSAL = "Memory is kept in Loom on this instance: there is nothing to set up here."
+
+
+def _refuse_loom_memory(ctx: Any) -> None:
+    if ctx.config.memory.backend == "loom":
+        raise HTTPException(status_code=409, detail=_LOOM_MEMORY_REFUSAL)
+
+
 @router.put("/api/setup/memory")
 async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person)):
     key_given = "openai_api_key" in req.model_fields_set
@@ -1620,6 +1630,7 @@ async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person))
         ctx = await _context(actor)
         _require_claimed(ctx)
         _require_writable(ctx)
+        _refuse_loom_memory(ctx)
         # The step exists to store an OpenAI key. Without local secrets it is
         # closed outright — "no embeddings" is what the instance does anyway.
         _refuse_without_local_secrets(ctx)
@@ -2371,6 +2382,7 @@ async def setup_models(actor: Actor = Depends(require_person)):
 @router.post("/api/setup/memory/test")
 async def memory_test(req: MemoryTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    _refuse_loom_memory(ctx)
     # Refused with the step it belongs to, unlike the provider test: a Bedrock
     # or environment credential is still worth testing there, whereas the only
     # thing to do with a working OpenAI key here is to save it, which is refused.

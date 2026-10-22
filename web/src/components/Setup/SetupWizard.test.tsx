@@ -1464,6 +1464,18 @@ describe('pre-configured connections', () => {
     expect(api.setupStep).not.toHaveBeenCalled();
   });
 
+  it('memory kept in Loom has nothing to choose, and Continue sends nothing', async () => {
+    current = withStep(makeState(), step('memory', { status: 'done', summary: 'Kept in Loom' }, { backend: 'loom' }));
+    renderAt('/setup/memory');
+    await heading('Memory');
+    expect(screen.getByText(/Memory on this server is kept in Loom/)).toBeInTheDocument();
+    expect(screen.queryByRole('radio', { name: /Use embeddings/ })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('OpenAI API key')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    expect(await heading('Connect Telegram or Slack')).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+
   it('sources the operator provided render as managed lines, not fields', async () => {
     current = withStep(makeState(), step('sources', { status: 'done' }, {
       github: { enabled: true, source: 'environment' },

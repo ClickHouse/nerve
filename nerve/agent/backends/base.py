@@ -242,9 +242,15 @@ def config_excluded_tools(config: Any) -> set[str]:
 
     A tool that is offered but can only refuse costs a turn to find that
     out. ``send_channel_message`` is the case: outbound is off by default,
-    and with it off no destination is reachable.
+    and with it off no destination is reachable. The memory tools are the
+    other: they serve memU, and with ``memory.backend: loom`` the agent
+    uses Loom's own tools from the MCP gateway's catalog instead.
     """
     excluded: set[str] = set()
     if not config.outbound_channels:
         excluded.add("send_channel_message")
+    if config.memory.backend == "loom":
+        from nerve.agent.tools.handlers.memory import MEMORY_SPECS
+
+        excluded.update(spec.name for spec in MEMORY_SPECS)
     return excluded

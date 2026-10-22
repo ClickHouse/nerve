@@ -175,7 +175,7 @@ ETAG_FIELDS: dict[str, tuple[str, ...]] = {
         "language", "agent_name", "agent_emoji", "about_set", "user_md_pristine",
         "identity_md_pristine",
     ),
-    STEP_MEMORY: ("openai_api_key", "embeddings_chosen", "embed_model"),
+    STEP_MEMORY: ("backend", "openai_api_key", "embeddings_chosen", "embed_model"),
     STEP_CHANNELS: (
         "telegram.enabled", "telegram.bot_token", "telegram.dm_policy",
         "slack.enabled", "slack.mode", "slack.bot_token", "slack.app_token",
@@ -959,17 +959,22 @@ def derive(facts: Facts) -> list[Step]:
         elif step_id == STEP_MEMORY:
             key = mask(config.openai_api_key, facts.credential_sources.get("openai_api_key"))
             detail = {
+                "backend": config.memory.backend,
                 "openai_api_key": key,
                 "embeddings_chosen": bool(config.openai_api_key),
                 "embed_model": config.memory.embed_model or "text-embedding-3-small",
             }
-            if config.openai_api_key:
+            # Loom embeds and recalls on its side: nothing to set up here.
+            loom = config.memory.backend == "loom"
+            if loom:
+                summary = "Kept in Loom"
+            elif config.openai_api_key:
                 summary = f"OpenAI key (…{key['last4']}) · vector search on" if key["last4"] else "OpenAI key · vector search on"
             elif STEP_MEMORY in answered:
                 summary = "LLM-ranked recall (chosen)"
             else:
                 summary = ""
-            done = bool(config.openai_api_key or STEP_MEMORY in answered)
+            done = bool(loom or config.openai_api_key or STEP_MEMORY in answered)
             if done:
                 status = STATUS_DONE
             elif locked:

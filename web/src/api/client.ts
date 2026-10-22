@@ -154,6 +154,8 @@ export interface SetupProfileDetail {
 }
 
 export interface SetupMemoryDetail {
+  /** `memory.backend`: under `loom` there is nothing to set up here. */
+  backend?: string;
   openai_api_key: SecretOut;
   embeddings_chosen: boolean;
   embed_model: string;

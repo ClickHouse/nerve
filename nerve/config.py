@@ -2199,8 +2199,54 @@ class MemoryCategoryConfig:
         return cls(name=d["name"], description=d.get("description", ""))
 
 
+# The backends ``memory.backend`` accepts: ``memu`` runs memU inside the
+# process; ``loom`` keeps memory in a Loom service that agents reach as the
+# ``loom`` server of the MCP gateway's catalog (``mcp_gateway_url``).
+MEMORY_BACKENDS: tuple[str, ...] = ("memu", "loom")
+DEFAULT_MEMORY_BACKEND = "memu"
+
+
+# Loom's names: a namespace is lowercase letters, digits and hyphens, starting
+# with a letter or digit, at most 128 characters; an org name is checked as
+# loosely, without whitespace or a slash.
+_LOOM_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
+_LOOM_ORG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
+
+
+@dataclass
+class LoomMemoryConfig:
+    """Optional settings of the Loom memory backend (``memory.backend: loom``).
+
+    Nerve reaches Loom through the MCP gateway (``mcp_gateway_url``) as the
+    agent the gateway serves, so none of these is needed. ``org`` and
+    ``namespace`` name the Loom workspace Nerve's own calls address, when it
+    should not be the one Loom resolves for the agent's credential;
+    ``dashboard_url`` is where people open Loom's dashboard (no link without
+    it). ``defer_extraction`` queues conversation extraction in Loom instead
+    of waiting for it: Loom then gives up on a batch after three tries within
+    about a minute, and Nerve cannot see that.
+    """
+
+    org: str = ""
+    namespace: str = ""
+    dashboard_url: str = ""
+    defer_extraction: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> LoomMemoryConfig:
+        return cls(
+            org=str(d.get("org") or "").strip(),
+            namespace=str(d.get("namespace") or "").strip(),
+            dashboard_url=str(d.get("dashboard_url") or "").strip(),
+            defer_extraction=d.get("defer_extraction", False),
+        )
+
+
 @dataclass
 class MemoryConfig:
+    # Which backend keeps the agent's memory: "memu" or "loom".
+    backend: str = DEFAULT_MEMORY_BACKEND
     recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
     memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
     fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
@@ -2209,6 +2255,7 @@ class MemoryConfig:
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
+    loom: LoomMemoryConfig = field(default_factory=LoomMemoryConfig)
 
     @classmethod
     @_coerced
@@ -2216,7 +2263,15 @@ class MemoryConfig:
         default_dsn = f"sqlite:///{paths.memu_sqlite()}"
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
+        raw_loom = d.get("loom")
+        if raw_loom is not None and not isinstance(raw_loom, dict):
+            logger.warning(
+                "memory.loom must be a mapping of settings, got %s; using the defaults",
+                type(raw_loom).__name__,
+            )
+            raw_loom = None
         return cls(
+            backend=str(d.get("backend") or DEFAULT_MEMORY_BACKEND).strip().lower(),
             recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
             memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
             fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
@@ -2225,6 +2280,7 @@ class MemoryConfig:
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
             categories=categories,
+            loom=LoomMemoryConfig.from_dict(raw_loom or {}),
         )
 
 
@@ -3341,6 +3397,13 @@ def _normalize_mcp_gateway_url(value: Any) -> str:
     is not an http or https URL with a host, or that has credentials, a query,
     a fragment or whitespace. The URL goes into logs.
     """
+    return _checked_http_url(value, "mcp_gateway_url")
+
+
+def _checked_http_url(value: Any, key: str) -> str:
+    """``value`` as an http or https URL without a trailing ``/``, for the
+    setting ``key``; empty stays empty. Raises :class:`ConfigError` naming
+    ``key`` for anything else (see :func:`_normalize_mcp_gateway_url`)."""
     url = "" if value is None else str(value).strip()
     if not url:
         return ""
@@ -3361,7 +3424,7 @@ def _normalize_mcp_gateway_url(value: Any) -> str:
         valid = False
     if not valid:
         raise ConfigError(
-            "mcp_gateway_url must be an http:// or https:// URL with a host "
+            f"{key} must be an http:// or https:// URL with a host "
             "and no credentials, query or fragment"
         )
     return url.rstrip("/")
@@ -3915,7 +3978,39 @@ class NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
         config._validate_anthropic_base_url()
+        config._validate_memory_backend()
         return config
+
+    def _validate_memory_backend(self) -> None:
+        """Refuse an unknown ``memory.backend``, and check ``memory.loom``
+        when Loom is the backend.
+
+        A typo in the backend name is a hard error, as it is for
+        ``agent.backend``: falling back to memU would boot an instance with
+        an empty memory and nothing to say why. The ``memory.loom`` section
+        is checked only while it is in use, so a stale value there cannot
+        stop a memU instance from starting.
+        """
+        backend = self.memory.backend
+        if backend not in MEMORY_BACKENDS:
+            raise ValueError(
+                f"memory.backend must be one of {MEMORY_BACKENDS}, got {backend!r}"
+            )
+        if backend == "loom":
+            loom = self.memory.loom
+            loom.dashboard_url = _checked_http_url(loom.dashboard_url, "memory.loom.dashboard_url")
+            if loom.namespace and not _LOOM_NAMESPACE_RE.fullmatch(loom.namespace):
+                raise ConfigError(
+                    "memory.loom.namespace must be a Loom namespace name: lowercase "
+                    "letters, digits and hyphens, starting with a letter or digit, "
+                    "at most 128 characters"
+                )
+            if loom.org and not _LOOM_ORG_RE.fullmatch(loom.org):
+                raise ConfigError(
+                    "memory.loom.org must be a Loom org name: letters, digits and "
+                    "'.', '_', ':', '@' or '-', starting with a letter or digit, "
+                    "at most 128 characters"
+                )
 
     def _validate_anthropic_base_url(self) -> None:
         """Refuse ``anthropic_base_url`` together with another endpoint setting.

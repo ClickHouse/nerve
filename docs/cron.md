@@ -450,7 +450,7 @@ Jobs with `session_mode: persistent` maintain SDK conversation context across ru
 
 - **First trigger**: Creates a fresh generation session (`cron:{job_id}:{run_id}`, the same ID form as an isolated run) and runs the prompt.
 - **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs of this generation in-context.
-- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memU, cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
+- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memory (memU, or Loom with `memory.backend: loom`), cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
 
 > **Upgrade note.** Installs that predate generation chats used the stable id
 > `cron:{job_id}`. That session is adopted as the current generation on the
@@ -517,7 +517,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |

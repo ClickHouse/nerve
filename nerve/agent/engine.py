@@ -67,6 +67,7 @@ from nerve.agent.prompts import (
     build_session_preamble,
     build_system_prompt,
     current_time_str,
+    memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
     worker_onboarding_prompt,
@@ -97,6 +98,11 @@ from nerve.identity import (
 )
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
+from nerve.memory.backend import (
+    MemoryBackendUnavailable,
+    create_memory_bridge,
+    recall_for_startup,
+)
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 from nerve.setup_writer import (
@@ -633,6 +639,13 @@ class AgentEngine:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
 
+    def _loom_tools_offered(self) -> bool:
+        """Whether sessions get Loom's tools: the MCP gateway's catalog,
+        read in external mode only, lists the ``loom`` server."""
+        return self._managed_mcp and any(
+            getattr(server, "name", "") == "loom" for server in self._mcp_servers_cache
+        )
+
     async def _refresh_mcp_catalog(self) -> None:
         """External mode: read the catalog and give its servers to new clients.
 
@@ -813,9 +826,16 @@ class AgentEngine:
         cron``) started while the gateway runs must not mark the gateway's
         live agents interrupted.
         """
-        from nerve.memory.memu_bridge import MemUBridge
-        self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
+        self._memory_bridge = create_memory_bridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
+        if self.config.memory.backend == "loom" and not self._managed_mcp:
+            # Loom's own tools reach agents as a server of the MCP gateway's
+            # catalog, which only external mode reads.
+            logger.warning(
+                "memory.backend is loom, but this instance is not in external "
+                "mode, so agents get no MCP gateway catalog and no Loom tools: "
+                "only the startup recall and transcript extraction use Loom",
+            )
 
         # Optional xmemory.ai structured-memory layer — inert unless both a
         # token and instance_id are configured. Runs alongside memU; never
@@ -990,7 +1010,7 @@ class AgentEngine:
             logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
 
         guide = await asyncio.to_thread(read_worker_guide)
-        prompt = worker_onboarding_prompt(task_description, guide)
+        prompt = worker_onboarding_prompt(task_description, guide, self.config.memory.backend)
 
         try:
             await self.run_cron(
@@ -1603,22 +1623,39 @@ class AgentEngine:
             # prompts across rebuilds are what let a resumed conversation
             # hit the prompt cache (see nerve/agent/cache_policy.py), and a
             # session keeping its original priors is more consistent anyway
-            # — live recall stays available via the memory_recall tool.
+            # — live recall stays available via the memory tools.
             recalled_memories: list[str] = []
             meta_updates: dict[str, Any] = {}
             frozen_recall = session_meta.get("recalled_memories")
+            # Said in place of the memories when the Loom backend could not
+            # recall any (memU stays silent): an outage is not an empty memory.
+            memory_note: str | None = None
             if isinstance(frozen_recall, list):
                 recalled_memories = [str(m) for m in frozen_recall]
+            elif (
+                self.config.memory.backend == "loom"
+                and self._memory_bridge is not None
+                and not self._memory_bridge.available
+            ):
+                # The Loom backend did not start (no gateway URL): said as
+                # for an outage.
+                memory_note = memory_unavailable_note(
+                    getattr(self._memory_bridge, "error", "") or "the Loom backend is not running",
+                )
             elif self._memory_bridge and self._memory_bridge.available:
                 try:
-                    raw = await self._memory_bridge.recall(
-                        f"context for {source} session",
-                        limit=8,
+                    raw = await recall_for_startup(
+                        self._memory_bridge, f"context for {source} session", 8,
                     )
                     recalled_memories = [m["summary"] for m in raw]
                     meta_updates["recalled_memories"] = recalled_memories
                 except Exception as e:
                     logger.warning("Pre-recall failed: %s", e)
+                    if (
+                        self.config.memory.backend == "loom"
+                        and isinstance(e, MemoryBackendUnavailable)
+                    ):
+                        memory_note = memory_unavailable_note(str(e))
 
             # Resolve the prompt-cache TTL for this client build (cadence-
             # aware; see nerve/agent/cache_policy.py). Claude-only — other
@@ -1696,6 +1733,9 @@ class AgentEngine:
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
                 static=static_prompt,
+                memory_note=memory_note,
+                memory_backend=self.config.memory.backend,
+                memory_tools=self._loom_tools_offered(),
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1793,6 +1833,7 @@ class AgentEngine:
             if deliver_preamble:
                 self._pending_preambles[session_id] = build_session_preamble(
                     session_id, source, recalled_memories or None,
+                    memory_note=memory_note,
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
