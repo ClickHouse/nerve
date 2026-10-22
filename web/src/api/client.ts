@@ -106,6 +106,40 @@ export interface SetupOnboardingState {
   awaiting: SetupOnboardingAwaiting | null;
 }
 
+/**
+ * One kind of work a worker can take on, from the server's catalog. The Mode
+ * step lists them as checkboxes; the onboarding conversation asks the chosen
+ * items' `follow_ups`.
+ */
+export interface WorkCatalogItem {
+  id: string;
+  /** `code`, `operations`, `communication` or `knowledge`. */
+  group: string;
+  label: string;
+  /** One line. */
+  description: string;
+  /** What the work depends on: `github`, `alerts`, `slack-or-telegram` or `web`. */
+  needs: string;
+  follow_ups: string[];
+  /**
+   * A caveat shown under the description: what the work needs that the
+   * instance may lack (alerts: an alert source). Empty for most items;
+   * absent when the description carries it.
+   */
+  note?: string;
+}
+
+/**
+ * What a worker was set up to do: catalog ids, other work in the person's
+ * own words, and what it must know or never do. All empty when nothing was
+ * chosen.
+ */
+export interface WorkSelection {
+  items: string[];
+  custom: string;
+  rules: string;
+}
+
 export interface SetupModeDetail {
   mode: SetupMode | null;
   templates_present: string[];
@@ -114,6 +148,10 @@ export interface SetupModeDetail {
   onboarding_session_id: string | null;
   /** Absent from an older backend: `conversation`. */
   onboarding_kind?: SetupOnboardingKind;
+  /** The worker work catalog, in display order. Absent from an older backend. */
+  work_catalog?: WorkCatalogItem[];
+  /** The saved selection (from `TASK.md`). Absent from an older backend. */
+  work?: WorkSelection;
 }
 
 export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';

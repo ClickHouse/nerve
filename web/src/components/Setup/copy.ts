@@ -76,9 +76,36 @@ export const MODE_CARDS: { value: SetupMode; title: string; description: string;
   },
 ];
 
-/** The worker's optional note at setup, written into TASK.md. */
-export const WORKER_NOTE_LABEL = 'Anything it should know? (optional)';
-export const WORKER_NOTE_HELP = 'You can also tell it in the first conversation.';
+/**
+ * A worker's work on the Mode step: the server's catalog as checkboxes, other
+ * work in the person's own words, and its rules — all written into TASK.md.
+ * Nothing ticked is an answer too: the onboarding conversation asks.
+ */
+export const WORK_HEADING = 'What should it do?';
+export const WORK_INTRO = 'Tick what applies; the conversation sorts out the details.';
+/** The catalog's groups, in display order, with their headings. */
+export const WORK_GROUPS: { id: string; heading: string }[] = [
+  { id: 'code', heading: 'Code' },
+  { id: 'operations', heading: 'Operations' },
+  { id: 'communication', heading: 'Communication' },
+  { id: 'knowledge', heading: 'Knowledge' },
+];
+/** A group this build does not know is headed by its id, capitalised. */
+export const workGroupHeading = (group: string) =>
+  WORK_GROUPS.find((g) => g.id === group)?.heading ?? group.charAt(0).toUpperCase() + group.slice(1);
+export const WORK_CUSTOM_LABEL = 'Custom…';
+/** The name of the field Custom… reveals; its placeholder is the visible prompt. */
+export const WORK_CUSTOM_FIELD = 'Other work';
+export const WORK_CUSTOM_PLACEHOLDER = 'Describe other work, in your own words';
+export const WORK_CUSTOM_MISSING = 'Untick Custom… or describe the other work.';
+export const WORK_RULES_LABEL = 'Anything it must know or never do? (optional)';
+export const WORK_RULES_PLACEHOLDER = 'For example: never merge anything on its own.';
+export const WORK_TOO_LONG = (max: number) => `Keep this under ${max} characters.`;
+/** The Review's lines under a worker's Mode row, in the words TASK.md uses. */
+export const WORK_REVIEW_ITEMS = (labels: string[]) => `Work: ${labels.join('; ')}`;
+export const WORK_REVIEW_ALSO = (text: string) => `Also: ${text}`;
+export const WORK_REVIEW_RULES = (text: string) => `Must know or never do: ${text}`;
+export const WORK_REVIEW_NONE = 'No work chosen yet — the conversation will ask';
 
 export const PROVIDER_CARDS: { value: 'anthropic' | 'oauth' | 'host_login' | 'bedrock'; title: string; description: string }[] = [
   { value: 'anthropic', title: 'Anthropic API key', description: 'Pay per use. Works for chat, memory and background jobs.' },
