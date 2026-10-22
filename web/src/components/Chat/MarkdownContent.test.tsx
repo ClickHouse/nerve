@@ -2,7 +2,7 @@ import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
-import { MarkdownContent } from './MarkdownContent';
+import { InlineMarkdown, MarkdownContent } from './MarkdownContent';
 
 const NOTE = '- Plan proposed: [plan-1](/plans/plan-1) (v1)\n- See [the docs](https://example.com/docs)';
 
@@ -33,5 +33,30 @@ describe('MarkdownContent links', () => {
   it('drops a script link', () => {
     render(<MemoryRouter><MarkdownContent content="[run](javascript:alert(1))" /></MemoryRouter>);
     expect(screen.getByText('run').closest('a')).not.toHaveAttribute('href', expect.stringContaining('javascript'));
+  });
+});
+
+describe('InlineMarkdown', () => {
+  it('renders code, emphasis and links with no block around them', () => {
+    const { container } = render(
+      <p>Should <InlineMarkdown content="`alice` post **drafts** to [org/repo-a](https://example.com/org/repo-a)?" /></p>,
+    );
+    expect(screen.getByText('alice').tagName).toBe('CODE');
+    expect(screen.getByText('drafts').tagName).toBe('STRONG');
+    expect(screen.getByRole('link', { name: 'org/repo-a' })).toHaveAttribute('target', '_blank');
+    expect(container.querySelector('p p, p div')).toBeNull();
+  });
+
+  it('keeps the text of a block without the block', () => {
+    const { container } = render(<InlineMarkdown content={'# Heading\n\n- one item'} />);
+    expect(container.querySelector('h1, ul, li')).toBeNull();
+    expect(container).toHaveTextContent('Heading');
+    expect(container).toHaveTextContent('one item');
+  });
+
+  it('keeps only a link\'s text where links are off', () => {
+    render(<InlineMarkdown content="See [the docs](https://example.com/docs)" links={false} />);
+    expect(screen.queryByRole('link')).toBeNull();
+    expect(screen.getByText(/the docs/)).toBeInTheDocument();
   });
 });

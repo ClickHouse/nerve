@@ -25,6 +25,8 @@ export type WSMessage =
   // `agent` names the subagent that asked; null or absent for the orchestrator.
   | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
   | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
+  // A short summary of the plan an ExitPlanMode pause waits on (buffered for replay like `interaction`).
+  | { type: 'plan_summary'; session_id: string; interaction_id: string; bullets: string[]; status: 'ok' | 'unavailable' }
   // No longer emitted (agent records replaced them); tolerated and ignored.
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }

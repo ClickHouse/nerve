@@ -206,6 +206,18 @@ export interface PanelTab {
   workflow?: WorkflowSnapshot;
   /** For type==='agent': the agent record whose transcript the tab shows. */
   agentId?: string;
+  /**
+   * A plan opened from a decided card, to read: no decision footer, and plan
+   * updates leave it alone (they go to the live plan tab).
+   */
+  readOnly?: boolean;
+}
+
+/** The short summary of a plan waiting for a decision (`plan_summary`). */
+export interface PlanSummary {
+  bullets: string[];
+  /** `unavailable`: no summary could be made (no credential, a failure, a timeout). */
+  status: 'ok' | 'unavailable';
 }
 
 // --- Session modified files & diff types ---

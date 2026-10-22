@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PanelTab } from '../../types/chat';
@@ -20,13 +20,14 @@ vi.mock('../../api/websocket', () => ({
 const { ws } = await import('../../api/websocket');
 const { useChatStore } = await import('../../stores/chatStore');
 const { SidePanel } = await import('./SidePanel');
+const { PlanApprovalBlock } = await import('./tools/PlanApprovalBlock');
 
 const PLAN = '# Plan for org/repo-a\n\n1. Read the open pull requests.\n2. Draft review comments for alice.';
 
-function planTab(): PanelTab {
+function planTab(extra: Partial<PanelTab> = {}): PanelTab {
   return {
     id: 'plan-1', type: 'plan', label: 'Plan', subagentType: 'Plan', description: '', content: PLAN,
-    prompt: '', streaming: false, status: 'complete', startedAt: 0, completedAt: 1, blocks: [],
+    prompt: '', streaming: false, status: 'complete', startedAt: 0, completedAt: 1, blocks: [], ...extra,
   };
 }
 
@@ -36,12 +37,12 @@ const sendMessage = vi.fn();
  * The plan tab open in the panel. `waiting`: the agent's turn waits on
  * `ExitPlanMode` (and so is running); `streaming`: a turn runs.
  */
-function open({ waiting, streaming = waiting, session = 'session-1' }: {
-  waiting: boolean; streaming?: boolean; session?: string;
+function open({ waiting, streaming = waiting, session = 'session-1', tab = {} }: {
+  waiting: boolean; streaming?: boolean; session?: string; tab?: Partial<PanelTab>;
 }) {
   useChatStore.setState({
     activeSession: session,
-    panels: [planTab()], activePanelId: 'plan-1', panelVisible: true,
+    panels: [planTab(tab)], activePanelId: 'plan-1', panelVisible: true, planEditRequest: null,
     isStreaming: streaming,
     pendingInteraction: waiting
       ? { interactionId: 'i-plan', interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput: { plan: PLAN } }
@@ -135,5 +136,89 @@ describe("The plan panel's footer", () => {
   it('offers no Edit when no plan decision waits', () => {
     open({ waiting: false });
     expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+  });
+
+  it('offers nothing in the onboarding conversation once no plan decision waits', () => {
+    open({ waiting: false, session: 'onboarding-1a2b3c4d' });
+    expect(screen.getByRole('heading', { name: 'Plan for org/repo-a' })).toBeInTheDocument();
+    expect(screen.queryAllByRole('button', { name: /Apply setup|Approve|Change something|Edit/ })).toHaveLength(0);
+  });
+
+  it('opens in edit mode from the card\'s Edit, applies the edit, and leaves no pre-edit plan behind', async () => {
+    // The panel is closed and holds no plan: it opens on request only.
+    useChatStore.setState({
+      activeSession: 'onboarding-1a2b3c4d', panels: [], activePanelId: null, panelVisible: false, isStreaming: true,
+      pendingInteraction: {
+        interactionId: 'i-plan', interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput: { plan: PLAN },
+      },
+      planEditRequest: null, sendMessage,
+    });
+    const panel = render(<SidePanel />);
+    const card = render(<PlanApprovalBlock block={{
+      type: 'tool_call', toolUseId: 'tu-exit', tool: 'ExitPlanMode', input: { plan: PLAN }, status: 'running',
+    }} />);
+    expect(within(panel.container).queryByRole('textbox')).not.toBeInTheDocument();
+
+    await userEvent.click(within(card.container).getByRole('button', { name: 'Edit' }));
+    const inPanel = within(panel.container);
+    const editor = inPanel.getByRole('textbox', { name: 'Edit the setup proposal' });
+    expect(editor).toHaveValue(PLAN);
+    expect(useChatStore.getState()).toMatchObject({ panelVisible: true, planEditRequest: null });
+    expect(inPanel.getByRole('button', { name: 'Apply edited plan' })).toBeDisabled();
+
+    await userEvent.type(editor, '\n3. Skip draft pull requests.');
+    await userEvent.click(inPanel.getByRole('button', { name: 'Apply edited plan' }));
+    expect(ws.answerInteraction).toHaveBeenCalledWith(
+      'onboarding-1a2b3c4d', 'i-plan', { plan: `${PLAN}\n3. Skip draft pull requests.` },
+    );
+    // The CLI writes the edit to disk without a plan update, so the tab
+    // would keep the old text: it closes instead.
+    expect(useChatStore.getState().panels).toHaveLength(0);
+    expect(within(card.container).getByText('Resolving…')).toBeInTheDocument();
+  });
+
+  it('takes the card\'s Edit once: back on the tab later, it shows the decision, not the editor', async () => {
+    useChatStore.setState({
+      activeSession: 'session-1', panels: [], activePanelId: null, panelVisible: false, isStreaming: true,
+      pendingInteraction: {
+        interactionId: 'i-plan', interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput: { plan: PLAN },
+      },
+      planEditRequest: null, sendMessage,
+    });
+    const panel = render(<SidePanel />);
+    const card = render(<PlanApprovalBlock block={{
+      type: 'tool_call', toolUseId: 'tu-exit', tool: 'ExitPlanMode', input: { plan: PLAN }, status: 'running',
+    }} />);
+    await userEvent.click(within(card.container).getByRole('button', { name: 'Edit' }));
+    await userEvent.click(within(panel.container).getByRole('button', { name: 'Cancel' }));
+    // Away from the tab and back: the footer remounts with no editor.
+    act(() => useChatStore.setState({ panelVisible: false }));
+    await userEvent.click(within(card.container).getByRole('button', { name: 'Read the plan' }));
+    expect(within(panel.container).queryByRole('textbox')).not.toBeInTheDocument();
+    expect(within(panel.container).getByRole('button', { name: 'Approve' })).toBeInTheDocument();
+  });
+
+  it('has no footer on a plan opened to read from a decided card', () => {
+    open({ waiting: true, tab: { readOnly: true } });
+    expect(screen.getByRole('heading', { name: 'Plan for org/repo-a' })).toBeInTheDocument();
+    expect(screen.queryAllByRole('button', { name: /Approve|Request changes|Edit/ })).toHaveLength(0);
+  });
+
+  it('never offers "Apply setup" again after the card applied it and the turn ended', async () => {
+    const panel = open({ waiting: true, session: 'onboarding-1a2b3c4d' });
+    const card = render(<PlanApprovalBlock block={{
+      type: 'tool_call', toolUseId: 'tu-exit', tool: 'ExitPlanMode', input: { plan: PLAN }, status: 'running',
+    }} />);
+    await userEvent.click(within(card.container).getByRole('button', { name: 'Apply setup' }));
+    expect(ws.answerInteraction).toHaveBeenCalledWith('onboarding-1a2b3c4d', 'i-plan', null);
+    // The card's decision closed the plan tab as well.
+    expect(useChatStore.getState().panels).toHaveLength(0);
+
+    // The apply turn ends and the plan tab is back (the agent touched the plan
+    // file again): still nothing to apply a second time.
+    act(() => useChatStore.setState({ isStreaming: false, panels: [planTab()], activePanelId: 'plan-1', panelVisible: true }));
+    expect(within(panel.container).getByRole('heading', { name: 'Plan for org/repo-a' })).toBeInTheDocument();
+    expect(within(panel.container).queryByRole('button', { name: 'Apply setup' })).not.toBeInTheDocument();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });

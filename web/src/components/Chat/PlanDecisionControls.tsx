@@ -1,9 +1,9 @@
-import { useId, useRef, useState, type FormEvent, type KeyboardEvent, type Ref } from 'react';
-import { Check, ChevronDown, ChevronUp, MessageSquare, Pencil, Send, X } from '../ui/icons';
+import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { BookOpen, Check, MessageSquare, Pencil, Send, X } from '../ui/icons';
 import { Button, TextArea } from '../ui';
-import { MarkdownContent } from './MarkdownContent';
 import {
-  PLAN_APPLY_EDITED, PLAN_EDIT, PLAN_EDIT_CANCEL, PLAN_FEEDBACK_LABEL, PLAN_FEEDBACK_SEND, usePlanDecisionCopy,
+  PLAN_APPLY_EDITED, PLAN_EDIT, PLAN_EDIT_CANCEL, PLAN_FEEDBACK_LABEL, PLAN_FEEDBACK_SEND, PLAN_READ,
+  usePlanDecisionCopy,
 } from './planDecision';
 
 /**
@@ -14,24 +14,24 @@ import {
  * - **Request changes…** opens a feedback field. It must hold some text
  *   before Send sends it. Cmd/Ctrl+Enter sends; Escape closes the field and
  *   keeps what was typed.
- * - **Edit** (given the plan and `onApproveEdited`) turns the plan into a
- *   text field. Approve and Request changes give way to **Apply edited
- *   plan**, enabled once the text differs from the plan and is not empty,
- *   and **Cancel**, which drops the edits. Cmd/Ctrl+Enter applies; Escape
- *   cancels only while nothing was changed, so a stray key loses no work.
- *
- * In the card the plan itself is shown here too, as markdown in a box of at
- * most 24rem with its own scroll (or all of it), with Show all and Edit
- * under it; editing replaces the box. The panel shows the plan in its own
- * body, so the footer has an Edit button instead and puts the field above
- * its buttons.
+ * - In the card, **Read the plan** and **Edit** open the plan in the side
+ *   panel (Edit with the footer's editor open); the card shows no plan text.
+ * - In the footer, **Edit** (given the plan and `onApproveEdited`) turns the
+ *   plan into a text field above the buttons. Approve and Request changes
+ *   give way to **Apply edited plan**, enabled once the text differs from
+ *   the plan and is not empty, and **Cancel**, which drops the edits.
+ *   Cmd/Ctrl+Enter applies; Escape cancels only while nothing was changed,
+ *   so a stray key loses no work. An Edit asked for from the card
+ *   (`editRequest`) opens the editor, once per request.
  *
  * Escape never leaves these fields: the app-wide Escape stops a running
  * turn, and the turn is running — it waits for this very decision.
  */
-export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan, onApproveEdited }: {
+export function PlanDecisionControls({
+  layout, onApprove, onRequestChanges, onReadPlan, onEdit, plan, onApproveEdited, editRequest,
+}: {
   /**
-   * `card`: the plan, then two equal buttons, then the feedback field.
+   * `card`: the buttons in a row, the feedback field below them.
    * `footer`: compact buttons on the right, any field above them.
    * Either way the buttons stay where they are when a field opens.
    */
@@ -39,10 +39,16 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
   onApprove: () => void;
   /** Receives the trimmed feedback. Omitted: no Request changes is offered. */
   onRequestChanges?: (feedback: string) => void;
-  /** The plan as markdown: shown in the card, and the text Edit starts from. */
+  /** Card: show the plan in the side panel. */
+  onReadPlan?: () => void;
+  /** Card: show the plan in the side panel with its editor open. */
+  onEdit?: () => void;
+  /** Footer: the plan as markdown, the text the editor starts from. */
   plan?: string | null;
-  /** Receives the edited plan. Omitted (or no plan): no Edit is offered. */
+  /** Footer: receives the edited plan. Omitted (or no plan): no Edit is offered. */
   onApproveEdited?: (plan: string) => void;
+  /** Footer: the id of an Edit asked for from the card. */
+  editRequest?: string | null;
 }) {
   const copy = usePlanDecisionCopy();
   const [feedbackOpen, setFeedbackOpen] = useState(false);
@@ -56,8 +62,20 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
   const editRef = useRef<HTMLButtonElement>(null);
   const card = layout === 'card';
   const canSend = feedback.trim().length > 0;
-  const canEdit = !!plan && !!onApproveEdited;
+  const canEdit = !card && !!plan && !!onApproveEdited;
   const canApplyEdit = canEdit && draft.trim().length > 0 && draft.trim() !== plan.trim();
+
+  // An Edit asked for from the card opens the editor here, once per request.
+  // Set during render, React's pattern for acting on a changed prop.
+  const [takenRequest, setTakenRequest] = useState<string | null>(null);
+  if (editRequest && editRequest !== takenRequest) {
+    setTakenRequest(editRequest);
+    if (canEdit) {
+      setDraft(plan);
+      setFeedbackOpen(false);
+      setEditing(true);
+    }
+  }
 
   const send = () => {
     if (canSend) onRequestChanges?.(feedback.trim());
@@ -111,7 +129,7 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
 
   const size = card ? 'md' : 'sm';
   const iconSize = card ? 13 : 12;
-  const secondaryClass = card ? 'flex-1' : 'py-1 rounded-md font-medium';
+  const secondaryClass = card ? '' : 'py-1 rounded-md font-medium';
 
   const approve = (
     <Button variant={card ? 'primary' : 'success'} size={size} className={card ? 'flex-1' : 'py-1'} onClick={onApprove}>
@@ -125,7 +143,7 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
       ref={toggleRef}
       variant="secondary"
       size={size}
-      className={secondaryClass}
+      className={card ? 'flex-1' : secondaryClass}
       aria-expanded={feedbackOpen}
       aria-controls={feedbackOpen ? formId : undefined}
       onClick={() => setFeedbackOpen(o => !o)}
@@ -133,44 +151,6 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
       <MessageSquare size={iconSize} />
       {copy.requestChanges}
     </Button>
-  );
-
-  const applyEdited = (
-    <Button
-      variant={card ? 'primary' : 'success'}
-      size={size}
-      className={card ? 'flex-1' : 'py-1'}
-      disabled={!canApplyEdit}
-      onClick={applyEdit}
-    >
-      <Check size={iconSize} />
-      {PLAN_APPLY_EDITED}
-    </Button>
-  );
-
-  const cancel = (
-    <Button variant="secondary" size={size} className={secondaryClass} onClick={cancelEdit}>
-      <X size={iconSize} />
-      {PLAN_EDIT_CANCEL}
-    </Button>
-  );
-
-  const editor = editing && (
-    <div className="space-y-1.5">
-      <label htmlFor={editorId} className="block text-xs font-medium text-text-secondary">{copy.editLabel}</label>
-      <TextArea
-        id={editorId}
-        value={draft}
-        onChange={e => setDraft(e.target.value)}
-        onKeyDown={onEditorKey}
-        rows={card ? 16 : 10}
-        resizable
-        // Opened on purpose a moment ago, by Edit.
-        autoFocus
-        spellCheck={false}
-        className={`font-mono text-xs ${card ? 'max-h-96' : 'max-h-[40vh]'}`}
-      />
-    </div>
   );
 
   const field = !editing && feedbackOpen && onRequestChanges && (
@@ -202,22 +182,62 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
   if (card) {
     return (
       <div className="space-y-3">
-        {plan && (editing ? editor : (
-          <PlanView text={plan} label={copy.planLabel} onEdit={canEdit ? startEdit : undefined} editRef={editRef} />
-        ))}
-        <div className="flex gap-2">
-          {editing ? <>{applyEdited}{cancel}</> : <>{approve}{requestChanges}</>}
+        <div className="flex flex-wrap gap-2">
+          {approve}
+          {requestChanges}
+          {onReadPlan && (
+            <Button variant="ghost" size="md" onClick={onReadPlan}>
+              <BookOpen size={13} />
+              {PLAN_READ}
+            </Button>
+          )}
+          {onEdit && (
+            <Button variant="ghost" size="md" onClick={onEdit}>
+              <Pencil size={13} />
+              {PLAN_EDIT}
+            </Button>
+          )}
         </div>
         {field}
       </div>
     );
   }
+
+  const editor = editing && (
+    <div className="space-y-1.5">
+      <label htmlFor={editorId} className="block text-xs font-medium text-text-secondary">{copy.editLabel}</label>
+      <TextArea
+        id={editorId}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onKeyDown={onEditorKey}
+        rows={10}
+        resizable
+        // Opened on purpose a moment ago, by Edit.
+        autoFocus
+        spellCheck={false}
+        className="font-mono text-xs max-h-[40vh]"
+      />
+    </div>
+  );
+
   return (
     <div className="space-y-2">
       {editor}
       {field}
       <div className="flex items-center justify-end gap-2">
-        {editing ? <>{cancel}{applyEdited}</> : (
+        {editing ? (
+          <>
+            <Button variant="secondary" size="sm" className={secondaryClass} onClick={cancelEdit}>
+              <X size={12} />
+              {PLAN_EDIT_CANCEL}
+            </Button>
+            <Button variant="success" size="sm" className="py-1" disabled={!canApplyEdit} onClick={applyEdit}>
+              <Check size={12} />
+              {PLAN_APPLY_EDITED}
+            </Button>
+          </>
+        ) : (
           <>
             {canEdit && (
               <Button ref={editRef} variant="secondary" size="sm" className={secondaryClass} onClick={startEdit}>
@@ -228,51 +248,6 @@ export function PlanDecisionControls({ layout, onApprove, onRequestChanges, plan
             {requestChanges}
             {approve}
           </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** The plan as markdown, in a box of at most 24rem with its own scroll, or all of it. */
-function PlanView({ text, label, onEdit, editRef }: {
-  text: string;
-  label: string;
-  onEdit?: () => void;
-  editRef: Ref<HTMLButtonElement>;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const regionId = useId();
-  return (
-    <div>
-      <div
-        id={regionId}
-        role="region"
-        aria-label={label}
-        // Scrolls on its own, so it takes focus for the keyboard to scroll it.
-        tabIndex={0}
-        className={`rounded-md border border-border-subtle bg-bg px-3 py-2 text-sm ${
-          expanded ? '' : 'max-h-96 overflow-y-auto'
-        }`}
-      >
-        <MarkdownContent content={text} />
-      </div>
-      <div className="mt-1.5 flex items-center gap-3">
-        <Button
-          variant="link"
-          size="xs"
-          aria-expanded={expanded}
-          aria-controls={regionId}
-          onClick={() => setExpanded(e => !e)}
-        >
-          {expanded ? <ChevronUp size={12} aria-hidden="true" /> : <ChevronDown size={12} aria-hidden="true" />}
-          {expanded ? 'Show less' : 'Show all'}
-        </Button>
-        {onEdit && (
-          <Button ref={editRef} variant="link" size="xs" onClick={onEdit}>
-            <Pencil size={12} aria-hidden="true" />
-            {PLAN_EDIT}
-          </Button>
         )}
       </div>
     </div>

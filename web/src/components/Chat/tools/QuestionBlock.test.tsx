@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ToolCallBlockData } from '../../../types/chat';
@@ -210,5 +210,73 @@ describe('AskUserQuestion: Other…', () => {
     expect(screen.getByRole('button', { name: /^Chat, then email/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /^Slack/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /^Other…/ })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('keeps Escape in the own-words field from stopping the waiting turn', async () => {
+    // The app-wide Escape (a document listener) stops a running turn; the
+    // turn is running while it waits for this answer.
+    const onDocumentKey = vi.fn();
+    document.addEventListener('keydown', onDocumentKey);
+    try {
+      pause();
+      render(<QuestionBlock block={ask([ACCOUNT])} />);
+      const other = screen.getByRole('button', { name: /^Other…/ });
+      await userEvent.click(other);
+      await userEvent.type(screen.getByRole('textbox', { name: 'Your answer' }), 'the review-bot account');
+      await userEvent.keyboard('{Escape}');
+
+      expect(onDocumentKey.mock.calls.some(([e]) => (e as KeyboardEvent).key === 'Escape')).toBe(false);
+      // It only leaves the field: back on Other…, still chosen, text kept.
+      expect(other).toHaveFocus();
+      expect(other).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByRole('textbox', { name: 'Your answer' })).toHaveValue('the review-bot account');
+      expect(ws.answerInteraction).not.toHaveBeenCalled();
+    } finally {
+      document.removeEventListener('keydown', onDocumentKey);
+    }
+  });
+
+  it('does not submit on the Enter that confirms an input method composition', async () => {
+    pause();
+    render(<QuestionBlock block={ask([ACCOUNT])} />);
+    await userEvent.click(screen.getByRole('button', { name: /^Other…/ }));
+    const answer = screen.getByRole('textbox', { name: 'Your answer' });
+    await userEvent.type(answer, 'bot');
+    fireEvent.keyDown(answer, { key: 'Enter', isComposing: true });
+    expect(ws.answerInteraction).not.toHaveBeenCalled();
+    fireEvent.keyDown(answer, { key: 'Enter' });
+    expect(ws.answerInteraction).toHaveBeenCalledWith('session-1', 'i-ask', { [ACCOUNT.question]: 'bot' });
+  });
+
+  it('renders markdown in the question and in option descriptions, with no link inside an option', () => {
+    pause();
+    const question = {
+      question: 'Should `alice` post review comments? See [the rules](https://example.com/rules).',
+      header: 'Posting',
+      multiSelect: false,
+      options: [
+        { label: 'Drafts only (recommended)', description: 'You approve each one in **this chat**' },
+        { label: 'Post directly', description: 'Needs a token, see [the docs](https://example.com/docs)' },
+      ],
+    };
+    render(<QuestionBlock block={ask([question])} />);
+    const posting = group('Should alice post review comments? See the rules.');
+    expect(posting.getByText('alice').tagName).toBe('CODE');
+    expect(posting.getByRole('link', { name: 'the rules' })).toHaveAttribute('href', 'https://example.com/rules');
+    expect(posting.getByText('this chat').tagName).toBe('STRONG');
+    const direct = posting.getByRole('button', { name: /^Post directly/ });
+    expect(within(direct).queryByRole('link')).toBeNull();
+    expect(direct).toHaveTextContent('Needs a token, see the docs');
+  });
+
+  it('answers a question that comes without options in the person\'s own words', async () => {
+    pause();
+    const free = { question: ACCOUNT.question, header: ACCOUNT.header, multiSelect: false };
+    render(<QuestionBlock block={ask([free])} />);
+    await userEvent.click(screen.getByRole('button', { name: /^Other…/ }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'Your answer' }), 'the review-bot account{Enter}');
+    expect(ws.answerInteraction).toHaveBeenCalledWith(
+      'session-1', 'i-ask', { [ACCOUNT.question]: 'the review-bot account' },
+    );
   });
 });

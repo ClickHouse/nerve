@@ -1,7 +1,7 @@
 import { useId, useState } from 'react';
 import { MessageCircleQuestion, Check, Send } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
-import { MarkdownContent } from '../MarkdownContent';
+import { InlineMarkdown, MarkdownContent } from '../MarkdownContent';
 import { useChatStore } from '../../../stores/chatStore';
 import { Badge, Button, TextField } from '../../ui';
 
@@ -82,7 +82,9 @@ function Indicator({ multiSelect, selected }: { multiSelect: boolean; selected: 
 }
 
 export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
-  const questions = (block.input.questions as Question[]) || [];
+  // A question may come without options (a free-text kind): then Other… is
+  // the whole answer.
+  const questions = ((block.input.questions as Question[]) || []).map(q => ({ ...q, options: q.options ?? [] }));
   // Per-question selections: Map<questionIndex, Set<optionIndex>>
   const [selections, setSelections] = useState<Map<number, Set<number>>>(new Map());
   // Per question answered with "Other…": the person's own words ('' until typed).
@@ -223,7 +225,9 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                     <span className="text-2xs text-text-faint ml-auto">Select multiple</span>
                   )}
                 </div>
-                <p id={questionId} className="text-sm text-text-secondary leading-relaxed">{q.question}</p>
+                <p id={questionId} className="text-sm text-text-secondary leading-relaxed">
+                  <InlineMarkdown content={q.question} />
+                </p>
               </div>
 
               {/* Options */}
@@ -250,7 +254,10 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                               {opt.label}
                             </div>
                             {opt.description && (
-                              <div className="text-xs text-text-muted mt-0.5 leading-relaxed">{opt.description}</div>
+                              <div className="text-xs text-text-muted mt-0.5 leading-relaxed">
+                                {/* Inside the option's button: no links. */}
+                                <InlineMarkdown content={opt.description} links={false} />
+                              </div>
                             )}
                           </div>
                         </div>
@@ -293,7 +300,17 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
                       value={ownText}
                       onChange={e => setOwnText(qIdx, e.target.value)}
                       onKeyDown={e => {
-                        if (e.key === 'Enter' && allAnswered) {
+                        if (e.key === 'Escape') {
+                          // Escape stays here: the app-wide Escape stops a
+                          // running turn, and the turn is running — it waits
+                          // for this answer. It only leaves the field, back to
+                          // Other… (the button above it); the text stays.
+                          e.preventDefault();
+                          e.stopPropagation();
+                          e.currentTarget.parentElement?.querySelector('button')?.focus();
+                        } else if (e.key === 'Enter' && !e.nativeEvent.isComposing && allAnswered) {
+                          // Not while an input method composes: its Enter
+                          // confirms the composition, not the answer.
                           e.preventDefault();
                           submitAnswers();
                         }

@@ -1,6 +1,6 @@
 import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PanelTab, ToolCallBlockData } from '../../../types/chat';
 
 vi.mock('../../../api/client', async (orig) => ({
@@ -24,36 +24,49 @@ const { PlanApprovalBlock } = await import('./PlanApprovalBlock');
 const PLAN = [
   '# Setup proposal — review pull requests in org/repo-a',
   '',
-  '## Jobs',
+  '## What I understood',
   '',
-  '- `pr-review`: every 30 minutes, drafts review comments for alice to approve',
+  '- Review new pull requests in org/repo-a and say which need a human.',
+  '- Act as `alice`; every public comment is a draft for you to approve.',
+  '- Scan every 30 minutes.',
 ].join('\n');
-const HEADING = 'Setup proposal — review pull requests in org/repo-a';
 const APPROVED_RESULT = 'User has approved your plan. You can now start coding.';
+const BULLETS = [
+  'Reviews new pull requests in `org/repo-a` every 30 minutes.',
+  'Drafts every public comment for you to approve; reads and clones on its own.',
+  'Needs a token with read access to org/repo-a.',
+];
 
 function call(tool: string, overrides: Partial<ToolCallBlockData> = {}): ToolCallBlockData {
   return { type: 'tool_call', toolUseId: `tu-${tool}`, tool, input: {}, status: 'running', ...overrides };
 }
 
 /** The agent waits on its plan; the pause carries `toolInput`. */
-function pause(toolInput: Record<string, unknown> = { plan: PLAN }) {
+function pause(toolInput: Record<string, unknown> = { plan: PLAN }, interactionId = 'i-plan') {
   useChatStore.setState({
-    pendingInteraction: { interactionId: 'i-plan', interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput },
+    pendingInteraction: { interactionId, interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput },
   });
 }
 
-function planTab(content: string | null): PanelTab {
+/** The server's summary of the pause's plan arrived. */
+function summarized(bullets = BULLETS, status: 'ok' | 'unavailable' = 'ok', interactionId = 'i-plan') {
+  useChatStore.setState(s => ({ planSummaries: { ...s.planSummaries, [interactionId]: { bullets, status } } }));
+}
+
+function planTab(content: string | null, extra: Partial<PanelTab> = {}): PanelTab {
   return {
     id: 'plan-1', type: 'plan', label: 'Plan', subagentType: 'Plan', description: '', content,
-    prompt: '', streaming: false, status: 'complete', startedAt: 0, completedAt: 1, blocks: [],
+    prompt: '', streaming: false, status: 'complete', startedAt: 0, completedAt: 1, blocks: [], ...extra,
   };
 }
+
+const summaryBox = () => within(screen.getByRole('group', { name: 'Summary' }));
 
 beforeEach(() => {
   vi.mocked(ws.answerInteraction).mockClear();
   useChatStore.setState({
     activeSession: 'session-1', pendingInteraction: null, panels: [], activePanelId: null, panelVisible: false,
-    isStreaming: false, streamingBlocks: [],
+    isStreaming: false, streamingBlocks: [], planSummaries: {}, planEditRequest: null,
   });
 });
 
@@ -88,13 +101,14 @@ describe('EnterPlanMode', () => {
 });
 
 describe('ExitPlanMode asks for a decision', () => {
-  it('in an ordinary session: Approve or Request changes', () => {
+  it('in an ordinary session: Approve, Request changes, Read the plan, Edit', () => {
     pause();
     render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
     expect(screen.getByText('Plan ready for your decision')).toBeInTheDocument();
-    expect(screen.getByText('Read it below or in the panel. Approve it, or say what should change.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Request changes…' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('button', { name: 'Read the plan' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Apply setup' })).not.toBeInTheDocument();
   });
 
@@ -103,11 +117,21 @@ describe('ExitPlanMode asks for a decision', () => {
     pause();
     render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
     expect(screen.getByText('Setup proposal')).toBeInTheDocument();
-    expect(screen.getByText('Read it below or in the panel. Apply it, or say what should change.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Apply setup' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Change something…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Read the plan' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
     expect(screen.queryByText('Plan ready for your decision')).not.toBeInTheDocument();
+  });
+
+  it('shows no plan text in the card, only its summary', () => {
+    pause();
+    summarized();
+    render(<PlanApprovalBlock block={call('ExitPlanMode', { input: { plan: PLAN } })} />);
+    expect(screen.queryByRole('heading')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Act as/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Show all' })).not.toBeInTheDocument();
   });
 
   it('approves, then says Approved', async () => {
@@ -188,54 +212,119 @@ describe('ExitPlanMode asks for a decision', () => {
   });
 });
 
-describe('ExitPlanMode shows the plan in the card', () => {
-  it('from the pause, as markdown, in a box with its own scroll that expands', async () => {
-    pause({ plan: PLAN });
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    const box = screen.getByRole('region', { name: 'Plan' });
-    expect(within(box).getByRole('heading', { level: 1, name: HEADING })).toBeInTheDocument();
-    expect(within(box).getByRole('heading', { level: 2, name: 'Jobs' })).toBeInTheDocument();
-    // The height cap is a layout fact only the class can express (jsdom has no layout).
-    expect(box.className).toMatch(/\bmax-h-96\b/);
-    expect(box.className).toMatch(/\boverflow-y-auto\b/);
-
-    const toggle = screen.getByRole('button', { name: 'Show all' });
-    expect(toggle).toHaveAttribute('aria-expanded', 'false');
-    expect(toggle).toHaveAttribute('aria-controls', box.id);
-    await userEvent.click(toggle);
-    expect(screen.getByRole('button', { name: 'Show less' })).toHaveAttribute('aria-expanded', 'true');
-    expect(box.className).not.toMatch(/\bmax-h-96\b/);
+describe('ExitPlanMode: the summary', () => {
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it('names the box after the setup proposal in the onboarding conversation', () => {
-    useChatStore.setState({ activeSession: 'onboarding-1a2b3c4d' });
-    pause({ plan: PLAN });
+  it('shows the server\'s summary as a list, with inline markdown', () => {
+    pause();
+    summarized();
     render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    expect(within(screen.getByRole('region', { name: 'Setup proposal' }))
-      .getByRole('heading', { level: 1, name: HEADING })).toBeInTheDocument();
+    const items = summaryBox().getAllByRole('listitem');
+    expect(items).toHaveLength(3);
+    expect(items[0]).toHaveTextContent('Reviews new pull requests in org/repo-a every 30 minutes.');
+    expect(within(items[0]).getByText('org/repo-a').tagName).toBe('CODE');
+    expect(summaryBox().queryByText('Summarizing…')).not.toBeInTheDocument();
   });
 
-  it('from the plan panel when the pause carries no plan text', () => {
-    useChatStore.setState({ panels: [planTab(PLAN)] });
-    pause({ plan: '  ' });
+  it('reads "Summarizing…" until the summary arrives', () => {
+    pause();
     render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    expect(within(screen.getByRole('region', { name: 'Plan' }))
-      .getByRole('heading', { level: 1, name: HEADING })).toBeInTheDocument();
+    expect(summaryBox().getByRole('status')).toHaveTextContent('Summarizing…');
+    expect(summaryBox().queryByRole('listitem')).not.toBeInTheDocument();
+
+    act(() => summarized());
+    expect(summaryBox().queryByText('Summarizing…')).not.toBeInTheDocument();
+    expect(summaryBox().getAllByRole('listitem')).toHaveLength(3);
   });
 
-  it('points to the side panel when there is no plan text to show', async () => {
-    useChatStore.setState({ panels: [planTab(null)] });
-    pause({});
+  it('falls back to the plan\'s first heading and two lines when no summary can be made', () => {
+    pause();
+    summarized([], 'unavailable');
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    const box = summaryBox();
+    expect(box.getByText('Setup proposal — review pull requests in org/repo-a')).toBeInTheDocument();
+    expect(box.getByText('Review new pull requests in org/repo-a and say which need a human.')).toBeInTheDocument();
+    // Plain text: no list marker, no backticks.
+    expect(box.getByText('Act as alice; every public comment is a draft for you to approve.')).toBeInTheDocument();
+    expect(box.queryByText(/Scan every 30 minutes/)).not.toBeInTheDocument();
+    expect(box.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('falls back after waiting for a summary that never comes', () => {
+    vi.useFakeTimers();
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    act(() => { vi.advanceTimersByTime(24_000); });
+    expect(summaryBox().getByRole('status')).toHaveTextContent('Summarizing…');
+    act(() => { vi.advanceTimersByTime(1_000); });
+    expect(summaryBox().queryByRole('status')).not.toBeInTheDocument();
+    expect(summaryBox().getByText('Setup proposal — review pull requests in org/repo-a')).toBeInTheDocument();
+  });
+
+  it('starts a new wait for a revised plan\'s summary', () => {
+    pause();
+    summarized();
     const view = render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    expect(screen.queryByRole('region')).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open the side panel to read the plan' }));
-    expect(useChatStore.getState()).toMatchObject({ activePanelId: 'plan-1', panelVisible: true });
-    view.unmount();
+    expect(summaryBox().getAllByRole('listitem')).toHaveLength(3);
+    // The same card can only see one pause, but a new pause id is a new wait.
+    act(() => pause({ plan: PLAN }, 'i-plan-2'));
+    view.rerender(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    expect(summaryBox().getByRole('status')).toHaveTextContent('Summarizing…');
+  });
+});
 
-    useChatStore.setState({ panels: [] });
+describe('ExitPlanMode: Read the plan and Edit open the side panel', () => {
+  it('opens a plan tab from the pause when there is none', async () => {
+    pause();
     render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    expect(screen.getByText('Open the side panel to read the plan.')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /side panel/ })).not.toBeInTheDocument();
+    expect(useChatStore.getState().panelVisible).toBe(false);
+    await userEvent.click(screen.getByRole('button', { name: 'Read the plan' }));
+    const { panels, activePanelId, panelVisible } = useChatStore.getState();
+    expect(panels).toHaveLength(1);
+    expect(panels[0]).toMatchObject({ type: 'plan', content: PLAN });
+    expect(panels[0].readOnly).toBeFalsy();
+    expect(activePanelId).toBe(panels[0].id);
+    expect(panelVisible).toBe(true);
+  });
+
+  it('focuses the plan tab that is there, and fills it in when it is empty', async () => {
+    useChatStore.setState({ panels: [planTab(null)], panelVisible: false });
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Read the plan' }));
+    const { panels, activePanelId, panelVisible } = useChatStore.getState();
+    expect(panels).toHaveLength(1);
+    expect(panels[0].content).toBe(PLAN);
+    expect(activePanelId).toBe('plan-1');
+    expect(panelVisible).toBe(true);
+  });
+
+  it('opens the plan for editing: the panel shows and its footer is asked to edit', async () => {
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    const { panels, panelVisible, planEditRequest } = useChatStore.getState();
+    expect(panels[0]).toMatchObject({ type: 'plan', content: PLAN });
+    expect(panelVisible).toBe(true);
+    expect(planEditRequest).toBe('i-plan');
+    expect(ws.answerInteraction).not.toHaveBeenCalled();
+  });
+
+  it('offers no Edit when the plan text did not come with the pause', () => {
+    useChatStore.setState({ panels: [planTab(PLAN)] });
+    pause({});
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    expect(screen.getByRole('button', { name: 'Read the plan' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+  });
+
+  it('offers no Read the plan when there is no plan text anywhere', () => {
+    pause({});
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    expect(screen.queryByRole('button', { name: 'Read the plan' })).not.toBeInTheDocument();
+    expect(summaryBox().queryByRole('status')).toBeInTheDocument();
   });
 });
 
@@ -289,111 +378,6 @@ describe('ExitPlanMode after the decision', () => {
     })} />);
     expect(screen.getByText('Changes requested — Use the alice account')).toBeInTheDocument();
   });
-});
-
-describe('ExitPlanMode: edit, then approve', () => {
-  const EDITED = PLAN.replace('every 30 minutes', 'every hour');
-
-  it('turns the plan into a text field and applies the edited text', async () => {
-    pause();
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-
-    const editor = screen.getByRole('textbox', { name: 'Edit the plan' });
-    expect(editor).toHaveValue(PLAN);
-    expect(editor).toHaveFocus();
-    expect(screen.queryByRole('region', { name: 'Plan' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Request changes…' })).not.toBeInTheDocument();
-    const apply = screen.getByRole('button', { name: 'Apply edited plan' });
-    expect(apply).toBeDisabled();
-
-    await userEvent.clear(editor);
-    await userEvent.type(editor, EDITED.replace(/[{[]/g, '$&$&'));
-    expect(apply).toBeEnabled();
-    await userEvent.click(apply);
-    expect(ws.answerInteraction).toHaveBeenCalledTimes(1);
-    expect(ws.answerInteraction).toHaveBeenCalledWith('session-1', 'i-plan', { plan: EDITED });
-    expect(screen.getByText('Approved with your edits')).toBeInTheDocument();
-  });
-
-  it('applies only a text that differs from the plan and is not empty', async () => {
-    pause();
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-    const editor = screen.getByRole('textbox', { name: 'Edit the plan' });
-    const apply = screen.getByRole('button', { name: 'Apply edited plan' });
-
-    await userEvent.type(editor, '\n\n');
-    expect(apply).toBeDisabled();
-    await userEvent.clear(editor);
-    expect(apply).toBeDisabled();
-    await userEvent.type(editor, '   ');
-    expect(apply).toBeDisabled();
-    await userEvent.click(apply);
-    expect(ws.answerInteraction).not.toHaveBeenCalled();
-  });
-
-  it('drops the edits on Cancel and shows the plan again', async () => {
-    pause();
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-    await userEvent.type(screen.getByRole('textbox', { name: 'Edit the plan' }), ' and more');
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-
-    expect(screen.getByRole('region', { name: 'Plan' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Approve' })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-    expect(screen.getByRole('textbox', { name: 'Edit the plan' })).toHaveValue(PLAN);
-    expect(ws.answerInteraction).not.toHaveBeenCalled();
-  });
-
-  it('applies with Cmd/Ctrl+Enter', async () => {
-    pause();
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-    await userEvent.type(screen.getByRole('textbox', { name: 'Edit the plan' }), '\n- also skip drafts');
-    await userEvent.keyboard('{Meta>}{Enter}{/Meta}');
-    expect(ws.answerInteraction).toHaveBeenCalledWith('session-1', 'i-plan', { plan: `${PLAN}\n- also skip drafts` });
-  });
-
-  it('cancels with Escape only while nothing changed, and never stops the waiting turn', async () => {
-    const onDocumentKey = vi.fn();
-    document.addEventListener('keydown', onDocumentKey);
-    try {
-      pause();
-      render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-      await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-      await userEvent.keyboard('{Escape}');
-      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-      expect(screen.getByRole('region', { name: 'Plan' })).toBeInTheDocument();
-
-      await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-      await userEvent.type(screen.getByRole('textbox', { name: 'Edit the plan' }), ' more');
-      await userEvent.keyboard('{Escape}');
-      expect(screen.getByRole('textbox', { name: 'Edit the plan' })).toHaveValue(`${PLAN} more`);
-      expect(onDocumentKey.mock.calls.some(([e]) => (e as KeyboardEvent).key === 'Escape')).toBe(false);
-    } finally {
-      document.removeEventListener('keydown', onDocumentKey);
-    }
-  });
-
-  it('names the field after the setup proposal in the onboarding conversation', async () => {
-    useChatStore.setState({ activeSession: 'onboarding-1a2b3c4d' });
-    pause();
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
-    expect(screen.getByRole('textbox', { name: 'Edit the setup proposal' })).toHaveValue(PLAN);
-    expect(screen.getByRole('button', { name: 'Apply edited plan' })).toBeDisabled();
-  });
-
-  it('offers no Edit when the plan text did not come with the pause', () => {
-    useChatStore.setState({ panels: [planTab(PLAN)] });
-    pause({});
-    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
-    expect(screen.getByRole('region', { name: 'Plan' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
-  });
 
   it('reads an edited approval back from the tool result, by its heading', () => {
     const view = render(<PlanApprovalBlock block={call('ExitPlanMode', {
@@ -407,6 +391,53 @@ describe('ExitPlanMode: edit, then approve', () => {
       status: 'complete', result: `${APPROVED_RESULT}\n\n## Approved Plan:\n- keep notes (edited by user): yes`,
     })} />);
     expect(screen.getByText('Approved')).toBeInTheDocument();
+  });
+});
+
+describe('ExitPlanMode in history: Read the plan', () => {
+  it('opens the approved plan, from the result, as its own tab to read', async () => {
+    const edited = PLAN.replace('every 30 minutes', 'every hour');
+    render(<PlanApprovalBlock block={call('ExitPlanMode', {
+      status: 'complete', input: { plan: PLAN },
+      result: `${APPROVED_RESULT}\n\n## Approved Plan (edited by user):\n${edited}`,
+    })} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Read the plan' }));
+    const { panels, activePanelId, panelVisible } = useChatStore.getState();
+    expect(panels).toHaveLength(1);
+    // The person's edits, which the call's input never saw.
+    expect(panels[0]).toMatchObject({ type: 'plan', content: edited, readOnly: true, description: 'Approved with your edits' });
+    expect(activePanelId).toBe(panels[0].id);
+    expect(panelVisible).toBe(true);
+
+    // A second click focuses the same tab.
+    act(() => useChatStore.setState({ panelVisible: false }));
+    await userEvent.click(screen.getByRole('button', { name: 'Read the plan' }));
+    expect(useChatStore.getState().panels).toHaveLength(1);
+    expect(useChatStore.getState().panelVisible).toBe(true);
+  });
+
+  it('opens the plan a change request was about, from the call\'s input', async () => {
+    render(<PlanApprovalBlock block={call('ExitPlanMode', {
+      status: 'complete', isError: true, result: 'Run it hourly', input: { plan: PLAN },
+    })} />);
+    expect(screen.getByText('Changes requested — Run it hourly')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Read the plan' }));
+    expect(useChatStore.getState().panels[0]).toMatchObject({ content: PLAN, readOnly: true, description: 'Changes requested' });
+  });
+
+  it('offers no link without any plan text', () => {
+    render(<PlanApprovalBlock block={call('ExitPlanMode', { status: 'complete', result: APPROVED_RESULT })} />);
+    expect(screen.queryByRole('button', { name: 'Read the plan' })).not.toBeInTheDocument();
+  });
+
+  it('leaves a read-only plan alone when the live plan is approved', async () => {
+    useChatStore.setState({
+      panels: [planTab(PLAN), planTab('# An earlier plan', { id: 'plan-read-tu-old', readOnly: true })],
+    });
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(useChatStore.getState().panels.map(p => p.id)).toEqual(['plan-read-tu-old']);
   });
 });
 
@@ -471,23 +502,81 @@ describe('ExitPlanMode while the approved work runs', () => {
 });
 
 describe('ExitPlanMode after a change request', () => {
-  it('gives the revised plan its own card, while the earlier one keeps its outcome', () => {
-    const REVISED = '# Setup proposal — review pull requests in org/repo-a, hourly\n\n## Jobs\n\n- `pr-review`: every hour';
+  it('gives the revised plan its own card, while the earlier one keeps its outcome', async () => {
+    const REVISED = '# Setup proposal — review pull requests in org/repo-a, hourly\n\n- Scan every hour.';
     const first = call('ExitPlanMode', {
       toolUseId: 'tu-first', status: 'complete', isError: true, result: 'Run the review hourly',
       input: { plan: PLAN },
     });
     const second = call('ExitPlanMode', { toolUseId: 'tu-second', input: { plan: REVISED } });
-    useChatStore.setState({
-      pendingInteraction: {
-        interactionId: 'i-plan-2', interactionType: 'plan_exit', toolName: 'ExitPlanMode', toolInput: { plan: REVISED },
-      },
-    });
+    pause({ plan: REVISED }, 'i-plan-2');
+    summarized(['Reviews pull requests in org/repo-a every hour.'], 'ok', 'i-plan-2');
     render(<><PlanApprovalBlock block={first} /><PlanApprovalBlock block={second} /></>);
 
     expect(screen.getByText('Changes requested — Run the review hourly')).toBeInTheDocument();
-    const box = screen.getByRole('region', { name: 'Plan' });
-    expect(within(box).getByRole('heading', { level: 1, name: /hourly$/ })).toBeInTheDocument();
-    expect(screen.getAllByRole('region')).toHaveLength(1);
+    expect(summaryBox().getByText('Reviews pull requests in org/repo-a every hour.')).toBeInTheDocument();
+    expect(screen.getAllByRole('group', { name: 'Summary' })).toHaveLength(1);
+    await userEvent.click(screen.getAllByRole('button', { name: 'Read the plan' })[1]);
+    expect(useChatStore.getState().panels[0]).toMatchObject({ content: REVISED });
+  });
+});
+
+describe('ExitPlanMode: the plan tab after a decision from the card', () => {
+  beforeEach(() => {
+    useChatStore.setState({ panels: [planTab(PLAN)], activePanelId: 'plan-1', panelVisible: true });
+  });
+
+  it('closes on Approve, as it does from the footer', async () => {
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(useChatStore.getState().panels).toHaveLength(0);
+  });
+
+  it('stays open on a change request, for the revised plan', async () => {
+    pause();
+    render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Request changes…' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'What should change?' }), 'Hourly');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(useChatStore.getState().panels.map(p => p.id)).toEqual(['plan-1']);
+  });
+});
+
+describe('ExitPlanMode: an error result that is no one\'s feedback', () => {
+  it('reads as closed when this client saw the call run and no decision was offered', () => {
+    const view = render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    view.rerender(<PlanApprovalBlock block={call('ExitPlanMode', {
+      status: 'complete', isError: true, result: 'Plan file could not be read',
+    })} />);
+    expect(screen.getByText('Closed — Plan file could not be read')).toBeInTheDocument();
+  });
+
+  it('reads as feedback when the decision was offered and someone decided', () => {
+    pause();
+    const view = render(<PlanApprovalBlock block={call('ExitPlanMode')} />);
+    act(() => useChatStore.setState({ pendingInteraction: null }));
+    view.rerender(<PlanApprovalBlock block={call('ExitPlanMode', {
+      status: 'complete', isError: true, result: 'Run the review hourly',
+    })} />);
+    expect(screen.getByText('Changes requested — Run the review hourly')).toBeInTheDocument();
+  });
+
+  it('tells CLI errors from feedback in history by the result text alone', () => {
+    const cases: [string, string][] = [
+      [
+        '<tool_use_error>You are not in plan mode. To enter plan mode, call the EnterPlanMode tool first.</tool_use_error>',
+        'Closed — You are not in plan mode. To enter plan mode, call the EnterPlanMode tool first.',
+      ],
+      ['<tool_use_error>InputValidationError: unexpected key</tool_use_error>', 'Closed — InputValidationError: unexpected key'],
+      // Feedback that only ends like a server denial stays feedback.
+      ['The nightly job timed out.', 'Changes requested — The nightly job timed out.'],
+      ['Session stopped before, so retry the clone', 'Changes requested — Session stopped before, so retry the clone'],
+    ];
+    for (const [result, text] of cases) {
+      const view = render(<PlanApprovalBlock block={call('ExitPlanMode', { status: 'complete', isError: true, result })} />);
+      expect(screen.getByText(text)).toBeInTheDocument();
+      view.unmount();
+    }
   });
 });

@@ -24,6 +24,39 @@ function MarkdownLink({ href, children }: { href?: string; children?: ReactNode 
   return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
 }
 
+/** What inline markdown keeps; anything else (a heading, a list) keeps its text without the block. */
+const INLINE_ELEMENTS = ['p', 'code', 'strong', 'em', 'del', 'a', 'br'];
+const INLINE_WITHOUT_LINKS = INLINE_ELEMENTS.filter(name => name !== 'a');
+
+/**
+ * Markdown inside a line of other text — a question, an option's
+ * description: code, emphasis and links, with no paragraph or other block
+ * around them. `links={false}` keeps a link's text only, for text that sits
+ * inside a button (a link there would be a control inside a control).
+ */
+export const InlineMarkdown = memo(function InlineMarkdown({ content, links = true }: {
+  content: string;
+  links?: boolean;
+}) {
+  return (
+    <span className="markdown-content">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        allowedElements={links ? INLINE_ELEMENTS : INLINE_WITHOUT_LINKS}
+        unwrapDisallowed
+        components={{
+          p({ children }) {
+            return <>{children}</>;
+          },
+          a({ href, children }) {
+            return <MarkdownLink href={href}>{children}</MarkdownLink>;
+          },
+        }}
+      >{content}</ReactMarkdown>
+    </span>
+  );
+});
+
 // Memoized: react-markdown parses and highlights the full string on each
 // render, and the chat renders again for each streamed token batch.
 export const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {

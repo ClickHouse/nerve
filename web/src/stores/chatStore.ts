@@ -3,7 +3,7 @@ import { api } from '../api/client';
 import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
-import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary } from '../types/chat';
+import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary, PlanSummary } from '../types/chat';
 import type { InteractionAgentRef } from '../types/agents';
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
@@ -22,7 +22,7 @@ import { onViewerStorageChange } from './helpers/viewerStorage';
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleInteractionResolved, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -100,7 +100,7 @@ let _quoteId = 0;
 // session_agents, …) stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
-  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update',
+  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update', 'plan_summary',
   'backend_status', 'workflow_progress',
   'agent_update', 'agent_event', 'queue_update', 'interaction',
   'interaction_resolved', 'file_changed',
@@ -182,6 +182,17 @@ interface ChatState {
     /** The subagent that asked; null (or absent) for the orchestrator. */
     agent?: InteractionAgentRef | null;
   } | null;
+  /**
+   * Short summaries of plans waiting for a decision, by interaction id: the
+   * server writes them with a small model when an `ExitPlanMode` pause
+   * starts (`plan_summary`). Live only; history shows the outcome instead.
+   */
+  planSummaries: Record<string, PlanSummary>;
+  /**
+   * The plan decision whose Edit was asked for from the chat card: the plan
+   * panel's footer opens its editor for it, once (`requestPlanEdit`).
+   */
+  planEditRequest: string | null;
 
   // Sidebar collapse (desktop column — persisted)
   sidebarCollapsed: boolean;
@@ -333,6 +344,10 @@ interface ChatState {
   // Interactions
   answerInteraction: (result: Record<string, string> | null) => void;
   denyInteraction: (message?: string) => void;
+  /** Ask the plan panel's footer to open its editor for this plan decision. */
+  requestPlanEdit: (interactionId: string) => void;
+  /** The footer took the edit request (or it no longer applies). */
+  clearPlanEditRequest: () => void;
   toggleSidebar: () => void;
   setMobileSidebarOpen: (open: boolean) => void;
   /** Show/hide the session list, whichever form it takes on this viewport. */
@@ -405,6 +420,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   chatWidth: parseFloat(localStorage.getItem('nerve_chat_width') || '768'),
   sidebarWidth: parseFloat(localStorage.getItem('nerve_sidebar_width') || '240'),
   pendingInteraction: null,
+  planSummaries: {},
+  planEditRequest: null,
   sidebarCollapsed: localStorage.getItem('nerve_sidebar_collapsed') === 'true',
   mobileSidebarOpen: false,
   modifiedFiles: [],
@@ -604,6 +621,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ pendingInteraction: null });
   },
 
+  requestPlanEdit: (interactionId: string) => set({ planEditRequest: interactionId }),
+
+  clearPlanEditRequest: () => set({ planEditRequest: null }),
+
   toggleSidebar: () => {
     const next = !get().sidebarCollapsed;
     localStorage.setItem('nerve_sidebar_collapsed', String(next));
@@ -729,6 +750,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
       backendStatus: null,
       currentTodos: [], currentCCTasks: [], pendingInteraction: null,
+      planSummaries: {}, planEditRequest: null,
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0,
     });
@@ -1439,6 +1461,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'user_message':     return handleUserMessage(msg, get, set);
       // Panels
       case 'plan_update':        return handlePlanUpdate(msg, get, set);
+      case 'plan_summary':       return handlePlanSummary(msg, get, set);
       case 'backend_status':
         set({ backendStatus: { subtype: msg.subtype, data: msg.data } });
         return;
