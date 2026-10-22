@@ -25,6 +25,8 @@ const EMAIL_RE = /^[^\s@-][^\s@]*@[^\s@]+\.[^\s@]+$/;
 const INBOX_JOB = 'inbox-processor';
 /** What an older backend, which says nothing about availability, offers. */
 const ALL_SOURCES: SetupSourceId[] = ['github', 'gmail', 'telegram'];
+/** The sources as the button that switches them off names them. */
+const SOURCE_NAMES: Record<SetupSourceId, string> = { github: 'GitHub', gmail: 'Gmail', telegram: 'Telegram' };
 /** Secondary controls reach the 44 px phone target without changing the desktop density. */
 const TOUCH = 'min-h-[44px] md:min-h-0';
 
@@ -221,6 +223,11 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const automation = stepOf(state, 'automation')?.detail as SetupAutomationDetail | undefined;
   const inboxJobOff = automation?.optional.some((job) => job.id === INBOX_JOB && !job.enabled) ?? false;
   const inboxWarning = (github || gmail || telegram) && inboxJobOff;
+  // "All" only while every source is on offer: one the operator keeps on (a
+  // GitHub held in the machine's configuration) stays on, so the button names
+  // the ones it switches.
+  const turnOffLabel = available.length === ALL_SOURCES.length
+    ? 'Turn all off' : `Turn ${available.map((id) => SOURCE_NAMES[id]).join(' and ')} off`;
   const dirty = github !== detail.github.enabled || gmail !== detail.gmail.enabled
     || telegram !== detail.telegram.enabled || accounts.join() !== detail.gmail.accounts.join()
     || newAccount !== '' || apiId !== '' || (apiHash ?? '') !== '';
@@ -395,7 +402,7 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
             }}
             className={TOUCH}
           >
-            Turn all off
+            {turnOffLabel}
           </Button>
         </div>
       )}

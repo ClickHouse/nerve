@@ -1535,7 +1535,9 @@ describe('pre-configured connections', () => {
     expect(await card.findByText(/once a GitHub credential is connected to it/)).toBeInTheDocument();
     // Gmail and Telegram are still on offer, and the save carries them alone.
     expect(screen.getByRole('checkbox', { name: /Gmail/ })).toBeEnabled();
-    await userEvent.click(screen.getByRole('button', { name: 'Turn all off' }));
+    // GitHub stays on, so the button names the sources it does switch off.
+    expect(screen.queryByRole('button', { name: 'Turn all off' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Turn Gmail and Telegram off' }));
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
   });
