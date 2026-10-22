@@ -40,3 +40,29 @@ The upstream rules still apply here:
 Give the tables and columns your migrations add a prefix of your own. An
 upstream migration that later adds an object with the same name would fail on
 your databases (`ADD COLUMN`) or skip its own (`CREATE TABLE IF NOT EXISTS`).
+
+## Moving a change upstream
+
+Never delete or renumber a fork migration that has run on a database. The
+highest fork migration your fork ships would then be below the version its
+databases record, and your fork's own build would refuse them. A rebase that
+drops the commit carrying the migration, because the change has landed
+upstream, does the same. Instead:
+
+1. Propose the change upstream with its own migration in the upstream track,
+   numbered above upstream's highest. Write it to do nothing where your
+   databases already have its tables or columns (`CREATE TABLE IF NOT EXISTS`,
+   check a column before adding it). Do not run it on your fork's databases
+   until upstream has merged it under that number: if upstream renumbers it,
+   those databases would already record the old number and would skip the
+   upstream migration that gets that number instead.
+2. Once your fork includes that upstream migration, make the fork migration a
+   no-op (`async def up(db): pass`), and keep its file and number. A new
+   database then gets the change from upstream only, and an existing one keeps
+   its fork version. If upstream named the tables or columns differently, also
+   add a fork migration that moves your data to them; it runs after the
+   upstream one.
+
+`check_migration_numbers.py --fork` accepts a new migration in the upstream
+track, numbered above upstream's highest, because that is how a fork prepares
+a change for upstream.

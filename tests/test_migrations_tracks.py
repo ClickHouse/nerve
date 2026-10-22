@@ -13,6 +13,7 @@ import contextlib
 import importlib
 import os
 import sqlite3
+import sys
 import uuid
 from pathlib import Path
 
@@ -46,8 +47,8 @@ def _track(tmp_path, monkeypatch, name: str, table: str, versions) -> runner.Mig
 
 
 @contextlib.asynccontextmanager
-async def _database(tmp_path):
-    async with aiosqlite.connect(tmp_path / "nerve.db") as db:
+async def _database(tmp_path, name: str = "nerve.db"):
+    async with aiosqlite.connect(tmp_path / name) as db:
         await db.execute(
             "CREATE TABLE IF NOT EXISTS applied (id INTEGER PRIMARY KEY, name TEXT)"
         )
@@ -161,6 +162,39 @@ async def test_the_log_names_the_track_of_each_migration(tmp_path, monkeypatch, 
     messages = [r.getMessage() for r in caplog.records]
     assert "Applied u migration V1" in messages
     assert "Failed to apply f migration V1" in messages
+
+
+@pytest.mark.asyncio
+async def test_a_fork_migration_that_went_upstream_stays_as_a_no_op(tmp_path, monkeypatch):
+    """Deleted, a fork migration that has run leaves the fork's databases ahead
+    of the fork's own build. Kept as a no-op with its number, it lets them
+    open, and the upstream migration that now ships the change runs."""
+    upstream = _track(tmp_path, monkeypatch, "u", "schema_version", [1])
+    fork = _track(tmp_path, monkeypatch, "f", "fork_schema_version", [1])
+    migration = fork.directory / "v001_step.py"
+
+    async with _database(tmp_path) as db:
+        await runner.run_migrations(db, (upstream, fork))
+
+        # The change went upstream as u2, and the fork deleted its migration.
+        _write_migration(upstream.directory, "u", 2)
+        migration.unlink()
+        importlib.invalidate_caches()
+        with pytest.raises(runner.SchemaNewerThanCodeError) as failure:
+            await runner.run_migrations(db, (upstream, fork))
+        assert (failure.value.track, failure.value.database_version) == ("f", 1)
+
+        migration.write_text("async def up(db):\n    pass\n", encoding="utf-8")
+        importlib.invalidate_caches()
+        monkeypatch.delitem(sys.modules, f"{fork.package}.v001_step")  # a new process
+        await runner.run_migrations(db, (upstream, fork))
+        assert await _applied(db) == ["u1", "f1", "u2"]
+
+    # A new database gets the change from upstream only.
+    async with _database(tmp_path, "new.db") as new:
+        await runner.run_migrations(new, (upstream, fork))
+        assert await _applied(new) == ["u1", "u2"]
+        assert await runner.get_current_version(new, fork) == 1
 
 
 @pytest.mark.asyncio
