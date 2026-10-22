@@ -309,7 +309,7 @@ Response: {
 | `finished` | every required step is `done` or `blocked`, every other step is `done`, `skipped` or `blocked`, and nothing waits on a restart |
 | `steps_left` | the number of `pending` steps plus the steps blocked only because the Mode step has not been answered yet (`blocked_kind: "sequencing"`) — they are still work left to do, so the count only ever goes down as a person progresses. Steps blocked by lockdown (`blocked_kind: "lockdown"`) are never counted |
 | `warning` | set when configuration was written but the state file could not be saved or a reload reported errors (`Saved. Reload reported: cron: error: …`) |
-| `onboarding` | the onboarding in one place: `status`, `session_id` and `kind` as the Mode step's `detail.onboarding`, `onboarding_session_id` and `onboarding_kind` (see [`POST /api/setup/finish`](#post-apisetupfinish)), plus `awaiting` — what the running onboarding session waits for from the person: `question` while an `AskUserQuestion` card waits for an answer, `plan` while an `ExitPlanMode` decision does (a plan wins over a question), otherwise `null`. Always `null` unless `status` is `running`. Read live from the session's pending interactions, never stored; the global `session_awaiting_input` event tells a client when to read again |
+| `onboarding` | the onboarding in one place: `status`, `session_id` and `kind` as the Mode step's `detail.onboarding`, `onboarding_session_id` and `onboarding_kind` (see [`POST /api/setup/finish`](#post-apisetupfinish)), plus `awaiting` — what the running onboarding session waits for from the person: `question` while an `AskUserQuestion` card or an `ask_form` form (the `form` interaction) waits for an answer, `plan` while an `ExitPlanMode` decision does (a plan wins over a question), otherwise `null`. Always `null` unless `status` is `running`. Read live from the session's pending interactions, never stored; the global `session_awaiting_input` event tells a client when to read again |
 
 Each step carries `id`, a short `title`, a `status` (`done`, `pending`,
 `skipped`, `blocked`), `required`, `can_skip`, `blocked_reason`, `blocked_kind`
@@ -1687,13 +1687,22 @@ fresh.
 // reason "resume" for the connection's person)
 { type: "resume", session_id: "abc123" }
 
-// Answer an interactive tool (AskUserQuestion, plan approval). denied: true
-// refuses it, and message reaches the agent verbatim as the refusal: for
-// ExitPlanMode that is "Request changes" — the agent stays in plan mode,
-// revises the plan and calls ExitPlanMode again (a new interaction). For
-// ExitPlanMode, result: null approves the plan as it is, and
+// Answer an interactive tool (AskUserQuestion, plan approval, an ask_form
+// form). denied: true refuses it, and message reaches the agent verbatim as
+// the refusal: for ExitPlanMode that is "Request changes" — the agent stays in
+// plan mode, revises the plan and calls ExitPlanMode again (a new
+// interaction). For ExitPlanMode, result: null approves the plan as it is, and
 // result: { plan: "<text>" } approves the person's edit of it: the CLI saves
-// the text to the plan file and tells the agent the plan was edited
+// the text to the plan file and tells the agent the plan was edited.
+// For a form (interaction_type "form"), result: { answers: { <question id>:
+// "text" | ["item", …] } }: a string for choice, text and url questions, a
+// list for multi, list and repos (choice: the option's label, or the Other…
+// text; multi: the labels, with the Other… text as one more item). Leave out
+// an optional question the person left empty; "", [] and blanks count as
+// left empty too. The server trims every value, drops blank and repeated
+// items, cuts a value to 4000 characters, and leaves out what breaks the
+// question's rules (a repos item that is not owner/name, a url that is not
+// http(s)://host, a value that is not an option when allow_other is false)
 { type: "answer_interaction", session_id: "main", interaction_id: "uuid", result?: { … }, denied?: false, message?: "" }
 
 // Keep-alive
@@ -1796,11 +1805,28 @@ those for another session. Events marked *global* go to every socket.
 { type: "file_changed", session_id: "main", path: "/home/user/project/foo.py", operation: "edit", tool_use_id: "toolu_..." }
 
 // Interactive tool waiting for user input (AskUserQuestion, ExitPlanMode,
-// Codex approvals; EnterPlanMode never waits). agent names the sub-agent that
-// asked; null for the orchestrator. agent_id is null when no record is known.
+// Nerve's ask_form tool, Codex approvals; EnterPlanMode never waits). agent
+// names the sub-agent that asked; null for the orchestrator (always null for
+// ask_form: an MCP call does not say which agent made it). agent_id is null
+// when no record is known.
 // For ExitPlanMode the Claude CLI puts the plan into tool_input: plan (the
 // plan file's text, read again at every call) and planFilePath.
-{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "plan_exit" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
+// For ask_form (interaction_type "form", tool_name "ask_form"; the chat's
+// tool block names it mcp__nerve__ask_form) tool_input is the form,
+// normalized, every key present: { title: "" | "…", questions: [{ id (as the
+// agent sent it), kind: "choice" | "multi" | "text" | "list" | "repos" |
+// "url", label (at most 40 characters), question, help, placeholder,
+// required, options: [{ label, description }] (2–8 for choice and multi, []
+// otherwise), allow_other (false unless choice or multi), default: null |
+// "…" | ["…"] }] } — 1 to 6 questions, unique ids and option labels. The tool
+// result the agent gets is one line per question, "<label>: <answer>" (a list
+// joined with ", ", "(skipped)" for none, continuation lines indented by two
+// spaces), after the line "The person answered the form.", then a blank line
+// and the answers as one line of JSON: {"answers": {<id>: "…" | ["…"]},
+// "skipped": [<id>]}. A refusal, a stop, no answer within the hour (the
+// interaction's timeout), a channel without forms and an invalid call are
+// error results without JSON
+{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "form" | "plan_exit" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
 // ... for a plan_exit interaction, once: a short summary of tool_input.plan for
 // the decision card, written by agent.title_model after the interaction event
 // (within about 20 s; the pause never waits for it). ok: up to six plain

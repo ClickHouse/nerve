@@ -73,7 +73,10 @@ External `ask_user` calls are **fire-and-forget**: the user is notified
 on Telegram / web as usual, but Nerve does **not** try to inject the
 answer back into the external client's conversation (Codex owns its
 own thread). If the external agent really needs blocking input, use
-the client's native input mechanism instead of `ask_user`.
+the client's native input mechanism instead of `ask_user`. An
+external client's `ask_form` call fails at once, because only a session
+in Nerve's web chat can show a form; the error says to ask in a plain
+message or with `ask_user`.
 
 ## Out of scope (for now)
 

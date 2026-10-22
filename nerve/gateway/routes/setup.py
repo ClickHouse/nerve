@@ -488,8 +488,9 @@ def _onboarding_awaiting(status: str, session_id: str | None) -> str | None:
     """What the running onboarding session waits for from the person.
 
     ``plan`` while an ``ExitPlanMode`` decision is pending, ``question`` while
-    an ``AskUserQuestion`` card is, else ``None`` (also for other pauses, and
-    whenever onboarding is not running). A plan wins over a question.
+    an ``AskUserQuestion`` card or an ``ask_form`` form is (the ``form``
+    interaction), else ``None`` (also for other pauses, and whenever
+    onboarding is not running). A plan wins over a question.
     """
     if status != onboarding_flow.RUNNING or not session_id:
         return None
@@ -501,7 +502,7 @@ def _onboarding_awaiting(status: str, session_id: str | None) -> str | None:
     waiting = handler.pending_interaction_types()
     if "plan_exit" in waiting:
         return "plan"
-    if "question" in waiting:
+    if "question" in waiting or "form" in waiting:
         return "question"
     return None
 

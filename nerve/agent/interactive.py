@@ -84,6 +84,8 @@ class InteractionOutcome:
 
     denied: bool = False
     cancelled: bool = False          # session stopped while waiting
+    #: Nobody answered within the pause's timeout (``denied`` is set too).
+    timed_out: bool = False
     message: str = ""
     result: dict[str, Any] | None = None
 
@@ -161,7 +163,8 @@ class InteractiveToolHandler:
         *,
         agent_task_id: str | None = None,
     ) -> InteractionOutcome:
-        """Pause for an interactive built-in (question / plan approval).
+        """Pause for an interactive built-in (question / plan approval) or
+        for Nerve's own form tool (``ask_form``, which calls this directly).
 
         ``agent_task_id`` is the runtime's id of the sub-agent that asked
         (a foreground agent); the ``interaction`` event then names it, and
@@ -294,6 +297,7 @@ class InteractiveToolHandler:
                 )
                 return InteractionOutcome(
                     denied=True,
+                    timed_out=True,
                     message=(
                         f"No response received after "
                         f"{_humanize_seconds(wait_timeout)} — timed out."
@@ -405,9 +409,9 @@ class InteractiveToolHandler:
 
     def pending_interaction_types(self) -> list[str]:
         """The ``interaction_type`` of each interaction waiting for the
-        person, oldest first: ``question`` (``AskUserQuestion``),
-        ``plan_exit`` (``ExitPlanMode``) or an approval kind. Empty when
-        nothing waits."""
+        person, oldest first: ``question`` (``AskUserQuestion``), ``form``
+        (Nerve's ``ask_form``), ``plan_exit`` (``ExitPlanMode``) or an
+        approval kind. Empty when nothing waits."""
         return [pending.interaction_type for pending in list(self._pending.values())]
 
 
@@ -493,10 +497,13 @@ def _interaction_type(tool_name: str) -> str:
     """Map tool name to a UI-friendly interaction type.
 
     ``EnterPlanMode`` never pauses (see :data:`INTERACTIVE_TOOLS`), so there
-    is no interaction type for it."""
+    is no interaction type for it. ``ask_form`` is a Nerve tool, not a CLI
+    built-in: its handler pauses through the hub itself, and the permission
+    adapters never see it as interactive."""
     return {
         "AskUserQuestion": "question",
         "ExitPlanMode": "plan_exit",
+        "ask_form": "form",
     }.get(tool_name, "unknown")
 
 

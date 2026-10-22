@@ -263,9 +263,10 @@ class Facts:
     #: session without a person, for a worker set up by ``nerve init``).
     onboarding_kind: str = "conversation"
     #: What the running onboarding session waits for from the person:
-    #: ``question`` (an ``AskUserQuestion`` card), ``plan`` (an
-    #: ``ExitPlanMode`` decision) or ``None``. Read live by the gateway from
-    #: the session's interaction hub; ``nerve doctor`` leaves it ``None``.
+    #: ``question`` (an ``AskUserQuestion`` card or an ``ask_form`` form),
+    #: ``plan`` (an ``ExitPlanMode`` decision) or ``None``. Read live by the
+    #: gateway from the session's interaction hub; ``nerve doctor`` leaves it
+    #: ``None``.
     onboarding_awaiting: str | None = None
     #: The caller's name: an account's display name, or the actor header's.
     display_name: str | None = None
