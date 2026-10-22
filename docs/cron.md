@@ -585,7 +585,10 @@ them start late or be dropped as [late runs](#late-runs):
   Run gates and `lock` apply as for a scheduled run, and the run is logged as
   usual.
 - Jobs with `catchup: false` only move on; the run each one skipped is recorded
-  in `cron_logs` with status `missed`. The wakeup sweep only moves on too:
+  in `cron_logs` with status `missed`. A run that the job's gates would have
+  skipped, going by their [forecast](#forecasts) for the time it came due, is
+  not missed: it is skipped like a scheduled run that its gates skip, with no
+  row. The wakeup sweep only moves on too:
   session wakeups (`ScheduleWakeup`) that came due fire on its next pass, within
   20 seconds.
 - The daemon log gets one INFO line per pause, with the size of the jump, the
