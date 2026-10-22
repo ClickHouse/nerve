@@ -66,6 +66,7 @@ from nerve.agent.interactive import (
     INTERACTIVE_TOOLS,
     InteractiveToolHandler,
     _read_file_safe,
+    defer_idle_timeout,
 )
 from nerve.inference_principal import custom_headers_env
 from nerve.utils.fs import atomic_write_text
@@ -1348,21 +1349,38 @@ class ClaudeClient(AgentClient):
 
         ``receive_response()`` can block indefinitely if the CLI hangs
         (stuck API request, broken stdio pipe). Each ``__anext__()`` is
-        wrapped in ``asyncio.wait_for`` so a silent CLI raises
+        awaited for at most ``idle_timeout`` seconds, so a silent CLI raises
         ``asyncio.TimeoutError`` into the engine's hung-client retry
         path. The timeout is per-message: long tool calls don't trip it
         as long as tool_use/tool_result chunks keep arriving.
         ``idle_timeout <= 0`` disables the timeout.
+
+        A CLI waiting for the person (a question or a plan decision asked
+        through ``can_use_tool``) is silent but not hung: while the
+        session's hub has one pending, a timeout keeps waiting
+        (:func:`~nerve.agent.interactive.defer_idle_timeout`). So the read
+        runs as a task that outlives a timeout: cancelling ``__anext__()``
+        would finalize the SDK's iterator. It runs in this task's context,
+        as the inline await it replaces did.
         """
         idle_timeout = self._spec.idle_timeout
         response_iter = self._sdk.receive_response()
+        read: asyncio.Task | None = None    # the __anext__() in flight
+        deferred = False                    # a deferral was logged
         try:
             while True:
                 try:
                     if idle_timeout and idle_timeout > 0:
-                        message = await asyncio.wait_for(
-                            response_iter.__anext__(), timeout=idle_timeout,
-                        )
+                        if read is None:
+                            read = asyncio.create_task(
+                                response_iter.__anext__(),
+                                context=asyncio.current_task().get_context(),
+                            )
+                        await asyncio.wait((read,), timeout=idle_timeout)
+                        if not read.done():
+                            raise asyncio.TimeoutError
+                        message = read.result()
+                        read = None
                     else:
                         message = await response_iter.__anext__()
                 except StopAsyncIteration:
@@ -1374,12 +1392,19 @@ class ClaudeClient(AgentClient):
                         "claude runtime ended the turn without a result",
                     ) from None
                 except asyncio.TimeoutError:
+                    if defer_idle_timeout(
+                        self._spec.interactive, self._spec.session_id,
+                        logged=deferred,
+                    ):
+                        deferred = True
+                        continue
                     logger.warning(
                         "CLI idle timeout (%ds) for session %s — no SDK "
                         "message received; treating CLI as hung",
                         idle_timeout, self._spec.session_id,
                     )
                     raise
+                deferred = False
                 done = False
                 for event in self._translate_and_capture(message):
                     if isinstance(event, ev.TurnCompleted):
@@ -1388,6 +1413,12 @@ class ClaudeClient(AgentClient):
                 if done:
                     return
         finally:
+            if read is not None:
+                # A real hang, an error or the caller leaving: end the read
+                # first (aclose() refuses an iterator that is running).
+                read.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await read
             with contextlib.suppress(Exception):
                 await response_iter.aclose()
 

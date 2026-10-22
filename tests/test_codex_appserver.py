@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -391,6 +392,86 @@ async def test_approval_declined_on_noninteractive_source(tmp_path, monkeypatch)
         assert isinstance(events[-1], ev.TurnCompleted)
     finally:
         await client.disconnect()
+
+
+class _QueueTransport:
+    """The app-server transport as ``receive_turn`` reads it."""
+
+    def __init__(self):
+        self.notifications: asyncio.Queue = asyncio.Queue()
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def _queue_client(cfg: NerveConfig, hub: InteractiveToolHandler):
+    from nerve.agent.backends.codex.backend import CodexClient
+
+    spec = _spec(cfg, idle_timeout=0.05)
+    spec.interactive = hub
+    client = CodexClient(CodexBackend(_deps(cfg)), spec)
+    client._transport = _QueueTransport()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_waits_while_an_approval_is_pending(tmp_path, caplog):
+    """An app-server waiting on an approval may stay silent until the person
+    decides: past the idle timeout the turn keeps waiting instead of
+    reporting a hung app-server, and later notifications still arrive."""
+    cfg = _config(tmp_path)
+    sent = _Broadcasts()
+    hub = InteractiveToolHandler("s1", sent, interactive_capable=True)
+    client = _queue_client(cfg, hub)
+    approval = asyncio.create_task(
+        client._approval("command_approval", {"itemId": "c1"}),
+    )
+    turn = None
+    try:
+        with caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+            turn = asyncio.create_task(_collect_turn(client))
+            await asyncio.sleep(0.4)  # eight idle timeouts, approval pending
+            assert hub.has_pending
+            assert not turn.done()
+            notes = client._transport.notifications
+            notes.put_nowait({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "still here"},
+            })
+            notes.put_nowait({
+                "method": "turn/completed",
+                "params": {"turn": {"status": "completed"}},
+            })
+            events = await asyncio.wait_for(turn, timeout=2)
+        (interaction,) = [m for _sid, m in sent.messages if m["type"] == "interaction"]
+        assert hub.resolve(interaction["interaction_id"], {})
+        assert await approval == {"decision": "accept"}
+    finally:
+        hub.cancel_all()
+        for task in (approval, turn):
+            if task is not None:
+                task.cancel()
+
+    assert "".join(e.text for e in events if isinstance(e, ev.TextDelta)) == "still here"
+    assert isinstance(events[-1], ev.TurnCompleted)
+    assert [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ] == [
+        "idle timeout deferred for session s1: waiting for the person "
+        "(command_approval pending)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_idle_timeout_with_nothing_pending(tmp_path):
+    """With nothing waiting for the person, a silent app-server is still
+    reported hung after the idle timeout."""
+    cfg = _config(tmp_path)
+    hub = InteractiveToolHandler("s1", _Broadcasts(), interactive_capable=True)
+    client = _queue_client(cfg, hub)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(_collect_turn(client), timeout=2)
 
 
 @pytest.mark.asyncio

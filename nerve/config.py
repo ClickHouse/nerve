@@ -1166,6 +1166,8 @@ class AgentConfig:
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
+    # Silence while a question or plan decision waits for the person never
+    # counts (the interaction timeout bounds that wait).
     cli_idle_timeout_seconds: int = 900
     # Upper bound on ONE stream-json message read from the CLI subprocess (the
     # Agent SDK's ``max_buffer_size``).  The SDK's own default is 1 MiB and a

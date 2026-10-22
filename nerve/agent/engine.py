@@ -59,6 +59,7 @@ from nerve.agent.backends.events import TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
+    defer_idle_timeout,
     register_handler,
     unregister_handler,
     get_handler,
@@ -4323,10 +4324,11 @@ class AgentEngine:
         main-chain ``TurnCompleted``) frames the turn.  Once content flows,
         the wait uses the same idle timeout as a normal run; on that
         timeout the partial turn is persisted and ``asyncio.TimeoutError``
-        propagates so the caller can apply hung-runtime treatment.  While
-        only agents run no turn is open, so agent silence can never trip
-        it.  A framed turn with nothing visible records its usage but
-        stores no message.
+        propagates so the caller can apply hung-runtime treatment — unless
+        the session waits for the person (a question or a plan decision),
+        when the wait goes on.  While only agents run no turn is open, so
+        agent silence can never trip it.  A framed turn with nothing
+        visible records its usage but stores no message.
 
         Backends without an idle stream (codex) return ``None`` from the
         probe immediately — the drain is a no-op for them.
@@ -4348,6 +4350,7 @@ class AgentEngine:
         session_framing = False
         pending_model: ModelObserved | None = None
         idle_batches = 0                    # batches read while st is None
+        deferred = False                    # an idle-timeout deferral was logged
 
         def _new_state() -> _TurnState:
             s = _TurnState()
@@ -4449,6 +4452,13 @@ class AgentEngine:
                             # usage, defer the rest to the next drain.
                             await _close_turn()
                             break
+                        if defer_idle_timeout(
+                            get_handler(session_id), session_id, logged=deferred,
+                        ):
+                            # Silent because it waits for the person's answer,
+                            # not hung: keep the turn open and wait again.
+                            deferred = True
+                            continue
                         logger.warning(
                             "Autonomous turn idle timeout (%ss) for session %s "
                             "— persisting partial turn and flagging runtime as hung",
@@ -4462,6 +4472,7 @@ class AgentEngine:
                         st.status, st.error = "interrupted", "runtime went silent"
                         await _close_turn()
                         raise
+                    deferred = False
                     if batch is None:
                         logger.warning(
                             "Agent stream ended mid-autonomous-turn for session %s",

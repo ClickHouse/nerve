@@ -466,6 +466,29 @@ def get_awaiting_ids() -> set[str]:
     return {sid for sid, handler in _handlers.items() if handler.has_pending}
 
 
+def defer_idle_timeout(hub: Any, session_id: str, *, logged: bool) -> bool:
+    """True when an idle timeout of *session_id*'s runtime is no hang.
+
+    A runtime that asked the person something (a question, a plan decision,
+    an approval) is silent until Nerve answers, and Nerve answers when the
+    person does. So while *hub* (the session's handler, or ``None``) has an
+    interaction pending, the caller keeps waiting instead of treating the
+    runtime as hung. The wait stays bounded: the pause has its own timeout
+    (:data:`INTERACTION_TIMEOUT`); when it ends the runtime gets its answer,
+    speaks again, and the idle timeout applies as before.
+
+    Logs the deferral unless *logged* (callers log once per silent stretch).
+    """
+    if hub is None or not hub.has_pending:
+        return False
+    if not logged:
+        logger.info(
+            "idle timeout deferred for session %s: waiting for the person (%s pending)",
+            session_id, ", ".join(hub.pending_interaction_types()),
+        )
+    return True
+
+
 def _interaction_type(tool_name: str) -> str:
     """Map tool name to a UI-friendly interaction type.
 

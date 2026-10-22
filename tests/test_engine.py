@@ -4,6 +4,7 @@ helpers (no SDK subprocess)."""
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -624,6 +625,135 @@ async def test_receive_turn_closes_the_iterator_on_a_completed_turn():
     async for _event in client.receive_turn():
         pass
     assert sdk.explicit_aclose == 1
+
+
+# ---------------------------------------------------------------------------
+# ClaudeClient.receive_turn — silence while the person decides is no hang
+# ---------------------------------------------------------------------------
+
+
+class _Hub:
+    """The session's interaction hub, as ``receive_turn`` reads it."""
+
+    def __init__(self, *pending: str):
+        self.pending = list(pending)
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+    def pending_interaction_types(self) -> list[str]:
+        return list(self.pending)
+
+
+class _AskingClient:
+    """SDK double for a CLI that asked the person through ``can_use_tool``:
+    it streams ``before``, is silent until ``answer()``, then streams
+    ``after``. The pause is over before the CLI speaks again, so the hub
+    clears in the same step as the next message.
+
+    ``receive_response`` is a real async generator, like the SDK's: a
+    cancelled ``__anext__()`` finalizes it, and waiting on it again would
+    report a dead runtime.
+    """
+
+    def __init__(self, hub: _Hub, before: list, after: list):
+        self._hub, self._before, self._after = hub, before, after
+        self._answered = asyncio.Event()
+
+    def answer(self) -> None:
+        self._answered.set()
+
+    def receive_response(self):
+        async def _gen():
+            for msg in self._before:
+                yield msg
+            await self._answered.wait()
+            self._hub.pending.clear()
+            for msg in self._after:
+                yield msg
+
+        return _gen()
+
+
+def _deferrals(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_waits_for_the_person_past_the_idle_timeout(caplog):
+    """A CLI paused on a plan decision is silent because it waits for Nerve's
+    answer, which waits for the person. Past the idle timeout the turn keeps
+    waiting (no TimeoutError), and after the decision the rest of the stream
+    arrives on the same iterator. The deferral is logged once."""
+    hub = _Hub("plan_exit")
+    before = [_text_msg("Here is the plan.")]
+    after = [_text_msg("Approved, building."), _result_msg()]
+    sdk = _AskingClient(hub, before, after)
+    client = _turn_client(sdk, "sess-plan", idle_timeout=0.05)
+    client._spec.interactive = hub
+    seen: list = []
+
+    async def _consume():
+        async for event in client.receive_turn():
+            seen.append(event)
+
+    with caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+        turn = asyncio.create_task(_consume())
+        try:
+            await asyncio.sleep(0.4)  # eight idle timeouts of silence
+            assert not turn.done()
+            sdk.answer()
+            await asyncio.wait_for(turn, timeout=2)
+        finally:
+            turn.cancel()
+
+    assert seen == _translated(before + after)
+    assert _deferrals(caplog) == [
+        "idle timeout deferred for session sess-plan: waiting for the person "
+        "(plan_exit pending)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_when_nothing_waits_for_the_person():
+    """With a hub but nothing pending, silence past the idle timeout is a
+    hang as before: TimeoutError, and the SDK iterator is closed."""
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=2.0)
+    client = _turn_client(sdk, "sess-idle", idle_timeout=0.05)
+    client._spec.interactive = _Hub()
+    with pytest.raises(asyncio.TimeoutError):
+        async for _event in client.receive_turn():
+            pass
+    assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_once_the_interaction_is_over():
+    """The wait lasts only while the interaction is pending: once it is
+    over, silence past the idle timeout is a hang again."""
+    hub = _Hub("question")
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=5.0)
+    client = _turn_client(sdk, "sess-q", idle_timeout=0.05)
+    client._spec.interactive = hub
+
+    async def _consume():
+        async for _event in client.receive_turn():
+            pass
+
+    turn = asyncio.create_task(_consume())
+    try:
+        await asyncio.sleep(0.2)
+        assert not turn.done()
+        hub.pending.clear()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(turn, timeout=2)
+    finally:
+        turn.cancel()
+    assert sdk.aclose_calls == 1
 
 
 # ---------------------------------------------------------------------------
