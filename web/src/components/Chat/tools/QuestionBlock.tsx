@@ -1,9 +1,10 @@
 import { useId, useState } from 'react';
-import { MessageCircleQuestion, Check, Send } from '../../ui/icons';
+import { Send } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { InlineMarkdown, MarkdownContent } from '../MarkdownContent';
 import { useChatStore } from '../../../stores/chatStore';
-import { Badge, Button, TextField } from '../../ui';
+import { Button, TextField } from '../../ui';
+import { AnsweredCard, OptionButton, QuestionHeader, type AnswerRow } from './QuestionCard';
 
 interface QuestionOption {
   label: string;
@@ -58,27 +59,6 @@ function parseAnswers(result: string, questions: Question[]): ParsedAnswers {
     if (text) own.set(qIdx, text);
   });
   return { chosen, own };
-}
-
-function optionClass(resolved: boolean, selected: boolean): string {
-  const state = resolved
-    ? selected
-      ? 'border-accent/40 bg-accent/10 cursor-default'
-      : 'border-surface-raised bg-bg-sunken opacity-40 cursor-default'
-    : selected
-      ? 'border-accent/50 bg-accent/10 cursor-pointer'
-      : 'border-border-subtle bg-bg-sunken hover:border-border hover:bg-surface cursor-pointer';
-  return `question-option w-full text-left px-3.5 py-2.5 rounded-md border transition-all duration-150 ${state}`;
-}
-
-function Indicator({ multiSelect, selected }: { multiSelect: boolean; selected: boolean }) {
-  return (
-    <div className={`mt-0.5 shrink-0 w-4 h-4 ${multiSelect ? 'rounded-sm' : 'rounded-full'} border flex items-center justify-center transition-colors duration-150 ${
-      selected ? 'border-accent bg-accent' : 'border-text-faint bg-transparent'
-    }`}>
-      {selected && <Check size={10} className="text-on-accent" />}
-    </div>
-  );
 }
 
 export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
@@ -200,139 +180,125 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
   };
   const allAnswered = questions.every((_q, i) => isAnswered(i));
 
+  // The questions with their options: the live poll, or (resolved) the
+  // full card behind the summary, showing what was answered.
+  const questionList = questions.map((q, qIdx) => {
+    const questionId = `${idBase}-q${qIdx}`;
+    const ownText = effOwn.get(qIdx);
+    const otherChosen = ownText !== undefined;
+    return (
+      <div
+        key={qIdx}
+        role="group"
+        aria-labelledby={questionId}
+        className={qIdx > 0 ? 'border-t border-border-subtle' : ''}
+      >
+        {/* Question header */}
+        <div className="px-4 pt-3.5 pb-2">
+          <QuestionHeader label={q.header} note={q.multiSelect ? 'Select multiple' : undefined} />
+          <p id={questionId} className="text-sm text-text-secondary leading-relaxed">
+            <InlineMarkdown content={q.question} />
+          </p>
+        </div>
+
+        {/* Options */}
+        <div className="px-3 pb-3 space-y-1.5">
+          {q.options.map((opt, oIdx) => {
+            const isSelected = effSelections.get(qIdx)?.has(oIdx) || false;
+            const isHovered = hoveredOption?.q === qIdx && hoveredOption?.o === oIdx;
+
+            return (
+              <div key={oIdx}>
+                <OptionButton
+                  multiSelect={q.multiSelect}
+                  selected={isSelected}
+                  resolved={isResolved}
+                  label={opt.label}
+                  description={opt.description}
+                  onClick={() => handleSelect(qIdx, oIdx)}
+                  onMouseEnter={() => setHoveredOption({ q: qIdx, o: oIdx })}
+                  onMouseLeave={() => setHoveredOption(null)}
+                />
+
+                {opt.markdown && (isHovered || (isSelected && !isResolved)) && (
+                  <div className="mx-2 mt-1 mb-0.5 px-3 py-2 bg-bg border border-border-subtle rounded text-xs max-h-48 overflow-y-auto">
+                    <MarkdownContent content={opt.markdown} />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Other…: the person's own words */}
+          <div>
+            <OptionButton
+              multiSelect={q.multiSelect}
+              selected={otherChosen}
+              resolved={isResolved}
+              label={OTHER_LABEL}
+              description={!otherChosen && !isResolved ? 'Answer in your own words' : undefined}
+              onClick={() => handleOther(qIdx)}
+            />
+            {otherChosen && (isResolved ? (
+              <p className="mx-2 mt-1.5 text-sm text-text-secondary whitespace-pre-wrap">{ownText}</p>
+            ) : (
+              <TextField
+                value={ownText}
+                onChange={e => setOwnText(qIdx, e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Escape') {
+                    // Escape stays here: the app-wide Escape stops a
+                    // running turn, and the turn is running — it waits
+                    // for this answer. It only leaves the field, back to
+                    // Other… (the button above it); the text stays.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.currentTarget.parentElement?.querySelector('button')?.focus();
+                  } else if (e.key === 'Enter' && !e.nativeEvent.isComposing && allAnswered) {
+                    // Not while an input method composes: its Enter
+                    // confirms the composition, not the answer.
+                    e.preventDefault();
+                    submitAnswers();
+                  }
+                }}
+                aria-label="Your answer"
+                placeholder="Type your answer"
+                required
+                autoComplete="off"
+                // Opened on purpose a moment ago, by Other….
+                autoFocus
+                className="mt-1.5"
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // Answered, or closed without an answer: one line per question; the full
+  // card opens on request. "Closed" when the interaction ended without an
+  // answer (timeout / cancel / deny).
+  if (isResolved) {
+    const rows: AnswerRow[] = questions.map((q, i) => {
+      const parts = [...(effSelections.get(i) ?? [])].sort((a, b) => a - b)
+        .flatMap(o => (q.options[o] ? [q.options[o].label] : []));
+      const words = effOwn.get(i)?.trim();
+      if (words) parts.push(words);
+      const answer = parts.length === 0 ? null : q.multiSelect ? parts : parts.join(', ');
+      return { key: String(i), label: q.header, answer };
+    });
+    return <AnsweredCard rows={rows} closed={!!block.isError}>{questionList}</AnsweredCard>;
+  }
+
   return (
     <div className="question-block my-2">
       <div className="border border-accent/20 rounded-lg bg-bg-sunken overflow-hidden">
-        {questions.map((q, qIdx) => {
-          const questionId = `${idBase}-q${qIdx}`;
-          const ownText = effOwn.get(qIdx);
-          const otherChosen = ownText !== undefined;
-          return (
-            <div
-              key={qIdx}
-              role="group"
-              aria-labelledby={questionId}
-              className={qIdx > 0 ? 'border-t border-border-subtle' : ''}
-            >
-              {/* Question header */}
-              <div className="px-4 pt-3.5 pb-2">
-                <div className="flex items-center gap-2 mb-2">
-                  <MessageCircleQuestion size={15} className="text-accent shrink-0" />
-                  <Badge tone="accent" className="px-2 font-semibold uppercase tracking-wider">
-                    {q.header}
-                  </Badge>
-                  {q.multiSelect && (
-                    <span className="text-2xs text-text-faint ml-auto">Select multiple</span>
-                  )}
-                </div>
-                <p id={questionId} className="text-sm text-text-secondary leading-relaxed">
-                  <InlineMarkdown content={q.question} />
-                </p>
-              </div>
-
-              {/* Options */}
-              <div className="px-3 pb-3 space-y-1.5">
-                {q.options.map((opt, oIdx) => {
-                  const isSelected = effSelections.get(qIdx)?.has(oIdx) || false;
-                  const isHovered = hoveredOption?.q === qIdx && hoveredOption?.o === oIdx;
-
-                  return (
-                    <div key={oIdx}>
-                      <button
-                        type="button"
-                        onClick={() => handleSelect(qIdx, oIdx)}
-                        onMouseEnter={() => setHoveredOption({ q: qIdx, o: oIdx })}
-                        onMouseLeave={() => setHoveredOption(null)}
-                        disabled={isResolved}
-                        aria-pressed={isSelected}
-                        className={optionClass(isResolved, isSelected)}
-                      >
-                        <div className="flex items-start gap-3">
-                          <Indicator multiSelect={q.multiSelect} selected={isSelected} />
-                          <div className="flex-1 min-w-0">
-                            <div className={`text-sm font-medium ${isSelected ? 'text-accent-text' : 'text-text-secondary'}`}>
-                              {opt.label}
-                            </div>
-                            {opt.description && (
-                              <div className="text-xs text-text-muted mt-0.5 leading-relaxed">
-                                {/* Inside the option's button: no links. */}
-                                <InlineMarkdown content={opt.description} links={false} />
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </button>
-
-                      {opt.markdown && (isHovered || (isSelected && !isResolved)) && (
-                        <div className="mx-2 mt-1 mb-0.5 px-3 py-2 bg-bg border border-border-subtle rounded text-xs max-h-48 overflow-y-auto">
-                          <MarkdownContent content={opt.markdown} />
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Other…: the person's own words */}
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => handleOther(qIdx)}
-                    disabled={isResolved}
-                    aria-pressed={otherChosen}
-                    className={optionClass(isResolved, otherChosen)}
-                  >
-                    <div className="flex items-start gap-3">
-                      <Indicator multiSelect={q.multiSelect} selected={otherChosen} />
-                      <div className="flex-1 min-w-0">
-                        <div className={`text-sm font-medium ${otherChosen ? 'text-accent-text' : 'text-text-secondary'}`}>
-                          {OTHER_LABEL}
-                        </div>
-                        {!otherChosen && !isResolved && (
-                          <div className="text-xs text-text-muted mt-0.5 leading-relaxed">Answer in your own words</div>
-                        )}
-                      </div>
-                    </div>
-                  </button>
-                  {otherChosen && (isResolved ? (
-                    <p className="mx-2 mt-1.5 text-sm text-text-secondary whitespace-pre-wrap">{ownText}</p>
-                  ) : (
-                    <TextField
-                      value={ownText}
-                      onChange={e => setOwnText(qIdx, e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === 'Escape') {
-                          // Escape stays here: the app-wide Escape stops a
-                          // running turn, and the turn is running — it waits
-                          // for this answer. It only leaves the field, back to
-                          // Other… (the button above it); the text stays.
-                          e.preventDefault();
-                          e.stopPropagation();
-                          e.currentTarget.parentElement?.querySelector('button')?.focus();
-                        } else if (e.key === 'Enter' && !e.nativeEvent.isComposing && allAnswered) {
-                          // Not while an input method composes: its Enter
-                          // confirms the composition, not the answer.
-                          e.preventDefault();
-                          submitAnswers();
-                        }
-                      }}
-                      aria-label="Your answer"
-                      placeholder="Type your answer"
-                      required
-                      autoComplete="off"
-                      // Opened on purpose a moment ago, by Other….
-                      autoFocus
-                      className="mt-1.5"
-                    />
-                  ))}
-                </div>
-              </div>
-            </div>
-          );
-        })}
+        {questionList}
 
         {/* Submit button — shown for multi-question or multiSelect, and for a
             single simple question answered in the person's own words. */}
-        {!isResolved && (!isSingleSimple || own.has(0)) && (
+        {(!isSingleSimple || own.has(0)) && (
           <div className="px-3 pb-3">
             <Button
               variant="primary"
@@ -344,17 +310,6 @@ export function QuestionBlock({ block }: { block: ToolCallBlockData }) {
               <Send size={13} />
               Submit
             </Button>
-          </div>
-        )}
-
-        {/* Resolution confirmation — "Answered", or "Closed" when the
-            interaction ended without an answer (timeout / cancel / deny). */}
-        {isResolved && (
-          <div className="px-4 py-2 border-t border-accent/10 flex items-center gap-2">
-            <Check size={12} className={block.isError ? 'text-text-faint' : 'text-success'} />
-            <span className={`text-xs ${block.isError ? 'text-text-faint' : 'text-success'}`}>
-              {block.isError ? 'Closed' : 'Answered'}
-            </span>
           </div>
         )}
       </div>
