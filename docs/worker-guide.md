@@ -22,9 +22,15 @@ bind address), starts Nerve and prints the setup page with a setup token. The
 worker is configured on that page:
 
 1. **Claim** — your username and password (or keep it passwordless), plus the token
-2. **Mode**: choose **Worker**, and optionally write a note on what it should
-   know. This writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
-   `MEMORY.md`), `TASK.md` from its template with your note in place (the
+2. **Mode**: choose **Worker**, and tick what it should do: review pull
+   requests, triage issues, fix issues and open pull requests, keep CI
+   healthy, dependency and security updates, first response to alerts (needs
+   an alert source; a Slack channel is the first-class one today), channel
+   digests and answers, research and reports, docs and release notes, or
+   **Custom…** in your own words; optionally add anything it must know or
+   never do. All of it is optional: the conversation sorts out the details.
+   This writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
+   `MEMORY.md`), `TASK.md` from its template with your choice in place (the
    onboarding conversation fills the rest), and `config/cron/system.yaml` with
    `skill-extractor` and `skill-reviser` on and `task-planner` off
    (`memory-maintenance` is always on; the onboarding conversation turns
@@ -54,11 +60,11 @@ waits for its onboarding conversation in the web UI.
 
 ## How Onboarding Works
 
-After setup in the browser, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first. When setup is complete and nobody pressed Finish, the banner in the web UI offers to start it. Until onboarding is done, `TASK.md` keeps the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line). The agent's hidden instruction holds your note, the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first: with a note that describes the work it restates the work in one sentence, says what it studies and sketches the setup it has in mind before it asks anything; without a note, or with one that holds only rules or only repositories, it asks which kinds of work apply. Then:
+After setup in the browser, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first. When setup is complete and nobody pressed Finish, the banner in the web UI offers to start it. Until onboarding is done, `TASK.md` keeps the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line). The agent's hidden instruction holds what you chose on the Mode step (each ticked item with what it does, the connection it needs and the follow-up questions it raises), the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first: with work chosen it offers no menu, restates the work in one sentence, says what it studies and sketches the setup it has in mind before it asks anything; with nothing ticked, or only rules, it offers the same list of work and asks which kinds apply. A free-text note (from an older setup page or `nerve init --terminal`) that describes the work counts as chosen work; one with only rules or only repositories gets the list. Then:
 
-1. **Explore and ask**: one background explorer clones the repositories into `<workspace>/repos/` and reads them, without installing, building or running tests (build and test, CI, contribution and review rules, the volume of the work, risks and missing access), while the agent asks you, in question cards with its recommendation first, only what neither the explorer nor setup can tell: the account it acts as on the code host, what waits for your approval, how often to look for new work, where results go
-2. **Propose the setup as a plan**: cron jobs with schedule and `run_if` gate, whether `task-planner` plans through the approval loop (it ships disabled for workers; the agent turns it on by overriding the job by id in `jobs.yaml`, with a `tasks` gate scoped to the worker's tag), task statuses (the built-in `backlog` and `plan_review`, plus a status for each other kind of wait), tags, skills, the `TASK.md` sections, what it needs from you and the approval boundaries. **Apply setup** approves it, **Edit** lets you change the text and approve your version, and **Change something…** sends your words back and the agent revises the plan. It is instructed to change nothing before you approve
-3. **Apply what you approved**: fills `TASK.md` in place (every `_(onboarding fills this in: …)_` placeholder and example line, keeping the headings and your note, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link), adds the jobs to `<workspace>/config/cron/jobs.yaml`, creates statuses, skills and the tasks only you can do, and saves what it learned to memory
+1. **Explore and ask**: one background explorer clones the repositories into `<workspace>/repos/` and reads them, without installing, building or running tests (build and test, CI, contribution and review rules, the volume of the work, risks and missing access), while the agent asks you, in question cards with its recommendation first, only what neither the explorer nor setup can tell. It works from the follow-up questions of each item you ticked (which repositories, what a review may do, the label vocabulary, how often to look for new work, and so on) and asks once what the items share: the account it acts as on the code host, what waits for your approval, where results go. What does not fit into two rounds becomes a default in the proposal; your rules ("Anything it must know or never do?") become hard rules and approval boundaries
+2. **Propose the setup as a plan**: cron jobs with schedule and `run_if` gate, whether `task-planner` plans through the approval loop (it ships disabled for workers; the agent turns it on by overriding the job by id in `jobs.yaml`, with a `tasks` gate scoped to the worker's tag), task statuses (the built-in `backlog` and `plan_review`, plus a status for each other kind of wait), tags, skills, the `TASK.md` sections, what it needs from you (including a connection a chosen item needs that the instance lacks) and the approval boundaries. **Apply setup** approves it, **Edit** lets you change the text and approve your version, and **Change something…** sends your words back and the agent revises the plan. It is instructed to change nothing before you approve
+3. **Apply what you approved**: fills `TASK.md` in place (every `_(onboarding fills this in: …)_` placeholder and example line, keeping the headings and what you chose, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link), adds the jobs to `<workspace>/config/cron/jobs.yaml`, creates statuses, skills and the tasks only you can do, and saves what it learned to memory
 4. **Summarize**: lists every change and the next steps for you
 5. **Mark onboarding done**: calls `onboarding_done`, which also removes the marker line from `TASK.md`
 
@@ -84,15 +90,17 @@ After onboarding, the worker operates on its configured schedule. You can change
 
 The task file lives at `workspace/TASK.md` and is injected into every session's system prompt. It is the worker's mission brief. What each section holds, and how to write rules that hold up, is in [Worker Best Practices → TASK.md Anatomy](worker-best-practices.md#taskmd-anatomy).
 
-**Before onboarding.** The Mode step, `nerve init --terminal` and `nerve init --non-interactive` write the worker template with your description, if any, in place. The comment on the second line marks the file as not onboarded yet. The example lines the template carries under each heading are left out here:
+**Before onboarding.** The Mode step, `nerve init --terminal` and `nerve init --non-interactive` write the worker template with what you chose or described, if anything, in place. The Mode step writes its choice as one comment line Nerve reads (the ticked items' ids) and one line each for people, each left out when empty: `Work:` (the ticked items), `Also:` (your own words) and `Must know or never do:`; the terminal paths write your task description as a plain paragraph. The comment on the second line marks the file as not onboarded yet. The example lines the template carries under each heading are left out here:
 
 ```markdown
 # Task
 <!-- nerve:onboarding pending: the onboarding conversation fills this file in; this line goes when onboarding is done. -->
 
 ## Task description (as given)
-Monitor the CI pipeline for flaky tests. When a test fails intermittently,
-investigate the root cause and propose a fix.
+<!-- nerve:work ci-health -->
+Work: Keep CI healthy
+Also: Hunt down flaky tests: when a test fails intermittently, investigate the root cause and propose a fix.
+Must know or never do: Never touch PRs or issues you did not open unless addressed.
 
 ## Identity
 _(onboarding fills this in: which account acts, exact git author, fork/remote names)_
@@ -134,8 +142,10 @@ Read the full guide: https://github.com/ClickHouse/nerve/blob/main/docs/worker-b
 # Task
 
 ## Task description (as given)
-Monitor the CI pipeline for flaky tests. When a test fails intermittently,
-investigate the root cause and propose a fix.
+<!-- nerve:work ci-health -->
+Work: Keep CI healthy
+Also: Hunt down flaky tests: when a test fails intermittently, investigate the root cause and propose a fix.
+Must know or never do: Never touch PRs or issues you did not open unless addressed.
 
 ## Identity
 You are `ci-bot`. Git author `CI Bot <ci-bot@example.com>`; fork `ci-bot/repo-a`
@@ -250,7 +260,7 @@ port; the other two come from the command line and the environment:
 ```bash
 # Worker 1: CI monitor
 NERVE_HOME=~/.nerve-ci-monitor nerve -c ~/nerve-ci-monitor init --port 8901
-# → open the setup page it prints, choose Worker, describe the task
+# → open the setup page it prints, choose Worker, tick what it should do
 
 # Worker 2: PR reviewer
 NERVE_HOME=~/.nerve-pr-reviewer nerve -c ~/nerve-pr-reviewer init --port 8902

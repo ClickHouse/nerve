@@ -13,8 +13,9 @@ import pytest
 
 from nerve import setup_checklist as checklist
 from nerve.config import NerveConfig
+from nerve.onboarding_catalog import WorkSelection, work_catalog
 from nerve.setup_state import SetupState
-from nerve.setup_writer import apply_mode, apply_profile_templates, set_optional_crons
+from nerve.setup_writer import apply_mode, apply_profile_templates, render_work_description, set_optional_crons
 
 
 _SOURCES_OFF = {
@@ -342,6 +343,45 @@ class TestDoneRules:
         (worker / "TASK.md").write_text("# Task\n\n## Mission\nx\n", encoding="utf-8")
         assert checklist.onboarding_from_task(worker, "worker") == "done"
         assert checklist.onboarding_from_task(worker, "personal") == "not_applicable"
+
+    def test_the_mode_detail_carries_the_work_catalog_and_what_was_chosen(self, tmp_path):
+        """Every body carries the catalog (the Mode step's checkboxes) and the
+        selection read back from a worker's ``TASK.md``; all empty when
+        nothing was chosen, for a personal install and once onboarding
+        completed the file."""
+        nothing = {"items": [], "custom": "", "rules": ""}
+        fresh, personal, worker = tmp_path / "fresh", tmp_path / "personal", tmp_path / "worker"
+        fresh.mkdir()
+        apply_mode(personal, "personal")
+        apply_mode(worker, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        for ws in (fresh, personal):
+            detail = step(facts(ws), "mode")["detail"]
+            assert detail["work_catalog"] == work_catalog() and detail["work"] == nothing
+        # A free-text note (an older page, ``nerve init``) reads as custom work.
+        assert step(facts(worker), "mode")["detail"]["work"] == {
+            "items": [], "custom": "Watch the nightly build for example/repo and propose fixes.", "rules": "",
+        }
+        chosen = tmp_path / "chosen"
+        apply_mode(chosen, "worker", render_work_description(WorkSelection(
+            items=("triage-issues", "review-prs"), custom="also watch the release branch",
+            rules="never merge anything",
+        )))
+        detail = step(facts(chosen), "mode")["detail"]
+        assert detail["work"] == {
+            "items": ["review-prs", "triage-issues"], "custom": "also watch the release branch",
+            "rules": "never merge anything",
+        }
+        # What was chosen is persisted configuration: part of the etag.
+        assert "work" in checklist.ETAG_FIELDS["mode"]
+        assert step(facts(chosen), "mode")["etag"] != step(facts(worker), "mode")["etag"]
+        task = chosen / "TASK.md"
+        task.write_text(
+            "".join(line for line in task.read_text().splitlines(keepends=True) if "nerve:onboarding pending" not in line),
+            encoding="utf-8",
+        )
+        assert step(facts(chosen), "mode")["detail"]["work"] == nothing
+        task.unlink()
+        assert step(facts(chosen), "mode")["detail"]["work"] == nothing
 
     def test_the_onboarding_block_carries_what_it_waits_for_only_while_running(self, worker):
         running = checklist.summarize(facts(

@@ -65,6 +65,8 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.accounts import instance_is_passwordless, setup_required
 from nerve.identity import Actor
+from nerve.onboarding_catalog import ITEMS as WORK_ITEMS
+from nerve.onboarding_catalog import CUSTOM_MAX, RULES_MAX, WorkSelection, in_catalog_order
 from nerve.setup_checklist import (
     BLOCKED_POLICY,
     GITHUB_SWITCH,
@@ -115,9 +117,11 @@ from nerve.setup_writer import (
     merge_settings_defaults,
     merge_settings_paths,
     plan_optional_crons,
+    render_work_description,
     replace_choices,
     settings_problem,
     task_description_from,
+    work_selection_from,
     workspace_mode,
 )
 
@@ -920,8 +924,21 @@ _LIST = 200           # allowlists, accounts, crons, agents
 _USER_IDS = 1000      # Telegram user ids
 
 
+class WorkRequest(BaseModel):
+    """What a worker should do: catalog ids, custom work, rules (each optional)."""
+
+    items: list[Annotated[str, Field(max_length=64)]] | None = Field(default=None, max_length=64)
+    custom: str | None = Field(default=None, max_length=8000)
+    rules: str | None = Field(default=None, max_length=4000)
+
+
 class ModeRequest(BaseModel):
     mode: str = Field(max_length=32)
+    work: WorkRequest | None = None
+    # Older clients' free-text note, an alias for ``work.custom``:
+    # ``task_description`` is what the shipped page sends, ``note`` the
+    # contract's name for it.
+    note: str | None = Field(default=None, max_length=8000)
     task_description: str | None = Field(default=None, max_length=8000)
 
 
@@ -1026,13 +1043,14 @@ async def get_setup(actor: Actor = Depends(require_person)):
 #  PUT /api/setup/mode                                                         #
 # --------------------------------------------------------------------------- #
 
-_TASK_MAX = 4000
 TASK_LOCK_REASON = (
     "The task description was written to TASK.md when the mode was chosen, and "
     "the worker reads and maintains that file itself. To change the task, edit "
     "TASK.md in the workspace (or tell the worker in chat); the Mode step is "
     "chosen once."
 )
+# Unknown ids named in one refusal, at most.
+_UNKNOWN_ITEMS_SHOWN = 3
 
 
 def _task_description_on_disk(task_path: Path) -> str | None:
@@ -1046,12 +1064,55 @@ def _task_description_on_disk(task_path: Path) -> str | None:
     return task_description_from(text)
 
 
+def _work_from_request(req: ModeRequest, mode: str) -> WorkSelection:
+    """The work a Mode ``PUT`` chooses, checked (``400`` naming the field).
+
+    ``work.custom`` wins over the older clients' ``note`` and
+    ``task_description``, and a refused length names the field the text came
+    in. A body with a note and no ``work`` is a free-text selection, written
+    as before: a plain paragraph. Ids are kept once each, in catalog order;
+    an unknown one is refused, and so is any item for a personal install,
+    whose custom work and rules are checked and, as before, written nowhere.
+    """
+    work = req.work
+    if work is not None and work.custom is not None:
+        custom, custom_field = work.custom, "work.custom"
+    elif req.note is not None:
+        custom, custom_field = req.note, "note"
+    elif req.task_description is not None:
+        custom, custom_field = req.task_description, "task_description"
+    else:
+        custom, custom_field = "", "work.custom"
+    custom = custom.strip()
+    rules = ((work.rules if work is not None else None) or "").strip()
+    ids = [i.strip() for i in ((work.items if work is not None else None) or []) if i.strip()]
+    unknown = sorted({i for i in ids if i not in WORK_ITEMS})
+    if unknown:
+        shown = ", ".join(unknown[:_UNKNOWN_ITEMS_SHOWN]) + (", …" if len(unknown) > _UNKNOWN_ITEMS_SHOWN else "")
+        raise SetupFieldError("work.items", f"Unknown work item: {shown}.")
+    if ids and mode != "worker":
+        raise SetupFieldError(
+            "work.items",
+            "A personal assistant takes no work items: choose Worker for this work, or "
+            "describe it to the agent in the onboarding conversation.",
+        )
+    if len(custom) > CUSTOM_MAX:
+        what = "the task description" if custom_field == "task_description" else "the custom work"
+        raise SetupFieldError(custom_field, f"Keep {what} under {CUSTOM_MAX} characters.")
+    if len(rules) > RULES_MAX:
+        raise SetupFieldError("work.rules", f"Keep what it must know or never do under {RULES_MAX} characters.")
+    return WorkSelection(items=in_catalog_order(ids), custom=custom, rules=rules, free_text=work is None)
+
+
 @router.put("/api/setup/mode")
 async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
     mode = (req.mode or "").strip().lower()
     if mode not in ("personal", "worker"):
         raise SetupFieldError("mode", "Choose personal or worker.")
-    task = (req.task_description or "").strip()
+    selection = _work_from_request(req, mode)
+    # A worker's choice becomes the description section of its TASK.md; a
+    # personal install has no TASK.md.
+    task = render_work_description(selection) if mode == "worker" else ""
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
@@ -1061,17 +1122,19 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
         if current is not None and current != mode:
             raise HTTPException(status_code=409, detail=MODE_LOCK_REASON)
         if current == "worker" and task and (ws / "TASK.md").exists():
-            # Chosen once: the same mode again is a no-op, and a *different*
-            # description is refused rather than silently replacing what a
-            # stale tab or a second person did not see. Only a worker whose
-            # TASK.md is still absent (templates arrived from a config
-            # repository) — or still the bare template, with no description
-            # in it — gets it written here.
+            # Chosen once: the same choice again is a no-op (nothing is
+            # rewritten), and a *different* one is refused rather than
+            # silently replacing what a stale tab or a second person did not
+            # see. The same items, custom work and rules are the same choice
+            # in either form (a selection, or an older client's note). Only a
+            # worker whose TASK.md is still absent (templates arrived from a
+            # config repository) — or still the bare template, with no
+            # description in it — gets it written here.
             on_disk = _task_description_on_disk(ws / "TASK.md")
-            if on_disk is None or (on_disk and on_disk != task):
+            if on_disk is None or (on_disk and work_selection_from(on_disk) != selection):
                 raise HTTPException(status_code=409, detail=TASK_LOCK_REASON)
-        if len(task) > _TASK_MAX:
-            raise SetupFieldError("task_description", "Keep the task description under 4000 characters.")
+            if on_disk:
+                task = ""
         if current is None and locked:
             steps = {s["id"]: s for s in summarize(ctx.facts)["steps"]}
             raise HTTPException(status_code=409, detail=steps[STEP_MODE]["blocked_reason"])

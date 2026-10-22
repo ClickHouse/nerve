@@ -184,7 +184,7 @@ keep", never read back.
 | Step | Asks | Writes | Takes effect |
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
-| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule); a worker takes an optional note (at most 4000 characters) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the note, if any, in place (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
+| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule). For a worker, what it should do: checkboxes from the work catalog, by group (code: review pull requests, triage issues, fix issues and open pull requests, keep CI healthy, dependency and security updates; operations: first response to alerts, which needs an alert source; communication: channel digests and answers; knowledge: research and reports, docs and release notes), **Custom…** for work in your own words (at most 4000 characters), and an optional "Anything it must know or never do?" (at most 2000). Nothing ticked is fine: the conversation then offers the same list | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with what you chose under "Task description (as given)" (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time). With `memory.backend: loom` nothing: the step is done and says memory is kept in Loom | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
@@ -292,21 +292,34 @@ reasons are listed before you click. Then:
 After setup, the agent is set up by talking to it. Finish opens one web chat
 session titled **Onboarding** for the person who finished setup, and the agent
 speaks first: its first message is the answer to a hidden instruction, which
-the chat does not show. What it says first depends on the worker's note from
-the Mode step:
+the chat does not show. What it says first depends on what a worker's Mode
+step recorded:
 
-- **Without a note** (a personal install, or a worker without one) it says
-  that it is set up by talking to it, offers what it can help with (fixing
-  issues through to deployment, flaky CI tests, performance regressions, PR
-  reviews, alerts, security notices and dependency bumps, channel summaries,
-  research, and personal-assistant work, which a personal install lists
-  first) and asks which apply.
-- **With a note that describes the work** it offers no menu and starts on
-  the work in the same message. It explains before it asks: it greets you,
-  restates the work in one sentence, says what it studies and sketches the
-  setup it has in mind, and only then shows its first questions. A note with
-  only rules ("never merge anything") or only repositories gets the list
-  too, and the agent carries the note into its proposal.
+- **With work chosen** (checkboxes, custom work, or both) it offers no menu
+  and starts on that work in the same message. It explains before it asks:
+  it greets you, restates the work in one sentence, says what it studies and
+  sketches the setup it has in mind, and only then shows its first questions.
+  It works from the follow-up questions of each item you ticked (which
+  repositories, what a review may do, the label vocabulary, how often, and so
+  on), asks the questions the items share once (the account it acts as, what
+  waits for your approval, where results go), and skips what setup or its
+  explorer can tell. What does not fit into two rounds of questions becomes a
+  default in its proposal, for you to change. An item whose connection the
+  instance lacks (first response to alerts without an alert source) appears
+  under what it needs from you.
+- **With nothing chosen** (a personal install, or a worker with nothing
+  ticked) it says that it is set up by talking to it, offers the work catalog
+  by group, each item with its one-line description (a personal install lists
+  personal-assistant work first), and asks which apply. A worker with only
+  "Anything it must know or never do?" filled in gets the list too.
+- **With a note from an older setup page, or from `nerve init --terminal`**
+  (free text), a note that describes the work is handled like chosen work; a
+  note with only rules ("never merge anything") or only repositories gets the
+  list.
+
+Whatever you wrote under "Anything it must know or never do?" (or as rules in
+a note) becomes hard rules and approval boundaries in its proposal, and an
+answer in the conversation never loosens one without asking.
 
 The agent runs no tool before its first message, so the hidden instruction
 also gives it what Nerve knows about the instance when the conversation

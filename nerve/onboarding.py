@@ -4,9 +4,11 @@ After setup in the browser, the agent is set up by talking to it (the
 ``conversation`` kind). :func:`start` opens one web chat session for that and
 gives the agent a hidden first message
 (:func:`nerve.agent.prompts.onboarding_prompt`), so the agent speaks first and
-the person sees only its answer. The message carries what Nerve knows about
-the instance (:mod:`nerve.onboarding_environment`), because the agent's first
-turn calls no tool before it speaks. The agent calls the ``onboarding_done`` tool
+the person sees only its answer. The message carries the work a worker's
+operator chose at setup (the Mode step's selection, read back from
+``TASK.md``) and what Nerve knows about the instance
+(:mod:`nerve.onboarding_environment`), because the agent's first turn calls no
+tool before it speaks. The agent calls the ``onboarding_done`` tool
 after the person confirmed the setup and the agent applied it
 (:func:`complete`). A person can skip onboarding on the setup page
 (:func:`skip`).
@@ -43,6 +45,7 @@ from nerve.setup_writer import (
     render_task_md,
     task_description_from,
     task_onboarding_pending,
+    work_selection_from,
     workspace_mode,
 )
 
@@ -50,6 +53,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
     from nerve.identity import ActorOrId
+    from nerve.onboarding_catalog import WorkSelection
     from nerve.onboarding_environment import InstanceFacts
 
 logger = logging.getLogger(__name__)
@@ -123,16 +127,20 @@ async def read_state(db: "Database", workspace: Path) -> OnboardingState:
     return OnboardingState(PENDING, None, stored, kind)
 
 
-def _prompt_inputs(workspace: Path, mode: str) -> tuple[str, str]:
-    """The worker's description and guide for the prompt. Blocking file I/O.
+def _prompt_inputs(workspace: Path, mode: str) -> "tuple[str, str, WorkSelection | None]":
+    """The worker's description, guide and work selection for the prompt.
+    Blocking file I/O.
 
-    A worker without ``TASK.md``, or with the raw ``# Task`` file of an older
+    The description is the ``TASK.md`` section as written; the selection is
+    what it holds (:func:`nerve.setup_writer.work_selection_from`: the Mode
+    step's catalog items, custom work and rules, or a free-text note). A
+    worker without ``TASK.md``, or with the raw ``# Task`` file of an older
     install, gets the template first, so the agent fills it in place.
     """
     from nerve.workspace import read_worker_guide
 
     if mode != "worker":
-        return "", ""
+        return "", "", None
     path = _task_md(workspace)
     try:
         raw = path.read_text(encoding="utf-8")
@@ -141,7 +149,7 @@ def _prompt_inputs(workspace: Path, mode: str) -> tuple[str, str]:
     description = task_description_from(raw) or "" if raw else ""
     if TASK_ONBOARDING_MARKER not in raw and (not raw or task_onboarding_pending(raw)):
         publish_text(path, render_task_md(description))
-    return description, read_worker_guide()
+    return description, read_worker_guide(), work_selection_from(description)
 
 
 async def _instance_facts(engine: "AgentEngine", workspace: Path) -> "InstanceFacts | None":
@@ -232,7 +240,7 @@ async def start(
             session_id, title=SESSION_TITLE, source=source, actor=actor, cause=cause,
         )
     mode = workspace_mode(Path(workspace)) or "personal"
-    description, guide = await asyncio.to_thread(_prompt_inputs, workspace, mode)
+    description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
         # The first turn calls no tool before its message: Nerve hands the
@@ -242,9 +250,12 @@ async def start(
             mode, description, guide, person_name=name,
             environment=facts.section if facts else "",
             github_access=facts.github_access if facts else "",
+            work=work,
             memory_backend=engine.config.memory.backend,
         )
     else:
+        # The description as written: a free-text one from ``nerve init``,
+        # or the Mode step's selection (its lines name the work).
         prompt = worker_onboarding_prompt(description, guide, engine.config.memory.backend)
 
     async def _first_turn() -> None:
@@ -300,6 +311,19 @@ def _task_description(workspace: Path) -> str:
     return (task_description_from(text) or "").strip()
 
 
+def _describes_work(workspace: Path) -> bool:
+    """A worker's pending ``TASK.md`` names work to set up. Blocking file I/O.
+
+    A free-text description does; a Mode step selection does with catalog
+    items or custom work, and not with rules alone.
+    """
+    description = _task_description(workspace)
+    if not description:
+        return False
+    work = work_selection_from(description)
+    return work.free_text or bool(work.items or work.custom)
+
+
 async def request_autonomous(db: "Database", workspace: Path) -> bool:
     """Ask the next daemon start for the autonomous onboarding. True when asked.
 
@@ -309,7 +333,7 @@ async def request_autonomous(db: "Database", workspace: Path) -> bool:
     """
     if workspace_mode(Path(workspace)) != "worker":
         return False
-    if not await asyncio.to_thread(_task_description, workspace):
+    if not await asyncio.to_thread(_describes_work, workspace):
         return False
     return await db.set_onboarding(
         REQUESTED, session_id=None, actor_id=None, expect=(None, None), kind=AUTONOMOUS,

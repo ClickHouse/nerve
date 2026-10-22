@@ -4,6 +4,7 @@ cross-session-stable system prompt, and renders the per-session preamble
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,19 @@ from zoneinfo import ZoneInfo
 
 from nerve.agent.tools import build_default_registry
 from nerve.memory import loom_prompts
+from nerve.onboarding_catalog import (
+    CATALOG,
+    GROUP_LABELS,
+    GROUPS,
+    PERSONAL_ASSISTANT,
+    SHARED_ACCOUNT,
+    SHARED_APPROVAL,
+    SHARED_DESTINATION,
+    SHARED_QUESTIONS,
+    WorkItem,
+    WorkSelection,
+    in_catalog_order,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,21 +256,14 @@ def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: 
 
 # --- The onboarding conversation's prompt -----------------------------------
 
-# What the agent offers in its first message, in this order. A personal
-# install moves the personal-assistant item to the top. The list is offered
-# when the agent knows no work yet: no note, or a note with only rules or
-# only targets.
-ONBOARDING_OFFERS = (
-    "Pick up an issue, fix the bug, open a PR, and follow it all the way to deployment",
-    "Hunt down flaky CI tests and propose fixes",
-    "Detect, investigate, and fix performance regressions",
-    "Review PRs",
-    "Watch alerts and do the first round of digging",
-    "Handle security notices and dependency bumps",
-    "Read busy Slack channels and post summaries",
-    "Competitor and product research",
-    "Personal assistant: inbox triage, reminders, planning your week",
-)
+# What the agent can offer in its first message: the work catalog's labels
+# (:mod:`nerve.onboarding_catalog`, the Mode step's checkboxes), then the
+# personal assistant. The list is offered when the agent knows no work yet:
+# nothing chosen at setup, only rules, or a free-text note with only rules or
+# only targets. It is offered by group, each item with its one-line
+# description (:func:`_offer_menu`); a personal install leads with the
+# personal assistant, and a worker's list leaves it out.
+ONBOARDING_OFFERS = tuple(item.label for item in CATALOG) + (PERSONAL_ASSISTANT,)
 
 # The first message without a description: the person names the work.
 _FIRST_MESSAGE_OFFERS = """\
@@ -265,6 +272,54 @@ _FIRST_MESSAGE_OFFERS = """\
 {greet}. In two or three sentences, say that you are set up by talking to \
 you, now and at any time later. Then offer this list, as it is, and ask which \
 items apply; they can choose more than one, or describe something else:
+
+{offers}
+
+Change nothing in this first message.
+"""
+
+# The first message when the work was chosen at setup (catalog items, custom
+# work or both): no menu, the work starts at once, explained before anything
+# is asked. ``{questions}`` names the list the first questions come from;
+# ``{unclear}`` is for custom work without items, whose words may name no work.
+_FIRST_MESSAGE_CHOSEN = """\
+## Your first message
+
+The work was chosen at setup: offer no menu, and do not ask again what was \
+chosen. Write the message text first, before any tool call:
+
+1. {greet}.
+2. Restate the work as you understand it, in one sentence.
+3. Say in one line what the explorer will study (step 1 below), or that it \
+starts as soon as the targets are named.
+4. In two to four lines, sketch how you intend to set this up (for example a \
+scan job that finds new pull requests, a review job gated on a tag, review \
+comments as drafts the person approves) and why the questions that follow \
+matter.
+
+Then start the explorer on the targets setup names, if any, and ask your \
+first questions with `AskUserQuestion` (step 2 below){questions}. The first \
+round asks for the targets still missing (which repositories, which \
+channels), so that the explorer can start on them.
+{unclear}"""
+
+_CHOSEN_FROM_LIST = ", from the list above"
+_CHOSEN_UNCLEAR = """
+When what was written names no work you can start on (only targets, or only \
+rules), ask in this message what the work is; still offer no menu, because \
+the person saw the list of work at setup.
+"""
+
+# The first message when only rules were given at setup: no work is known, so
+# the list is offered, and the rules carry into the plan.
+_FIRST_MESSAGE_RULES_ONLY = """\
+## Your first message
+
+Nothing was ticked at setup, only rules. {greet}, say in one sentence that \
+you noted the rules, and in two or three sentences say that you are set up by \
+talking to you, now and at any time later. Then offer this list, as it is, \
+and ask which items apply; they can choose more than one, or describe \
+something else:
 
 {offers}
 
@@ -357,9 +412,9 @@ when nothing waits".
 no feature tour. Pitch nothing that setup already configured (channels, \
 sources, quiet hours, memory) and nothing this work does not need.
 - Optional extras go only into the plan's last section, "Later, if you \
-want": at most three one-liners, and none of them an item of the first \
-message's list that the person saw and did not choose. Outside it, pitch \
-nothing.
+want": at most three one-liners, and none of them a kind of work from the \
+list that the person saw, at setup or in your first message, and did not \
+choose. Outside it, pitch nothing.
 """
 
 _EXPLORE_STEP = """\
@@ -497,8 +552,9 @@ kind of wait, such as a PR in review. One tag for each kind of work, so that \
 each job selects its own tasks.
 - **Skills**: one for each procedure that runs repeatedly.
 - **What I will remember**: what you will `memorize`.
-- **What I need from you**: access to grant, accounts to create, decisions \
-left open; each becomes a task.
+- **What I need from you**: access to grant, accounts to create, a \
+connection the work needs that this instance lacks, decisions left open; each \
+becomes a task.
 - **Approval boundaries**: what you do on your own, and what waits for the \
 person.
 - **Later, if you want**: optional; at most three one-liners.
@@ -586,8 +642,8 @@ This agent is a worker. `<workspace>/TASK.md` (already in your system prompt) \
 is the worker template. Fill it when you apply the setup (step 4):
 
 - Keep every `##` heading in its order. Under `## Task description (as \
-given)`, keep what the operator wrote at setup; when it is empty, write the \
-work the person described in this conversation.
+given)`, keep what setup recorded there; when it is empty, write the work the \
+person described in this conversation.
 - Replace each `_(onboarding fills this in: …)_` placeholder and every \
 `Example:` line; the guide's anatomy table says what belongs in each section.
 - Hard rules: one `### ⛔ HARD RULE: <one sentence> [operator directive \
@@ -605,9 +661,95 @@ you propose the setup.
 """
 
 
+def _menu_line(item: WorkItem) -> str:
+    return f"- {item.label} — {item.description}" + (f" {item.note}" if item.note else "")
+
+
+def _offer_menu(worker: bool) -> str:
+    """The list a first message offers: the catalog by group, each item with
+    its description; a personal install leads with the personal assistant,
+    which a worker's list leaves out."""
+    blocks = [] if worker else [f"- {PERSONAL_ASSISTANT}"]
+    for group in GROUPS:
+        items = [_menu_line(item) for item in CATALOG if item.group == group]
+        blocks.append("\n".join([f"**{GROUP_LABELS[group]}**", *items]))
+    return "\n\n".join(blocks)
+
+
+def _quote(text: str) -> str:
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in text.strip().splitlines())
+
+
+def _settle_list(items: tuple[WorkItem, ...]) -> str:
+    """The questions the chosen items raise: the shared ones once, then each
+    item's own, as the list the conversation's questions come from."""
+    shared = [SHARED_APPROVAL, SHARED_DESTINATION]
+    if any(item.needs == "github" for item in items):
+        shared.insert(0, SHARED_ACCOUNT)
+    blocks = ["For all of the work, once:\n" + _bullets([SHARED_QUESTIONS[key] for key in shared])]
+    for item in items:
+        own = [f.text for f in item.follow_ups if f.shared is None]
+        if own:
+            blocks.append(f"{item.label}:\n" + _bullets(own))
+    return "\n\n".join(blocks)
+
+
+def _bullets(lines: list[str]) -> str:
+    return "\n".join(f"- {line}{'.' if n == len(lines) else ';'}" for n, line in enumerate(lines, 1))
+
+
+def _chosen_section(work: WorkSelection, who: str) -> str:
+    """``## What the operator chose at setup``: the ticked items with what
+    each does and needs, the custom work, the rules, how to use them, and
+    the questions the items raise."""
+    items = work.chosen
+    parts = [f"## What the {who} chose at setup"]
+    if items:
+        parts.append("Work:\n" + "\n".join(
+            f"- {item.label} — {item.description} {item.needs_text}" for item in items
+        ))
+    else:
+        parts.append("Nothing was ticked in the list of work Nerve offers.")
+    if work.custom:
+        parts.append(f"Also:\n{_quote(work.custom)}")
+    if work.rules:
+        parts.append(f"Must know or never do:\n{_quote(work.rules)}")
+    use = []
+    if items:
+        use.append(
+            f"The {who} ticked these in the list of work Nerve offers"
+            + (" and added what follows Also." if work.custom else ".")
+        )
+    elif work.custom:
+        use.append(f"What follows Also is the work, in the {who}'s words.")
+    if items or work.custom:
+        use.append("In the explorer's brief, [the work items] are this work.")
+    if items:
+        use.append(
+            "When this instance lacks the connection an item needs, the plan names it "
+            "under What I need from you."
+        )
+    if work.rules:
+        use.append(
+            'The rules under "Must know or never do" become hard rules and approval '
+            "boundaries in the plan. When an answer seems to loosen one, keep the rule "
+            "and ask about it in one line."
+        )
+    parts.append(" ".join(use))
+    if items:
+        parts.append(
+            "Your questions in step 2 come from this list. Ask only what neither setup, "
+            "the facts about this instance nor the explorer's findings answer; one "
+            "question covers what several items share (which repositories, how often); "
+            "what does not fit into two rounds goes into the plan as your recommended "
+            "default, for the person to change.\n\n" + _settle_list(items)
+        )
+    return "\n\n".join(parts)
+
+
 def onboarding_prompt(
     mode: str, task_description: str = "", guide: str = "", person_name: str = "",
-    *, environment: str = "", github_access: str = "",
+    *, environment: str = "", github_access: str = "", work: WorkSelection | None = None,
     memory_backend: str = "memu",
 ) -> str:
     """The hidden first message of the onboarding conversation.
@@ -621,24 +763,36 @@ def onboarding_prompt(
 
     ``environment`` is the ``## This instance`` section of
     :func:`nerve.onboarding_environment.gather`: what is configured and from
-    where, the GitHub login when the CLI is authenticated. It follows the
-    note (before the first message), with the rules that make its lines
-    facts: never asked about, never checked again before the first message,
-    a known login offered as the recommended account. ``github_access`` is
-    that build's line for the explorer's brief; both are ignored without
-    ``environment``.
+    where, the GitHub login when the CLI is authenticated. It follows what
+    the operator chose or wrote at setup (before the first message), with the
+    rules that make its lines facts: never asked about, never checked again
+    before the first message, a known login offered as the recommended
+    account. ``github_access`` is that build's line for the explorer's brief;
+    both are ignored without ``environment``.
 
-    The description of the work (a worker's note from the Mode step) decides
-    the first message: without one, the agent offers
-    :data:`ONBOARDING_OFFERS` and asks what to do; with one that describes
-    work, it explains first (restates the work, names what the explorer
-    studies, sketches the setup it intends), then starts a background explorer
-    and asks its first questions in the same turn. A note that names no work
-    (only rules or only targets) still gets the list, and the note carries
-    into the plan. The steps after it are shared: explore in the background
-    (read only), ask with ``AskUserQuestion`` after explaining, propose the
-    setup as a native plan (``EnterPlanMode`` … ``ExitPlanMode``), apply,
-    summarize, ``onboarding_done``.
+    What setup recorded about the work decides the first message:
+
+    - ``work``, the Mode step's selection
+      (:func:`nerve.setup_writer.work_selection_from`), with catalog items or
+      custom work: the section "What the operator chose at setup" (each item
+      with what it does and needs, the custom work, the rules, and the
+      questions the items raise, the shared ones once), and a first message
+      without a menu that explains first (restates the work, names what the
+      explorer studies, sketches the setup it intends), then starts a
+      background explorer and asks its first questions in the same turn.
+    - ``work`` with only rules: the same section, the list (by group, with
+      descriptions; :func:`_offer_menu`), and the rules carried into the plan.
+    - ``task_description``, a free-text note (an older client, ``nerve init
+      --terminal``; ``work`` without items, custom work or rules, or a
+      free-text ``work``, defers to it): "What the operator wrote at setup",
+      and a first message that starts on the work when the note describes
+      some, else offers the list and carries the note into the plan.
+    - Nothing: the list, and the question what to do.
+
+    The steps after it are shared: explore in the background (read only),
+    ask with ``AskUserQuestion`` after explaining, propose the setup as a
+    native plan (``EnterPlanMode`` … ``ExitPlanMode``), apply, summarize,
+    ``onboarding_done``.
 
     A worker's prompt also carries its description (or a line that none was
     given), the ``TASK.md`` rules and ``guide``, the worker guide in full
@@ -649,8 +803,17 @@ def onboarding_prompt(
     """
     worker = mode == "worker"
     description = task_description.strip()
+    if work is not None and work.free_text and not description:
+        description = work.custom.strip()
+    if work is not None and not work.free_text:
+        # Ids the catalog does not know are left out, as when TASK.md is read.
+        work = dataclasses.replace(
+            work, items=in_catalog_order(work.items), custom=work.custom.strip(), rules=work.rules.strip(),
+        )
+    chosen = work if work is not None and not work.free_text and not work.empty else None
     name = " ".join((person_name or "").split())[:80]
     kind = "a worker for a team" if worker else "a personal assistant"
+    who = "operator" if worker else "person"
     parts = [
         "This is the **onboarding conversation** of this Nerve agent, which is "
         f"set up as {kind}. The person who set it up opens this chat. They do "
@@ -661,21 +824,24 @@ def onboarding_prompt(
         "precedes it, and everything that message needs is in your system "
         "prompt and in this message.",
     ]
-    if worker or description:
-        quoted = "\n".join(
-            f"> {line}" if line.strip() else ">" for line in description.splitlines()
-        ) or "> (no description was given at setup)"
-        who = "operator" if worker else "person"
+    if chosen is not None:
+        parts.append(_chosen_section(chosen, who))
+    elif worker or description:
+        quoted = _quote(description) or "> (no description was given at setup)"
         parts.append(f"## What the {who} wrote at setup\n\n{quoted}")
     facts = environment.strip()
     if facts:
         parts.append(f"{facts}\n\n{_ENVIRONMENT_RULES}")
-    offers = list(ONBOARDING_OFFERS)
-    if not worker:
-        offers.insert(0, offers.pop())
-    first = _FIRST_MESSAGE_DESCRIBED if description else _FIRST_MESSAGE_OFFERS
+    if chosen is not None and (chosen.items or chosen.custom):
+        first = _FIRST_MESSAGE_CHOSEN.replace(
+            "{questions}", _CHOSEN_FROM_LIST if chosen.items else "",
+        ).replace("{unclear}", "" if chosen.items else _CHOSEN_UNCLEAR)
+    elif chosen is not None:
+        first = _FIRST_MESSAGE_RULES_ONLY
+    else:
+        first = _FIRST_MESSAGE_DESCRIBED if description else _FIRST_MESSAGE_OFFERS
     parts.append(
-        first.replace("{offers}", "\n".join(f"- {item}" for item in offers))
+        first.replace("{offers}", _offer_menu(worker))
         .replace("{greet}", "Greet the person by name" if name else "Greet the person without a name")
     )
     access = " ".join(github_access.split()) if facts else ""

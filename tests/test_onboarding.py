@@ -30,6 +30,15 @@ from nerve.agent.prompts import (
 from nerve.agent.tools.handlers.onboarding import onboarding_done_handler
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig
+from nerve.onboarding_catalog import (
+    CATALOG,
+    GROUP_LABELS,
+    GROUPS,
+    ITEMS,
+    PERSONAL_ASSISTANT,
+    SHARED_QUESTIONS,
+    WorkSelection,
+)
 from nerve.onboarding_environment import InstanceFacts
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
@@ -37,7 +46,9 @@ from nerve.setup_writer import (
     list_optional_crons,
     plan_optional_crons,
     render_task_md,
+    render_work_description,
     system_cron_file,
+    work_selection_from,
 )
 from nerve.identity import ACTOR_KIND_HUMAN, Actor
 from nerve.workspace import read_worker_guide
@@ -45,6 +56,11 @@ from tests.actor_rows import ensure_actor_row, ensure_system_principal
 
 DESCRIPTION = "Watch the nightly build for example/repo and propose fixes."
 PERSONAL_ITEM = ONBOARDING_OFFERS[-1]
+LABELS = [item.label for item in CATALOG]
+# What the Mode step's checkboxes chose: two items, custom work and rules.
+CHOSEN = WorkSelection(
+    items=("review-prs", "triage-issues"), custom="also watch the release branch", rules="never merge anything",
+)
 ALICE = Actor(
     actor_id="11111111-2222-4333-8444-555555555555", kind=ACTOR_KIND_HUMAN, display_name="Alice Example",
 )
@@ -165,7 +181,31 @@ def _names_no_work(prompt: str) -> str:
 
 
 def _offered(text: str) -> list[str]:
-    return [line[2:] for line in text.splitlines() if line[2:] in ONBOARDING_OFFERS]
+    """The labels of the list's items in ``text``, in order (``- <label> — <description>``)."""
+    labels = [line[2:].split(" — ", 1)[0] for line in text.splitlines() if line.startswith("- ")]
+    return [label for label in labels if label in ONBOARDING_OFFERS]
+
+
+def _menu(mode: str) -> list[str]:
+    """The list a first message offers: a personal install leads with the
+    personal assistant; a worker's list leaves it out."""
+    return LABELS if mode == "worker" else [PERSONAL_ITEM, *LABELS]
+
+
+def _groups(text: str) -> dict[str, str]:
+    """Each offered label and the group heading above it."""
+    heading, found = None, {}
+    for line in text.splitlines():
+        if line.startswith("**") and line.endswith("**"):
+            heading = line.strip("*")
+        elif line.startswith("- ") and heading:
+            found[line[2:].split(" — ", 1)[0]] = heading
+    return found
+
+
+def _chosen(prompt: str) -> str:
+    """The section with what the operator chose at setup."""
+    return _between(prompt, "## What the operator chose at setup", "\n## ")
 
 
 def _shared(prompt: str) -> str:
@@ -182,11 +222,23 @@ class TestPrompt:
     steps after it are shared."""
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
-    def test_without_a_description_the_first_message_offers_the_whole_list(self, mode):
+    def test_without_a_description_the_first_message_offers_the_catalog_by_group(self, mode):
+        """The work catalog (the Mode step's checkboxes), by group in the
+        catalog's order, each item with its one-line description."""
         prompt = onboarding_prompt(mode, "", GUIDE)
         first = _first_message(prompt)
-        for item in ONBOARDING_OFFERS:
-            assert f"\n- {item}\n" in first, item
+        assert _offered(first) == _menu(mode)
+        for item in CATALOG:
+            assert f"\n- {item.label} — {item.description}" in first, item.id
+            assert _groups(first)[item.label] == GROUP_LABELS[item.group], item.id
+        headings = [first.index(f"\n**{GROUP_LABELS[group]}**\n") for group in GROUPS]
+        assert headings == sorted(headings)
+        # The alert item carries the connection it needs.
+        assert (
+            "- First response to alerts — Reads where alerts land, does the first investigation, "
+            "posts findings, escalates by rule. Needs an alert source; a Slack channel is the "
+            "first-class one today.\n"
+        ) in first
         for part in (
             "Greet the person without a name. In two or three sentences",
             "say that you are set up by talking to you, now and at any time later",
@@ -196,17 +248,22 @@ class TestPrompt:
             assert part in first, part
         assert "Restate the work" not in prompt
         assert "you speak first" in prompt
+        assert "chose at setup" not in prompt
 
     def test_a_personal_install_leads_with_the_personal_assistant(self):
+        """The personal assistant is a personal install's menu item only: first
+        there, absent from a worker's list (and from the catalog)."""
         lines = [line for line in onboarding_prompt("personal").splitlines() if line.startswith("- ")]
         assert lines[0] == f"- {PERSONAL_ITEM}"
+        assert PERSONAL_ITEM == PERSONAL_ASSISTANT and PERSONAL_ITEM not in LABELS
         assert "Worker Best Practices" not in onboarding_prompt("personal")
         assert "## TASK.md" not in onboarding_prompt("personal")
-        worker = [
-            line for line in onboarding_prompt("worker", "", GUIDE).splitlines()
-            if line.startswith("- ") and line[2:] in ONBOARDING_OFFERS
-        ]
-        assert worker == [f"- {item}" for item in ONBOARDING_OFFERS]
+        worker = onboarding_prompt("worker", "", GUIDE)
+        assert _offered(_first_message(worker)) == LABELS
+        assert PERSONAL_ITEM not in worker
+
+    def test_the_offers_are_the_catalog_labels_and_the_personal_assistant(self):
+        assert ONBOARDING_OFFERS == (*LABELS, PERSONAL_ASSISTANT)
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
     def test_a_note_that_describes_work_is_explained_before_anything_is_asked(self, mode):
@@ -240,7 +297,8 @@ class TestPrompt:
         prompt = onboarding_prompt(mode, DESCRIPTION, GUIDE)
         no_work = _names_no_work(prompt)
         assert _offered(no_work) == _offered(_first_message(onboarding_prompt(mode, "", GUIDE)))
-        assert len(_offered(no_work)) == len(ONBOARDING_OFFERS)
+        assert _offered(no_work) == _menu(mode)
+        assert _groups(no_work) == _groups(_first_message(onboarding_prompt(mode, "", GUIDE)))
         for part in (
             'only rules, such as "never merge anything"', 'only targets, such as "org/repo-a"',
             "offer the list. Greet the person without a name, say in one sentence what you noted",
@@ -411,8 +469,10 @@ class TestPrompt:
             "never list what you can do in general: no menu, no feature tour",
             "Pitch nothing that setup already configured (channels, sources, quiet hours, memory)",
             'the plan\'s last section, "Later, if you want": at most three one-liners',
-            # No re-offer of the menu items the person passed over.
-            "none of them an item of the first message's list that the person saw and did not choose",
+            # No re-offer of the kinds of work the person passed over, in
+            # the Mode step's checkboxes or in the first message's list.
+            "none of them a kind of work from the list that the person saw, at setup or in your "
+            "first message, and did not choose",
             "Outside it, pitch nothing",
         ):
             assert part in features, part
@@ -532,6 +592,181 @@ class TestPrompt:
         assert _shared(prompt) == _shared(onboarding_prompt(mode, "", GUIDE, **WITH_FACTS))
 
 
+class TestChosenWork:
+    """The Mode step's selection (catalog items, custom work, rules) in the
+    hidden first message: what was chosen, with the questions it raises, and
+    no menu; with only rules, the menu and the rules carried."""
+
+    def test_chosen_items_with_their_questions_and_no_menu(self):
+        prompt = onboarding_prompt("worker", "", GUIDE, person_name="Alice Example", work=CHOSEN)
+        chosen = _chosen(prompt)
+        assert "wrote at setup" not in prompt
+        assert prompt.index("## What the operator chose at setup") < prompt.index("## Your first message")
+        # Each chosen item: what it does and what it needs.
+        work = _between(chosen, "Work:\n", "\n\n")
+        assert work.splitlines() == [
+            "- Review pull requests — Reads diffs, runs targeted checks, posts review comments. "
+            "Needs GitHub access.",
+            "- Triage issues — Labels, finds duplicates, asks reporters for missing info, routes, "
+            "flags stale. Needs GitHub access.",
+        ]
+        assert "Also:\n> also watch the release branch\n" in chosen
+        assert "Must know or never do:\n> never merge anything\n" in chosen
+        for part in (
+            "The operator ticked these in the list of work Nerve offers and added what follows Also",
+            "In the explorer's brief, [the work items] are this work",
+            # A connection the instance lacks is named in the plan.
+            "When this instance lacks the connection an item needs, the plan names it under What I need from you",
+            # Rules become hard rules and approval boundaries, never loosened.
+            'The rules under "Must know or never do" become hard rules and approval boundaries in the plan',
+            "When an answer seems to loosen one, keep the rule and ask about it in one line",
+            # The list the questions come from, bounded by the two rounds.
+            "Your questions in step 2 come from this list",
+            "Ask only what neither setup, the facts about this instance nor the explorer's findings answer",
+            "one question covers what several items share",
+            "what does not fit into two rounds goes into the plan as your recommended default",
+        ):
+            assert part in _flat(chosen), part
+        # The first message: no menu, the work explained before anything is asked.
+        first = _first_message(prompt)
+        assert not _offered(first) and "**Code**" not in prompt
+        steps = [
+            "offer no menu, and do not ask again what was chosen",
+            "Write the message text first, before any tool call",
+            "1. Greet the person by name.",
+            "2. Restate the work as you understand it, in one sentence",
+            "3. Say in one line what the explorer will study (step 1 below)",
+            "4. In two to four lines, sketch how you intend to set this up",
+            "ask your first questions with `AskUserQuestion` (step 2 below), from the list above",
+            "The first round asks for the targets still missing (which repositories, which channels)",
+        ]
+        positions = [_flat(first).index(step) for step in steps]
+        assert positions == sorted(positions)
+        assert "When what was written names no work" not in first
+        # The steps after the first message are the shared ones.
+        assert _shared(prompt) == _shared(onboarding_prompt("worker", "", GUIDE))
+
+    def test_shared_questions_come_once_and_each_item_brings_its_own(self):
+        chosen = _chosen(onboarding_prompt("worker", "", GUIDE, work=CHOSEN))
+        once = _between(chosen, "For all of the work, once:\n", "\n\n").splitlines()
+        assert once == [
+            f"- {SHARED_QUESTIONS['account']};",
+            f"- {SHARED_QUESTIONS['approval']};",
+            f"- {SHARED_QUESTIONS['destination']}.",
+        ]
+        assert chosen.count("For all of the work, once:") == 1
+        for item_id in CHOSEN.items:
+            item = ITEMS[item_id]
+            block = _between(chosen, f"\n{item.label}:\n").split("\n\n", 1)[0]
+            own = [f.text for f in item.follow_ups if f.shared is None]
+            assert [line[2:].rstrip(";.") for line in block.splitlines()] == own, item_id
+        # A follow-up that is a shared question is not repeated per item.
+        for item_id in CHOSEN.items:
+            for follow_up in ITEMS[item_id].follow_ups:
+                if follow_up.shared:
+                    assert follow_up.text not in chosen, follow_up.text
+
+    def test_the_account_question_only_for_work_on_github(self):
+        chosen = _chosen(onboarding_prompt("worker", "", GUIDE, work=WorkSelection(
+            items=("channel-digests", "research-reports"),
+        )))
+        once = _between(chosen, "For all of the work, once:\n", "\n\n")
+        assert SHARED_QUESTIONS["account"] not in chosen
+        assert SHARED_QUESTIONS["approval"] in once and SHARED_QUESTIONS["destination"] in once
+        assert "where to post" not in chosen and "where reports go" not in chosen
+        assert "Needs a Slack or Telegram connection." in chosen and "Needs web access." in chosen
+        alerts = _chosen(onboarding_prompt("worker", "", GUIDE, work=WorkSelection(items=("alert-response",))))
+        assert "Needs an alert source; a Slack channel is the first-class one today." in alerts
+
+    def test_custom_work_alone_is_the_work_without_a_menu(self):
+        work = WorkSelection(custom="Watch the release notes of org/repo-a.\nSummarize them weekly.")
+        prompt = onboarding_prompt("worker", "", GUIDE, work=work)
+        chosen = _chosen(prompt)
+        assert "Nothing was ticked in the list of work Nerve offers." in chosen
+        assert "Also:\n> Watch the release notes of org/repo-a.\n> Summarize them weekly." in chosen
+        assert "What follows Also is the work, in the operator's words" in chosen
+        assert "Work:" not in chosen and "For all of the work, once:" not in chosen
+        assert "Must know" not in chosen
+        first = _flat(_first_message(prompt))
+        assert not _offered(first) and "offer no menu" in first
+        assert "(step 2 below). The first round asks for the targets still missing" in first
+        # Words that name no work: ask what the work is, still without a menu.
+        assert (
+            "When what was written names no work you can start on (only targets, or only rules), "
+            "ask in this message what the work is; still offer no menu, because the person saw "
+            "the list of work at setup"
+        ) in first
+
+    def test_rules_alone_get_the_menu_and_carry_the_rules(self):
+        prompt = onboarding_prompt("worker", "", GUIDE, work=WorkSelection(rules="Never merge anything."))
+        chosen = _chosen(prompt)
+        assert "Nothing was ticked in the list of work Nerve offers." in chosen
+        assert "Must know or never do:\n> Never merge anything." in chosen
+        assert "become hard rules and approval boundaries in the plan" in chosen
+        assert "Also:" not in chosen and "explorer's brief" not in chosen
+        first = _first_message(prompt)
+        assert _offered(first) == LABELS
+        assert _groups(first) == _groups(_first_message(onboarding_prompt("worker", "", GUIDE)))
+        for part in (
+            "Nothing was ticked at setup, only rules. Greet the person without a name, "
+            "say in one sentence that you noted the rules",
+            "say that you are set up by talking to you, now and at any time later",
+            "offer this list, as it is, and ask which items apply",
+            "Change nothing in this first message.",
+        ):
+            assert part in _flat(first), part
+        assert "Restate the work" not in first
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_nothing_chosen_is_no_description(self, mode):
+        bare = onboarding_prompt(mode, "", GUIDE)
+        assert onboarding_prompt(mode, "", GUIDE, work=WorkSelection()) == bare
+        assert onboarding_prompt(mode, "", GUIDE, work=work_selection_from(None)) == bare
+        assert onboarding_prompt(mode, "", GUIDE, work=WorkSelection(custom=" \n ", rules="\t")) == bare
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_a_free_text_note_keeps_what_was_written(self, mode):
+        """A note from an older client or ``nerve init --terminal`` is no
+        selection: the prompt is the one for the description, either way it
+        is handed over."""
+        note = work_selection_from(DESCRIPTION)
+        assert note.free_text and note.custom == DESCRIPTION
+        written = onboarding_prompt(mode, DESCRIPTION, GUIDE)
+        assert onboarding_prompt(mode, "", GUIDE, work=note) == written
+        assert onboarding_prompt(mode, DESCRIPTION, GUIDE, work=note) == written
+
+    def test_the_selection_wins_over_a_description(self):
+        assert onboarding_prompt("worker", DESCRIPTION, GUIDE, work=CHOSEN) == onboarding_prompt(
+            "worker", "", GUIDE, work=CHOSEN,
+        )
+
+    def test_unknown_items_are_left_out(self):
+        known = onboarding_prompt("worker", "", GUIDE, work=WorkSelection(items=("review-prs",)))
+        assert onboarding_prompt(
+            "worker", "", GUIDE, work=WorkSelection(items=("no-such-work", "review-prs", "review-prs")),
+        ) == known
+        assert onboarding_prompt("worker", "", GUIDE, work=WorkSelection(items=("no-such-work",))) == (
+            onboarding_prompt("worker", "", GUIDE)
+        )
+
+    def test_the_facts_follow_what_was_chosen(self):
+        """``## This instance`` comes after the chosen work, before the first
+        message; taking it away leaves the prompt without facts."""
+        prompt = onboarding_prompt("worker", "", GUIDE, work=CHOSEN, **WITH_FACTS)
+        assert (
+            prompt.index("## What the operator chose at setup") < prompt.index("## This instance")
+            < prompt.index("## Your first message")
+        )
+        block = "## This instance" + _between(prompt, "## This instance", "## Your first message")
+        rest = prompt.replace(block, "", 1).replace(FACTS.github_access + "\n\n", "", 1)
+        assert rest == onboarding_prompt("worker", "", GUIDE, work=CHOSEN)
+
+    def test_a_personal_install_has_no_worker_parts_with_a_selection(self):
+        prompt = onboarding_prompt("personal", "", "", work=WorkSelection(items=("research-reports",)))
+        assert "## What the person chose at setup" in prompt
+        assert "## TASK.md" not in prompt and "Worker Best Practices" not in prompt
+
+
 @pytest.mark.asyncio
 class TestState:
     async def test_no_mode_is_not_applicable(self, db, tmp_path):
@@ -631,15 +866,36 @@ class TestStart:
         assert message == onboarding_prompt("worker", DESCRIPTION, read_worker_guide(), **WITH_FACTS)
         assert "Restate the work as you understand it" in message
         assert not _offered(_describes_work(message))
-        assert _offered(_names_no_work(message)) == list(ONBOARDING_OFFERS)
+        assert _offered(_names_no_work(message)) == LABELS
+        # A free-text note keeps its section: it is no selection.
+        assert f"## What the operator wrote at setup\n\n> {DESCRIPTION}" in message
+        assert "chose at setup" not in message
 
     async def test_a_worker_without_a_note_is_offered_the_list(self, db, tmp_path):
         apply_mode(tmp_path, "worker")
         engine = _engine(db)
         await onboarding.start(engine, tmp_path, actor=None, cause=None)
         message = (await _first_turn(engine))["user_message"]
-        assert all(f"- {item}" in message for item in ONBOARDING_OFFERS)
+        assert _offered(_first_message(message)) == LABELS
         assert "> (no description was given at setup)" in message
+
+    async def test_the_work_chosen_at_setup_opens_the_conversation(self, db, tmp_path):
+        """The Mode step's checkboxes, written to ``TASK.md`` and read back:
+        the conversation starts on the chosen work, with its questions."""
+        apply_mode(tmp_path, "worker", render_work_description(CHOSEN))
+        await ensure_actor_row(db, ALICE)
+        engine = _engine(db)
+        await onboarding.start(engine, tmp_path, actor=ALICE, cause=ALICE)
+        message = (await _first_turn(engine))["user_message"]
+        assert message == onboarding_prompt(
+            "worker", "", read_worker_guide(), person_name="Alice Example", work=CHOSEN, **WITH_FACTS,
+        )
+        chosen = _chosen(message)
+        assert "- Review pull requests — Reads diffs" in chosen and "- Triage issues — Labels" in chosen
+        assert "> also watch the release branch" in chosen and "> never merge anything" in chosen
+        assert "wrote at setup" not in message and not _offered(_first_message(message))
+        # TASK.md keeps the selection as written; the prompt only reads it.
+        assert work_selection_from(render_work_description(CHOSEN)) == CHOSEN
 
     async def test_the_agent_greets_the_person_who_finished_setup_by_name(self, db, tmp_path):
         """Finish passes the person as the cause; their display name goes into
@@ -769,6 +1025,25 @@ class TestBoot:
         assert not (await onboarding_done_handler(ctx, {})).is_error
         assert (await onboarding.read_state(db, tmp_path)).status == "done"
         assert TASK_ONBOARDING_MARKER not in (tmp_path / "TASK.md").read_text()
+
+    async def test_a_selection_that_names_work_is_a_description_for_the_autonomous_kind(self, db, tmp_path):
+        """A Mode step selection with items or custom work counts as the task
+        description (the session gets the section as written); rules alone
+        name no work, so the worker waits for the conversation."""
+        for name, work, describes in (
+            ("items", WorkSelection(items=("ci-health",)), True),
+            ("custom", WorkSelection(custom="Keep the build green."), True),
+            ("rules", WorkSelection(rules="Never merge anything."), False),
+        ):
+            apply_mode(tmp_path / name, "worker", render_work_description(work))
+            assert onboarding._describes_work(tmp_path / name) is describes, name
+        assert not await onboarding.request_autonomous(db, tmp_path / "rules")
+        assert await onboarding.request_autonomous(db, tmp_path / "items")
+        engine = _engine(db)
+        await onboarding.start_on_boot(engine, tmp_path / "items")
+        assert (await _first_turn(engine))["user_message"] == worker_onboarding_prompt(
+            render_work_description(WorkSelection(items=("ci-health",))), read_worker_guide(),
+        )
 
     async def test_a_worker_without_a_description_waits_for_the_conversation(self, db, tmp_path):
         """No task description, or an install from before the row: nothing
