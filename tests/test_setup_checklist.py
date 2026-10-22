@@ -239,7 +239,8 @@ class TestDoneRules:
 
     def test_sources_show_the_gateway_when_only_github_is_hosted(self, personal):
         """As the Channels step does for a hosted Slack; volatile, so outside
-        the etag."""
+        the etag. An open stream is not a connected GitHub: records also need
+        a GitHub credential connected to the agent, which Nerve cannot see."""
         hosted = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
         live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
 
@@ -249,7 +250,10 @@ class TestDoneRules:
         assert connected["detail"]["github"] == {
             "enabled": True, "source": None, "mode": "hosted", "gateway": live,
         }
-        assert connected["summary"] == "GitHub from the channel gateway · connected"
+        assert connected["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
         assert waiting["detail"]["github"]["gateway"] == {"streams": 0, "connected": False, "last_event_at": None}
         assert waiting["summary"] == "GitHub from the channel gateway · waiting for the gateway"
         assert connected["etag"] == waiting["etag"]
@@ -687,9 +691,10 @@ class TestGitHubSwitchHeldOnTheMachine:
         }
         assert s["status"] == "done" and s["read_only"] is False and s["read_only_reason"] is None
 
-    def test_the_summary_names_the_credential_while_no_stream_is_open(self, personal):
+    def test_the_summary_never_claims_a_connected_credential(self, personal):
         """Nerve cannot tell a credential that is not connected from a gateway
-        it cannot reach, so the waiting line names both."""
+        it cannot reach, so the waiting line names both. Once a stream is open
+        the line names the stream, and the credential stays a condition."""
         on = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
         waiting = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
         assert waiting["summary"] == (
@@ -698,8 +703,25 @@ class TestGitHubSwitchHeldOnTheMachine:
         )
         live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
         connected = step(facts(personal, on, machine_switches=GITHUB_HELD, hosted_gateway=live), "sources")
-        assert connected["summary"] == "GitHub from the channel gateway · connected"
+        assert connected["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
         assert connected["etag"] == waiting["etag"], "the gateway's state is volatile: never remounts the form"
+
+    def test_a_stream_a_hosted_slack_opens_is_not_a_connected_github(self, personal):
+        """The gateway's streams carry every hosted provider, so a hosted Slack
+        opens them whether or not a GitHub credential is connected to the
+        agent. The Channels step may say Slack is connected; the Sources step
+        names only the stream."""
+        config = cfg(personal, slack={"mode": "hosted"}, sync={"github": {"enabled": True, "mode": "hosted"}})
+        live = {"streams": 2, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+        f = facts(personal, config, machine_switches=GITHUB_HELD, hosted_gateway=live)
+        assert step(f, "channels")["summary"] == "Slack managed by the channel gateway · connected"
+        assert step(f, "sources")["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
 
     def test_without_local_secrets_nothing_is_on_offer_and_the_done_step_is_read_only(self, personal):
         on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})

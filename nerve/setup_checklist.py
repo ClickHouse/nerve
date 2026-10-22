@@ -162,6 +162,16 @@ GITHUB_GATEWAY_WAITING = (
     "waiting for the channel gateway — if no GitHub credential is connected to "
     "this agent yet, connect one where your operator manages it"
 )
+# The summary of a hosted GitHub once a gateway stream is open, whoever holds
+# its switch. An open stream says that the gateway is reachable, not that
+# GitHub records can arrive: the streams carry every hosted provider, so a
+# hosted Slack opens them too, and Nerve cannot see whether a GitHub
+# credential is connected to the agent. So the line names the stream and
+# keeps the credential a condition.
+GITHUB_STREAM_CONNECTED = (
+    "stream connected; records arrive once a GitHub credential is connected to "
+    "this agent"
+)
 MODE_LOCK_REASON = (
     "Mode was chosen when the workspace was created. Changing it means starting a "
     "new workspace: stop Nerve, point workspace: in config.yaml at an empty "
@@ -830,7 +840,7 @@ def _sources_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     on = []
     if sync.github.enabled and gateway is not None:
         if gateway.get("connected"):
-            on.append("GitHub from the channel gateway · connected")
+            on.append(f"GitHub from the channel gateway · {GITHUB_STREAM_CONNECTED}")
         elif github.get("managed"):
             on.append(f"GitHub · {GITHUB_GATEWAY_WAITING}")
         else:

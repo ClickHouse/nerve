@@ -187,9 +187,14 @@ running. Nerve reads them over the hosted channel streams.
   save that includes it (`409`, naming `github`); Gmail and Telegram work as
   before. Until a gateway stream opens, the step says that it is waiting for
   the channel gateway and that a GitHub credential may still need to be
-  connected: Nerve cannot tell those two cases apart. A `false` in either file
-  keeps GitHub off the same way. Without the key in either file, the Sources
-  step switches GitHub as before.
+  connected: Nerve cannot tell those two cases apart. Once a stream is open,
+  it says that the stream is connected and that records arrive once a GitHub
+  credential is connected to the agent, and never that GitHub is connected,
+  also when the page holds the switch: the streams carry every hosted
+  provider, so a hosted Slack opens them too, and Nerve cannot see whether a
+  credential is connected. A `false` in either file keeps GitHub off the same
+  way. Without the key in either file, the Sources step switches GitHub as
+  before.
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
