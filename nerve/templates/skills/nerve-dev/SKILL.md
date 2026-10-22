@@ -247,7 +247,7 @@ uv sync --locked --extra test
 # and fails if the two have drifted apart.
 uv lock && uv sync --locked --extra test
 
-# What CI runs on your new migrations (see Critical Rules)
+# What CI runs on your new migrations (see Critical Rules); a fork of Nerve adds --fork
 python3 scripts/check_migration_numbers.py origin/main
 
 # Health check of a running install
@@ -285,7 +285,7 @@ npm run dev                 # Vite dev server; proxies /api and /ws to localhost
 
 5. **Config layers:** `<workspace>/config/settings.yaml` (shareable, git-tracked with the workspace) < `config.yaml` (machine-local, gitignored) < `config.local.yaml` (secrets, gitignored). `config.example.yaml` is the committed example. Never put credentials in a tracked file — reference them as `${ENV_VAR}` or keep them in `config.local.yaml`. New keys go in the dataclasses in `nerve/config.py` and in the `docs/config.md` table, with their layer and whether they hot-reload.
 
-6. **Database migrations:** each migration is a numbered Python file in `nerve/db/migrations/` (`vNNN_your_feature.py`) exporting `async def up(db)`. `SCHEMA_VERSION` is derived from the highest file number. Number a new migration **above the highest version on `main`** — the runner skips versions at or below the database's current one, so a lower number never runs on an already-migrated database. CI enforces this with `scripts/check_migration_numbers.py`; gaps in the sequence are fine, renumbering an existing migration is not. **Forks add migrations only under `fork/`** (`nerve/db/migrations/fork/`). They are numbered from `v001`, apart from upstream's numbers, and recorded in their own `fork_schema_version` table, so a fork's migration never shadows an upstream one. Never add a fork's migration to the upstream track, and upstream never ships a fork migration. No transaction wraps a migration, so make each one idempotent. A database newer than the code on either track refuses to start (override only deliberately with `NERVE_ALLOW_NEWER_SCHEMA=1`).
+6. **Database migrations:** each migration is a numbered Python file in `nerve/db/migrations/` (`vNNN_your_feature.py`) exporting `async def up(db)`. `SCHEMA_VERSION` is derived from the highest file number. Number a new migration **above the highest version on `main`** — the runner skips versions at or below the database's current one, so a lower number never runs on an already-migrated database. CI enforces this with `scripts/check_migration_numbers.py`; gaps in the sequence are fine, renumbering an existing migration or reusing its number is not. **Forks add migrations only under `fork/`** (`nerve/db/migrations/fork/`). They are numbered from `v001`, apart from upstream's numbers, and recorded in their own `fork_schema_version` table, so a fork's migration never shadows an upstream one. Never add a fork's migration to the upstream track. Upstream never ships a fork migration (the check fails on one; a fork runs it with `--fork`). No transaction wraps a migration, so make each one idempotent. A database newer than the code on either track refuses to start (override only deliberately with `NERVE_ALLOW_NEWER_SCHEMA=1`).
 
 7. **Database domain modules:** data access lives in mixin classes by domain under `nerve/db/` (sessions, messages, tasks, plans, notifications, sources, cron, skills, mcp, audit, accounts, usage, workflow_runs, review_loops, ...). `Database` in `base.py` inherits them all. Add methods to the matching mixin, not to `base.py`.
 

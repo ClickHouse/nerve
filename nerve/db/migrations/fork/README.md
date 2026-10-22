@@ -1,7 +1,8 @@
 # Fork migrations
 
 This package is the second migration track. Upstream Nerve never ships a
-migration here: the directory holds only `__init__.py` and this file.
+migration here: the directory holds only `__init__.py` and this file, and
+`scripts/check_migration_numbers.py` fails if a migration is added.
 
 A fork of Nerve that changes the database schema adds its migrations **here,
 and only here**:
@@ -24,7 +25,9 @@ one, and rebasing the fork onto a newer upstream needs no renumbering.
 The upstream rules still apply here:
 
 - Number each new migration above the highest fork migration already in your
-  fork. Never reuse or renumber one.
+  fork. Never reuse or renumber one. To check, run
+  `python3 scripts/check_migration_numbers.py --fork <base>`. It fails when
+  two fork migrations share a number.
 - Make each migration idempotent (`CREATE TABLE IF NOT EXISTS`, check a column
   before adding it). No transaction wraps a migration, so one that is
   interrupted runs again from the start.
