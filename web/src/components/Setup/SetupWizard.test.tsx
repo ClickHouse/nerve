@@ -134,6 +134,8 @@ const HOSTED_PREFLIGHT = {
 };
 /** The Sources step's reason while the channel gateway polls GitHub and the operator holds its switch. */
 const GITHUB_HELD = 'GitHub arrives from the channel gateway of this deployment once a GitHub credential is connected to this agent; nothing to switch here.';
+/** The same, with the switch held off. */
+const GITHUB_HELD_OFF = 'GitHub is switched off for this agent by the operator of this deployment; nothing to switch here.';
 /** The Sources step as the server sends it then: done, GitHub on, Gmail and Telegram still on offer. */
 const githubHeld = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', { status: 'done', ...overrides }, {
   github: { enabled: true, source: null, managed: true }, available: ['gmail', 'telegram'], unavailable_reason: GITHUB_HELD, ...detail,
@@ -1547,6 +1549,30 @@ describe('pre-configured connections', () => {
     renderAt('/setup');
     await heading(/^Welcome, /);
     expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Sources.');
+  });
+
+  it('a GitHub the operator switched off has no card, is said once, and does not count as configured', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    // "None of these" answered earlier: done, with Gmail and Telegram still on offer.
+    current = withStep(makeState(), githubHeld({ summary: 'None' }, {
+      github: { enabled: false, source: null, managed: true }, unavailable_reason: GITHUB_HELD_OFF,
+    }));
+    const view = renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getAllByText(GITHUB_HELD_OFF)).toHaveLength(1);
+    expect(screen.queryByRole('region', { name: 'GitHub' })).not.toBeInTheDocument();
+    expect(screen.queryByText('On · managed by the channel gateway')).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).toBeEnabled();
+    expect(screen.getByRole('checkbox', { name: /Telegram — your own messages/ })).toBeEnabled();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
+    view.unmount();
+
+    // Nothing the operator provides is on, so the Overview does not name Sources.
+    useSetupStore.getState().reset();
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
   });
 
   it('a save refused for a GitHub switch the operator took over meanwhile says so and keeps the other choices', async () => {
