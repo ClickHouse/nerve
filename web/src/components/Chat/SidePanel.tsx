@@ -1,11 +1,15 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { X, Loader2, Check, Ban } from '../ui/icons';
+import { X, Loader2 } from '../ui/icons';
 import { Button, IconButton } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { isLive } from '../../stores/helpers/agentSelectors';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { MarkdownContent } from './MarkdownContent';
+import { PlanDecisionControls } from './PlanDecisionControls';
+import {
+  approveEditedPlan, approvePlan, PLAN_APPROVE_MESSAGE, requestPlanChanges, usePendingPlanText, usePlanDecisionPending,
+} from './planDecision';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
 import { FileChangesPanel } from './FileChangesPanel';
@@ -225,50 +229,51 @@ function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.
 }
 
 // ------------------------------------------------------------------ //
-//  PlanActions — approve/decline footer for plan tabs                  //
+//  PlanActions — the plan decision in the footer of plan tabs          //
 // ------------------------------------------------------------------ //
 
+/**
+ * The same decision as the plan card in the chat, with the same controls
+ * (`PlanDecisionControls`). Approve, and Apply edited plan, close the tab.
+ * Request changes keeps it open: the agent rewrites the plan and the tab
+ * shows the new version in place. Edit starts from the text the agent waits
+ * on (`toolInput.plan`). With no `ExitPlanMode` waiting (a finished turn),
+ * Approve sends `PLAN_APPROVE_MESSAGE` as a message instead, and there is
+ * nothing to turn down or edit.
+ */
 function PlanActions({ tab }: { tab: PanelTab }) {
-  const pendingInteraction = useChatStore(s => s.pendingInteraction);
-  const answerInteraction = useChatStore(s => s.answerInteraction);
-  const denyInteraction = useChatStore(s => s.denyInteraction);
+  const isPlanExit = usePlanDecisionPending();
+  const pendingPlan = usePendingPlanText();
   const sendMessage = useChatStore(s => s.sendMessage);
   const isStreaming = useChatStore(s => s.isStreaming);
   const closePanelTab = useChatStore(s => s.closePanelTab);
 
-  const isPlanExit = pendingInteraction?.interactionType === 'plan_exit';
   const canApprove = tab.content && !tab.streaming && (!isStreaming || isPlanExit);
 
   if (!canApprove) return null;
 
   const handleApprove = () => {
     if (isPlanExit) {
-      answerInteraction(null);
+      approvePlan();
     } else {
-      sendMessage('Looks good — implement it.');
+      sendMessage(PLAN_APPROVE_MESSAGE);
     }
     closePanelTab(tab.id);
   };
 
-  const handleDecline = () => {
-    if (isPlanExit) {
-      denyInteraction('User declined the plan.');
-    }
-    closePanelTab(tab.id);
+  const handleApproveEdited = (text: string) => {
+    if (approveEditedPlan(text)) closePanelTab(tab.id);
   };
 
   return (
-    <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-border-subtle bg-bg shrink-0">
-      {isPlanExit && (
-        <Button size="sm" onClick={handleDecline} className="py-1 rounded-md font-medium">
-          <Ban size={12} />
-          Decline
-        </Button>
-      )}
-      <Button variant="success" size="sm" onClick={handleApprove} className="py-1">
-        <Check size={12} />
-        Approve
-      </Button>
+    <div className="px-4 py-2.5 border-t border-border-subtle bg-bg shrink-0">
+      <PlanDecisionControls
+        layout="footer"
+        onApprove={handleApprove}
+        onRequestChanges={isPlanExit ? requestPlanChanges : undefined}
+        plan={pendingPlan}
+        onApproveEdited={pendingPlan ? handleApproveEdited : undefined}
+      />
     </div>
   );
 }
