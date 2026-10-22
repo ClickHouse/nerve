@@ -8,8 +8,8 @@ import { useSetupStore } from '../../../stores/setupStore';
 import { Button, Checkbox, TextField } from '../../ui';
 import { Github, Mail, MessageCircle, RefreshCw, X } from '../../ui/icons';
 import {
-  INBOX_JOB_OFF, MANAGED_SOURCE_TEXT, SOURCES_IDLE_HINT, STEP_HEADINGS, TELEGRAM_SIGNIN, TELEGRAM_SYNC_INTRO,
-  TELEGRAM_SYNC_TITLE, managedLine,
+  GITHUB_MANAGED_ON, INBOX_JOB_OFF, MANAGED_SOURCE_TEXT, SOURCES_IDLE_HINT, STEP_HEADINGS, TELEGRAM_SIGNIN,
+  TELEGRAM_SYNC_INTRO, TELEGRAM_SYNC_TITLE, managedLine,
 } from '../copy';
 import { managedSource, secretManaged, type ManagedSource } from '../credentialSource';
 import { CodeText, Field } from '../Field';
@@ -54,7 +54,12 @@ function ManagedValue({ label, secret, source }: { label: string; secret?: Secre
  * anything yet. The Ready screen points back here when it is still unsigned.
  *
  * A credential the operator provided (environment, configuration
- * repository) renders as managed: the line says so, there is no field.
+ * repository) renders as managed: the line says so, there is no field. So
+ * does a GitHub source whose switch the operator holds in the machine's
+ * configuration while the channel gateway polls GitHub
+ * (`detail.github.managed`): the card says it is on and who provides it,
+ * with no switch, and the step's reason says what decides. A source held
+ * off that way is not shown; the reason says so.
  *
  * On an instance that keeps no credentials on disk (`local_secrets: false`)
  * the server says which sources the page may switch (`detail.available`):
@@ -103,6 +108,8 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   }, [savedNotice]);
 
   const githubManaged = managedSource(detail.github.source);
+  // The operator holds the GitHub switch: never offered, so never in the save.
+  const githubSwitchManaged = detail.github.managed === true;
   const gmailManaged = managedSource(detail.gmail.source);
   const apiIdManaged = secretManaged(detail.telegram.api_id);
   const apiHashManaged = secretManaged(detail.telegram.api_hash);
@@ -225,18 +232,23 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
 
       {(offers('github') || detail.github.enabled) && (
         <section aria-label="GitHub" className={card}>
-          <Checkbox
-            checked={github}
-            onChange={(e) => setGithub(e.target.checked)}
-            disabled={locked || !offers('github')}
-            label={<span className="flex items-center gap-2 text-text"><Github size={16} />GitHub — notifications, PRs, issues</span>}
-          />
+          {githubSwitchManaged ? (
+            <p className="flex items-center gap-2 text-sm text-text"><Github size={16} />GitHub — notifications, PRs, issues</p>
+          ) : (
+            <Checkbox
+              checked={github}
+              onChange={(e) => setGithub(e.target.checked)}
+              disabled={locked || !offers('github')}
+              label={<span className="flex items-center gap-2 text-text"><Github size={16} />GitHub — notifications, PRs, issues</span>}
+            />
+          )}
           <p className="text-xs text-text-dim" role="status">
             {githubOk === null ? 'Checking…'
               : githubHosted ? preflight?.github.hint
                 : githubOk ? `gh is installed and signed in${preflight?.github.login ? ` as ${preflight.github.login}` : ''}`
                   : preflight?.github.hint ?? 'gh is not signed in on the server'}
           </p>
+          {githubSwitchManaged && <p className="text-xs text-text-muted">{GITHUB_MANAGED_ON}</p>}
           {githubManaged && <p className="text-xs text-text-muted">{managedLine('Token', githubManaged)}</p>}
           {github && githubOk === false && <Notice tone="warning">{SOURCES_IDLE_HINT}</Notice>}
         </section>

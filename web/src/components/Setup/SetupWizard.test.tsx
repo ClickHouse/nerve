@@ -122,6 +122,23 @@ const SESSION_OUT: TelegramSyncSession = {
 const ALICE = { id: 1, username: 'alice_example', first_name: 'Alice' };
 const SESSION_IN: TelegramSyncSession = { ...SESSION_OUT, session_present: true, authorized: true, user: ALICE };
 
+/** The sources preflight while the channel gateway polls GitHub: gh is not run. */
+const HOSTED_PREFLIGHT = {
+  github: {
+    cli: false, authenticated: false, login: null, hosted: true,
+    hint: 'The channel gateway polls GitHub for this agent once a GitHub credential is connected to it; gh is not needed on the server.',
+  },
+  gmail: { cli: false, hint: 'Install gog.' },
+  telegram: { credentials_configured: false },
+  checked_at: '2026-10-10T09:12:03Z',
+};
+/** The Sources step's reason while the channel gateway polls GitHub and the operator holds its switch. */
+const GITHUB_HELD = 'GitHub arrives from the channel gateway of this deployment once a GitHub credential is connected to this agent; nothing to switch here.';
+/** The Sources step as the server sends it then: done, GitHub on, Gmail and Telegram still on offer. */
+const githubHeld = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', { status: 'done', ...overrides }, {
+  github: { enabled: true, source: null, managed: true }, available: ['gmail', 'telegram'], unavailable_reason: GITHUB_HELD, ...detail,
+});
+
 const realMatchMedia = window.matchMedia;
 
 beforeEach(() => {
@@ -808,15 +825,7 @@ describe('forms open on server values and send the right payload', () => {
   });
 
   it('sources: hosted GitHub needs no gh, says so, and does not warn when enabled', async () => {
-    m(api.setupSourcesPreflight).mockResolvedValue({
-      github: {
-        cli: false, authenticated: false, login: null, hosted: true,
-        hint: 'The channel gateway polls GitHub for this agent; gh is not needed on the server.',
-      },
-      gmail: { cli: false, hint: 'Install gog.' },
-      telegram: { credentials_configured: false },
-      checked_at: '2026-10-10T09:12:03Z',
-    });
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
     renderAt('/setup/sources');
     await heading('Choose what Nerve reads');
     expect(await screen.findByText(/gh is not needed on the server/)).toBeInTheDocument();
@@ -1513,6 +1522,30 @@ describe('pre-configured connections', () => {
     await heading(/^Welcome, /);
     expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Memory, Channels.');
   });
+
+  it('a GitHub switch the operator holds shows the source with no switch, and the save leaves it out', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    current = withStep(makeState(), githubHeld());
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getByText(GITHUB_HELD)).toBeInTheDocument();
+    const card = within(screen.getByRole('region', { name: 'GitHub' }));
+    expect(card.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(card.getByText('On · managed by the channel gateway')).toBeInTheDocument();
+    expect(await card.findByText(/once a GitHub credential is connected to it/)).toBeInTheDocument();
+    // Gmail and Telegram are still on offer, and the save carries them alone.
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Turn all off' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
+  });
+
+  it('a GitHub the operator switched on counts as already configured', async () => {
+    current = withStep(makeState(), githubHeld());
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Sources.');
+  });
 });
 
 describe('telegram message sync sign-in', () => {
@@ -1996,6 +2029,26 @@ describe('instances that keep no credentials on disk', () => {
     expect(rows.getAllByText('Not available on this instance')).toHaveLength(3);
     expect(rows.getByRole('link', { name: 'Sources' }).closest('li')).toHaveTextContent('To do');
     expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+  });
+
+  it('a GitHub switch the operator holds leaves nothing on offer and says why once', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    const reason = `${GITHUB_HELD} Gmail and Telegram are not available on this instance.`;
+    const held = githubHeld({ read_only: true, read_only_reason: reason }, { available: [], unavailable_reason: reason });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? held : s)) });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const form = within(screen.getByRole('form', { name: 'Choose what Nerve reads' }));
+    expect(form.getAllByText(reason)).toHaveLength(1);
+    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
+    const card = within(screen.getByRole('region', { name: 'GitHub' }));
+    expect(card.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(card.getByText('On · managed by the channel gateway')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Gmail' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Turn all off|Skip for now/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Next/ }));
+    expect(api.setupStep).not.toHaveBeenCalled();
   });
 });
 

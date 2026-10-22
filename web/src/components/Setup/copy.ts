@@ -148,11 +148,21 @@ export const MANAGED_SOURCE_SHORT: Record<ManagedSource, string> = {
   'config-repo': 'from the configuration repository',
   gateway: 'held by the channel gateway',
 };
-/** "Token: configured by your operator (environment)". */
-export const managedLine = (what: string, source: ManagedSource) => {
+/** The sentence inside a line: "configured by your operator (environment)". */
+const managedPhrase = (source: ManagedSource) => {
   const text = MANAGED_SOURCE_TEXT[source];
-  return `${what}: ${text.charAt(0).toLowerCase()}${text.slice(1)}`;
+  return `${text.charAt(0).toLowerCase()}${text.slice(1)}`;
 };
+/** "Token: configured by your operator (environment)". */
+export const managedLine = (what: string, source: ManagedSource) => `${what}: ${managedPhrase(source)}`;
+/**
+ * The GitHub card while the channel gateway polls GitHub and the operator
+ * holds the source's switch in the machine's configuration
+ * (`detail.github.managed`): in place of the switch, that the source is on
+ * and who provides it. The step's reason, the server's sentence, says what
+ * decides whether anything arrives.
+ */
+export const GITHUB_MANAGED_ON = `On · ${managedPhrase('gateway')}`;
 
 /**
  * An instance whose setup page stores no credential (`setup.local_secrets:

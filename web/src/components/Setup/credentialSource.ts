@@ -52,8 +52,10 @@ export function stepManaged(step: SetupStep): ManagedSource | null {
     }
     case 'sources': {
       const { github, gmail, telegram } = step.detail as SetupSourcesDetail;
-      return managedSource(github.source) ?? managedSource(gmail.source)
-        ?? secretManaged(telegram.api_id) ?? secretManaged(telegram.api_hash);
+      // A GitHub the operator switched on in the machine's configuration
+      // arrives through the channel gateway.
+      return managedSource(github.source) ?? (github.managed && github.enabled ? 'gateway' : null)
+        ?? managedSource(gmail.source) ?? secretManaged(telegram.api_id) ?? secretManaged(telegram.api_hash);
     }
     default:
       return null;
