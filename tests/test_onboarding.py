@@ -11,6 +11,7 @@ Installs from before keep their worker rule: no ``TASK.md`` marker means done.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from nerve import onboarding
+from nerve import onboarding, onboarding_environment
 from nerve.agent.prompts import (
     ONBOARDING_OFFERS,
     WORKER_GUIDE_URL,
@@ -28,6 +29,8 @@ from nerve.agent.prompts import (
 )
 from nerve.agent.tools.handlers.onboarding import onboarding_done_handler
 from nerve.agent.tools.registry import ToolContext
+from nerve.config import NerveConfig
+from nerve.onboarding_environment import InstanceFacts
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
     apply_mode,
@@ -45,12 +48,41 @@ PERSONAL_ITEM = ONBOARDING_OFFERS[-1]
 ALICE = Actor(
     actor_id="11111111-2222-4333-8444-555555555555", kind=ACTOR_KIND_HUMAN, display_name="Alice Example",
 )
+# What Nerve knows about the instance (``nerve.onboarding_environment``; the
+# builder has its own tests). The starts here get these facts.
+FACTS = InstanceFacts(
+    section=(
+        "## This instance\n\n"
+        "- Mode: worker (an agent for a team).\n"
+        "- GitHub CLI (`gh`): authenticated as `alice`.\n"
+        "- Slack: provided by the platform (hosted mode: the shared channel gateway holds the tokens); "
+        "the gateway is connected.\n"
+        "- Telegram channel: not configured."
+    ),
+    github_access="GitHub access: `gh` as `alice`.",
+)
+WITH_FACTS = {"environment": FACTS.section, "github_access": FACTS.github_access}
+NONE_KNOWN = "GitHub access: none known — clone public URLs only; report what needs a credential."
+_REAL_GATHER = onboarding_environment.gather
 
 
 @pytest_asyncio.fixture
 async def db(db):  # noqa: F811 - the conftest database, with an identity
     await ensure_system_principal(db)
     return db
+
+
+@pytest.fixture(autouse=True)
+def gathered(monkeypatch) -> list[Path]:
+    """Every start here gets :data:`FACTS`; the workspaces it gathered them for."""
+    calls: list[Path] = []
+
+    def _gather(config, workspace, **kwargs):
+        calls.append(Path(workspace))
+        return FACTS
+
+    monkeypatch.setattr(onboarding_environment, "gather", _gather)
+    return calls
 
 
 def _engine(db, *, outcome: str = "completed", slow: bool = False) -> MagicMock:
@@ -449,6 +481,56 @@ class TestPrompt:
         ):
             assert part in apply, part
 
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_instance_facts_come_before_the_first_message_as_facts(self, mode, description):
+        """A real run asked about `gh` without checking anything: the first
+        turn calls no tool before its message, so Nerve's facts about the
+        instance follow the note, ahead of the first message, with the rules
+        that make them facts."""
+        prompt = onboarding_prompt(mode, description, GUIDE, **WITH_FACTS)
+        assert prompt.index(FACTS.section) < prompt.index("## Your first message")
+        start = prompt.index("## This instance")
+        if mode == "worker" or description:
+            assert prompt.index("wrote at setup") < start
+        else:
+            assert prompt.index("This is the **onboarding conversation**") < start
+            assert "wrote at setup" not in prompt
+        rules = _flat(_between(prompt, FACTS.section, "## Your first message"))
+        for part in (
+            "These lines are facts: Nerve read them when this conversation opened",
+            "Never ask the person about them, and never check them again with a tool before your first message",
+            "A line that says unknown is yours to ask about, or for the explorer to find out",
+            # A known login is the recommendation, never an open question.
+            'when a line above names a GitHub login, offer it as the recommended option '
+            '("act as `<login>` (recommended)") and ask only to confirm it or to name another',
+            "Never ask which account as an open question",
+        ):
+            assert part in rules, part
+        bare = onboarding_prompt(mode, description, GUIDE)
+        for absent in ("## This instance", "These lines are facts", "GitHub access:"):
+            assert absent not in bare, absent
+        assert onboarding_prompt(mode, description, GUIDE, environment=" \n ", github_access="x") == bare
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_explorer_brief_carries_the_github_access(self, mode, description):
+        brief = _between(onboarding_prompt(mode, description, GUIDE, **WITH_FACTS), "```text\n", "\n```")
+        assert "ten minutes and report what you have.\n\nGitHub access: `gh` as `alice`.\n\n- Clone each" in brief
+        unknown = onboarding_prompt(mode, description, GUIDE, environment=FACTS.section, github_access=NONE_KNOWN)
+        assert f"\n\n{NONE_KNOWN}\n\n- Clone each" in _between(unknown, "```text\n", "\n```")
+        # The access line comes with the facts only.
+        assert "GitHub access:" not in onboarding_prompt(mode, description, GUIDE, github_access=FACTS.github_access)
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_facts_change_nothing_else(self, mode, description):
+        """Take the section, its rules and the brief's access line away, and
+        the prompt is the one without facts, byte for byte."""
+        prompt = onboarding_prompt(mode, description, GUIDE, person_name="Alice Example", **WITH_FACTS)
+        block = "## This instance" + _between(prompt, "## This instance", "## Your first message")
+        rest = prompt.replace(block, "", 1).replace(FACTS.github_access + "\n\n", "", 1)
+        assert rest == onboarding_prompt(mode, description, GUIDE, person_name="Alice Example")
+        # Both first messages still lead into the same steps.
+        assert _shared(prompt) == _shared(onboarding_prompt(mode, "", GUIDE, **WITH_FACTS))
+
 
 @pytest.mark.asyncio
 class TestState:
@@ -483,7 +565,7 @@ class TestState:
 
 @pytest.mark.asyncio
 class TestStart:
-    async def test_opens_one_web_session_with_a_hidden_first_turn(self, db, tmp_path):
+    async def test_opens_one_web_session_with_a_hidden_first_turn(self, db, tmp_path, gathered):
         apply_mode(tmp_path, "personal")
         engine = _engine(db)
         states = await asyncio.gather(*(
@@ -492,9 +574,10 @@ class TestStart:
         assert {s.session_id for s in states} == {states[0].session_id}
         turn = await _first_turn(engine)
         assert engine.run.await_count == 1
+        assert gathered == [tmp_path], "the facts are gathered once, for the one opening"
         assert turn["internal"] is True and turn["source"] == "web"
         assert turn["actor"] == db.system_actor
-        assert turn["user_message"] == onboarding_prompt("personal")
+        assert turn["user_message"] == onboarding_prompt("personal", **WITH_FACTS)
         assert (await db.get_session(states[0].session_id))["title"] == "Onboarding"
 
     async def test_a_start_during_another_start_sees_its_session(self, db, tmp_path):
@@ -545,7 +628,7 @@ class TestStart:
         engine = _engine(db)
         await onboarding.start(engine, tmp_path, actor=None, cause=None)
         message = (await _first_turn(engine))["user_message"]
-        assert message == onboarding_prompt("worker", DESCRIPTION, read_worker_guide())
+        assert message == onboarding_prompt("worker", DESCRIPTION, read_worker_guide(), **WITH_FACTS)
         assert "Restate the work as you understand it" in message
         assert not _offered(_describes_work(message))
         assert _offered(_names_no_work(message)) == list(ONBOARDING_OFFERS)
@@ -567,7 +650,7 @@ class TestStart:
         await onboarding.start(engine, tmp_path, actor=ALICE, cause=ALICE)
         message = (await _first_turn(engine))["user_message"]
         assert message == onboarding_prompt(
-            "worker", DESCRIPTION, read_worker_guide(), person_name="Alice Example",
+            "worker", DESCRIPTION, read_worker_guide(), person_name="Alice Example", **WITH_FACTS,
         )
         assert "The person's name is Alice Example." in message
 
@@ -578,6 +661,65 @@ class TestStart:
         message = (await _first_turn(engine))["user_message"]
         assert "The person's name is" not in message
         assert "Greet the person without a name" in message
+
+    async def test_the_first_turn_knows_the_instance(self, db, tmp_path, monkeypatch, gathered):
+        """The real builder, on the engine's configuration, with the GitHub CLI
+        probe replaced: the hidden first message names what is configured and
+        the login, and the explorer's brief carries the access."""
+        monkeypatch.setattr(onboarding_environment, "gather", _REAL_GATHER)
+        probes: list[float] = []
+
+        def _signed_in(timeout):
+            probes.append(timeout)
+            return {"cli": True, "authenticated": True, "login": "alice", "hint": None}
+
+        monkeypatch.setattr(onboarding_environment, "_github_cli", _signed_in)
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        engine = _engine(db)
+        engine.config = NerveConfig(workspace=tmp_path, config_dir=tmp_path / "config")
+        await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        message = (await _first_turn(engine))["user_message"]
+        facts = _between(message, "## This instance\n\n", "\n\nThese lines are facts")
+        assert facts.splitlines()[0] == "- Mode: worker (an agent for a team)."
+        for line in (
+            f"- Workspace: `{tmp_path}`; clone repositories into `{tmp_path}/repos/<name>`.",
+            "- GitHub CLI (`gh`): authenticated as `alice`.",
+            "- Slack: not configured.",
+            "- Telegram channel: not configured.",
+        ):
+            assert line in facts.splitlines(), line
+        assert "GitHub access: `gh` as `alice`." in _between(message, "```text\n", "\n```")
+        assert len(probes) == 1 and 0 < probes[0] <= onboarding_environment.BUDGET_SECONDS
+
+    async def test_a_failed_build_costs_the_facts_not_the_conversation(self, db, tmp_path, monkeypatch):
+        apply_mode(tmp_path, "personal")
+
+        def _fails(config, workspace, **kwargs):
+            raise RuntimeError("no facts")
+
+        monkeypatch.setattr(onboarding_environment, "gather", _fails)
+        engine = _engine(db)
+        state = await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        assert state.status == "running"
+        assert (await _first_turn(engine))["user_message"] == onboarding_prompt("personal")
+
+    async def test_slow_facts_are_given_up(self, db, tmp_path, monkeypatch):
+        """The start waits for the facts no longer than their budget and a
+        margin; past that, the conversation opens without them."""
+        apply_mode(tmp_path, "personal")
+
+        def _slow(config, workspace, **kwargs):
+            time.sleep(0.5)
+            return FACTS
+
+        monkeypatch.setattr(onboarding_environment, "gather", _slow)
+        monkeypatch.setattr(onboarding_environment, "BUDGET_SECONDS", 0.0)
+        monkeypatch.setattr(onboarding, "_FACTS_MARGIN_SECONDS", 0.05)
+        engine = _engine(db)
+        began = time.monotonic()
+        await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        assert time.monotonic() - began < 0.4
+        assert (await _first_turn(engine))["user_message"] == onboarding_prompt("personal")
 
 
 @pytest.mark.asyncio
@@ -600,7 +742,7 @@ class TestBoot:
         await onboarding.start_on_boot(engine, tmp_path)
         assert "The person's name is Alice Example." in (await _first_turn(engine))["user_message"]
 
-    async def test_a_worker_from_nerve_init_sets_itself_up_once(self, db, tmp_path):
+    async def test_a_worker_from_nerve_init_sets_itself_up_once(self, db, tmp_path, gathered):
         """``nerve init`` with a task description: one autonomous session at
         the next start, for the system, with the old prompt in the
         transcript; it ends with ``onboarding_done``."""
@@ -613,6 +755,7 @@ class TestBoot:
         assert (state.status, state.kind) == ("running", "autonomous")
         turn = await _first_turn(engine)
         assert turn["user_message"] == worker_onboarding_prompt(DESCRIPTION, read_worker_guide())
+        assert gathered == [], "the autonomous kind is unchanged: no facts are gathered for it"
         assert turn["internal"] is False and turn["source"] == "cron"
         session = await db.get_session(state.session_id)
         assert session["source"] == "cron"

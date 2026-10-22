@@ -4,7 +4,9 @@ After setup in the browser, the agent is set up by talking to it (the
 ``conversation`` kind). :func:`start` opens one web chat session for that and
 gives the agent a hidden first message
 (:func:`nerve.agent.prompts.onboarding_prompt`), so the agent speaks first and
-the person sees only its answer. The agent calls the ``onboarding_done`` tool
+the person sees only its answer. The message carries what Nerve knows about
+the instance (:mod:`nerve.onboarding_environment`), because the agent's first
+turn calls no tool before it speaks. The agent calls the ``onboarding_done`` tool
 after the person confirmed the setup and the agent applied it
 (:func:`complete`). A person can skip onboarding on the setup page
 (:func:`skip`).
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.db import Database
     from nerve.identity import ActorOrId
+    from nerve.onboarding_environment import InstanceFacts
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,9 @@ CONVERSATION = "conversation"
 AUTONOMOUS = "autonomous"
 
 SESSION_TITLE = "Onboarding"
+
+#: How much longer than the facts' own budget a start waits for them.
+_FACTS_MARGIN_SECONDS = 2.0
 
 # One start at a time in this process, so a second caller sees the session
 # that the first one created. One lock per event loop: tests run many loops.
@@ -138,6 +144,29 @@ def _prompt_inputs(workspace: Path, mode: str) -> tuple[str, str]:
     return description, read_worker_guide()
 
 
+async def _instance_facts(engine: "AgentEngine", workspace: Path) -> "InstanceFacts | None":
+    """What the conversation's agent knows about this instance from the start.
+
+    :func:`nerve.onboarding_environment.gather` in a thread: a few small
+    files and one ``gh auth status``, within
+    :data:`nerve.onboarding_environment.BUDGET_SECONDS`. ``None`` when it
+    cannot be had in time; the prompt then goes without it.
+    """
+    from nerve import onboarding_environment
+
+    config = getattr(engine, "config", None)
+    if config is None:
+        return None
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(onboarding_environment.gather, config, workspace),
+            onboarding_environment.BUDGET_SECONDS + _FACTS_MARGIN_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - the conversation opens without the facts
+        logger.warning("Onboarding: the facts about this instance are unavailable", exc_info=True)
+        return None
+
+
 async def _person_name(db: "Database", cause: "ActorOrId | None") -> str:
     """The display name of the person the conversation is for, else ``""``.
 
@@ -206,8 +235,13 @@ async def start(
     description, guide = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
+        # The first turn calls no tool before its message: Nerve hands the
+        # agent what is configured, and from where, instead.
+        facts = await _instance_facts(engine, workspace)
         prompt = onboarding_prompt(
             mode, description, guide, person_name=name,
+            environment=facts.section if facts else "",
+            github_access=facts.github_access if facts else "",
             memory_backend=engine.config.memory.backend,
         )
     else:
