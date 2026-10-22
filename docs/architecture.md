@@ -60,7 +60,7 @@ FastAPI application serving:
 Claude Agent SDK wrapper providing:
 - Agent configuration (model, tools, system prompt)
 - Agentic loop execution (tool calls → results → continuation)
-- **Interactive tool handler** — `can_use_tool` callback replaces `bypassPermissions`; pauses the agent mid-turn for tools that need user input (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`), auto-approves everything else. Answers routed via WebSocket `answer_interaction` messages. See `interactive.py`.
+- **Interactive tool handler** — `can_use_tool` callback replaces `bypassPermissions`; pauses the agent mid-turn for tools that need user input (`AskUserQuestion`, `ExitPlanMode`; `EnterPlanMode` is allowed without a pause), auto-approves everything else. Answers routed via WebSocket `answer_interaction` messages. See `interactive.py`.
 - **File snapshot hooks** — `PreToolUse` hook on `Edit|Write|NotebookEdit` captures original file content to `session_file_snapshots` table before the tool executes. Enables session-scoped unified diffs without git. See `engine.py::_build_snapshot_hooks()`.
 - **Diff computation** — `gateway/diff.py` computes structured unified diffs (hunks with line numbers) using `difflib.unified_diff` from stored snapshots vs current file on disk.
 - Streaming bridge to broadcast events to all interfaces (bounded buffers, max 10k events)

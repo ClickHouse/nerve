@@ -343,6 +343,19 @@ class TestDoneRules:
         assert checklist.onboarding_from_task(worker, "worker") == "done"
         assert checklist.onboarding_from_task(worker, "personal") == "not_applicable"
 
+    def test_the_onboarding_block_carries_what_it_waits_for_only_while_running(self, worker):
+        running = checklist.summarize(facts(
+            worker, onboarding="running", onboarding_session_id="onboarding-1",
+            onboarding_kind="conversation", onboarding_awaiting="plan",
+        ))
+        assert running["onboarding"] == {
+            "status": "running", "session_id": "onboarding-1", "kind": "conversation", "awaiting": "plan",
+        }
+        for status in ("pending", "done", "skipped", "not_applicable"):
+            block = checklist.summarize(facts(worker, onboarding=status, onboarding_awaiting="question"))["onboarding"]
+            assert block["status"] == status and block["awaiting"] is None
+        assert checklist.summarize(facts(worker))["onboarding"]["awaiting"] is None
+
     def test_onboarding_is_done_once_the_marker_is_gone(self, worker):
         """The template's marker comment decides, not the headings: a filled
         file with the marker still standing is pending; without it, done."""

@@ -27,9 +27,14 @@ logger = logging.getLogger(__name__)
 # Default timeout for interactive tool waits (1 hour)
 INTERACTION_TIMEOUT = 3600
 
-# Claude CLI built-ins that require user interaction before execution.
-# Defined here (not in the claude backend) so the neutral registry and
-# tests can reference the set without importing backend modules.
+# Claude CLI built-ins whose permission ``can_use_tool`` decides itself (the
+# PreToolUse grant hook leaves them alone). When the CLI asks, all three are
+# denied on a non-interactive channel; on an interactive one
+# ``AskUserQuestion`` and ``ExitPlanMode`` pause for the person, and
+# ``EnterPlanMode`` is allowed at once (entering plan mode only restricts the
+# agent; the bundled CLI does not even ask for it). Defined here (not in the
+# claude backend) so the neutral registry and tests can reference the set
+# without importing backend modules.
 INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion",
     "ExitPlanMode",
@@ -67,6 +72,9 @@ class PendingInteraction:
     result: dict[str, Any] | None = None
     denied: bool = False
     deny_message: str = ""
+    #: The ``interaction_type`` the UI was sent (``question``, ``plan_exit``,
+    #: one of :data:`APPROVAL_KINDS`, …).
+    interaction_type: str = ""
 
 
 @dataclass
@@ -237,6 +245,7 @@ class InteractiveToolHandler:
             interaction_id=interaction_id,
             tool_name=tool_name,
             tool_input=tool_input,
+            interaction_type=interaction_type,
         )
         self._pending[interaction_id] = pending
 
@@ -379,6 +388,13 @@ class InteractiveToolHandler:
     def has_pending(self) -> bool:
         return len(self._pending) > 0
 
+    def pending_interaction_types(self) -> list[str]:
+        """The ``interaction_type`` of each interaction waiting for the
+        person, oldest first: ``question`` (``AskUserQuestion``),
+        ``plan_exit`` (``ExitPlanMode``) or an approval kind. Empty when
+        nothing waits."""
+        return [pending.interaction_type for pending in list(self._pending.values())]
+
 
 # ------------------------------------------------------------------ #
 #  File snapshot helpers                                               #
@@ -436,11 +452,13 @@ def get_awaiting_ids() -> set[str]:
 
 
 def _interaction_type(tool_name: str) -> str:
-    """Map tool name to a UI-friendly interaction type."""
+    """Map tool name to a UI-friendly interaction type.
+
+    ``EnterPlanMode`` never pauses (see :data:`INTERACTIVE_TOOLS`), so there
+    is no interaction type for it."""
     return {
         "AskUserQuestion": "question",
         "ExitPlanMode": "plan_exit",
-        "EnterPlanMode": "plan_enter",
     }.get(tool_name, "unknown")
 
 

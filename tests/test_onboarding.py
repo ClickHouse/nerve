@@ -87,35 +87,222 @@ async def _first_turn(engine) -> dict:
     return engine.run.await_args.kwargs
 
 
+GUIDE = "# Worker Best Practices"
+PLAN_HEADINGS = [
+    "# Setup proposal — <the work, in one line>",
+    "## What I understood", "## What I found", "## TASK.md", "## Jobs",
+    "## Statuses and tags", "## Skills", "## What I will remember",
+    "## What I need from you", "## Approval boundaries", "## Later, if you want",
+]
+VARIANTS = [
+    pytest.param(mode, description, id=f"{mode}-{'described' if description else 'blank'}")
+    for mode in ("personal", "worker") for description in ("", DESCRIPTION)
+]
+
+
+def _between(text: str, start: str, end: str | None = None) -> str:
+    """The part of ``text`` from ``start`` up to ``end`` (or the end)."""
+    assert start in text, start
+    tail = text.split(start, 1)[1]
+    if end is None:
+        return tail
+    assert end in tail, end
+    return tail.split(end, 1)[0]
+
+
+def _first_message(prompt: str) -> str:
+    return _between(prompt, "## Your first message", "## Rules")
+
+
+def _shared(prompt: str) -> str:
+    """Everything after the first message: the same for both of its variants."""
+    return _between(prompt, "## Rules")
+
+
+def _plan_skeleton(prompt: str) -> list[str]:
+    return _between(prompt, "```markdown\n", "\n```").splitlines()
+
+
 class TestPrompt:
+    """The hidden first message: the description picks the first message, the
+    steps after it are shared."""
+
     @pytest.mark.parametrize("mode", ["personal", "worker"])
-    def test_offers_the_whole_list_and_the_setup_rules(self, mode):
-        prompt = onboarding_prompt(mode, DESCRIPTION, "# Worker Best Practices")
+    def test_without_a_description_the_first_message_offers_the_whole_list(self, mode):
+        prompt = onboarding_prompt(mode, "", GUIDE)
+        first = _first_message(prompt)
         for item in ONBOARDING_OFFERS:
-            assert f"- {item}" in prompt
+            assert f"\n- {item}\n" in first, item
         for part in (
-            "## Your first message", "you speak first", "which repositories to onboard",
-            "Change nothing and start no real work before the person confirms",
-            "`backlog`", "`plan_review`", "`task-planner`", "`task_status_create`",
-            "`skill_create`", "`memorize`", "config/cron/jobs.yaml", "run_if",
-            "### 4. Summarize", "`onboarding_done`",
+            "Greet the person (by name, if `USER.md` gives it)",
+            "say that you are set up by talking to you, now and at any time later",
+            "offer this list, as it is, and ask which items apply",
+            "Change nothing in this first message.",
         ):
-            assert part in prompt, part
+            assert part in first, part
+        assert "Restate the work" not in prompt
+        assert "you speak first" in prompt
 
     def test_a_personal_install_leads_with_the_personal_assistant(self):
         lines = [line for line in onboarding_prompt("personal").splitlines() if line.startswith("- ")]
         assert lines[0] == f"- {PERSONAL_ITEM}"
         assert "Worker Best Practices" not in onboarding_prompt("personal")
         assert "## TASK.md" not in onboarding_prompt("personal")
+        worker = [
+            line for line in onboarding_prompt("worker", "", GUIDE).splitlines()
+            if line.startswith("- ") and line[2:] in ONBOARDING_OFFERS
+        ]
+        assert worker == [f"- {item}" for item in ONBOARDING_OFFERS]
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_with_a_description_the_first_message_has_no_menu(self, mode):
+        prompt = onboarding_prompt(mode, DESCRIPTION, GUIDE)
+        first = _first_message(prompt)
+        assert not any(item in prompt for item in ONBOARDING_OFFERS)
+        assert "set up by talking to you" not in prompt
+        assert f"> {DESCRIPTION}" in _between(prompt, "wrote at setup", "## Your first message")
+        for part in (
+            "offer no menu", "In this one turn",
+            "Greet the person (by name, if `USER.md` gives it)",
+            "Restate the work as you understand it, in one sentence",
+            "Start the explorer (step 1 below)", "Ask your first questions (step 2 below)",
+            "targets that the description does not name, ask for them",
+        ):
+            assert part in first, part
+
+    def test_a_blank_description_is_no_description(self):
+        for mode in ("personal", "worker"):
+            assert onboarding_prompt(mode, " \n\t\n", GUIDE) == onboarding_prompt(mode, "", GUIDE)
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_both_first_messages_lead_into_the_same_steps(self, mode):
+        assert _shared(onboarding_prompt(mode, "", GUIDE)) == _shared(onboarding_prompt(mode, DESCRIPTION, GUIDE))
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_setup_rules_and_the_steps_after_the_plan(self, mode, description):
+        shared = _shared(onboarding_prompt(mode, description, GUIDE))
+        for part in (
+            "Change nothing and start no real work before the person approves your proposal",
+            "Nerve plans (`plan_propose`)", "the one file you write is your plan file",
+            "never invent a repository", "skip onboarding on the setup page",
+            "`backlog`", "`plan_review`", "`task-planner`", "`task_status_create`",
+            "`skill_create`", "`task_create`", "`memorize`", "`propose_config_change`",
+            "config/cron/jobs.yaml", "config/cron/system.yaml", "run_if", "prompt_file",
+            "### 4. Apply what the person approved", "Only after the approval",
+            "Apply it yourself, in this session, without teammates or sub-agents",
+            "### 5. Summarize", "### 6. Mark onboarding done", "`onboarding_done`",
+        ):
+            assert part in shared, part
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_one_background_explorer_with_a_brief(self, mode, description):
+        explore = _between(onboarding_prompt(mode, description, GUIDE), "### 1. Explore in the background", "### 2.")
+        for part in (
+            "start **one** explorer", "`Agent` tool call with `run_in_background: true`",
+            "the brackets and `<workspace>` filled in",
+            "its progress shows on the agent line below the chat",
+            "ask for them first, in one plain message, and end your turn",
+            "Do not study the same targets yourself", "a second explorer studies only those",
+            "Skip the explorer when there is nothing to clone or fetch",
+        ):
+            assert part in explore, part
+        brief = _between(explore, "```text\n", "\n```")
+        for part in (
+            "Study [the targets] for a Nerve agent that will [the work items]",
+            "Change nothing outside <workspace>/repos/", "ask the person nothing",
+            "Clone each repository into <workspace>/repos/<name>", "gh repo clone", "`git clone`",
+            "Report what you could not access; do not guess",
+            "how to build and test", "CODEOWNERS", "open PRs and issues", "access mode",
+            "a Findings report of at most 60 lines", '"not found" is a valid finding',
+        ):
+            assert part in brief, part
+        headings = [
+            "Repositories", "Build and test", "CI", "Rules and conventions", "Volume",
+            "Risks and missing access", "Suggested first task",
+        ]
+        assert ", ".join(headings) + "." in " ".join(brief.split())
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_questions_in_the_foreground(self, mode, description):
+        ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
+        for part in (
+            "`AskUserQuestion`", "one to four questions per call",
+            'the recommended default first with "(recommended)"', "At most two rounds",
+            "the account you act as on the code host", "the approval boundary", "the cadence",
+            "where results go",
+            # What setup already knows is never asked.
+            "the mode, the person's name, the time zone and quiet hours",
+            "the connected channels and sources", "read them, never ask",
+            "Ask nothing in plain text in a turn that calls `AskUserQuestion`",
+            # The explorer is not polled.
+            "Do not check on the explorer or poll it", "say so in one line and end your turn",
+        ):
+            assert part in ask, part
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_proposal_is_a_native_plan(self, mode, description):
+        prompt = onboarding_prompt(mode, description, GUIDE)
+        plan = _between(prompt, "### 3. Propose the setup as a plan", "### 4.")
+        wait, enter, write, exit_ = (
+            plan.index("Exploring and asking end before plan mode: first wait for the answers, "
+                       "and for the explorer's Findings when one runs"),
+            plan.index("Then call `EnterPlanMode`"),
+            plan.index("write the proposal to the plan file path that plan mode names"),
+            plan.index("and call `ExitPlanMode`"),
+        )
+        assert wait < enter < write < exit_
+        # Plan mode's own reminder pushes Explore agents and questions; in
+        # plan mode there are none, unless a gap blocks the proposal.
+        assert (
+            "in plan mode start no further explorer and ask nothing more, unless a gap in the "
+            "findings blocks the proposal, and then say so in one line"
+        ) in plan
+        # The plan-mode tools are deferred in the CLI: loaded before use.
+        assert "load them with `ToolSearch` before their first use" in prompt
+        expected = [h for h in PLAN_HEADINGS if mode == "worker" or h != "## TASK.md"]
+        assert _plan_skeleton(prompt) == expected
+        assert ("- **TASK.md**:" in plan) == (mode == "worker")
+        assert "**Later, if you want**: optional; at most three one-liners" in plan
+        # Request changes: the person's words come back as the refusal.
+        for part in (
+            "`ExitPlanMode` comes back refused with their words", "Stay in plan mode",
+            "revise the plan file and call `ExitPlanMode` again", "never ask what their words already answer",
+        ):
+            assert part in plan, part
+        assert "times out (no answer within the hour) is no answer" in prompt
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_features_are_applied_not_advertised(self, mode, description):
+        features = _between(
+            onboarding_prompt(mode, description, GUIDE),
+            "## Nerve features: applied, not advertised", "## How the conversation goes",
+        )
+        for part in (
+            "only as the answer to a need of this work",
+            "never list what you can do in general: no menu, no feature tour",
+            "Pitch nothing that setup already configured (channels, sources, quiet hours, memory)",
+            'the plan\'s last section, "Later, if you want": at most three one-liners',
+            "Outside it, pitch nothing",
+        ):
+            assert part in features, part
 
     def test_a_worker_gets_its_description_the_task_md_rules_and_the_guide(self):
-        prompt = onboarding_prompt("worker", DESCRIPTION + "\nNever merge.", "# Worker Best Practices")
-        offers = [line for line in prompt.splitlines() if line.startswith("- ") and line[2:] in ONBOARDING_OFFERS]
-        assert offers[-1] == f"- {PERSONAL_ITEM}"
-        assert f"> {DESCRIPTION}\n> Never merge." in prompt
-        assert "## TASK.md" in prompt and "# Worker Best Practices" in prompt
+        prompt = onboarding_prompt("worker", DESCRIPTION + "\nNever merge.", GUIDE)
+        assert f"## What the operator wrote at setup\n\n> {DESCRIPTION}\n> Never merge." in prompt
+        assert prompt.index("wrote at setup") < prompt.index("## Your first message")
+        task_md = _between(prompt, "\n## TASK.md\n", "\n---\n")
+        assert "Fill it when you apply the setup (step 4)" in task_md
+        assert "### ⛔ HARD RULE" in task_md and "`onboarding_done` removes the marker" in task_md
+        assert prompt.endswith(f"---\n\n{GUIDE}\n\n---")
         assert "> (no description was given at setup)" in onboarding_prompt("worker", "", "x")
         assert WORKER_GUIDE_URL in onboarding_prompt("worker", DESCRIPTION, "")
+
+    def test_a_personal_install_with_a_description_gets_it_without_the_worker_parts(self):
+        prompt = onboarding_prompt("personal", DESCRIPTION)
+        assert f"## What the person wrote at setup\n\n> {DESCRIPTION}" in prompt
+        assert "Restate the work as you understand it" in prompt
+        assert "## TASK.md" not in prompt and "Worker Best Practices" not in prompt
+        assert "wrote at setup" not in onboarding_prompt("personal")
 
 
 @pytest.mark.asyncio
@@ -204,6 +391,25 @@ class TestStart:
         await onboarding.start(engine, tmp_path, actor=None, cause=None)
         assert (tmp_path / "TASK.md").read_text() == render_task_md("Keep the build green.")
         assert "> Keep the build green." in (await _first_turn(engine))["user_message"]
+
+    async def test_a_workers_note_starts_on_the_work(self, db, tmp_path):
+        """The note from the Mode step, read back from ``TASK.md``, picks the
+        first message without the list."""
+        apply_mode(tmp_path, "worker", DESCRIPTION)
+        engine = _engine(db)
+        await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        message = (await _first_turn(engine))["user_message"]
+        assert message == onboarding_prompt("worker", DESCRIPTION, read_worker_guide())
+        assert "Restate the work as you understand it" in message
+        assert not any(item in message for item in ONBOARDING_OFFERS)
+
+    async def test_a_worker_without_a_note_is_offered_the_list(self, db, tmp_path):
+        apply_mode(tmp_path, "worker")
+        engine = _engine(db)
+        await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        message = (await _first_turn(engine))["user_message"]
+        assert all(f"- {item}" in message for item in ONBOARDING_OFFERS)
+        assert "> (no description was given at setup)" in message
 
 
 @pytest.mark.asyncio

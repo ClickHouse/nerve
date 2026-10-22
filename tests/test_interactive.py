@@ -1,4 +1,6 @@
-"""Tests for the interactive tool handler: timeout, waiting-input indicator.
+"""Tests for the interactive tool handler: timeout, waiting-input indicator,
+plan mode (entering never pauses; ExitPlanMode waits for the decision) and
+what a session waits for.
 
 The hub itself is backend-neutral; the SDK ``can_use_tool`` surface lives in
 ``ClaudeToolPermissions``, which translates the hub's ``InteractionOutcome``
@@ -141,7 +143,7 @@ async def test_cancel_all_clears_awaiting():
     register_handler("sess-cancel", handler)
     try:
         task = asyncio.create_task(
-            ClaudeToolPermissions(handler).can_use_tool("EnterPlanMode", {}, None)
+            ClaudeToolPermissions(handler).can_use_tool("ExitPlanMode", {}, None)
         )
         await _wait_until_pending(handler)
         assert "sess-cancel" in get_awaiting_ids()
@@ -156,3 +158,152 @@ async def test_cancel_all_clears_awaiting():
         assert awaiting[-1]["awaiting"] is False
     finally:
         unregister_handler("sess-cancel")
+
+
+# ------------------------------------------------------------------ #
+#  Plan mode: entering never pauses, the decision is ExitPlanMode's    #
+# ------------------------------------------------------------------ #
+
+
+@pytest.mark.asyncio
+async def test_enter_plan_mode_is_allowed_without_a_pause():
+    """Entering plan mode only restricts the agent: on an interactive channel
+    it is allowed at once, with no card, no waiting indicator."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-enter", broadcast, interactive_capable=True)
+    register_handler("sess-enter", handler)
+    try:
+        result = await asyncio.wait_for(
+            ClaudeToolPermissions(handler).can_use_tool("EnterPlanMode", {}, None), timeout=1,
+        )
+        assert isinstance(result, PermissionResultAllow)
+        assert result.updated_input is None
+        assert messages == []
+        assert not handler.has_pending and handler.pending_interaction_types() == []
+        assert "sess-enter" not in get_awaiting_ids()
+    finally:
+        unregister_handler("sess-enter")
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_is_still_denied_on_a_non_interactive_channel():
+    async def broadcast(channel: str, msg: dict) -> None:  # pragma: no cover - never called
+        raise AssertionError("a non-interactive channel never broadcasts a pause")
+
+    handler = InteractiveToolHandler("sess-cron", broadcast, interactive_capable=False)
+    permissions = ClaudeToolPermissions(handler)
+    enter = await permissions.can_use_tool("EnterPlanMode", {}, None)
+    exit_ = await permissions.can_use_tool("ExitPlanMode", {"plan": "x"}, None)
+    assert isinstance(enter, PermissionResultDeny) and "Plan mode is not available" in enter.message
+    assert isinstance(exit_, PermissionResultDeny) and "Plan mode is not available" in exit_.message
+
+
+@pytest.mark.asyncio
+async def test_exit_plan_mode_pauses_and_a_change_request_carries_its_words():
+    """ExitPlanMode waits for the person's decision; "Request changes" denies
+    with their words, which reach the agent as the refusal's message."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-plan", broadcast, interactive_capable=True)
+    register_handler("sess-plan", handler)
+    try:
+        task = asyncio.create_task(
+            ClaudeToolPermissions(handler).can_use_tool("ExitPlanMode", {}, None)
+        )
+        await _wait_until_pending(handler)
+        interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
+        assert (interaction["interaction_type"], interaction["tool_name"]) == ("plan_exit", "ExitPlanMode")
+        assert handler.pending_interaction_types() == ["plan_exit"]
+
+        words = "Scan every 15 minutes, and leave org/repo-b out."
+        assert handler.deny(interaction["interaction_id"], words)
+        result = await task
+        assert isinstance(result, PermissionResultDeny)
+        assert result.message == words and not result.interrupt
+        assert handler.pending_interaction_types() == []
+    finally:
+        unregister_handler("sess-plan")
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_types_name_what_waits_oldest_first():
+    async def broadcast(channel: str, msg: dict) -> None:
+        pass
+
+    handler = InteractiveToolHandler("sess-types", broadcast, interactive_capable=True)
+    assert handler.pending_interaction_types() == []
+    question = asyncio.create_task(handler.request_interaction("AskUserQuestion", {"questions": []}))
+    await _wait_until_pending(handler)
+    approval = asyncio.create_task(handler.request_approval("command_approval", {"command": "ls"}))
+    for _ in range(200):
+        if len(handler.pending_interaction_types()) == 2:
+            break
+        await asyncio.sleep(0.005)
+    assert handler.pending_interaction_types() == ["question", "command_approval"]
+
+    handler.cancel_all()
+    assert (await question).cancelled is False and (await question).denied
+    assert (await approval).denied
+    assert handler.pending_interaction_types() == []
+
+
+PLAN_INPUT = {
+    "plan": "# Setup proposal — review PRs in org/repo-a\n## Jobs\n| pr-scan | */30 * * * * |\n",
+    "planFilePath": "/home/someone/.claude/plans/quiet-blue-river.md",
+}
+
+
+async def _decide_plan(answer=None, *, deny: str | None = None) -> tuple[dict, object]:
+    """Pause on ExitPlanMode with the CLI's input (``plan``, ``planFilePath``),
+    answer it like the web UI does, return the broadcast and the decision."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-decide", broadcast, interactive_capable=True)
+    register_handler("sess-decide", handler)
+    try:
+        task = asyncio.create_task(
+            ClaudeToolPermissions(handler).can_use_tool("ExitPlanMode", dict(PLAN_INPUT), None)
+        )
+        await _wait_until_pending(handler)
+        interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
+        if deny is not None:
+            handler.deny(interaction["interaction_id"], deny)
+        else:
+            handler.resolve(interaction["interaction_id"], answer)
+        return interaction, await task
+    finally:
+        unregister_handler("sess-decide")
+
+
+@pytest.mark.asyncio
+async def test_the_plan_pause_carries_the_clis_input_unchanged():
+    """The CLI puts the plan file's text into ExitPlanMode's input; the
+    interaction event hands it to the UI as is, so the card can show it."""
+    interaction, result = await _decide_plan(None)
+    assert interaction["tool_input"] == PLAN_INPUT
+    assert isinstance(result, PermissionResultAllow) and result.updated_input is None
+
+
+@pytest.mark.asyncio
+async def test_a_plan_approved_with_the_persons_edits_goes_back_edited():
+    edited = PLAN_INPUT["plan"].replace("*/30", "*/15")
+    _interaction, result = await _decide_plan({"plan": edited})
+    assert isinstance(result, PermissionResultAllow)
+    assert result.updated_input == {**PLAN_INPUT, "plan": edited}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [{}, {"plan": "  \n"}, {"plan": 3}, {"other": "x"}])
+async def test_anything_but_an_edited_plan_is_a_plain_approval(answer):
+    _interaction, result = await _decide_plan(answer)
+    assert isinstance(result, PermissionResultAllow) and result.updated_input is None

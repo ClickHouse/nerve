@@ -1797,3 +1797,47 @@ def test_build_options_forwards_subagent_text(tmp_path):
             system_prompt="", cwd=str(ws),
         )
         assert backend._build_options(spec).forward_subagent_text is flag
+
+
+# ---------------------------------------------------------------------------
+# Plan files: where the CLI's plan mode writes them, and the plan_update
+# broadcast that streams them into the side panel
+# ---------------------------------------------------------------------------
+
+
+def test_plan_files_live_in_the_clis_plans_directory(tmp_path, monkeypatch):
+    from nerve.agent.engine import _is_plan_file
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+    assert not _is_plan_file(str(tmp_path / "plans" / "quiet-blue-river.md"))
+    assert not _is_plan_file(str(tmp_path / "notes.md")) and not _is_plan_file("")
+
+    # CLAUDE_CONFIG_DIR moves the CLI's config directory, plans included.
+    config_dir = tmp_path / "cli-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river.md"))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river-agent-a1b2.md"))
+    assert not _is_plan_file(str(config_dir / "plans-old" / "x.md"))
+    assert not _is_plan_file(str(config_dir / "settings.json"))
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+
+
+@pytest.mark.asyncio
+async def test_a_plan_written_under_a_moved_config_dir_reaches_the_panel(tmp_path, monkeypatch):
+    from nerve.agent import engine as engine_module
+
+    config_dir = tmp_path / "cli-config"
+    plan = config_dir / "plans" / "quiet-blue-river.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Setup proposal — review PRs in org/repo-a\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    sent = AsyncMock()
+    monkeypatch.setattr(engine_module.broadcaster, "broadcast_plan_update", sent)
+
+    log = [{"tool": "Write", "tool_use_id": "tu-1", "input": {"file_path": str(plan)}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-1", log)
+    other = [{"tool": "Write", "tool_use_id": "tu-2", "input": {"file_path": str(tmp_path / "x.md")}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-2", other)
+    await asyncio.sleep(0)
+    sent.assert_awaited_once_with("s-plan", "# Setup proposal — review PRs in org/repo-a\n")

@@ -4981,6 +4981,24 @@ class AgentEngine:
             logger.warning("Failed to generate session title: %s", e)
 
 
+def _is_plan_file(file_path: str) -> bool:
+    """A file in the Claude CLI's plans directory, where plan mode keeps the
+    session's plan (``<dir>/<slug>.md``).
+
+    The CLI's directory is ``$CLAUDE_CONFIG_DIR/plans`` when that variable
+    moves its config directory, else ``~/.claude/plans``. Its
+    ``plansDirectory`` setting never applies here: Nerve loads no settings
+    files (``setting_sources=[]``).
+    """
+    if "/.claude/plans/" in file_path:
+        return True
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not file_path or not config_dir:
+        return False
+    plans = os.path.join(os.path.abspath(os.path.expanduser(config_dir)), "plans")
+    return os.path.abspath(os.path.expanduser(file_path)).startswith(plans + os.sep)
+
+
 def _maybe_broadcast_plan_update(
     session_id: str,
     tool_use_id: str,
@@ -5003,7 +5021,7 @@ def _maybe_broadcast_plan_update(
         return
 
     file_path = str(tool_input.get("file_path", ""))
-    if "/.claude/plans/" not in file_path:
+    if not _is_plan_file(file_path):
         return
 
     # Read the updated plan file and broadcast

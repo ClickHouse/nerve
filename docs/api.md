@@ -249,6 +249,7 @@ Response: {
   "finished": false,
   "steps_left": 2,
   "warning": null,
+  "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d", "kind": "conversation", "awaiting": "question" },
   "steps": [
     { "id": "claim", "title": "Claim", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "blocked_kind": null, "read_only": false, "read_only_reason": null, "etag": "0a1b2c3d4e5f",
@@ -260,7 +261,7 @@ Response: {
       "etag": "…", "summary": "Personal assistant",
       "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
       "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
-                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null,
+                  "task_present": false, "onboarding": "running", "onboarding_session_id": "onboarding-1a2b3c4d",
                   "onboarding_kind": "conversation" } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
@@ -301,6 +302,7 @@ Response: {
 | `finished` | every required step is `done` or `blocked`, every other step is `done`, `skipped` or `blocked`, and nothing waits on a restart |
 | `steps_left` | the number of `pending` steps plus the steps blocked only because the Mode step has not been answered yet (`blocked_kind: "sequencing"`) — they are still work left to do, so the count only ever goes down as a person progresses. Steps blocked by lockdown (`blocked_kind: "lockdown"`) are never counted |
 | `warning` | set when configuration was written but the state file could not be saved or a reload reported errors (`Saved. Reload reported: cron: error: …`) |
+| `onboarding` | the onboarding in one place: `status`, `session_id` and `kind` as the Mode step's `detail.onboarding`, `onboarding_session_id` and `onboarding_kind` (see [`POST /api/setup/finish`](#post-apisetupfinish)), plus `awaiting` — what the running onboarding session waits for from the person: `question` while an `AskUserQuestion` card waits for an answer, `plan` while an `ExitPlanMode` decision does (a plan wins over a question), otherwise `null`. Always `null` unless `status` is `running`. Read live from the session's pending interactions, never stored; the global `session_awaiting_input` event tells a client when to read again |
 
 Each step carries `id`, a short `title`, a `status` (`done`, `pending`,
 `skipped`, `blocked`), `required`, `can_skip`, `blocked_reason`, `blocked_kind`
@@ -685,13 +687,15 @@ Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_required", "onboarding": { "status": "pending", "session_id": null } }
 ```
 
-`onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
+`onboarding.status` (and, in `GET /api/setup`, `onboarding.status` and
+`mode.detail.onboarding`) is
 `not_applicable` (no mode chosen), `pending`, `running` (the session id is
 carried), `done` or `skipped`. The agent sets `done` with the
 `onboarding_done` tool, from the onboarding session only. A worker whose
 `TASK.md` no longer carries the onboarding marker is `done`. A running
 conversation whose session was deleted reads `pending` again.
-`mode.detail.onboarding_kind` is `conversation`, or `autonomous` for a worker
+`mode.detail.onboarding_kind` (`onboarding.kind`) is `conversation`, or
+`autonomous` for a worker
 that `nerve init` set up with a task description: the next start of the daemon
 runs its onboarding in one session without a person (source `cron`). While
 onboarding is `pending`, Finish opens the conversation for either kind.
@@ -1660,7 +1664,13 @@ fresh.
 // reason "resume" for the connection's person)
 { type: "resume", session_id: "abc123" }
 
-// Answer an interactive tool (AskUserQuestion, plan approval)
+// Answer an interactive tool (AskUserQuestion, plan approval). denied: true
+// refuses it, and message reaches the agent verbatim as the refusal: for
+// ExitPlanMode that is "Request changes" — the agent stays in plan mode,
+// revises the plan and calls ExitPlanMode again (a new interaction). For
+// ExitPlanMode, result: null approves the plan as it is, and
+// result: { plan: "<text>" } approves the person's edit of it: the CLI saves
+// the text to the plan file and tells the agent the plan was edited
 { type: "answer_interaction", session_id: "main", interaction_id: "uuid", result?: { … }, denied?: false, message?: "" }
 
 // Keep-alive
@@ -1739,7 +1749,8 @@ those for another session. Events marked *global* go to every socket.
 // Session resumed
 { type: "session_resumed", session_id: "abc123" }
 
-// Plan file updated (Write/Edit to .claude/plans/, also by a sub-agent)
+// Plan file updated (Write/Edit to the CLI's plans directory — ~/.claude/plans/,
+// or $CLAUDE_CONFIG_DIR/plans/ — also by a sub-agent)
 { type: "plan_update", session_id: "main", content: "# Plan\n..." }
 
 // The serving model changed (a capacity fallback and back)
@@ -1762,9 +1773,11 @@ those for another session. Events marked *global* go to every socket.
 { type: "file_changed", session_id: "main", path: "/home/user/project/foo.py", operation: "edit", tool_use_id: "toolu_..." }
 
 // Interactive tool waiting for user input (AskUserQuestion, ExitPlanMode,
-// EnterPlanMode, Codex approvals). agent names the sub-agent that asked;
-// null for the orchestrator. agent_id is null when no record is known.
-{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "plan_exit" | "plan_enter" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
+// Codex approvals; EnterPlanMode never waits). agent names the sub-agent that
+// asked; null for the orchestrator. agent_id is null when no record is known.
+// For ExitPlanMode the Claude CLI puts the plan into tool_input: plan (the
+// plan file's text, read again at every call) and planFilePath.
+{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "plan_exit" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
 // ... and settled (any client answered, or it was cancelled)
 { type: "interaction_resolved", session_id: "main", interaction_id: "uuid" }
 // A session waits for input, or no longer does (global)

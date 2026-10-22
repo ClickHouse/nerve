@@ -259,6 +259,11 @@ class Facts:
     #: ``conversation`` (a web chat with a person) or ``autonomous`` (one
     #: session without a person, for a worker set up by ``nerve init``).
     onboarding_kind: str = "conversation"
+    #: What the running onboarding session waits for from the person:
+    #: ``question`` (an ``AskUserQuestion`` card), ``plan`` (an
+    #: ``ExitPlanMode`` decision) or ``None``. Read live by the gateway from
+    #: the session's interaction hub; ``nerve doctor`` leaves it ``None``.
+    onboarding_awaiting: str | None = None
     #: The caller's name: an account's display name, or the actor header's.
     display_name: str | None = None
     #: Live channel → process cache → ST → None (resolved by the caller).
@@ -1225,5 +1230,13 @@ def summarize(facts: Facts) -> dict[str, Any]:
         # Pending steps plus the ones waiting only for the Mode step — never
         # a lockdown-blocked one (C13) — so the count only ever goes down.
         "steps_left": sum(1 for s in steps if s.counts_as_left),
+        # The onboarding in one place (the Mode step's detail carries the
+        # same status, session and kind); ``awaiting`` only while it runs.
+        "onboarding": {
+            "status": facts.onboarding,
+            "session_id": facts.onboarding_session_id,
+            "kind": facts.onboarding_kind,
+            "awaiting": facts.onboarding_awaiting if facts.onboarding == "running" else None,
+        },
         "steps": [s.as_dict() for s in steps],
     }

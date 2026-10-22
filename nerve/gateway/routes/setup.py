@@ -480,6 +480,28 @@ async def _onboarding(config: NerveConfig) -> tuple[str, str | None, str]:
     return state.status, state.session_id, state.kind
 
 
+def _onboarding_awaiting(status: str, session_id: str | None) -> str | None:
+    """What the running onboarding session waits for from the person.
+
+    ``plan`` while an ``ExitPlanMode`` decision is pending, ``question`` while
+    an ``AskUserQuestion`` card is, else ``None`` (also for other pauses, and
+    whenever onboarding is not running). A plan wins over a question.
+    """
+    if status != onboarding_flow.RUNNING or not session_id:
+        return None
+    from nerve.agent.interactive import get_handler
+
+    handler = get_handler(session_id)
+    if handler is None:
+        return None
+    waiting = handler.pending_interaction_types()
+    if "plan_exit" in waiting:
+        return "plan"
+    if "question" in waiting:
+        return "question"
+    return None
+
+
 async def _context(actor: Actor) -> _Context:
     """The checklist's world, as one read. No shell-outs, no network."""
     config = get_config()
@@ -528,6 +550,7 @@ async def _context(actor: Actor) -> _Context:
         onboarding=onboarding,
         onboarding_session_id=onboarding_id,
         onboarding_kind=onboarding_kind,
+        onboarding_awaiting=_onboarding_awaiting(onboarding, onboarding_id),
         display_name=actor.display_name,
         bot_username=_bot_username(config, state, live),
         account_username=username,
