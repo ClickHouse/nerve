@@ -1547,7 +1547,7 @@ describe('pre-configured connections', () => {
     expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Sources.');
   });
 
-  it('a save refused for a GitHub switch the operator took over meanwhile says so', async () => {
+  it('a save refused for a GitHub switch the operator took over meanwhile says so and keeps the other choices', async () => {
     const gmail = { enabled: true, accounts: ['alice@example.com'], source: 'file' as const };
     // Opened before the operator held the switch, so GitHub is still on offer here.
     current = withStep(makeState(), step('sources', { status: 'done' }, { github: { enabled: true, source: null }, gmail }));
@@ -1559,14 +1559,25 @@ describe('pre-configured connections', () => {
     renderAt('/setup/sources');
     await heading('Choose what Nerve reads');
     await userEvent.click(screen.getByRole('checkbox', { name: /Gmail/ }));
+    await userEvent.click(screen.getByRole('checkbox', { name: /Telegram — your own messages/ }));
+    await userEvent.type(screen.getByLabelText('API id'), '1234567');
+    await userEvent.type(screen.getByLabelText('API hash'), 'abcdef0123456789abcdef0123456789');
     await userEvent.click(continueButton());
-    expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: false, telegram: false });
+    const credentials = { telegram_api_id: 1234567, telegram_api_hash: 'abcdef0123456789abcdef0123456789' };
+    expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: false, telegram: true, ...credentials });
     // The form now shows the switch as the operator's, and the refusal is said
     // once: in place of the step's reason, which is the same sentence.
     const card = within(await screen.findByRole('region', { name: 'GitHub' }));
     await waitFor(() => expect(card.queryByRole('checkbox')).not.toBeInTheDocument());
     expect(screen.getByRole('alert')).toHaveTextContent(GITHUB_HELD);
     expect(screen.getAllByText(GITHUB_HELD)).toHaveLength(1);
+    // What the person chose for the other sources is still there, and the
+    // next Continue saves it without the switch.
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: /Telegram — your own messages/ })).toBeChecked();
+    expect(screen.getByLabelText('API id')).toHaveValue('1234567');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenLastCalledWith('sources', { gmail: false, telegram: true, ...credentials }));
   });
 });
 

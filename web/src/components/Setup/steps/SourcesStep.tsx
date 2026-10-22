@@ -4,7 +4,7 @@ import {
   api, type SecretOut, type SetupAutomationDetail, type SetupSourceId, type SetupSourcesDetail, type SetupState,
   type SetupStep,
 } from '../../../api/client';
-import { useSetupStore } from '../../../stores/setupStore';
+import { unsavedFor, useSetupStore } from '../../../stores/setupStore';
 import { Button, Checkbox, TextField } from '../../ui';
 import { Github, Mail, MessageCircle, RefreshCw, X } from '../../ui/icons';
 import {
@@ -27,6 +27,17 @@ const INBOX_JOB = 'inbox-processor';
 const ALL_SOURCES: SetupSourceId[] = ['github', 'gmail', 'telegram'];
 /** Secondary controls reach the 44 px phone target without changing the desktop density. */
 const TOUCH = 'min-h-[44px] md:min-h-0';
+
+/** What the form holds; a refused save keeps it for the form remounted after it (`unsavedFor`). */
+interface SourcesForm {
+  github: boolean;
+  gmail: boolean;
+  telegram: boolean;
+  accounts: string[];
+  newAccount: string;
+  apiId: string;
+  apiHash: string | null;
+}
 
 /** A value the operator provided, in the place its field would be. */
 function ManagedValue({ label, secret, source }: { label: string; secret?: SecretOut; source: ManagedSource }) {
@@ -94,24 +105,6 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   // A Telegram sync the operator switched on where the page may not: shown, not editable.
   const telegramLocked = locked || !offers('telegram');
 
-  const [github, setGithub] = useState(detail.github.enabled);
-  const [gmail, setGmail] = useState(detail.gmail.enabled);
-  const [telegram, setTelegram] = useState(detail.telegram.enabled);
-  const [accounts, setAccounts] = useState<string[]>(detail.gmail.accounts);
-  const [newAccount, setNewAccount] = useState('');
-  const [apiId, setApiId] = useState('');
-  const [apiHash, setApiHash] = useState<string | null>('');
-  const [clientError, setClientError] = useState<{ field: string; detail: string } | null>(null);
-  const [rechecking, setRechecking] = useState(false);
-
-  useEffect(() => { void loadPreflight(); }, [loadPreflight]);
-
-  // After credentials are saved the server's answer remounts this form and
-  // the sign-in panel is what comes next, so its heading takes focus.
-  useEffect(() => {
-    if (savedNotice === 'sources') document.getElementById('setup-telegram-signin-heading')?.focus();
-  }, [savedNotice]);
-
   const githubManaged = managedSource(detail.github.source);
   // The operator holds the GitHub switch: never offered, so never in the save.
   const githubSwitchManaged = detail.github.managed === true;
@@ -119,6 +112,33 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
   const apiIdManaged = secretManaged(detail.telegram.api_id);
   const apiHashManaged = secretManaged(detail.telegram.api_hash);
   const credentialsSaved = detail.telegram.api_id.configured && detail.telegram.api_hash.configured;
+
+  // A save the server refused re-reads the state, which remounts this form
+  // when the step changed (GitHub no longer on offer, say). The form starts
+  // from what the person had chosen wherever it still lets them change it,
+  // so the refusal does not also discard their other changes.
+  const [kept] = useState(() => unsavedFor(step) as Partial<SourcesForm> | null);
+  const keep = <T,>(editable: boolean, mine: T | undefined, server: T): T => (editable && mine !== undefined ? mine : server);
+  const [github, setGithub] = useState(() => keep(offers('github'), kept?.github, detail.github.enabled));
+  const [gmail, setGmail] = useState(() => keep(offers('gmail'), kept?.gmail, detail.gmail.enabled));
+  const [telegram, setTelegram] = useState(() => keep(offers('telegram'), kept?.telegram, detail.telegram.enabled));
+  const [accounts, setAccounts] = useState<string[]>(
+    () => keep(offers('gmail') && !gmailManaged, kept?.accounts, detail.gmail.accounts),
+  );
+  const [newAccount, setNewAccount] = useState(() => keep(offers('gmail') && !gmailManaged, kept?.newAccount, ''));
+  const [apiId, setApiId] = useState(() => keep(offers('telegram') && !apiIdManaged, kept?.apiId, ''));
+  const [apiHash, setApiHash] = useState<string | null>(() => keep(offers('telegram') && !apiHashManaged, kept?.apiHash, ''));
+  const [clientError, setClientError] = useState<{ field: string; detail: string } | null>(null);
+  const [rechecking, setRechecking] = useState(false);
+
+  useEffect(() => { if (kept) useSetupStore.getState().dropUnsaved(); }, [kept]);
+  useEffect(() => { void loadPreflight(); }, [loadPreflight]);
+
+  // After credentials are saved the server's answer remounts this form and
+  // the sign-in panel is what comes next, so its heading takes focus.
+  useEffect(() => {
+    if (savedNotice === 'sources') document.getElementById('setup-telegram-signin-heading')?.focus();
+  }, [savedNotice]);
 
   const errFor = (field: string) =>
     clientError?.field === field ? clientError.detail
@@ -165,7 +185,8 @@ export function SourcesStep({ step, state }: { step: SetupStep; state: SetupStat
       }
     }
     const credentialsSent = body.telegram_api_id !== undefined || body.telegram_api_hash !== undefined;
-    const ok = await save('sources', () => api.setupStep('sources', body));
+    const form: SourcesForm = { github, gmail, telegram, accounts, newAccount, apiId, apiHash };
+    const ok = await save('sources', () => api.setupStep('sources', body), form);
     if (!ok) return false;
     setApiId('');
     setApiHash('');
