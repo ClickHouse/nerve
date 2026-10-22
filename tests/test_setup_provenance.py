@@ -247,6 +247,17 @@ class TestMachineSwitches:
         merge_machine_paths(config_dir / "config.yaml", {"sync.github.enabled": False}, header=CONFIG_YAML_HEADER)
         assert prov.machine_switches(load_config(config_dir)) == {"sync.github.enabled": "config.yaml"}
 
+    def test_status_and_doctor_read_the_switch_as_the_page_does(self, tmp_path):
+        """``nerve status`` and ``nerve doctor`` derive the checklist in their
+        own process, from the same layers, so the steps they count are the
+        page's."""
+        config_dir, _ws = _install(tmp_path)
+        merge_private_paths(config_dir / "config.local.yaml", {"sync.github.mode": "hosted", "sync.github.enabled": True})
+        summary = cli._setup_summary(load_config(config_dir))
+        sources = next(s for s in summary["steps"] if s["id"] == "sources")
+        assert sources["detail"]["github"]["managed"] is True
+        assert sources["detail"]["available"] == ["gmail", "telegram"]
+
     def test_an_unreadable_or_missing_layer_states_nothing(self, tmp_path):
         config_dir, ws = _install(tmp_path)
         (config_dir / "config.local.yaml").write_text("- not: [a mapping", encoding="utf-8")
