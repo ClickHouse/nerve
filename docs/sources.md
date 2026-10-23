@@ -218,7 +218,8 @@ running. Nerve reads them over the hosted channel streams.
   `source:github` runner drains it. The drop hook, `condense`, health checks,
   consumer cursors, `messages` gates and the Sources page work as they do for
   the polling source. The drain also runs on `sync.github.schedule`, as a
-  fallback.
+  fallback; that run is not the instance's next scheduled task, so a platform
+  that parks the machine does not wake it for the fallback.
 - **Runs on delivery.** As soon as records arrive, the runner drains them, and
   the jobs gated on `messages` for `github`, or for any source, run once
   `cron.delivery_debounce_seconds` (default 60) after the first record of a

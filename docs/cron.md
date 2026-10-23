@@ -646,7 +646,9 @@ in when they arrive, and goes on without them after 10 seconds.
   will be reached, say), and counts the first one forecast to happen. A gate on
   the default forecast is asked once: it answers the same for any time, so if it
   says no, so does every later run;
-- the next run of each source runner;
+- the next run of each source runner, except a source that runs when records
+  are delivered (the hosted GitHub source, `Source.push_fed`): its scheduled
+  run is a fallback and does not count;
 - the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
   with "Run later").
 
@@ -665,7 +667,9 @@ timezone-aware, or it raises `ValueError`.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);
-`reason` says why a run is forecast to be skipped.
+`reason` says why a run is forecast to be skipped. For a source that runs when
+records are delivered, `skip` means the scheduled run is not counted in
+`next`; the run itself still fires.
 
 Forecasts are judged from what is known when you ask. Code that keeps the answer
 around can register a schedule listener (`CronService.add_schedule_listener`) to
@@ -719,7 +723,10 @@ started by hand starts as it always does. A catch-up queued before the run does
 not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
 schedule, and the schedules stay the fallback for everything. The setting is
-read for each delivery, so a reload applies it.
+read for each delivery, so a reload applies it. A scheduled run of a source
+that runs on delivery is not counted as the next scheduled task (see
+[What runs next](#what-runs-next)): it normally finds nothing, so a platform
+that parks the machine is not told to wake it for that run.
 
 ## Logging
 
