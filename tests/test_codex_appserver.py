@@ -285,6 +285,33 @@ async def test_endpoint_mode_needs_no_codex_login(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_endpoint_mode_turns_ultracode_off(tmp_path, monkeypatch, caplog):
+    """Ultracode workers do not use the endpoint. With both settings the
+    config loads with a warning, and Ultracode is off: no install, no
+    worker environment."""
+    _mode(monkeypatch, "basic")
+
+    async def no_install(config):
+        raise AssertionError("Ultracode must not be installed")
+
+    monkeypatch.setattr(
+        "nerve.agent.backends.codex.backend.ensure_ultracode_installed", no_install,
+    )
+    with caplog.at_level(logging.WARNING, logger="nerve.config"):
+        cfg = _config(tmp_path, base_url=_ENDPOINT, ultracode={"enabled": True})
+    assert "codex.ultracode.enabled is ignored" in caplog.text
+    assert cfg.codex.ultracode.enabled is False
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        env = client._transport._env
+        assert "CODEX_CLI_PATH" not in env
+        assert "NERVE_CODEX_CHILD_CONFIG" not in env
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_config_overrides_carry_mcp_bridge(tmp_path, monkeypatch):
     _mode(monkeypatch, "basic")
     cfg = _config(tmp_path)

@@ -3294,10 +3294,13 @@ class CodexConfig:
         base_url = base_url.removesuffix("/")
         ultracode = UltracodeConfig.from_dict(d.get("ultracode"))
         if base_url and ultracode.enabled:
-            raise ConfigError(
-                "codex.ultracode.enabled cannot be set together with "
-                "codex.base_url (Ultracode workers do not use the endpoint)"
+            # Ultracode workers do not use the endpoint. A warning and not an
+            # error, so that this setting cannot stop Nerve from starting.
+            logger.warning(
+                "codex.ultracode.enabled is ignored because codex.base_url is "
+                "set: Ultracode workers do not use the endpoint"
             )
+            ultracode.enabled = False
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),

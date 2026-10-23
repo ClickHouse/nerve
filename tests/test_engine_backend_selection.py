@@ -199,16 +199,6 @@ class TestConfigValidation:
             })
             assert cfg.codex.base_url == want
 
-    def test_codex_base_url_refuses_ultracode(self, tmp_path):
-        with pytest.raises(ValueError, match="codex.ultracode.enabled"):
-            NerveConfig.from_dict({
-                "workspace": str(tmp_path),
-                "codex": {
-                    "base_url": "http://127.0.0.1:4000/v1",
-                    "ultracode": {"enabled": True},
-                },
-            })
-
     def test_pricing_defaults_cover_default_model(self, tmp_path):
         cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
         from nerve.agent.backends.codex.pricing import match_pricing

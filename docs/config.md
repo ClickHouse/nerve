@@ -1110,9 +1110,10 @@ codex:
 - Turn costs are estimates from `codex.pricing`, with
   `cost_basis: api_billed`. A model that the Codex catalog does not list
   must be in `codex.models`.
-- Ultracode is not available in this mode. Nerve refuses a config with
-  `codex.ultracode.enabled` together with `codex.base_url` at load, because
-  the Ultracode workers do not use the endpoint.
+- Ultracode is not available in this mode, because the Ultracode workers
+  do not use the endpoint. When `codex.ultracode.enabled` is also set, Nerve
+  logs a config warning and keeps Ultracode off: it does not install the
+  plugin and does not give sessions the worker environment.
 
 Ultracode is installed only into the isolated Nerve Codex home at the exact
 configured revision. A hash-verified Nerve policy overlay hard-enforces the
