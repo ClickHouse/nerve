@@ -58,6 +58,7 @@ from nerve.agent.backends.codex.ultracode import (
     read_verified_run_journal,
 )
 from nerve.agent.backends.images import validate_image_data
+from nerve.agent.interactive import defer_idle_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -1027,7 +1028,9 @@ class CodexClient(AgentClient):
 
         Per-notification idle timeout mirrors the Claude path: a silent
         app-server raises ``asyncio.TimeoutError`` into the engine's
-        hung-client retry path. Terminates on ``turn/completed``
+        hung-client retry path — unless it waits for the person (an
+        approval or a question pending on the session's hub), when the
+        wait goes on. Terminates on ``turn/completed``
         regardless of status (completed / interrupted / failed) so the
         /stop flow's graceful wait works.
         """
@@ -1039,6 +1042,7 @@ class CodexClient(AgentClient):
         # serving-model tracking (parity with AssistantMessage.model).
         yield ev.ModelObserved(model=self.model)
 
+        deferred = False  # an idle-timeout deferral was logged
         while True:
             if self._transport.notifications.empty() and not self._transport.is_alive():
                 raise TransportDiedError("codex app-server died mid-turn")
@@ -1051,12 +1055,20 @@ class CodexClient(AgentClient):
                 else:
                     note = await self._transport.notifications.get()
             except asyncio.TimeoutError:
+                # A cancelled Queue.get() loses nothing: waiting again is safe.
+                if defer_idle_timeout(
+                    self._spec.interactive, self._spec.session_id,
+                    logged=deferred,
+                ):
+                    deferred = True
+                    continue
                 logger.warning(
                     "codex idle timeout (%ds) for session %s — no "
                     "notification received; treating app-server as hung",
                     idle_timeout, self._spec.session_id,
                 )
                 raise
+            deferred = False
 
             method = note.get("method", "")
             params = note.get("params", {}) or {}
