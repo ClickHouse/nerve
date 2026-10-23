@@ -80,11 +80,16 @@ export interface SetupClaimDetail {
 }
 
 /**
- * A worker's onboarding session. `ended` is a session that stopped without
- * writing a plan into TASK.md (a placeholder key, a crash): the page links
- * to it and offers to try again instead of waiting for it.
+ * The onboarding conversation: `pending` until it opens (setup not finished,
+ * or a restart first), `running` while it waits for the person, then `done`
+ * or `skipped`. `not_applicable` before a mode is chosen.
  */
-export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'ended' | 'done';
+export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' | 'skipped';
+/**
+ * How the agent is set up: in a web chat with a person, or, for a worker set
+ * up with `nerve init` and a task description, in one session without a person.
+ */
+export type SetupOnboardingKind = 'conversation' | 'autonomous';
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -92,6 +97,8 @@ export interface SetupModeDetail {
   task_present: boolean;
   onboarding: SetupOnboarding;
   onboarding_session_id: string | null;
+  /** Absent from an older backend: `conversation`. */
+  onboarding_kind?: SetupOnboardingKind;
 }
 
 export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';
@@ -263,10 +270,12 @@ export interface SetupCronJob {
   default?: boolean;
   /**
    * Whether the mode's first-run default turns this optional job on. A
-   * worker's `task-planner` is off until its onboarding session decides.
+   * worker's `task-planner` is off until its onboarding conversation decides.
    * Absent from an older backend.
    */
   default_enabled?: boolean;
+  /** Set in `jobs.yaml`, which replaces the built-in job; `enabled` is that job's. */
+  overridden?: boolean;
 }
 
 export interface SetupAutomationDetail {
@@ -1134,6 +1143,9 @@ export const api = {
     request<SetupState>(`/setup/${encodeURIComponent(step)}`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+
+  setupSkipOnboarding: () =>
+    request<SetupState>('/setup/onboarding/skip', { method: 'POST', body: '{}' }),
 
   setupSkip: (step: SetupStepId, skipped: boolean) =>
     request<SetupState>(

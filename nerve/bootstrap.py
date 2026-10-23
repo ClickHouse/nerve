@@ -1373,7 +1373,9 @@ class SetupWizard:
         click.echo()
         click.secho(
             "In worker mode, Nerve needs to know what to do. Describe\n"
-            "your task — what to monitor, what to fix, what to report.\n\n"
+            "your task: what to monitor, what to fix, what to report.\n"
+            "Or leave it empty and set the worker up in a conversation\n"
+            "in the web UI after the first start.\n\n"
             "Examples:\n"
             '  "Monitor CI for repo X and fix flaky tests"\n'
             '  "Review PRs in org/repo and suggest improvements"\n'
@@ -1381,16 +1383,26 @@ class SetupWizard:
             dim=True,
         )
         click.echo()
-        self.choices.task_description = click.prompt("Describe your task")
+        self.choices.task_description = click.prompt(
+            "Describe your task (optional)", default="", show_default=False,
+        ).strip()
         click.echo()
-        click.secho(
-            "  This will be saved to TASK.md in your workspace.\n\n"
-            "  On first boot, a setup agent will run with full tool\n"
-            "  access to research your task, create a structured\n"
-            "  TASK.md, generate custom cron jobs and skills, then\n"
-            "  notify you when setup is complete.",
-            dim=True,
-        )
+        if self.choices.task_description:
+            click.secho(
+                "  This will be saved to TASK.md in your workspace.\n\n"
+                "  On first boot, a setup agent will run with full tool\n"
+                "  access to research your task, create a structured\n"
+                "  TASK.md, generate custom cron jobs and skills, then\n"
+                "  notify you when setup is complete.",
+                dim=True,
+            )
+        else:
+            click.secho(
+                "  After the first start, open the web UI. A notice there\n"
+                "  leads you to the onboarding conversation, where the\n"
+                "  worker asks what to do and sets itself up.",
+                dim=True,
+            )
         click.echo()
 
     # --- Step: External Agents (Codex, Claude Code, ...) ---
@@ -1544,8 +1556,9 @@ class SetupWizard:
             click.secho(f"  │  Timezone:   {self.choices.timezone:<33}│")
         else:
             task_preview = self.choices.task_description[:30] + "..." if len(self.choices.task_description) > 33 else self.choices.task_description
-            click.secho(f"  │  Task:       {task_preview:<33}│")
-            click.secho("  │  Setup:      on first boot (agent session)     │")
+            setup = "on first boot (agent session)" if task_preview else "conversation in the web UI"
+            click.secho(f"  │  Task:       {task_preview or 'none':<33}│")
+            click.secho(f"  │  Setup:      {setup:<33}│")
 
         click.secho("  └──────────────────────────────────────────────┘", dim=True)
         click.echo()
@@ -1618,7 +1631,7 @@ class SetupWizard:
 
         # 5. Worker: TASK.md from the template with the description in place —
         #    the same writer the web Mode step uses, so every install path
-        #    produces one file for the onboarding session to fill in.
+        #    produces one file for the onboarding conversation to fill in.
         if self.choices.mode == "worker":
             apply_task_md(ws_path, self.choices.task_description)
 
@@ -2618,7 +2631,7 @@ def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) 
 
     # The mode's default optional crons — the set the web Mode step writes too.
     # Personal: inbox-processor and task-planner. Worker: the two skill jobs;
-    # its task-planner stays off until the onboarding session enables it.
+    # its task-planner stays off until the onboarding conversation enables it.
     if choices.mode in DEFAULT_CRONS:
         choices.enabled_crons = list(DEFAULT_CRONS[choices.mode])
 
@@ -2640,7 +2653,9 @@ def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) 
             "NERVE_EXTERNAL_AGENTS_CONFLICT", "backup",
         )
 
-    # Worker task description (setup agent runs on first boot, not during init)
+    # Worker task description. With one, the autonomous onboarding runs at the
+    # first start; without one, the worker waits for the onboarding
+    # conversation in the web UI (nerve.onboarding).
     if choices.mode == "worker":
         choices.task_description = os.environ.get("NERVE_TASK", "")
 

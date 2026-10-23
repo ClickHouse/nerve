@@ -70,7 +70,6 @@ from nerve.agent.prompts import (
     memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
-    worker_onboarding_prompt,
 )
 from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
@@ -105,16 +104,8 @@ from nerve.memory.backend import (
 )
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
-from nerve.setup_writer import (
-    TASK_ONBOARDING_MARKER,
-    publish_text,
-    render_task_md,
-    task_description_from,
-    task_onboarding_pending,
-)
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
-from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
 
@@ -904,11 +895,6 @@ class AgentEngine:
         except Exception as e:
             logger.error("Orphaned session recovery failed: %s", e)
 
-        # Worker mode: check if first-boot onboarding is needed
-        if self._needs_worker_onboarding():
-            asyncio.get_event_loop().call_soon(
-                lambda: asyncio.ensure_future(self._run_worker_onboarding())
-            )
 
         logger.info("Agent engine initialized")
 
@@ -955,71 +941,6 @@ class AgentEngine:
             len(self._claude_code_plugins),
         )
         return self._mcp_servers_cache
-
-    def _needs_worker_onboarding(self) -> bool:
-        """Check if this is a worker instance that needs first-boot onboarding.
-
-        Pending while ``TASK.md`` carries the template's onboarding marker —
-        the onboarding session deletes that line last, once every section is
-        filled — and, for files written by older versions, while it is still
-        the raw ``# Task`` form (:func:`nerve.setup_writer.task_onboarding_pending`).
-        """
-        task_md = self.config.workspace / "TASK.md"
-        if not task_md.exists():
-            return False
-        try:
-            content = task_md.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("Worker onboarding: cannot read %s: %s", task_md, e)
-            return False
-        return task_onboarding_pending(content)
-
-    def ensure_worker_onboarding(self) -> bool:
-        """Start the first-boot onboarding session if it is due and not running.
-
-        The public, idempotent-per-process entry the setup wizard's finish
-        step uses when the mode was chosen in the browser after boot (the
-        start-up check in :meth:`initialize` has already run by then). Returns
-        whether a session was scheduled now. The session it creates is the one
-        :meth:`run_cron` names ``Cron: worker-onboarding`` with
-        ``source="cron"``, which is how the checklist recognises it.
-        """
-        task = getattr(self, "_onboarding_task", None)
-        if task is not None and not task.done():
-            return False
-        if not self._needs_worker_onboarding():
-            return False
-        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
-        return True
-
-    async def _run_worker_onboarding(self) -> None:
-        """Run the worker onboarding agent session on first boot."""
-        logger.info("Worker onboarding: starting first-boot setup session")
-
-        task_md = self.config.workspace / "TASK.md"
-        raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
-        task_description = task_description_from(raw_task)
-        if task_description is None:  # completed since the check; nothing to do
-            logger.info("Worker onboarding: TASK.md is already complete")
-            return
-        if TASK_ONBOARDING_MARKER not in raw_task:
-            # A raw ``# Task`` file from an older install. The session is told
-            # to fill the template in place, so give it the template: its text
-            # kept under the description heading, the marker on line 2.
-            await asyncio.to_thread(publish_text, task_md, render_task_md(task_description))
-            logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
-
-        guide = await asyncio.to_thread(read_worker_guide)
-        prompt = worker_onboarding_prompt(task_description, guide, self.config.memory.backend)
-
-        try:
-            await self.run_cron(
-                job_id="worker-onboarding",
-                prompt=prompt,
-            )
-            logger.info("Worker onboarding: setup session completed")
-        except Exception as e:
-            logger.error("Worker onboarding failed: %s", e)
 
     @staticmethod
     async def _safe_disconnect(client: Any, timeout: float = 5.0) -> None:

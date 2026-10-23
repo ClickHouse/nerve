@@ -201,8 +201,10 @@ the `PairingWidget` (t.me link, code, 2 s poll) when the bot is live, with a
 manual user id fallback; Sources load `GET /api/setup/sources/preflight` and
 warn when a toggle is on but its tool is missing; Automation renders
 schedules in the chosen time zone and, for a worker, shows `task-planner` off
-by default with a note that the onboarding session enables it when the worker
-should plan through the approval loop; Agents default-checks what is installed.
+by default with a note that the onboarding conversation turns it on when the
+worker should plan through the approval loop; a job that `jobs.yaml` replaces
+shows that file's state, read-only, with a note; Agents default-checks what is
+installed.
 
 **Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
 runs the server check-up (`GET /api/setup/environment`) with its hints — an
@@ -213,11 +215,22 @@ address, a passwordless-on-LAN warning — shows what was written where from
 restart, with the reasons listed. Under systemd (or an operator-declared
 supervisor) the operator's command is shown before the click — it arrives as
 `restart_command` in the setup state (and `command` from `/api/setup/environment`),
-never parsed out of the message. Then `ReadyScreen`: "Nerve is ready", three summary
-lines, **Say hello** (opens a new chat with a suggested first message),
-a pairing card when a live Telegram bot has nobody paired yet, and "Open
-the setup page". A worker's ending is "Your worker is ready" with the onboarding
-session's status and a link to it, polled every 5 s while it runs.
+never parsed out of the message. Then `ReadyScreen`: "Nerve is ready" (a
+worker: "Your worker is ready"), three summary lines, **Start the
+conversation** into the onboarding conversation (or, after a restart is
+needed first, a line that it opens after the restart; when onboarding is over,
+**Say hello** with a suggested first message, or **Open chat** for a worker),
+a pairing card when a live Telegram bot has nobody paired yet, and "Open the
+setup page". The setup Overview shows `OnboardingPanel` while onboarding is
+pending or waits: the way into the conversation (**Start the conversation**
+once setup is complete) and **Skip onboarding** behind an inline
+confirmation. `SetupBanner` shows the onboarding reminder first: on every
+page except the onboarding chat, to every signed-in person, with **Continue**;
+when setup is complete and the conversation has not started, with **Start**,
+which calls `POST /api/setup/finish` and opens the conversation; while a
+worker sets itself up without a person, with **Open**, a link to that
+session. Its close button hides it until the next page, and it reads the
+setup state again on each page change while a session runs.
 
 **RestartOverlay** covers the page while the daemon restarts and is never a
 trap: "Restarting Nerve… (12 s)" with **Not now** after ten seconds; for an

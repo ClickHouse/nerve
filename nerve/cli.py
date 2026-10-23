@@ -368,6 +368,20 @@ def init(
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    # A worker with a task description sets itself up at the next start,
+    # without a person. Without one, it waits for its onboarding conversation
+    # in the web UI.
+    if choices.mode == "worker":
+        from nerve.onboarding import request_autonomous_sync
+
+        try:
+            if request_autonomous_sync(config):
+                click.echo("  The worker sets itself up from its task description when Nerve starts.")
+        except Exception as e:  # noqa: BLE001 - the web UI still offers the conversation
+            click.echo(
+                f"  Could not record the worker's onboarding ({e}). It waits for its "
+                "onboarding conversation in the web UI."
+            )
     from nerve.db.accounts import read_setup_required
 
     # In external mode there are no local accounts to claim, so the hint

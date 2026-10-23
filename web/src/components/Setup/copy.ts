@@ -1,4 +1,4 @@
-import type { SetupMode, SetupOnboarding, SetupStepId } from '../../api/client';
+import type { SetupMode, SetupOnboarding, SetupOnboardingKind, SetupStepId } from '../../api/client';
 import type { ManagedSource } from './credentialSource';
 
 /**
@@ -20,7 +20,7 @@ export const STEP_HEADINGS: Record<SetupStepId, { heading: string; intro: string
   },
   mode: {
     heading: 'Choose a mode',
-    intro: 'You choose this once. The mode decides which notes Nerve starts with and which jobs it runs on its own.',
+    intro: 'You choose this once. After setup, Nerve asks what you want it to do and sets itself up in a conversation with you.',
   },
   provider: {
     heading: 'Connect a model',
@@ -66,35 +66,19 @@ export const MODE_CARDS: { value: SetupMode; title: string; description: string;
   {
     value: 'personal',
     title: 'Personal assistant',
-    description: 'An assistant for one person. It keeps notes about you and can read your inboxes.',
+    description: 'Works for you. It reads your own inboxes, such as Gmail, GitHub notifications and Telegram, and keeps notes about you.',
     recommended: true,
   },
   {
     value: 'worker',
     title: 'Worker',
-    description: 'Works on one task you describe and reports its results.',
+    description: 'Works for a team on engineering, operations or research. It has its own memory, task list and schedule, and reads no personal inbox.',
   },
 ];
 
-export const WORKER_TEMPLATES: { label: string; text: string }[] = [
-  {
-    label: 'Monitor a build',
-    text: 'Watch the nightly build for example/repo. When it fails, find the first bad commit, propose a fix as a pull request, and never merge anything yourself.',
-  },
-  {
-    label: 'Review pull requests',
-    text: 'Review every open pull request in example/repo for correctness and test coverage. Leave one consolidated comment per PR; ask before requesting changes.',
-  },
-  {
-    label: 'Watch logs',
-    text: 'Read the application logs under /var/log/example every hour. Summarise new errors, group repeats, and open a task for anything that recurs three times.',
-  },
-];
-
-export const WORKER_FIRST_BOOT =
-  'On first boot the worker reads this description, drafts a mission and a plan into TASK.md, '
-  + 'and starts an onboarding session you can watch and correct. Work on the task starts '
-  + 'only after that session has written the plan.';
+/** The worker's optional note at setup, written into TASK.md. */
+export const WORKER_NOTE_LABEL = 'Anything it should know? (optional)';
+export const WORKER_NOTE_HELP = 'You can also tell it in the first conversation.';
 
 export const PROVIDER_CARDS: { value: 'anthropic' | 'oauth' | 'host_login' | 'bedrock'; title: string; description: string }[] = [
   { value: 'anthropic', title: 'Anthropic API key', description: 'Pay per use. Works for chat, memory and background jobs.' },
@@ -290,8 +274,11 @@ export const AUTOMATION_IDLE_UNTIL_SOURCE =
 
 /** Under a worker's task planner while the mode's default leaves it off. */
 export const AUTOMATION_TASK_PLANNER_WORKER =
-  'Off for workers until onboarding decides. The onboarding session enables it when this worker '
+  'Off for workers until onboarding decides. The onboarding conversation turns it on when this worker '
   + 'should plan through the approval loop.';
+
+/** Under a job that `jobs.yaml` replaces: the checkbox shows that file's state. */
+export const AUTOMATION_OVERRIDDEN = 'Set in jobs.yaml. Change it there, or ask the agent.';
 
 /** The Slack card when the shared channel gateway holds the connection: a status line, and only the switch. */
 export const SLACK_GATEWAY_LINE = (connected: boolean) =>
@@ -494,17 +481,42 @@ export const READY_TELEGRAM_SYNC_LINK = 'Sign in';
 export const READY_STEPS_LEFT = (n: number) =>
   `${n} optional ${n === 1 ? 'step is' : 'steps are'} still open. You can finish ${n === 1 ? 'it' : 'them'} later on the setup page.`;
 
-/**
- * A worker's onboarding, in sentences. Never the session id: the link
- * carries it. `ended` is a session that stopped without writing a plan.
- */
-export const ONBOARDING_ENDED = 'The onboarding session ended without writing a plan';
+/** The onboarding conversation, in sentences. Never the session id: the link carries it. */
 export const ONBOARDING_SENTENCES: Record<SetupOnboarding, string> = {
   not_applicable: '',
-  pending: 'The onboarding session starts after setup finishes.',
-  running: 'Onboarding session running',
-  ended: `${ONBOARDING_ENDED}. Open it to see why.`,
-  done: 'Onboarding is complete.',
+  pending: 'The onboarding conversation starts when you finish setup.',
+  running: 'Your agent waits for you in its onboarding conversation.',
+  done: 'Onboarding is done.',
+  skipped: 'Onboarding was skipped.',
 };
-export const ONBOARDING_OPEN = 'Open the onboarding session';
-export const ONBOARDING_TRY_AGAIN = 'Try again';
+/** A worker that sets itself up without a person, after `nerve init`. */
+export const ONBOARDING_AUTONOMOUS = 'Your worker is setting itself up from its task description.';
+/**
+ * The onboarding in one sentence. `canStart`: setup is complete, so a
+ * pending conversation can start now.
+ */
+export function onboardingSentence(status: SetupOnboarding, kind: SetupOnboardingKind, canStart: boolean): string {
+  if (kind === 'autonomous' && status === 'pending') return 'Your worker sets itself up from its task description when Nerve starts.';
+  if (kind === 'autonomous' && status === 'running') return ONBOARDING_AUTONOMOUS;
+  if (status === 'pending' && canStart) return 'Your agent is ready for its onboarding conversation.';
+  return ONBOARDING_SENTENCES[status];
+}
+export const ONBOARDING_OPEN = 'Continue the conversation';
+/** The link to the session of a worker that sets itself up. */
+export const ONBOARDING_OPEN_SESSION = 'Open the session';
+export const ONBOARDING_START = 'Start the conversation';
+export const ONBOARDING_SKIP = 'Skip onboarding';
+export const ONBOARDING_SKIP_CONFIRM =
+  'Skip onboarding? Nothing is set up for you. You can still ask the agent to set itself up in any chat.';
+export const ONBOARDING_SKIP_KEEP = 'Keep it';
+/** The ready screen when the conversation opens. */
+export const READY_ONBOARDING =
+  'Your agent waits for you in its first conversation. It asks what you want it to do and sets itself up.';
+/** The ready screen when a restart comes first. */
+export const READY_ONBOARDING_AFTER_RESTART = 'The first conversation with your agent opens after the restart.';
+/** The banner while the conversation waits, on every page but the conversation. */
+export const BANNER_ONBOARDING = 'Your agent waits for you in its onboarding conversation';
+/** The banner when setup is complete and the conversation has not started. */
+export const BANNER_ONBOARDING_START = 'Your agent is ready for its onboarding conversation';
+/** The banner while a worker sets itself up without a person. */
+export const BANNER_ONBOARDING_AUTONOMOUS = 'Your worker is setting itself up from its task description';

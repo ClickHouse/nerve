@@ -22,6 +22,7 @@ from nerve.agent.backends.codex.backend import _BACKEND_NOTES, _backend_notes
 from nerve.agent.prompts import (
     _ONBOARDING_STEPS,
     build_system_prompt,
+    onboarding_prompt,
     worker_onboarding_prompt,
 )
 from nerve.config import MemoryConfig, NerveConfig
@@ -132,6 +133,16 @@ def test_onboarding_saves_to_loom_under_loom() -> None:
     loom = worker_onboarding_prompt("Watch the build.", "guide", "loom")
     assert "`loom_memory_set`" in loom and "- what you saved to Loom." in loom
     assert "`memorize`" not in loom and "what you memorized" not in loom
+
+
+def test_the_onboarding_conversation_saves_to_loom_under_loom() -> None:
+    for mode in ("personal", "worker"):
+        memu = onboarding_prompt(mode, "Watch the build.", "guide")
+        assert memu == onboarding_prompt(mode, "Watch the build.", "guide", memory_backend="memu")
+        loom = onboarding_prompt(mode, "Watch the build.", "guide", memory_backend="loom")
+        for old, new in loom_prompts.CONVERSATION_EDITS:
+            assert old in memu and new in loom, (mode, old[:60])
+        assert not MEMU_TOOLS.search(loom), (mode, MEMU_TOOLS.search(loom))
 
 
 def test_the_codex_note_names_loom_tools_under_loom() -> None:

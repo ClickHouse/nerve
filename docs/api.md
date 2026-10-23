@@ -260,7 +260,8 @@ Response: {
       "etag": "…", "summary": "Personal assistant",
       "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
       "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
-                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null } },
+                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null,
+                  "onboarding_kind": "conversation" } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
       "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort xhigh",
@@ -341,8 +342,9 @@ default: `02:00`–`08:00` for a personal install, none for a worker. Each job i
 `detail.automation.optional` carries `id`, `name`, `description`, `schedule`
 and `schedule_text`, `requires` and `requirement_met`, `enabled`, and
 `default_enabled`: whether the mode's default set switches it on (`false` for
-a worker's `task-planner`, which the onboarding session decides on; `default`
-is the older name for the same value).
+a worker's `task-planner`, which the onboarding conversation decides on; `default`
+is the older name for the same value), and `overridden`: a job with the same id
+in `jobs.yaml` replaces this one, and `enabled` is that job's.
 
 **Where a value came from.** Every masked secret is
 `{"configured": bool, "last4": str | null, "source": str | null}`. `source`
@@ -669,26 +671,35 @@ reports as `restart_mode`, `restart_message` and `restart_command`.
 
 #### `POST /api/setup/finish`
 
-Body `{}`. Reloads the configuration, recomputes the checklist and, for a
-worker whose `TASK.md` still carries the onboarding marker (the comment on its
-second line, deleted by the onboarding session when the file is complete), a
-provider is configured and nothing waits on a restart, starts the onboarding
-session. Idempotent; allowed under lockdown (it writes nothing).
+Body `{}`. Reloads the configuration and recomputes the checklist. While
+onboarding is `pending`, it opens the onboarding conversation for the caller:
+one web session titled `Onboarding`, whose hidden first message makes the
+agent speak first. When a restart is pending or no model is configured, it
+records the request instead, and the next start of the daemon opens the
+conversation. Idempotent: a second call, also at the same time, names the same
+session. When the agent's first turn fails, the status goes back to `pending`.
+Allowed under lockdown.
 
 ```json
-Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "cron:worker-onboarding:…" } }
+Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d" } }
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_required", "onboarding": { "status": "pending", "session_id": null } }
 ```
 
 `onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
-`not_applicable`, `pending`, `running`, `ended` or `done`. `ended` means the
-onboarding session exists but the engine is no longer driving it while
-`TASK.md` still carries the onboarding marker — it stopped before completing
-the file (a placeholder key, a crash); the session id is carried so the page
-can link to it instead of waiting. Calling `finish` again schedules the session anew; the
-ended row stays in the table, and a session the engine is driving always wins
-over an ended one (among several ended ones the newest is named), so every
-tab reads `running` with the new id.
+`not_applicable` (no mode chosen), `pending`, `running` (the session id is
+carried), `done` or `skipped`. The agent sets `done` with the
+`onboarding_done` tool, from the onboarding session only. A worker whose
+`TASK.md` no longer carries the onboarding marker is `done`. A running
+conversation whose session was deleted reads `pending` again.
+`mode.detail.onboarding_kind` is `conversation`, or `autonomous` for a worker
+that `nerve init` set up with a task description: the next start of the daemon
+runs its onboarding in one session without a person (source `cron`). While
+onboarding is `pending`, Finish opens the conversation for either kind.
+
+#### `POST /api/setup/onboarding/skip`
+
+Body `{}`. Sets onboarding to `skipped` while it is `pending` or `running`; the
+session stays. Answers the `GET /api/setup` body.
 
 #### `POST /api/system/restart`
 

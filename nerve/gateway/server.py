@@ -967,6 +967,13 @@ async def lifespan(app: FastAPI):
         # background task so a (possibly long) resumed turn never blocks startup;
         # the engine, notification service and channels are all wired by now.
         asyncio.create_task(_engine.resume_enrolled_sessions())
+
+        # Open the onboarding conversation when setup asked for it before a
+        # restart. The gateway does this, not AgentEngine.initialize, so the
+        # one-shot engines of `nerve cron` and `nerve sync` never open it.
+        from nerve import onboarding as onboarding_flow
+
+        asyncio.create_task(onboarding_flow.start_on_boot(_engine, Path(config.workspace)))
     except BaseException:
         # The shutdown code after the yield will not run, so stop what started
         # here, then re-raise the original error.

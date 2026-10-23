@@ -36,6 +36,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from nerve import onboarding as onboarding_flow
 from nerve import (
     boot,
     config_reload,
@@ -85,7 +86,6 @@ from nerve.setup_checklist import (
     Step,
     derive,
     managed_switch_reason,
-    onboarding_from_task,
     sources_available,
     steps_for_mode,
     summarize,
@@ -307,7 +307,6 @@ _NO_CONFIG_DIR = (
 )
 _BUSY = "Another check is running; try again in a moment."
 _RESTART_DELAY_SECONDS = 0.75
-_ONBOARDING_TITLE = "Cron: worker-onboarding"
 
 # How response bodies name the files the wizard writes: the display paths
 # the Review table uses (``setup_checklist.files_for``), never an absolute
@@ -462,72 +461,23 @@ def _bot_username(config: NerveConfig, state: SetupState, live: bool) -> str | N
     return state.telegram_bot_username
 
 
-_SESSION_STATUSES_TO_SCAN = [
-    "created", "idle", "pending", "active", "running",
-    "completed", "failed", "stopped", "killed", "error",
-]
+async def _onboarding(config: NerveConfig) -> tuple[str, str | None, str]:
+    """The onboarding status, its session id and its kind (:func:`nerve.onboarding.read_state`).
 
-
-def _onboarding_still_running(engine: Any, session_id: str) -> bool | None:
-    """Whether the engine is still driving the onboarding session.
-
-    ``None`` when there is no engine to ask (``nerve doctor``, a stand-in):
-    the stored row cannot say — a turn is marked running only in memory and
-    the row keeps the status it was created with — so the caller must not
-    claim the session ended.
+    Without a database (``nerve doctor``, a stand-in) a worker falls back to
+    the ``TASK.md`` marker and a personal install reads ``not_applicable``.
     """
-    if engine is None:
-        return None
-    task = getattr(engine, "_onboarding_task", None)
-    if task is not None and not task.done():
-        return True  # scheduled: between create_session and the first turn
-    running = getattr(engine, "is_session_running", None)
-    if not callable(running):
-        return None
     try:
-        return bool(running(session_id))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-async def _onboarding(config: NerveConfig, mode: str | None) -> tuple[str, str | None]:
-    """``not_applicable`` | ``pending`` | ``running`` | ``ended`` | ``done``.
-
-    ``ended``: the onboarding session exists and the engine is no longer
-    driving it, yet ``TASK.md`` still lacks a ``## Mission`` — it stopped
-    without writing a plan (a placeholder key, a crash). Reported with the
-    session id so the page can link to it instead of spinning.
-    """
-    status = onboarding_from_task(config.workspace, mode)
-    if status != "pending":
-        return status, None
-    try:
-        deps = get_deps()
-        db = deps.db
-        rows = await db.get_sessions_by_status(_SESSION_STATUSES_TO_SCAN)
-    except Exception:  # noqa: BLE001 — no DB (doctor), or a stand-in
-        return status, None
-    try:
-        engine = get_deps().engine
+        db = get_deps().db
     except RuntimeError:
-        engine = None
-    # Several onboarding rows can exist: "Try again" starts a new session and
-    # the ended one stays in the table. A row the engine still drives wins
-    # over any ended one regardless of the table's order; among ended rows
-    # the newest is named, so the link points at the latest attempt.
-    ended: tuple[str, str] | None = None  # (created_at, id)
-    for row in rows:
-        if row.get("source") != "cron" or row.get("title") != _ONBOARDING_TITLE:
-            continue
-        live = _onboarding_still_running(engine, row["id"])
-        if live is not False:
-            return "running", row["id"]
-        created = str(row.get("created_at") or "")
-        if ended is None or created >= ended[0]:
-            ended = (created, row["id"])
-    if ended is not None:
-        return "ended", ended[1]
-    return status, None
+        db = None
+    if db is None:
+        from nerve.setup_checklist import onboarding_from_task
+
+        status = onboarding_from_task(config.workspace, workspace_mode(config.workspace))
+        return status, None, onboarding_flow.CONVERSATION
+    state = await onboarding_flow.read_state(db, Path(config.workspace))
+    return state.status, state.session_id, state.kind
 
 
 async def _context(actor: Actor) -> _Context:
@@ -548,9 +498,8 @@ async def _context(actor: Actor) -> _Context:
             username = (account or {}).get("username")
     state = setup_state.load_state()
     setup_state.retire_on_boot(state)
-    mode = workspace_mode(config.workspace)
     live = _telegram_live(config)
-    onboarding, onboarding_id = await _onboarding(config, mode)
+    onboarding, onboarding_id, onboarding_kind = await _onboarding(config)
     env_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     env_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
     try:
@@ -578,6 +527,7 @@ async def _context(actor: Actor) -> _Context:
         env_oauth_only=env_oauth and not env_key,
         onboarding=onboarding,
         onboarding_session_id=onboarding_id,
+        onboarding_kind=onboarding_kind,
         display_name=actor.display_name,
         bot_username=_bot_username(config, state, live),
         account_username=username,
@@ -1053,7 +1003,7 @@ async def get_setup(actor: Actor = Depends(require_person)):
 #  PUT /api/setup/mode                                                         #
 # --------------------------------------------------------------------------- #
 
-_TASK_MIN, _TASK_MAX = 20, 4000
+_TASK_MAX = 4000
 TASK_LOCK_REASON = (
     "The task description was written to TASK.md when the mode was chosen, and "
     "the worker reads and maintains that file itself. To change the task, edit "
@@ -1097,12 +1047,6 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
             on_disk = _task_description_on_disk(ws / "TASK.md")
             if on_disk is None or (on_disk and on_disk != task):
                 raise HTTPException(status_code=409, detail=TASK_LOCK_REASON)
-        if mode == "worker" and current is None:
-            if len(task) < _TASK_MIN:
-                raise SetupFieldError(
-                    "task_description",
-                    "Describe the task in at least one full sentence (20+ characters).",
-                )
         if len(task) > _TASK_MAX:
             raise SetupFieldError("task_description", "Keep the task description under 4000 characters.")
         if current is None and locked:
@@ -2739,26 +2683,36 @@ async def finish(actor: Actor = Depends(require_person)):
         ctx = await _context(actor)
         facts = ctx.facts
         onboarding = {"status": facts.onboarding, "session_id": facts.onboarding_session_id}
-        provider_ready = facts.config.credential_available()
-        # ``ended`` (the session stopped without writing a plan) is retried on
-        # an explicit Finish: the engine's wrapper is idempotent while a run
-        # is in flight, so this cannot start two.
-        if (
-            workspace_mode(facts.workspace) == "worker" and facts.onboarding in ("pending", "ended")
-            and provider_ready and not facts.restart_pending and not facts.state.debts
-        ):
+        restart = bool(facts.restart_pending or facts.state.debts)
+        if facts.onboarding == onboarding_flow.PENDING:
+            # The conversation opens now, for this person, when the agent can
+            # answer; otherwise the next daemon start opens it. Finish always
+            # opens the conversation, also for a worker that waits for its
+            # autonomous onboarding.
             try:
-                engine = get_deps().engine
-                if engine is not None and hasattr(engine, "ensure_worker_onboarding"):
-                    engine.ensure_worker_onboarding()
-                    await asyncio.sleep(0)
-                    status, session_id = await _onboarding(facts.config, "worker")
-                    onboarding = {"status": status, "session_id": session_id}
+                deps = get_deps()
+                if restart or not facts.config.credential_available() or deps.engine is None:
+                    await onboarding_flow.request(deps.db, facts.workspace, actor_id=actor.actor_id)
+                else:
+                    state = await onboarding_flow.start(
+                        deps.engine, facts.workspace, actor=actor, cause=actor,
+                    )
+                    onboarding = {"status": state.status, "session_id": state.session_id}
+                    ctx = await _context(actor)
             except Exception as e:  # noqa: BLE001
-                logger.warning("Setup: worker onboarding could not be scheduled: %s", e)
-        action = "restart_required" if (facts.restart_pending or facts.state.debts) else "reloaded"
+                logger.warning("Setup: the onboarding conversation could not be opened: %s", e)
+        action = "restart_required" if restart else "reloaded"
         warning = _warning_from(summary, True)
         return {"state": _render(ctx, warning=warning), "action": action, "onboarding": onboarding}
+
+
+@router.post("/api/setup/onboarding/skip")
+async def skip_onboarding(actor: Actor = Depends(require_person)):
+    """Skip the onboarding conversation. The session stays in the list."""
+    async with _loop_lock("state"):
+        ctx = await _claimed_context(actor)
+        await onboarding_flow.skip(get_deps().db, Path(ctx.config.workspace), actor_id=actor.actor_id)
+        return _render(await _context(actor))
 
 
 class RestartResponse(BaseModel):

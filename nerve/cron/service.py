@@ -34,6 +34,7 @@ from nerve.cron.jobs import (
     describe_reserved_job_ids,
     is_reserved_job_id,
     load_jobs,
+    merge_jobs,
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
@@ -1686,11 +1687,7 @@ class CronService:
                     job.id,
                 )
 
-        jobs_by_id = {j.id: j for j in system_jobs}
-        for j in user_jobs:
-            jobs_by_id[j.id] = j
-
-        kept, self._rejected_job_ids = _drop_reserved(list(jobs_by_id.values()))
+        kept, self._rejected_job_ids = _drop_reserved(merge_jobs(system_jobs, user_jobs))
         return kept
 
     async def _run_job_wrapper(

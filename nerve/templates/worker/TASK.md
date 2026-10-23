@@ -1,5 +1,5 @@
 # Task
-<!-- nerve:onboarding pending — the first-boot onboarding session fills this file in and deletes this line. -->
+<!-- nerve:onboarding pending: the onboarding conversation fills this file in; this line goes when onboarding is done. -->
 
 ## Task description (as given)
 {{TASK_DESCRIPTION}}

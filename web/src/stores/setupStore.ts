@@ -2,8 +2,8 @@ import { create } from 'zustand';
 import {
   api,
   type AgentsDetect, type HostLogin, type RestartResponse, type SetupEnvironment,
-  type SetupFinishResponse, type SetupModelsResponse, type SetupState, type SetupStep,
-  type SetupStepId, type SourcesPreflight,
+  type SetupFinishResponse, type SetupModeDetail, type SetupModelsResponse, type SetupOnboarding,
+  type SetupOnboardingKind, type SetupState, type SetupStep, type SetupStepId, type SourcesPreflight,
 } from '../api/client';
 import { ApiError, clearUnavailable } from '../api/hosted';
 import { errorDetail } from './accountStore';
@@ -82,6 +82,10 @@ export interface SetupStoreState {
   save: (step: SetupStepId, run: () => Promise<SetupState>, unsaved?: unknown) => Promise<boolean>;
   skip: (step: SetupStepId, skipped: boolean) => Promise<boolean>;
   finish: () => Promise<SetupFinishResponse | null>;
+  /** Open the onboarding conversation (Finish, which is idempotent). Its session id, or null. */
+  startOnboarding: () => Promise<string | null>;
+  /** End the onboarding conversation without its setup. */
+  skipOnboarding: () => Promise<boolean>;
   restart: () => Promise<boolean>;
   waitForGeneration: (before: string, timeoutMs: number) => Promise<boolean>;
   /** Another bounded wait on the generation the last restart reported. */
@@ -164,6 +168,24 @@ export function setupIsUnfinished(s: SetupStoreState): boolean {
  */
 export function setupNotStarted(s: SetupStoreState): boolean {
   return setupIsUnfinished(s) && stepById(s, 'mode')?.status === 'pending';
+}
+
+/** The onboarding, from the Mode step's detail. */
+export function onboardingOf(state: SetupState | null): {
+  status: SetupOnboarding; sessionId: string | null; kind: SetupOnboardingKind;
+} {
+  const detail = state?.steps.find((x) => x.id === 'mode')?.detail as SetupModeDetail | undefined;
+  return {
+    status: detail?.onboarding ?? 'not_applicable',
+    sessionId: detail?.onboarding_session_id ?? null,
+    kind: detail?.onboarding_kind ?? 'conversation',
+  };
+}
+
+/** Setup is complete and the onboarding conversation can start now. */
+export function onboardingCanStart(state: SetupState | null): boolean {
+  const { status, kind } = onboardingOf(state);
+  return !!state?.finished && status === 'pending' && kind === 'conversation';
 }
 
 export function stepsLeft(s: SetupStoreState): number {
@@ -352,6 +374,30 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       if (!asked()) return null;
       set({ error: errorDetail(e, 'Could not finish setup') });
       return null;
+    } finally {
+      if (asked()) set({ busy: null });
+    }
+  },
+
+  startOnboarding: async () => {
+    const response = await get().finish();
+    const { status, session_id: sessionId } = response?.onboarding ?? {};
+    return status === 'running' ? sessionId ?? null : null;
+  },
+
+  skipOnboarding: async () => {
+    const asked = bindRequest();
+    mutationSeq += 1;
+    set({ busy: 'onboarding', error: null, fieldError: null });
+    try {
+      const state = await api.setupSkipOnboarding();
+      if (!asked()) return false;
+      set({ state });
+      return true;
+    } catch (e) {
+      if (!asked()) return false;
+      set({ error: errorDetail(e, 'Could not skip onboarding') });
+      return false;
     } finally {
       if (asked()) set({ busy: null });
     }

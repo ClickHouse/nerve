@@ -1,21 +1,25 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { Link, MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../api/client', async () => {
   const actual = await vi.importActual<typeof import('../../api/client')>('../../api/client');
   return {
     ...actual,
-    api: { authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn() },
+    api: {
+      authStatus: vi.fn(), getViewer: vi.fn(), login: vi.fn(), listActors: vi.fn(), setupState: vi.fn(),
+      setupFinish: vi.fn(),
+    },
     setUnauthorizedHandler: vi.fn(),
   };
 });
 vi.mock('../../stores/helpers/draftStorage', () => ({ clearAllDrafts: vi.fn() }));
 vi.mock('../../stores/helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
 
+const { api } = await import('../../api/client');
 const { useSetupStore } = await import('../../stores/setupStore');
-const { makeState } = await import('../../test/setupFixtures');
+const { makeState, step } = await import('../../test/setupFixtures');
 const { SetupBanner } = await import('./SetupBanner');
 
 function renderAt(path = '/chat') {
@@ -117,5 +121,133 @@ describe('SetupBanner', () => {
     expect(box.className).toMatch(/\btop-\[calc\(env\(safe-area-inset-top\)\+3\.5rem\)\]/);
     expect(box.className).not.toMatch(/\btop-2\b/);
     expect(box.className).not.toMatch(/\bbottom-4\b/);
+  });
+});
+
+describe('SetupBanner while the onboarding conversation waits', () => {
+  const waiting = (overrides = {}) => makeState({
+    finished: true, steps_left: 0,
+    steps: [step('mode', { status: 'done' }, {
+      mode: 'personal', onboarding: 'running', onboarding_session_id: 'onboarding-1',
+    })],
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    useSetupStore.setState({ state: waiting() });
+    vi.mocked(api.setupState).mockImplementation(async () => useSetupStore.getState().state!);
+  });
+
+  function renderWithLink(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Link to="/tasks">Tasks</Link>
+        <SetupBanner />
+      </MemoryRouter>,
+    );
+  }
+
+  it('sends the person back to the conversation from every page, also after setup', async () => {
+    renderWithLink('/setup');
+    const link = await screen.findByRole('status');
+    expect(link).toHaveTextContent('Your agent waits for you in its onboarding conversation · Continue');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-1');
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+  });
+
+  it('is hidden on the conversation itself', () => {
+    renderWithLink('/chat/onboarding-1');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('hides only until the next page, and reads the state again on each page', async () => {
+    renderWithLink('/chat');
+    await userEvent.click(screen.getByRole('button', { name: 'Hide until the next page' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    const reads = vi.mocked(api.setupState).mock.calls.length;
+    await userEvent.click(screen.getByRole('link', { name: 'Tasks' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('onboarding conversation');
+    expect(vi.mocked(api.setupState).mock.calls.length).toBeGreaterThan(reads);
+  });
+
+  it('is gone once onboarding is done or skipped', () => {
+    for (const onboarding of ['done', 'skipped'] as const) {
+      useSetupStore.setState({ state: waiting({
+        steps: [step('mode', { status: 'done' }, { mode: 'personal', onboarding, onboarding_session_id: 'onboarding-1' })],
+      }) });
+      const view = renderWithLink('/chat');
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+});
+
+describe('SetupBanner when setup is complete and the conversation has not started', () => {
+  const withMode = (detail: Record<string, unknown>, overrides = {}) => makeState({
+    finished: true, steps_left: 0,
+    steps: [step('mode', { status: 'done' }, {
+      mode: 'personal', onboarding: 'pending', onboarding_session_id: null, ...detail,
+    })],
+    ...overrides,
+  });
+
+  function ChatProbe() {
+    return <p>chat page {useParams().sessionId}</p>;
+  }
+
+  function renderRoutes(path = '/tasks') {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/chat/:sessionId" element={<ChatProbe />} />
+          <Route path="*" element={<p>other page</p>} />
+        </Routes>
+        <SetupBanner />
+      </MemoryRouter>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('starts the conversation once, without Finish, and opens it', async () => {
+    const running = withMode({ onboarding: 'running', onboarding_session_id: 'onboarding-9' });
+    vi.mocked(api.setupFinish).mockResolvedValue({
+      state: running, action: 'reloaded', onboarding: { status: 'running', session_id: 'onboarding-9' },
+    });
+    vi.mocked(api.setupState).mockResolvedValue(running);
+    useSetupStore.setState({ state: withMode({}) });
+    renderRoutes();
+    await userEvent.click(screen.getByRole('button', { name: /ready for its onboarding conversation · Start/ }));
+    expect(await screen.findByText('chat page onboarding-9')).toBeInTheDocument();
+    expect(api.setupFinish).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('waits for the steps first, and is not offered to a worker that sets itself up', () => {
+    useSetupStore.setState({ state: withMode({}, { finished: false, steps_left: 2 }) });
+    let view = renderRoutes();
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('2 steps left');
+    view.unmount();
+
+    useSetupStore.setState({ state: withMode({ onboarding_kind: 'autonomous' }) });
+    view = renderRoutes();
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('only links to the session while a worker sets itself up', () => {
+    useSetupStore.setState({ state: withMode({
+      mode: 'worker', onboarding: 'running', onboarding_session_id: 'onboarding-2', onboarding_kind: 'autonomous',
+    }) });
+    vi.mocked(api.setupState).mockImplementation(async () => useSetupStore.getState().state!);
+    renderRoutes();
+    const link = screen.getByRole('status');
+    expect(link).toHaveTextContent('Your worker is setting itself up from its task description · Open');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-2');
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument();
   });
 });

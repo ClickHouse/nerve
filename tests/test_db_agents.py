@@ -65,10 +65,8 @@ async def test_v058_creates_tables_and_is_idempotent(db: Database):
 
 @pytest.mark.asyncio
 async def test_actor_columns_registry_lists_the_stop_attribution():
-    assert ACTOR_COLUMNS[-2:] == (
-        ("session_agents", "stopped_by_actor_id"),
-        ("session_agents", "stopped_caused_by_actor_id"),
-    )
+    assert ("session_agents", "stopped_by_actor_id") in ACTOR_COLUMNS
+    assert ("session_agents", "stopped_caused_by_actor_id") in ACTOR_COLUMNS
 
 
 @pytest.mark.asyncio

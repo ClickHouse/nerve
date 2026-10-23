@@ -296,7 +296,7 @@ class TestInstallerOutputIsUnchanged:
         _assert_matches_golden(produced, "unattended-worker")
         # The worker template with the description in place — the same file
         # the web Mode step and ``nerve init --terminal`` write — still
-        # carrying the marker the onboarding session deletes.
+        # carrying the marker that onboarding_done deletes.
         assert produced["TASK.md"].startswith("# Task\n")
         assert produced["TASK.md"] == render_task_md("Keep the build green.")
         assert produced["TASK.md"].splitlines()[1].startswith(TASK_ONBOARDING_MARKER)
@@ -682,7 +682,7 @@ class TestApplyMode:
         # Still pending (the marker stands): a second description replaces it.
         apply_mode(ws, "worker", "Something else entirely, twenty characters.")
         assert "Something else" in task.read_text(encoding="utf-8")
-        # Once the onboarding session deleted the marker, the file is theirs.
+        # Once onboarding deleted the marker, the file is theirs.
         task.write_text(text.replace(lines[1] + "\n", "", 1), encoding="utf-8")
         again = apply_mode(ws, "worker", "A third description that must not land.")
         assert not again.task_written
@@ -714,12 +714,18 @@ class TestApplyMode:
         )
         # The writer owns the file: the MANIFEST lists it (``nerve doctor``
         # expects it of a worker), the copier leaves it out, and without a
-        # description there is no TASK.md rather than one with a bare token.
+        # description the template gets an empty description section (never
+        # a bare token), which the onboarding conversation fills.
         assert "TASK.md" in [name for name, _ in read_manifest("worker")]
         assert "TASK.md" not in outcome.created
         bare = tmp_path / "bare"
-        assert apply_mode(bare, "worker").task_written is False
-        assert not (bare / "TASK.md").exists()
+        assert apply_mode(bare, "worker").task_written is True
+        written = (bare / "TASK.md").read_text(encoding="utf-8")
+        assert TASK_DESCRIPTION_TOKEN not in written
+        assert task_onboarding_pending(written) and task_description_from(written) == ""
+        # A later call without a description keeps the file as it is.
+        assert apply_mode(ws, "worker").task_written is False
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == description
         assert "TASK.md" in initialize_workspace(tmp_path / "copied", "worker")
         assert TASK_DESCRIPTION_TOKEN in (tmp_path / "copied" / "TASK.md").read_text(encoding="utf-8")
 
@@ -776,7 +782,7 @@ class TestApplyMode:
     def test_worker_mode_writes_no_quiet_hours_and_leaves_task_planner_off(self, tmp_path: Path) -> None:
         """A worker's defaults: quiet hours off — stated as empty strings, so
         the loader's own 02:00–08:00 cannot come back — and task-planner in
-        the catalogue but disabled until the onboarding session decides."""
+        the catalogue but disabled until the onboarding conversation decides."""
         ws = tmp_path / "ws"
         outcome = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
         assert {"quiet_start", "quiet_end"} <= set(outcome.settings_defaults_added)
@@ -800,7 +806,7 @@ class TestApplyMode:
         assert not (ws / "SOUL.md").exists()
         # Templates arrived from the repository: only TASK.md is written.
         apply_mode(ws, "worker")
-        assert not (ws / "TASK.md").exists()
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == ""
         outcome = apply_mode(ws, "worker", "Watch the nightly build and propose fixes.", locked=True)
         assert outcome.task_written and outcome.created == () and not outcome.cron_written
         # The same template-sourced file as the unlocked path writes.
@@ -966,7 +972,7 @@ class TestFixRoundTwoWriterRules:
 
 class TestModeDefaults:
     """Quiet hours are optional (a worker's are off) and a worker's
-    task-planner is off until its onboarding session enables it."""
+    task-planner is off until its onboarding conversation enables it."""
 
     @staticmethod
     def _quiet(**fields) -> tuple[str, str]:

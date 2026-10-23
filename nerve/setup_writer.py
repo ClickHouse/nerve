@@ -210,8 +210,8 @@ PRODUCTIVITY_CRONS = [
 # The optional crons each mode switches on when nobody chose otherwise: what
 # ``nerve init --non-interactive`` writes, and what the web Mode step writes
 # into a fresh ``system.yaml``. A worker's ``task-planner`` is not among them:
-# whether the worker plans through the approval loop is the onboarding
-# session's decision, and it enables the job (overridden by id in
+# whether the worker plans through the approval loop is decided in the
+# onboarding conversation, which enables the job (overridden by id in
 # ``jobs.yaml``, scoped to the worker's tag) when the answer is yes.
 DEFAULT_CRONS: dict[str, list[str]] = {
     "personal": ["inbox-processor", "task-planner"],
@@ -1333,7 +1333,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
         # Workers get skill crons — they create skills during onboarding
         # and those skills should be maintained automatically. task-planner
         # is catalogued too but on only when chosen (DEFAULT_CRONS leaves it
-        # to the onboarding session); other jobs are added during onboarding.
+        # to the onboarding conversation); other jobs are added during onboarding.
         for cron in PRODUCTIVITY_CRONS:
             if cron["id"] not in _WORKER_CRONS:
                 continue
@@ -1396,6 +1396,9 @@ class CronToggle:
     enabled: bool
     schedule: str = ""
     requires: str | None = None
+    #: ``jobs.yaml`` has a job with this id, which replaces the ``system.yaml``
+    #: job: ``enabled`` is that job's, and the checklist cannot change it.
+    overridden: bool = False
 
 
 @dataclass(frozen=True)
@@ -1472,8 +1475,24 @@ def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str
     return document, raw, ""
 
 
+def _user_cron_jobs(workspace: Path) -> list[Any]:
+    """The jobs of ``jobs.yaml`` beside ``system.yaml`` that the scheduler loads.
+
+    Gates are built, as the scheduler builds them: a job whose gate does not
+    build is left out, and the ``system.yaml`` job with its id runs instead.
+    """
+    from nerve.cron.jobs import load_jobs
+
+    path = system_cron_file(workspace).parent / "jobs.yaml"
+    return load_jobs(path) if path.exists() else []
+
+
 def list_optional_crons(workspace: Path) -> list[CronToggle]:
     """The optional crons this install actually has, and whether each is on.
+
+    ``enabled`` is the effective state, the one the scheduler runs: a job in
+    ``jobs.yaml`` with the same id replaces the ``system.yaml`` job
+    (:func:`nerve.cron.jobs.merge_jobs`).
 
     Empty when the file is missing or unreadable: the checklist then says the
     step has nothing to offer rather than inventing jobs that were never
@@ -1487,15 +1506,21 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
         for job in document["jobs"]
         if isinstance(job, dict) and job.get("id")
     }
+    from nerve.cron.jobs import load_jobs, merge_jobs
+
+    user = _user_cron_jobs(workspace)
+    overridden = {job.id for job in user}
+    effective = {job.id: job for job in merge_jobs(load_jobs(system_cron_file(workspace)), user)}
     known = {cron["id"]: cron for cron in PRODUCTIVITY_CRONS}
     return [
         CronToggle(
             id=cron_id,
             name=str(known[cron_id].get("display_name") or known[cron_id].get("name") or cron_id),
             description=str(known[cron_id].get("description") or ""),
-            enabled=present[cron_id],
+            enabled=bool(effective[cron_id].enabled) if cron_id in effective else present[cron_id],
             schedule=str(known[cron_id].get("schedule") or ""),
             requires=known[cron_id].get("requires"),
+            overridden=cron_id in overridden,
         )
         for cron_id in OPTIONAL_CRON_IDS
         if cron_id in present
@@ -1517,11 +1542,14 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
 
     enabled, disabled = [], []
     changed = False
+    # A job that ``jobs.yaml`` replaces keeps its ``system.yaml`` entry: a
+    # change there would not change what runs.
+    overridden = {job.id for job in _user_cron_jobs(workspace)}
     for job in document["jobs"]:
         if not isinstance(job, dict):
             continue
         job_id = str(job.get("id") or "")
-        if job_id not in OPTIONAL_CRON_IDS:
+        if job_id not in OPTIONAL_CRON_IDS or job_id in overridden:
             continue
         wanted = job_id in enabled_ids
         (enabled if wanted else disabled).append(job_id)
@@ -1723,13 +1751,14 @@ class ModeOutcome:
 
 # --- A worker's TASK.md -------------------------------------------------------
 #
-# The contract with ``nerve/templates/worker/TASK.md`` (and with the first-boot
-# onboarding session, whose prompt restates it): line 1 is the ``# Task``
-# heading, line 2 the marker comment, and the operator's description sits under
+# The contract with ``nerve/templates/worker/TASK.md`` (and with the onboarding
+# conversation, whose prompt restates it): line 1 is the ``# Task`` heading,
+# line 2 the marker comment, and the operator's description sits under
 # ``## Task description (as given)`` where the template has the token. The
-# onboarding session fills the other sections in place and deletes the marker
-# line last — so "marker present" is "onboarding still pending", for the
-# installers, the setup checklist and the engine's start-up check alike.
+# onboarding conversation fills the other sections in place, and
+# ``onboarding_done`` deletes the marker line (:mod:`nerve.onboarding`). An
+# install from before the onboarding state keeps "marker present" as
+# "onboarding still pending".
 _TASK_HEADER = "# Task\n"
 TASK_ONBOARDING_MARKER = "<!-- nerve:onboarding pending"
 TASK_DESCRIPTION_TOKEN = "{{TASK_DESCRIPTION}}"
@@ -1741,7 +1770,7 @@ WRITER_OWNED_TEMPLATES = ("TASK.md",)
 
 
 def task_onboarding_pending(text: str) -> bool:
-    """Whether a ``TASK.md`` body is still waiting for the onboarding session.
+    """Whether a ``TASK.md`` body is still waiting for onboarding.
 
     The marker comment decides. Files written by older versions carry no
     marker: those are the raw ``# Task`` form until onboarding gave them a
@@ -1759,7 +1788,7 @@ def task_description_from(text: str) -> str | None:
     The section under ``## Task description (as given)`` up to the next ``##``
     heading; for the legacy raw form, everything after the ``# Task`` line.
     ``""`` when the file is pending but holds no description yet (the template
-    token still in place). ``None`` once the onboarding session owns the file.
+    token still in place). ``None`` once onboarding has completed the file.
     """
     if not task_onboarding_pending(text):
         return None
@@ -1790,7 +1819,7 @@ def render_task_md(task_description: str) -> str:
 
 
 def _task_is_placeholder(path: Path) -> bool:
-    """A ``TASK.md`` the onboarding session has not completed (or none at all)."""
+    """A ``TASK.md`` that onboarding has not completed (or none at all)."""
     if not path.exists():
         return True
     return task_onboarding_pending(path.read_text(encoding="utf-8"))
@@ -1800,16 +1829,15 @@ def apply_task_md(workspace: Path, task_description: str) -> bool:
     """Write a worker's ``TASK.md`` from the template while it is still pending.
 
     The one writer behind the web Mode step, ``nerve init --terminal`` and
-    ``--non-interactive``, so the three paths produce the same file. Nothing is
-    written without a description, and never over a file the onboarding
-    session has completed (marker gone, or a legacy file with ``## Mission``).
-    Returns whether it wrote.
+    ``--non-interactive``, so the three paths produce the same file. Never
+    over a file the onboarding conversation has completed (marker gone, or a
+    legacy file with ``## Mission``). Without a description it writes only a
+    missing file, with an empty description section that the onboarding
+    conversation fills. Returns whether it wrote.
     """
     description = (task_description or "").strip()
-    if not description:
-        return False
     path = Path(workspace) / "TASK.md"
-    if not _task_is_placeholder(path):
+    if not _task_is_placeholder(path) or (not description and path.exists()):
         return False
     publish_text(path, render_task_md(description))
     return True

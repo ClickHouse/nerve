@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
-  SetupFinishResponse, SetupProfileDetail, SetupProviderDetail, SetupState, SetupStep,
+  SetupProfileDetail, SetupProviderDetail, SetupState, SetupStep,
 } from '../../../api/client';
 import { useSetupStore } from '../../../stores/setupStore';
 import { copyToClipboard } from '../../../utils/clipboard';
@@ -58,7 +58,6 @@ export function ReviewStep({ state }: { state: SetupState }) {
   const reconnecting = useSetupStore((s) => s.reconnecting);
   const latest = useSetupStore((s) => s.state) ?? state;
   const [ready, setReady] = useState(false);
-  const [onboarding, setOnboarding] = useState<SetupFinishResponse['onboarding'] | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => { void loadEnvironment(); }, [loadEnvironment]);
@@ -66,13 +65,12 @@ export function ReviewStep({ state }: { state: SetupState }) {
   const apply = async () => {
     const result = await finish();
     if (!result) return;
-    setOnboarding(result.onboarding);
     if (result.action === 'reloaded') { setReady(true); return; }
     const back = await restart();
     if (back) setReady(true);
   };
 
-  if (ready) return <ReadyScreen state={latest} onboarding={onboarding} />;
+  if (ready) return <ReadyScreen state={latest} />;
 
   const files = [...new Set(state.steps.flatMap((s) => s.status === 'done' ? s.files : []))].sort();
   // The operator's command, on screen before anyone clicks: the server's
