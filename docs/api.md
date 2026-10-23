@@ -262,7 +262,14 @@ Response: {
       "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
       "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
                   "task_present": false, "onboarding": "running", "onboarding_session_id": "onboarding-1a2b3c4d",
-                  "onboarding_kind": "conversation" } },
+                  "onboarding_kind": "conversation",
+                  "work_catalog": [
+                    { "id": "review-prs", "group": "code", "label": "Review pull requests",
+                      "description": "Reads diffs, runs targeted checks, posts review comments.", "needs": "github",
+                      "follow_ups": ["which repositories", "which account it acts as", "…"], "note": "" },
+                    { "id": "triage-issues", "…": "…" }
+                  ],
+                  "work": { "items": [], "custom": "", "rules": "" } } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
       "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort xhigh",
@@ -329,6 +336,20 @@ waiting for Mode read `lockdown` too, because Mode itself cannot be answered
 there). Steps: `claim` (local only), `mode`, `provider`, `profile` (titled
 `Operator` for a worker), `memory`, `channels`, `sources` (personal),
 `automation`, `agents` (personal).
+
+`detail.mode.work_catalog` is what a worker can be set up to do, in display
+order (grouped: `code`, `operations`, `communication`, `knowledge`): each
+item's `id`, `group`, `label`, one-line `description`, the connection it
+`needs` (`github`, `alerts`, `slack-or-telegram` or `web`), the `follow_ups`
+the onboarding conversation settles for it, and a `note` shown with it (empty
+except for `alert-response`: it needs an alert source). Every body carries it,
+in both modes. `detail.mode.work` is what was chosen: `items` (catalog ids, in
+catalog order), `custom` (work in the operator's own words) and `rules`
+(anything it must know or never do), read back from a worker's `TASK.md`
+while onboarding is due; all empty when nothing was chosen, for a personal
+install, and once onboarding completed the file. A free-text description from
+an older client or `nerve init --terminal` reads as `custom`. `work` is part
+of the step's `etag`; `work_catalog` is not.
 
 `detail.provider.credential` is `bedrock`, `proxy`, `api_key`, `oauth_token`,
 `environment` or `none`; `detail.provider.warning` is `oauth_background_jobs`
@@ -410,6 +431,8 @@ stays owner-only. After every write the configuration is hot-reloaded. One
 mutation runs at a time.
 
 ```json
+PUT /api/setup/mode        { "mode": "worker", "work": { "items": ["review-prs", "triage-issues"], "custom": "Also watch the release branch.",
+                                                     "rules": "Never merge anything." } }
 PUT /api/setup/mode        { "mode": "worker", "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything." }
 PUT /api/setup/provider    { "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE", "model": "claude-opus-5-5", "effort": "high" }
 PUT /api/setup/provider    { "type": "oauth", "claude_oauth_token": "sk-ant-oat01-REPLACE" }
@@ -433,7 +456,7 @@ PUT /api/setup/agents      { "agents": ["codex"], "conflict_policy": "backup" }
 
 | Step | Rules |
 |---|---|
-| `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker needs `task_description` (20–4000 characters → `400`, `field: task_description`). Once `TASK.md` exists, the same mode with a **different** description is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); only a worker whose templates exist but whose `TASK.md` is still absent gets it written by a later PUT. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
+| `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker's `work` is optional, and so is each of its keys: `items` (ids from `detail.mode.work_catalog`; an unknown one is `400` `field: work.items`; kept once each, in catalog order), `custom` (at most 4000 characters, `field: work.custom`) and `rules` (at most 2000, `field: work.rules`); nothing chosen is valid. `note` and the older `task_description` are aliases for `work.custom` from older clients (`work.custom` wins; a too-long one names the field it came in); a body with one of them and no `work` is written as before, as a plain paragraph. A personal install takes no `items` (`400` `field: work.items`); its `custom` and `rules` are checked and written nowhere, as before. The choice lands in `TASK.md` under "Task description (as given)": a `<!-- nerve:work <ids> -->` comment line, then `Work: <labels>`, `Also: <custom>` and `Must know or never do: <rules>`, each line left out when empty. Once `TASK.md` exists, the same mode with a **different** choice is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); the same items, custom work and rules again are a no-op, in either form. Only a worker whose templates exist but whose `TASK.md` is still absent (or the bare template) gets it written by a later PUT, also under lockdown. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
 | `provider` | `type` is `anthropic`, `oauth`, `host_login` or `bedrock`, optional when only `model`/`effort` change. `anthropic_api_key` must start with `sk-ant-`; `aws_region` must look like a region; `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` must be in the catalogue for these credentials or be a Claude id. `host_login` is accepted only when `GET /api/setup/provider/host-login` finds one (`409` otherwise; `429` while other checks are running) and copies that credential into `config.local.yaml`; the value is never returned. In external authentication mode `host_login` is `409` unless the operator set `NERVE_SETUP_HOST_LOGIN=1` (see the host-login endpoint). Switching the credential type deletes the other secret; leaving Bedrock drops the region-scoped model ids. A credential whose `source` is not `file` (provisioned from the environment or the configuration repository) is neither replaced nor removed from here: `409` with `field: anthropic_api_key` / `claude_oauth_token` (`host_login` too); a `model`/`effort`-only save still works. The model catalogue and the host-login detection run before the write lock is taken, so other people's reads and saves never wait on them. No catalogue reset after a save: the cache is keyed by the credentials' fingerprint, so a new key finds the catalogue the provider test warmed for it. A `model` writes both `agent.model` and `agent.cron_model`, also when it equals the current model (the setup page sends the picker's model after a live test on a pending step and on the Continue that follows a credential save, so the preselected default counts as the choice — but not on a save that moves into or out of Bedrock, whose ids come from the server); an `effort`-only or credential-only save leaves `agent.cron_model` alone; a switch into or out of Bedrock without a `model` resets both to the installer's defaults |
 | `profile` | `timezone` must be an IANA name; `quiet_start`/`quiet_end` are `HH:MM`; `name` ≤ 80, `agent_name` ≤ 40, `language` ≤ 40, `about` ≤ 600 characters. Every field becomes one line of a file the agent reads: `name`, `language`, `agent_name`, `agent_emoji` refuse control characters and line breaks (`400` with the `field`), and `about` is folded to a single line. A `null` time zone or quiet time is treated as omitted (nothing written, no decision recorded). `quiet_enabled` switches quiet hours: `false` writes both times empty (no quiet hours; the personal `USER.md` line reads `none`) and ignores any times sent with it; `true` needs both times (`400` naming the missing or invalid one), or neither, which keeps the window configured now or else uses `02:00`–`08:00`; omitted or `null` changes nothing, except that times sent alone switch quiet hours on with those times (the other time is kept, or set to its `02:00`–`08:00` default when there was none). Writes `timezone`/`quiet_*` to `settings.yaml`, the still-pristine template lines of `USER.md`/`IDENTITY.md` (personal), and — local mode only — the display name on your account. In external mode the name goes to `USER.md` alone; no account is touched. Under lockdown (local) only `name` is accepted; any other key is `409` with that `field` and the lockdown reason (a read-only state, not a validation error) |
 | `memory` | `openai_api_key` must start with `sk-`. Adding, changing or removing it records that embeddings start after a restart. `{"openai_api_key": null}` alone removes the key; `"embeddings": false` records "continue without" as a decision. A key whose `source` is not `file` is `409` `field: openai_api_key` |

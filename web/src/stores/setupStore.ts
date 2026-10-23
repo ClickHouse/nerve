@@ -4,7 +4,7 @@ import {
   type AgentsDetect, type HostLogin, type RestartResponse, type SetupEnvironment,
   type SetupFinishResponse, type SetupModeDetail, type SetupModelsResponse, type SetupOnboarding,
   type SetupOnboardingAwaiting, type SetupOnboardingKind, type SetupState, type SetupStep, type SetupStepId,
-  type SourcesPreflight,
+  type SourcesPreflight, type WorkCatalogItem, type WorkSelection,
 } from '../api/client';
 import { ApiError, clearUnavailable } from '../api/hosted';
 import { errorDetail } from './accountStore';
@@ -187,6 +187,21 @@ export function onboardingOf(state: SetupState | null): {
     sessionId: detail?.onboarding_session_id ?? null,
     kind: detail?.onboarding_kind ?? 'conversation',
     awaiting: status === 'running' ? state?.onboarding?.awaiting ?? null : null,
+  };
+}
+
+/**
+ * A worker's work, from the Mode step's detail: the server's catalog, in
+ * display order, and the saved selection. `selection` is `null` unless the
+ * mode is `worker`, and from an older backend (which sends neither).
+ */
+export function workOf(state: SetupState | null): {
+  catalog: WorkCatalogItem[]; selection: WorkSelection | null;
+} {
+  const detail = state?.steps.find((x) => x.id === 'mode')?.detail as SetupModeDetail | undefined;
+  return {
+    catalog: detail?.work_catalog ?? [],
+    selection: detail?.mode === 'worker' ? detail.work ?? null : null,
   };
 }
 

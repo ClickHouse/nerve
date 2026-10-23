@@ -39,6 +39,7 @@ import yaml
 from nerve import setup_writer
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
+from nerve.onboarding_catalog import WorkSelection
 from nerve.setup_writer import (
     TASK_DESCRIPTION_TOKEN,
     TASK_ONBOARDING_MARKER,
@@ -50,8 +51,10 @@ from nerve.setup_writer import (
     merge_private_paths,
     merge_settings_defaults,
     render_task_md,
+    render_work_description,
     task_description_from,
     task_onboarding_pending,
+    work_selection_from,
     workspace_mode,
     write_config_yaml,
     write_cron_jobs,
@@ -813,6 +816,102 @@ class TestApplyMode:
         assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md(
             "Watch the nightly build and propose fixes.",
         )
+
+
+class TestWorkDescription:
+    """The Mode step's selection as ``TASK.md``'s description section: one
+    comment line for programs, one line each for people, and back."""
+
+    CHOSEN = WorkSelection(
+        items=("review-prs", "triage-issues"), custom="also watch the release branch",
+        rules="never merge anything",
+    )
+
+    def test_the_contract_shape(self) -> None:
+        assert render_work_description(self.CHOSEN) == (
+            "<!-- nerve:work review-prs, triage-issues -->\n"
+            "Work: Review pull requests; Triage issues\n"
+            "Also: also watch the release branch\n"
+            "Must know or never do: never merge anything"
+        )
+
+    def test_each_line_is_left_out_when_empty(self) -> None:
+        assert render_work_description(WorkSelection()) == ""
+        assert render_work_description(WorkSelection(custom=" \n ", rules="\t")) == ""
+        assert render_work_description(WorkSelection(items=("ci-health",))) == (
+            "<!-- nerve:work ci-health -->\nWork: Keep CI healthy"
+        )
+        # Without items the comment line still opens the section: it tells a
+        # selection from a free-text note.
+        assert render_work_description(WorkSelection(custom="Keep the build green.")) == (
+            "<!-- nerve:work -->\nAlso: Keep the build green."
+        )
+        assert render_work_description(WorkSelection(rules="Never merge.")) == (
+            "<!-- nerve:work -->\nMust know or never do: Never merge."
+        )
+
+    def test_items_once_each_in_catalog_order_unknown_ones_left_out(self) -> None:
+        text = render_work_description(WorkSelection(
+            items=("docs-release-notes", "review-prs", "no-such-work", "review-prs"),
+        ))
+        assert text == (
+            "<!-- nerve:work review-prs, docs-release-notes -->\n"
+            "Work: Review pull requests; Docs and release notes"
+        )
+
+    @pytest.mark.parametrize("selection", [
+        WorkSelection(),
+        WorkSelection(items=("review-prs", "triage-issues"), custom="also watch the release branch",
+                      rules="never merge anything"),
+        WorkSelection(items=("alert-response",)),
+        WorkSelection(custom="Watch org/repo-a.\n\nReport weekly.\n  - indented line"),
+        WorkSelection(rules="Never merge.\nNever push to main."),
+        # Lines of the custom text that read like the people's lines stay its own.
+        WorkSelection(items=("ci-health",), custom="first\nWork: only weekdays\nAlso: the docs",
+                      rules="Also: never close issues"),
+        WorkSelection(items=tuple(i for i in (
+            "review-prs", "triage-issues", "fix-issues", "ci-health", "dependency-updates",
+            "alert-response", "channel-digests", "research-reports", "docs-release-notes",
+        ))),
+    ])
+    def test_round_trip(self, selection: WorkSelection) -> None:
+        text = render_work_description(selection)
+        back = work_selection_from(text)
+        assert back == selection and not back.free_text
+        # Through a real TASK.md as well.
+        assert work_selection_from(task_description_from(render_task_md(text))) == selection
+
+    def test_a_free_text_note_stays_a_paragraph_and_reads_as_custom_work(self) -> None:
+        note = "Watch the nightly build for example/repo.\n\nPropose fixes before changing anything."
+        selection = work_selection_from(note)
+        assert selection == WorkSelection(custom=note) and selection.free_text
+        assert render_work_description(selection) == note
+        # A note that happens to start like the people's lines is still a note.
+        lookalike = work_selection_from("Work: review pull requests in org/repo-a")
+        assert lookalike.free_text and lookalike.custom == "Work: review pull requests in org/repo-a"
+        assert work_selection_from(None) == work_selection_from("") == work_selection_from(" \n") == WorkSelection()
+
+    def test_unknown_ids_are_dropped_with_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="nerve.setup_writer"):
+            selection = work_selection_from(
+                "<!-- nerve:work review-prs, retired-item -->\nWork: Review pull requests; Retired"
+            )
+        assert selection == WorkSelection(items=("review-prs",))
+        assert "retired-item" in caplog.text
+
+    def test_the_worker_task_md_carries_the_selection_under_its_heading(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        text = render_work_description(self.CHOSEN)
+        assert apply_mode(ws, "worker", text).task_written
+        written = (ws / "TASK.md").read_text(encoding="utf-8")
+        lines = written.splitlines()
+        assert lines[0] == "# Task" and lines[1].startswith(TASK_ONBOARDING_MARKER)
+        assert f"## Task description (as given)\n{text}\n\n## Identity\n" in written
+        assert task_description_from(written) == text
+        assert work_selection_from(task_description_from(written)) == self.CHOSEN
+        # Once onboarding removed the marker, nothing reads as chosen any more.
+        done = written.replace(lines[1] + "\n", "", 1)
+        assert work_selection_from(task_description_from(done)) == WorkSelection()
 
 
 class TestProfileTemplates:

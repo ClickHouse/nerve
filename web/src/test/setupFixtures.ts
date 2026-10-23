@@ -1,12 +1,68 @@
 import type {
   CredentialSource, SecretOut, SetupAgentsDetail, SetupAutomationDetail, SetupChannelsDetail, SetupClaimDetail,
   SetupMemoryDetail, SetupModeDetail, SetupProfileDetail, SetupProviderDetail,
-  SetupSourcesDetail, SetupState, SetupStep, SetupStepDetail, SetupStepId,
+  SetupSourcesDetail, SetupState, SetupStep, SetupStepDetail, SetupStepId, WorkCatalogItem, WorkSelection,
 } from '../api/client';
 
 /** Fixtures for the setup wizard: a personal, local, mid-way instance. */
 
 export const OFF: SecretOut = { configured: false, last4: null };
+
+/**
+ * The worker work catalog as the Mode step's detail carries it: display
+ * order, groups in sequence, and a `note` that only the alerts item fills.
+ */
+export const WORK_CATALOG: WorkCatalogItem[] = [
+  {
+    id: 'review-prs', group: 'code', label: 'Review pull requests',
+    description: 'Reads diffs, runs targeted checks, posts review comments.',
+    needs: 'github', follow_ups: ['which repositories', 'which account it acts as', 'comments only or approve'], note: '',
+  },
+  {
+    id: 'triage-issues', group: 'code', label: 'Triage issues',
+    description: 'Labels, finds duplicates, asks reporters for missing info, routes, flags stale.',
+    needs: 'github', follow_ups: ['which repositories', 'label vocabulary', 'may it close'], note: '',
+  },
+  {
+    id: 'fix-issues', group: 'code', label: 'Fix issues and open pull requests',
+    description: 'Picks ready issues, implements, opens PRs, follows CI and review.',
+    needs: 'github', follow_ups: ['which repositories', 'which issues', 'what needs approval'], note: '',
+  },
+  {
+    id: 'ci-health', group: 'code', label: 'Keep CI healthy',
+    description: 'Failures on main, flaky tests, quarantines, perf regressions where benchmarks exist.',
+    needs: 'github', follow_ups: ['which repositories', 'which CI system', 'report or fix'], note: '',
+  },
+  {
+    id: 'dependency-updates', group: 'code', label: 'Dependency and security updates',
+    description: 'Reviews bot PRs (dependabot/renovate), checks advisories, prepares upgrades.',
+    needs: 'github', follow_ups: ['which repositories', 'which bots', 'merge policy'], note: '',
+  },
+  {
+    id: 'alert-response', group: 'operations', label: 'First response to alerts',
+    description: 'Reads where alerts land, does the first investigation, posts findings, escalates by rule.',
+    needs: 'alerts', follow_ups: ['alert source', 'runbooks', 'escalation path'],
+    note: 'Needs an alert source; a Slack channel is the first-class one today.',
+  },
+  {
+    id: 'channel-digests', group: 'communication', label: 'Channel digests and answers',
+    description: 'Summarizes busy Slack/Telegram channels, answers recurring questions from docs.',
+    needs: 'slack-or-telegram', follow_ups: ['which channels', 'cadence', 'where to post'], note: '',
+  },
+  {
+    id: 'research-reports', group: 'knowledge', label: 'Research and reports',
+    description: 'Tracks topics, competitors, releases; periodic reports.',
+    needs: 'web', follow_ups: ['topics', 'sources', 'cadence'], note: '',
+  },
+  {
+    id: 'docs-release-notes', group: 'knowledge', label: 'Docs and release notes',
+    description: 'Keeps docs in step with merged changes, drafts changelogs.',
+    needs: 'github', follow_ups: ['which repositories', 'triggers', 'drafts or direct'], note: '',
+  },
+];
+
+/** Nothing chosen: what the server sends before a worker's work is saved, and for a personal install. */
+export const NO_WORK: WorkSelection = { items: [], custom: '', rules: '' };
 /** A configured secret; `source` names who provided it when it was not this wizard. */
 export const on = (last4: string, source?: CredentialSource): SecretOut => (
   source ? { configured: true, last4, source } : { configured: true, last4 }
@@ -18,6 +74,7 @@ export const DETAILS: Record<SetupStepId, SetupStepDetail> = {
     mode: 'personal',
     templates_present: ['SOUL.md', 'IDENTITY.md', 'USER.md', 'AGENTS.md', 'TOOLS.md', 'MEMORY.md'],
     task_present: false, onboarding: 'not_applicable', onboarding_session_id: null,
+    work_catalog: WORK_CATALOG, work: NO_WORK,
   } satisfies SetupModeDetail,
   provider: {
     type: 'anthropic', credential: 'none', anthropic_api_key: OFF, claude_oauth_token: OFF,

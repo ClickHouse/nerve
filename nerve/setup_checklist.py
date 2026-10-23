@@ -30,6 +30,7 @@ from typing import Any
 import yaml
 
 from nerve.config import NerveConfig
+from nerve.onboarding_catalog import WorkSelection, work_catalog
 from nerve.setup_provenance import SOURCE_ENVIRONMENT, SOURCE_FILE, SOURCE_GATEWAY
 from nerve.setup_state import SetupState
 from nerve.setup_writer import (
@@ -42,8 +43,10 @@ from nerve.setup_writer import (
     list_optional_crons,
     optional_cron_ids_for,
     system_cron_file,
+    task_description_from,
     task_onboarding_pending,
     user_md_pristine,
+    work_selection_from,
     workspace_mode,
 )
 
@@ -199,7 +202,7 @@ DEFAULT_TIMEZONE = NerveConfig().timezone
 # typing into. ``name[]`` maps over a list.
 ETAG_FIELDS: dict[str, tuple[str, ...]] = {
     STEP_CLAIM: ("username", "passwordless"),
-    STEP_MODE: ("mode", "templates_present", "task_present"),
+    STEP_MODE: ("mode", "templates_present", "task_present", "work"),
     STEP_PROVIDER: (
         "type", "credential", "anthropic_api_key", "claude_oauth_token",
         "proxy_enabled", "aws_region", "aws_profile", "model", "effort", "cron_model",
@@ -933,6 +936,24 @@ def _agents_detail(facts: Facts) -> tuple[dict[str, Any], str]:
     return detail, ", ".join(enabled)
 
 
+def saved_work(workspace: Path, mode: str | None) -> WorkSelection:
+    """What a worker's operator chose at setup, read back from ``TASK.md``.
+
+    The description section while onboarding is still due
+    (:func:`nerve.setup_writer.work_selection_from`: catalog items, custom
+    work, rules; an older free-text note reads as the custom work). Nothing
+    for a personal install, without the file, or once onboarding completed
+    it: the file is then the worker's.
+    """
+    if mode != "worker":
+        return WorkSelection()
+    try:
+        text = (Path(workspace) / "TASK.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return WorkSelection()
+    return work_selection_from(task_description_from(text))
+
+
 def _mode_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str]:
     ws = facts.workspace
     templates = _WORKER_TEMPLATES if mode == "worker" else _PERSONAL_TEMPLATES
@@ -944,6 +965,10 @@ def _mode_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str]:
         "onboarding": facts.onboarding,
         "onboarding_session_id": facts.onboarding_session_id,
         "onboarding_kind": facts.onboarding_kind,
+        # What a worker can be set up to do (the Mode step's checkboxes), and
+        # what was chosen; all empty when nothing was.
+        "work_catalog": work_catalog(),
+        "work": saved_work(ws, mode).as_dict(),
     }
     summary = {"personal": "Personal assistant", "worker": "Worker"}.get(mode or "", "")
     return detail, summary

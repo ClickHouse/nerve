@@ -44,6 +44,7 @@ import copy
 import dataclasses
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -67,12 +68,16 @@ from nerve.config import (
     _interpolate_str,
     workspace_settings_file,
 )
+from nerve.onboarding_catalog import ITEMS as WORK_ITEMS
+from nerve.onboarding_catalog import WorkSelection, in_catalog_order
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
     install_config_scaffold,
     template_file,
 )
+
+logger = logging.getLogger(__name__)
 
 # --- Cron definitions for the wizard ---
 
@@ -1816,6 +1821,94 @@ def render_task_md(task_description: str) -> str:
             "onboarding marker; the installers and the onboarding check key on both"
         )
     return template.replace(TASK_DESCRIPTION_TOKEN, task_description.strip(), 1)
+
+
+# --- What the operator chose at setup -----------------------------------------
+#
+# The Mode step's selection (:mod:`nerve.onboarding_catalog`) is written as the
+# ``## Task description (as given)`` section: one comment line a program reads,
+# then one line each for people, each left out when empty:
+#
+#     <!-- nerve:work review-prs, triage-issues -->
+#     Work: Review pull requests; Triage issues
+#     Also: <custom text>
+#     Must know or never do: <rules>
+#
+# The comment line opens every selection, also one without items
+# (``<!-- nerve:work -->``): it is what tells a selection from a free-text
+# note (an older client, ``nerve init --terminal``, ``NERVE_TASK``), which
+# stays a plain paragraph and reads back as ``custom``.
+WORK_MARKER = "<!-- nerve:work"
+_WORK_COMMENT = re.compile(r"^<!-- nerve:work(?:\s+(?P<ids>.*?))?\s*-->$")
+_WORK_LINE = "Work:"
+_ALSO_LINE = "Also:"
+_RULES_LINE = "Must know or never do:"
+
+
+def render_work_description(selection: WorkSelection) -> str:
+    """The ``## Task description (as given)`` text for ``selection``.
+
+    ``""`` when nothing was chosen; the note itself for a free-text
+    selection. Items are written once each, in catalog order; an id the
+    catalog does not know is left out.
+    """
+    custom, rules = selection.custom.strip(), selection.rules.strip()
+    if selection.free_text:
+        return custom
+    items = in_catalog_order(selection.items)
+    if not (items or custom or rules):
+        return ""
+    lines = [f"{WORK_MARKER} {', '.join(items)} -->" if items else f"{WORK_MARKER} -->"]
+    if items:
+        lines.append(f"{_WORK_LINE} " + "; ".join(WORK_ITEMS[i].label for i in items))
+    if custom:
+        lines.append(f"{_ALSO_LINE} {custom}")
+    if rules:
+        lines.append(f"{_RULES_LINE} {rules}")
+    return "\n".join(lines)
+
+
+def work_selection_from(text: str | None) -> WorkSelection:
+    """The selection a ``## Task description (as given)`` text holds.
+
+    ``text`` is :func:`task_description_from`'s result (``None`` and ``""``
+    read as nothing chosen). The ids come from the comment line; the custom
+    work and the rules from their lines, each running on until a line that
+    opens a later one (the order is ``Work:``, ``Also:``, ``Must know or
+    never do:``), so a custom text may hold lines of its own. The ``Work:``
+    line is for people and is not read. An id the catalog does not know is
+    dropped with a warning. A text without the comment line is a free-text
+    note: all of it is ``custom``.
+    """
+    body = (text or "").strip()
+    if not body:
+        return WorkSelection()
+    lines = body.splitlines()
+    match = _WORK_COMMENT.match(lines[0].strip())
+    if match is None:
+        return WorkSelection(custom=body, free_text=True)
+    ids = [part.strip() for part in (match.group("ids") or "").split(",") if part.strip()]
+    for unknown in sorted({i for i in ids if i not in WORK_ITEMS}):
+        logger.warning("TASK.md names the work item %r, which the catalog does not know; it is left out", unknown)
+    order = (_WORK_LINE, _ALSO_LINE, _RULES_LINE)
+    parts: dict[str, list[str]] = {_ALSO_LINE: [], _RULES_LINE: []}
+    stage = -1
+    current: list[str] | None = None
+    for line in lines[1:]:
+        opened = next((i for i, p in enumerate(order) if i > stage and line.startswith(p)), None)
+        if opened is None:
+            if current is not None:
+                current.append(line)
+            continue
+        stage, prefix = opened, order[opened]
+        current = parts.get(prefix)
+        if current is not None:
+            current.append(line[len(prefix):].lstrip())
+    return WorkSelection(
+        items=in_catalog_order(ids),
+        custom="\n".join(parts[_ALSO_LINE]).strip(),
+        rules="\n".join(parts[_RULES_LINE]).strip(),
+    )
 
 
 def _task_is_placeholder(path: Path) -> bool:

@@ -3,7 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession, TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupModeDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession,
+  TelegramSyncSessionSummary, WorkCatalogItem, WorkSelection,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -51,7 +52,8 @@ const { useAuthStore } = await import('../../stores/authStore');
 const { useSetupStore } = await import('../../stores/setupStore');
 const { browserTimeZone } = await import('../../utils/timeZones');
 const {
-  CHANNELS, MODE_LOCK_REASON, WAITS_FOR_MODE, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState,
+  CHANNELS, MODE_LOCK_REASON, NO_WORK, WAITS_FOR_MODE, WORKER_AUTOMATION, WORKER_PROFILE, WORK_CATALOG,
+  makeExternalState, makeState,
   makeWorkerState, on, step, withStep,
 } = await import('../../test/setupFixtures');
 const { SetupPage } = await import('../../pages/SetupPage');
@@ -951,29 +953,232 @@ describe('forms open on server values and send the right payload', () => {
     expect(planner).toHaveAccessibleDescription('Set in jobs.yaml. Change it there, or ask the agent.');
   });
 
-  it('a worker\'s note is optional and goes to the server only when given', async () => {
-    current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
-    const view = renderAt('/setup/mode');
-    await heading('Choose a mode');
-    expect(screen.queryByText(/one task/i)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
-    expect(screen.getByLabelText('Anything it should know? (optional)'))
-      .toHaveAccessibleDescription('You can also tell it in the first conversation.');
-    expect(screen.queryByRole('button', { name: 'Monitor a build' })).not.toBeInTheDocument();
-    await userEvent.click(continueButton());
-    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', { mode: 'worker' }));
-    view.unmount();
+});
 
-    m(api.setupStep).mockClear();
-    useSetupStore.getState().reset();
+describe('a worker\'s work on the Mode step', () => {
+  const RULES = 'Anything it must know or never do? (optional)';
+  const byGroup = (group: string) => WORK_CATALOG.filter((item) => item.group === group);
+  /** A fresh instance on the Mode step, with the server's catalog. */
+  const fresh = (catalog: WorkCatalogItem[] = WORK_CATALOG) => withStep(
+    makeState({ mode: null }),
+    step('mode', {}, { mode: null, templates_present: [], work_catalog: catalog, work: NO_WORK }),
+  );
+  async function openWorker(catalog?: WorkCatalogItem[]) {
+    current = fresh(catalog);
     renderAt('/setup/mode');
     await heading('Choose a mode');
     await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
-    await userEvent.type(screen.getByLabelText('Anything it should know? (optional)'), 'It works in example/repo.');
+  }
+  const box = (name: string) => screen.getByRole('checkbox', { name });
+  /** A worker past the Mode step whose detail carries `work` (or none: an older backend). */
+  const workerWith = (work: WorkSelection | undefined) => {
+    const base = makeWorkerState();
+    const mode = base.steps.find((s) => s.id === 'mode')!;
+    return withStep(base, { ...mode, detail: { ...mode.detail, work_catalog: WORK_CATALOG, work } as SetupModeDetail });
+  };
+  const modeRow = () => within(screen.getByRole('region', { name: 'Checklist' })).getByText('Worker').closest('li')!;
+
+  it('lists the catalog in groups, code · operations · communication · knowledge, each item with its line', async () => {
+    // The groups' order is the page's, not the order they arrive in.
+    await openWorker([...byGroup('knowledge'), ...byGroup('communication'), ...byGroup('code'), ...byGroup('operations')]);
+    const section = screen.getByRole('region', { name: 'What should it do?' });
+    expect(within(section).getByText('Tick what applies; the conversation sorts out the details.')).toBeInTheDocument();
+    expect(within(section).getAllByRole('heading', { level: 3 }).map((h) => h.textContent))
+      .toEqual(['Code', 'Operations', 'Communication', 'Knowledge']);
+    const code = within(section).getByRole('group', { name: 'Code' });
+    expect(within(code).getAllByRole('checkbox')).toHaveLength(5);
+    expect(within(code).getByRole('checkbox', { name: 'Review pull requests' }))
+      .toHaveAccessibleDescription('Reads diffs, runs targeted checks, posts review comments.');
+    expect(within(section).getByRole('group', { name: 'Knowledge' })).toHaveTextContent('Research and reports');
+    expect(within(section).getByRole('group', { name: 'Communication' })).toHaveTextContent('Channel digests and answers');
+    // The alerts item carries its connection note under the description; no other item has one.
+    const operations = within(section).getByRole('group', { name: 'Operations' });
+    expect(within(operations).getByRole('checkbox', { name: 'First response to alerts' })).toHaveAccessibleDescription(
+      'Reads where alerts land, does the first investigation, posts findings, escalates by rule. '
+      + 'Needs an alert source; a Slack channel is the first-class one today.',
+    );
+    expect(within(operations).getByText('Needs an alert source; a Slack channel is the first-class one today.')).toBeInTheDocument();
+    expect(within(code).getByRole('checkbox', { name: 'Review pull requests' }))
+      .not.toHaveAccessibleDescription(/Needs an alert source/);
+    // Headings are text, not "select all" boxes; nothing is ticked on arrival.
+    expect(screen.queryByRole('checkbox', { name: 'Code' })).not.toBeInTheDocument();
+    expect(within(section).getAllByRole('checkbox').filter((c) => (c as HTMLInputElement).checked)).toHaveLength(0);
+    expect(box('Custom…')).not.toBeChecked();
+    expect(screen.queryByRole('textbox', { name: 'Other work' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText(RULES)).toHaveAttribute('placeholder', 'For example: never merge anything on its own.');
+    expect(screen.queryByText(/Anything it should know/)).not.toBeInTheDocument();
+  });
+
+  it('an item without a `note` shows its description as the server wrote it, note and all', async () => {
+    const note = 'Needs an alert source; a Slack channel is the first-class one today.';
+    await openWorker(WORK_CATALOG.map((item) => {
+      const plain: WorkCatalogItem = { ...item };
+      delete plain.note;
+      return plain.id === 'alert-response' ? { ...plain, description: `${plain.description} ${note}` } : plain;
+    }));
+    expect(box('First response to alerts')).toHaveAccessibleDescription(
+      `Reads where alerts land, does the first investigation, posts findings, escalates by rule. ${note}`,
+    );
+    // Within the description, not again on a line of its own.
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+  });
+
+  it('ticked items go to the server in catalog order, with the rules; unticking takes one out', async () => {
+    await openWorker();
+    await userEvent.click(box('Research and reports'));
+    await userEvent.click(box('Triage issues'));
+    await userEvent.click(box('Review pull requests'));
+    expect(box('Triage issues')).toBeChecked();
+    await userEvent.click(box('Triage issues'));
+    expect(box('Triage issues')).not.toBeChecked();
+    // The whole row is the hit area: its description ticks it too.
+    await userEvent.click(screen.getByText('Failures on main, flaky tests, quarantines, perf regressions where benchmarks exist.'));
+    expect(box('Keep CI healthy')).toBeChecked();
+    // Space on a focused box, as a keyboard ticks it.
+    box('Docs and release notes').focus();
+    await userEvent.keyboard(' ');
+    expect(box('Docs and release notes')).toBeChecked();
+    await userEvent.type(screen.getByLabelText(RULES), '  Never merge anything on its own.  ');
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
-      mode: 'worker', task_description: 'It works in example/repo.',
+      mode: 'worker',
+      work: {
+        items: ['review-prs', 'ci-health', 'research-reports', 'docs-release-notes'],
+        custom: '',
+        rules: 'Never merge anything on its own.',
+      },
     }));
+  });
+
+  it('Custom… opens a field for other work; unticking clears and hides it; ticked, it needs words', async () => {
+    await openWorker();
+    await userEvent.click(box('Custom…'));
+    const field = screen.getByRole('textbox', { name: 'Other work' });
+    expect(field).toHaveAttribute('placeholder', 'Describe other work, in your own words');
+    expect(field).toHaveFocus();
+    await userEvent.type(field, 'Watch the nightly benchmark job in org/repo-a.');
+    await userEvent.click(box('Custom…'));
+    expect(screen.queryByRole('textbox', { name: 'Other work' })).not.toBeInTheDocument();
+    await userEvent.click(box('Custom…'));
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveValue('');
+
+    await userEvent.click(continueButton());
+    expect(screen.getByRole('textbox', { name: 'Other work' }))
+      .toHaveAccessibleDescription('Untick Custom… or describe the other work.');
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    await userEvent.type(screen.getByRole('textbox', { name: 'Other work' }), '  Watch the nightly benchmark job in org/repo-a.  ');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
+      mode: 'worker', work: { items: [], custom: 'Watch the nightly benchmark job in org/repo-a.', rules: '' },
+    }));
+  });
+
+  it('nothing ticked is an answer; the length caps are checked before anything is sent', async () => {
+    await openWorker();
+    await userEvent.click(box('Custom…'));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Other work' }), { target: { value: 'x'.repeat(4001) } });
+    fireEvent.change(screen.getByLabelText(RULES), { target: { value: 'y'.repeat(2001) } });
+    await userEvent.click(continueButton());
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveAccessibleDescription('Keep this under 4000 characters.');
+    expect(screen.getByLabelText(RULES)).toHaveAccessibleDescription('Keep this under 2000 characters.');
+    // Focus lands on the first field to fix.
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveFocus();
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    await userEvent.click(box('Custom…'));
+    fireEvent.change(screen.getByLabelText(RULES), { target: { value: '' } });
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
+      mode: 'worker', work: { items: [], custom: '', rules: '' },
+    }));
+  });
+
+  it('a refusal from the server lands beside the field it names', async () => {
+    m(api.setupStep)
+      .mockRejectedValueOnce(new ApiError(400, '{"detail": "Unknown work item: review-everything.", "field": "work.items"}'))
+      .mockRejectedValueOnce(new ApiError(400, '{"detail": "Keep the rules under 2000 characters.", "field": "work.rules"}'));
+    await openWorker();
+    await userEvent.click(box('Review pull requests'));
+    await userEvent.click(continueButton());
+    const section = screen.getByRole('region', { name: 'What should it do?' });
+    expect(await within(section).findByRole('alert')).toHaveTextContent('Unknown work item: review-everything.');
+
+    await userEvent.type(screen.getByLabelText(RULES), 'Never merge.');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(screen.getByLabelText(RULES)).toHaveAccessibleDescription('Keep the rules under 2000 characters.'));
+    expect(within(section).queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Choose a mode' })).toBeInTheDocument();
+  });
+
+  it('personal is unchanged: no catalog, no fields, and the mode alone is sent', async () => {
+    current = fresh();
+    renderAt('/setup/mode');
+    await heading('Choose a mode');
+    expect(screen.getByRole('radio', { name: /Personal assistant/ })).toBeChecked();
+    expect(screen.queryByRole('region', { name: 'What should it do?' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    // Ticks made under Worker stay behind when the choice goes back to Personal.
+    await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
+    await userEvent.click(box('Review pull requests'));
+    await userEvent.click(screen.getByRole('radio', { name: /Personal assistant/ }));
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', { mode: 'personal' }));
+  });
+
+  it('the Review lists the work chosen, the other work and the rules under the Mode row', async () => {
+    current = workerWith({
+      items: ['triage-issues', 'review-prs'],
+      custom: 'Watch the nightly benchmark job in org/repo-a.',
+      rules: 'Never merge anything on its own.',
+    });
+    const view = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('Work: Triage issues; Review pull requests');
+    expect(modeRow()).toHaveTextContent('Also: Watch the nightly benchmark job in org/repo-a.');
+    expect(modeRow()).toHaveTextContent('Must know or never do: Never merge anything on its own.');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    view.unmount();
+
+    // Nothing chosen: the conversation asks. The rules still show.
+    useSetupStore.getState().reset();
+    current = workerWith({ items: [], custom: '', rules: 'Never merge anything on its own.' });
+    const again = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('No work chosen yet — the conversation will ask');
+    expect(modeRow()).toHaveTextContent('Must know or never do: Never merge anything on its own.');
+    expect(modeRow()).not.toHaveTextContent('Work:');
+    expect(modeRow()).not.toHaveTextContent('Also:');
+    again.unmount();
+
+    // Other work alone is work chosen.
+    useSetupStore.getState().reset();
+    current = workerWith({ items: [], custom: 'Answer questions about org/repo-a.', rules: '' });
+    const third = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('Also: Answer questions about org/repo-a.');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    expect(modeRow()).not.toHaveTextContent('Must know');
+    third.unmount();
+
+    // An older backend sends no `work`: no lines, rather than a wrong "nothing chosen".
+    useSetupStore.getState().reset();
+    current = workerWith(undefined);
+    const older = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    older.unmount();
+
+    // A personal install has no work lines.
+    useSetupStore.getState().reset();
+    current = decided();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const personal = within(screen.getByRole('region', { name: 'Checklist' })).getByText('Personal assistant').closest('li')!;
+    expect(personal).not.toHaveTextContent('No work chosen yet');
+    expect(personal).not.toHaveTextContent('Work:');
   });
 });
 

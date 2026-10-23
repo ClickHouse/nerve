@@ -42,6 +42,7 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
+from nerve.onboarding_catalog import work_catalog
 from nerve.setup_writer import (
     SetupChoices, apply_mode, merge_settings_paths, task_description_from, write_slim_install,
 )
@@ -523,6 +524,174 @@ class TestModeLock:
             assert bare.status_code == 200
         assert (claimed.workspace / "TASK.md").read_bytes() == task_before
         assert other not in (claimed.workspace / "TASK.md").read_text()
+
+
+_NOTHING = {"items": [], "custom": "", "rules": ""}
+_CHOSEN = {"items": ["triage-issues", "review-prs"], "custom": " also watch the release branch ",
+           "rules": "never merge anything"}
+_CHOSEN_TEXT = (
+    "<!-- nerve:work review-prs, triage-issues -->\n"
+    "Work: Review pull requests; Triage issues\n"
+    "Also: also watch the release branch\n"
+    "Must know or never do: never merge anything"
+)
+
+
+@pytest.mark.asyncio
+class TestModeWork:
+    """The worker's checkboxes: ``work`` in, ``TASK.md`` written, the
+    catalog and the selection back in every body."""
+
+    async def test_every_body_carries_the_catalog_and_the_selection(self, claimed):
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "mode")["detail"]
+            personal = step((await http.put("/api/setup/mode", json={"mode": "personal"})).json(), "mode")["detail"]
+        for detail in (before, personal):
+            assert detail["work_catalog"] == work_catalog()
+            assert detail["work"] == _NOTHING
+
+    async def test_a_worker_with_items_custom_work_and_rules(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})).json()
+            again = (await http.get("/api/setup")).json()
+        expected = {"items": ["review-prs", "triage-issues"], "custom": "also watch the release branch",
+                    "rules": "never merge anything"}
+        assert step(state, "mode")["detail"]["work"] == expected
+        assert step(again, "mode")["detail"]["work"] == expected
+        assert step(again, "mode")["etag"] == step(state, "mode")["etag"]
+        task_md = (claimed.workspace / "TASK.md").read_text()
+        assert task_md.startswith("# Task\n<!-- nerve:onboarding pending")
+        assert f"## Task description (as given)\n{_CHOSEN_TEXT}\n\n## Identity\n" in task_md
+        assert task_description_from(task_md) == _CHOSEN_TEXT
+
+    async def test_nothing_ticked_is_valid(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _NOTHING})).json()
+        assert step(state, "mode")["status"] == "done"
+        assert step(state, "mode")["detail"]["work"] == _NOTHING
+        assert task_description_from((claimed.workspace / "TASK.md").read_text()) == ""
+
+    async def test_an_unknown_item_is_a_field_error_and_writes_nothing(self, claimed):
+        async with claimed.client() as http:
+            response = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["review-prs", "make-coffee"], "custom": "", "rules": ""},
+            })
+        assert response.status_code == 400
+        assert response.json()["field"] == "work.items" and "make-coffee" in response.json()["detail"]
+        assert not (claimed.workspace / "SOUL.md").exists()
+
+    async def test_a_personal_install_takes_no_items_and_keeps_custom_work_and_rules_to_itself(self, claimed):
+        async with claimed.client() as http:
+            refused = await http.put("/api/setup/mode", json={
+                "mode": "personal", "work": {"items": ["research-reports"]},
+            })
+            assert refused.status_code == 400 and refused.json()["field"] == "work.items"
+            assert not (claimed.workspace / "SOUL.md").exists()
+            state = (await http.put("/api/setup/mode", json={
+                "mode": "personal", "work": {"items": [], "custom": "Plan my week.", "rules": "No calls."},
+            })).json()
+        assert state["mode"] == "personal"
+        assert not (claimed.workspace / "TASK.md").exists()
+        assert step(state, "mode")["detail"]["work"] == _NOTHING
+
+    @pytest.mark.parametrize("body, field", [
+        ({"work": {"custom": "x" * 4001}}, "work.custom"),
+        ({"work": {"rules": "x" * 2001}}, "work.rules"),
+        ({"note": "x" * 4001}, "note"),
+        ({"task_description": "x" * 4001}, "task_description"),
+    ])
+    async def test_a_long_text_names_the_field_it_came_in(self, claimed, body, field):
+        async with claimed.client() as http:
+            response = await http.put("/api/setup/mode", json={"mode": "worker", **body})
+            assert response.status_code == 400
+            assert response.json()["field"] == field
+            assert not (claimed.workspace / "SOUL.md").exists()
+            # At the limit it is accepted.
+            at_limit = {
+                key: ({k: v[: (2000 if k == "rules" else 4000)] for k, v in value.items()}
+                      if isinstance(value, dict) else value[:4000])
+                for key, value in body.items()
+            }
+            assert (await http.put("/api/setup/mode", json={"mode": "worker", **at_limit})).status_code == 200
+
+    async def test_the_older_note_is_an_alias_for_custom_work(self, claimed):
+        """An older page's note (``note``, or the shipped ``task_description``)
+        stays a plain paragraph in ``TASK.md`` and reads back as custom work."""
+        note = "Watch the nightly build for example/repo and propose fixes."
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "note": note})).json()
+        assert f"## Task description (as given)\n{note}\n" in (claimed.workspace / "TASK.md").read_text()
+        assert step(state, "mode")["detail"]["work"] == {"items": [], "custom": note, "rules": ""}
+
+    async def test_custom_work_wins_over_the_older_note(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["ci-health"], "custom": "Watch main only."},
+                "note": "Something else.",
+            })).json()
+        assert step(state, "mode")["detail"]["work"] == {
+            "items": ["ci-health"], "custom": "Watch main only.", "rules": "",
+        }
+        assert "Something else" not in (claimed.workspace / "TASK.md").read_text()
+
+    async def test_chosen_once_the_same_choice_is_a_no_op_and_another_is_refused(self, claimed):
+        async with claimed.client() as http:
+            await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})
+            before = (claimed.workspace / "TASK.md").read_bytes()
+            same = await http.put("/api/setup/mode", json={"mode": "worker", "work": {
+                "items": ["review-prs", "triage-issues", "review-prs"], "custom": "also watch the release branch",
+                "rules": " never merge anything\n",
+            }})
+            assert same.status_code == 200
+            other = await http.put("/api/setup/mode", json={"mode": "worker", "work": {
+                **_CHOSEN, "items": ["review-prs"],
+            }})
+            assert other.status_code == 409 and "chosen once" in other.json()["detail"]
+            bare = await http.put("/api/setup/mode", json={"mode": "worker"})
+            assert bare.status_code == 200
+        assert (claimed.workspace / "TASK.md").read_bytes() == before
+
+    async def test_an_older_note_and_the_same_custom_work_are_one_choice(self, claimed):
+        note = "Watch the nightly build for example/repo and propose fixes."
+        async with claimed.client() as http:
+            await http.put("/api/setup/mode", json={"mode": "worker", "task_description": note})
+            before = (claimed.workspace / "TASK.md").read_bytes()
+            same = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": [], "custom": note, "rules": ""},
+            })
+            more = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["ci-health"], "custom": note, "rules": ""},
+            })
+        assert same.status_code == 200 and more.status_code == 409
+        assert (claimed.workspace / "TASK.md").read_bytes() == before
+
+    async def test_locked_the_selection_waits_for_the_templates(self, claimed, monkeypatch):
+        _lock(claimed, monkeypatch)
+        async with claimed.client() as http:
+            refused = await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})
+            assert refused.status_code == 409
+            assert not (claimed.workspace / "SOUL.md").exists()
+        # Templates arrive from the repository; TASK.md is runtime state.
+        apply_mode(claimed.workspace, "worker")
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})).json()
+        assert statuses(state)["mode"] == "done"
+        assert task_description_from((claimed.workspace / "TASK.md").read_text()) == _CHOSEN_TEXT
+
+    async def test_finish_opens_the_conversation_on_the_chosen_work(self, claimed, monkeypatch):
+        choose(claimed, "worker", _CHOSEN_TEXT)
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            body = (await http.post("/api/setup/finish")).json()
+        assert body["onboarding"]["status"] == "running"
+        assert step(body["state"], "mode")["detail"]["work"]["items"] == ["review-prs", "triage-issues"]
+        await asyncio.sleep(0)
+        message = engine.run.await_args.kwargs["user_message"]
+        assert "## What the operator chose at setup" in message and "wrote at setup" not in message
+        assert "- Review pull requests — Reads diffs, runs targeted checks, posts review comments." in message
+        assert "Must know or never do:\n> never merge anything" in message
 
 
 # --------------------------------------------------------------------------- #
