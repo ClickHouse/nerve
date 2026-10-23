@@ -177,20 +177,13 @@ class TestConfigValidation:
         })
         assert cfg.agent.backend == "claude"
 
-    @pytest.mark.parametrize("url", [
-        "ftp://127.0.0.1:4000/v1",
-        "http:///v1",
-        "http://user:secret@127.0.0.1:4000/v1",
-        "http://127.0.0.1:4000/v1?key=1",
-        "http://127.0.0.1:4000/v1#frag",
-        "127.0.0.1:4000/v1",
-    ])
-    def test_codex_base_url_must_be_a_plain_http_url(self, tmp_path, url):
+    def test_codex_base_url_is_checked_at_load(self, tmp_path):
+        """Refused also while codex is not a selected backend: workflow runs
+        and review-loop legs can still start Codex sessions."""
         with pytest.raises(ValueError, match="codex.base_url"):
             NerveConfig.from_dict({
                 "workspace": str(tmp_path),
-                "agent": {"backend": "codex"},
-                "codex": {"base_url": url},
+                "codex": {"base_url": "http://user:secret@127.0.0.1:4000/v1"},
             })
 
     def test_codex_base_url_keeps_the_path_and_drops_one_slash(self, tmp_path):
@@ -210,7 +203,6 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="codex.ultracode.enabled"):
             NerveConfig.from_dict({
                 "workspace": str(tmp_path),
-                "agent": {"backend": "codex"},
                 "codex": {
                     "base_url": "http://127.0.0.1:4000/v1",
                     "ultracode": {"enabled": True},

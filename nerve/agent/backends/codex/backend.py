@@ -302,11 +302,6 @@ class CodexBackend:
     async def create_client(self, spec: SessionSpec) -> "CodexClient":
         await self._check_cli_version()
         if self.codex.ultracode.enabled:
-            if self.codex.base_url:
-                # Ultracode workers do not get the endpoint provider.
-                raise BackendError(
-                    "Codex Ultracode is not available with codex.base_url"
-                )
             await ensure_ultracode_installed(self.config)
         client = CodexClient(self, spec)
         try:

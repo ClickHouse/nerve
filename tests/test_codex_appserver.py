@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from nerve.agent.backends import BackendDeps, BackendError, SessionSpec, TransportDiedError
+from nerve.agent.backends import BackendDeps, SessionSpec, TransportDiedError
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
 from nerve.agent.backends.base import TurnInput
@@ -282,18 +282,6 @@ async def test_endpoint_mode_needs_no_codex_login(tmp_path, monkeypatch):
     finally:
         await client.disconnect()
     assert not (tmp_path / "codex-home" / "login_calls").exists()
-
-
-@pytest.mark.asyncio
-async def test_endpoint_mode_refuses_ultracode(tmp_path, monkeypatch):
-    """Ultracode workers do not get the endpoint provider, so a session
-    with both settings is refused, also when codex is not the default
-    backend (load validation only warns then)."""
-    _mode(monkeypatch, "basic")
-    cfg = _config(tmp_path, base_url=_ENDPOINT, ultracode={"enabled": True})
-    backend = CodexBackend(_deps(cfg))
-    with pytest.raises(BackendError, match="Ultracode"):
-        await backend.create_client(_spec(cfg))
 
 
 @pytest.mark.asyncio

@@ -1093,6 +1093,8 @@ codex:
 - The value includes the version path. Nerve removes one trailing `/`. The
   URL must use http or https and have a host, and it must not have
   credentials, a query or a fragment. A `${VAR}` reference resolves at load.
+  Nerve checks the value at load also when Codex is not a selected backend,
+  and refuses a config that breaks the rule.
 - Nerve gives Codex a custom model provider (`nerve-endpoint`, wire API
   `responses`) through `--config` overrides.
 - Credential: only `codex.api_key`. If it is set, Codex sends it as a
@@ -1108,9 +1110,9 @@ codex:
 - Turn costs are estimates from `codex.pricing`, with
   `cost_basis: api_billed`. A model that the Codex catalog does not list
   must be in `codex.models`.
-- Ultracode is not available in this mode. Nerve refuses
-  `codex.ultracode.enabled` together with `codex.base_url`, because the
-  Ultracode workers do not use the endpoint.
+- Ultracode is not available in this mode. Nerve refuses a config with
+  `codex.ultracode.enabled` together with `codex.base_url` at load, because
+  the Ultracode workers do not use the endpoint.
 
 Ultracode is installed only into the isolated Nerve Codex home at the exact
 configured revision. A hash-verified Nerve policy overlay hard-enforces the

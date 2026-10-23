@@ -3287,6 +3287,17 @@ class CodexConfig:
         raw_effort = d.get("effort_map") or {}
         if isinstance(raw_effort, dict):
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
+        # Checked at load also while codex is not a selected backend:
+        # workflow runs and review-loop legs can start Codex sessions.
+        base_url = str(d.get("base_url") or "").strip()
+        _checked_http_url(base_url, "codex.base_url")
+        base_url = base_url.removesuffix("/")
+        ultracode = UltracodeConfig.from_dict(d.get("ultracode"))
+        if base_url and ultracode.enabled:
+            raise ConfigError(
+                "codex.ultracode.enabled cannot be set together with "
+                "codex.base_url (Ultracode workers do not use the endpoint)"
+            )
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
@@ -3300,7 +3311,7 @@ class CodexConfig:
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
-            base_url=str(d.get("base_url") or "").strip().removesuffix("/"),
+            base_url=base_url,
             sandbox=str(d.get("sandbox", "danger-full-access")),
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
@@ -3311,7 +3322,7 @@ class CodexConfig:
             ),
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
-            ultracode=UltracodeConfig.from_dict(d.get("ultracode")),
+            ultracode=ultracode,
         )
 
     def validate(self) -> list[str]:
@@ -3332,16 +3343,6 @@ class CodexConfig:
                 f"codex.sandbox must be one of {_CODEX_SANDBOX_MODES}, "
                 f"got {self.sandbox!r}"
             )
-        if self.base_url:
-            try:
-                _checked_http_url(self.base_url, "codex.base_url")
-            except ConfigError as e:
-                problems.append(str(e))
-            if self.ultracode.enabled:
-                problems.append(
-                    "codex.ultracode.enabled cannot be set together with "
-                    "codex.base_url (Ultracode workers do not use the endpoint)"
-                )
         problems.extend(self.ultracode.validate())
         return problems
 
