@@ -258,7 +258,7 @@ A reload is always explicit. Two things cause one:
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
-| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
+| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
 All of that is reloaded together, and the response says what happened to each
 piece: `POST /api/config/reload` returns `ok`, a per-subsystem `detail`, and an
@@ -1028,6 +1028,7 @@ codex:                     # active when a codex backend is selected
   models: [gpt-6-astra]    # hidden catalog entries to offer when the account serves them
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
+  base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
   sandbox: danger-full-access   # read-only | workspace-write | danger-full-access
   approval_policy: never        # never | on-request | untrusted
   web_search: true
@@ -1077,6 +1078,37 @@ flags a mismatch with `codex.auth`). With ChatGPT authentication, token counts a
 but `cost_usd` is null: any API-price calculation is stored separately as an
 `api_equivalent_estimate`. API-key sessions use `cost_basis: api_billed` when a
 known price is available.
+
+### Codex through an OpenAI-compatible endpoint
+
+Set `codex.base_url` to send Codex to an endpoint that serves the OpenAI
+Responses API, for example a local proxy:
+
+```yaml
+codex:
+  base_url: http://127.0.0.1:4000/v1   # Codex sends POST <base_url>/responses
+  api_key_env: PROXY_API_KEY           # optional, see below
+```
+
+- The value includes the version path. Nerve removes one trailing `/`. The
+  URL must use http or https and have a host, and it must not have
+  credentials, a query or a fragment. A `${VAR}` reference resolves at load.
+- Nerve gives Codex a custom model provider (`nerve-endpoint`, wire API
+  `responses`) through `--config` overrides.
+- Credential: if `codex.api_key` or the variable that `codex.api_key_env`
+  names (default `OPENAI_API_KEY`) gives a key, Codex sends it as a bearer
+  token. Nerve puts the key in the environment of the Codex process, not in
+  its arguments. Without a key, Codex sends no credential. Nerve never sends
+  the top-level `openai_api_key` to the endpoint.
+- Codex needs no login, and `codex.auth` has no effect. Preflight does not
+  require an account and uses the same provider. `nerve codex doctor` and
+  `GET /api/codex/status` show the endpoint in `preflight.base_url`.
+- Turn costs are estimates from `codex.pricing`, with
+  `cost_basis: api_billed`. A model that the Codex catalog does not list
+  must be in `codex.models`.
+- Ultracode is not available in this mode. Nerve refuses
+  `codex.ultracode.enabled` together with `codex.base_url`, because the
+  Ultracode workers do not use the endpoint.
 
 Ultracode is installed only into the isolated Nerve Codex home at the exact
 configured revision. A hash-verified Nerve policy overlay hard-enforces the
