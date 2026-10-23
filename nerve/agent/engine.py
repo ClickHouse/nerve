@@ -63,6 +63,7 @@ from nerve.agent.interactive import (
     unregister_handler,
     get_handler,
 )
+from nerve.agent.plan_summary import summarize_plan
 from nerve.agent.prompts import (
     build_session_preamble,
     build_system_prompt,
@@ -389,6 +390,9 @@ class AgentEngine:
         # refs so the tasks aren't GC'd mid-flight; pruned by their
         # done-callbacks and flushed in shutdown().
         self._memorize_bg_tasks: set[asyncio.Task] = set()
+        # Plan summaries being written (see _schedule_plan_summary) — strong
+        # refs too; cancelled in shutdown().
+        self._plan_summary_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Idle stream watchers — one per live SDK client. Between run()
         # calls nothing reads the SDK message stream, but the CLI keeps
@@ -1014,6 +1018,15 @@ class AgentEngine:
                 *self._memorize_bg_tasks, return_exceptions=True,
             )
         self._memorize_bg_tasks.clear()
+
+        # Plan summaries still being written have nobody left to show them to.
+        for task in list(self._plan_summary_tasks):
+            task.cancel()
+        if self._plan_summary_tasks:
+            await asyncio.gather(
+                *self._plan_summary_tasks, return_exceptions=True,
+            )
+        self._plan_summary_tasks.clear()
 
         # Close the optional xmemory HTTP client (no-op when disabled).
         if self._xmemory_bridge is not None:
@@ -1808,13 +1821,64 @@ class AgentEngine:
     ) -> None:
         """Let a session's interaction hub name the sub-agent that asks a
         question and mark it waiting for an answer (attention
-        ``needs_input``) until the pause ends."""
+        ``needs_input``) until the pause ends, and summarize each plan that
+        waits for a decision."""
         handler.describe_agent = (
             lambda task_id: self.agents.describe_task(session_id, task_id)
         )
         handler.on_agent_interaction = (
             lambda task_id, pending: self.agents.on_interaction(session_id, task_id, pending)
         )
+        handler.on_plan_pending = (
+            lambda interaction_id, tool_input: self._schedule_plan_summary(
+                session_id, interaction_id, tool_input,
+            )
+        )
+
+    def _schedule_plan_summary(
+        self, session_id: str, interaction_id: str, tool_input: dict,
+    ) -> None:
+        """Summarize the plan an ``ExitPlanMode`` pause waits on, in the
+        background (the pause never waits for it), then broadcast the
+        ``plan_summary`` event."""
+        plan = tool_input.get("plan") if isinstance(tool_input, dict) else None
+        task = asyncio.create_task(self._broadcast_plan_summary(
+            session_id, interaction_id, plan if isinstance(plan, str) else "",
+        ))
+        self._plan_summary_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._plan_summary_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning(
+                    "Plan summary for session %s was not sent: %s",
+                    session_id, t.exception(),
+                )
+
+        task.add_done_callback(_done)
+
+    async def _broadcast_plan_summary(
+        self, session_id: str, interaction_id: str, plan_text: str,
+    ) -> None:
+        """``plan_summary`` on the session channel, as the ``interaction``
+        event is: the same broadcaster, so a running turn's buffer replays it
+        to a client that reconnects. ``unavailable`` with no bullets when no
+        summary could be made (an empty plan never reaches the model)."""
+        try:
+            bullets = await summarize_plan(
+                self.config, plan_text,
+                label=f"session {session_id} (interaction {interaction_id[:8]})",
+            )
+        except Exception:  # noqa: BLE001 — the card falls back to the plan's first lines
+            logger.warning("Plan summary failed for session %s", session_id, exc_info=True)
+            bullets = None
+        await broadcaster.broadcast(session_id, {
+            "type": "plan_summary",
+            "session_id": session_id,
+            "interaction_id": interaction_id,
+            "bullets": bullets or [],
+            "status": "ok" if bullets else "unavailable",
+        })
 
     async def _reset_cost_baseline(self, session_id: str) -> None:
         """Zero the persisted SDK cumulative-cost baseline for a session.
@@ -4981,6 +5045,24 @@ class AgentEngine:
             logger.warning("Failed to generate session title: %s", e)
 
 
+def _is_plan_file(file_path: str) -> bool:
+    """A file in the Claude CLI's plans directory, where plan mode keeps the
+    session's plan (``<dir>/<slug>.md``).
+
+    The CLI's directory is ``$CLAUDE_CONFIG_DIR/plans`` when that variable
+    moves its config directory, else ``~/.claude/plans``. Its
+    ``plansDirectory`` setting never applies here: Nerve loads no settings
+    files (``setting_sources=[]``).
+    """
+    if "/.claude/plans/" in file_path:
+        return True
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not file_path or not config_dir:
+        return False
+    plans = os.path.join(os.path.abspath(os.path.expanduser(config_dir)), "plans")
+    return os.path.abspath(os.path.expanduser(file_path)).startswith(plans + os.sep)
+
+
 def _maybe_broadcast_plan_update(
     session_id: str,
     tool_use_id: str,
@@ -5003,7 +5085,7 @@ def _maybe_broadcast_plan_update(
         return
 
     file_path = str(tool_input.get("file_path", ""))
-    if "/.claude/plans/" not in file_path:
+    if not _is_plan_file(file_path):
         return
 
     # Read the updated plan file and broadcast

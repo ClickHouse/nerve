@@ -366,8 +366,10 @@ class ClaudeToolPermissions:
 
     * File-modifying tools trigger a pre-execution snapshot (redundant
       with the PreToolUse hook, kept as belt-and-suspenders).
-    * Interactive built-ins pause via the hub and translate its outcome
-      into ``PermissionResultAllow/Deny``.
+    * Interactive built-ins are denied on a non-interactive channel. On an
+      interactive one, ``AskUserQuestion`` and ``ExitPlanMode`` pause via the
+      hub and translate its outcome into ``PermissionResultAllow/Deny``;
+      ``EnterPlanMode`` is allowed without a pause.
     * Everything else auto-approves with zero overhead.
     """
 
@@ -435,6 +437,14 @@ class ClaudeToolPermissions:
                 )
             )
 
+        # Entering plan mode only restricts the agent (it reads and writes
+        # its plan file until ExitPlanMode), so asking the person to allow it
+        # is a click without a decision: allow it at once. The decision is
+        # ExitPlanMode's, which still pauses below. (The bundled CLI does not
+        # even ask: it switches to plan mode itself. This covers one that does.)
+        if tool_name == "EnterPlanMode":
+            return PermissionResultAllow()
+
         # A foreground sub-agent's question names the agent that asked.
         agent_task_id = getattr(context, "agent_id", None)
         if agent_task_id:
@@ -456,8 +466,25 @@ class ClaudeToolPermissions:
         if tool_name == "AskUserQuestion" and outcome.result:
             updated = {**tool_input, "answers": outcome.result}
             return PermissionResultAllow(updated_input=updated)
-        # For ExitPlanMode/EnterPlanMode: just allow
+        # ExitPlanMode approved with the person's edit of the plan
+        # (``{"plan": text}``): the CLI saves the text to the plan file and
+        # tells the agent the approved plan was edited by the user.
+        edited = _edited_plan(outcome.result) if tool_name == "ExitPlanMode" else None
+        if edited is not None:
+            return PermissionResultAllow(updated_input={**tool_input, "plan": edited})
+        # Otherwise just allow (a refusal carried the person's words as the
+        # deny message above)
         return PermissionResultAllow()
+
+
+def _edited_plan(result: Any) -> str | None:
+    """The plan text a person approved with their edits, from the answer of an
+    ``ExitPlanMode`` pause: ``{"plan": "<non-empty text>"}``. ``None`` for a
+    plain approval (no result) or anything else."""
+    if not isinstance(result, dict):
+        return None
+    plan = result.get("plan")
+    return plan if isinstance(plan, str) and plan.strip() else None
 
 
 # ------------------------------------------------------------------ #

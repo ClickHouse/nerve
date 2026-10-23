@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from nerve.identity import actor_id_of
+from nerve.identity import ACTOR_KIND_HUMAN, Actor, actor_id_of
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
     publish_text,
@@ -138,6 +138,32 @@ def _prompt_inputs(workspace: Path, mode: str) -> tuple[str, str]:
     return description, read_worker_guide()
 
 
+async def _person_name(db: "Database", cause: "ActorOrId | None") -> str:
+    """The display name of the person the conversation is for, else ``""``.
+
+    ``cause`` is the person who finished setup: the resolved :class:`Actor`
+    at Finish, or their stored actor id at a daemon start. The system actor,
+    an unknown id and a person without a display name give ``""`` (the agent
+    then greets without a name).
+    """
+    if isinstance(cause, Actor):
+        if not cause.is_human:
+            return ""
+        if cause.display_name:
+            return cause.display_name
+    actor_id = actor_id_of(cause) if isinstance(cause, (Actor, str)) else None
+    if not actor_id:
+        return ""
+    try:
+        ref = await db.get_actor_ref(actor_id)
+    except Exception:  # noqa: BLE001 - a missing name never stops the start
+        logger.debug("Onboarding: no name for actor %s", actor_id, exc_info=True)
+        return ""
+    if not ref or ref.get("kind") != ACTOR_KIND_HUMAN:
+        return ""
+    return ref.get("display_name") or ""
+
+
 async def start(
     engine: "AgentEngine",
     workspace: Path,
@@ -179,8 +205,10 @@ async def start(
     mode = workspace_mode(Path(workspace)) or "personal"
     description, guide = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
+        name = await _person_name(db, cause)
         prompt = onboarding_prompt(
-            mode, description, guide, memory_backend=engine.config.memory.backend,
+            mode, description, guide, person_name=name,
+            memory_backend=engine.config.memory.backend,
         )
     else:
         prompt = worker_onboarding_prompt(description, guide, engine.config.memory.backend)

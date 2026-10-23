@@ -27,9 +27,14 @@ logger = logging.getLogger(__name__)
 # Default timeout for interactive tool waits (1 hour)
 INTERACTION_TIMEOUT = 3600
 
-# Claude CLI built-ins that require user interaction before execution.
-# Defined here (not in the claude backend) so the neutral registry and
-# tests can reference the set without importing backend modules.
+# Claude CLI built-ins whose permission ``can_use_tool`` decides itself (the
+# PreToolUse grant hook leaves them alone). When the CLI asks, all three are
+# denied on a non-interactive channel; on an interactive one
+# ``AskUserQuestion`` and ``ExitPlanMode`` pause for the person, and
+# ``EnterPlanMode`` is allowed at once (entering plan mode only restricts the
+# agent; the bundled CLI does not even ask for it). Defined here (not in the
+# claude backend) so the neutral registry and tests can reference the set
+# without importing backend modules.
 INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion",
     "ExitPlanMode",
@@ -67,6 +72,9 @@ class PendingInteraction:
     result: dict[str, Any] | None = None
     denied: bool = False
     deny_message: str = ""
+    #: The ``interaction_type`` the UI was sent (``question``, ``plan_exit``,
+    #: one of :data:`APPROVAL_KINDS`, …).
+    interaction_type: str = ""
 
 
 @dataclass
@@ -128,6 +136,11 @@ class InteractiveToolHandler:
         # answer. A question from the orchestrator has no agent.
         self.describe_agent: Callable[[str], dict | None] | None = None
         self.on_agent_interaction: Callable[[str, bool], None] | None = None
+        # Set by the engine: ``on_plan_pending(interaction_id, tool_input)``
+        # hears of each plan that waits for a decision (``plan_exit``), right
+        # after its ``interaction`` event, and writes a summary of it in the
+        # background. Called synchronously: it must not block the pause.
+        self.on_plan_pending: Callable[[str, dict], None] | None = None
 
     # -- snapshot bookkeeping ------------------------------------------- #
 
@@ -200,6 +213,14 @@ class InteractiveToolHandler:
         except Exception:  # noqa: BLE001
             logger.debug("on_agent_interaction failed for %s", task_id, exc_info=True)
 
+    def _plan_pending(self, interaction_id: str, tool_input: dict[str, Any]) -> None:
+        if self.on_plan_pending is None:
+            return
+        try:
+            self.on_plan_pending(interaction_id, tool_input)
+        except Exception:  # noqa: BLE001 — a summary never breaks a pause
+            logger.debug("on_plan_pending failed for %s", interaction_id[:8], exc_info=True)
+
     async def request_approval(
         self, kind: str, payload: dict[str, Any],
     ) -> InteractionOutcome:
@@ -237,6 +258,7 @@ class InteractiveToolHandler:
             interaction_id=interaction_id,
             tool_name=tool_name,
             tool_input=tool_input,
+            interaction_type=interaction_type,
         )
         self._pending[interaction_id] = pending
 
@@ -250,6 +272,8 @@ class InteractiveToolHandler:
             "tool_input": tool_input,
             "agent": agent,
         })
+        if interaction_type == "plan_exit":
+            self._plan_pending(interaction_id, tool_input)
         # Tell every connected client this session is now waiting for input,
         # so the sidebar can show the "waiting" indicator (blue dot).
         await self._broadcast_awaiting()
@@ -379,6 +403,13 @@ class InteractiveToolHandler:
     def has_pending(self) -> bool:
         return len(self._pending) > 0
 
+    def pending_interaction_types(self) -> list[str]:
+        """The ``interaction_type`` of each interaction waiting for the
+        person, oldest first: ``question`` (``AskUserQuestion``),
+        ``plan_exit`` (``ExitPlanMode``) or an approval kind. Empty when
+        nothing waits."""
+        return [pending.interaction_type for pending in list(self._pending.values())]
+
 
 # ------------------------------------------------------------------ #
 #  File snapshot helpers                                               #
@@ -436,11 +467,13 @@ def get_awaiting_ids() -> set[str]:
 
 
 def _interaction_type(tool_name: str) -> str:
-    """Map tool name to a UI-friendly interaction type."""
+    """Map tool name to a UI-friendly interaction type.
+
+    ``EnterPlanMode`` never pauses (see :data:`INTERACTIVE_TOOLS`), so there
+    is no interaction type for it."""
     return {
         "AskUserQuestion": "question",
         "ExitPlanMode": "plan_exit",
-        "EnterPlanMode": "plan_enter",
     }.get(tool_name, "unknown")
 
 

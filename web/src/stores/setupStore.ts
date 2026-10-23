@@ -3,7 +3,8 @@ import {
   api,
   type AgentsDetect, type HostLogin, type RestartResponse, type SetupEnvironment,
   type SetupFinishResponse, type SetupModeDetail, type SetupModelsResponse, type SetupOnboarding,
-  type SetupOnboardingKind, type SetupState, type SetupStep, type SetupStepId, type SourcesPreflight,
+  type SetupOnboardingAwaiting, type SetupOnboardingKind, type SetupState, type SetupStep, type SetupStepId,
+  type SourcesPreflight,
 } from '../api/client';
 import { ApiError, clearUnavailable } from '../api/hosted';
 import { errorDetail } from './accountStore';
@@ -170,15 +171,22 @@ export function setupNotStarted(s: SetupStoreState): boolean {
   return setupIsUnfinished(s) && stepById(s, 'mode')?.status === 'pending';
 }
 
-/** The onboarding, from the Mode step's detail. */
+/**
+ * The onboarding, from the Mode step's detail, and what its agent waits for
+ * (`awaiting`, from the state's `onboarding` block; `null` while it is not
+ * running, and from an older backend).
+ */
 export function onboardingOf(state: SetupState | null): {
   status: SetupOnboarding; sessionId: string | null; kind: SetupOnboardingKind;
+  awaiting: SetupOnboardingAwaiting | null;
 } {
   const detail = state?.steps.find((x) => x.id === 'mode')?.detail as SetupModeDetail | undefined;
+  const status = detail?.onboarding ?? 'not_applicable';
   return {
-    status: detail?.onboarding ?? 'not_applicable',
+    status,
     sessionId: detail?.onboarding_session_id ?? null,
     kind: detail?.onboarding_kind ?? 'conversation',
+    awaiting: status === 'running' ? state?.onboarding?.awaiting ?? null : null,
   };
 }
 

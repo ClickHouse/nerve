@@ -180,6 +180,57 @@ describe('SetupBanner while the onboarding conversation waits', () => {
       view.unmount();
     }
   });
+
+  /** The state's `onboarding` block, as the server sends it beside the Mode step's detail. */
+  const awaiting = (value: 'question' | 'plan' | null) => waiting({
+    onboarding: { status: 'running', session_id: 'onboarding-1', kind: 'conversation', awaiting: value },
+  });
+
+  it('says the agent has a question, with Answer, linking to the conversation', () => {
+    useSetupStore.setState({ state: awaiting('question') });
+    renderWithLink('/tasks');
+    const link = screen.getByRole('status');
+    expect(link).toHaveTextContent('Your agent has a question for you · Answer');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-1');
+  });
+
+  it('says the agent proposed a setup, with Review, linking to the conversation', () => {
+    useSetupStore.setState({ state: awaiting('plan') });
+    renderWithLink('/tasks');
+    const link = screen.getByRole('status');
+    expect(link).toHaveTextContent('Your agent proposed a setup · Review');
+    expect(link).toHaveAttribute('href', '/chat/onboarding-1');
+  });
+
+  it('keeps the plain reminder when the agent waits for nothing in particular', () => {
+    useSetupStore.setState({ state: awaiting(null) });
+    renderWithLink('/tasks');
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Your agent waits for you in its onboarding conversation · Continue',
+    );
+  });
+
+  it('is still hidden on the conversation, and hides only until the next page, while the agent asks', async () => {
+    useSetupStore.setState({ state: awaiting('question') });
+    const view = renderWithLink('/chat/onboarding-1');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    view.unmount();
+
+    renderWithLink('/chat');
+    await userEvent.click(screen.getByRole('button', { name: 'Hide until the next page' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('link', { name: 'Tasks' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Your agent has a question for you · Answer');
+  });
+
+  it('follows what the agent waits for from one page to the next', async () => {
+    useSetupStore.setState({ state: awaiting('question') });
+    vi.mocked(api.setupState).mockResolvedValue(awaiting('plan'));
+    renderWithLink('/chat');
+    expect(screen.getByRole('status')).toHaveTextContent('Your agent has a question for you');
+    await userEvent.click(screen.getByRole('link', { name: 'Tasks' }));
+    expect(await screen.findByText(/Your agent proposed a setup/)).toBeInTheDocument();
+  });
 });
 
 describe('SetupBanner when setup is complete and the conversation has not started', () => {

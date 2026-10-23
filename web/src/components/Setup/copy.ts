@@ -516,6 +516,10 @@ export const READY_ONBOARDING =
 export const READY_ONBOARDING_AFTER_RESTART = 'The first conversation with your agent opens after the restart.';
 /** The banner while the conversation waits, on every page but the conversation. */
 export const BANNER_ONBOARDING = 'Your agent waits for you in its onboarding conversation';
+/** The same, while the agent waits for an answer to its question. */
+export const BANNER_ONBOARDING_QUESTION = 'Your agent has a question for you';
+/** The same, while the agent waits for a decision on its setup proposal. */
+export const BANNER_ONBOARDING_PLAN = 'Your agent proposed a setup';
 /** The banner when setup is complete and the conversation has not started. */
 export const BANNER_ONBOARDING_START = 'Your agent is ready for its onboarding conversation';
 /** The banner while a worker sets itself up without a person. */

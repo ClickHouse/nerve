@@ -3,9 +3,10 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { onboardingCanStart, onboardingOf, useSetupStore } from '../../stores/setupStore';
 import { IconButton } from '../ui';
-import { AlertTriangle, MessageSquare, X } from '../ui/icons';
+import { AlertTriangle, FileCheck, MessageCircleQuestion, MessageSquare, X, type Icon } from '../ui/icons';
 import {
-  BANNER_ONBOARDING, BANNER_ONBOARDING_AUTONOMOUS, BANNER_ONBOARDING_START, BANNER_RESTART, BANNER_STEPS_LEFT,
+  BANNER_ONBOARDING, BANNER_ONBOARDING_AUTONOMOUS, BANNER_ONBOARDING_PLAN, BANNER_ONBOARDING_QUESTION,
+  BANNER_ONBOARDING_START, BANNER_RESTART, BANNER_STEPS_LEFT,
 } from './copy';
 
 /**
@@ -32,7 +33,9 @@ const BANNER_TEXT_CLASS = 'flex items-start gap-2 flex-1 min-w-0 text-sm text-te
  * conversation has not started (nobody pressed Finish, or an install from
  * before onboarding), it offers **Start**, which runs Finish (idempotent)
  * and opens the conversation. While the agent waits in the conversation,
- * every page except that chat says so, with **Continue**. While a worker
+ * every page except that chat says so, with **Continue** — or, when the
+ * agent waits for something in particular (`awaiting`), says what: a
+ * question (**Answer**) or its setup proposal (**Review**). While a worker
  * sets itself up without a person, it only links to that session. It is not
  * dismissible for good: the close button hides it until the next page. It
  * shows for everyone who uses the instance, because the conversation sets up
@@ -86,11 +89,10 @@ export function SetupBanner() {
           text={BANNER_ONBOARDING_START} action="Start" {...hide} />
       );
     }
-    const autonomous = onboarding.kind === 'autonomous';
+    const { text, action, Icon } = waitingReminder(onboarding);
     return (
-      <BannerBox isMobile={isMobile} to={chat} icon={icon}
-        text={autonomous ? BANNER_ONBOARDING_AUTONOMOUS : BANNER_ONBOARDING}
-        action={autonomous ? 'Open' : 'Continue'} {...hide} />
+      <BannerBox isMobile={isMobile} to={chat} icon={<Icon size={14} className="text-accent shrink-0 mt-0.5" />}
+        text={text} action={action} {...hide} />
     );
   }
   if (state.finished || dismissed) return null;
@@ -110,6 +112,16 @@ export function SetupBanner() {
     <BannerBox isMobile={isMobile} to={to} icon={<AlertTriangle size={14} className="text-hue-amber shrink-0 mt-0.5" />}
       text={text} action={action} label="Dismiss" onClose={dismiss} />
   );
+}
+
+/** What the reminder says while the conversation runs, by what the agent waits for. */
+function waitingReminder({ kind, awaiting }: ReturnType<typeof onboardingOf>): {
+  text: string; action: string; Icon: Icon;
+} {
+  if (kind === 'autonomous') return { text: BANNER_ONBOARDING_AUTONOMOUS, action: 'Open', Icon: MessageSquare };
+  if (awaiting === 'question') return { text: BANNER_ONBOARDING_QUESTION, action: 'Answer', Icon: MessageCircleQuestion };
+  if (awaiting === 'plan') return { text: BANNER_ONBOARDING_PLAN, action: 'Review', Icon: FileCheck };
+  return { text: BANNER_ONBOARDING, action: 'Continue', Icon: MessageSquare };
 }
 
 /** `to` makes the text a link; `onAction` makes it a button. */

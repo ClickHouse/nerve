@@ -2138,6 +2138,71 @@ class TestFinish:
         assert engine.run.await_count == 0
         assert (await claimed.db.get_onboarding())["status"] == "requested"
 
+    async def test_the_onboarding_block_says_what_the_agent_waits_for(self, claimed, monkeypatch):
+        """``onboarding.awaiting`` is ``question`` while an AskUserQuestion card
+        waits in the onboarding session, ``plan`` while an ExitPlanMode decision
+        does (a plan wins), ``null`` for anything else and once it stops running."""
+        from nerve.agent.interactive import InteractiveToolHandler, register_handler, unregister_handler
+
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["onboarding"] == {
+            "status": "not_applicable", "session_id": None, "kind": "conversation", "awaiting": None,
+        }
+
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+
+        async def _quiet(channel, message):
+            pass
+
+        async def _awaiting(http) -> str | None:
+            state = (await http.get("/api/setup")).json()
+            assert state["onboarding"]["status"] == step(state, "mode")["detail"]["onboarding"]
+            return state["onboarding"]["awaiting"]
+
+        async def _pause(handler, tool, count):
+            task = asyncio.create_task(
+                handler.request_approval(tool, {}) if tool == "command_approval"
+                else handler.request_interaction(tool, {}),
+            )
+            for _ in range(200):
+                if len(handler.pending_interaction_types()) == count:
+                    return task
+                await asyncio.sleep(0.005)
+            raise AssertionError(f"{tool} never paused")
+
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            finished = (await http.post("/api/setup/finish")).json()
+            session_id = finished["onboarding"]["session_id"]
+            assert finished["state"]["onboarding"] == {
+                "status": "running", "session_id": session_id, "kind": "conversation", "awaiting": None,
+            }
+            handler = InteractiveToolHandler(session_id, _quiet, interactive_capable=True)
+            register_handler(session_id, handler)
+            try:
+                assert await _awaiting(http) is None
+                approval = await _pause(handler, "command_approval", 1)
+                assert await _awaiting(http) is None
+                question = await _pause(handler, "AskUserQuestion", 2)
+                assert await _awaiting(http) == "question"
+                plan = await _pause(handler, "ExitPlanMode", 3)
+                assert await _awaiting(http) == "plan"
+                handler.cancel_all()
+                await asyncio.gather(approval, question, plan)
+                assert await _awaiting(http) is None
+
+                plan = await _pause(handler, "ExitPlanMode", 1)
+                skipped = (await http.post("/api/setup/onboarding/skip")).json()
+                assert skipped["onboarding"]["status"] == "skipped"
+                assert skipped["onboarding"]["awaiting"] is None
+                handler.cancel_all()
+                await plan
+            finally:
+                unregister_handler(session_id)
+
 
 def _onboarding_engine(db) -> MagicMock:
     """An engine whose sessions are real rows and whose turns do nothing."""

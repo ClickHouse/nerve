@@ -90,6 +90,21 @@ export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' 
  * up with `nerve init` and a task description, in one session without a person.
  */
 export type SetupOnboardingKind = 'conversation' | 'autonomous';
+/**
+ * What the onboarding agent waits for in its conversation: an answer to its
+ * question (`AskUserQuestion`), or a decision on its setup proposal (the plan
+ * of `ExitPlanMode`).
+ */
+export type SetupOnboardingAwaiting = 'question' | 'plan';
+
+/** The onboarding at a glance; the Mode step's detail carries the same status, session and kind. */
+export interface SetupOnboardingState {
+  status: SetupOnboarding;
+  session_id: string | null;
+  kind: SetupOnboardingKind;
+  /** `null` unless `status` is `running` and the agent waits for the person. */
+  awaiting: SetupOnboardingAwaiting | null;
+}
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -342,6 +357,8 @@ export interface SetupState {
   steps_left: number;
   warning: string | null;
   steps: SetupStep[];
+  /** Absent from an older backend. */
+  onboarding?: SetupOnboardingState;
 }
 
 export interface RestartResponse {

@@ -243,7 +243,9 @@ def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: 
 # --- The onboarding conversation's prompt -----------------------------------
 
 # What the agent offers in its first message, in this order. A personal
-# install moves the personal-assistant item to the top.
+# install moves the personal-assistant item to the top. The list is offered
+# when the agent knows no work yet: no note, or a note with only rules or
+# only targets.
 ONBOARDING_OFFERS = (
     "Pick up an issue, fix the bug, open a PR, and follow it all the way to deployment",
     "Hunt down flaky CI tests and propose fixes",
@@ -256,72 +258,251 @@ ONBOARDING_OFFERS = (
     "Personal assistant: inbox triage, reminders, planning your week",
 )
 
+# The first message without a description: the person names the work.
+_FIRST_MESSAGE_OFFERS = """\
+## Your first message
+
+{greet}. In two or three sentences, say that you are set up by talking to \
+you, now and at any time later. Then offer this list, as it is, and ask which \
+items apply; they can choose more than one, or describe something else:
+
+{offers}
+
+Change nothing in this first message.
+"""
+
+# The first message with a description. A note that describes work gets no
+# menu: the work starts at once, explained before anything is asked. A note
+# that names no work (only rules, only targets) still gets the list.
+_FIRST_MESSAGE_DESCRIBED = """\
+## Your first message
+
+**When the note above describes work** (what to do, such as "review pull \
+requests in org/repo-a"), offer no menu. Write the message text first, before \
+any tool call:
+
+1. {greet}.
+2. Restate the work as you understand it, in one sentence.
+3. Say in one line what the explorer will study (step 1 below).
+4. In two to four lines, sketch how you intend to set this up (for example a \
+scan job that finds new pull requests, a review job gated on a tag, review \
+comments as drafts the person approves) and why the questions that follow \
+matter.
+
+Then start the explorer on the targets the note names, and ask your first \
+questions with `AskUserQuestion` (step 2 below). Targets the note leaves out \
+you ask for as step 1 says.
+
+**When the note names no work** (only rules, such as "never merge anything", \
+or only targets, such as "org/repo-a"), offer the list. {greet}, say in one \
+sentence what you noted, and in two or three sentences say that you are set \
+up by talking to you, now and at any time later. Then offer this list, as it \
+is, and ask which items apply; they can choose more than one, or describe \
+something else:
+
+{offers}
+
+Carry the note into the plan: its rules become hard rules and approval \
+boundaries, and its targets are what the explorer studies once the work is \
+known.
+"""
+
 _ONBOARDING_RULES = """\
 ## Rules
 
-- Speak to the person directly, in short messages. Ask only what you need, a \
-few questions at a time.
-- **Change nothing and start no real work before the person confirms the \
-setup you propose.** Until then you read, clone, study and ask; you do not \
-create cron jobs, skills, statuses, tasks or plans, and you do not edit \
-configuration files.
+- Speak to the person directly, in short messages.
+- **Change nothing and start no real work before the person approves your \
+proposal** (step 3). Until then you and the explorer read, clone, study and \
+ask. You do not create cron jobs, skills, statuses, tasks or Nerve plans \
+(`plan_propose`), you do not `memorize`, and you do not edit configuration \
+files; the one file you write is your plan file, in plan mode.
 - Use placeholders for anything you do not know; never invent a repository, \
 a channel, a person or a credential. Record where a credential lives, never \
 its value.
 - If the person wants to stop, say that they can come back to this \
 conversation at any time, or skip onboarding on the setup page.
+- A question card that times out (no answer within the hour) is no answer: \
+say in one line that you wait for the person and end your turn; ask again \
+when they write. A plan decision that times out is no answer either: even in \
+plan mode, say in one line that the proposal waits for them and end your \
+turn; when they write, call `ExitPlanMode` again instead of asking anything.
+- `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` may be deferred \
+tools: load them with `ToolSearch` before their first use. Only when a tool \
+this message names is not available even there, do that step without it: \
+study the targets yourself, ask in a message, and send the proposal as one \
+message with the plan's headings for the person to approve or change.
 """
 
-_CONVERSATION_STEPS = """\
-## How the conversation goes
+_FEATURE_RULES = """\
+## Nerve features: applied, not advertised
 
-### 1. Learn the work
+- Name a Nerve mechanism only as the answer to a need of this work, in a few \
+words: "the review job gates on tasks tagged `pr-review`, so it stays idle \
+when nothing waits".
+- After the first message, never list what you can do in general: no menu, \
+no feature tour. Pitch nothing that setup already configured (channels, \
+sources, quiet hours, memory) and nothing this work does not need.
+- Optional extras go only into the plan's last section, "Later, if you \
+want": at most three one-liners, and none of them an item of the first \
+message's list that the person saw and did not choose. Outside it, pitch \
+nothing.
+"""
 
-For each item the person chose:
+_EXPLORE_STEP = """\
+### 1. Explore in the background
 
-- Engineering work (issues and PRs, CI, performance, reviews, security and \
-dependency bumps): ask which repositories to onboard. Clone each one into the \
-workspace and study it: how to build and test it, its CI, its contribution and \
-review rules, its labels. Ask which account the agent uses on the code host, \
-and which actions need approval first.
-- Alerts and channels: ask which alert sources and which channels to read, \
-how often, and where to post results.
-- Research: ask about the topics, the sources and how often to report.
-- Personal assistant: ask which inboxes and calendars to read, quiet hours, \
-and how to send reminders.
+As soon as you know what the work needs studied (repositories, documentation \
+sites, data sources, alert sources, topics), start **one** explorer: an \
+`Agent` tool call with `run_in_background: true` and the brief below, with \
+the brackets and `<workspace>` filled in. Tell the person, in one line, what \
+it studies and that its progress shows on the agent line below the chat. \
+Start it on the targets you know, and ask for the ones still missing (which \
+repositories, which channels): in the question card, where the person can \
+type them under Other…, or in one plain message in a turn without a card.
 
-Ask about schedules and approval rules for every item.
+Do not study the same targets yourself. Nothing is studied twice: when the \
+person names more targets later, a second explorer studies only those. Skip \
+the explorer when there is nothing to clone or fetch (a personal assistant \
+for the inbox, reminders and planning). If the explorer fails or returns \
+partial findings, continue with what you have and say so in the plan; the \
+gap goes under What I need from you.
 
-### 2. Propose the setup, in one message
+```text
+Study [the targets] for a Nerve agent that will [the work items]. Only read: \
+write nothing but the clones under <workspace>/repos/; install no \
+dependencies, build nothing, and run no tests or linters. Ask the person \
+nothing: open questions go under Risks and missing access. Stop after about \
+ten minutes and report what you have.
 
-Name every change you would make:
+- Clone each repository into <workspace>/repos/<name>: `gh repo clone \
+<owner>/<name> <workspace>/repos/<name> -- --filter=blob:none` when `gh auth \
+status` succeeds, else `git clone --filter=blob:none` of its public URL. \
+Report what you could not access; do not guess.
+- Learn from the CI configuration, scripts and docs: how to build and test; \
+the CI system and its entry points, with CI's own run times where they are \
+visible (`gh run list`); the contribution, review and labelling rules \
+(CONTRIBUTING, PR templates, CODEOWNERS, bots); the volume of the work (open \
+PRs and issues, new ones per week, from `gh` when it works); where things \
+live (docs, scripts, package layout); the risks (private dependencies, \
+required credentials, a large repository or a monorepo).
+- For alerts, channels or research: each source's access mode (API, token, \
+read-only), its volume, and what a first result would look like.
 
-- **Cron jobs**: id, schedule, gate (`run_if`), session mode, and what each \
-run does. A scan job that finds new work runs on its schedule without a gate. \
-A job that works the queue gates on a `tasks` status and tag, so it stays idle \
-when there is no work.
-- **Built-in jobs**: which ones in `config/cron/system.yaml` you turn on or \
-off. The effective state of a built-in job is `system.yaml` with a job of the \
-same id in `config/cron/jobs.yaml` replacing it. Read both files before you \
-say what is on.
-- **The plan-and-approve loop**: whether the `task-planner` job proposes \
-plans that the person approves before an implementation session does the \
-work, or whether a work job has a standing grant for routine items.
-- **Task statuses**: the built-in ones are `backlog` (not ready; no built-in \
-job picks it up), `pending` (ready; the queue), `plan_review` (a plan waits \
-for a decision; `plan_propose` moves the task there and notifies the person), \
-`in_progress`, `done` and `deferred`. Add a status only for another kind of \
-wait, such as a PR in review.
-- **Task tags**: one tag for each kind of work, so that each job selects its \
-own tasks.
+Return a Findings report of at most 60 lines under these headings: \
+Repositories, Build and test, CI, Rules and conventions, Volume, Risks and \
+missing access, Suggested first task. Give each fact with its source path or \
+URL; "not found" is a valid finding.
+```
+"""
+
+_ASK_STEP = """\
+### 2. Ask in the foreground, while the explorer works
+
+Explain before you ask. In every turn that asks, write the text first and \
+call `AskUserQuestion` after it: a question card without text before it is a \
+mistake. The text says what you understood, what the explorer studies, how \
+you intend to set this up and why the questions matter. The questions go in \
+the card, and the text explains and asks none of them: until the turn ends, \
+the person can answer only the card.
+
+Ask only what neither the explorer nor setup can tell you, with \
+`AskUserQuestion`: one to four questions per call, each with two to four \
+concrete options, the recommended default first with "(recommended)" at the \
+end of its label. Each question carries its reason in one clause ("so the \
+review job knows how often to run"), and each option's description says what \
+choosing it leads to. At most two rounds. Typical questions:
+
+- the account you act as on the code host, and the git author to use;
+- the approval boundary; recommended: drafts the person approves for anything \
+public (review comments, issues, PRs), and on your own for reading, cloning \
+and local checks;
+- the cadence; recommended: every 30 minutes for PR review, hourly for issue \
+triage, daily for research;
+- where results go: this chat, a channel, or notifications only;
+- for a personal assistant: which of the connected inboxes and calendars to \
+read, and how reminders reach the person.
+
+Setup already recorded the mode, the person's name, the time zone and quiet \
+hours (`USER.md`, `config/settings.yaml`) and the connected channels and \
+sources (the configuration): read them, never ask.
+
+Do not check on the explorer or poll it: its findings reach you on their own \
+when it finishes. When the answers are in before the findings, say so in one \
+line and end your turn.
+"""
+
+# The plan's headings, in order. ``TASK.md`` is a worker's only.
+_PLAN_HEADINGS = (
+    "# Setup proposal — <the work, in one line>",
+    "## What I understood",
+    "## What I found",
+    "## TASK.md",
+    "## Jobs",
+    "## Statuses and tags",
+    "## Skills",
+    "## What I will remember",
+    "## What I need from you",
+    "## Approval boundaries",
+    "## Later, if you want",
+)
+
+_PLAN_STEP = """\
+### 3. Propose the setup as a plan
+
+Exploring and asking end before plan mode: first wait for the answers, and \
+for the explorer's Findings when one runs. Then call `EnterPlanMode`, write \
+the proposal to the plan file path that plan mode names, and call \
+`ExitPlanMode`. Plan mode's own reminder suggests Explore and Plan agents and \
+more questions: in plan mode start no further explorer and ask nothing more, \
+unless a gap in the findings blocks the proposal, and then say so in one \
+line. The plan is your proposal, and approving it is the person's one \
+decision. Use only these headings, in this order; plan mode's own plan format \
+(context, files, verification) does not apply here:
+
+```markdown
+{headings}
+```
+
+- **What I understood**: the work items, the targets, the person's answers.
+- **What I found**: the findings that shape the setup, with their sources.
+{task_md}\
+- **Jobs**: a table with id, schedule, gate (`run_if`), session mode and what \
+one run does. A scan job that finds new work runs on its schedule without a \
+gate; a job that works the queue gates on a `tasks` status and tag, so it \
+stays idle when there is no work. Add the built-in jobs you turn on or off: a \
+built-in job's state is `config/cron/system.yaml` with a job of the same id \
+in `config/cron/jobs.yaml` replacing it, so read both files first. Say \
+whether `task-planner` proposes plans that the person approves before an \
+implementation session does the work, or a work job has a standing grant for \
+routine items.
+- **Statuses and tags**: the built-in statuses are `backlog` (not ready; no \
+built-in job picks it up), `pending` (ready; the queue), `plan_review` (a plan \
+waits for a decision; `plan_propose` moves the task there and notifies the \
+person), `in_progress`, `done` and `deferred`. Add a status only for another \
+kind of wait, such as a PR in review. One tag for each kind of work, so that \
+each job selects its own tasks.
 - **Skills**: one for each procedure that runs repeatedly.
-- **Notes**: what you will save to memory.
+- **What I will remember**: what you will `memorize`.
+- **What I need from you**: access to grant, accounts to create, decisions \
+left open; each becomes a task.
+- **Approval boundaries**: what you do on your own, and what waits for the \
+person.
+- **Later, if you want**: optional; at most three one-liners.
 
-Then ask the person to confirm or to change the proposal.
+When the person asks for changes, `ExitPlanMode` comes back refused with their \
+words. Stay in plan mode, revise the plan file and call `ExitPlanMode` again, \
+as often as it takes; never ask what their words already answer. A change \
+request never widens what the person allowed earlier: when their words seem \
+to, keep the narrower choice and ask about it in one line.
+"""
 
-### 3. Apply what the person confirmed
+_PLAN_TASK_MD = "- **TASK.md**: the sections you will fill, in short.\n"
 
-Only after the confirmation, and only what they confirmed:
+_APPLY_STEPS = """\
+### 4. Apply what the person approved
+
+Only after the approval, and only what the plan says. Apply it yourself, in \
+this session, without teammates or sub-agents:
 
 - Add jobs to `<workspace>/config/cron/jobs.yaml` (Nerve's scheduler, not the \
 system crontab). Put a long prompt in `config/cron/prompts/<job>.md` and load \
@@ -344,31 +525,46 @@ jobs:
     prompt_file: prompts/work-queue.md
 ```
 
+- After editing `config/cron/jobs.yaml`, run `nerve reload` so this instance \
+loads the jobs. If the CLI does not find the instance, `nerve doctor` prints \
+its config directory; then run `nerve -c <that directory> reload`.
 - Create statuses with `task_status_create`, skills with `skill_create`, and \
 tasks with `task_create` for what only the person can do (access to grant, \
 accounts to create).
 - `memorize` what you learned about the work and what was decided.
 - When configuration changes arrive by pull request on this instance, use \
-`propose_config_change` instead of editing the files.
+`propose_config_change` instead of editing the files, and skip the reload.
 
-### 4. Summarize
+### 5. Summarize
 
 End with one message that lists every change: jobs (id, schedule, gate, on or \
 off), statuses, tags, skills, tasks with their ids, notes. Then give numbered \
 next steps for the person. Say that they can change the setup at any time by \
 asking you.
 
-### 5. Mark onboarding done
+### 6. Mark onboarding done
 
 After the summary, call `onboarding_done`. Until you call it, the web UI \
 shows a notice that sends the person back to this conversation.
 """
 
+
+def _conversation_steps(worker: bool) -> str:
+    """The steps after the first message, the same for both of its variants."""
+    headings = [h for h in _PLAN_HEADINGS if worker or h != "## TASK.md"]
+    plan = _PLAN_STEP.replace("{headings}", "\n".join(headings)).replace(
+        "{task_md}", _PLAN_TASK_MD if worker else "",
+    )
+    return "\n".join((
+        "## How the conversation goes\n", _EXPLORE_STEP, _ASK_STEP, plan, _APPLY_STEPS,
+    ))
+
+
 _WORKER_TASK_MD = """\
 ## TASK.md
 
 This agent is a worker. `<workspace>/TASK.md` (already in your system prompt) \
-is the worker template. Fill it as part of step 3:
+is the worker template. Fill it when you apply the setup (step 4):
 
 - Keep every `##` heading in its order. Under `## Task description (as \
 given)`, keep what the operator wrote at setup; when it is empty, write the \
@@ -391,53 +587,72 @@ you propose the setup.
 
 
 def onboarding_prompt(
-    mode: str, task_description: str = "", guide: str = "", *, memory_backend: str = "memu",
+    mode: str, task_description: str = "", guide: str = "", person_name: str = "",
+    *, memory_backend: str = "memu",
 ) -> str:
     """The hidden first message of the onboarding conversation.
 
     The person who opens the conversation does not see it; the agent's
     answer is the first message they see. ``mode`` is ``personal`` or
-    ``worker``. A worker's prompt adds the operator's description, if any,
-    the ``TASK.md`` rules and ``guide``, the worker guide in full
+    ``worker``. ``person_name`` is the display name of the person it is for,
+    so the agent greets them by name without reading a file (a worker has
+    no ``USER.md``); empty, the agent greets without a name. The first turn
+    begins with the visible message: no tool call precedes it.
+
+    The description of the work (a worker's note from the Mode step) decides
+    the first message: without one, the agent offers
+    :data:`ONBOARDING_OFFERS` and asks what to do; with one that describes
+    work, it explains first (restates the work, names what the explorer
+    studies, sketches the setup it intends), then starts a background explorer
+    and asks its first questions in the same turn. A note that names no work
+    (only rules or only targets) still gets the list, and the note carries
+    into the plan. The steps after it are shared: explore in the background
+    (read only), ask with ``AskUserQuestion`` after explaining, propose the
+    setup as a native plan (``EnterPlanMode`` … ``ExitPlanMode``), apply,
+    summarize, ``onboarding_done``.
+
+    A worker's prompt also carries its description (or a line that none was
+    given), the ``TASK.md`` rules and ``guide``, the worker guide in full
     (:func:`nerve.workspace.read_worker_guide`); when ``guide`` is empty, it
     points at the published copy. Under ``memory_backend`` ``loom`` the step
     that saves what was learned names Loom's tool
     (:data:`nerve.memory.loom_prompts.CONVERSATION_EDITS`).
     """
-    offers = list(ONBOARDING_OFFERS)
-    if mode != "worker":
-        offers.insert(0, offers.pop())
-    offer_lines = "\n".join(f"- {item}" for item in offers)
-    kind = "a worker for a team" if mode == "worker" else "a personal assistant"
+    worker = mode == "worker"
+    description = task_description.strip()
+    name = " ".join((person_name or "").split())[:80]
+    kind = "a worker for a team" if worker else "a personal assistant"
     parts = [
         "This is the **onboarding conversation** of this Nerve agent, which is "
         f"set up as {kind}. The person who set it up opens this chat. They do "
         "not see this message: your answer is the first message of the "
-        "conversation, so you speak first.\n\n"
-        "## Your first message\n\n"
-        "Greet the person (by name, if `USER.md` gives it). In two or three "
-        "sentences, say that you are set up by talking to you, now and at any "
-        "time later. Then offer this list, as it is, and ask which items apply; "
-        "they can choose more than one, or describe something else:\n\n"
-        f"{offer_lines}\n\n"
-        "Change nothing in this first message.",
-        _ONBOARDING_RULES,
-        _CONVERSATION_STEPS,
+        "conversation, so you speak first."
+        + (f" The person's name is {name}." if name else "")
+        + " Your first turn begins with the visible message: no tool call "
+        "precedes it, and everything that message needs is in your system "
+        "prompt and in this message.",
     ]
-    if mode == "worker":
+    if worker or description:
         quoted = "\n".join(
-            f"> {line}" if line.strip() else ">"
-            for line in task_description.strip().splitlines()
+            f"> {line}" if line.strip() else ">" for line in description.splitlines()
         ) or "> (no description was given at setup)"
+        who = "operator" if worker else "person"
+        parts.append(f"## What the {who} wrote at setup\n\n{quoted}")
+    offers = list(ONBOARDING_OFFERS)
+    if not worker:
+        offers.insert(0, offers.pop())
+    first = _FIRST_MESSAGE_DESCRIBED if description else _FIRST_MESSAGE_OFFERS
+    parts.append(
+        first.replace("{offers}", "\n".join(f"- {item}" for item in offers))
+        .replace("{greet}", "Greet the person by name" if name else "Greet the person without a name")
+    )
+    parts += [_ONBOARDING_RULES, _FEATURE_RULES, _conversation_steps(worker)]
+    if worker:
         body = guide.strip() or (
             "(The guide could not be read from this installation. Fetch it from "
             f"{WORKER_GUIDE_URL} and read it in full before you propose the setup.)"
         )
-        parts += [
-            f"## What the operator wrote at setup\n\n{quoted}",
-            _WORKER_TASK_MD,
-            f"---\n\n{body}\n\n---",
-        ]
+        parts += [_WORKER_TASK_MD, f"---\n\n{body}\n\n---"]
     prompt = "\n\n".join(part.strip() for part in parts)
     if memory_backend == "loom":
         prompt = loom_prompts.apply_edits(

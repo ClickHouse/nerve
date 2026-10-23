@@ -292,18 +292,72 @@ reasons are listed before you click. Then:
 After setup, the agent is set up by talking to it. Finish opens one web chat
 session titled **Onboarding** for the person who finished setup, and the agent
 speaks first: its first message is the answer to a hidden instruction, which
-the chat does not show. It says that it is set up by talking to it, offers what
-it can help with (fixing issues through to deployment, flaky CI tests,
-performance regressions, PR reviews, alerts, security notices and dependency
-bumps, channel summaries, research, and personal-assistant work, which a
-personal install lists first) and asks which apply. For engineering work it
-asks which repositories to onboard, clones and studies them, and asks only
-what it needs. Then it proposes the setup: cron jobs with their schedules and
-gates, whether to plan through `task-planner`, task statuses (the built-in
-`backlog` and `plan_review` and any extra waits), tags, skills and, for a
-worker, the `TASK.md` sections. It changes nothing before you confirm, then
-applies what you confirmed, summarizes every change and calls the
-`onboarding_done` tool.
+the chat does not show. What it says first depends on the worker's note from
+the Mode step:
+
+- **Without a note** (a personal install, or a worker without one) it says
+  that it is set up by talking to it, offers what it can help with (fixing
+  issues through to deployment, flaky CI tests, performance regressions, PR
+  reviews, alerts, security notices and dependency bumps, channel summaries,
+  research, and personal-assistant work, which a personal install lists
+  first) and asks which apply.
+- **With a note that describes the work** it offers no menu and starts on
+  the work in the same message. It explains before it asks: it greets you,
+  restates the work in one sentence, says what it studies and sketches the
+  setup it has in mind, and only then shows its first questions. A note with
+  only rules ("never merge anything") or only repositories gets the list
+  too, and the agent carries the note into its proposal.
+
+Then:
+
+1. **It explores in the background.** As soon as it knows what to study
+   (repositories, documentation, data or alert sources, topics), it starts
+   one explorer, a background sub-agent, and says in one line what it
+   studies; the explorer's progress shows on the agent line below the chat.
+   The explorer only reads. It clones repositories into
+   `<workspace>/repos/<name>` (with `gh` when it is signed in, else from the
+   public URL) and is told to write nothing else, install nothing, build
+   nothing and run no tests: it learns how to build and test from the CI
+   configuration, scripts and docs, works for about ten minutes and returns a
+   short findings report: how to build and test, CI, contribution and review
+   rules, the volume of the work, risks and missing access, a suggested first
+   task. If it fails or finds only part, the proposal says so. With nothing to
+   clone or fetch (a personal assistant for the inbox and reminders) there is
+   no explorer.
+2. **It asks in the foreground** while the explorer works, and only what
+   neither the explorer nor setup can tell. It explains first, then shows
+   question cards of up to four questions, each saying why it is asked, with
+   a few options that say what they lead to and its recommendation first, in
+   at most two rounds; **Other…** lets you answer in your own words. Typical
+   questions: the account it acts as on the code host, what waits for your
+   approval (its recommendation: drafts you approve for anything public, on
+   its own for reading, cloning and local checks), how often to look for new
+   work, and where results go. It never asks what setup recorded: the mode,
+   your name, time zone and quiet hours, the connected channels and sources.
+3. **It proposes the setup as a plan** once the findings and your answers
+   are in, in Claude Code's plan mode. The plan has fixed headings: what it
+   understood, what it found, the `TASK.md` sections (a worker), the cron
+   jobs (schedule, gate, session mode and what one run does, plus the
+   built-in jobs it turns on or off, such as whether `task-planner` plans
+   through the approval loop), task statuses and tags (the built-in
+   `backlog` and `plan_review` and any extra waits), skills, what it will
+   remember, what it needs from you, the approval boundaries, and at most
+   three optional extras under "Later, if you want". Nerve features appear
+   only where this work needs them. The chat shows the plan in a decision
+   card: **Apply setup**; **Change something…** with what should change, and
+   the agent revises the plan and asks again, as often as it takes, without
+   asking what you already wrote (a change request never widens what you
+   allowed earlier: when it seems to, the agent keeps the narrower choice and
+   asks); or **Edit** to change the plan text yourself and **Apply edited
+   plan**, which tells the agent the setup was approved with your edits.
+4. **It applies what you approved**: cron jobs in `config/cron/jobs.yaml`
+   (then `nerve reload`, so the instance loads them; on an instance whose
+   configuration arrives by pull request, it proposes the change instead),
+   statuses, skills, tasks for what only you can do, notes in memory and,
+   for a worker, the `TASK.md` sections. It is instructed to change nothing
+   before you approve; the runtime does not enforce that (plan mode does not
+   block file writes here). Then it summarizes every change with numbered
+   next steps and calls the `onboarding_done` tool.
 
 The state is one row in `nerve.db` (`onboarding`): pending, running (with the
 session id), done or skipped, and the kind: the conversation, or the
@@ -318,7 +372,10 @@ onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits
-  for you, with **Continue**; its close button hides it until the next page.
+  for you, with **Continue**. While the agent waits for an answer it says
+  what for: "Your agent has a question for you" with **Answer**, or "Your
+  agent proposed a setup" with **Review** (`onboarding.awaiting` in
+  `GET /api/setup`). Its close button hides it until the next page.
   When setup is complete and the conversation has not started (nobody pressed
   Finish, or an install from before), the banner offers **Start**, which does
   what Finish does and opens the conversation. Every signed-in person sees

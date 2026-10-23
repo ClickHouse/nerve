@@ -110,6 +110,14 @@ ONBOARDING_EDITS: tuple[tuple[str, str], ...] = (
 # the memU sentence, then its Loom wording.
 CONVERSATION_EDITS: tuple[tuple[str, str], ...] = (
     (
+        "you do not `memorize`, and you do not edit configuration",
+        "you do not save to Loom, and you do not edit configuration",
+    ),
+    (
+        "- **What I will remember**: what you will `memorize`.",
+        "- **What I will remember**: what you will save to Loom (`loom_memory_set`).",
+    ),
+    (
         "- `memorize` what you learned about the work and what was decided.",
         (
             "- Save to Loom what you learned about the work and what was decided, "
