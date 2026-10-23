@@ -17,6 +17,15 @@ class Source(abc.ABC):
 
     source_name: str = ""
 
+    # True for a source that reads a buffer another component fills as records
+    # arrive and that the cron service runs as soon as they do: the hosted
+    # sources. A scheduled run of such a source is a fallback that normally
+    # finds nothing, so the cron schedule does not count it as work the
+    # instance will start on its own, and a platform that parks the machine
+    # is not told to wake it for the run. A source whose buffer is drained
+    # only on its schedule, like the channel drains, keeps the default.
+    push_fed: bool = False
+
     @abc.abstractmethod
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
         """Fetch new records since cursor.

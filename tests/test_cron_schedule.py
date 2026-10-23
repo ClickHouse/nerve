@@ -29,6 +29,9 @@ from nerve.cron.gates import (
 )
 from nerve.cron.jobs import CronJob
 from nerve.cron.service import CronService, ScheduledTick
+from nerve.sources.channel import ChannelSource
+from nerve.sources.github import GitHubSource
+from nerve.sources.github_hosted import HostedGitHubSource
 from nerve.sources.models import IngestResult, SourceRecord
 from tests.actor_rows import mock_system_principal
 
@@ -370,6 +373,51 @@ async def test_a_source_runner_counts(held):
     assert tick == ScheduledTick(
         at=now + timedelta(minutes=5), name="source:mail", kind="source",
     )
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_runs_on_delivery_never_counts(held):
+    """The hosted GitHub source reads a buffer that fills when records are
+    delivered, and it runs then. Its scheduled run is a fallback, so it is not
+    the next scheduled task, and a platform that parks the machine is not told
+    to wake it for that run."""
+    now = datetime.now(UTC)
+    drain = _runner("github")
+    drain.source.push_fed = True
+    svc = await held([_job("digest")], [_runner("mail"), drain])
+    _due(svc, "digest", now + timedelta(minutes=30))
+    _due(svc, "source:mail", now + timedelta(minutes=10))
+    _due(svc, "source:github", now + timedelta(minutes=5))
+
+    tick = await svc.next_scheduled(now=now)
+
+    assert tick == ScheduledTick(
+        at=now + timedelta(minutes=10), name="source:mail", kind="source",
+    )
+    by_id = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert by_id["source:github"]["forecast"] == "skip"
+    assert by_id["source:github"]["reason"] == cron_service._PUSH_FED_REASON
+    assert by_id["source:github"]["next_run"] == (now + timedelta(minutes=5)).isoformat()
+    assert by_id["source:mail"]["forecast"] == "run"
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_runs_on_delivery_alone_schedules_nothing(held):
+    now = datetime.now(UTC)
+    drain = _runner("github")
+    drain.source.push_fed = True
+    svc = await held([], [drain])
+    _due(svc, "source:github", now + timedelta(minutes=5))
+
+    assert await svc.next_scheduled(now=now) is None
+
+
+@pytest.mark.parametrize(
+    ("source", "fed"),
+    [(HostedGitHubSource, True), (ChannelSource, False), (GitHubSource, False)],
+)
+def test_the_sources_say_whether_deliveries_feed_them(source, fed):
+    assert source.push_fed is fed
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,11 @@ class _Forecast:
     runs_at: datetime | None = None
 
 
+# The forecast reason of a source runner whose source runs when records are
+# delivered (``Source.push_fed``): its scheduled run is a fallback.
+_PUSH_FED_REASON = "the source runs when records are delivered; the scheduled run is a fallback"
+
+
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
 # /loop command, so resolve them to a plain continuation instruction.
 _WAKEUP_SENTINELS = {"<<autonomous-loop>>", "<<autonomous-loop-dynamic>>"}
@@ -2425,10 +2430,12 @@ class CronService:
         gates forecast to happen (judged from what is known now, see
         :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
         is forecast to skip, one of its next few runs (see
-        :meth:`_forecast_job`); the next run of each source runner; the
-        earliest pending session wakeup. Cleanup and the wakeup sweep are
-        housekeeping and never count. ``None`` when nothing falls within
-        *horizon* of *now* (default: the current time), which must be
+        :meth:`_forecast_job`); the next run of each source runner, except
+        one whose source runs when records are delivered (``Source.push_fed``),
+        whose scheduled run is a fallback; the earliest pending session
+        wakeup. Cleanup and the wakeup sweep are housekeeping and never
+        count. ``None`` when nothing falls within *horizon* of *now*
+        (default: the current time), which must be
         timezone-aware: a naive *now* raises ``ValueError``.
 
         The tick can lie before *now*: a session wakeup that came due but has
@@ -2486,9 +2493,18 @@ class CronService:
         for sched_job in self.scheduler.get_jobs():
             next_run = getattr(sched_job, "next_run_time", None)
             if sched_job.func == self._run_source_wrapper:
-                forecasts[sched_job.id] = _Forecast(
-                    "source", next_run, runs=True, runs_at=next_run,
-                )
+                runner = sched_job.args[0]
+                if getattr(runner.source, "push_fed", False) is True:
+                    # The source runs when records are delivered, and its
+                    # scheduled run is a fallback that normally finds nothing,
+                    # so it is not work the instance will start on its own.
+                    forecasts[sched_job.id] = _Forecast(
+                        "source", next_run, runs=False, reason=_PUSH_FED_REASON,
+                    )
+                else:
+                    forecasts[sched_job.id] = _Forecast(
+                        "source", next_run, runs=True, runs_at=next_run,
+                    )
             elif sched_job.func == self._run_job_wrapper:
                 forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
         return forecasts

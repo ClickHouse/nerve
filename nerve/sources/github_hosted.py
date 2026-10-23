@@ -52,6 +52,7 @@ class HostedGitHubSource(Source):
     """The GitHub source over the hosted records buffer."""
 
     source_name = SOURCE_NAME
+    push_fed = True
 
     def __init__(self, db: Database):
         self._db = db
