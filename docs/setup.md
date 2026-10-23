@@ -308,6 +308,23 @@ the Mode step:
   only rules ("never merge anything") or only repositories gets the list
   too, and the agent carries the note into its proposal.
 
+The agent runs no tool before its first message, so the hidden instruction
+also gives it what Nerve knows about the instance when the conversation
+opens: the mode and the workspace (cloned repositories go to
+`<workspace>/repos/`), whether configuration arrives by pull request, the
+model and memory, and each connection, with what is configured and where it
+comes from (a file on this machine, the environment, the configuration
+repository, or the platform): the GitHub token, the GitHub CLI's login when
+`gh auth status` says it is authenticated, the GitHub sync source and its
+repositories, Slack (in hosted mode, with the platform gateway's status),
+Telegram and Gmail, and the time zone and quiet hours. It never includes a
+secret. The agent takes these as facts: it does not ask about them or check
+them again before its first message, and it asks only about what is marked
+unknown. When the GitHub login is known, it recommends acting as that account
+and asks you only to confirm it or name another, and the explorer is told the
+same access. Reading the facts adds a moment to Finish: `gh auth status`,
+eight seconds at most.
+
 Then:
 
 1. **It explores in the background.** As soon as it knows what to study

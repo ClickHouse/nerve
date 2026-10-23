@@ -307,6 +307,20 @@ boundaries, and its targets are what the explorer studies once the work is \
 known.
 """
 
+# Follows the facts Nerve gathered about the instance
+# (:mod:`nerve.onboarding_environment`): the first turn may not call a tool
+# before its message, so the agent must not ask what Nerve already knows.
+_ENVIRONMENT_RULES = """\
+These lines are facts: Nerve read them when this conversation opened. Never \
+ask the person about them, and never check them again with a tool before your \
+first message. A line that says unknown is yours to ask about, or for the \
+explorer to find out.
+
+The account on the code host: when a line above names a GitHub login, offer \
+it as the recommended option ("act as `<login>` (recommended)") and ask only \
+to confirm it or to name another. Never ask which account as an open question.
+"""
+
 _ONBOARDING_RULES = """\
 ## Rules
 
@@ -374,7 +388,7 @@ dependencies, build nothing, and run no tests or linters. Ask the person \
 nothing: open questions go under Risks and missing access. Stop after about \
 ten minutes and report what you have.
 
-- Clone each repository into <workspace>/repos/<name>: `gh repo clone \
+{access}- Clone each repository into <workspace>/repos/<name>: `gh repo clone \
 <owner>/<name> <workspace>/repos/<name> -- --filter=blob:none` when `gh auth \
 status` succeeds, else `git clone --filter=blob:none` of its public URL. \
 Report what you could not access; do not guess.
@@ -549,14 +563,19 @@ shows a notice that sends the person back to this conversation.
 """
 
 
-def _conversation_steps(worker: bool) -> str:
-    """The steps after the first message, the same for both of its variants."""
+def _conversation_steps(worker: bool, github_access: str = "") -> str:
+    """The steps after the first message, the same for both of its variants.
+
+    ``github_access`` is the explorer brief's line on how it reaches GitHub
+    (:attr:`nerve.onboarding_environment.InstanceFacts.github_access`).
+    """
     headings = [h for h in _PLAN_HEADINGS if worker or h != "## TASK.md"]
     plan = _PLAN_STEP.replace("{headings}", "\n".join(headings)).replace(
         "{task_md}", _PLAN_TASK_MD if worker else "",
     )
+    explore = _EXPLORE_STEP.replace("{access}", f"{github_access}\n\n" if github_access else "")
     return "\n".join((
-        "## How the conversation goes\n", _EXPLORE_STEP, _ASK_STEP, plan, _APPLY_STEPS,
+        "## How the conversation goes\n", explore, _ASK_STEP, plan, _APPLY_STEPS,
     ))
 
 
@@ -588,7 +607,8 @@ you propose the setup.
 
 def onboarding_prompt(
     mode: str, task_description: str = "", guide: str = "", person_name: str = "",
-    *, memory_backend: str = "memu",
+    *, environment: str = "", github_access: str = "",
+    memory_backend: str = "memu",
 ) -> str:
     """The hidden first message of the onboarding conversation.
 
@@ -598,6 +618,15 @@ def onboarding_prompt(
     so the agent greets them by name without reading a file (a worker has
     no ``USER.md``); empty, the agent greets without a name. The first turn
     begins with the visible message: no tool call precedes it.
+
+    ``environment`` is the ``## This instance`` section of
+    :func:`nerve.onboarding_environment.gather`: what is configured and from
+    where, the GitHub login when the CLI is authenticated. It follows the
+    note (before the first message), with the rules that make its lines
+    facts: never asked about, never checked again before the first message,
+    a known login offered as the recommended account. ``github_access`` is
+    that build's line for the explorer's brief; both are ignored without
+    ``environment``.
 
     The description of the work (a worker's note from the Mode step) decides
     the first message: without one, the agent offers
@@ -638,6 +667,9 @@ def onboarding_prompt(
         ) or "> (no description was given at setup)"
         who = "operator" if worker else "person"
         parts.append(f"## What the {who} wrote at setup\n\n{quoted}")
+    facts = environment.strip()
+    if facts:
+        parts.append(f"{facts}\n\n{_ENVIRONMENT_RULES}")
     offers = list(ONBOARDING_OFFERS)
     if not worker:
         offers.insert(0, offers.pop())
@@ -646,7 +678,8 @@ def onboarding_prompt(
         first.replace("{offers}", "\n".join(f"- {item}" for item in offers))
         .replace("{greet}", "Greet the person by name" if name else "Greet the person without a name")
     )
-    parts += [_ONBOARDING_RULES, _FEATURE_RULES, _conversation_steps(worker)]
+    access = " ".join(github_access.split()) if facts else ""
+    parts += [_ONBOARDING_RULES, _FEATURE_RULES, _conversation_steps(worker, access)]
     if worker:
         body = guide.strip() or (
             "(The guide could not be read from this installation. Fetch it from "
