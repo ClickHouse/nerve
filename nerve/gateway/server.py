@@ -30,6 +30,7 @@ from nerve.agent.engine import AgentEngine
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
+from nerve.db.base import check_database_file
 from nerve.gateway.auth import (
     ACTOR_CONTEXT_HEADER,
     AUTH_MODE_EXTERNAL,
@@ -1497,6 +1498,12 @@ def create_app() -> FastAPI:
     # a restart to know when the *new* process is answering.
     from nerve import boot as _boot
 
+    # The git commit of the running code, read once here at startup. It is
+    # cached, so the signed-in diagnostics and the backup manifest name the
+    # code this process loaded, even after a later ``git pull``, and no
+    # request waits on git. /health answers anyone and does not report it.
+    _boot.source_commit()
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "version": "0.1.0", "generation": _boot.boot_id()}
@@ -1709,11 +1716,21 @@ def uvicorn_log_config() -> dict[str, Any]:
 
 
 def run_server(config: NerveConfig | None = None) -> None:
-    """Run the Nerve server with uvicorn."""
+    """Run the Nerve server with uvicorn.
+
+    Raises :class:`SchemaNewerThanCodeError` before uvicorn starts when the
+    database is newer than this code. The lifespan would refuse it as well,
+    but uvicorn reports a failed lifespan as a traceback and exit status 3.
+    Raised here, the CLI prints one line and exits with
+    ``NEWER_SCHEMA_EXIT_CODE``. State files that other users can write to are
+    not read here; the lifespan's open refuses them.
+    """
     import uvicorn
 
     if config is None:
         config = get_config()
+
+    asyncio.run(check_database_file(paths.db_path()))
 
     ssl_config = {}
     if config.gateway.ssl.enabled:

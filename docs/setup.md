@@ -864,6 +864,7 @@ Environment=PATH=/home/YOUR_USER/nerve/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/YOUR_USER/nerve/.venv/bin/nerve start --foreground
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=65
 
 [Install]
 WantedBy=multi-user.target
@@ -871,7 +872,10 @@ WantedBy=multi-user.target
 
 Note: Use `--foreground` with systemd since it manages the process lifecycle.
 If you set up the instance with `nerve init` first, stop the daemon it
-started (`nerve stop`) before enabling the unit.
+started (`nerve stop`) before enabling the unit. `RestartPreventExitStatus=65`
+keeps systemd from restarting a Nerve that refused a database newer than its
+code, where every restart would refuse again (see
+[Going back to an older Nerve](#going-back-to-an-older-nerve)).
 
 ```bash
 sudo systemctl daemon-reload
@@ -939,9 +943,20 @@ Subsequent `nerve upgrade` runs install from the lock automatically.
 
 Going back to an older Nerve after an upgrade is refused by default: the
 database schema is then newer than the code, and older code on a newer schema
-fails quietly later rather than loudly at start. Restore the backup taken
-before the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start
-anyway and accept that risk.
+fails quietly later rather than loudly at start. The check covers each
+migration track on its own, so a Nerve without a fork's migrations also
+refuses a database that fork migrated (see
+[Migrations](architecture.md#migrations)). The refusal is one line, naming the
+track and both versions. `nerve start --foreground`, which is what a
+supervisor runs, and every command that opens the database then exit with
+status 65. A supervisor can key on it, for example with systemd's
+`RestartPreventExitStatus=65`, as in the unit above. The daemonizing
+`nerve start` does not pass the status on: it checks the process it started
+once, a second later, and only if that process has exited by then does it
+print `Nerve failed to start (exit code 65)` and exit with status 1. The
+refusal line is in the log file either way. Restore the backup taken before
+the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start anyway and
+accept that risk.
 
 ### Changing a dependency
 

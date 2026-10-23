@@ -51,7 +51,6 @@ import shutil
 import socket
 import sqlite3
 import stat
-import subprocess
 import tarfile
 import tempfile
 from contextlib import contextmanager
@@ -62,7 +61,7 @@ from typing import IO, Callable, Iterator
 
 import yaml
 
-from nerve import pidfile
+from nerve import boot, pidfile
 
 logger = logging.getLogger(__name__)
 
@@ -268,26 +267,6 @@ def _nerve_version() -> str:
         return version("nerve")
     except Exception:
         return "unknown"
-
-
-def _git_sha() -> str:
-    """Best-effort git SHA of the installed source checkout."""
-    try:
-        source_root = Path(__file__).resolve().parent.parent
-        if not (source_root / ".git").exists():
-            return ""
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=source_root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode == 0:
-            return out.stdout.strip()
-    except Exception:
-        pass
-    return ""
 
 
 def _unique_bundle_path(
@@ -817,12 +796,16 @@ def _secure_install_db(src: Path, dst: Path) -> None:
     )
 
 
-def _db_schema_version(db_path: Path) -> int:
-    """Read the persisted schema version from a nerve.db (0 if absent)."""
+def _db_schema_version(db_path: Path, table: str = "schema_version") -> int:
+    """Read the persisted schema version from a nerve.db (0 if absent).
+
+    ``table`` picks the migration track: ``schema_version`` or
+    ``fork_schema_version``.
+    """
     try:
         conn = _connect(db_path)
         try:
-            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            row = conn.execute(f"SELECT MAX(version) FROM {table}").fetchone()
             return int(row[0]) if row and row[0] is not None else 0
         finally:
             conn.close()
@@ -1171,8 +1154,11 @@ def create_backup(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "host": host,
             "nerve_version": _nerve_version(),
-            "git_sha": _git_sha(),
+            "git_sha": boot.source_commit(),
             "schema_version": _db_schema_version(state_dir / "nerve.db"),
+            "fork_schema_version": _db_schema_version(
+                state_dir / "nerve.db", "fork_schema_version",
+            ),
             "code_schema_version": _code_schema_version(),
             "compression": compression,
             "flags": {
@@ -1274,12 +1260,13 @@ def create_backup(
         os.close(stage_fd)
 
 
-def _code_schema_version() -> int:
-    """Current migration-head schema version of this codebase."""
+def _code_schema_version(*, fork: bool = False) -> int:
+    """Current migration-head schema version of this codebase (the fork
+    track's with ``fork=True``)."""
     try:
-        from nerve.db import SCHEMA_VERSION
+        from nerve.db import FORK_SCHEMA_VERSION, SCHEMA_VERSION
 
-        return int(SCHEMA_VERSION)
+        return int(FORK_SCHEMA_VERSION if fork else SCHEMA_VERSION)
     except Exception:
         return 0
 
@@ -1366,14 +1353,20 @@ def verify_bundle(path: Path, extract_to: Path | None = None) -> VerifyReport:
                 errors.append(f"cannot open {db_name}: {e}")
 
         # Schema guard — restoring a newer-schema bundle onto older code
-        # would break at startup; flag it here.
-        bundle_schema = int(manifest.get("schema_version", 0) or 0)
-        code_schema = _code_schema_version()
-        if bundle_schema > code_schema:
-            errors.append(
-                f"bundle schema v{bundle_schema} is newer than this code "
-                f"(v{code_schema}) — upgrade Nerve before restoring"
-            )
+        # would break at startup; flag it here, once per migration track. A
+        # bundle from before the fork track has no fork version: 0.
+        for label, key, code_schema, remedy in (
+            ("schema", "schema_version", _code_schema_version(),
+             "upgrade Nerve before restoring"),
+            ("fork schema", "fork_schema_version", _code_schema_version(fork=True),
+             "restore it with a Nerve that ships those fork migrations"),
+        ):
+            bundle_schema = int(manifest.get(key, 0) or 0)
+            if bundle_schema > code_schema:
+                errors.append(
+                    f"bundle {label} v{bundle_schema} is newer than this code "
+                    f"(v{code_schema}) — {remedy}"
+                )
 
         ok = not errors
         return VerifyReport(

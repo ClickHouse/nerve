@@ -8,7 +8,8 @@ contracts those files pin stay untouched:
 * the Claude backend exports ``CLAUDE_CODE_OAUTH_TOKEN`` when no API key is set;
 * ``TelegramChannel.bot_username`` / ``allowed_users``, and ``/pair`` marks
   its own append as applied;
-* the gateway: ``/health`` carries ``generation``, ``/setup`` is served
+* the gateway: ``/health`` carries ``generation`` and no commit (only the
+  signed-in diagnostics name the build), ``/setup`` is served
   without a built UI, the startup snapshot is taken, a Telegram channel
   whose ``start()`` raises never takes the gateway down and its token never
   reaches the log or the state file, the startup notice is skipped when
@@ -421,6 +422,63 @@ class TestHealthAndFallbackPage:
             body = (await http.get("/health")).json()
         assert body["status"] == "ok"
         assert body["generation"] == boot.boot_id() and len(body["generation"]) == 16
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("commit", ["9f2c4e1a7b3d5f60812c4e6a8b0d2f4618a3c5e7", ""])
+    async def test_only_the_signed_in_diagnostics_name_the_running_commit(
+        self, tmp_path, monkeypatch, db, bypass_auth, commit,
+    ):
+        """``/health`` answers anyone, so it does not say which build runs. The
+        diagnostics do, from the commit read at startup."""
+        from nerve.gateway import server
+        from nerve.gateway.routes import _deps as deps_module
+
+        reads: list[str] = []
+
+        def source_commit() -> str:
+            reads.append(commit)
+            return commit
+
+        monkeypatch.setattr(boot, "source_commit", source_commit)
+        monkeypatch.setattr(
+            deps_module, "_deps", deps_module.RouteDeps(engine=SimpleNamespace(), db=db),
+        )
+        config = NerveConfig()
+        config.workspace = tmp_path / "ws"
+        config.workspace.mkdir()
+        set_config(config)
+        monkeypatch.setattr(server, "lifespan", _no_lifespan)
+        try:
+            app = bypass_auth(server.create_app())
+            assert reads == [commit], "read at startup"
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://nerve-test") as http:
+                health = (await http.get("/health")).json()
+                system = (await http.get("/api/diagnostics")).json()["system"]
+        finally:
+            set_config(NerveConfig())
+
+        assert health == {"status": "ok", "version": "0.1.0", "generation": boot.boot_id()}
+        assert system["commit"] == (commit or None)
+
+    def test_source_commit_is_the_checkout_head(self):
+        import shutil
+        import subprocess
+
+        root = Path(boot.__file__).resolve().parent.parent
+        if not (root / ".git").exists() or not shutil.which("git"):
+            pytest.skip("not running from a git checkout")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True,
+            check=True,
+        ).stdout.strip()
+        assert boot.source_commit.__wrapped__() == head
+
+    def test_source_commit_is_empty_when_git_cannot_say(self, monkeypatch):
+        def no_git(*args, **kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(boot.subprocess, "run", no_git)
+        assert boot.source_commit.__wrapped__() == ""
 
     @pytest.mark.asyncio
     async def test_setup_is_served_without_a_built_ui(self, app):
