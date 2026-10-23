@@ -1,20 +1,42 @@
-import { useState } from 'react';
-import { Button, Modal, TextArea, TextField } from '../ui';
+import { useEffect, useState } from 'react';
+import { useTaskStatusStore, type TaskStatusDef } from '../../stores/taskStatusStore';
+import { Button, Modal, Select, TextArea, TextField } from '../ui';
 
 const FORM_ID = 'task-create-form';
 
-export function TaskCreateDialog({ onClose, onCreate }: {
+// A new task from the UI waits in the backlog unless the user picks another
+// status. The agent's `task_create` keeps `pending` as its default.
+const DEFAULT_STATUS = 'backlog';
+const FALLBACK_STATUS = 'pending';
+
+function labelOf(statuses: TaskStatusDef[], name: string): string {
+  return statuses.find((s) => s.name === name)?.label ?? name;
+}
+
+export function TaskCreateDialog({ onClose, onCreate, initialStatus }: {
   onClose: () => void;
-  onCreate: (title: string, content: string, deadline: string) => void;
+  onCreate: (title: string, content: string, deadline: string, status: string) => void;
+  /** The status of the board column that opened the dialog, if any. */
+  initialStatus?: string | null;
 }) {
+  const statuses = useTaskStatusStore((s) => s.statuses);
+  const loadStatuses = useTaskStatusStore((s) => s.load);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [deadline, setDeadline] = useState('');
+  // Null until the user picks one, so the default follows the statuses
+  // that arrive after the dialog opens.
+  const [picked, setPicked] = useState<string | null>(initialStatus ?? null);
+
+  useEffect(() => { void loadStatuses(); }, [loadStatuses]);
+
+  const hasBacklog = statuses.some((s) => s.name === DEFAULT_STATUS);
+  const status = picked ?? (hasBacklog ? DEFAULT_STATUS : FALLBACK_STATUS);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
-    onCreate(title.trim(), content.trim(), deadline);
+    onCreate(title.trim(), content.trim(), deadline, status);
   };
 
   return (
@@ -59,6 +81,21 @@ export function TaskCreateDialog({ onClose, onCreate }: {
             onChange={e => setContent(e.target.value)}
             rows={4}
           />
+        </div>
+        <div>
+          <label htmlFor="task-create-status" className="block text-xs text-text-muted mb-1">
+            Status
+          </label>
+          <Select
+            id="task-create-status"
+            value={status}
+            onChange={(e) => setPicked(e.target.value)}
+            options={statuses.map((s) => ({ value: s.name, label: s.label }))}
+          />
+          <p className="mt-1 text-xs text-text-faint">
+            The agent can pick up tasks in {labelOf(statuses, FALLBACK_STATUS)}.
+            {hasBacklog && ` Tasks in ${labelOf(statuses, DEFAULT_STATUS)} wait until you move them.`}
+          </p>
         </div>
         <div>
           <label className="block text-xs text-text-muted mb-1">Deadline</label>

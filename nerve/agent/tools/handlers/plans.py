@@ -5,6 +5,10 @@ plan_approve, plan_decline, plan_revise.
 session (via ``ctx.session_id``), which is how plan_service.py routes
 revisions back to the proposer. Cross-domain calls into task handlers
 are direct function imports (per design decision); no registry round-trip.
+
+Each pending plan that ``plan_propose`` or ``plan_update`` writes also moves
+its task to ``plan_review`` (see :func:`_move_to_plan_review`) and sends one
+notification that names the plan and the task (see :func:`_notify_plan_ready`).
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 
+from nerve.agent.plan_service import plan_link
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     PLAN_APPROVE_SCHEMA,
@@ -27,6 +32,8 @@ from nerve.agent.tools.schemas import (
 # handlers without going through the registry. This is the chosen pattern
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
 from nerve.agent.tools.handlers.tasks import task_update_handler
+from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
+from nerve.tasks.escalation import _is_quiet_hour
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,65 @@ logger = logging.getLogger(__name__)
 _NO_LONGER_PENDING = (
     "Plan {plan_id} is no longer pending; another decision was made first."
 )
+
+
+async def _move_to_plan_review(ctx: ToolContext, task_id: str) -> bool:
+    """Move the task to ``plan_review`` if its status is in ``PLAN_REVIEW_FROM``.
+
+    A task in a custom status stays there. The write names the revision that
+    was read, so a status that another writer set in the meantime stays too.
+    Returns True when the task moved.
+    """
+    task = await ctx.db.get_task(task_id)
+    if not task or task.get("status") not in PLAN_REVIEW_FROM:
+        return False
+    result = await task_update_handler(ctx, {
+        "task_id": task_id,
+        "status": PLAN_REVIEW_STATUS,
+        "expect_revision": task["revision"],
+    })
+    return not result.is_error
+
+
+async def _notify_plan_ready(
+    ctx: ToolContext, task: dict, plan_id: str, version: int,
+) -> bool:
+    """Tell the user that a plan waits for review. Returns True when sent.
+
+    The notification stores the plan id and the task id, so the web UI and
+    Telegram can open the plan from it. It replaces the task's earlier plan
+    notifications, and it makes no sound during quiet hours.
+    """
+    if not ctx.notification_service:
+        return False
+    try:
+        await ctx.db.dismiss_plan_notifications(task["id"], attribution=ctx.attribution)
+        service = ctx.notification_service
+        await service.send_notification(
+            session_id=ctx.session_id,
+            title=f"Plan ready for review: {task['title']}",
+            body=f"Version {version} of plan {plan_id} waits for your decision.",
+            priority="high",
+            silent=_is_quiet_hour(service.config),
+            metadata={"plan_id": plan_id, "task_id": task["id"]},
+        )
+    except Exception:
+        logger.exception("Could not send the notification for plan %s", plan_id)
+        return False
+    return True
+
+
+def _review_summary(moved: bool, notified: bool) -> str:
+    """The lines of a plan tool result that say what else happened."""
+    lines = []
+    if moved:
+        lines.append(f"Task moved to {PLAN_REVIEW_STATUS}.")
+    if notified:
+        lines.append(
+            "The user got a notification with a link to the plan. "
+            "Do not send another notification about this plan."
+        )
+    return "\n".join(lines)
 
 
 async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -89,15 +155,16 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         attribution=ctx.attribution,
     )
 
-    # Note on the task
+    moved = await _move_to_plan_review(ctx, task_id)
     await task_update_handler(ctx, {
         "task_id": task_id,
-        "note": f"Plan proposed: {plan_id} (v{version})",
+        "note": f"Plan proposed: {plan_link(plan_id)} (v{version})",
     })
+    notified = await _notify_plan_ready(ctx, task, plan_id, version)
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review."
+        "Awaiting human review.\n" + _review_summary(moved, notified)
     )
 
 
@@ -150,17 +217,19 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         attribution=ctx.attribution,
     )
 
-    note = f"Plan updated: {plan_id} → {new_plan_id} (v{new_version})"
+    task_id = old_plan["task_id"]
+    note = f"Plan updated: {plan_link(plan_id)} → {plan_link(new_plan_id)} (v{new_version})"
     if feedback:
-        note += f" — {feedback}"
-    await task_update_handler(ctx, {
-        "task_id": old_plan["task_id"],
-        "note": note,
-    })
+        note += f": {feedback}"
+    moved = await _move_to_plan_review(ctx, task_id)
+    await task_update_handler(ctx, {"task_id": task_id, "note": note})
+    task = await ctx.db.get_task(task_id)
+    notified = bool(task) and await _notify_plan_ready(ctx, task, new_plan_id, new_version)
 
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
-        "The new version is pending review."
+        "The new version is pending review.\n"
+        + _review_summary(moved, notified)
     )
 
 

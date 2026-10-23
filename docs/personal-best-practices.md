@@ -161,12 +161,12 @@ Tool calls first, the message last. Make turn-ending calls (`memorize`, `Schedul
 |---|---|---|
 | Payment failure, security alert, deadline today | `notify` | `urgent` |
 | Review requested from the human, approaching deadline | `notify` | `high` |
-| Task created, plan proposed, job finished | `notify` | `normal` |
+| Task created, job finished | `notify` | `normal` |
 | Routine completion, minor observation | `notify` | `low` |
 | Two plausible options, an ambiguous instruction | `ask_user` with `options` | — |
 | Approve, decline or snooze a queued mechanical action (`target_kind: mechanical-action`, carried out by the workspace's `scripts/mechanical-action.sh`) | `propose_action` | — |
 
-- A cron that creates tasks, proposes plans or finds problems notifies, because nobody reads cron output. Housekeeping stays silent.
+- A cron that creates tasks or finds problems notifies, because nobody reads cron output. Housekeeping stays silent. `plan_propose` sends its own notification with a link to the plan, so do not notify about a plan.
 - In monitoring loops and delegated work, notify each decision you made on your own ("restarted the export after a stall, my call"), not only status.
 - When the human is mentioned, assigned or asked for a review anywhere, notify with the full URL.
 - Apply quiet hours yourself. Nerve's `quiet_start` and `quiet_end` ([config.md](config.md#quiet-hours)) gate nothing the agent sends, `notify` included, so hold anything below `urgent` and keep the human's timezone and quiet hours as `[stable]` facts.

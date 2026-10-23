@@ -16,15 +16,15 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 
 **Tasks** (persistent tracker, `memory/tasks/`)
 - `task_search` first; `task_create` refuses likely duplicates unless `confirm_duplicate=true`
-- `task_list`: filter by status or tag
+- `task_list`: filter by status or tag; a `backlog` task is not ready for work yet
 - `task_update`: status, deadline, tags, title, or a dated note
 - `task_read`/`task_write`: read or overwrite the markdown; `task_write` needs a prior `task_read`
 - `task_done`: moves the file to `done/` and the task's implementing plans to done
 - `task_status_list`/`task_status_create`: configured statuses; create only on request
 
-**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; reviewed at `/plans`)
-- `plan_propose`: a plan for a task; one pending plan per task
-- `plan_update`: version n+1 of your own pending plan (instead of decline and propose)
+**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
+- `plan_propose`: a plan for a task; one pending plan per task; moves a `pending`, `backlog` or `in_progress` task to `plan_review` and notifies the user with a link, so send no `notify` about it
+- `plan_update`: version n+1 of your own pending plan (instead of decline and propose); moves and notifies like `plan_propose`
 - `plan_list`/`plan_read`: browse; the full plan with version and feedback
 - `plan_approve`: pending → implementing; spawns an `impl-<id>` session, task → `in_progress`
 - `plan_decline`: pending → declined; **moves the task to done**

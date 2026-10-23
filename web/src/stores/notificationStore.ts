@@ -36,6 +36,28 @@ export interface Notification {
   metadata?: string | Record<string, unknown> | null;
 }
 
+function metadataObject(metadata: Notification['metadata']): Record<string, unknown> {
+  if (!metadata) return {};
+  if (typeof metadata === 'object') return metadata;
+  try {
+    const parsed: unknown = JSON.parse(metadata);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The plan and the task that a notification is about. The server stores
+ * them as `plan_id` and `task_id` in the metadata, for example on the
+ * notification that a proposed plan sends.
+ */
+export function notificationRefs(notif: Notification): { planId: string | null; taskId: string | null } {
+  const meta = metadataObject(notif.metadata);
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : null);
+  return { planId: text(meta.plan_id), taskId: text(meta.task_id) };
+}
+
 // A deterministic suppression rule. Matched notify's are persisted as
 // status='silenced' and not delivered; priority is never changed.
 export interface Silence {
@@ -168,14 +190,16 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       target_id: data.target_id ?? null,
       option_labels: data.option_labels ?? null,
       // Carry the silence context inline so the greyed row can render
-      // the reason/pattern without a metadata round-trip.
+      // the reason/pattern without a metadata round-trip. `data.metadata`
+      // holds the plan and task that the notification names.
       metadata: silenced
         ? {
+            ...(data.metadata ?? {}),
             silenced_by: data.silenced_by ?? null,
             silence_reason: data.silence_reason ?? '',
             silence_pattern: data.silence_pattern ?? '',
           }
-        : null,
+        : data.metadata ?? null,
     };
 
     set(s => {

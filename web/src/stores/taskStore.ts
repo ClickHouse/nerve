@@ -79,7 +79,7 @@ interface TaskState {
   availableTags: { name: string; count: number }[];
   /** task_id → ISO time it entered its current status (card aging). */
   statusSince: Record<string, string>;
-  /** Lane to pre-select when the create dialog is opened from a column. */
+  /** Status to pre-select when the create dialog is opened from a column. */
   createInStatus: string | null;
 
   // Detail view
@@ -100,7 +100,7 @@ interface TaskState {
   setSort: (s: TaskSort) => void;
   setPage: (p: number) => void;
   updateStatus: (id: string, status: string) => Promise<void>;
-  createTask: (title: string, content: string, deadline: string) => Promise<void>;
+  createTask: (title: string, content: string, deadline: string, status: string) => Promise<void>;
   setShowCreateDialog: (show: boolean, status?: string | null) => void;
 
   loadTask: (id: string) => Promise<void>;
@@ -399,14 +399,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (get().viewMode === 'list') get().loadTasks();
   },
 
-  createTask: async (title: string, content: string, deadline: string) => {
-    const { createInStatus } = get();
-    await api.createTask({
-      title,
-      content,
-      deadline,
-      ...(createInStatus ? { status: createInStatus } : {}),
-    });
+  createTask: async (title: string, content: string, deadline: string, status: string) => {
+    await api.createTask({ title, content, deadline, status });
     set({ showCreateDialog: false, createInStatus: null, page: 1 });
     if (get().viewMode === 'board') void get().loadBoard({ quiet: true });
     else get().loadTasks();
