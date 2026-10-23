@@ -901,6 +901,25 @@ def _read_if_exists(path: Path) -> str | None:
     return None
 
 
+def _read_platform_notes(config_dir: Path | None) -> str | None:
+    """``platform.md`` in the config directory (next to config.yaml), written by
+    whoever runs the instance (an operator or a hosting platform), never by
+    Nerve. At most 16 KiB of it; ``None`` when missing, empty or unreadable."""
+    path = Path(config_dir) / "platform.md" if config_dir is not None else None
+    if path is None or not path.is_file():
+        return None
+    cap = 16 * 1024
+    try:
+        with path.open("rb") as f:
+            raw = f.read(cap + 1)
+    except OSError:
+        return None
+    text = raw[:cap].decode("utf-8", errors="replace").strip()
+    if text and len(raw) > cap:
+        text += "\n[platform notes truncated at 16 KiB]"
+    return text or None
+
+
 def _format_skills_list(skill_summaries: list[dict] | None = None) -> str | None:
     """Generate the skills section for the system prompt (progressive disclosure level 1)."""
     if not skill_summaries:
@@ -935,11 +954,13 @@ def build_system_prompt(
     memory_note: str | None = None,
     memory_backend: str = "memu",
     memory_tools: bool = True,
+    config_dir: Path | None = None,
 ) -> str:
     """Build the system prompt for the agent.
 
     Loads identity files from the workspace, adds the session-context
-    block, the tool list and the skills summary.
+    block, the tool list and the skills summary. A ``platform.md`` in
+    ``config_dir`` follows ``TOOLS.md`` (see :func:`_read_platform_notes`).
 
     ``static=True`` (default) renders a prompt that is byte-identical for
     every session of the same workspace, source and tool set: the
@@ -971,6 +992,10 @@ def build_system_prompt(
         content = _read_if_exists(workspace / filename)
         if content:
             parts.append(content)
+
+    platform_notes = _read_platform_notes(config_dir)
+    if platform_notes:
+        parts.append(platform_notes)
 
     # Load MEMORY.md (truncated to first 300 lines for context window)
     memory_content = _read_if_exists(workspace / "MEMORY.md")

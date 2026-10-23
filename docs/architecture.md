@@ -213,6 +213,15 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 6. Streaming events broadcast to Telegram (edit-in-place) and any WebSocket clients
 7. Final response stored in SQLite
 
+The system prompt in step 4 also takes `platform.md` from the config directory
+(next to `config.yaml`) when that file exists and is not empty. In it, whoever
+runs the instance, an operator or a hosting platform, tells the agent about the
+instance. Nerve never writes the file. Its content goes in as written, after
+`TOOLS.md` and before `MEMORY.md`, and at most 16 KiB of it is used: a longer
+file is cut there and ends with `[platform notes truncated at 16 KiB]`. The
+file is read whenever a session's prompt is built, so a change applies to new
+sessions.
+
 ### User Message (Web UI)
 1. User sends message via WebSocket
 2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept

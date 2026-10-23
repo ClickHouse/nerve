@@ -140,3 +140,42 @@ def test_static_false_restores_legacy_shape(tmp_path: Path):
         recalled_memories=["old fact"], static=False,
     )
     assert p != q
+
+
+# ---------------------------------------------------------------------------
+# platform.md in the config directory, written by whoever runs the instance.
+# ---------------------------------------------------------------------------
+
+
+def _workspace_and_config_dir(tmp_path: Path) -> tuple[Path, Path]:
+    prompts._PROMPT_TOOL_REGISTRY = None
+    ws, config_dir = tmp_path / "ws", tmp_path / "cfg"
+    ws.mkdir()
+    config_dir.mkdir()
+    (ws / "TOOLS.md").write_text("# TOOLS\ntools file\n", encoding="utf-8")
+    (ws / "MEMORY.md").write_text("# MEMORY\nmemory file\n", encoding="utf-8")
+    return ws, config_dir
+
+
+def test_platform_md_goes_after_tools_and_before_memory(tmp_path: Path):
+    ws, config_dir = _workspace_and_config_dir(tmp_path)
+    (config_dir / "platform.md").write_text("# This instance\n4 vCPUs\n", encoding="utf-8")
+    prompt = build_system_prompt(workspace=ws, config_dir=config_dir)
+    assert (
+        "# TOOLS\ntools file\n\n---\n\n# This instance\n4 vCPUs\n\n---\n\n# MEMORY\nmemory file"
+    ) in prompt
+
+
+def test_no_platform_md_leaves_the_prompt_byte_identical(tmp_path: Path):
+    ws, config_dir = _workspace_and_config_dir(tmp_path)
+    before = build_system_prompt(workspace=ws)
+    assert build_system_prompt(workspace=ws, config_dir=config_dir) == before
+
+
+def test_platform_md_over_16_kib_is_cut_with_a_marker(tmp_path: Path):
+    ws, config_dir = _workspace_and_config_dir(tmp_path)
+    kept = "a" * (16 * 1024)
+    (config_dir / "platform.md").write_text(kept + "dropped", encoding="utf-8")
+    prompt = build_system_prompt(workspace=ws, config_dir=config_dir)
+    assert f"\n\n---\n\n{kept}\n[platform notes truncated at 16 KiB]\n\n---\n\n# MEMORY" in prompt
+    assert "dropped" not in prompt
