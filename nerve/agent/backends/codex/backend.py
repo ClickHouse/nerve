@@ -712,22 +712,15 @@ class CodexBackend:
             return os.environ.get(self.codex.api_key_env) or None
         return None
 
-    def endpoint_key(self) -> str | None:
-        """The bearer key for ``codex.base_url``: ``codex.api_key``, then the
-        variable that ``codex.api_key_env`` names. Not ``openai_api_key``:
-        that key is for OpenAI, and the endpoint is a different service."""
-        if self.codex.api_key:
-            return self.codex.api_key
-        if self.codex.api_key_env:
-            return os.environ.get(self.codex.api_key_env) or None
-        return None
-
     def endpoint_overrides(self) -> list[str]:
         """``--config`` overrides that send Codex to ``codex.base_url``.
 
-        Codex sends ``POST <base_url>/responses``. With a key, the provider
-        reads it from the child environment (``env_key``), so the key is
-        never in argv. Without a key, Codex sends no credential.
+        Codex sends ``POST <base_url>/responses``. The only key source is
+        ``codex.api_key``: ``codex.api_key_env`` and ``openai_api_key`` can
+        hold an OpenAI key, and the endpoint is a different service. With a
+        key, the provider reads it from the child environment (``env_key``),
+        so the key is never in argv. Without a key, Codex sends no
+        credential.
         """
         if not self.codex.base_url:
             return []
@@ -738,14 +731,15 @@ class CodexBackend:
             f"{base}.base_url={_toml_str(self.codex.base_url)}",
             f'{base}.wire_api="responses"',
         ]
-        if self.endpoint_key():
+        if self.codex.api_key:
             overrides.append(f"{base}.env_key={_toml_str(_ENDPOINT_KEY_ENV)}")
         return overrides
 
     def endpoint_env(self) -> dict[str, str]:
         """The child environment for :meth:`endpoint_overrides`."""
-        key = self.endpoint_key() if self.codex.base_url else None
-        return {_ENDPOINT_KEY_ENV: key} if key else {}
+        if self.codex.base_url and self.codex.api_key:
+            return {_ENDPOINT_KEY_ENV: self.codex.api_key}
+        return {}
 
 
 class CodexClient(AgentClient):

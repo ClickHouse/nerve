@@ -1087,7 +1087,7 @@ Responses API, for example a local proxy:
 ```yaml
 codex:
   base_url: http://127.0.0.1:4000/v1   # Codex sends POST <base_url>/responses
-  api_key_env: PROXY_API_KEY           # optional, see below
+  api_key: ${PROXY_API_KEY}            # optional, see below
 ```
 
 - The value includes the version path. Nerve removes one trailing `/`. The
@@ -1095,11 +1095,13 @@ codex:
   credentials, a query or a fragment. A `${VAR}` reference resolves at load.
 - Nerve gives Codex a custom model provider (`nerve-endpoint`, wire API
   `responses`) through `--config` overrides.
-- Credential: if `codex.api_key` or the variable that `codex.api_key_env`
-  names (default `OPENAI_API_KEY`) gives a key, Codex sends it as a bearer
-  token. Nerve puts the key in the environment of the Codex process, not in
-  its arguments. Without a key, Codex sends no credential. Nerve never sends
-  the top-level `openai_api_key` to the endpoint.
+- Credential: only `codex.api_key`. If it is set, Codex sends it as a
+  bearer token. Nerve puts the key in the environment of the Codex process,
+  not in its arguments. Without it, Codex sends no credential. For a key
+  from the environment, write `api_key: ${PROXY_API_KEY}`, or
+  `${PROXY_API_KEY:-}` when the key is optional. In this mode Nerve does not
+  read `codex.api_key_env` or the top-level `openai_api_key`, because they
+  can hold an OpenAI key.
 - Codex needs no login, and `codex.auth` has no effect. Preflight does not
   require an account and uses the same provider. `nerve codex doctor` and
   `GET /api/codex/status` show the endpoint in `preflight.base_url`.

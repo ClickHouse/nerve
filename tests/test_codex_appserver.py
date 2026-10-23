@@ -227,24 +227,20 @@ _ENV_KEY = 'model_providers.nerve-endpoint.env_key="NERVE_CODEX_ENDPOINT_KEY"'
 
 
 def test_endpoint_provider_overrides_and_key(tmp_path, monkeypatch):
-    """codex.base_url selects a custom provider. A key goes into the child
-    environment through env_key, never into argv; openai_api_key is never
-    used for the endpoint."""
-    monkeypatch.delenv("NERVE_TEST_ENDPOINT_KEY", raising=False)
-    cfg = _config(
-        tmp_path, base_url=_ENDPOINT + "/", api_key_env="NERVE_TEST_ENDPOINT_KEY",
-    )
+    """codex.base_url selects a custom provider. The only key source is
+    codex.api_key: not the variable that codex.api_key_env names, not
+    openai_api_key. The key goes into the child environment through
+    env_key, never into argv."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env")
+    cfg = _config(tmp_path, base_url=_ENDPOINT + "/")
     cfg.openai_api_key = "sk-openai-only"
+    assert cfg.codex.api_key_env == "OPENAI_API_KEY"
     assert cfg.codex.base_url == _ENDPOINT
     backend = CodexBackend(_deps(cfg))
     overrides = backend.build_config_overrides(_spec(cfg))
     assert all(line in overrides for line in _PROVIDER)
     assert _ENV_KEY not in overrides
     assert "NERVE_CODEX_ENDPOINT_KEY" not in backend.build_env(_spec(cfg))
-
-    monkeypatch.setenv("NERVE_TEST_ENDPOINT_KEY", "sk-from-env")
-    assert _ENV_KEY in backend.build_config_overrides(_spec(cfg))
-    assert backend.build_env(_spec(cfg))["NERVE_CODEX_ENDPOINT_KEY"] == "sk-from-env"
 
     cfg.codex.api_key = "sk-endpoint-test"
     overrides = backend.build_config_overrides(_spec(cfg))
