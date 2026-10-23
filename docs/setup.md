@@ -355,11 +355,14 @@ Then:
    clone or fetch (a personal assistant for the inbox and reminders) there is
    no explorer.
 2. **It asks in the foreground** while the explorer works, and only what
-   neither the explorer nor setup can tell. It explains first, then shows
-   question cards of up to four questions, each saying why it is asked, with
-   a few options that say what they lead to and its recommendation first, in
-   at most two rounds; **Other…** lets you answer in your own words. Typical
-   questions: the account it acts as on the code host, what waits for your
+   neither the explorer nor setup can tell. It explains first, then shows one
+   form of up to six questions per round, in at most two rounds, each saying
+   why it is asked and each in the shape its answer needs (the Nerve tool
+   `ask_form`): repositories as `owner/name` entries, decisions as a few
+   options that say what they lead to with its recommendation first and
+   **Other…** for your own words, channels and topics as a list, anything
+   else as free text. Typical questions: the account it acts as on the code
+   host (the login it knows is its recommendation), what waits for your
    approval (its recommendation: drafts you approve for anything public, on
    its own for reading, cloning and local checks), how often to look for new
    work, and where results go. It never asks what setup recorded: the mode,

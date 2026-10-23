@@ -283,7 +283,7 @@ class TestPrompt:
             "4. In two to four lines, sketch how you intend to set this up",
             "and why the questions that follow matter",
             "Then start the explorer on the targets the note names",
-            "ask your first questions with `AskUserQuestion` (step 2 below)",
+            "ask your first questions with `ask_form` (step 2 below)",
         ]
         positions = [work.index(step) for step in steps]
         assert positions == sorted(positions)
@@ -343,8 +343,8 @@ class TestPrompt:
             "its progress shows on the agent line below the chat",
             # Partly named targets: explore what is named, ask for the rest.
             "Start it on the targets you know, and ask for the ones still missing",
-            "in the question card, where the person can type them under Other…",
-            "or in one plain message in a turn without a card",
+            "in the form, as a `repos` or `list` question",
+            "or in one plain message in a turn without a form",
             "Do not study the same targets yourself", "a second explorer studies only those",
             "Skip the explorer when there is nothing to clone or fetch",
             # A failed or partial explorer does not stall the proposal.
@@ -397,18 +397,60 @@ class TestPrompt:
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_every_turn_that_asks_explains_first(self, mode, description):
         """A real run sent a question card with no text at all: the rule is an
-        explicit order (text, then the card), and the text asks nothing."""
+        explicit order (text, then the form), and the text asks nothing."""
         ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
-        explain = _between(ask, "Explain before you ask.", "Ask only what neither")
+        explain = _flat(_between(ask, "Explain before you ask.", "Ask only what neither"))
         for part in (
-            "In every turn that asks, write the text first and call `AskUserQuestion` after it",
-            "a question card without text before it is a mistake",
+            "In every turn that asks, write the text first and call `ask_form` after it",
+            "a form without text before it is a mistake",
             "The text says what you understood, what the explorer studies, how you intend to set "
             "this up and why the questions matter",
-            "The questions go in the card, and the text explains and asks none of them",
+            "The questions go in the form, and the text explains and asks none of them",
         ):
             assert part in explain, part
         assert "Ask nothing in plain text" not in ask
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_questions_come_in_a_form_of_the_kind_each_answer_needs(self, mode, description):
+        """Free-text facts (repository names) were forced into AskUserQuestion's
+        two to four options. The questions go into one ``ask_form`` form, each
+        of the kind its answer needs; AskUserQuestion is only the fallback."""
+        ask = _flat(_between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3."))
+        for part in (
+            "with `ask_form`: one form per round, with up to six questions. At most two rounds",
+            "repositories: `repos` (the person enters each as `owner/name`)",
+            "a decision, such as the account you act as, the approval boundary or the cadence: "
+            "`choice`, with two to eight concrete options, the recommended default first",
+            # The login Nerve knows is the recommended account (B8).
+            "for the account, the GitHub login you know is that option",
+            "`multi` when several options can apply at once",
+            "channels, topics and other names: `list`",
+            "a link: `url`",
+            "anything else, in the person's own words: `text`",
+            'its reason in one clause ("so the review job knows how often to run") as its `help`',
+            "Mark a question `required: false` when the setup works without its answer",
+            "an optional question left empty comes back under `skipped`",
+        ):
+            assert part in ask, part
+        fallback = ask.index("Use `AskUserQuestion` only when `ask_form` is not available")
+        assert ask.index("with `ask_form`") < fallback
+        assert "one to four questions per call, each with two to four options" in ask[fallback:]
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_ask_form_loads_with_the_nerve_tools_and_falls_back(self, mode, description):
+        """Nerve's server is always loaded (``alwaysLoad``), the CLI's
+        interactive built-ins may be deferred; without ``ask_form`` the agent
+        asks with AskUserQuestion, without both in a message."""
+        rules = _flat(_between(onboarding_prompt(mode, description, GUIDE), "## Rules", "## Nerve features"))
+        for part in (
+            "`AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` may be deferred tools: load them "
+            "with `ToolSearch` before their first use",
+            "`ask_form` (`mcp__nerve__ask_form`) loads with the other Nerve tools; if it is not among "
+            "your tools, look for it with `ToolSearch` as well",
+            "ask with `AskUserQuestion` when `ask_form` is missing, and in a message when both are",
+            "send the proposal as one message with the plan's headings",
+        ):
+            assert part in rules, part
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_the_proposal_is_a_native_plan(self, mode, description):
@@ -450,8 +492,9 @@ class TestPrompt:
     def test_a_timeout_is_no_answer_and_plan_mode_waits_with_exit_plan_mode(self, mode, description):
         rules = _flat(_between(onboarding_prompt(mode, description, GUIDE), "## Rules", "## Nerve features"))
         for part in (
-            "A question card that times out (no answer within the hour) is no answer: say in one "
-            "line that you wait for the person and end your turn; ask again when they write",
+            "A form or question card that times out (no answer within the hour) or is closed "
+            "without an answer is no answer: say in one line that you wait for the person and end "
+            "your turn; ask again when they write",
             "A plan decision that times out is no answer either: even in plan mode, say in one "
             "line that the proposal waits for them and end your turn",
             "when they write, call `ExitPlanMode` again instead of asking anything",
@@ -637,7 +680,7 @@ class TestChosenWork:
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
-            "ask your first questions with `AskUserQuestion` (step 2 below), from the list above",
+            "ask your first questions with `ask_form` (step 2 below), from the list above",
             "The first round asks for the targets still missing (which repositories, which channels)",
         ]
         positions = [_flat(first).index(step) for step in steps]

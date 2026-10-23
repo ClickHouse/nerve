@@ -2372,6 +2372,47 @@ class TestFinish:
             finally:
                 unregister_handler(session_id)
 
+    async def test_a_form_waits_as_a_question(self, claimed, monkeypatch):
+        """An ``ask_form`` form (the ``form`` interaction) is a question for
+        ``onboarding.awaiting``, so the banner says the agent has one; a plan
+        still wins."""
+        from nerve.agent.interactive import InteractiveToolHandler, register_handler, unregister_handler
+
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+
+        async def _quiet(channel, message):
+            pass
+
+        async def _awaiting(http) -> str | None:
+            return (await http.get("/api/setup")).json()["onboarding"]["awaiting"]
+
+        async def _pause(handler, tool, count):
+            task = asyncio.create_task(handler.request_interaction(tool, {}))
+            for _ in range(200):
+                if len(handler.pending_interaction_types()) == count:
+                    return task
+                await asyncio.sleep(0.005)
+            raise AssertionError(f"{tool} never paused")
+
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            session_id = (await http.post("/api/setup/finish")).json()["onboarding"]["session_id"]
+            handler = InteractiveToolHandler(session_id, _quiet, interactive_capable=True)
+            register_handler(session_id, handler)
+            try:
+                form = await _pause(handler, "ask_form", 1)
+                assert handler.pending_interaction_types() == ["form"]
+                assert await _awaiting(http) == "question"
+                plan = await _pause(handler, "ExitPlanMode", 2)
+                assert await _awaiting(http) == "plan"
+                handler.cancel_all()
+                await asyncio.gather(form, plan)
+                assert await _awaiting(http) is None
+            finally:
+                unregister_handler(session_id)
+
 
 def _onboarding_engine(db) -> MagicMock:
     """An engine whose sessions are real rows and whose turns do nothing."""

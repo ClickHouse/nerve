@@ -173,10 +173,10 @@ interface ChatState {
   // localStorage 'nerve_sidebar_width'). Default 240 = the previous w-60.
   sidebarWidth: number;
 
-  // Pending interactive tool (AskUserQuestion, ExitPlanMode, etc.)
+  // Pending interactive tool (AskUserQuestion, ask_form, ExitPlanMode, etc.)
   pendingInteraction: {
     interactionId: string;
-    interactionType: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval';
+    interactionType: 'question' | 'form' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval';
     toolName: string;
     toolInput: Record<string, unknown>;
     /** The subagent that asked; null (or absent) for the orchestrator. */
@@ -342,7 +342,11 @@ interface ChatState {
   /** Open (or focus) one agent's transcript tab and start streaming it. */
   openAgentTab: (agentId: string) => void;
   // Interactions
-  answerInteraction: (result: Record<string, string> | null) => void;
+  /**
+   * Answer the pending interaction: AskUserQuestion's `{question: "labels"}`,
+   * ask_form's `{answers: {id: string | string[]}}`, null to just continue.
+   */
+  answerInteraction: (result: Record<string, unknown> | null) => void;
   denyInteraction: (message?: string) => void;
   /** Ask the plan panel's footer to open its editor for this plan decision. */
   requestPlanEdit: (interactionId: string) => void;
@@ -606,7 +610,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   //  Interactions                                                        //
   // ------------------------------------------------------------------ //
 
-  answerInteraction: (result: Record<string, string> | null) => {
+  answerInteraction: (result: Record<string, unknown> | null) => {
     const pending = get().pendingInteraction;
     if (!pending) return;
     ws.answerInteraction(get().activeSession, pending.interactionId, result);

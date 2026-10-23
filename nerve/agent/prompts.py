@@ -298,7 +298,7 @@ comments as drafts the person approves) and why the questions that follow \
 matter.
 
 Then start the explorer on the targets setup names, if any, and ask your \
-first questions with `AskUserQuestion` (step 2 below){questions}. The first \
+first questions with `ask_form` (step 2 below){questions}. The first \
 round asks for the targets still missing (which repositories, which \
 channels), so that the explorer can start on them.
 {unclear}"""
@@ -345,7 +345,7 @@ comments as drafts the person approves) and why the questions that follow \
 matter.
 
 Then start the explorer on the targets the note names, and ask your first \
-questions with `AskUserQuestion` (step 2 below). Targets the note leaves out \
+questions with `ask_form` (step 2 below). Targets the note leaves out \
 you ask for as step 1 says.
 
 **When the note names no work** (only rules, such as "never merge anything", \
@@ -390,16 +390,20 @@ a channel, a person or a credential. Record where a credential lives, never \
 its value.
 - If the person wants to stop, say that they can come back to this \
 conversation at any time, or skip onboarding on the setup page.
-- A question card that times out (no answer within the hour) is no answer: \
-say in one line that you wait for the person and end your turn; ask again \
-when they write. A plan decision that times out is no answer either: even in \
-plan mode, say in one line that the proposal waits for them and end your \
-turn; when they write, call `ExitPlanMode` again instead of asking anything.
+- A form or question card that times out (no answer within the hour) or is \
+closed without an answer is no answer: say in one line that you wait for the \
+person and end your turn; ask again when they write. A plan decision that \
+times out is no answer either: even in plan mode, say in one line that the \
+proposal waits for them and end your turn; when they write, call \
+`ExitPlanMode` again instead of asking anything.
 - `AskUserQuestion`, `EnterPlanMode` and `ExitPlanMode` may be deferred \
-tools: load them with `ToolSearch` before their first use. Only when a tool \
-this message names is not available even there, do that step without it: \
-study the targets yourself, ask in a message, and send the proposal as one \
-message with the plan's headings for the person to approve or change.
+tools: load them with `ToolSearch` before their first use. `ask_form` \
+(`mcp__nerve__ask_form`) loads with the other Nerve tools; if it is not among \
+your tools, look for it with `ToolSearch` as well. Only when a tool this \
+message names is not available even there, do that step without it: ask with \
+`AskUserQuestion` when `ask_form` is missing, and in a message when both are; \
+study the targets yourself; and send the proposal as one message with the \
+plan's headings for the person to approve or change.
 """
 
 _FEATURE_RULES = """\
@@ -426,8 +430,8 @@ sites, data sources, alert sources, topics), start **one** explorer: an \
 the brackets and `<workspace>` filled in. Tell the person, in one line, what \
 it studies and that its progress shows on the agent line below the chat. \
 Start it on the targets you know, and ask for the ones still missing (which \
-repositories, which channels): in the question card, where the person can \
-type them under Other…, or in one plain message in a turn without a card.
+repositories, which channels): in the form, as a `repos` or `list` question, \
+or in one plain message in a turn without a form.
 
 Do not study the same targets yourself. Nothing is studied twice: when the \
 person names more targets later, a second explorer studies only those. Skip \
@@ -468,18 +472,31 @@ _ASK_STEP = """\
 ### 2. Ask in the foreground, while the explorer works
 
 Explain before you ask. In every turn that asks, write the text first and \
-call `AskUserQuestion` after it: a question card without text before it is a \
-mistake. The text says what you understood, what the explorer studies, how \
-you intend to set this up and why the questions matter. The questions go in \
-the card, and the text explains and asks none of them: until the turn ends, \
-the person can answer only the card.
+call `ask_form` after it: a form without text before it is a mistake. The \
+text says what you understood, what the explorer studies, how you intend to \
+set this up and why the questions matter. The questions go in the form, and \
+the text explains and asks none of them: until the turn ends, the person can \
+answer only the form.
 
-Ask only what neither the explorer nor setup can tell you, with \
-`AskUserQuestion`: one to four questions per call, each with two to four \
-concrete options, the recommended default first with "(recommended)" at the \
-end of its label. Each question carries its reason in one clause ("so the \
-review job knows how often to run"), and each option's description says what \
-choosing it leads to. At most two rounds. Typical questions:
+Ask only what neither the explorer nor setup can tell you, with `ask_form`: \
+one form per round, with up to six questions. At most two rounds. Give each \
+question the kind its answer needs:
+
+- repositories: `repos` (the person enters each as `owner/name`);
+- a decision, such as the account you act as, the approval boundary or the \
+cadence: `choice`, with two to eight concrete options, the recommended \
+default first with "(recommended)" at the end of its label; for the account, \
+the GitHub login you know is that option. `multi` when several options can \
+apply at once;
+- channels, topics and other names: `list`;
+- a link: `url`;
+- anything else, in the person's own words: `text`.
+
+Each question carries its reason in one clause ("so the review job knows how \
+often to run") as its `help`, and each option's description says what \
+choosing it leads to. Mark a question `required: false` when the setup works \
+without its answer; an optional question left empty comes back under \
+`skipped`. Typical questions:
 
 - the account you act as on the code host, and the git author to use;
 - the approval boundary; recommended: drafts the person approves for anything \
@@ -490,6 +507,10 @@ triage, daily for research;
 - where results go: this chat, a channel, or notifications only;
 - for a personal assistant: which of the connected inboxes and calendars to \
 read, and how reminders reach the person.
+
+Use `AskUserQuestion` only when `ask_form` is not available: one to four \
+questions per call, each with two to four options, the recommended one first, \
+and Other… for the person's own words (which repositories, which channels).
 
 Setup already recorded the mode, the person's name, the time zone and quiet \
 hours (`USER.md`, `config/settings.yaml`) and the connected channels and \
@@ -790,9 +811,10 @@ def onboarding_prompt(
     - Nothing: the list, and the question what to do.
 
     The steps after it are shared: explore in the background (read only),
-    ask with ``AskUserQuestion`` after explaining, propose the setup as a
-    native plan (``EnterPlanMode`` … ``ExitPlanMode``), apply, summarize,
-    ``onboarding_done``.
+    ask with ``ask_form`` after explaining (each question of the kind its
+    answer needs; ``AskUserQuestion`` only when ``ask_form`` is missing),
+    propose the setup as a native plan (``EnterPlanMode`` …
+    ``ExitPlanMode``), apply, summarize, ``onboarding_done``.
 
     A worker's prompt also carries its description (or a line that none was
     given), the ``TASK.md`` rules and ``guide``, the worker guide in full

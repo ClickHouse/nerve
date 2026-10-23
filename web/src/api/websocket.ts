@@ -23,7 +23,8 @@ export type WSMessage =
   | { type: 'plan_update'; session_id: string; content: string }
   | { type: 'backend_status'; session_id: string; subtype: string; data: Record<string, unknown> }
   // `agent` names the subagent that asked; null or absent for the orchestrator.
-  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
+  // `form` is Nerve's ask_form (tool_name `ask_form`); it is answered `{answers: {id: string | string[]}}`.
+  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'form' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
   | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
   // A short summary of the plan an ExitPlanMode pause waits on (buffered for replay like `interaction`).
   | { type: 'plan_summary'; session_id: string; interaction_id: string; bullets: string[]; status: 'ok' | 'unavailable' }
@@ -263,7 +264,7 @@ export class NerveWebSocket {
     this.send({ type: 'resume', session_id: sessionId });
   }
 
-  answerInteraction(sessionId: string, interactionId: string, result: Record<string, string> | null, denied = false, message = '') {
+  answerInteraction(sessionId: string, interactionId: string, result: Record<string, unknown> | null, denied = false, message = '') {
     this.send({ type: 'answer_interaction', session_id: sessionId, interaction_id: interactionId, result, denied, message });
   }
 

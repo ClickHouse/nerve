@@ -55,6 +55,13 @@ function pause() {
 
 const group = (name: string) => within(screen.getByRole('group', { name }));
 
+/** The folded card's answer line for the question with this chip. */
+function answerTo(label: string): HTMLElement {
+  const term = screen.getAllByRole('term').find(t => t.textContent === label);
+  if (!term?.parentElement) throw new Error(`no answer line for ${label}`);
+  return within(term.parentElement).getByRole('definition');
+}
+
 beforeEach(() => {
   vi.mocked(ws.answerInteraction).mockClear();
   useChatStore.setState({ activeSession: 'session-1', pendingInteraction: null });
@@ -186,10 +193,11 @@ describe('AskUserQuestion: Other…', () => {
     expect(submit).toBeEnabled();
   });
 
-  it('shows the own words again from the tool result after a reload', () => {
+  it('shows the own words again from the tool result after a reload', async () => {
     const result = `User has answered your questions: "${ACCOUNT.question}"="the review-bot account", `
       + `"${REPORT.question}"="This chat, a weekly email". You can now continue with the user's answers in mind.`;
     render(<QuestionBlock block={ask([ACCOUNT, REPORT], { status: 'complete', result })} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Show questions' }));
 
     const account = group(ACCOUNT.question);
     expect(account.getByRole('button', { name: /^Other…/ })).toHaveAttribute('aria-pressed', 'true');
@@ -203,10 +211,15 @@ describe('AskUserQuestion: Other…', () => {
     expect(screen.queryByRole('button', { name: 'Submit' })).not.toBeInTheDocument();
   });
 
-  it('re-highlights an option whose label holds a comma, without taking it for own words', () => {
+  it('re-highlights an option whose label holds a comma, without taking it for own words', async () => {
     const question = { ...REPORT, options: [{ label: 'Chat, then email', description: '' }, { label: 'Slack', description: '' }] };
     const result = `User has answered your questions: "${REPORT.question}"="Chat, then email, Slack".`;
     render(<QuestionBlock block={ask([question], { status: 'complete', result })} />);
+    const chips = within(answerTo('Report'));
+    expect(chips.getByText('Chat, then email')).toBeInTheDocument();
+    expect(chips.getByText('Slack')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Show questions' }));
     expect(screen.getByRole('button', { name: /^Chat, then email/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /^Slack/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /^Other…/ })).toHaveAttribute('aria-pressed', 'false');
@@ -278,5 +291,56 @@ describe('AskUserQuestion: Other…', () => {
     expect(ws.answerInteraction).toHaveBeenCalledWith(
       'session-1', 'i-ask', { [ACCOUNT.question]: 'the review-bot account' },
     );
+  });
+});
+
+describe('AskUserQuestion: the answered card folds', () => {
+  it('folds to one line per question, chip and answer, once answered here', async () => {
+    pause();
+    render(<QuestionBlock block={ask([ACCOUNT, REPORT])} />);
+    // While it waits it is the whole poll, at its full size.
+    expect(screen.queryByRole('button', { name: 'Show questions' })).not.toBeInTheDocument();
+    await userEvent.click(group(ACCOUNT.question).getByRole('button', { name: /^alice/ }));
+    await userEvent.click(group(REPORT.question).getByRole('button', { name: /^This chat/ }));
+    await userEvent.click(group(REPORT.question).getByRole('button', { name: /^Other…/ }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'Your answer' }), 'a weekly email');
+    await userEvent.click(screen.getByRole('button', { name: 'Submit' }));
+
+    expect(screen.queryByRole('group', { name: ACCOUNT.question })).not.toBeInTheDocument();
+    expect(answerTo('Account')).toHaveTextContent('alice (recommended)');
+    // A multi-select answer as chips.
+    const report = within(answerTo('Report'));
+    expect(report.getByText('This chat')).toBeInTheDocument();
+    expect(report.getByText('a weekly email')).toBeInTheDocument();
+    expect(screen.getByText('Answered')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show questions' })).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('opens the full card read-only on Show questions, and folds it again on Hide', async () => {
+    const result = `User has answered your questions: "${ACCOUNT.question}"="A bot account", "${REPORT.question}"="Notifications".`;
+    render(<QuestionBlock block={ask([ACCOUNT, REPORT], { status: 'complete', result })} />);
+    const toggle = screen.getByRole('button', { name: 'Show questions' });
+    await userEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle).toHaveAccessibleName('Hide');
+    expect(toggle).toHaveFocus();
+    expect(screen.queryByRole('term')).not.toBeInTheDocument();
+    const bot = group(ACCOUNT.question).getByRole('button', { name: /^A bot account/ });
+    expect(bot).toHaveAttribute('aria-pressed', 'true');
+    expect(bot).toBeDisabled();
+    expect(group(REPORT.question).getByRole('button', { name: /^Notifications/ })).toHaveAttribute('aria-pressed', 'true');
+
+    await userEvent.click(toggle);
+    expect(screen.queryByRole('group', { name: ACCOUNT.question })).not.toBeInTheDocument();
+    expect(answerTo('Account')).toHaveTextContent('A bot account');
+    expect(toggle).toHaveAccessibleName('Show questions');
+  });
+
+  it('shows a dash for every question of a card closed without an answer', () => {
+    render(<QuestionBlock block={ask([ACCOUNT, REPORT], { status: 'complete', isError: true, result: 'Question timed out' })} />);
+    expect(screen.getByText('Closed')).toBeInTheDocument();
+    expect(answerTo('Account')).toHaveTextContent('No answer');
+    expect(answerTo('Report')).toHaveTextContent('No answer');
   });
 });

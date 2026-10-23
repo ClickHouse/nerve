@@ -254,6 +254,55 @@ async def test_pending_interaction_types_name_what_waits_oldest_first():
     assert handler.pending_interaction_types() == []
 
 
+@pytest.mark.asyncio
+async def test_ask_form_pauses_as_a_form_interaction():
+    """Nerve's ``ask_form`` tool pauses through the hub itself (the CLI's
+    permission callback never sees it): a ``form`` interaction, pending as
+    ``form`` until the person answers."""
+    messages: list[tuple[str, dict]] = []
+
+    async def broadcast(channel: str, msg: dict) -> None:
+        messages.append((channel, msg))
+
+    handler = InteractiveToolHandler("sess-form", broadcast, interactive_capable=True)
+    form = {"title": "", "questions": []}
+    task = asyncio.create_task(handler.request_interaction("ask_form", form))
+    await _wait_until_pending(handler)
+    interaction = next(m for (_c, m) in messages if m["type"] == "interaction")
+    assert (interaction["interaction_type"], interaction["tool_name"]) == ("form", "ask_form")
+    assert interaction["tool_input"] == form
+    assert handler.pending_interaction_types() == ["form"]
+
+    handler.resolve(interaction["interaction_id"], {"answers": {"repos": ["org/repo-a"]}})
+    outcome = await task
+    assert outcome.approved and not outcome.timed_out
+    assert outcome.result == {"answers": {"repos": ["org/repo-a"]}}
+
+
+@pytest.mark.asyncio
+async def test_only_a_timeout_is_timed_out():
+    """``timed_out`` tells a timeout from a refusal or a stop, which all deny."""
+    async def broadcast(channel: str, msg: dict) -> None:
+        pass
+
+    handler = InteractiveToolHandler("sess-timed-out", broadcast, interactive_capable=True)
+    timed = await handler.request_interaction("ask_form", {}, timeout=0.1)
+    assert timed.denied and timed.timed_out and not timed.cancelled
+    assert timed.message == "No response received after 1 minute — timed out."
+
+    refused = asyncio.create_task(handler.request_interaction("ask_form", {}))
+    await _wait_until_pending(handler)
+    handler.deny(next(iter(handler._pending)), "Not now")
+    outcome = await refused
+    assert outcome.denied and not outcome.timed_out and outcome.message == "Not now"
+
+    stopped = asyncio.create_task(handler.request_interaction("ask_form", {}))
+    await _wait_until_pending(handler)
+    handler.cancel_all()
+    outcome = await stopped
+    assert outcome.denied and not outcome.timed_out and outcome.message == "Session stopped."
+
+
 PLAN_INPUT = {
     "plan": "# Setup proposal — review PRs in org/repo-a\n## Jobs\n| pr-scan | */30 * * * * |\n",
     "planFilePath": "/home/someone/.claude/plans/quiet-blue-river.md",
