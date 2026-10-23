@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from nerve.agent.backends import BackendDeps, SessionSpec, TransportDiedError
+from nerve.agent.backends import BackendDeps, BackendError, SessionSpec, TransportDiedError
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
 from nerve.agent.backends.base import TurnInput
@@ -214,6 +214,90 @@ async def test_effective_api_key_auth_controls_billing(tmp_path, monkeypatch):
         assert done.cost_basis == "api_billed"
     finally:
         await client.disconnect()
+
+
+_ENDPOINT = "http://127.0.0.1:4000/v1"
+_PROVIDER = [
+    'model_provider="nerve-endpoint"',
+    'model_providers.nerve-endpoint.name="Nerve endpoint"',
+    f'model_providers.nerve-endpoint.base_url="{_ENDPOINT}"',
+    'model_providers.nerve-endpoint.wire_api="responses"',
+]
+_ENV_KEY = 'model_providers.nerve-endpoint.env_key="NERVE_CODEX_ENDPOINT_KEY"'
+
+
+def test_endpoint_provider_overrides_and_key(tmp_path, monkeypatch):
+    """codex.base_url selects a custom provider. A key goes into the child
+    environment through env_key, never into argv; openai_api_key is never
+    used for the endpoint."""
+    monkeypatch.delenv("NERVE_TEST_ENDPOINT_KEY", raising=False)
+    cfg = _config(
+        tmp_path, base_url=_ENDPOINT + "/", api_key_env="NERVE_TEST_ENDPOINT_KEY",
+    )
+    cfg.openai_api_key = "sk-openai-only"
+    assert cfg.codex.base_url == _ENDPOINT
+    backend = CodexBackend(_deps(cfg))
+    overrides = backend.build_config_overrides(_spec(cfg))
+    assert all(line in overrides for line in _PROVIDER)
+    assert _ENV_KEY not in overrides
+    assert "NERVE_CODEX_ENDPOINT_KEY" not in backend.build_env(_spec(cfg))
+
+    monkeypatch.setenv("NERVE_TEST_ENDPOINT_KEY", "sk-from-env")
+    assert _ENV_KEY in backend.build_config_overrides(_spec(cfg))
+    assert backend.build_env(_spec(cfg))["NERVE_CODEX_ENDPOINT_KEY"] == "sk-from-env"
+
+    cfg.codex.api_key = "sk-endpoint-test"
+    overrides = backend.build_config_overrides(_spec(cfg))
+    assert _ENV_KEY in overrides
+    assert not any("sk-" in line for line in overrides)
+    assert backend.build_env(_spec(cfg))["NERVE_CODEX_ENDPOINT_KEY"] == "sk-endpoint-test"
+
+    cfg.codex.base_url = ""
+    assert not any(
+        line.startswith("model_provider")
+        for line in backend.build_config_overrides(_spec(cfg))
+    )
+    assert "NERVE_CODEX_ENDPOINT_KEY" not in backend.build_env(_spec(cfg))
+
+
+@pytest.mark.asyncio
+async def test_endpoint_mode_needs_no_codex_login(tmp_path, monkeypatch):
+    """With a custom provider Codex reports no account. Preflight passes
+    with the same provider overrides, the session does not log in, and
+    turns are API-billed from codex.pricing."""
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path, base_url=_ENDPOINT, auth="api_key", api_key="sk-endpoint-test")
+    backend = CodexBackend(_deps(cfg))
+    status = await backend.preflight(force=True)
+    assert status["available"] is True, status
+    assert status["base_url"] == _ENDPOINT
+    # "unknown": the fake saw the provider override and reported no account.
+    assert status["auth"] == "unknown"
+    assert status["auth_mismatch"] is False
+
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="hello"))
+        done = (await _collect_turn(client))[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.total_cost_usd == pytest.approx(0.003)
+        assert done.estimated_cost_usd is None
+        assert done.cost_basis == "api_billed"
+    finally:
+        await client.disconnect()
+    assert not (tmp_path / "codex-home" / "login_calls").exists()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_mode_refuses_ultracode(tmp_path, monkeypatch):
+    """Ultracode workers do not get the endpoint provider, so a session
+    with both settings is refused, also when codex is not the default
+    backend (load validation only warns then)."""
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path, base_url=_ENDPOINT, ultracode={"enabled": True})
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(BackendError, match="Ultracode"):
+        await backend.create_client(_spec(cfg))
 
 
 @pytest.mark.asyncio

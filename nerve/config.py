@@ -3239,6 +3239,9 @@ class CodexConfig:
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
     api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
+    # OpenAI-compatible endpoint that serves the Responses API, with the
+    # version path (http://127.0.0.1:4000/v1). Empty: Codex's own provider.
+    base_url: str = ""
     sandbox: str = "danger-full-access"     # read-only | workspace-write | danger-full-access
     approval_policy: str = "never"          # never | on-request | untrusted
     # nerve effort vocabulary -> codex reasoning effort string
@@ -3297,6 +3300,7 @@ class CodexConfig:
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
+            base_url=str(d.get("base_url") or "").strip().removesuffix("/"),
             sandbox=str(d.get("sandbox", "danger-full-access")),
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
@@ -3328,6 +3332,16 @@ class CodexConfig:
                 f"codex.sandbox must be one of {_CODEX_SANDBOX_MODES}, "
                 f"got {self.sandbox!r}"
             )
+        if self.base_url:
+            try:
+                _checked_http_url(self.base_url, "codex.base_url")
+            except ConfigError as e:
+                problems.append(str(e))
+            if self.ultracode.enabled:
+                problems.append(
+                    "codex.ultracode.enabled cannot be set together with "
+                    "codex.base_url (Ultracode workers do not use the endpoint)"
+                )
         problems.extend(self.ultracode.validate())
         return problems
 
