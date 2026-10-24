@@ -211,10 +211,11 @@ async def start(
 ) -> OnboardingState:
     """Open the onboarding if it is pending. Idempotent.
 
-    ``kind`` ``conversation`` opens a web chat with a hidden first message;
-    ``autonomous`` runs the worker's onboarding session without a person,
-    with its prompt in the transcript, as a ``cron`` source (the backend and
-    model of scheduled jobs).
+    ``kind`` ``conversation`` opens a web chat with a hidden first message,
+    and the chat shows no thinking from before the agent's first text or
+    tool call; ``autonomous`` runs the worker's onboarding session without a
+    person, with its prompt in the transcript, as a ``cron`` source (the
+    backend and model of scheduled jobs).
 
     Starts in this process run one at a time, and the claim of the row is a
     compare-and-set from the state that was read, so there is one session
@@ -266,9 +267,11 @@ async def start(
                     user_message=prompt,
                     source=source,
                     # Nerve composes this message. In the conversation,
-                    # ``internal`` keeps it out of the transcript, so the
-                    # agent's answer opens the chat.
+                    # ``internal`` keeps it out of the transcript, and the
+                    # thinking before the greeting is dropped, so the
+                    # agent's greeting opens the chat.
                     internal=kind == CONVERSATION,
+                    drop_leading_thinking=kind == CONVERSATION,
                     actor=db.system_actor,
                 )
             failed = turn.outcome is not None and turn.outcome.status == "failed"

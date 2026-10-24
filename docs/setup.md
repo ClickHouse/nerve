@@ -321,6 +321,10 @@ step recorded:
   note with only rules ("never merge anything") or only repositories gets the
   form.
 
+In the agent's first turn, the chat does not show the thinking that comes
+before its first words or its first tool call. Thinking after that shows as
+in any other chat.
+
 Whatever you wrote under "Anything it must know or never do?" (or as rules in
 a note) becomes hard rules and approval boundaries in its proposal, and an
 answer in the conversation never loosens one without asking.

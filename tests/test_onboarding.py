@@ -934,6 +934,8 @@ class TestStart:
         assert engine.run.await_count == 1
         assert gathered == [tmp_path], "the facts are gathered once, for the one opening"
         assert turn["internal"] is True and turn["source"] == "web"
+        # The chat opens with the greeting: no thinking from before it.
+        assert turn["drop_leading_thinking"] is True
         assert turn["actor"] == db.system_actor
         assert turn["user_message"] == onboarding_prompt("personal", **WITH_FACTS)
         assert (await db.get_session(states[0].session_id))["title"] == "Onboarding"
@@ -1136,6 +1138,7 @@ class TestBoot:
         assert turn["user_message"] == worker_onboarding_prompt(DESCRIPTION, read_worker_guide())
         assert gathered == [], "the autonomous kind is unchanged: no facts are gathered for it"
         assert turn["internal"] is False and turn["source"] == "cron"
+        assert turn["drop_leading_thinking"] is False
         session = await db.get_session(state.session_id)
         assert session["source"] == "cron"
         assert session["caused_by_actor_id"] == db.system_actor.actor_id

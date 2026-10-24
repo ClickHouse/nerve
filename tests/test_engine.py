@@ -1713,6 +1713,81 @@ async def test_sidechain_only_user_turn_still_crash_retries(tmp_path, db):
     assert [r["content"] for r in rows if r["role"] == "assistant"] == ["recovered"]
 
 
+def _thinking_script(first: list) -> list:
+    """Thinking, then ``first`` (the turn's first text or tool call), then
+    more thinking and a closing text."""
+    from claude_agent_sdk import ThinkingBlock
+
+    def _think(text: str) -> AssistantMessage:
+        return AssistantMessage(content=[ThinkingBlock(thinking=text, signature="sig")], model="claude-test")
+
+    return [
+        _think("LEADING-1 "),
+        _think("LEADING-2"),
+        *first,
+        _think("AFTER"),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+
+
+def _first_tool_call() -> list:
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    return [
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_read", name="Read", input={"file_path": "/tmp/notes.md"},
+        )], model="claude-test"),
+        UserMessage(content=[ToolResultBlock(tool_use_id="toolu_read", content="notes")]),
+    ]
+
+
+_FIRST_TEXT = [AssistantMessage(content=[TextBlock(text="Hello.")], model="claude-test")]
+
+
+async def _run_with_thinking(tmp_path, db, sid, first, **run_kwargs):
+    """Run :func:`_thinking_script`; the stored reply and the thinking sent to the chat."""
+    from nerve.agent.streaming import broadcaster
+
+    engine, _backend = _sdk_script_engine(tmp_path, db, [(_thinking_script(first), False)])
+    sent = AsyncMock()
+    with patch.object(broadcaster, "broadcast_thinking", sent), \
+            patch("nerve.agent.engine._maybe_broadcast_file_changed"), \
+            patch("nerve.agent.engine._maybe_broadcast_plan_update"):
+        await engine.run(sid, "go", source="web", channel="web", actor=None, **run_kwargs)
+    (assistant,) = [r for r in await db.get_messages(sid) if r["role"] == "assistant"]
+    return assistant, [call.args[1] for call in sent.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_drop_leading_thinking_drops_only_the_thinking_before_the_first_output(
+    tmp_path, db, first, first_type,
+):
+    """The onboarding conversation's first turn: the thinking before the
+    first text or tool call is neither sent to the chat nor stored with the
+    reply; the thinking after it is both."""
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-drop", first, drop_leading_thinking=True)
+    assert sent == ["AFTER"]
+    assert assistant["thinking"] == "AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == [first_type, "thinking", "text"]
+    assert "LEADING" not in json.dumps(assistant["blocks"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_a_normal_turn_sends_and_stores_all_of_its_thinking(tmp_path, db, first, first_type):
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-keep", first)
+    assert sent == ["LEADING-1 ", "LEADING-2", "AFTER"]
+    assert assistant["thinking"] == "LEADING-1 LEADING-2AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == ["thinking", first_type, "thinking", "text"]
+    assert assistant["blocks"][0]["content"] == "LEADING-1 LEADING-2"
+
+
 @pytest.mark.asyncio
 async def test_process_agent_event_routes_sidechain_to_registry():
     """Every event carrying parent_tool_use_id (and every SubagentUsage) is
