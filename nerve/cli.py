@@ -469,6 +469,7 @@ def _setup_summary(config) -> dict | None:
             onboarding=setup_checklist.onboarding_from_task(
                 Path(config.workspace), workspace_mode(Path(config.workspace)),
             ),
+            agent_display_name=setup_checklist.agent_display_name_from_environment(),
         )
         return setup_checklist.summarize(facts)
     except Exception as e:  # noqa: BLE001 — status/doctor must never die on the checklist

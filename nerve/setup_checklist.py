@@ -11,7 +11,9 @@ Everything here is pure: :class:`Facts` carries what the caller already
 resolved (the config object, the state file, whether the instance is
 claimed, whether a Telegram channel is live), and the only I/O is reading the
 workspace files the facts point at. The HTTP route and ``nerve doctor`` both
-feed it, which is what keeps the two in agreement.
+feed it, which is what keeps the two in agreement; the one reader of the
+environment, :func:`agent_display_name_from_environment`, is for them to
+call when they resolve the facts, never part of the derivation.
 
 **No local-account fact is consulted** except for the ``claim`` step, which
 exists only in local mode. The profile step's name comes from the actor the
@@ -23,6 +25,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -270,6 +274,11 @@ class Facts:
     onboarding_awaiting: str | None = None
     #: The caller's name: an account's display name, or the actor header's.
     display_name: str | None = None
+    #: The agent's display name from the environment that runs the instance
+    #: (:func:`agent_display_name_from_environment`), or ``None``. The profile
+    #: step offers it as the agent's name while IDENTITY.md's name line is
+    #: still the template's.
+    agent_display_name: str | None = None
     #: Live channel → process cache → ST → None (resolved by the caller).
     bot_username: str | None = None
     #: Local mode: the claimed account, for the claim step's detail.
@@ -462,6 +471,28 @@ def _line_value(lines: list[str], prefix: str) -> str | None:
     return None
 
 
+#: The longest agent name the profile step accepts, in characters.
+AGENT_NAME_MAX_CHARS = 40
+
+#: What a single-line profile value must not contain: C0 and C1 control
+#: characters and DEL. A line break would plant a prompt line in a workspace
+#: file; the profile route refuses them with this same expression.
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def agent_display_name_from_environment() -> str | None:
+    """The agent's display name from ``NERVE_DISPLAY_NAME``, as the profile
+    step may offer it: stripped, and only when it meets the bounds of a typed
+    name — one line without control characters (:data:`CONTROL_CHARS_RE`), at
+    most :data:`AGENT_NAME_MAX_CHARS` characters. ``None`` otherwise: a name
+    nobody chose is not cut to fit. A hosted deployment sets the variable from
+    its own record of the agent; a local install has none."""
+    value = (os.environ.get("NERVE_DISPLAY_NAME") or "").strip()
+    if not value or len(value) > AGENT_NAME_MAX_CHARS or CONTROL_CHARS_RE.search(value):
+        return None
+    return value
+
+
 def onboarding_from_task(workspace: Path, mode: str | None) -> str:
     """``not_applicable`` | ``pending`` | ``done`` from a worker's ``TASK.md`` alone.
 
@@ -610,6 +641,18 @@ def _profile_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str
     # "default" means the mode's own — personal 02:00–08:00, a worker none.
     quiet = (str(config.quiet_start or ""), str(config.quiet_end or ""))
     quiet_default = DEFAULT_QUIET_HOURS.get(mode or "personal", DEFAULT_QUIET_HOURS["personal"])
+    # The agent's name is what IDENTITY.md holds. While its name line is
+    # still the template's, the name the environment gives the agent (a
+    # hosted deployment seeds the one its console shows) is offered as the
+    # prefill, so the person confirms it rather than types it again: the page
+    # sends it on Continue like a typed name, the writer puts it into
+    # IDENTITY.md, and from then on the file is the source. Nothing is offered
+    # under lockdown, where the step saves nothing: a disabled field must not
+    # show a name the file does not hold.
+    agent_name = _line_value(identity_lines, "- **Name:**")
+    agent_name_prefill = None
+    if agent_name is None and personal and identity_pristine.get("name", True) and not facts.lockdown:
+        agent_name_prefill = facts.agent_display_name
     detail = {
         "name": name,
         "name_source": name_source,
@@ -623,7 +666,8 @@ def _profile_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str
         "quiet_end": quiet[1],
         "quiet_is_default": quiet == quiet_default,
         "language": _line_value(user_lines, "- **Language:**"),
-        "agent_name": _line_value(identity_lines, "- **Name:**"),
+        "agent_name": agent_name,
+        "agent_name_prefill": agent_name_prefill,
         "agent_emoji": _line_value(identity_lines, "- **Emoji:**"),
         "about_set": bool(personal and not user_pristine.get("work", False)
                           and _line_value(user_lines, "**Work:**") is not None),
