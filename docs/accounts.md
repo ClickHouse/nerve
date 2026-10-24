@@ -241,6 +241,7 @@ These columns store actor IDs:
 | `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
 | `session_wakeups.created_by_actor_id`, `session_wakeups.caused_by_actor_id` | Who scheduled a wakeup or a deferred message, and on whose behalf. The turn that it fires runs in its session, for the session's cause |
 | `cron_logs.actor_id`, `cron_logs.caused_by_actor_id` | Who started a cron or source run, and on whose behalf |
+| `task_comments.actor_id`, `task_comments.caused_by_actor_id` | Who wrote a task comment, and on whose behalf |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns

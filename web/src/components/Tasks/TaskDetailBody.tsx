@@ -5,12 +5,13 @@ import { Button, IconButton } from '../ui';
 import { Calendar, Edit3, ExternalLink, Eye, History, Save } from '../ui/icons';
 import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { TaskComments } from './TaskComments';
 import { TaskPlan } from './TaskPlan';
 import { TaskTimeline } from './TaskTimeline';
 
 /**
  * The task editor itself: metadata row, the task's plan, edit/preview
- * toggle, markdown body, save.
+ * toggle, markdown body, save, and in preview the comments.
  *
  * Shared by the full page and the board's modal so the two can't drift.
  * Only the surrounding chrome differs: the page supplies a back button and
@@ -153,10 +154,13 @@ export function TaskDetailBody({ task }: { task: Task }) {
           placeholder="Task content..."
         />
       ) : (
+        // The comments scroll with the content, so they read as the task's
+        // discussion, after the task itself.
         <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
           {localContent
             ? <MarkdownContent content={localContent} />
             : <span className="text-text-faint italic">No content</span>}
+          <TaskComments taskId={task.id} refreshKey={task.updated_at} />
         </div>
       )}
     </div>

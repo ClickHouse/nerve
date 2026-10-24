@@ -333,6 +333,83 @@ class TaskStore:
             if live.get(task_id) == to_status
         }
 
+    # ── Comments (task_comments) ─────────────────────────────────────────
+    #
+    # Adding or deleting a comment also changes the task row in the same
+    # transaction: ``comment_count`` so that each reader of the row has the
+    # count, ``updated_at`` so that the task broadcast tells an open task view
+    # and the board to show the change, and ``revision`` because ``task_read``
+    # shows comments, so an agent that read the task before the change must
+    # read it again before a guarded write.
+
+    async def add_task_comment(
+        self, task_id: str, body: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> dict | None:
+        """Add a comment to a task and return its row.
+
+        Returns ``None`` and writes nothing when the task does not exist.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            cursor = await self.db.execute(
+                "UPDATE tasks SET comment_count = comment_count + 1, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
+                (now, task_id),
+            )
+            found = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if not found:
+                return None
+            cursor = await self.db.execute(
+                "INSERT INTO task_comments "
+                "(task_id, body, actor_id, caused_by_actor_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, body, attribution.actor_id, attribution.caused_by_actor_id, now),
+            )
+            comment_id = cursor.lastrowid
+            await cursor.close()
+            async with self.db.execute(
+                "SELECT * FROM task_comments WHERE id = ?", (comment_id,),
+            ) as cursor:
+                return dict(await cursor.fetchone())
+
+    async def get_task_comment(self, comment_id: int) -> dict | None:
+        async with self.db.execute(
+            "SELECT * FROM task_comments WHERE id = ?", (comment_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_task_comments(self, task_id: str, limit: int = -1) -> list[dict]:
+        """The newest ``limit`` comments of a task, oldest first.
+
+        The default ``-1`` is SQLite's "no limit": all comments.
+        """
+        async with self.db.execute(
+            "SELECT * FROM (SELECT * FROM task_comments WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+            (task_id, limit),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+    async def delete_task_comment(self, task_id: str, comment_id: int) -> bool:
+        """Delete one comment of a task. ``False`` when the task has no such comment."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._atomic():
+            cursor = await self.db.execute(
+                "DELETE FROM task_comments WHERE id = ? AND task_id = ?",
+                (comment_id, task_id),
+            )
+            deleted = (cursor.rowcount or 0) == 1
+            await cursor.close()
+            if deleted:
+                await self.db.execute(
+                    "UPDATE tasks SET comment_count = comment_count - 1, updated_at = ?, "
+                    "revision = revision + 1 WHERE id = ?",
+                    (now, task_id),
+                )
+        return deleted
+
     # ── Board ordering (tasks.position) ──────────────────────────────────
     #
     # Lanes sort by ``position ASC``, so a *lower* rank is *higher* in the
