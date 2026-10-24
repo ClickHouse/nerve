@@ -272,7 +272,6 @@ def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseExcep
         timestamp=updated_at or datetime.now(timezone.utc).isoformat(),
         metadata={
             "reason": reason,
-            "unread": notif.get("unread", False),
             "subject_type": subject_type,
             "subject_url": html_url,
             "repo_name": repo_name,
@@ -322,7 +321,15 @@ class GitHubSource(Source):
 
         try:
             # Query params go in the URL — -f flags would force POST
-            endpoint = f"notifications?since={since}&participating=true"
+            # `all=true` lists read threads too: GitHub marks a thread read as
+            # soon as a mail client renders the notification email with its
+            # images, which can happen within seconds of the notification, so
+            # the unread state says nothing about what this instance has seen.
+            # Storage skips a re-listed thread whose stored record is
+            # unchanged, which is why the record carries no read state. A
+            # read thread that moved long after it was last read is left out
+            # (see _own_update): that is the account's own merge or review.
+            endpoint = f"notifications?since={since}&participating=true&all=true"
             # `since` filters on when a thread last notified, not on the
             # returned `updated_at`, so read every page of the window.
             proc = await asyncio.create_subprocess_exec(
@@ -343,7 +350,10 @@ class GitHubSource(Source):
                 for line in stdout.decode().split("\n")
                 if line.strip()
             ]
-            notifications = list({n.get("id", ""): n for n in listing}.values())
+            notifications = [
+                n for n in {n.get("id", ""): n for n in listing}.values()
+                if not self._own_update(n)
+            ]
 
             # Enrich notifications with actual content in parallel
             sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
@@ -379,6 +389,26 @@ class GitHubSource(Source):
         except Exception as e:
             logger.error("GitHub error: %s", e)
             return FetchResult(records=[], next_cursor=cursor)
+
+    @staticmethod
+    def _own_update(notif: dict) -> bool:
+        """Whether a thread moved without becoming unread, long after it was
+        last read.
+
+        GitHub moves the thread of the account's own merge or review about
+        twenty seconds after the action and leaves it read, so such a move
+        is no news. A thread read within a minute before its update is kept:
+        a mail client's read of the notification email can be stamped up to
+        a few seconds before GitHub stamps the update itself.
+        """
+        if notif.get("unread", True) or not notif.get("last_read_at"):
+            return False
+        try:
+            updated = datetime.fromisoformat(str(notif.get("updated_at", "")))
+            read = datetime.fromisoformat(str(notif["last_read_at"]))
+            return updated - read > timedelta(seconds=60)
+        except (ValueError, TypeError, OverflowError):
+            return False
 
     # ------------------------------------------------------------------
     # Enrichment helpers
