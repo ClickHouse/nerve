@@ -32,7 +32,7 @@ import click
 import yaml
 
 from nerve import paths
-from nerve.config import DEFAULT_MODEL, workspace_settings_file
+from nerve.config import DEFAULT_MODEL, default_timezone, workspace_settings_file
 from nerve.setup_writer import (
     CONFIG_YAML_HEADER,
     CORE_CRONS,
@@ -1112,7 +1112,7 @@ class SetupWizard:
         )
         click.echo()
         self.choices.user_name = click.prompt("Your name", default="")
-        self.choices.timezone = click.prompt("Your timezone", default="America/New_York")
+        self.choices.timezone = click.prompt("Your timezone", default=default_timezone())
         click.echo()
         click.secho(
             "  You can customize Nerve's name, personality, and style later\n"
@@ -2581,7 +2581,7 @@ def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) 
     choices.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
     default_ws = _DOCKER_WORKSPACE if is_docker else "~/nerve-workspace"
     choices.workspace_path = Path(os.environ.get("NERVE_WORKSPACE", default_ws))
-    choices.timezone = os.environ.get("NERVE_TIMEZONE", "America/New_York")
+    choices.timezone = default_timezone()
     choices.telegram_bot_token = os.environ.get("NERVE_TELEGRAM_BOT_TOKEN", "")
     # Comma-separated Telegram user IDs allowed to DM the bot. Without this
     # the bot starts in pairing mode (authorize via `nerve pair`).

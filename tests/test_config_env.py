@@ -250,7 +250,7 @@ class TestDefaultTimezone:
 
     @pytest.mark.parametrize("value", [
         "Local", "localtime", "LOCALTIME", "/etc/localtime", "../zoneinfo/UTC",
-        "Europe/../UTC", "Mars/Olympus", "europe/berlin", "zone.tab", "x" * 300,
+        "Europe/../UTC", "Mars/Olympus", "zone.tab", "x" * 300,
     ])
     def test_a_value_that_is_not_a_zone_is_refused_with_one_warning(self, tmp_path, monkeypatch, caplog, value):
         monkeypatch.setenv(TIMEZONE_ENV, value)

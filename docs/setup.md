@@ -569,7 +569,7 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 |---|---|---|
 | `NERVE_MODE` | `personal` | `personal` or `worker` — this is how an unattended install chooses the mode |
 | `NERVE_WORKSPACE` | `~/nerve-workspace` | Workspace directory |
-| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone, written to `settings.yaml`. When the variable is also in the environment of the Nerve process, it is the default time zone ([Configuration](config.md#core)) |
+| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone, written to `settings.yaml`. An empty value or a value that is not a time zone name gives `America/New_York`. When the variable is also in the environment of the Nerve process, it is the default time zone ([Configuration](config.md#core)) |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
 | `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
