@@ -308,14 +308,18 @@ step recorded:
   instance lacks (first response to alerts without an alert source) appears
   under what it needs from you.
 - **With nothing chosen** (a personal install, or a worker with nothing
-  ticked) it says that it is set up by talking to it, offers the work catalog
-  by group, each item with its one-line description (a personal install lists
-  personal-assistant work first), and asks which apply. A worker with only
-  "Anything it must know or never do?" filled in gets the list too.
+  ticked) it greets you, says in one sentence that it is set up by talking to
+  it, and shows one form with one question, "What should I help you with?",
+  with a checkbox for each of: review pull requests, fix issues and open pull
+  requests, keep CI healthy, research and reports, and, on a personal install,
+  personal assistant. **Other…** takes work in your own words; the agent knows
+  the full work catalog and uses it to understand that answer, but does not
+  list it. A worker with only "Anything it must know or never do?" filled in
+  gets the same form.
 - **With a note from an older setup page, or from `nerve init --terminal`**
   (free text), a note that describes the work is handled like chosen work; a
   note with only rules ("never merge anything") or only repositories gets the
-  list.
+  form.
 
 Whatever you wrote under "Anything it must know or never do?" (or as rules in
 a note) becomes hard rules and approval boundaries in its proposal, and an

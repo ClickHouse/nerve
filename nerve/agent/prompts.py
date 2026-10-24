@@ -5,6 +5,7 @@ cross-session-stable system prompt, and renders the per-session preamble
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from nerve.agent.tools import build_default_registry
 from nerve.memory import loom_prompts
 from nerve.onboarding_catalog import (
     CATALOG,
+    FIRST_FORM_OPTIONS,
     GROUP_LABELS,
     GROUPS,
     PERSONAL_ASSISTANT,
@@ -256,26 +258,56 @@ def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: 
 
 # --- The onboarding conversation's prompt -----------------------------------
 
-# What the agent can offer in its first message: the work catalog's labels
-# (:mod:`nerve.onboarding_catalog`, the Mode step's checkboxes), then the
-# personal assistant. The list is offered when the agent knows no work yet:
-# nothing chosen at setup, only rules, or a free-text note with only rules or
-# only targets. It is offered by group, each item with its one-line
-# description (:func:`_offer_menu`); a personal install leads with the
-# personal assistant, and a worker's list leaves it out.
-ONBOARDING_OFFERS = tuple(item.label for item in CATALOG) + (PERSONAL_ASSISTANT,)
+# When the agent knows no work yet (nothing chosen at setup, only rules, or a
+# free-text note with only rules or only targets), its first message is two
+# sentences and one form: one ``multi`` question with the options of
+# :data:`nerve.onboarding_catalog.FIRST_FORM_OPTIONS`, given as fixed
+# ``ask_form`` arguments (:func:`first_form_arguments`), so that the form is
+# the same every time. The catalog follows as reference for answers given in
+# Other… and is never listed (:func:`_catalog_reference`).
+
+#: The first form's one question, without its options.
+FIRST_FORM_QUESTION = {
+    "id": "work",
+    "kind": "multi",
+    "label": "Work",
+    "question": "What should I help you with?",
+    "help": "So that I set up only what you need.",
+}
+
+# Follows the greeting in each first message that asks what the work is.
+_FIRST_FORM = """\
+Then say in one sentence that you are set up by talking to you, now and at \
+any time later. Then call `ask_form` once, with exactly these arguments:
+
+```json
+{arguments}
+```
+
+Write no other text: no list of what you can do, and no other question. Step \
+2's rule on the text before a form does not apply to this first form. Without \
+`ask_form` (see Rules), ask the same question in one plain message and name \
+the options in one sentence. The answer comes back as the result of the call, \
+in this turn; then go on with steps 1 and 2 below."""
+
+# The catalog, for answers given in Other…; never shown to the person.
+_CATALOG_REFERENCE = """\
+### The work catalog: reference only, do not list
+
+What Nerve can set up: use it to understand an answer given in Other… and to \
+plan the work. Never list it or offer it, in this message or later.
+
+{catalog}"""
 
 # The first message without a description: the person names the work.
 _FIRST_MESSAGE_OFFERS = """\
 ## Your first message
 
-{greet}. In two or three sentences, say that you are set up by talking to \
-you, now and at any time later. Then offer this list, as it is, and ask which \
-items apply; they can choose more than one, or describe something else:
-
-{offers}
+{greet}, in one sentence. {form}
 
 Change nothing in this first message.
+
+{catalog}
 """
 
 # The first message when the work was chosen at setup (catalog items, custom
@@ -311,24 +343,21 @@ the person saw the list of work at setup.
 """
 
 # The first message when only rules were given at setup: no work is known, so
-# the list is offered, and the rules carry into the plan.
+# the first form asks for it, and the rules carry into the plan.
 _FIRST_MESSAGE_RULES_ONLY = """\
 ## Your first message
 
-Nothing was ticked at setup, only rules. {greet}, say in one sentence that \
-you noted the rules, and in two or three sentences say that you are set up by \
-talking to you, now and at any time later. Then offer this list, as it is, \
-and ask which items apply; they can choose more than one, or describe \
-something else:
-
-{offers}
+Nothing was ticked at setup, only rules. {greet} and say that you noted the \
+rules, in one sentence. {form}
 
 Change nothing in this first message.
+
+{catalog}
 """
 
 # The first message with a description. A note that describes work gets no
 # menu: the work starts at once, explained before anything is asked. A note
-# that names no work (only rules, only targets) still gets the list.
+# that names no work (only rules, only targets) gets the first form.
 _FIRST_MESSAGE_DESCRIBED = """\
 ## Your first message
 
@@ -349,17 +378,14 @@ questions with `ask_form` (step 2 below). Targets the note leaves out \
 you ask for as step 1 says.
 
 **When the note names no work** (only rules, such as "never merge anything", \
-or only targets, such as "org/repo-a"), offer the list. {greet}, say in one \
-sentence what you noted, and in two or three sentences say that you are set \
-up by talking to you, now and at any time later. Then offer this list, as it \
-is, and ask which items apply; they can choose more than one, or describe \
-something else:
-
-{offers}
+or only targets, such as "org/repo-a"), ask what the work is. {greet} and say \
+what you noted, in one sentence. {form}
 
 Carry the note into the plan: its rules become hard rules and approval \
 boundaries, and its targets are what the explorer studies once the work is \
 known.
+
+{catalog}
 """
 
 # Follows the facts Nerve gathered about the instance
@@ -686,15 +712,34 @@ def _menu_line(item: WorkItem) -> str:
     return f"- {item.label} — {item.description}" + (f" {item.note}" if item.note else "")
 
 
-def _offer_menu(worker: bool) -> str:
-    """The list a first message offers: the catalog by group, each item with
-    its description; a personal install leads with the personal assistant,
-    which a worker's list leaves out."""
-    blocks = [] if worker else [f"- {PERSONAL_ASSISTANT}"]
+def first_form_arguments(worker: bool) -> dict[str, Any]:
+    """The ``ask_form`` arguments of the first form: :data:`FIRST_FORM_QUESTION`
+    with the options of :data:`nerve.onboarding_catalog.FIRST_FORM_OPTIONS`
+    (a worker's without the personal assistant), Other… on, an answer
+    required."""
+    options = [
+        {"label": label, "description": description}
+        for label, description in FIRST_FORM_OPTIONS
+        if not (worker and label == PERSONAL_ASSISTANT)
+    ]
+    question = {**FIRST_FORM_QUESTION, "options": options, "allow_other": True, "required": True}
+    return {"questions": [question]}
+
+
+def _first_form(worker: bool) -> str:
+    """The instructions for the first form, with its arguments as JSON."""
+    arguments = json.dumps(first_form_arguments(worker), indent=2, ensure_ascii=False)
+    return _FIRST_FORM.replace("{arguments}", arguments)
+
+
+def _catalog_reference() -> str:
+    """The catalog by group, each item with its description: the reference
+    for answers given in Other…, under a heading that says not to list it."""
+    blocks = []
     for group in GROUPS:
         items = [_menu_line(item) for item in CATALOG if item.group == group]
         blocks.append("\n".join([f"**{GROUP_LABELS[group]}**", *items]))
-    return "\n\n".join(blocks)
+    return _CATALOG_REFERENCE.replace("{catalog}", "\n\n".join(blocks))
 
 
 def _quote(text: str) -> str:
@@ -801,14 +846,20 @@ def onboarding_prompt(
       without a menu that explains first (restates the work, names what the
       explorer studies, sketches the setup it intends), then starts a
       background explorer and asks its first questions in the same turn.
-    - ``work`` with only rules: the same section, the list (by group, with
-      descriptions; :func:`_offer_menu`), and the rules carried into the plan.
+    - ``work`` with only rules: the same section, the first form, and the
+      rules carried into the plan.
     - ``task_description``, a free-text note (an older client, ``nerve init
       --terminal``; ``work`` without items, custom work or rules, or a
       free-text ``work``, defers to it): "What the operator wrote at setup",
       and a first message that starts on the work when the note describes
-      some, else offers the list and carries the note into the plan.
-    - Nothing: the list, and the question what to do.
+      some, else asks with the first form and carries the note into the plan.
+    - Nothing: the first form.
+
+    The first form is a greeting, one sentence that the agent is set up by
+    talking to it, and one ``ask_form`` call with fixed arguments
+    (:func:`first_form_arguments`): one ``multi`` question with five options,
+    four for a worker. The catalog follows it as reference for answers given
+    in Other…, which the agent never lists (:func:`_catalog_reference`).
 
     The steps after it are shared: explore in the background (read only),
     ask with ``ask_form`` after explaining (each question of the kind its
@@ -834,13 +885,12 @@ def onboarding_prompt(
         )
     chosen = work if work is not None and not work.free_text and not work.empty else None
     name = " ".join((person_name or "").split())[:80]
-    kind = "a worker for a team" if worker else "a personal assistant"
+    agent = "this Nerve agent, which is set up as a worker for a team" if worker else "a Nerve agent"
     who = "operator" if worker else "person"
     parts = [
-        "This is the **onboarding conversation** of this Nerve agent, which is "
-        f"set up as {kind}. The person who set it up opens this chat. They do "
-        "not see this message: your answer is the first message of the "
-        "conversation, so you speak first."
+        f"This is the **onboarding conversation** of {agent}. The person who "
+        "set it up opens this chat. They do not see this message: your answer "
+        "is the first message of the conversation, so you speak first."
         + (f" The person's name is {name}." if name else "")
         + " Your first turn begins with the visible message: no tool call "
         "precedes it, and everything that message needs is in your system "
@@ -863,7 +913,8 @@ def onboarding_prompt(
     else:
         first = _FIRST_MESSAGE_DESCRIBED if description else _FIRST_MESSAGE_OFFERS
     parts.append(
-        first.replace("{offers}", _offer_menu(worker))
+        first.replace("{form}", _first_form(worker))
+        .replace("{catalog}", _catalog_reference())
         .replace("{greet}", "Greet the person by name" if name else "Greet the person without a name")
     )
     access = " ".join(github_access.split()) if facts else ""
