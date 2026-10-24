@@ -131,6 +131,12 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# The Codex model provider for ``codex.base_url``, and the child environment
+# variable that holds its bearer key (Codex reads it through ``env_key``).
+_ENDPOINT_PROVIDER = "nerve-endpoint"
+_ENDPOINT_KEY_ENV = "NERVE_CODEX_ENDPOINT_KEY"
+
+
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
 # app-server catalog, weakest first. Used only to clamp a requested effort
 # down to what the serving model advertises.
@@ -357,17 +363,24 @@ class CodexBackend:
                         return {"action": "decline"}
                     return {}
 
+                # The same endpoint provider as sessions, so that the
+                # checks below see what sessions see.
                 transport = CodexAppServerClient(
                     bin_path=self.codex.bin_path,
                     cwd=str(self.config.workspace),
-                    env={**os.environ, "CODEX_HOME": self._home_dir()},
+                    env={
+                        **os.environ, "CODEX_HOME": self._home_dir(),
+                        **self.endpoint_env(),
+                    },
                     server_request_handler=_decline,
+                    config_overrides=self.endpoint_overrides(),
                     request_timeout=10,
                 )
                 try:
                     await transport.start()
                     account = await transport.request("account/read", {}, timeout=10)
-                    if not account.get("account"):
+                    # With codex.base_url, Codex reports no account.
+                    if not account.get("account") and not self.codex.base_url:
                         raise BackendError(
                             "Codex is not authenticated. To fix: " + self.auth_hint()
                         )
@@ -424,6 +437,7 @@ class CodexBackend:
                 }
             except Exception as e:
                 result = {"available": False, "reason": str(e)}
+            result["base_url"] = self.codex.base_url
             self._preflight_cache = (time.monotonic(), result)
             return dict(result)
 
@@ -441,6 +455,7 @@ class CodexBackend:
     def build_env(self, spec: SessionSpec) -> dict[str, str]:
         env = os.environ.copy()
         env["CODEX_HOME"] = self._home_dir()
+        env.update(self.endpoint_env())
         # Session-bound bearer token for the nerve MCP endpoint —
         # referenced from the MCP config via bearer_token_env_var so the
         # token never lands in any file.
@@ -570,6 +585,8 @@ class CodexBackend:
         if not self.codex.web_search:
             overrides.append("tools.web_search=false")
 
+        overrides += self.endpoint_overrides()
+
         for key, value in (self.codex.extra_config or {}).items():
             if isinstance(value, str):
                 overrides.append(f"{key}={_toml_str(value)}")
@@ -689,6 +706,35 @@ class CodexBackend:
         if self.codex.api_key_env:
             return os.environ.get(self.codex.api_key_env) or None
         return None
+
+    def endpoint_overrides(self) -> list[str]:
+        """``--config`` overrides that send Codex to ``codex.base_url``.
+
+        Codex sends ``POST <base_url>/responses``. The only key source is
+        ``codex.api_key``: ``codex.api_key_env`` and ``openai_api_key`` can
+        hold an OpenAI key, and the endpoint is a different service. With a
+        key, the provider reads it from the child environment (``env_key``),
+        so the key is never in argv. Without a key, Codex sends no
+        credential.
+        """
+        if not self.codex.base_url:
+            return []
+        base = f"model_providers.{_ENDPOINT_PROVIDER}"
+        overrides = [
+            f"model_provider={_toml_str(_ENDPOINT_PROVIDER)}",
+            f"{base}.name={_toml_str('Nerve endpoint')}",
+            f"{base}.base_url={_toml_str(self.codex.base_url)}",
+            f'{base}.wire_api="responses"',
+        ]
+        if self.codex.api_key:
+            overrides.append(f"{base}.env_key={_toml_str(_ENDPOINT_KEY_ENV)}")
+        return overrides
+
+    def endpoint_env(self) -> dict[str, str]:
+        """The child environment for :meth:`endpoint_overrides`."""
+        if self.codex.base_url and self.codex.api_key:
+            return {_ENDPOINT_KEY_ENV: self.codex.api_key}
+        return {}
 
 
 class CodexClient(AgentClient):
@@ -895,8 +941,13 @@ class CodexClient(AgentClient):
 
         An api-key config logs in automatically (persisted in
         CODEX_HOME/auth.json); ChatGPT auth must be done once manually.
+        With ``codex.base_url`` there is no Codex login: the endpoint gets
+        the provider key or no credential, and turns are priced as API use.
         """
         backend = self._backend
+        if backend.codex.base_url:
+            self._effective_auth = "api_key"
+            return
         try:
             account = await self._transport.request("account/read", {})
         except CodexRpcError as e:

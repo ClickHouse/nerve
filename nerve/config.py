@@ -3239,6 +3239,9 @@ class CodexConfig:
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
     api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
+    # OpenAI-compatible endpoint that serves the Responses API, with the
+    # version path (http://127.0.0.1:4000/v1). Empty: Codex's own provider.
+    base_url: str = ""
     sandbox: str = "danger-full-access"     # read-only | workspace-write | danger-full-access
     approval_policy: str = "never"          # never | on-request | untrusted
     # nerve effort vocabulary -> codex reasoning effort string
@@ -3284,6 +3287,20 @@ class CodexConfig:
         raw_effort = d.get("effort_map") or {}
         if isinstance(raw_effort, dict):
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
+        # Checked at load also while codex is not a selected backend:
+        # workflow runs and review-loop legs can start Codex sessions.
+        base_url = str(d.get("base_url") or "").strip()
+        _checked_http_url(base_url, "codex.base_url")
+        base_url = base_url.removesuffix("/")
+        ultracode = UltracodeConfig.from_dict(d.get("ultracode"))
+        if base_url and ultracode.enabled:
+            # Ultracode workers do not use the endpoint. A warning and not an
+            # error, so that this setting cannot stop Nerve from starting.
+            logger.warning(
+                "codex.ultracode.enabled is ignored because codex.base_url is "
+                "set: Ultracode workers do not use the endpoint"
+            )
+            ultracode.enabled = False
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
@@ -3297,6 +3314,7 @@ class CodexConfig:
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
+            base_url=base_url,
             sandbox=str(d.get("sandbox", "danger-full-access")),
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
@@ -3307,7 +3325,7 @@ class CodexConfig:
             ),
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
-            ultracode=UltracodeConfig.from_dict(d.get("ultracode")),
+            ultracode=ultracode,
         )
 
     def validate(self) -> list[str]:

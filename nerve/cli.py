@@ -2858,6 +2858,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
     if json_output:
         click.echo(json.dumps(report, indent=2, sort_keys=True))
     else:
+        if status.get("base_url"):
+            click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
             click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
