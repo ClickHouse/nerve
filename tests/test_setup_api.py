@@ -1204,6 +1204,21 @@ class TestProfile:
             response = await http.put("/api/setup/profile", json={"quiet_start": "25:99"})
             assert response.status_code == 400 and response.json()["field"] == "quiet_start"
 
+    async def test_the_time_zone_from_the_environment_is_the_default(self, claimed, monkeypatch):
+        """``NERVE_TIMEZONE`` is the default, not an answer: the step stays
+        pending, so the page prefills the browser's zone. A save records it."""
+        monkeypatch.setenv("NERVE_TIMEZONE", "Europe/Berlin")
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            profile = step(state, "profile")
+            assert profile["status"] == "pending"
+            assert profile["detail"]["timezone"] == "Europe/Berlin"
+            assert profile["detail"]["timezone_is_default"] is True
+            state = (await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})).json()
+        assert step(state, "profile")["status"] == "done"
+        assert claimed.settings_yaml()["timezone"] == "Europe/Berlin"
+
 
 # --------------------------------------------------------------------------- #
 #  Memory, sources, automation, agents                                         #

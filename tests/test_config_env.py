@@ -1,8 +1,19 @@
-"""Tests for ${ENV_VAR} interpolation in config loading."""
+"""Tests for ${ENV_VAR} interpolation and environment defaults in config loading."""
+
+import logging
 
 import pytest
 
-from nerve.config import ConfigError, _resolve_env_refs, load_config
+from nerve import config as config_module
+from nerve.config import (
+    FALLBACK_TIMEZONE,
+    TIMEZONE_ENV,
+    ConfigError,
+    NerveConfig,
+    _resolve_env_refs,
+    default_timezone,
+    load_config,
+)
 
 
 class TestResolveEnvRefs:
@@ -187,6 +198,78 @@ class TestLoadConfigInterpolation:
         )
         cfg = load_config(tmp_path)
         assert cfg.openai_api_key == "sk-openai-env"
+
+
+class TestDefaultTimezone:
+    """``NERVE_TIMEZONE`` is the default time zone when no settings layer names one."""
+
+    @pytest.fixture(autouse=True)
+    def _no_refusals_logged(self, monkeypatch):
+        monkeypatch.setattr(config_module, "_refused_env_timezones", set())
+
+    @staticmethod
+    def _install(tmp_path, config_yaml: str = "", settings_yaml: str | None = None):
+        ws = tmp_path / "ws"
+        (tmp_path / "config.yaml").write_text(f"workspace: {ws}\n{config_yaml}", encoding="utf-8")
+        if settings_yaml is not None:
+            (ws / "config").mkdir(parents=True)
+            (ws / "config" / "settings.yaml").write_text(settings_yaml, encoding="utf-8")
+        return tmp_path
+
+    def test_without_the_variable_the_fallback(self, tmp_path):
+        assert default_timezone() == FALLBACK_TIMEZONE == "America/New_York"
+        assert NerveConfig().timezone == FALLBACK_TIMEZONE
+        assert load_config(self._install(tmp_path)).timezone == FALLBACK_TIMEZONE
+
+    def test_the_variable_is_the_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(TIMEZONE_ENV, "Europe/Berlin")
+        assert default_timezone() == "Europe/Berlin"
+        assert NerveConfig().timezone == "Europe/Berlin"
+        assert NerveConfig.from_dict({}).timezone == "Europe/Berlin"
+        assert load_config(self._install(tmp_path)).timezone == "Europe/Berlin"
+
+    def test_surrounding_space_is_removed(self, monkeypatch):
+        monkeypatch.setenv(TIMEZONE_ENV, "  Asia/Tokyo\n")
+        assert default_timezone() == "Asia/Tokyo"
+
+    @pytest.mark.parametrize("layer", ["config", "settings"])
+    def test_a_settings_layer_that_names_one_wins(self, tmp_path, monkeypatch, layer):
+        monkeypatch.setenv(TIMEZONE_ENV, "Europe/Berlin")
+        if layer == "config":
+            install = self._install(tmp_path, config_yaml="timezone: UTC\n")
+        else:
+            install = self._install(tmp_path, settings_yaml="timezone: UTC\n")
+        assert load_config(install).timezone == "UTC"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_an_empty_variable_is_unset(self, monkeypatch, caplog, value):
+        monkeypatch.setenv(TIMEZONE_ENV, value)
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            assert default_timezone() == FALLBACK_TIMEZONE
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", [
+        "Local", "localtime", "LOCALTIME", "/etc/localtime", "../zoneinfo/UTC",
+        "Europe/../UTC", "Mars/Olympus", "europe/berlin", "zone.tab", "x" * 300,
+    ])
+    def test_a_value_that_is_not_a_zone_is_refused_with_one_warning(self, tmp_path, monkeypatch, caplog, value):
+        monkeypatch.setenv(TIMEZONE_ENV, value)
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            assert default_timezone() == FALLBACK_TIMEZONE
+            assert NerveConfig().timezone == FALLBACK_TIMEZONE
+            assert load_config(self._install(tmp_path)).timezone == FALLBACK_TIMEZONE
+        warnings = [r for r in caplog.records if TIMEZONE_ENV in r.getMessage()]
+        assert len(warnings) == 1
+        assert FALLBACK_TIMEZONE in warnings[0].getMessage()
+
+    def test_each_refused_value_is_logged(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            for value in ("Local", "Mars/Olympus", "Local"):
+                monkeypatch.setenv(TIMEZONE_ENV, value)
+                default_timezone()
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 2
+        assert "'Local'" in messages[0] and "'Mars/Olympus'" in messages[1]
 
 
 class TestScalarCoercion:

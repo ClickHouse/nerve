@@ -201,6 +201,16 @@ def _no_ambient_system_principal(monkeypatch):
     monkeypatch.delenv(SYSTEM_PRINCIPAL_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_timezone(monkeypatch):
+    """Strip ``NERVE_TIMEZONE`` from the developer shell.
+
+    Nerve uses it as the default time zone when no settings layer names one.
+    Tests about it set the variable themselves.
+    """
+    monkeypatch.delenv(nerve.config.TIMEZONE_ENV, raising=False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _deterministic_umask():
     """Run the suite under umask 022, whatever the developer's shell has.

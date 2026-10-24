@@ -323,7 +323,8 @@ and a `detail` object with the current values, secrets masked.
 A step is `done` because a fact says so — `mode` when `SOUL.md` exists;
 `provider` when a credential is configured (including one from the gateway's
 environment, reported as `"credential": "environment"`); `profile` when the
-time zone differs from the default or `USER.md` carries a name; `channels`
+time zone differs from the default (`NERVE_TIMEZONE`, else `America/New_York`;
+see [config.md](config.md#core)) or `USER.md` carries a name; `channels`
 when a Telegram or Slack token is stored; `sources`/`agents`/`automation`
 when something is enabled or the step was answered — so an instance set up at
 the terminal or from the environment shows the same list. `done` beats

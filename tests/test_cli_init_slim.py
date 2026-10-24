@@ -505,6 +505,24 @@ class TestStatusAndDoctor:
         assert "Telegram bot failed to start at the last boot: InvalidToken" in report
         assert "<token>" in report
 
+    def test_doctor_reads_the_time_zone_from_the_environment_as_the_default(self, tmp_path, no_daemon, monkeypatch):
+        """``NERVE_TIMEZONE`` is the default, not an answer: About you stays open."""
+        from nerve import setup_state
+        from nerve.setup_writer import apply_mode, merge_private_paths
+
+        monkeypatch.setenv("NERVE_TIMEZONE", "Europe/Berlin")
+        config_dir = tmp_path / "config"
+        ws = tmp_path / "ws"
+        assert _init(config_dir, "--workspace", str(ws), "--port", "8977", "--no-start", *_FLAGS).exit_code == 0
+        _claimed_db()
+        apply_mode(ws, "personal")
+        merge_private_paths(config_dir / "config.local.yaml", {"anthropic_api_key": "sk-ant-REPLACE0000000000"})
+        state = setup_state.SetupState(skipped={"memory", "channels", "sources", "agents"}, answered={"automation"})
+        setup_state.save_state(state)
+        config = load_config(config_dir)
+        assert config.timezone == "Europe/Berlin"
+        assert "[WARN] Setup checklist incomplete (steps: profile)" in cli.doctor_report(config)
+
 
 class TestDockerSlim:
     @pytest.fixture

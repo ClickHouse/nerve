@@ -48,7 +48,7 @@ from nerve import (
     setup_state,
     setup_telegram_login,
 )
-from nerve.config import DEFAULT_MODEL, NerveConfig, get_config
+from nerve.config import DEFAULT_MODEL, NerveConfig, default_timezone, get_config
 from nerve.config_reload import reload_all, reload_failures
 from nerve.db.accounts import AccountError, NotClaimableError, UsernameTakenError
 from nerve.gateway.auth import (
@@ -552,6 +552,7 @@ async def _context(actor: Actor) -> _Context:
         telegram_start_error=setup_state.boot_errors_for_current_boot(state).get("telegram"),
         env_credential=env_key or env_oauth,
         env_oauth_only=env_oauth and not env_key,
+        default_timezone=default_timezone(),
         onboarding=onboarding,
         onboarding_session_id=onboarding_id,
         onboarding_kind=onboarding_kind,
