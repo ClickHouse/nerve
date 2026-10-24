@@ -71,9 +71,15 @@ class GitHubReposSource(Source):
 
         # Flatten into (repo, issue) pairs, skipping repos that errored.
         items: list[tuple[str, dict]] = []
+        fetch_failed = False
         for repo, res in zip(self._repos, results):
             if isinstance(res, Exception):
                 logger.warning("github_repos: fetch failed for %s: %s", repo, res)
+                fetch_failed = True
+                continue
+            if res is None:
+                logger.warning("github_repos: fetch failed for %s", repo)
+                fetch_failed = True
                 continue
             for issue in res:
                 if isinstance(issue, dict):
@@ -84,6 +90,11 @@ class GitHubReposSource(Source):
 
         # First run: establish baseline cursor, don't backfill history.
         if cursor is None:
+            if fetch_failed:
+                logger.info(
+                    "github_repos: first run incomplete, baseline not established",
+                )
+                return FetchResult(records=[], next_cursor=None)
             newest_ts = max(
                 (it.get("created_at", "") for _, it in items),
                 default=None,
@@ -108,9 +119,13 @@ class GitHubReposSource(Source):
         new_items.sort(key=lambda ri: ri[1].get("created_at", ""))
         records = [self._issue_to_record(repo, it) for repo, it in new_items]
 
-        # Advance cursor to the newest created_at we just ingested.
+        # Successful repositories can be ingested immediately, but a shared
+        # cursor is safe to advance only after every repository was observed.
+        # Unchanged retries from healthy repositories are deduplicated by
+        # (source, id).
         newest_ts = max(it.get("created_at", "") for _, it in new_items)
-        return FetchResult(records=records, next_cursor=newest_ts, has_more=False)
+        next_cursor = cursor if fetch_failed else newest_ts
+        return FetchResult(records=records, next_cursor=next_cursor, has_more=False)
 
     # ------------------------------------------------------------------
     # Fetch + formatting helpers
@@ -118,11 +133,11 @@ class GitHubReposSource(Source):
 
     async def _fetch_repo(
         self, repo: str, per_page: int, sem: asyncio.Semaphore,
-    ) -> list[dict]:
+    ) -> list[dict] | None:
         """Fetch the most-recently-created issues+PRs for a single repo.
 
         Returns a list of issue dicts (PRs included — they carry a
-        ``pull_request`` key). Returns [] on any error.
+        ``pull_request`` key), or ``None`` on error.
         """
         endpoint = (
             f"repos/{repo}/issues"
@@ -131,7 +146,7 @@ class GitHubReposSource(Source):
         async with sem:
             data = await self._gh_api_get(endpoint)
         if not isinstance(data, list):
-            return []
+            return None
         return data
 
     def _issue_to_record(self, repo: str, issue: dict) -> SourceRecord:
