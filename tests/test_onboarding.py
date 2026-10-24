@@ -266,7 +266,8 @@ class TestPrompt:
             "Then say in one sentence that you are set up by talking to you, now and at any time later.",
             "Then call `ask_form` once, with exactly these arguments:",
             "Write no other text: no list of what you can do, and no other question.",
-            "Step 2's rule on the text before a form does not apply to this first form.",
+            "Step 2's rule on the text before a form does not apply to this first form, and this "
+            "form is not one of step 2's rounds.",
             "The answer comes back as the result of the call, in this turn; then go on with steps 1 "
             "and 2 below.",
             "Change nothing in this first message.",
@@ -292,6 +293,8 @@ class TestPrompt:
         assert [o["label"] for o in shown["questions"][0]["options"]] == _form_options(mode)
         assert not [line for line in _message_text(first).splitlines() if line.startswith("- ")]
         assert "more than one" not in prompt and "offer this list" not in prompt
+        # Without ask_form, the one fallback in Rules applies.
+        assert "Without `ask_form`" not in first
         assert "Restate the work" not in prompt
         assert "you speak first" in prompt
         assert "chose at setup" not in prompt
@@ -599,9 +602,9 @@ class TestPrompt:
             "Pitch nothing that setup already configured (channels, sources, quiet hours, memory)",
             'the plan\'s last section, "Later, if you want": at most three one-liners',
             # No re-offer of the kinds of work the person passed over, in
-            # the Mode step's checkboxes or in the first message's list.
-            "none of them a kind of work from the list that the person saw, at setup or in your "
-            "first message, and did not choose",
+            # the Mode step's checkboxes or in the first message's form.
+            "none of them a kind of work from the options that the person saw, at setup or in the "
+            "form of your first message, and did not choose",
             "Outside it, pitch nothing",
         ):
             assert part in features, part

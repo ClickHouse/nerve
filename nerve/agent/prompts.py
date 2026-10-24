@@ -258,14 +258,6 @@ def worker_onboarding_prompt(task_description: str, guide: str, memory_backend: 
 
 # --- The onboarding conversation's prompt -----------------------------------
 
-# When the agent knows no work yet (nothing chosen at setup, only rules, or a
-# free-text note with only rules or only targets), its first message is two
-# sentences and one form: one ``multi`` question with the options of
-# :data:`nerve.onboarding_catalog.FIRST_FORM_OPTIONS`, given as fixed
-# ``ask_form`` arguments (:func:`first_form_arguments`), so that the form is
-# the same every time. The catalog follows as reference for answers given in
-# Other… and is never listed (:func:`_catalog_reference`).
-
 #: The first form's one question, without its options.
 FIRST_FORM_QUESTION = {
     "id": "work",
@@ -285,10 +277,9 @@ any time later. Then call `ask_form` once, with exactly these arguments:
 ```
 
 Write no other text: no list of what you can do, and no other question. Step \
-2's rule on the text before a form does not apply to this first form. Without \
-`ask_form` (see Rules), ask the same question in one plain message and name \
-the options in one sentence. The answer comes back as the result of the call, \
-in this turn; then go on with steps 1 and 2 below."""
+2's rule on the text before a form does not apply to this first form, and \
+this form is not one of step 2's rounds. The answer comes back as the result \
+of the call, in this turn; then go on with steps 1 and 2 below."""
 
 # The catalog, for answers given in Other…; never shown to the person.
 _CATALOG_REFERENCE = """\
@@ -443,8 +434,8 @@ no feature tour. Pitch nothing that setup already configured (channels, \
 sources, quiet hours, memory) and nothing this work does not need.
 - Optional extras go only into the plan's last section, "Later, if you \
 want": at most three one-liners, and none of them a kind of work from the \
-list that the person saw, at setup or in your first message, and did not \
-choose. Outside it, pitch nothing.
+options that the person saw, at setup or in the form of your first \
+message, and did not choose. Outside it, pitch nothing.
 """
 
 _EXPLORE_STEP = """\
