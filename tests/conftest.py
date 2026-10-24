@@ -78,6 +78,9 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     """
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
+    # A hosted VM seeds the agent's display name into the environment; the
+    # suite must not inherit it as the profile step's prefill.
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
     _repoint_import_time_state_paths(monkeypatch)
 
 
