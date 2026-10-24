@@ -267,19 +267,28 @@ FIRST_FORM_QUESTION = {
     "help": "So that I set up only what you need.",
 }
 
-# Follows the greeting in each first message that asks what the work is.
+#: The paragraph before the first form, after the opening.
+FIRST_FORM_LEAD = "Let's start with a few questions so I understand how I can help you."
+
+# Each first message that asks what the work is. ``{noted}`` is empty, or
+# the sentence about what setup recorded without naming work.
 _FIRST_FORM = """\
-Then say in one sentence that you are set up by talking to you, now and at \
-any time later. Then call `ask_form` once, with exactly these arguments:
+Open with this paragraph, word for word: “{opening}”{noted} Then write this \
+paragraph, word for word: “{lead}” Then call `ask_form` once, with exactly \
+these arguments:
 
 ```json
 {arguments}
 ```
 
-Write no other text: no list of what you can do, and no other question. Step \
-2's rule on the text before a form does not apply to this first form, and \
-this form is not one of step 2's rounds. The answer comes back as the result \
-of the call, in this turn; then go on with steps 1 and 2 below."""
+Write no other text: no list of what you can do, and no other question. \
+This form has no intro: step 2's rule on the intro does not apply to it, and \
+it is not one of step 2's rounds. The answer comes back as the result of the \
+call, in this turn; then go on with steps 1 and 2 below, where every form \
+has an intro."""
+
+_NOTED_RULES = " Then say in one sentence that you noted the rules."
+_NOTED_NOTE = " Then say in one sentence what you noted."
 
 # The catalog, for answers given in Other…; never shown to the person.
 _CATALOG_REFERENCE = """\
@@ -294,7 +303,7 @@ plan the work. Never list it or offer it, in this message or later.
 _FIRST_MESSAGE_OFFERS = """\
 ## Your first message
 
-{greet}, in one sentence. {form}
+{form}
 
 Change nothing in this first message.
 
@@ -311,7 +320,7 @@ _FIRST_MESSAGE_CHOSEN = """\
 The work was chosen at setup: offer no menu, and do not ask again what was \
 chosen. Write the message text first, before any tool call:
 
-1. {greet}.
+1. {greet}
 2. Restate the work as you understand it, in one sentence.
 3. Say in one line what the explorer will study (step 1 below), or that it \
 starts as soon as the targets are named.
@@ -338,8 +347,7 @@ the person saw the list of work at setup.
 _FIRST_MESSAGE_RULES_ONLY = """\
 ## Your first message
 
-Nothing was ticked at setup, only rules. {greet} and say that you noted the \
-rules, in one sentence. {form}
+Nothing was ticked at setup, only rules. {form}
 
 Change nothing in this first message.
 
@@ -356,7 +364,7 @@ _FIRST_MESSAGE_DESCRIBED = """\
 requests in org/repo-a"), offer no menu. Write the message text first, before \
 any tool call:
 
-1. {greet}.
+1. {greet}
 2. Restate the work as you understand it, in one sentence.
 3. Say in one line what the explorer will study (step 1 below).
 4. In two to four lines, sketch how you intend to set this up (for example a \
@@ -369,8 +377,7 @@ questions with `ask_form` (step 2 below). Targets the note leaves out \
 you ask for as step 1 says.
 
 **When the note names no work** (only rules, such as "never merge anything", \
-or only targets, such as "org/repo-a"), ask what the work is. {greet} and say \
-what you noted, in one sentence. {form}
+or only targets, such as "org/repo-a"), ask what the work is. {form}
 
 Carry the note into the plan: its rules become hard rules and approval \
 boundaries, and its targets are what the explorer studies once the work is \
@@ -488,12 +495,15 @@ URL; "not found" is a valid finding.
 _ASK_STEP = """\
 ### 2. Ask in the foreground, while the explorer works
 
-Explain before you ask. In every turn that asks, write the text first and \
-call `ask_form` after it: a form without text before it is a mistake. The \
-text says what you understood, what the explorer studies, how you intend to \
-set this up and why the questions matter. The questions go in the form, and \
-the text explains and asks none of them: until the turn ends, the person can \
-answer only the form.
+Explain before you ask, in the form's `intro`: the card shows it above the \
+questions. The person does not see your thinking, so an explanation that you \
+only think is lost, and a form without an intro is a mistake. In two to five \
+short lines, the intro says what you understood, what the explorer studies, \
+how you intend to set this up and why the questions matter. When the message \
+before the form already says this (your first message), the intro says in \
+one line why these questions matter. The intro explains and asks none of the \
+questions: they go in the form, and until the turn ends the person can answer \
+only the form.
 
 Ask only what neither the explorer nor setup can tell you, with `ask_form`: \
 one form per round, with up to six questions. At most two rounds. Give each \
@@ -527,7 +537,8 @@ read, and how reminders reach the person.
 
 Use `AskUserQuestion` only when `ask_form` is not available: one to four \
 questions per call, each with two to four options, the recommended one first, \
-and Other… for the person's own words (which repositories, which channels).
+and Other… for the person's own words (which repositories, which channels). \
+It has no intro, so write the explanation as a message before the call.
 
 Setup already recorded the mode, the person's name, the time zone and quiet \
 hours (`USER.md`, `config/settings.yaml`) and the connected channels and \
@@ -717,10 +728,27 @@ def first_form_arguments(worker: bool) -> dict[str, Any]:
     return {"questions": [question]}
 
 
-def _first_form(worker: bool) -> str:
-    """The instructions for the first form, with its arguments as JSON."""
+def onboarding_opening(person_name: str = "", agent_name: str = "") -> str:
+    """The first paragraph of the first message: a greeting with the
+    person's name, the agent's name, and how the agent is set up. Without a
+    person's name the greeting has none; without an agent's name the agent
+    is "your Nerve agent"."""
+    person = " ".join((person_name or "").split())[:80]
+    agent = " ".join((agent_name or "").split())[:40] or "your Nerve agent"
+    hello = f"Hi {person}, nice to meet you!" if person else "Hi, nice to meet you!"
+    return f"{hello} I'm {agent}, and you can configure me by talking to me."
+
+
+def _first_form(worker: bool, opening: str, noted: str = "") -> str:
+    """The instructions for the first form: the opening and the lead word
+    for word, ``noted`` between them, then the form's arguments as JSON."""
     arguments = json.dumps(first_form_arguments(worker), indent=2, ensure_ascii=False)
-    return _FIRST_FORM.replace("{arguments}", arguments)
+    return (
+        _FIRST_FORM.replace("{arguments}", arguments)
+        .replace("{lead}", FIRST_FORM_LEAD)
+        .replace("{noted}", noted)
+        .replace("{opening}", opening)
+    )
 
 
 def _catalog_reference() -> str:
@@ -807,7 +835,7 @@ def _chosen_section(work: WorkSelection, who: str) -> str:
 def onboarding_prompt(
     mode: str, task_description: str = "", guide: str = "", person_name: str = "",
     *, environment: str = "", github_access: str = "", work: WorkSelection | None = None,
-    memory_backend: str = "memu",
+    memory_backend: str = "memu", agent_name: str = "",
 ) -> str:
     """The hidden first message of the onboarding conversation.
 
@@ -815,8 +843,11 @@ def onboarding_prompt(
     answer is the first message they see. ``mode`` is ``personal`` or
     ``worker``. ``person_name`` is the display name of the person it is for,
     so the agent greets them by name without reading a file (a worker has
-    no ``USER.md``); empty, the agent greets without a name. The first turn
-    begins with the visible message: no tool call precedes it.
+    no ``USER.md``); empty, the agent greets without a name. ``agent_name``
+    is the name the agent gives itself; empty, it is "your Nerve agent".
+    Every first message opens with :func:`onboarding_opening`, word for
+    word. The first turn begins with the visible message: no tool call
+    precedes it.
 
     ``environment`` is the ``## This instance`` section of
     :func:`nerve.onboarding_environment.gather`: what is configured and from
@@ -846,14 +877,15 @@ def onboarding_prompt(
       some, else asks with the first form and carries the note into the plan.
     - Nothing: the first form.
 
-    The first form is a greeting, one sentence that the agent is set up by
-    talking to it, and one ``ask_form`` call with fixed arguments
+    The first form is the opening, :data:`FIRST_FORM_LEAD`, both word for
+    word, and one ``ask_form`` call with fixed arguments
     (:func:`first_form_arguments`): one ``multi`` question with five options,
     four for a worker. The catalog follows it as reference for answers given
     in Other…, which the agent never lists (:func:`_catalog_reference`).
 
     The steps after it are shared: explore in the background (read only),
-    ask with ``ask_form`` after explaining (each question of the kind its
+    ask with ``ask_form``, the explanation in the form's ``intro`` (each
+    question of the kind its
     answer needs; ``AskUserQuestion`` only when ``ask_form`` is missing),
     propose the setup as a native plan (``EnterPlanMode`` …
     ``ExitPlanMode``), apply, summarize, ``onboarding_done``.
@@ -899,14 +931,18 @@ def onboarding_prompt(
         first = _FIRST_MESSAGE_CHOSEN.replace(
             "{questions}", _CHOSEN_FROM_LIST if chosen.items else "",
         ).replace("{unclear}", "" if chosen.items else _CHOSEN_UNCLEAR)
+        noted = ""
     elif chosen is not None:
-        first = _FIRST_MESSAGE_RULES_ONLY
+        first, noted = _FIRST_MESSAGE_RULES_ONLY, _NOTED_RULES
+    elif description:
+        first, noted = _FIRST_MESSAGE_DESCRIBED, _NOTED_NOTE
     else:
-        first = _FIRST_MESSAGE_DESCRIBED if description else _FIRST_MESSAGE_OFFERS
+        first, noted = _FIRST_MESSAGE_OFFERS, ""
+    opening = onboarding_opening(name, agent_name)
     parts.append(
-        first.replace("{form}", _first_form(worker))
-        .replace("{catalog}", _catalog_reference())
-        .replace("{greet}", "Greet the person by name" if name else "Greet the person without a name")
+        first.replace("{catalog}", _catalog_reference())
+        .replace("{form}", _first_form(worker, opening, noted))
+        .replace("{greet}", f"Open with this paragraph, word for word: “{opening}”")
     )
     access = " ".join(github_access.split()) if facts else ""
     parts += [_ONBOARDING_RULES, _FEATURE_RULES, _conversation_steps(worker, access)]

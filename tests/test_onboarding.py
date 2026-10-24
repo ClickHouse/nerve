@@ -23,8 +23,10 @@ import pytest_asyncio
 
 from nerve import onboarding, onboarding_environment
 from nerve.agent.prompts import (
+    FIRST_FORM_LEAD,
     WORKER_GUIDE_URL,
     first_form_arguments,
+    onboarding_opening,
     onboarding_prompt,
     worker_onboarding_prompt,
 )
@@ -108,6 +110,12 @@ def gathered(monkeypatch) -> list[Path]:
 
     monkeypatch.setattr(onboarding_environment, "gather", _gather)
     return calls
+
+
+@pytest.fixture(autouse=True)
+def _no_platform_agent_name(monkeypatch):
+    """No hosting platform names the agent unless a test sets it."""
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
 
 
 def _engine(
@@ -254,28 +262,31 @@ class TestPrompt:
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
     def test_without_a_description_the_first_message_is_a_greeting_and_one_form(self, mode):
-        """Two sentences, then one ``ask_form`` call with fixed arguments: one
-        ``multi`` question, its options in order, Other… on, an answer
-        required. The message lists nothing and does not say that more than
-        one may be chosen: the form's checkboxes say that."""
+        """The opening and the lead word for word, then one ``ask_form`` call
+        with fixed arguments: one ``multi`` question, its options in order,
+        Other… on, an answer required. The message lists nothing and does not
+        say that more than one may be chosen: the form's checkboxes say that.
+        After the answer, step 2's text is a message, not thinking."""
         prompt = onboarding_prompt(mode, "", GUIDE)
         first = _first_message(prompt)
         text = _flat(_message_text(first))
         steps = [
-            "Greet the person without a name, in one sentence.",
-            "Then say in one sentence that you are set up by talking to you, now and at any time later.",
+            "Open with this paragraph, word for word: “Hi, nice to meet you! I'm your Nerve agent, "
+            "and you can configure me by talking to me.”",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
             "Then call `ask_form` once, with exactly these arguments:",
             "Write no other text: no list of what you can do, and no other question.",
-            "Step 2's rule on the text before a form does not apply to this first form, and this "
-            "form is not one of step 2's rounds.",
+            "This form has no intro: step 2's rule on the intro does not apply to it, and it is not "
+            "one of step 2's rounds.",
             "The answer comes back as the result of the call, in this turn; then go on with steps 1 "
-            "and 2 below.",
+            "and 2 below, where every form has an intro.",
             "Change nothing in this first message.",
         ]
         positions = [text.index(step) for step in steps]
         assert positions == sorted(positions)
         form = _form(first)
         assert form == first_form_arguments(mode == "worker")
+        assert "intro" not in form
         (question,) = form["questions"]
         assert question == {
             "id": "work", "kind": "multi", "label": "Work",
@@ -363,7 +374,7 @@ class TestPrompt:
         assert "offer no menu" in work and "set up by talking to you" not in work
         steps = [
             "Write the message text first, before any tool call",
-            "1. Greet the person without a name.",
+            f"1. Open with this paragraph, word for word: “{onboarding_opening()}”",
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
@@ -374,6 +385,7 @@ class TestPrompt:
         positions = [work.index(step) for step in steps]
         assert positions == sorted(positions)
         assert "Targets the note leaves out you ask for as step 1 says" in work
+        assert FIRST_FORM_LEAD not in work
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
     def test_a_note_that_names_no_work_gets_the_first_form(self, mode):
@@ -387,8 +399,9 @@ class TestPrompt:
         assert _reference(no_work) == _reference(blank)
         steps = [
             'only rules, such as "never merge anything"', 'only targets, such as "org/repo-a"',
-            "ask what the work is. Greet the person without a name and say what you noted, in one sentence.",
-            "Then say in one sentence that you are set up by talking to you, now and at any time later.",
+            f"ask what the work is. Open with this paragraph, word for word: “{onboarding_opening()}”",
+            "Then say in one sentence what you noted.",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
             "Then call `ask_form` once, with exactly these arguments:",
             "Write no other text: no list of what you can do, and no other question.",
             "its rules become hard rules and approval boundaries",
@@ -484,19 +497,24 @@ class TestPrompt:
             assert part in ask, part
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
-    def test_every_turn_that_asks_explains_first(self, mode, description):
-        """A real run sent a question card with no text at all: the rule is an
-        explicit order (text, then the form), and the text asks nothing."""
+    def test_every_form_explains_in_its_intro(self, mode, description):
+        """Real runs sent a question card with no text: the explanation stayed
+        in the thinking, which the person does not see. It goes in the form's
+        intro, which the card shows, and asks nothing."""
         ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
-        explain = _flat(_between(ask, "Explain before you ask.", "Ask only what neither"))
+        explain = _flat(_between(ask, "Explain before you ask, in the form's `intro`", "Ask only what neither"))
         for part in (
-            "In every turn that asks, write the text first and call `ask_form` after it",
-            "a form without text before it is a mistake",
-            "The text says what you understood, what the explorer studies, how you intend to set "
+            "the card shows it above the questions",
+            "The person does not see your thinking, so an explanation that you only think is lost, "
+            "and a form without an intro is a mistake",
+            "the intro says what you understood, what the explorer studies, how you intend to set "
             "this up and why the questions matter",
-            "The questions go in the form, and the text explains and asks none of them",
+            "When the message before the form already says this (your first message), the intro "
+            "says in one line why these questions matter",
+            "The intro explains and asks none of the questions",
         ):
             assert part in explain, part
+        assert "It has no intro, so write the explanation as a message before the call" in _flat(ask)
         assert "Ask nothing in plain text" not in ask
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
@@ -639,20 +657,42 @@ class TestPrompt:
         ) in intro
         assert "USER.md" not in _first_message(prompt)
 
+    def test_the_opening_names_the_person_and_the_agent(self):
+        assert onboarding_opening() == (
+            "Hi, nice to meet you! I'm your Nerve agent, and you can configure me by talking to me."
+        )
+        assert onboarding_opening("  Alice \n Example ", " Scout ") == (
+            "Hi Alice Example, nice to meet you! I'm Scout, and you can configure me by talking to me."
+        )
+        assert onboarding_opening(" \n ", " \n ") == onboarding_opening()
+        assert onboarding_opening("A" * 200, "B" * 100) == (
+            f"Hi {'A' * 80}, nice to meet you! I'm {'B' * 40}, and you can configure me by talking to me."
+        )
+        assert FIRST_FORM_LEAD == "Let's start with a few questions so I understand how I can help you."
+
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_the_person_is_greeted_by_the_name_given(self, mode, description):
         named = onboarding_prompt(mode, description, GUIDE, person_name="  Alice \n Example ")
         assert "The person's name is Alice Example." in _between(named, "This is the", "## ")
-        assert "Greet the person by name" in _first_message(named)
-        assert "without a name" not in named
+        assert f"“{onboarding_opening('Alice Example')}”" in _first_message(named)
+        assert "Hi, nice to meet you!" not in named
         unnamed = onboarding_prompt(mode, description, GUIDE)
         assert "The person's name is" not in unnamed
-        assert "Greet the person without a name" in _first_message(unnamed)
+        assert f"“{onboarding_opening()}”" in _first_message(unnamed)
         assert onboarding_prompt(mode, description, GUIDE, person_name=" \n ") == unnamed
         # The steps after the first message do not depend on the name.
         assert _shared(named) == _shared(unnamed)
         long = onboarding_prompt(mode, description, GUIDE, person_name="A" * 200)
         assert f"The person's name is {'A' * 80}." in long
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_agent_gives_the_name_given(self, mode, description):
+        named = onboarding_prompt(mode, description, GUIDE, agent_name=" Scout ")
+        assert f"“{onboarding_opening('', 'Scout')}”" in _first_message(named)
+        assert "your Nerve agent" not in named
+        unnamed = onboarding_prompt(mode, description, GUIDE)
+        assert _shared(named) == _shared(unnamed)
+        assert onboarding_prompt(mode, description, GUIDE, agent_name=" \n ") == unnamed
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_a_change_request_never_widens_what_was_allowed(self, mode, description):
@@ -766,7 +806,7 @@ class TestChosenWork:
         steps = [
             "offer no menu, and do not ask again what was chosen",
             "Write the message text first, before any tool call",
-            "1. Greet the person by name.",
+            f"1. Open with this paragraph, word for word: “{onboarding_opening('Alice Example')}”",
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
@@ -843,9 +883,10 @@ class TestChosenWork:
         assert _form(first) == _form(blank) == first_form_arguments(True)
         assert _reference(first) == _reference(blank)
         steps = [
-            "Nothing was ticked at setup, only rules. Greet the person without a name and say "
-            "that you noted the rules, in one sentence.",
-            "Then say in one sentence that you are set up by talking to you, now and at any time later.",
+            "Nothing was ticked at setup, only rules. Open with this paragraph, word for word: "
+            f"“{onboarding_opening()}”",
+            "Then say in one sentence that you noted the rules.",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
             "Then call `ask_form` once, with exactly these arguments:",
             "Write no other text: no list of what you can do, and no other question.",
             "Change nothing in this first message.",
@@ -1086,7 +1127,32 @@ class TestStart:
         await onboarding.start(engine, tmp_path, actor=db.system_actor, cause=db.system_actor)
         message = (await _first_turn(engine))["user_message"]
         assert "The person's name is" not in message
-        assert "Greet the person without a name" in message
+        assert f"“{onboarding_opening()}”" in message
+
+    @pytest.mark.parametrize("identity, env, expected", [
+        ("- **Name:** Scout", "Console Name", "Scout"),
+        ("- **Name:** *(your name here)*", "Console Name", "Console Name"),
+        (None, "Console Name", "Console Name"),
+        ("- **Name:** *(your name here)*", None, ""),
+        (None, None, ""),
+    ], ids=["identity", "placeholder-env", "no-file-env", "placeholder", "nothing"])
+    async def test_the_agent_names_itself_from_identity_else_the_platform(
+        self, db, tmp_path, monkeypatch, identity, env, expected,
+    ):
+        """``IDENTITY.md``'s name once it is filled in, else the hosting
+        platform's ``NERVE_DISPLAY_NAME``, else no name."""
+        apply_mode(tmp_path, "personal")
+        path = tmp_path / "IDENTITY.md"
+        if identity is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(f"# IDENTITY.md\n\n{identity}\n- **Emoji:** *(optional)*\n", encoding="utf-8")
+        if env is not None:
+            monkeypatch.setenv("NERVE_DISPLAY_NAME", env)
+        engine = _engine(db)
+        await onboarding.start(engine, tmp_path, actor=db.system_actor, cause=db.system_actor)
+        message = (await _first_turn(engine))["user_message"]
+        assert f"“{onboarding_opening('', expected)}”" in message
 
     async def test_the_first_turn_knows_the_instance(self, db, tmp_path, monkeypatch, gathered):
         """The real builder, on the engine's configuration, with the GitHub CLI

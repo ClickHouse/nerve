@@ -292,13 +292,20 @@ reasons are listed before you click. Then:
 After setup, the agent is set up by talking to it. Finish opens one web chat
 session titled **Onboarding** for the person who finished setup, and the agent
 speaks first: its first message is the answer to a hidden instruction, which
-the chat does not show. What it says first depends on what a worker's Mode
-step recorded:
+the chat does not show. Its first message always opens with the same
+sentence: "Hi Alice, nice to meet you! I'm Scout, and you can configure me by
+talking to me." The person's name is the display name of the person who
+finished setup. The agent's name is the name in `IDENTITY.md` (the About you
+step), else `NERVE_DISPLAY_NAME` (the name a hosting platform gives the
+agent). Without a name, the greeting is "Hi, nice to meet you!" and the agent
+is "your Nerve agent". What comes next depends on what a worker's Mode step
+recorded:
 
 - **With work chosen** (checkboxes, custom work, or both) it offers no menu
   and starts on that work in the same message. It explains before it asks:
-  it greets you, restates the work in one sentence, says what it studies and
-  sketches the setup it has in mind, and only then shows its first questions.
+  after the opening, it restates the work in one sentence, says what it
+  studies and sketches the setup it has in mind, and only then shows its
+  first questions.
   It works from the follow-up questions of each item you ticked (which
   repositories, what a review may do, the label vocabulary, how often, and so
   on), asks the questions the items share once (the account it acts as, what
@@ -308,8 +315,9 @@ step recorded:
   instance lacks (first response to alerts without an alert source) appears
   under what it needs from you.
 - **With nothing chosen** (a personal install, or a worker with nothing
-  ticked) it greets you, says in one sentence that it is set up by talking to
-  it, and shows one form with one question, "What should I help you with?",
+  ticked) the opening is followed by "Let's start with a few questions so I
+  understand how I can help you." and one form with one question, "What
+  should I help you with?",
   with a checkbox for each of: review pull requests, fix issues and open pull
   requests, keep CI healthy, research and reports, and, on a personal install,
   personal assistant. **Other…** takes work in your own words; the agent knows
@@ -363,7 +371,9 @@ Then:
    clone or fetch (a personal assistant for the inbox and reminders) there is
    no explorer.
 2. **It asks in the foreground** while the explorer works, and only what
-   neither the explorer nor setup can tell. It explains first, then shows one
+   neither the explorer nor setup can tell. It explains first, in the form's
+   intro (the text above the questions, because the chat does not show its
+   thinking as a message), then shows one
    form of up to six questions per round, in at most two rounds, each saying
    why it is asked and each in the shape its answer needs (the Nerve tool
    `ask_form`): repositories as `owner/name` entries, decisions as a few

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -155,6 +156,31 @@ def _prompt_inputs(workspace: Path, mode: str) -> "tuple[str, str, WorkSelection
     return description, read_worker_guide(), work_selection_from(description)
 
 
+#: The line of ``IDENTITY.md`` that names the agent.
+_IDENTITY_NAME = "- **Name:**"
+
+
+def _agent_name(workspace: Path) -> str:
+    """The name the agent gives itself in its first message, else ``""``.
+    Blocking file I/O.
+
+    The name line of ``IDENTITY.md`` once it is filled in (About you), else
+    ``NERVE_DISPLAY_NAME``, the agent's name that a hosting platform sets.
+    A template placeholder is no name.
+    """
+    try:
+        lines = (Path(workspace) / "IDENTITY.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith(_IDENTITY_NAME):
+            value = line[len(_IDENTITY_NAME):].strip()
+            if value and not value.startswith("*(") and "{{" not in value:
+                return value
+            break
+    return os.environ.get("NERVE_DISPLAY_NAME", "").strip()
+
+
 async def _instance_facts(engine: "AgentEngine", workspace: Path) -> "InstanceFacts | None":
     """What the conversation's agent knows about this instance from the start.
 
@@ -268,6 +294,7 @@ async def start(
     description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
+        agent_name = await asyncio.to_thread(_agent_name, workspace)
         # The first turn calls no tool before its message: Nerve hands the
         # agent what is configured, and from where, instead.
         facts = await _instance_facts(engine, workspace)
@@ -277,6 +304,7 @@ async def start(
             github_access=facts.github_access if facts else "",
             work=work,
             memory_backend=engine.config.memory.backend,
+            agent_name=agent_name,
         )
     else:
         # The description as written: a free-text one from ``nerve init``,
