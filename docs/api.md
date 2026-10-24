@@ -702,7 +702,8 @@ one web session titled `Onboarding`, whose hidden first message makes the
 agent speak first. When a restart is pending or no model is configured, it
 records the request instead, and the next start of the daemon opens the
 conversation. Idempotent: a second call, also at the same time, names the same
-session. When the agent's first turn fails, the status goes back to `pending`.
+session. When the agent's first turn fails before it showed its first form,
+the status goes back to `pending`; after the form, it stays `running`.
 Allowed under lockdown.
 
 ```json

@@ -407,9 +407,10 @@ onboarded by an earlier version (the `TASK.md` marker is gone) counts as done.
 An install from before the onboarding state that still has its marker, and a
 personal install from before, count as pending: the banner offers them the
 conversation once setup is complete. Nothing opens without a model credential.
-When the agent's first turn fails (a model error), onboarding goes back to
-pending, and the next Finish or daemon start opens a new conversation. Until
-onboarding is done or skipped:
+When the agent's first turn fails (a model error) before you saw its form,
+onboarding goes back to pending, and the next Finish or daemon start opens a
+new conversation. When it fails after the form, the conversation stays open
+and you continue in the same chat. Until onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits

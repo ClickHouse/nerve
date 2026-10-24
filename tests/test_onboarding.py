@@ -81,6 +81,12 @@ FACTS = InstanceFacts(
     github_access="GitHub access: `gh` as `alice`.",
 )
 WITH_FACTS = {"environment": FACTS.section, "github_access": FACTS.github_access}
+# A stored first reply: the greeting, then the first form (still open).
+_GREETING = {"type": "text", "content": "Hello."}
+_FORM_CALL = {
+    "type": "tool_call", "tool": "mcp__nerve__ask_form", "input": first_form_arguments(False),
+    "tool_use_id": "toolu_form",
+}
 NONE_KNOWN = "GitHub access: none known — clone public URLs only; report what needs a credential."
 _REAL_GATHER = onboarding_environment.gather
 
@@ -104,14 +110,19 @@ def gathered(monkeypatch) -> list[Path]:
     return calls
 
 
-def _engine(db, *, outcome: str = "completed", slow: bool = False) -> MagicMock:
-    """Real session rows; turns that only record their arguments and end with ``outcome``."""
+def _engine(
+    db, *, outcome: str = "completed", slow: bool = False, reply_blocks: list | None = None,
+) -> MagicMock:
+    """Real session rows; turns that only record their arguments and end with
+    ``outcome``, after storing a reply with ``reply_blocks`` when given."""
     engine = MagicMock()
     engine.db = db
     engine.config.credential_available.return_value = True
     turn = SimpleNamespace(outcome=None)
 
     async def _run(**kwargs):
+        if reply_blocks is not None:
+            await db.add_message(kwargs["session_id"], "assistant", "", blocks=reply_blocks, actor=None)
         turn.outcome = SimpleNamespace(status=outcome)
         return ""
 
@@ -965,6 +976,37 @@ class TestStart:
         # The next start opens a new conversation.
         again = await onboarding.start(_engine(db), tmp_path, actor=None, cause=None)
         assert again.status == "running" and again.session_id != state.session_id
+
+    @pytest.mark.parametrize("blocks, kept", [
+        pytest.param(None, False, id="nothing-stored"),
+        pytest.param([{"type": "text", "content": "Turn failed: overloaded"}], False, id="text-only"),
+        pytest.param([_GREETING, {**_FORM_CALL, "result": "ask_form: the call is invalid", "is_error": True}],
+                     False, id="invalid-form"),
+        pytest.param([_GREETING, _FORM_CALL], True, id="form-open"),
+        pytest.param([_GREETING, {**_FORM_CALL, "result": "The person answered the form.", "is_error": False},
+                      {"type": "text", "content": "Thanks."}], True, id="form-answered"),
+    ])
+    async def test_a_failed_first_turn_asks_again_only_before_its_form(self, db, tmp_path, blocks, kept):
+        """The first turn goes on after the person answers the form. A failure
+        before the person saw a form asks again; a failure after it keeps the
+        conversation running, so the person continues in the same chat and
+        its agent can still end the onboarding."""
+        apply_mode(tmp_path, "personal")
+        engine = _engine(db, outcome="failed", reply_blocks=blocks)
+        tasks: list[asyncio.Task] = []
+        engine.register_task = lambda session_id, task: tasks.append(task)
+        state = await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        await tasks[0]
+        stored = await db.get_onboarding()
+        if not kept:
+            assert stored["status"] == "requested"
+            assert (await onboarding.read_state(db, tmp_path)).status == "pending"
+            return
+        assert (stored["status"], stored["session_id"]) == ("running", state.session_id)
+        assert (await onboarding.read_state(db, tmp_path)).session_id == state.session_id
+        ctx = ToolContext(session_id=state.session_id, workspace=tmp_path, db=db, actor=db.system_actor)
+        assert not (await onboarding_done_handler(ctx, {})).is_error
+        assert (await onboarding.read_state(db, tmp_path)).status == "done"
 
     async def test_a_worker_without_task_md_gets_the_template_first(self, db, tmp_path):
         apply_mode(tmp_path, "worker")

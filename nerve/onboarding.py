@@ -74,6 +74,9 @@ SESSION_TITLE = "Onboarding"
 #: How much longer than the facts' own budget a start waits for them.
 _FACTS_MARGIN_SECONDS = 2.0
 
+#: Nerve's form tool as a stored reply names it (both backends).
+_FORM_TOOL = "mcp__nerve__ask_form"
+
 # One start at a time in this process, so a second caller sees the session
 # that the first one created. One lock per event loop: tests run many loops.
 _start_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
@@ -201,6 +204,24 @@ async def _person_name(db: "Database", cause: "ActorOrId | None") -> str:
     return ref.get("display_name") or ""
 
 
+async def _form_shown(db: "Database", session_id: str) -> bool:
+    """The session's stored replies hold an ``ask_form`` call that did not
+    fail: the person saw a form, answered or still open. An invalid call
+    shows nothing, so it does not count; in a session without the web chat
+    (the autonomous kind) every call fails."""
+    try:
+        messages = await db.get_messages(session_id)
+    except Exception:  # noqa: BLE001 - unknown counts as not shown
+        logger.debug("Onboarding: could not read the replies of %s", session_id, exc_info=True)
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_call"
+        and block.get("tool") == _FORM_TOOL and not block.get("is_error")
+        for message in messages if message.get("role") == "assistant"
+        for block in message.get("blocks") or ()
+    )
+
+
 async def start(
     engine: "AgentEngine",
     workspace: Path,
@@ -220,8 +241,11 @@ async def start(
     Starts in this process run one at a time, and the claim of the row is a
     compare-and-set from the state that was read, so there is one session
     for each opening. The agent's first turn runs in the background. When
-    that turn fails (a model error), the row goes back to ``requested``:
-    the next Finish or daemon start opens a new one.
+    that turn fails (a model error) before the person saw a form, the row
+    goes back to ``requested``: the next Finish or daemon start opens a new
+    one. A conversation whose first turn fails after the person saw its
+    form (:func:`_form_shown`) stays ``running``: the turn goes on after the
+    form's answer, so the person continues in the same chat.
     """
     from nerve.agent.prompts import onboarding_prompt, worker_onboarding_prompt
 
@@ -278,7 +302,16 @@ async def start(
         except Exception:
             logger.exception("Onboarding: the first turn in %s failed", session_id)
             failed = True
-        if failed and await db.set_onboarding(
+        if not failed:
+            return
+        if await _form_shown(db, session_id):
+            # The person has the chat and its form: they go on there, and
+            # its agent can still end the onboarding.
+            logger.warning(
+                "Onboarding: the first turn in %s failed after its form; the session stays open",
+                session_id,
+            )
+        elif await db.set_onboarding(
             REQUESTED, session_id=None, actor_id=actor_id, expect=(RUNNING, session_id),
         ):
             logger.warning("Onboarding: the first turn in %s failed; asked again", session_id)
