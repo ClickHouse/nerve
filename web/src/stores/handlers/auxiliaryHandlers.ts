@@ -7,11 +7,14 @@ import type { Get, Set } from './types';
 
 export function handleInteraction(
   msg: Extract<WSMessage, { type: 'interaction' }>,
-  get: Get,
+  _get: Get,
   set: Set,
 ): void {
   // Agent is paused waiting for user input (AskUserQuestion, ExitPlanMode, etc.).
   // `agent` names the subagent that asked (null: the orchestrator itself).
+  // An ExitPlanMode pause does not open the plan panel: the decision card in
+  // the chat summarizes the plan, and the panel opens when the person asks
+  // (Read the plan, Edit).
   set({
     pendingInteraction: {
       interactionId: msg.interaction_id,
@@ -21,13 +24,20 @@ export function handleInteraction(
       agent: msg.agent ?? null,
     },
   });
-  // Auto-open the plan panel when ExitPlanMode fires, so the user sees the plan
-  if (msg.interaction_type === 'plan_exit') {
-    const planTab = [...get().panels].reverse().find(p => p.type === 'plan');
-    if (planTab) {
-      set({ activePanelId: planTab.id, panelVisible: true });
-    }
-  }
+}
+
+export function handlePlanSummary(
+  msg: Extract<WSMessage, { type: 'plan_summary' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The server's short summary of the plan a pause waits on, for its card.
+  set({
+    planSummaries: {
+      ...get().planSummaries,
+      [msg.interaction_id]: { bullets: Array.isArray(msg.bullets) ? msg.bullets : [], status: msg.status },
+    },
+  });
 }
 
 export function handleInteractionResolved(

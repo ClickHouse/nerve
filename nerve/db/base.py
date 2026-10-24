@@ -26,9 +26,17 @@ from nerve.db.files import FileStore
 from nerve.db.maintenance import MaintenanceStore
 from nerve.db.mcp import McpStore
 from nerve.db.messages import MessageStore
-from nerve.db.migrations.runner import discover_migrations, run_migrations
+from nerve.db.migrations.runner import (
+    FORK_TRACK,
+    check_schema,
+    code_version,
+    discover_migrations,
+    newer_schema_allowed,
+    run_migrations,
+)
 from nerve.db.notifications import NotificationStore
 from nerve.db.observations import ObservationStore
+from nerve.db.onboarding import OnboardingStore
 from nerve.db.plans import PlanStore
 from nerve.db.review_loops import ReviewLoopStore
 from nerve.db.sessions import SessionStore
@@ -46,6 +54,9 @@ logger = logging.getLogger(__name__)
 # SCHEMA_VERSION is derived from the highest migration file number.
 # This keeps a single source of truth (the migration files themselves).
 SCHEMA_VERSION = max(v for v, _ in discover_migrations()) if discover_migrations() else 0
+# The same for the fork track (migrations/fork/), which is numbered on its own.
+# It is 0 upstream, which ships no fork migration.
+FORK_SCHEMA_VERSION = code_version(FORK_TRACK)
 
 
 class WriteResult(NamedTuple):
@@ -302,6 +313,34 @@ def _refusal_message(db_path: Path, perms: StatePermissions) -> str:
     )
 
 
+async def check_database_file(db_path: Path) -> None:
+    """The newer-schema guard (:func:`check_schema`) on the database file at
+    ``db_path``, read-only and without migrating it.
+
+    The gateway calls this to refuse before uvicorn starts. Step 1 of the
+    state-file policy (:meth:`Database.connect`) comes first: when another user
+    can write to a database file, a sidecar or the state directory, or a mode
+    cannot be read, nothing in the files is trusted. Then this reads nothing,
+    and the real open refuses the storage. A database that is missing or
+    cannot be read is left to the real open as well, which reports the
+    problem itself. With the override set, there is nothing to refuse, and
+    the real open logs the warning.
+    """
+    if newer_schema_allowed() or not db_path.is_file():
+        return
+    pre = _inspect_state_permissions(db_path)
+    if pre.writable or pre.uninspectable:
+        return
+    try:
+        db = await aiosqlite.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001 — the real open reports it
+        return
+    try:
+        await check_schema(db)
+    finally:
+        await db.close()
+
+
 class Database(
     SessionStore,
     MessageStore,
@@ -323,6 +362,7 @@ class Database(
     AccountStore,
     MaintenanceStore,
     AgentStore,
+    OnboardingStore,
 ):
     """Async SQLite database wrapper.
 

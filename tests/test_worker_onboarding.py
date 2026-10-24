@@ -1,41 +1,28 @@
-"""The worker's first-boot onboarding: what starts it and what it is told.
+"""The worker's autonomous onboarding prompt, and the worker guide it carries.
 
-"Pending" is the marker comment on line 2 of ``nerve/templates/worker/TASK.md``,
-which the onboarding session deletes last. The session's prompt carries the
-worker guide in full, read from the checkout's ``docs/`` with a packaged copy
-as the fallback for wheel installs — and the two copies must not drift.
+A worker that ``nerve init`` set up with a task description sets itself up in
+one session at the next start; its prompt carries the worker guide in full,
+read from the checkout's ``docs/`` with a packaged copy as the fallback for
+wheel installs, and the two copies must not drift. The onboarding state and
+the conversation are tested in ``tests/test_onboarding.py``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
-
-import pytest
 
 from nerve import workspace as workspace_module
-from nerve.agent.engine import AgentEngine
 from nerve.agent.prompts import WORKER_GUIDE_URL, worker_onboarding_prompt
-from nerve.setup_writer import TASK_ONBOARDING_MARKER, apply_mode, render_task_md
 from nerve.workspace import read_worker_guide, worker_guide_paths
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCE_GUIDE = REPO / "docs" / "worker-best-practices.md"
 PACKAGED_GUIDE = REPO / "nerve" / "templates" / "guides" / "worker-best-practices.md"
 DESCRIPTION = "Watch the nightly build for example/repo and propose fixes before changing anything."
-MISSION_PLACEHOLDER = "_(onboarding fills this in: one paragraph ending in the quality bar)_"
 
 
 def _section_headings(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.startswith("## ")]
-
-
-def _bare_engine(ws: Path) -> AgentEngine:
-    """An engine with only what the onboarding methods touch."""
-    engine = AgentEngine.__new__(AgentEngine)
-    engine.config = SimpleNamespace(workspace=ws)
-    return engine
 
 
 class TestGuideCopy:
@@ -96,11 +83,14 @@ class TestPrompt:
             "`task_create`",
             "`memorize`",
             "`notify`",
-            "### 7. Delete the marker — last",
+            "### 7. Mark onboarding done, last",
+            "`onboarding_done`",
             "<!-- nerve:onboarding pending",
+            "`backlog`",
+            "`plan_review`",
         ):
             assert needle in prompt, needle
-        assert prompt.index("### 7. Delete the marker — last") > prompt.index(
+        assert prompt.index("### 7. Mark onboarding done, last") > prompt.index(
             "### 6. Walk through everything you did, then give next steps"
         )
 
@@ -117,6 +107,7 @@ class TestPrompt:
             "this worker's `tag`",
             "Leave it off when a work job with a standing grant covers the routine items",
             "`TASK.md` § Approval Required",
+            "A planner prompt sends no `notify`",
         ):
             assert needle in step_four, needle
 
@@ -144,7 +135,7 @@ class TestPrompt:
             "what to watch during the first runs",
         ):
             assert needle in step_six, needle
-        # The final message comes after the marker is gone; the marker stays last among the changes.
+        # The final message comes after onboarding is marked done, the last change.
         assert "after step 7" in step_six
 
     def test_multi_line_descriptions_are_quoted_line_by_line(self) -> None:
@@ -155,67 +146,3 @@ class TestPrompt:
         prompt = worker_onboarding_prompt(DESCRIPTION, "")
         assert WORKER_GUIDE_URL in prompt
         assert "## Steps" in prompt
-
-
-class TestEngine:
-    def test_needs_onboarding_keys_on_the_marker(self, tmp_path: Path) -> None:
-        ws = tmp_path / "ws"
-        engine = _bare_engine(ws)
-        assert engine._needs_worker_onboarding() is False, "no TASK.md: not a worker"
-        apply_mode(ws, "worker", DESCRIPTION)
-        task = ws / "TASK.md"
-        assert engine._needs_worker_onboarding() is True
-        text = task.read_text(encoding="utf-8")
-        marker_line = text.splitlines()[1]
-        assert marker_line.startswith(TASK_ONBOARDING_MARKER)
-        # Sections filled but the marker left standing: still due.
-        task.write_text(text.replace(MISSION_PLACEHOLDER, "Keep CI green."), encoding="utf-8")
-        assert engine._needs_worker_onboarding() is True
-        # Marker deleted: done.
-        task.write_text(text.replace(marker_line + "\n", "", 1), encoding="utf-8")
-        assert engine._needs_worker_onboarding() is False
-        # Files from older versions: raw until ``## Mission`` appears.
-        task.write_text("# Task\n\nKeep the build green.\n", encoding="utf-8")
-        assert engine._needs_worker_onboarding() is True
-        task.write_text("# Task\n\n## Mission\nKeep the build green.\n", encoding="utf-8")
-        assert engine._needs_worker_onboarding() is False
-
-    @pytest.mark.asyncio
-    async def test_run_hands_the_full_prompt_to_the_onboarding_cron(self, tmp_path: Path) -> None:
-        ws = tmp_path / "ws"
-        apply_mode(ws, "worker", DESCRIPTION)
-        engine = _bare_engine(ws)
-        engine.run_cron = AsyncMock(return_value="done")
-        await engine._run_worker_onboarding()
-        assert engine.run_cron.await_count == 1
-        kwargs = engine.run_cron.await_args.kwargs
-        assert kwargs["job_id"] == "worker-onboarding"
-        prompt = kwargs["prompt"]
-        assert prompt == worker_onboarding_prompt(DESCRIPTION, SOURCE_GUIDE.read_text(encoding="utf-8"))
-        assert "# Worker Best Practices" in prompt and "## Further Reading" in prompt
-        # The engine leaves TASK.md to the session.
-        assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md(DESCRIPTION)
-
-    @pytest.mark.asyncio
-    async def test_a_legacy_raw_task_md_is_given_the_template_shape_first(self, tmp_path: Path) -> None:
-        """An older install's ``# Task`` + description: the session is told to
-        fill the template in place, so it gets the template, text kept."""
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        (ws / "TASK.md").write_text("# Task\n\nKeep the build green.\n", encoding="utf-8")
-        engine = _bare_engine(ws)
-        engine.run_cron = AsyncMock(return_value="done")
-        await engine._run_worker_onboarding()
-        assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md("Keep the build green.")
-        assert "> Keep the build green." in engine.run_cron.await_args.kwargs["prompt"]
-        assert engine._needs_worker_onboarding() is True, "pending until the session deletes the marker"
-
-    @pytest.mark.asyncio
-    async def test_a_completed_task_md_starts_no_session(self, tmp_path: Path) -> None:
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        (ws / "TASK.md").write_text("# Task\n\n## Mission\nKeep the build green.\n", encoding="utf-8")
-        engine = _bare_engine(ws)
-        engine.run_cron = AsyncMock(return_value="done")
-        await engine._run_worker_onboarding()
-        assert engine.run_cron.await_count == 0

@@ -39,10 +39,18 @@ The slug is the title truncated to 40 characters, so two titles that differ only
 
 ## Statuses
 
-- `pending` — Not started
-- `in_progress` — Being worked on
-- `done` — Completed (file moved to `done/`)
-- `deferred` — Postponed
+Statuses are configurable (`task_status_list`, `task_status_create`, and the board's status manager). These ship with Nerve:
+
+- `backlog`: not ready for work yet. No built-in cron job or gate selects it, so the agent does not pick it up. The New Task dialog uses it as its default.
+- `pending`: ready for work. The default of `task_create`. The `task-planner` job and the example work jobs gate on it.
+- `plan_review`: a plan for the task waits for a human decision. `plan_propose` and `plan_update` move a `pending`, `backlog` or `in_progress` task to it ([plans.md](plans.md)).
+- `in_progress`: being worked on. Approving a plan moves the task to it.
+- `done`: completed. The file moves to `done/`.
+- `deferred`: postponed.
+
+`pending`, `plan_review` and `done` are protected and cannot be deleted. Migration v059 adds `backlog` and `plan_review` to an existing install, before and after `pending`; a status that already has one of these names stays as it is.
+
+An install that existed before keeps the `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks, until the Automation step writes that file again. On such an install the planner can propose a plan for a `backlog` task.
 
 ## Agent Tools
 
@@ -220,6 +228,10 @@ The escalation check pauses during quiet hours when they are set (`quiet_start`/
 ### Task List (`/tasks`)
 
 Tasks are listed with status filter buttons and a search input (250ms debounce). Status can be changed via dropdown on each card. Clicking a task card navigates to the detail page.
+
+The New Task dialog has a status picker with the configured statuses. It starts on `backlog`, or on the status of the board column whose add button opened it, and falls back to `pending` when `backlog` does not exist. A hint under the picker says that the agent may pick up a `pending` task.
+
+Task notes that the plan tools write link to the plan (`/plans/<id>`) and to the implementation session (`/chat/<id>`). The markdown preview opens these links in the app.
 
 ### Task Detail (`/tasks/:taskId`)
 

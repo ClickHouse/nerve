@@ -1,11 +1,16 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { X, Loader2, Check, Ban } from '../ui/icons';
+import { X, Loader2 } from '../ui/icons';
 import { Button, IconButton } from '../ui';
 import { useChatStore } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { isLive } from '../../stores/helpers/agentSelectors';
 import { useIsMobile } from '../../hooks/useMediaQuery';
 import { MarkdownContent } from './MarkdownContent';
+import { PlanDecisionControls } from './PlanDecisionControls';
+import {
+  approveEditedPlan, approvePlan, isOnboardingSession, PLAN_APPROVE_MESSAGE, requestPlanChanges, usePendingPlanText,
+  usePlanDecisionPending,
+} from './planDecision';
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
 import { FileChangesPanel } from './FileChangesPanel';
@@ -225,50 +230,71 @@ function TabContent({ tab, containerRef }: { tab: PanelTab; containerRef: React.
 }
 
 // ------------------------------------------------------------------ //
-//  PlanActions — approve/decline footer for plan tabs                  //
+//  PlanActions — the plan decision in the footer of plan tabs          //
 // ------------------------------------------------------------------ //
 
+/**
+ * The same decision as the plan card in the chat, with the same controls
+ * (`PlanDecisionControls`). Approve, and Apply edited plan, close the tab —
+ * from either surface (`approvePlan`). Request changes keeps it open: the
+ * agent rewrites the plan and the tab shows the new version in place. Edit
+ * starts from the text the agent waits on (`toolInput.plan`).
+ *
+ * With no `ExitPlanMode` waiting (a finished turn), Approve sends
+ * `PLAN_APPROVE_MESSAGE` as a message instead, with nothing to turn down or
+ * edit. Not in the onboarding conversation: there the plan is the setup
+ * proposal, decided once on its pause, and a later "implement it" would ask
+ * the agent to set everything up again. A plan opened to read from a
+ * decided card (`readOnly`) has no footer at all.
+ *
+ * Edit on the chat card asks for this footer's editor (`planEditRequest`):
+ * taken here once, then cleared.
+ */
 function PlanActions({ tab }: { tab: PanelTab }) {
-  const pendingInteraction = useChatStore(s => s.pendingInteraction);
-  const answerInteraction = useChatStore(s => s.answerInteraction);
-  const denyInteraction = useChatStore(s => s.denyInteraction);
+  const isPlanExit = usePlanDecisionPending();
+  const pendingPlan = usePendingPlanText();
+  const onboarding = useChatStore(s => isOnboardingSession(s.activeSession));
   const sendMessage = useChatStore(s => s.sendMessage);
   const isStreaming = useChatStore(s => s.isStreaming);
   const closePanelTab = useChatStore(s => s.closePanelTab);
+  const editRequest = useChatStore(s => (
+    s.planEditRequest && s.planEditRequest === s.pendingInteraction?.interactionId ? s.planEditRequest : null
+  ));
+  const clearPlanEditRequest = useChatStore(s => s.clearPlanEditRequest);
 
-  const isPlanExit = pendingInteraction?.interactionType === 'plan_exit';
-  const canApprove = tab.content && !tab.streaming && (!isStreaming || isPlanExit);
+  const byMessage = !isStreaming && !onboarding;
+  const canApprove = !tab.readOnly && tab.content && !tab.streaming && (isPlanExit || byMessage);
+  const takesEdit = !!canApprove && !!editRequest;
+  // The editor opens from the request below; the request itself is spent.
+  useEffect(() => {
+    if (takesEdit) clearPlanEditRequest();
+  }, [takesEdit, clearPlanEditRequest]);
 
   if (!canApprove) return null;
 
   const handleApprove = () => {
     if (isPlanExit) {
-      answerInteraction(null);
+      approvePlan(tab.id);
     } else {
-      sendMessage('Looks good — implement it.');
+      sendMessage(PLAN_APPROVE_MESSAGE);
+      closePanelTab(tab.id);
     }
-    closePanelTab(tab.id);
   };
 
-  const handleDecline = () => {
-    if (isPlanExit) {
-      denyInteraction('User declined the plan.');
-    }
-    closePanelTab(tab.id);
+  const handleApproveEdited = (text: string) => {
+    approveEditedPlan(text, tab.id);
   };
 
   return (
-    <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-border-subtle bg-bg shrink-0">
-      {isPlanExit && (
-        <Button size="sm" onClick={handleDecline} className="py-1 rounded-md font-medium">
-          <Ban size={12} />
-          Decline
-        </Button>
-      )}
-      <Button variant="success" size="sm" onClick={handleApprove} className="py-1">
-        <Check size={12} />
-        Approve
-      </Button>
+    <div className="px-4 py-2.5 border-t border-border-subtle bg-bg shrink-0">
+      <PlanDecisionControls
+        layout="footer"
+        onApprove={handleApprove}
+        onRequestChanges={isPlanExit ? requestPlanChanges : undefined}
+        plan={pendingPlan}
+        onApproveEdited={pendingPlan ? handleApproveEdited : undefined}
+        editRequest={editRequest}
+      />
     </div>
   );
 }

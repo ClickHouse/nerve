@@ -28,6 +28,8 @@ async def test_newer_schema_refuses_to_start(tmp_path, monkeypatch):
 
     assert failure.value.database_version == code_version + 7
     assert failure.value.code_version == code_version
+    assert failure.value.track == "upstream"
+    assert f"upstream schema version {code_version + 7}" in str(failure.value)
     assert runner.ALLOW_NEWER_SCHEMA_ENV in str(failure.value)
 
 

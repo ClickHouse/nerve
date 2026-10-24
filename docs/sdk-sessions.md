@@ -28,7 +28,9 @@ The SDK sets `--permission-prompt-tool stdio` automatically, routing all tool pe
 
 - **Non-interactive tools** (Read, Bash, MCP, etc.) → `PermissionResultAllow()` immediately
 - **`AskUserQuestion`** → Broadcasts question to UI via WebSocket `interaction` event, awaits user answer, returns `PermissionResultAllow(updated_input={...answers})` — the SDK injects answers into the tool's `answers` field
-- **`ExitPlanMode` / `EnterPlanMode`** → Broadcasts approval request, awaits user decision, returns allow or deny
+- **`ExitPlanMode`** → Broadcasts the decision request (the CLI puts the plan file's text in the input as `plan`, with `planFilePath`), awaits the person's decision, returns allow (`PermissionResultAllow(updated_input={...input, "plan": edited})` when they approved their edit of the plan: the CLI saves it and tells the agent the plan was edited), or deny with the person's words as the message ("Request changes": the agent stays in plan mode and revises)
+- **`EnterPlanMode`** → `PermissionResultAllow()` at once, no pause: entering plan mode only restricts the agent. The bundled CLI switches into plan mode without asking at all
+- On a non-interactive channel (Telegram, cron, hooks) `AskUserQuestion` and `ExitPlanMode` are denied, and `EnterPlanMode` too when a CLI asks for it
 
 Handlers are registered per-session in a global registry (`interactive._handlers`). The WebSocket server routes `answer_interaction` messages to the correct handler by session ID.
 

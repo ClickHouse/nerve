@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from nerve import boot
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -168,6 +169,7 @@ async def diagnostics():
         "system": {
             "platform": platform.platform(),
             "python": platform.python_version(),
+            "commit": boot.source_commit() or None,  # cached at startup
             "hostname": platform.node(),
             "memory_mb": round(mem_mb, 1),
             "disk_total_gb": round(disk.total / (1024**3), 1),

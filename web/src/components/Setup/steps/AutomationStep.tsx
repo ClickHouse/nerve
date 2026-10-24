@@ -5,7 +5,9 @@ import {
 import { useSetupStore } from '../../../stores/setupStore';
 import { Badge, Checkbox } from '../../ui';
 import { Clock } from '../../ui/icons';
-import { AUTOMATION_IDLE_UNTIL_SOURCE, AUTOMATION_TASK_PLANNER_WORKER, STEP_HEADINGS } from '../copy';
+import {
+  AUTOMATION_IDLE_UNTIL_SOURCE, AUTOMATION_OVERRIDDEN, AUTOMATION_TASK_PLANNER_WORKER, STEP_HEADINGS,
+} from '../copy';
 import { StepFrame } from '../StepFrame';
 
 /**
@@ -26,9 +28,13 @@ const offByDefault = (job: SetupCronJob) => (job.default_enabled ?? job.default)
  * source connected) stays checked and wears an "idle" badge that says why
  * it does nothing yet.
  *
- * A worker's task planner ships off: its onboarding session turns it on
- * when the worker should plan through the approval loop. While the file
- * still has it off, the row says so.
+ * A worker's task planner ships off: its onboarding conversation turns it
+ * on when the worker should plan through the approval loop. While it is
+ * still off, the row says so.
+ *
+ * Each checkbox shows the state the scheduler runs. A job that `jobs.yaml`
+ * replaces (the onboarding conversation writes such jobs) shows that file's
+ * state, cannot be changed here, and says where it is set.
  */
 export function AutomationStep({ step, state }: { step: SetupStep; state: SetupState }) {
   const detail = step.detail as SetupAutomationDetail;
@@ -37,7 +43,9 @@ export function AutomationStep({ step, state }: { step: SetupStep; state: SetupS
   const locked = step.read_only || step.status === 'blocked';
   const worker = state.mode === 'worker';
   const hintFor = (job: SetupCronJob) => (
-    worker && job.id === 'task-planner' && !job.enabled && offByDefault(job) ? AUTOMATION_TASK_PLANNER_WORKER : null
+    job.overridden ? AUTOMATION_OVERRIDDEN
+      : worker && job.id === 'task-planner' && !job.enabled && offByDefault(job) ? AUTOMATION_TASK_PLANNER_WORKER
+        : null
   );
   const [initialEnabled] = useState<string[]>(() => detail.optional.filter((j) => j.enabled).map((j) => j.id));
   const [enabled, setEnabled] = useState<string[]>(initialEnabled);
@@ -93,7 +101,7 @@ export function AutomationStep({ step, state }: { step: SetupStep; state: SetupS
                   <Checkbox
                     checked={enabled.includes(job.id)}
                     onChange={() => toggle(job.id)}
-                    disabled={locked}
+                    disabled={locked || job.overridden}
                     label={<span className="text-text">{job.name}</span>}
                     labelClassName="items-start"
                     aria-describedby={hint ? hintId : undefined}

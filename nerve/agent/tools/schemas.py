@@ -643,6 +643,9 @@ SKILL_UPDATE_SCHEMA = {
 
 # ----- Notification tools -----
 
+ONBOARDING_DONE_SCHEMA = {"type": "object", "properties": {}, "required": []}
+
+
 NOTIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -700,6 +703,140 @@ ASK_USER_SCHEMA = {
         },
     },
     "required": ["title"],
+}
+
+# ----- Form tool (ask_form) -----
+#
+# The handler (``handlers/forms.py``) checks what the schema cannot say
+# (unique ids and option labels, options only on choice and multi, a default
+# that fits its question) with the same limits.
+
+#: Question kinds. ``choice``, ``text`` and ``url`` answer one string; the
+#: others answer a list of strings.
+FORM_KINDS = ("choice", "multi", "text", "list", "repos", "url")
+FORM_SINGLE_KINDS = frozenset({"choice", "text", "url"})
+FORM_OPTION_KINDS = frozenset({"choice", "multi"})
+FORM_MAX_QUESTIONS = 6
+FORM_LABEL_MAX = 40
+FORM_MIN_OPTIONS = 2
+FORM_MAX_OPTIONS = 8
+#: A question's id: a slug, the key of its answer. Taken verbatim, never
+#: rewritten: a call with an id that does not match is invalid.
+FORM_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+
+ASK_FORM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "Optional heading shown above the questions.",
+            "default": "",
+        },
+        "questions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": FORM_MAX_QUESTIONS,
+            "description": (
+                "One to six questions, shown together in one form; mix kinds as "
+                "the answers need."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "pattern": FORM_ID_PATTERN,
+                        "description": (
+                            "Slug, unique in the call: the key of this question's "
+                            "answer (e.g. 'repos')."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": list(FORM_KINDS),
+                        "description": (
+                            "choice: one of the options; multi: any of the options; "
+                            "text: free text; list: several free-text items (channels, "
+                            "topics); repos: GitHub repositories as owner/name; url: an "
+                            "http(s) link."
+                        ),
+                    },
+                    "label": {
+                        "type": "string",
+                        "maxLength": FORM_LABEL_MAX,
+                        "description": (
+                            "Short header chip, at most 40 characters (e.g. "
+                            "'Repositories'); it names the answer in the result."
+                        ),
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The question sentence.",
+                    },
+                    "help": {
+                        "type": "string",
+                        "description": (
+                            "Why you ask, in one clause; shown muted under the question."
+                        ),
+                    },
+                    "placeholder": {
+                        "type": "string",
+                        "description": "Hint shown in an empty input.",
+                    },
+                    "required": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true. An optional question left empty comes back "
+                            "under skipped."
+                        ),
+                    },
+                    "options": {
+                        "type": "array",
+                        "minItems": FORM_MIN_OPTIONS,
+                        "maxItems": FORM_MAX_OPTIONS,
+                        "description": (
+                            "choice and multi only: two to eight options, the "
+                            "recommended one first with its label ending in "
+                            "'(recommended)'."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "The option; the answer when chosen.",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "What choosing it leads to.",
+                                },
+                            },
+                            "required": ["label"],
+                        },
+                    },
+                    "allow_other": {
+                        "type": "boolean",
+                        "description": (
+                            "choice and multi only. Default true: an Other… field lets "
+                            "the person type an answer that is not an option."
+                        ),
+                    },
+                    "default": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                        "description": (
+                            "Prefilled answer: a string for choice, text and url; a list "
+                            "of strings for multi, list and repos."
+                        ),
+                    },
+                },
+                "required": ["id", "kind", "label", "question"],
+            },
+        },
+    },
+    "required": ["questions"],
 }
 
 PROPOSE_ACTION_SCHEMA = {

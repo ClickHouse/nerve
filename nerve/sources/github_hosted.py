@@ -24,7 +24,7 @@ Buffered payload (one row per record)::
                 "metadata": [{"key", "value", "values"}, ...]}}
 
 Metadata values arrive as strings. ``actors`` and ``changes`` are lists, and
-``unread`` becomes the boolean the polling source stores.
+``unread`` becomes a boolean.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ class HostedGitHubSource(Source):
     """The GitHub source over the hosted records buffer."""
 
     source_name = SOURCE_NAME
+    push_fed = True
 
     def __init__(self, db: Database):
         self._db = db

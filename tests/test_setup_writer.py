@@ -39,6 +39,7 @@ import yaml
 from nerve import setup_writer
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
+from nerve.onboarding_catalog import WorkSelection
 from nerve.setup_writer import (
     TASK_DESCRIPTION_TOKEN,
     TASK_ONBOARDING_MARKER,
@@ -50,8 +51,10 @@ from nerve.setup_writer import (
     merge_private_paths,
     merge_settings_defaults,
     render_task_md,
+    render_work_description,
     task_description_from,
     task_onboarding_pending,
+    work_selection_from,
     workspace_mode,
     write_config_yaml,
     write_cron_jobs,
@@ -296,7 +299,7 @@ class TestInstallerOutputIsUnchanged:
         _assert_matches_golden(produced, "unattended-worker")
         # The worker template with the description in place — the same file
         # the web Mode step and ``nerve init --terminal`` write — still
-        # carrying the marker the onboarding session deletes.
+        # carrying the marker that onboarding_done deletes.
         assert produced["TASK.md"].startswith("# Task\n")
         assert produced["TASK.md"] == render_task_md("Keep the build green.")
         assert produced["TASK.md"].splitlines()[1].startswith(TASK_ONBOARDING_MARKER)
@@ -682,7 +685,7 @@ class TestApplyMode:
         # Still pending (the marker stands): a second description replaces it.
         apply_mode(ws, "worker", "Something else entirely, twenty characters.")
         assert "Something else" in task.read_text(encoding="utf-8")
-        # Once the onboarding session deleted the marker, the file is theirs.
+        # Once onboarding deleted the marker, the file is theirs.
         task.write_text(text.replace(lines[1] + "\n", "", 1), encoding="utf-8")
         again = apply_mode(ws, "worker", "A third description that must not land.")
         assert not again.task_written
@@ -714,12 +717,18 @@ class TestApplyMode:
         )
         # The writer owns the file: the MANIFEST lists it (``nerve doctor``
         # expects it of a worker), the copier leaves it out, and without a
-        # description there is no TASK.md rather than one with a bare token.
+        # description the template gets an empty description section (never
+        # a bare token), which the onboarding conversation fills.
         assert "TASK.md" in [name for name, _ in read_manifest("worker")]
         assert "TASK.md" not in outcome.created
         bare = tmp_path / "bare"
-        assert apply_mode(bare, "worker").task_written is False
-        assert not (bare / "TASK.md").exists()
+        assert apply_mode(bare, "worker").task_written is True
+        written = (bare / "TASK.md").read_text(encoding="utf-8")
+        assert TASK_DESCRIPTION_TOKEN not in written
+        assert task_onboarding_pending(written) and task_description_from(written) == ""
+        # A later call without a description keeps the file as it is.
+        assert apply_mode(ws, "worker").task_written is False
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == description
         assert "TASK.md" in initialize_workspace(tmp_path / "copied", "worker")
         assert TASK_DESCRIPTION_TOKEN in (tmp_path / "copied" / "TASK.md").read_text(encoding="utf-8")
 
@@ -776,7 +785,7 @@ class TestApplyMode:
     def test_worker_mode_writes_no_quiet_hours_and_leaves_task_planner_off(self, tmp_path: Path) -> None:
         """A worker's defaults: quiet hours off — stated as empty strings, so
         the loader's own 02:00–08:00 cannot come back — and task-planner in
-        the catalogue but disabled until the onboarding session decides."""
+        the catalogue but disabled until the onboarding conversation decides."""
         ws = tmp_path / "ws"
         outcome = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
         assert {"quiet_start", "quiet_end"} <= set(outcome.settings_defaults_added)
@@ -800,13 +809,109 @@ class TestApplyMode:
         assert not (ws / "SOUL.md").exists()
         # Templates arrived from the repository: only TASK.md is written.
         apply_mode(ws, "worker")
-        assert not (ws / "TASK.md").exists()
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == ""
         outcome = apply_mode(ws, "worker", "Watch the nightly build and propose fixes.", locked=True)
         assert outcome.task_written and outcome.created == () and not outcome.cron_written
         # The same template-sourced file as the unlocked path writes.
         assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md(
             "Watch the nightly build and propose fixes.",
         )
+
+
+class TestWorkDescription:
+    """The Mode step's selection as ``TASK.md``'s description section: one
+    comment line for programs, one line each for people, and back."""
+
+    CHOSEN = WorkSelection(
+        items=("review-prs", "triage-issues"), custom="also watch the release branch",
+        rules="never merge anything",
+    )
+
+    def test_the_contract_shape(self) -> None:
+        assert render_work_description(self.CHOSEN) == (
+            "<!-- nerve:work review-prs, triage-issues -->\n"
+            "Work: Review pull requests; Triage issues\n"
+            "Also: also watch the release branch\n"
+            "Must know or never do: never merge anything"
+        )
+
+    def test_each_line_is_left_out_when_empty(self) -> None:
+        assert render_work_description(WorkSelection()) == ""
+        assert render_work_description(WorkSelection(custom=" \n ", rules="\t")) == ""
+        assert render_work_description(WorkSelection(items=("ci-health",))) == (
+            "<!-- nerve:work ci-health -->\nWork: Keep CI healthy"
+        )
+        # Without items the comment line still opens the section: it tells a
+        # selection from a free-text note.
+        assert render_work_description(WorkSelection(custom="Keep the build green.")) == (
+            "<!-- nerve:work -->\nAlso: Keep the build green."
+        )
+        assert render_work_description(WorkSelection(rules="Never merge.")) == (
+            "<!-- nerve:work -->\nMust know or never do: Never merge."
+        )
+
+    def test_items_once_each_in_catalog_order_unknown_ones_left_out(self) -> None:
+        text = render_work_description(WorkSelection(
+            items=("docs-release-notes", "review-prs", "no-such-work", "review-prs"),
+        ))
+        assert text == (
+            "<!-- nerve:work review-prs, docs-release-notes -->\n"
+            "Work: Review pull requests; Docs and release notes"
+        )
+
+    @pytest.mark.parametrize("selection", [
+        WorkSelection(),
+        WorkSelection(items=("review-prs", "triage-issues"), custom="also watch the release branch",
+                      rules="never merge anything"),
+        WorkSelection(items=("alert-response",)),
+        WorkSelection(custom="Watch org/repo-a.\n\nReport weekly.\n  - indented line"),
+        WorkSelection(rules="Never merge.\nNever push to main."),
+        # Lines of the custom text that read like the people's lines stay its own.
+        WorkSelection(items=("ci-health",), custom="first\nWork: only weekdays\nAlso: the docs",
+                      rules="Also: never close issues"),
+        WorkSelection(items=tuple(i for i in (
+            "review-prs", "triage-issues", "fix-issues", "ci-health", "dependency-updates",
+            "alert-response", "channel-digests", "research-reports", "docs-release-notes",
+        ))),
+    ])
+    def test_round_trip(self, selection: WorkSelection) -> None:
+        text = render_work_description(selection)
+        back = work_selection_from(text)
+        assert back == selection and not back.free_text
+        # Through a real TASK.md as well.
+        assert work_selection_from(task_description_from(render_task_md(text))) == selection
+
+    def test_a_free_text_note_stays_a_paragraph_and_reads_as_custom_work(self) -> None:
+        note = "Watch the nightly build for example/repo.\n\nPropose fixes before changing anything."
+        selection = work_selection_from(note)
+        assert selection == WorkSelection(custom=note) and selection.free_text
+        assert render_work_description(selection) == note
+        # A note that happens to start like the people's lines is still a note.
+        lookalike = work_selection_from("Work: review pull requests in org/repo-a")
+        assert lookalike.free_text and lookalike.custom == "Work: review pull requests in org/repo-a"
+        assert work_selection_from(None) == work_selection_from("") == work_selection_from(" \n") == WorkSelection()
+
+    def test_unknown_ids_are_dropped_with_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="nerve.setup_writer"):
+            selection = work_selection_from(
+                "<!-- nerve:work review-prs, retired-item -->\nWork: Review pull requests; Retired"
+            )
+        assert selection == WorkSelection(items=("review-prs",))
+        assert "retired-item" in caplog.text
+
+    def test_the_worker_task_md_carries_the_selection_under_its_heading(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        text = render_work_description(self.CHOSEN)
+        assert apply_mode(ws, "worker", text).task_written
+        written = (ws / "TASK.md").read_text(encoding="utf-8")
+        lines = written.splitlines()
+        assert lines[0] == "# Task" and lines[1].startswith(TASK_ONBOARDING_MARKER)
+        assert f"## Task description (as given)\n{text}\n\n## Identity\n" in written
+        assert task_description_from(written) == text
+        assert work_selection_from(task_description_from(written)) == self.CHOSEN
+        # Once onboarding removed the marker, nothing reads as chosen any more.
+        done = written.replace(lines[1] + "\n", "", 1)
+        assert work_selection_from(task_description_from(done)) == WorkSelection()
 
 
 class TestProfileTemplates:
@@ -966,7 +1071,7 @@ class TestFixRoundTwoWriterRules:
 
 class TestModeDefaults:
     """Quiet hours are optional (a worker's are off) and a worker's
-    task-planner is off until its onboarding session enables it."""
+    task-planner is off until its onboarding conversation enables it."""
 
     @staticmethod
     def _quiet(**fields) -> tuple[str, str]:

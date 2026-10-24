@@ -10,10 +10,12 @@ from __future__ import annotations
 from nerve.agent.tools.registry import ToolRegistry
 
 from nerve.agent.tools.handlers.config_pr import CONFIG_PR_SPECS
+from nerve.agent.tools.handlers.forms import FORM_SPECS
 from nerve.agent.tools.handlers.hoa import HOA_SPECS
 from nerve.agent.tools.handlers.mcp_admin import MCP_ADMIN_SPECS
 from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 from nerve.agent.tools.handlers.notifications import NOTIFICATION_SPECS
+from nerve.agent.tools.handlers.onboarding import ONBOARDING_SPECS
 from nerve.agent.tools.handlers.plans import PLAN_SPECS
 from nerve.agent.tools.handlers.review_loops import REVIEW_LOOP_SPECS
 from nerve.agent.tools.handlers.skills import SKILL_SPECS
@@ -39,6 +41,8 @@ def build_default_registry() -> ToolRegistry:
         *PLAN_SPECS,
         *SKILL_SPECS,
         *NOTIFICATION_SPECS,
+        *FORM_SPECS,
+        *ONBOARDING_SPECS,
         *MCP_ADMIN_SPECS,
         *CONFIG_PR_SPECS,
         *WAKEUP_SPECS,

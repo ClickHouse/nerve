@@ -58,6 +58,7 @@ from nerve.agent.backends.codex.ultracode import (
     read_verified_run_journal,
 )
 from nerve.agent.backends.images import validate_image_data
+from nerve.agent.interactive import defer_idle_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,19 @@ You are running on Nerve's Codex backend.
 """
 
 
+def _backend_notes(memory_backend: str, memory_tools: bool = True) -> str:
+    """The backend notes; under Loom, the tool line names Loom's memory tools
+    instead of Nerve's, which are not served then, and none at all when the
+    session gets no ``loom`` server (``memory_tools`` false)."""
+    if memory_backend != "loom":
+        return _BACKEND_NOTES
+    from nerve.memory import loom_prompts
+
+    old, loom_line = loom_prompts.CODEX_NOTE_EDIT
+    line = loom_line if memory_tools else loom_prompts.CODEX_NOTE_NO_TOOLS
+    return loom_prompts.apply_edits(_BACKEND_NOTES, ((old, line),), name="Codex backend notes")
+
+
 class CodexTurnError(BackendError):
     """A codex turn failed with a non-retryable error."""
 
@@ -115,6 +129,12 @@ def _is_missing_thread_error(error: CodexRpcError) -> bool:
 def _toml_str(value: str) -> str:
     """Quote a string as a TOML literal for ``-c key=value`` overrides."""
     return json.dumps(value, ensure_ascii=False)
+
+
+# The Codex model provider for ``codex.base_url``, and the child environment
+# variable that holds its bearer key (Codex reads it through ``env_key``).
+_ENDPOINT_PROVIDER = "nerve-endpoint"
+_ENDPOINT_KEY_ENV = "NERVE_CODEX_ENDPOINT_KEY"
 
 
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
@@ -343,17 +363,24 @@ class CodexBackend:
                         return {"action": "decline"}
                     return {}
 
+                # The same endpoint provider as sessions, so that the
+                # checks below see what sessions see.
                 transport = CodexAppServerClient(
                     bin_path=self.codex.bin_path,
                     cwd=str(self.config.workspace),
-                    env={**os.environ, "CODEX_HOME": self._home_dir()},
+                    env={
+                        **os.environ, "CODEX_HOME": self._home_dir(),
+                        **self.endpoint_env(),
+                    },
                     server_request_handler=_decline,
+                    config_overrides=self.endpoint_overrides(),
                     request_timeout=10,
                 )
                 try:
                     await transport.start()
                     account = await transport.request("account/read", {}, timeout=10)
-                    if not account.get("account"):
+                    # With codex.base_url, Codex reports no account.
+                    if not account.get("account") and not self.codex.base_url:
                         raise BackendError(
                             "Codex is not authenticated. To fix: " + self.auth_hint()
                         )
@@ -410,6 +437,7 @@ class CodexBackend:
                 }
             except Exception as e:
                 result = {"available": False, "reason": str(e)}
+            result["base_url"] = self.codex.base_url
             self._preflight_cache = (time.monotonic(), result)
             return dict(result)
 
@@ -427,6 +455,7 @@ class CodexBackend:
     def build_env(self, spec: SessionSpec) -> dict[str, str]:
         env = os.environ.copy()
         env["CODEX_HOME"] = self._home_dir()
+        env.update(self.endpoint_env())
         # Session-bound bearer token for the nerve MCP endpoint —
         # referenced from the MCP config via bearer_token_env_var so the
         # token never lands in any file.
@@ -556,6 +585,8 @@ class CodexBackend:
         if not self.codex.web_search:
             overrides.append("tools.web_search=false")
 
+        overrides += self.endpoint_overrides()
+
         for key, value in (self.codex.extra_config or {}).items():
             if isinstance(value, str):
                 overrides.append(f"{key}={_toml_str(value)}")
@@ -639,9 +670,21 @@ class CodexBackend:
             # review-loop verifier legs to enforce workspace-write.
             "sandbox": str(spec.extra.get("sandbox") or "") or self.codex.sandbox,
             "approvalPolicy": self.codex.approval_policy,
-            "developerInstructions": spec.system_prompt + _BACKEND_NOTES,
+            "developerInstructions": spec.system_prompt + self._notes(),
         }
         return params
+
+    def _notes(self) -> str:
+        """The backend notes for this client: under Loom, whether it gets
+        Loom's tools is whether the MCP gateway's catalog (external mode
+        only) lists the ``loom`` server."""
+        memory_backend = self.config.memory.backend
+        if memory_backend != "loom":
+            return _backend_notes(memory_backend)
+        offered = bool(self._deps.managed_mcp) and any(
+            getattr(server, "name", "") == "loom" for server in self._deps.external_mcp_servers()
+        )
+        return _backend_notes(memory_backend, offered)
 
     def map_effort(self, effort: str) -> str | None:
         return (self.codex.effort_map or {}).get(effort)
@@ -663,6 +706,35 @@ class CodexBackend:
         if self.codex.api_key_env:
             return os.environ.get(self.codex.api_key_env) or None
         return None
+
+    def endpoint_overrides(self) -> list[str]:
+        """``--config`` overrides that send Codex to ``codex.base_url``.
+
+        Codex sends ``POST <base_url>/responses``. The only key source is
+        ``codex.api_key``: ``codex.api_key_env`` and ``openai_api_key`` can
+        hold an OpenAI key, and the endpoint is a different service. With a
+        key, the provider reads it from the child environment (``env_key``),
+        so the key is never in argv. Without a key, Codex sends no
+        credential.
+        """
+        if not self.codex.base_url:
+            return []
+        base = f"model_providers.{_ENDPOINT_PROVIDER}"
+        overrides = [
+            f"model_provider={_toml_str(_ENDPOINT_PROVIDER)}",
+            f"{base}.name={_toml_str('Nerve endpoint')}",
+            f"{base}.base_url={_toml_str(self.codex.base_url)}",
+            f'{base}.wire_api="responses"',
+        ]
+        if self.codex.api_key:
+            overrides.append(f"{base}.env_key={_toml_str(_ENDPOINT_KEY_ENV)}")
+        return overrides
+
+    def endpoint_env(self) -> dict[str, str]:
+        """The child environment for :meth:`endpoint_overrides`."""
+        if self.codex.base_url and self.codex.api_key:
+            return {_ENDPOINT_KEY_ENV: self.codex.api_key}
+        return {}
 
 
 class CodexClient(AgentClient):
@@ -869,8 +941,13 @@ class CodexClient(AgentClient):
 
         An api-key config logs in automatically (persisted in
         CODEX_HOME/auth.json); ChatGPT auth must be done once manually.
+        With ``codex.base_url`` there is no Codex login: the endpoint gets
+        the provider key or no credential, and turns are priced as API use.
         """
         backend = self._backend
+        if backend.codex.base_url:
+            self._effective_auth = "api_key"
+            return
         try:
             account = await self._transport.request("account/read", {})
         except CodexRpcError as e:
@@ -1002,7 +1079,9 @@ class CodexClient(AgentClient):
 
         Per-notification idle timeout mirrors the Claude path: a silent
         app-server raises ``asyncio.TimeoutError`` into the engine's
-        hung-client retry path. Terminates on ``turn/completed``
+        hung-client retry path — unless it waits for the person (an
+        approval or a question pending on the session's hub), when the
+        wait goes on. Terminates on ``turn/completed``
         regardless of status (completed / interrupted / failed) so the
         /stop flow's graceful wait works.
         """
@@ -1014,6 +1093,7 @@ class CodexClient(AgentClient):
         # serving-model tracking (parity with AssistantMessage.model).
         yield ev.ModelObserved(model=self.model)
 
+        deferred = False  # an idle-timeout deferral was logged
         while True:
             if self._transport.notifications.empty() and not self._transport.is_alive():
                 raise TransportDiedError("codex app-server died mid-turn")
@@ -1026,12 +1106,20 @@ class CodexClient(AgentClient):
                 else:
                     note = await self._transport.notifications.get()
             except asyncio.TimeoutError:
+                # A cancelled Queue.get() loses nothing: waiting again is safe.
+                if defer_idle_timeout(
+                    self._spec.interactive, self._spec.session_id,
+                    logged=deferred,
+                ):
+                    deferred = True
+                    continue
                 logger.warning(
                     "codex idle timeout (%ds) for session %s — no "
                     "notification received; treating app-server as hung",
                     idle_timeout, self._spec.session_id,
                 )
                 raise
+            deferred = False
 
             method = note.get("method", "")
             params = note.get("params", {}) or {}

@@ -413,3 +413,16 @@ async def test_a_failure_after_the_reporter_started_stops_it(harness, reporter):
 
     (built,) = reporter
     assert built.starts == 1 and built.stops == 1
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_asks_for_the_onboarding_conversation(harness, monkeypatch):
+    """The gateway opens a requested onboarding conversation at start-up;
+    one-shot CLI engines run initialize() only and never do."""
+    import nerve.onboarding as onboarding
+
+    start_on_boot = AsyncMock(return_value=None)
+    monkeypatch.setattr(onboarding, "start_on_boot", start_on_boot)
+    async with harness["server"].lifespan(MagicMock()):
+        await asyncio.sleep(0)
+    start_on_boot.assert_awaited_once_with(harness["engine"], harness["config"].workspace)

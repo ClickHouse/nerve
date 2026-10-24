@@ -156,7 +156,40 @@ def _docker_compose(
 _SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init", "migrate"})
 
 
-@click.group()
+class _NerveGroup(click.Group):
+    """The ``nerve`` group. A database newer than this code gets one line, not a
+    traceback.
+
+    Any command that opens the database (``start --foreground``, which runs
+    the gateway, included) can hit the refusal. It prints ``Error: <reason>``
+    and exits with ``NEWER_SCHEMA_EXIT_CODE``, so a supervisor can tell it
+    apart from any other failure.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except (RuntimeError, click.ClickException) as e:
+            # Only the runner raises the refusal, so its module is loaded
+            # whenever there is one. The CLI does not load the database package
+            # to start, and a failure elsewhere must not import it either.
+            runner = sys.modules.get("nerve.db.migrations.runner")
+            if runner is None:
+                raise
+            if isinstance(e, runner.SchemaNewerThanCodeError):
+                refusal = click.ClickException(str(e))
+                refusal.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+                raise refusal from e
+            # A command that puts the refusal in its own message (nerve init)
+            # still exits with the refusal's status.
+            if isinstance(e, click.ClickException) and isinstance(
+                e.__cause__, runner.SchemaNewerThanCodeError,
+            ):
+                e.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+            raise
+
+
+@click.group(cls=_NerveGroup)
 @click.option(
     "--config-dir", "-c", type=click.Path(), default=None,
     help="Config directory (default: auto-detected — see `nerve doctor`)",
@@ -226,18 +259,29 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--serve-next", is_flag=True, hidden=True,
     help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
 )
+@click.option(
+    "--memory-backend", type=click.Choice(["memu", "loom"], case_sensitive=False), default=None,
+    help=(
+        "Word the workspace templates, bundled skills and built-in jobs for this memory "
+        "backend (default: what an existing configuration names, else memu). It does not "
+        "set memory.backend itself"
+    ),
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool, serve_next: bool = False,
+    keep_env: bool, serve_next: bool = False, memory_backend: str | None = None,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
     The default asks only what the browser cannot decide (deployment, paths,
     port), starts Nerve and prints the setup page and token. ``--terminal``
     asks everything here instead; ``--non-interactive`` reads the environment.
+    ``--memory-backend`` is init-only: a platform that switches the instance
+    to Loom afterwards (``memory.backend: loom``) passes ``loom`` so the files
+    written now name Loom's memory tools.
     """
     from nerve.bootstrap import SetupWizard, is_fresh_install, run_non_interactive
 
@@ -252,7 +296,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
-            system_principal=not serve_next,
+            system_principal=not serve_next, memory_backend=memory_backend,
         )
         return
 
@@ -272,9 +316,9 @@ def init(
 
     wizard = None
     if non_interactive:
-        choices = run_non_interactive(config_dir)
+        choices = run_non_interactive(config_dir, memory_backend=memory_backend)
     else:
-        wizard = SetupWizard(config_dir, inside_docker=inside_docker)
+        wizard = SetupWizard(config_dir, inside_docker=inside_docker, memory_backend=memory_backend)
         choices = wizard.run()
 
     # Remember where the config lives so every future `nerve` command
@@ -324,6 +368,20 @@ def init(
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    # A worker with a task description sets itself up at the next start,
+    # without a person. Without one, it waits for its onboarding conversation
+    # in the web UI.
+    if choices.mode == "worker":
+        from nerve.onboarding import request_autonomous_sync
+
+        try:
+            if request_autonomous_sync(config):
+                click.echo("  The worker sets itself up from its task description when Nerve starts.")
+        except Exception as e:  # noqa: BLE001 - the web UI still offers the conversation
+            click.echo(
+                f"  Could not record the worker's onboarding ({e}). It waits for its "
+                "onboarding conversation in the web UI."
+            )
     from nerve.db.accounts import read_setup_required
 
     # In external mode there are no local accounts to claim, so the hint
@@ -400,6 +458,7 @@ def _setup_summary(config) -> dict | None:
             restart_pending=[],
             telegram_live=False,
             credential_sources=setup_provenance.credential_sources(config),
+            machine_switches=setup_provenance.machine_switches(config),
             telegram_session_present=setup_telegram_login.session_present(),
             env_credential=bool(
                 os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -744,6 +803,7 @@ def _slim_init(
     yes: bool,
     keep_env: bool = False,
     system_principal: bool = True,
+    memory_backend: str | None = None,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -756,6 +816,7 @@ def _slim_init(
     flags = SlimFlags(
         deployment=deployment, workspace=workspace, port=port, bind=bind,
         yes=yes, start=start, browser=browser, clipboard=clipboard,
+        memory_backend=memory_backend,
     )
     with _quiet_console(paths.log_file()):
         result = SlimSetup(config_dir, flags).run()
@@ -1945,7 +2006,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             errors.append(f"[ERR] Claude API: {detail}")
 
-    if config.openai_api_key:
+    if config.memory.backend == "loom":
+        # Loom embeds and recalls on its side, and Nerve reaches it through
+        # the MCP gateway with no credential of its own.
+        if config.mcp_gateway_url:
+            lines.append(f"[OK] Memory backend: Loom, through the MCP gateway at {config.mcp_gateway_url}")
+        else:
+            errors.append("[ERR] Memory backend: Loom, but mcp_gateway_url is not set, so Loom cannot be reached")
+    elif config.openai_api_key:
         lines.append(
             f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
             f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"
@@ -2799,6 +2867,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
     if json_output:
         click.echo(json.dumps(report, indent=2, sort_keys=True))
     else:
+        if status.get("base_url"):
+            click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
             click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
@@ -3592,6 +3662,7 @@ def db_vacuum(ctx: click.Context) -> None:
     VACUUM takes a write lock and cannot run while the daemon holds the DB.
     Stop the daemon first (`nerve stop`) for a clean run.
     """
+    from nerve.db.migrations.runner import SchemaNewerThanCodeError
     from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
@@ -3620,6 +3691,8 @@ def db_vacuum(ctx: click.Context) -> None:
 
     try:
         asyncio.run(_run())
+    except SchemaNewerThanCodeError:
+        raise  # _NerveGroup reports it with its own exit status
     except Exception as e:
         click.echo(f"[ERR] VACUUM failed: {e}")
         ctx.exit(1)

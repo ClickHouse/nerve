@@ -162,6 +162,8 @@ class TestDefaultRegistry:
             # notifications
             "notify", "ask_user", "react", "send_sticker", "send_file",
             "send_channel_message",
+            # forms
+            "ask_form",
             # mcp admin
             "nerve_api", "mcp_reload",
             # workflow runs

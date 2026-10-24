@@ -548,6 +548,8 @@ body {
 .markdown-content h3 { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.3em; }
 .markdown-content p { margin: 0.4em 0; line-height: 1.6; }
 .markdown-content ul, .markdown-content ol { margin: 0.4em 0; padding-left: 1.5em; }
+/* Tailwind's preflight strips list markers; markdown lists need them back (task lists draw a checkbox instead). */
+.markdown-content ul:not(.contains-task-list) { list-style: disc; } .markdown-content ol { list-style: decimal; }
 .markdown-content li { margin: 0.2em 0; line-height: 1.5; }
 .markdown-content blockquote { border-left: 3px solid var(--theme-text-faint); padding-left: 1em; margin: 0.5em 0; color: var(--theme-text-muted); }
 .markdown-content a { color: var(--theme-link); text-decoration: none; }

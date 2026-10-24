@@ -150,6 +150,7 @@ Logs: nerve logs. Re-run nerve init after fixing the cause.`
 | `--terminal` | The full terminal wizard — see [The terminal wizard](#the-terminal-wizard-nerve-init---terminal) |
 | `--non-interactive` | Read everything from the environment — see [Unattended installation](#unattended-installation) |
 | `--if-needed` | Exit silently unless this is a fresh install (used by the Docker entrypoint) |
+| `--memory-backend memu\|loom` | Word the workspace templates, bundled skills and built-in jobs written now for this memory backend. Init-only: it does not set `memory.backend`, which a platform switching the instance to Loom writes into `config.local.yaml` afterwards. Without it, `nerve init` uses what an existing configuration names, else `memu`. Works with every path above |
 
 A non-TTY stdin still answers the prompts line by line; only `--yes` skips
 them. Scripted example:
@@ -183,13 +184,13 @@ keep", never read back.
 | Step | Asks | Writes | Takes effect |
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
-| **Mode** | Personal assistant or Worker; a worker also needs a task description (20–4000 characters; three starter templates) | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with the description in place (the onboarding session fills the other sections — see the [Worker Guide](worker-guide.md#how-onboarding-works)); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing | `memory.categories` is read at startup → restart; the rest is live |
+| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule). For a worker, what it should do: checkboxes from the work catalog, by group (code: review pull requests, triage issues, fix issues and open pull requests, keep CI healthy, dependency and security updates; operations: first response to alerts, which needs an alert source; communication: channel digests and answers; knowledge: research and reports, docs and release notes), **Custom…** for work in your own words (at most 4000 characters), and an optional "Anything it must know or never do?" (at most 2000). Nothing ticked is fine: the conversation then offers the same list | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with what you chose under "Task description (as given)" (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
-| **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time) | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
+| **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time). With `memory.backend: loom` nothing: the step is done and says memory is kept in Loom | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
 | **Channels** | a Telegram bot token (verified against Telegram **before** it is saved), pairing; Slack bot and app tokens (verified the same way), who may talk to it | tokens → `config.local.yaml`; `telegram.enabled` / `slack.enabled` → `config.yaml`; Slack allow-lists → `settings.yaml` | Telegram → restart (the bot is built with its token at startup); Slack is live |
 | **Sources** (personal) | GitHub, Gmail (addresses), Telegram message sync (API id and hash, then a one-time sign-in to your own Telegram account: phone, the code Telegram sends, your two-step password if you have one) as toggle cards, each with a server-side check of its tool (`gh`, `gog`). On an [instance that keeps no credentials](#instances-that-keep-no-credentials) only the GitHub toggle, and only when the operator provides the token from the environment | `sync.*.enabled` → `settings.yaml`; `sync.gmail.accounts` → `config.yaml`; Telegram API credentials → `config.local.yaml`; the Telegram session → `NERVE_HOME/telegram_sync.session` (owner-only, written by Telethon) | live |
-| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. For a worker `task-planner` starts off: the onboarding session enables it when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` | live (the scheduler reloads) |
+| **Automation** | which optional built-in jobs run; the core set is always on; schedules shown in your time zone. Each job shows its effective state: a job with the same id in `config/cron/jobs.yaml` replaces the built-in job, and the step shows it read-only. For a worker `task-planner` starts off: the onboarding conversation turns it on when the worker should plan through the approval loop | `enabled` flags in `config/cron/system.yaml` (never for a job that `jobs.yaml` replaces) | live (the scheduler reloads) |
 | **Agents** (personal) | which coding agents on this server (Codex, Claude Code) get a connection to Nerve; what to do with an existing config | the agents' own config files; `external_agents.*` and `mcp_endpoint.enabled` → `config.yaml` | restart |
 | **Review and finish** | a server check-up (Claude CLI, Node, `gh`, `gog`, disk, time zone, web build), what was written where, and the apply button | nothing new | hot reload, or a restart when something above needs one |
 
@@ -248,9 +249,10 @@ A few things worth knowing per step:
   screen and `nerve doctor` say so.
 - **Automation** lists the core jobs as always-on and the optional ones as
   checkboxes with their schedule rendered in the chosen time zone. A worker's
-  `task-planner` is unchecked by default; leave it for the onboarding session,
-  which turns it on (scoped to the worker's tasks) when the worker should plan
-  through the approval loop.
+  `task-planner` is unchecked by default; leave it for the onboarding
+  conversation, which turns it on (scoped to the worker's tasks) when the
+  worker should plan through the approval loop. A job that `jobs.yaml`
+  replaces shows that file's state and cannot be changed here.
 - **Review and finish** shows an HTTPS warning when the page is served over
   plain HTTP from an address other than loopback, and a warning when the
   instance is passwordless and listening beyond localhost.
@@ -275,15 +277,163 @@ live, or **Restart Nerve** when something is read at startup (the time zone, a
 Telegram token, Bedrock's memory models, external agents). The restart
 reasons are listed before you click. Then:
 
-- **Finish** reloads the configuration in place and shows **Nerve is ready**
-  with a "Say hello" button that opens a new chat with a suggested first
-  message.
+- **Finish** reloads the configuration in place, opens the
+  [onboarding conversation](#the-onboarding-conversation) and shows **Nerve
+  is ready** with **Start the conversation**. When onboarding is already done
+  or skipped, a personal install offers "Say hello" (a new chat with a
+  suggested first message) and a worker offers "Open chat".
 - **Restart Nerve** restarts the daemon and waits for the *new* process to
   answer (see [Restarts from the browser](#restarts-from-the-browser)). The
-  page stays where it is, reconnects on its own and ends the same way.
-- A **worker** ends with "Onboarding session starting" and a link to that
-  session: the agent reads your task description, researches it and fills in
-  `TASK.md` — see the [Worker Guide](worker-guide.md#how-onboarding-works).
+  page stays where it is, reconnects on its own and ends the same way. The
+  new process opens the onboarding conversation when it starts.
+
+### The onboarding conversation
+
+After setup, the agent is set up by talking to it. Finish opens one web chat
+session titled **Onboarding** for the person who finished setup, and the agent
+speaks first: its first message is the answer to a hidden instruction, which
+the chat does not show. What it says first depends on what a worker's Mode
+step recorded:
+
+- **With work chosen** (checkboxes, custom work, or both) it offers no menu
+  and starts on that work in the same message. It explains before it asks:
+  it greets you, restates the work in one sentence, says what it studies and
+  sketches the setup it has in mind, and only then shows its first questions.
+  It works from the follow-up questions of each item you ticked (which
+  repositories, what a review may do, the label vocabulary, how often, and so
+  on), asks the questions the items share once (the account it acts as, what
+  waits for your approval, where results go), and skips what setup or its
+  explorer can tell. What does not fit into two rounds of questions becomes a
+  default in its proposal, for you to change. An item whose connection the
+  instance lacks (first response to alerts without an alert source) appears
+  under what it needs from you.
+- **With nothing chosen** (a personal install, or a worker with nothing
+  ticked) it says that it is set up by talking to it, offers the work catalog
+  by group, each item with its one-line description (a personal install lists
+  personal-assistant work first), and asks which apply. A worker with only
+  "Anything it must know or never do?" filled in gets the list too.
+- **With a note from an older setup page, or from `nerve init --terminal`**
+  (free text), a note that describes the work is handled like chosen work; a
+  note with only rules ("never merge anything") or only repositories gets the
+  list.
+
+Whatever you wrote under "Anything it must know or never do?" (or as rules in
+a note) becomes hard rules and approval boundaries in its proposal, and an
+answer in the conversation never loosens one without asking.
+
+The agent runs no tool before its first message, so the hidden instruction
+also gives it what Nerve knows about the instance when the conversation
+opens: the mode and the workspace (cloned repositories go to
+`<workspace>/repos/`), whether configuration arrives by pull request, the
+model and memory, and each connection, with what is configured and where it
+comes from (a file on this machine, the environment, the configuration
+repository, or the platform): the GitHub token, the GitHub CLI's login when
+`gh auth status` says it is authenticated, the GitHub sync source and its
+repositories, Slack (in hosted mode, with the platform gateway's status),
+Telegram and Gmail, and the time zone and quiet hours. It never includes a
+secret. The agent takes these as facts: it does not ask about them or check
+them again before its first message, and it asks only about what is marked
+unknown. When the GitHub login is known, it recommends acting as that account
+and asks you only to confirm it or name another, and the explorer is told the
+same access. Reading the facts adds a moment to Finish: `gh auth status`,
+eight seconds at most.
+
+Then:
+
+1. **It explores in the background.** As soon as it knows what to study
+   (repositories, documentation, data or alert sources, topics), it starts
+   one explorer, a background sub-agent, and says in one line what it
+   studies; the explorer's progress shows on the agent line below the chat.
+   The explorer only reads. It clones repositories into
+   `<workspace>/repos/<name>` (with `gh` when it is signed in, else from the
+   public URL) and is told to write nothing else, install nothing, build
+   nothing and run no tests: it learns how to build and test from the CI
+   configuration, scripts and docs, works for about ten minutes and returns a
+   short findings report: how to build and test, CI, contribution and review
+   rules, the volume of the work, risks and missing access, a suggested first
+   task. If it fails or finds only part, the proposal says so. With nothing to
+   clone or fetch (a personal assistant for the inbox and reminders) there is
+   no explorer.
+2. **It asks in the foreground** while the explorer works, and only what
+   neither the explorer nor setup can tell. It explains first, then shows one
+   form of up to six questions per round, in at most two rounds, each saying
+   why it is asked and each in the shape its answer needs (the Nerve tool
+   `ask_form`): repositories as `owner/name` entries, decisions as a few
+   options that say what they lead to with its recommendation first and
+   **Other…** for your own words, channels and topics as a list, anything
+   else as free text. Typical questions: the account it acts as on the code
+   host (the login it knows is its recommendation), what waits for your
+   approval (its recommendation: drafts you approve for anything public, on
+   its own for reading, cloning and local checks), how often to look for new
+   work, and where results go. It never asks what setup recorded: the mode,
+   your name, time zone and quiet hours, the connected channels and sources.
+3. **It proposes the setup as a plan** once the findings and your answers
+   are in, in Claude Code's plan mode. The plan has fixed headings: what it
+   understood, what it found, the `TASK.md` sections (a worker), the cron
+   jobs (schedule, gate, session mode and what one run does, plus the
+   built-in jobs it turns on or off, such as whether `task-planner` plans
+   through the approval loop), task statuses and tags (the built-in
+   `backlog` and `plan_review` and any extra waits), skills, what it will
+   remember, what it needs from you, the approval boundaries, and at most
+   three optional extras under "Later, if you want". Nerve features appear
+   only where this work needs them. The chat shows the plan in a decision
+   card: **Apply setup**; **Change something…** with what should change, and
+   the agent revises the plan and asks again, as often as it takes, without
+   asking what you already wrote (a change request never widens what you
+   allowed earlier: when it seems to, the agent keeps the narrower choice and
+   asks); or **Edit** to change the plan text yourself and **Apply edited
+   plan**, which tells the agent the setup was approved with your edits.
+4. **It applies what you approved**: cron jobs in `config/cron/jobs.yaml`
+   (then `nerve reload`, so the instance loads them; on an instance whose
+   configuration arrives by pull request, it proposes the change instead),
+   statuses, skills, tasks for what only you can do, notes in memory and,
+   for a worker, the `TASK.md` sections. It is instructed to change nothing
+   before you approve; the runtime does not enforce that (plan mode does not
+   block file writes here). Then it summarizes every change with numbered
+   next steps and calls the `onboarding_done` tool.
+
+The state is one row in `nerve.db` (`onboarding`): pending, running (with the
+session id), done or skipped, and the kind: the conversation, or the
+[autonomous onboarding](#a-worker-set-up-without-the-browser). A worker
+onboarded by an earlier version (the `TASK.md` marker is gone) counts as done.
+An install from before the onboarding state that still has its marker, and a
+personal install from before, count as pending: the banner offers them the
+conversation once setup is complete. Nothing opens without a model credential.
+When the agent's first turn fails (a model error), onboarding goes back to
+pending, and the next Finish or daemon start opens a new conversation. Until
+onboarding is done or skipped:
+
+- the Ready screen leads into the conversation;
+- a banner on every page except the conversation says that the agent waits
+  for you, with **Continue**. While the agent waits for an answer it says
+  what for: "Your agent has a question for you" with **Answer**, or "Your
+  agent proposed a setup" with **Review** (`onboarding.awaiting` in
+  `GET /api/setup`). Its close button hides it until the next page.
+  When setup is complete and the conversation has not started (nobody pressed
+  Finish, or an install from before), the banner offers **Start**, which does
+  what Finish does and opens the conversation. Every signed-in person sees
+  it, because the conversation sets up the shared agent and anyone who can use
+  setup can continue or skip it;
+- the setup page shows the conversation and **Skip onboarding**, behind a
+  confirmation. A skip keeps the session and ends the reminders.
+
+### A worker set up without the browser
+
+`nerve init --terminal` and `nerve init --non-interactive` (`NERVE_TASK`) take
+the worker's task description. With a description, the worker sets itself up
+without a person: at the first start of the daemon with a model credential,
+one session titled **Onboarding** (with the model of scheduled jobs) reads the
+description and the worker guide, researches, fills `TASK.md`, creates
+skills, cron jobs and the tasks only you can do, notifies you with a summary
+and the next steps, and calls `onboarding_done`. It runs once: a restart
+during the session does not start it again, and the banner in the web UI
+links to the session while it runs. When its first turn fails, the next start
+runs it again. Finish on the setup page opens the conversation instead, while
+the session has not started.
+
+With an empty task description, the worker waits for its onboarding
+conversation in the web UI: open the web UI after the first start, and the
+banner leads you to it.
 
 ### Coming back later
 
@@ -424,13 +574,13 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
 | `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
 | `NERVE_PASSWORDLESS` | unset | `1` completes setup without a password: anyone who can reach the gateway acts as the owner (see [Accounts and identity](accounts.md)). Not allowed with `NERVE_PASSWORD`. With neither, setup stays incomplete until the browser claim (`nerve status` prints the token once the gateway runs) |
-| `NERVE_TASK` | unset | Worker mode task description |
+| `NERVE_TASK` | unset | Worker mode task description. With it, the worker sets itself up at its first start; without it, the worker waits for its onboarding conversation in the web UI (see [A worker set up without the browser](#a-worker-set-up-without-the-browser)) |
 | `NERVE_EXTERNAL_AGENTS` | unset | Personal mode, e.g. `codex,claude-code` |
 | `GH_TOKEN` | unset | GitHub integration |
 
 This path writes the same files it always has and starts no daemon; only a
 worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
-empty) and `task-planner` disabled until the onboarding session enables it.
+empty) and `task-planner` disabled until onboarding enables it.
 The browser checklist afterwards shows what the environment decided as done —
 the mode, the provider, the time zone, a Telegram token — and leaves the rest
 to skip or fill in.
@@ -863,6 +1013,7 @@ Environment=PATH=/home/YOUR_USER/nerve/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/YOUR_USER/nerve/.venv/bin/nerve start --foreground
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=65
 
 [Install]
 WantedBy=multi-user.target
@@ -870,7 +1021,10 @@ WantedBy=multi-user.target
 
 Note: Use `--foreground` with systemd since it manages the process lifecycle.
 If you set up the instance with `nerve init` first, stop the daemon it
-started (`nerve stop`) before enabling the unit.
+started (`nerve stop`) before enabling the unit. `RestartPreventExitStatus=65`
+keeps systemd from restarting a Nerve that refused a database newer than its
+code, where every restart would refuse again (see
+[Going back to an older Nerve](#going-back-to-an-older-nerve)).
 
 ```bash
 sudo systemctl daemon-reload
@@ -938,9 +1092,20 @@ Subsequent `nerve upgrade` runs install from the lock automatically.
 
 Going back to an older Nerve after an upgrade is refused by default: the
 database schema is then newer than the code, and older code on a newer schema
-fails quietly later rather than loudly at start. Restore the backup taken
-before the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start
-anyway and accept that risk.
+fails quietly later rather than loudly at start. The check covers each
+migration track on its own, so a Nerve without a fork's migrations also
+refuses a database that fork migrated (see
+[Migrations](architecture.md#migrations)). The refusal is one line, naming the
+track and both versions. `nerve start --foreground`, which is what a
+supervisor runs, and every command that opens the database then exit with
+status 65. A supervisor can key on it, for example with systemd's
+`RestartPreventExitStatus=65`, as in the unit above. The daemonizing
+`nerve start` does not pass the status on: it checks the process it started
+once, a second later, and only if that process has exited by then does it
+print `Nerve failed to start (exit code 65)` and exit with status 1. The
+refusal line is in the log file either way. Restore the backup taken before
+the upgrade instead, or set `NERVE_ALLOW_NEWER_SCHEMA=1` to start anyway and
+accept that risk.
 
 ### Changing a dependency
 

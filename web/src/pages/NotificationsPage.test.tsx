@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ActorRef } from '../api/client';
 import type { Notification, Silence } from '../stores/notificationStore';
@@ -22,6 +23,7 @@ const { api } = await import('../api/client');
 const { useActorStore } = await import('../stores/actorStore');
 const { useNotificationStore } = await import('../stores/notificationStore');
 const { NotificationsPage } = await import('./NotificationsPage');
+const { NotificationToast } = await import('../components/Notifications/NotificationToast');
 
 const listNotifications = vi.mocked(api.listNotifications);
 const listSilences = vi.mocked(api.listSilences);
@@ -208,5 +210,83 @@ describe('NotificationsPage attribution', () => {
       });
     });
     await waitFor(() => expect(attributions()).toEqual(['Alice']));
+  });
+});
+
+/** Shows the current path, so a test can see where a click navigated. */
+function Where() {
+  return <p data-testid="where">{useLocation().pathname}</p>;
+}
+
+function renderAt(element: ReactElement) {
+  return render(
+    <MemoryRouter initialEntries={['/notifications']}>
+      <Routes><Route path="*" element={<>{element}<Where /></>} /></Routes>
+    </MemoryRouter>,
+  );
+}
+
+const PLAN_NOTICE = {
+  type: 'notify' as const, status: 'pending', answer: null, answered_by: null,
+  answered_at: null, title: 'Plan ready for review: Fix the encoder',
+  body: 'Version 1 of plan plan-1 waits for your decision.',
+  metadata: JSON.stringify({ plan_id: 'plan-1', task_id: 'task-1' }),
+};
+
+describe('NotificationsPage links', () => {
+  it('opens the plan and the task that a notification names', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification(PLAN_NOTICE)], pending_count: 1,
+    });
+    renderAt(<NotificationsPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open plan' }));
+    expect(screen.getByTestId('where')).toHaveTextContent('/plans/plan-1');
+    await userEvent.click(screen.getByRole('button', { name: 'Open task' }));
+    expect(screen.getByTestId('where')).toHaveTextContent('/tasks/task-1');
+  });
+
+  it('shows no plan link on a notification without one', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({ type: 'notify', status: 'pending', title: 'Build finished' })],
+      pending_count: 1,
+    });
+    renderAt(<NotificationsPage />);
+    await screen.findByText('Build finished');
+    expect(screen.queryByRole('button', { name: 'Open plan' })).not.toBeInTheDocument();
+  });
+
+  it('renders the body as markdown, with app links in place', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({
+        type: 'notify', status: 'pending', title: 'Done',
+        body: 'See **the plan**: [plan-2](/plans/plan-2) or [docs](https://example.com/docs)',
+      })],
+      pending_count: 1,
+    });
+    renderAt(<NotificationsPage />);
+    expect((await screen.findByText('the plan')).tagName).toBe('STRONG');
+    expect(screen.getByRole('link', { name: 'docs' })).toHaveAttribute('target', '_blank');
+    const planLink = screen.getByRole('link', { name: 'plan-2' });
+    expect(planLink).not.toHaveAttribute('target');
+    await userEvent.click(planLink);
+    expect(screen.getByTestId('where')).toHaveTextContent('/plans/plan-2');
+  });
+});
+
+describe('NotificationToast links', () => {
+  it('opens the plan from a live notification and closes the toast', async () => {
+    renderAt(<NotificationToast />);
+    act(() => {
+      useNotificationStore.getState().handleWSNotification({
+        notification_id: 'notif-live-plan', notification_type: 'notify', session_id: 's1',
+        title: PLAN_NOTICE.title, body: PLAN_NOTICE.body, priority: 'high', options: null,
+        metadata: { plan_id: 'plan-1', task_id: 'task-1' },
+      });
+    });
+    await userEvent.click(await screen.findByRole('button', { name: 'Open plan' }));
+    expect(screen.getByTestId('where')).toHaveTextContent('/plans/plan-1');
+    expect(useNotificationStore.getState().toastQueue).toEqual([]);
+    expect(useNotificationStore.getState().notifications[0].metadata)
+      .toEqual({ plan_id: 'plan-1', task_id: 'task-1' });
   });
 });

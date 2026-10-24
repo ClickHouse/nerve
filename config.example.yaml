@@ -339,6 +339,10 @@ sync:
 memory:
   recall_model: claude-sonnet-5-5
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
+  # backend: loom   # Keep memory in Loom, reached through mcp_gateway_url
+  #                 # (docs/config.md "Loom memory backend"); default: memu
+  # loom:
+  #   dashboard_url: "https://loom.example.com"   # Optional: link people to Loom's dashboard
 
 # Cron — no path keys needed. Cron config lives in <workspace>/config/cron/
 # (system.yaml, jobs.yaml, gates/) and is resolved from the workspace, with a
@@ -429,7 +433,8 @@ memory:
 # MCP gateway (external mode only, NERVE_AUTH_MODE=external). Nerve then takes
 # its MCP servers only from the gateway's catalog, and mcp_servers has no
 # effect. A change needs a restart. See docs/config.md "MCP servers in
-# external mode".
+# external mode". The Loom memory backend (memory.backend: loom) reaches Loom
+# through it in either mode.
 # mcp_gateway_url: "http://192.0.2.1:8080"
 
 # Observability (optional) — Langfuse tracing for the agent loop.

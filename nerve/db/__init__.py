@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nerve import paths
-from nerve.db.base import SCHEMA_VERSION, Database
+from nerve.db.base import FORK_SCHEMA_VERSION, SCHEMA_VERSION, Database
 
 # Global database instance
 _db: Database | None = None
@@ -70,6 +70,7 @@ def global_system_actor_id() -> str | None:
 __all__ = [
     "Database",
     "SCHEMA_VERSION",
+    "FORK_SCHEMA_VERSION",
     "get_db",
     "init_db",
     "close_db",

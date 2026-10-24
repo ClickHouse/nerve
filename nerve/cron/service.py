@@ -34,6 +34,7 @@ from nerve.cron.jobs import (
     describe_reserved_job_ids,
     is_reserved_job_id,
     load_jobs,
+    merge_jobs,
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
@@ -78,7 +79,8 @@ _STOP_WAIT_SECONDS = GRACEFUL_STOP_SECONDS
 _CATCHUP_SETTLE_SECONDS = 15
 
 # The cron_logs error of a run that came due during a pause of the machine and
-# was not caught up.
+# was not caught up, although its gates would have let it run (see
+# CronService._record_paused_run).
 _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: false)"
 
 # How a run of a cron job or source runner was started: by its schedule, as a
@@ -192,6 +194,11 @@ class _Forecast:
     runs: bool
     reason: str | None = None
     runs_at: datetime | None = None
+
+
+# The forecast reason of a source runner whose source runs when records are
+# delivered (``Source.push_fed``): its scheduled run is a fallback.
+_PUSH_FED_REASON = "the source runs when records are delivered; the scheduled run is a fallback"
 
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
@@ -424,6 +431,22 @@ class _ClockCheckingScheduler(AsyncIOScheduler):
             # Never at the cost of the schedule itself.
             logger.exception("Clock check before processing cron jobs failed")
         return super()._process_jobs()
+
+
+def _reword_for_loom(jobs: list[CronJob]) -> None:
+    """Under the Loom memory backend, a built-in job that still carries the
+    prompt Nerve wrote for memU (a ``system.yaml`` from before the switch)
+    runs with its Loom wording: ``memory-maintenance`` would otherwise prune
+    memories through Loom's tools. An edited prompt is left alone."""
+    from nerve.setup_writer import loom_wording_of_shipped_job
+
+    for job in jobs:
+        if job.prompt_file or not job.prompt:
+            continue
+        reworded = loom_wording_of_shipped_job(job.id, job.prompt, job.description)
+        if reworded is not None:
+            job.prompt, job.description = reworded
+            logger.info("Cron job %s: memU's prompt in system.yaml runs in its Loom wording", job.id)
 
 
 class CronService:
@@ -1164,10 +1187,11 @@ class CronService:
         ``catchup``, the source runners and cleanup — except one with a run
         still going, which the fire that came due would have found going too
         (see :meth:`_may_start`). A job with ``catchup: false`` only moves on,
-        with a ``missed`` row for the run it skips; the wakeup sweep (which
-        fires every due session wakeup on its next pass) only moves on. Jobs
-        are handled one by one: one that cannot be moved is logged and left to
-        the scheduler, and the rest still move.
+        with a ``missed`` row for the run it skips unless its gates would have
+        skipped that run (see :meth:`_record_paused_run`); the wakeup sweep
+        (which fires every due session wakeup on its next pass) only moves on.
+        Jobs are handled one by one: one that cannot be moved is logged and
+        left to the scheduler, and the rest still move.
         """
         after = paused_to + timedelta(microseconds=1)
         grace = timedelta(seconds=_MISFIRE_GRACE_SECONDS)
@@ -1196,10 +1220,9 @@ class CronService:
                     if self._may_start(sched_job.id, "catchup"):
                         due.append(sched_job.id)
                 elif func == self._run_job_wrapper:
-                    # Recorded like a run the scheduler drops for being late.
-                    asyncio.create_task(self._record_missed_run(
-                        sched_job.id, missed, error=_PAUSED_MISS,
-                    ))
+                    asyncio.create_task(
+                        self._record_paused_run(sched_job.args[0], missed),
+                    )
             except Exception:
                 logger.exception("Could not move %s past the pause", sched_job.id)
         # Re-arm the scheduler's own timer against the stepped clock too.
@@ -1220,6 +1243,38 @@ class CronService:
         if rearmed:
             self._schedule_changed()
         return due
+
+    async def _record_paused_run(self, job: CronJob, due: datetime) -> None:
+        """Record the run that *job*, a job with ``catchup: false``, skipped by
+        coming due at *due* during a pause of the machine.
+
+        The run is missed, and recorded like a run the scheduler drops for
+        being late, only if the job's gates would have let it run. If they
+        would have skipped it, it is skipped as a scheduled run that its gates
+        skip is: no ``cron_logs`` row, a log line, and the schedule listeners
+        are told. The gates are asked for their forecast for *due*, as
+        :meth:`next_scheduled` asks them about a run to come — the answer that
+        left this run out of the next scheduled tick — and not for their
+        check, which may keep state for a run it lets through (a cursor
+        renewed, a fingerprint stored) when this run never happened. A
+        forecast that raises lets the run through, as a check that raises does.
+        """
+        if job.gates:
+            from nerve.cron.gates import GateContext, forecast_gates
+
+            decision = await forecast_gates(
+                job.gates, GateContext(job_id=job.id, db=self.db), due,
+            )
+            if not decision.should_run:
+                logger.debug(
+                    "Skipping cron job %s, due at %s while the machine was paused: %s",
+                    job.id,
+                    due.astimezone(self.timezone).isoformat(timespec="seconds"),
+                    decision.reason,
+                )
+                self._schedule_changed()
+                return
+        await self._record_missed_run(job.id, due, error=_PAUSED_MISS)
 
     async def _catch_up_after_pause(self) -> None:
         """Run once each job waiting to be caught up, concurrently, through
@@ -1609,12 +1664,17 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
+            if self.config.memory.backend == "loom":
+                # The built-in jobs live here too on such an install.
+                _reword_for_loom(user_jobs)
             kept, self._rejected_job_ids = _drop_reserved(user_jobs)
             return kept
 
         # Tag sources for display in CLI
         for j in system_jobs:
             j.metadata["_source"] = "system"
+        if self.config.memory.backend == "loom":
+            _reword_for_loom(system_jobs)
         for j in user_jobs:
             j.metadata["_source"] = "user"
 
@@ -1627,11 +1687,7 @@ class CronService:
                     job.id,
                 )
 
-        jobs_by_id = {j.id: j for j in system_jobs}
-        for j in user_jobs:
-            jobs_by_id[j.id] = j
-
-        kept, self._rejected_job_ids = _drop_reserved(list(jobs_by_id.values()))
+        kept, self._rejected_job_ids = _drop_reserved(merge_jobs(system_jobs, user_jobs))
         return kept
 
     async def _run_job_wrapper(
@@ -2384,10 +2440,12 @@ class CronService:
         gates forecast to happen (judged from what is known now, see
         :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
         is forecast to skip, one of its next few runs (see
-        :meth:`_forecast_job`); the next run of each source runner; the
-        earliest pending session wakeup. Cleanup and the wakeup sweep are
-        housekeeping and never count. ``None`` when nothing falls within
-        *horizon* of *now* (default: the current time), which must be
+        :meth:`_forecast_job`); the next run of each source runner, except
+        one whose source runs when records are delivered (``Source.push_fed``),
+        whose scheduled run is a fallback; the earliest pending session
+        wakeup. Cleanup and the wakeup sweep are housekeeping and never
+        count. ``None`` when nothing falls within *horizon* of *now*
+        (default: the current time), which must be
         timezone-aware: a naive *now* raises ``ValueError``.
 
         The tick can lie before *now*: a session wakeup that came due but has
@@ -2445,9 +2503,18 @@ class CronService:
         for sched_job in self.scheduler.get_jobs():
             next_run = getattr(sched_job, "next_run_time", None)
             if sched_job.func == self._run_source_wrapper:
-                forecasts[sched_job.id] = _Forecast(
-                    "source", next_run, runs=True, runs_at=next_run,
-                )
+                runner = sched_job.args[0]
+                if getattr(runner.source, "push_fed", False) is True:
+                    # The source runs when records are delivered, and its
+                    # scheduled run is a fallback that normally finds nothing,
+                    # so it is not work the instance will start on its own.
+                    forecasts[sched_job.id] = _Forecast(
+                        "source", next_run, runs=False, reason=_PUSH_FED_REASON,
+                    )
+                else:
+                    forecasts[sched_job.id] = _Forecast(
+                        "source", next_run, runs=True, runs_at=next_run,
+                    )
             elif sched_job.func == self._run_job_wrapper:
                 forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
         return forecasts

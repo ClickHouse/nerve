@@ -41,7 +41,7 @@ web/src/
 │   │   └── DiffView.tsx          # GitHub PR-style unified diff renderer
 │   ├── Tasks/          # Task list, search, detail editor
 │   ├── Memory/         # File browser with markdown editor
-│   ├── Memu/           # Semantic memory browser (categories, items, sources)
+│   ├── Memu/           # Semantic memory browser (categories, items, sources); a Loom note under memory.backend: loom
 │   └── Diagnostics/    # System status dashboard
 ├── utils/
 │   ├── dateGroups.ts       # Date grouping (Today/Yesterday/This Week/Older)
@@ -95,8 +95,10 @@ Tool calls are collapsed by default with specialized renderers:
 - **Skills** (skill_list/get/create/update/read_reference/run_script) — Purple-themed cards. Load Skill shows skill name badge + line count; Create Skill shows name, description, and content preview; List Skills parses into individual skill cards; Update shows content diff preview.
 - **Agents** (Agent/Task tool) — One live line at the spawn point: status, name, type, activity or result, elapsed time, tokens, `[Open]` and a two-step `[■]` stop; the chevron reveals the prompt and result. Groups of agent calls show the last 8. Old history without an agent record keeps the legacy card with its "View →" result tab. A sub-agent's own work never appears in the main chat; it is in the agent's tab.
 - **Background continuation** — An autonomous turn (the runtime resumed after background work settled) starts with a divider naming what settled ("Background · build-chart finished").
-- **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Falls back to a regular chat message for historical/non-interactive renders.
-- **ExitPlanMode / EnterPlanMode** — Approval card with Allow/Decline buttons. Agent pauses mid-turn until the user responds. Plan panel auto-closes on approval.
+- **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Each question also offers **Other…**, which opens a "Your answer" field: the typed text (required once chosen) is that question's answer — it replaces the option in a single-select question and is appended to the chosen labels in a multi-select one. A card with one single-select question still answers on one click of an option. Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Once the question is no longer pending (answered here or in another tab, after a reload, or closed by a timeout), the card is read-only and shows the chosen answers; it never posts an answer as a chat message.
+- **ask_form** (Nerve's form tool, `mcp__nerve__ask_form`) — One card for up to six questions while the agent's tool call waits for the answers (up to an hour): an optional title, then each question with its label chip (`*` when required, or "Optional"), the question and the agent's reason in muted text. By kind: `choice` is option rows to pick one and `multi` option rows to pick any, each with **Other…** for the person's own words unless the agent turned it off (in `multi` the Other… text is one more answer); `text` is a two-row box that grows (Enter is a new line); `url` is checked to be http(s) with a host and no spaces; `list` is chips (a comma or Enter adds one, Backspace in the empty field removes the last, a paste splits at commas and line breaks, and leaving the field keeps the typed text); `repos` is chips like `list`, each `owner/name` (a pasted GitHub URL becomes `owner/name`; an invalid one is red with a hint and blocks Submit). Defaults are prefilled. **Submit** (or Cmd/Ctrl+Enter anywhere in the card) is enabled once every required question has an answer and nothing is invalid; Escape inside the card never stops the waiting turn. The answers go back through `answer_interaction` (`result: { answers }`), and the agent gets one line per question plus the same answers as JSON. The card answers only while its own form waits; after an answer here or in another tab, a timeout or a reload it is read-only. Answered cards fold, `ask_form` and AskUserQuestion alike: an answered or closed card shows one line per question, `LABEL → answer` (chips for a list, "—" for no answer); **Show questions** opens the full card, read-only, and **Hide** folds it again. Cards start folded, also after a reload, where the answers are read from the tool result; a card that still waits is shown in full. "Closed" means it ended without an answer (a timeout, the form was closed, or the session stopped).
+- **EnterPlanMode** — A status line, "Entering plan mode…" while it runs and "Entered plan mode" when complete ("Plan mode declined" on an error), with no buttons: entering plan mode only restricts the agent, so no approval is involved (the Claude CLI switches the mode itself; if a CLI asks, the server allows it at once).
+- **ExitPlanMode** — The decision card. The agent pauses mid-turn until the person decides. The card shows an autogenerated summary, not the plan itself: up to six short bullets that the server writes with `agent.title_model` when the pause starts (the `plan_summary` event), with "Summarizing…" until they arrive and the plan's first heading and two lines when no summary can be made; the full plan (the interaction's `tool_input.plan`, which the CLI fills with the plan file's text) is in the side panel, which **Read the plan** opens. **Approve** lets the agent go on (it starts on the plan in the same turn) and closes the plan tab. **Request changes…** opens a required "What should change?" field; **Send** refuses the plan with that text, which reaches the agent verbatim: it stays in plan mode, revises the plan and asks again with a new card. **Edit**, offered when the pause carries the plan text, opens the side panel with the plan as a text field ("Edit the plan"); there **Apply edited plan** (enabled once the text changed) approves the person's text instead (`answer_interaction` with `result: { plan }`): the CLI saves it to the plan file and tells the agent the plan was approved with the person's edits. **Cancel** drops the edits. A decided card keeps its outcome line and a **Read the plan** link that opens that plan read-only (the edited text, for an edited approval). In the onboarding conversation the card is titled "Setup proposal" with **Apply setup**, **Change something…** and "Edit the setup proposal". After an approval, while that turn still runs, the card reads "Approved — applying…" ("Approved with your edits — applying…"; "Applying the setup…" in the onboarding conversation), then "Approved" or "Approved with your edits"; a change request reads "Changes requested" with the first line of the feedback, and an error that is not the person's feedback (a timeout, a stopped session, a CLI validation error) reads "Closed" with its reason.
 
 ### Modified Files Panel
 GitHub PR-style diff viewer for files modified during a session. Accessible via the `[📁 N]` badge button in the chat header (appears when files have been modified).
@@ -121,9 +123,10 @@ Sub-agents and background tasks (shells, monitors, workflows) of the session; se
 Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows and modified files:
 
 - **Tabbed interface** — Tab bar appears when multiple tabs exist. Each tab has its own labelled close button.
-- **Plan actions** — Plan tabs get Approve/Decline buttons in the footer. When `ExitPlanMode` fires, both buttons appear. Approve resolves the interaction; Decline denies so the agent can revise.
-- **Plan live updates** — Backend broadcasts `plan_update` WS events when Write/Edit targets `.claude/plans/` files (also by a sub-agent), updating the panel content in real-time.
-- **Auto-close** — No side-panel tab closes on its own timer. Plan tabs close on approve/decline; finished plan and old-history result tabs beyond the five newest are pruned (never the focused one).
+- **Plan actions** — While `ExitPlanMode` waits, the plan tab's footer offers the same decision as the chat card, with the same labels, feedback field and Edit: Approve resolves the interaction and closes the tab (from either surface); Request changes… denies it with the person's text and keeps the tab, so the revised plan updates in place. With no `ExitPlanMode` waiting and no turn running, the footer's Approve sends "Looks good — implement it." as a message and closes the tab; the onboarding conversation has no such fallback, because its setup proposal is decided once, on its pause.
+- **Plan live updates** — Backend broadcasts `plan_update` WS events when Write/Edit targets a file in the CLI's plans directory (`~/.claude/plans/`, or `$CLAUDE_CONFIG_DIR/plans/`; also by a sub-agent), updating the panel content in real-time.
+- **Plans open on demand** — In Claude sessions the plan tab no longer opens by itself, neither when the agent writes its plan file nor when `ExitPlanMode` waits: the decision card's summary is what the person sees first, and **Read the plan** or **Edit** on the card open the tab. Codex sessions, which have no decision card, still open the tab on a plan update.
+- **Auto-close** — No side-panel tab closes on its own timer. Plan tabs close on approve; finished plan and old-history result tabs beyond the five newest are pruned (never the focused one).
 - **Resizable** — Drag the left edge to resize (20%–65%). Width persists in localStorage.
 - **Keyboard shortcut** — `Cmd/Ctrl + \` toggles panel visibility.
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
@@ -201,8 +204,10 @@ the `PairingWidget` (t.me link, code, 2 s poll) when the bot is live, with a
 manual user id fallback; Sources load `GET /api/setup/sources/preflight` and
 warn when a toggle is on but its tool is missing; Automation renders
 schedules in the chosen time zone and, for a worker, shows `task-planner` off
-by default with a note that the onboarding session enables it when the worker
-should plan through the approval loop; Agents default-checks what is installed.
+by default with a note that the onboarding conversation turns it on when the
+worker should plan through the approval loop; a job that `jobs.yaml` replaces
+shows that file's state, read-only, with a note; Agents default-checks what is
+installed.
 
 **Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
 runs the server check-up (`GET /api/setup/environment`) with its hints — an
@@ -213,11 +218,26 @@ address, a passwordless-on-LAN warning — shows what was written where from
 restart, with the reasons listed. Under systemd (or an operator-declared
 supervisor) the operator's command is shown before the click — it arrives as
 `restart_command` in the setup state (and `command` from `/api/setup/environment`),
-never parsed out of the message. Then `ReadyScreen`: "Nerve is ready", three summary
-lines, **Say hello** (opens a new chat with a suggested first message),
-a pairing card when a live Telegram bot has nobody paired yet, and "Open
-the setup page". A worker's ending is "Your worker is ready" with the onboarding
-session's status and a link to it, polled every 5 s while it runs.
+never parsed out of the message. Then `ReadyScreen`: "Nerve is ready" (a
+worker: "Your worker is ready"), three summary lines, **Start the
+conversation** into the onboarding conversation (or, after a restart is
+needed first, a line that it opens after the restart; when onboarding is over,
+**Say hello** with a suggested first message, or **Open chat** for a worker),
+a pairing card when a live Telegram bot has nobody paired yet, and "Open the
+setup page". The setup Overview shows `OnboardingPanel` while onboarding is
+pending or waits: the way into the conversation (**Start the conversation**
+once setup is complete) and **Skip onboarding** behind an inline
+confirmation. `SetupBanner` shows the onboarding reminder first: on every
+page except the onboarding chat, to every signed-in person, with **Continue**;
+while the conversation runs and the agent waits for the person
+(`onboarding.awaiting` in the setup state), "Your agent has a question for
+you" with **Answer** (`question`) or "Your agent proposed a setup" with
+**Review** (`plan`), both linking to the conversation;
+when setup is complete and the conversation has not started, with **Start**,
+which calls `POST /api/setup/finish` and opens the conversation; while a
+worker sets itself up without a person, with **Open**, a link to that
+session. Its close button hides it until the next page, and it reads the
+setup state again on each page change while a session runs.
 
 **RestartOverlay** covers the page while the daemon restarts and is never a
 trap: "Restarting Nerve… (12 s)" with **Not now** after ten seconds; for an
@@ -315,6 +335,7 @@ System status dashboard (`/diagnostics`) with:
 - **Usage & Cost** — 7-day totals, daily cost, and cost breakdowns by model, by source, and by cron job (with runs and average cost per run)
 - **Sources** — Per-source sync status: cursor, last run, records fetched/processed, errors
 - **Tasks / FTS Index** — Active/done counts, FTS indexed vs total, in-sync status indicator (green ✓ / red ✗)
+- **Memory service** — memU's status, item counts and operations; with `memory.backend: loom`, Loom's: the gateway it is reached through, the org and namespace, where the namespace came from, the last error and when it was checked, and a link to Loom's dashboard when `memory.loom.dashboard_url` is set
 - **Recent Cron Logs** — Job ID, status, timestamps, errors
 
 ### Reload Resilience

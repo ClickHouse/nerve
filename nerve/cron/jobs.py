@@ -274,6 +274,18 @@ class CronJob:
         return job
 
 
+def merge_jobs(system_jobs: list[CronJob], user_jobs: list[CronJob]) -> list[CronJob]:
+    """The jobs that run: a user job replaces the system job with the same id.
+
+    System jobs come first, in their order; a user job with a new id follows.
+    The scheduler and the setup checklist both use this merge.
+    """
+    jobs_by_id = {j.id: j for j in system_jobs}
+    for j in user_jobs:
+        jobs_by_id[j.id] = j
+    return list(jobs_by_id.values())
+
+
 def load_jobs(
     jobs_file: Path,
     strict: bool = False,

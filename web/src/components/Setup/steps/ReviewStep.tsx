@@ -1,16 +1,17 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type {
-  SetupFinishResponse, SetupProfileDetail, SetupProviderDetail, SetupState, SetupStep,
+  SetupProfileDetail, SetupProviderDetail, SetupState, SetupStep, WorkCatalogItem, WorkSelection,
 } from '../../../api/client';
-import { useSetupStore } from '../../../stores/setupStore';
+import { useSetupStore, workOf } from '../../../stores/setupStore';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { Badge, Button } from '../../ui';
 import { Check, Copy, Loader2, RefreshCw } from '../../ui/icons';
 import {
   ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, HTTPS_HINT, PASSWORDLESS_LAN_HINT, PROVIDER_LAST_TEST_FAILED,
   QUIET_HOURS_LINE, RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN, REVIEW_DECIDE_FIRST,
-  REVIEW_HEADING, describeRestartReason, isFirstRunRestart,
+  REVIEW_HEADING, WORK_REVIEW_ALSO, WORK_REVIEW_ITEMS, WORK_REVIEW_NONE, WORK_REVIEW_RULES,
+  describeRestartReason, isFirstRunRestart,
 } from '../copy';
 import { stepTitle, stopPath } from '../navigation';
 import { Notice } from '../Notice';
@@ -31,6 +32,25 @@ function lastTestFailed(step: SetupStep): boolean {
 function quietHoursLine(step: SetupStep): string {
   const detail = step.detail as SetupProfileDetail;
   return QUIET_HOURS_LINE(quietEnabled(detail) ? { start: detail.quiet_start, end: detail.quiet_end } : null);
+}
+
+/**
+ * A worker's Mode row: the work chosen (catalog labels), other work in the
+ * person's words and the rules, as `TASK.md` has them. With neither items
+ * nor other work, the onboarding conversation asks; the row says so.
+ */
+function WorkLines({ catalog, selection }: { catalog: WorkCatalogItem[]; selection: WorkSelection }) {
+  const labels = selection.items.map((id) => catalog.find((item) => item.id === id)?.label ?? id);
+  const custom = selection.custom.trim();
+  const rules = selection.rules.trim();
+  return (
+    <div className="flex flex-col gap-0.5 text-xs text-text-dim">
+      {labels.length > 0 && <p>{WORK_REVIEW_ITEMS(labels)}</p>}
+      {custom && <p className="whitespace-pre-line break-words line-clamp-3" title={custom}>{WORK_REVIEW_ALSO(custom)}</p>}
+      {labels.length === 0 && !custom && <p>{WORK_REVIEW_NONE}</p>}
+      {rules && <p className="whitespace-pre-line break-words line-clamp-3" title={rules}>{WORK_REVIEW_RULES(rules)}</p>}
+    </div>
+  );
 }
 
 /**
@@ -58,7 +78,6 @@ export function ReviewStep({ state }: { state: SetupState }) {
   const reconnecting = useSetupStore((s) => s.reconnecting);
   const latest = useSetupStore((s) => s.state) ?? state;
   const [ready, setReady] = useState(false);
-  const [onboarding, setOnboarding] = useState<SetupFinishResponse['onboarding'] | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => { void loadEnvironment(); }, [loadEnvironment]);
@@ -66,13 +85,12 @@ export function ReviewStep({ state }: { state: SetupState }) {
   const apply = async () => {
     const result = await finish();
     if (!result) return;
-    setOnboarding(result.onboarding);
     if (result.action === 'reloaded') { setReady(true); return; }
     const back = await restart();
     if (back) setReady(true);
   };
 
-  if (ready) return <ReadyScreen state={latest} onboarding={onboarding} />;
+  if (ready) return <ReadyScreen state={latest} />;
 
   const files = [...new Set(state.steps.flatMap((s) => s.status === 'done' ? s.files : []))].sort();
   // The operator's command, on screen before anyone clicks: the server's
@@ -89,6 +107,7 @@ export function ReviewStep({ state }: { state: SetupState }) {
     ? RESTART_EXPLAINER
     : state.restart_message;
   const anyBusy = busy !== null || reconnecting;
+  const work = workOf(state);
   const pendingSteps = state.steps.filter((s) => s.status === 'pending');
   const canFinish = pendingSteps.length === 0;
 
@@ -202,6 +221,9 @@ export function ReviewStep({ state }: { state: SetupState }) {
                     {step.summary}
                     {lastTestFailed(step) && <span className="text-hue-amber"> · {PROVIDER_LAST_TEST_FAILED}</span>}
                   </p>
+                )}
+                {step.id === 'mode' && work.selection && (
+                  <WorkLines catalog={work.catalog} selection={work.selection} />
                 )}
                 {/* Before a mode is chosen the times are the config's
                     fallback, which the mode is about to replace. */}

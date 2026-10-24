@@ -504,7 +504,12 @@ def reset_caches() -> None:
 # (taken at, GitHub hosted, result)
 _sources_cache: tuple[float, bool, dict[str, Any]] | None = None
 
-GH_HOSTED_HINT = "The channel gateway polls GitHub for this agent; gh is not needed on the server."
+# The gateway polls GitHub for an agent only while a GitHub credential is
+# connected to it, so the hint says that is what GitHub waits for here.
+GH_HOSTED_HINT = (
+    "The channel gateway polls GitHub for this agent once a GitHub credential "
+    "is connected to it; gh is not needed on the server."
+)
 
 
 def gh_needed(config: NerveConfig) -> bool:
@@ -518,19 +523,27 @@ def gh_needed(config: NerveConfig) -> bool:
         return True
     return bool(sync.github_events.enabled or sync.github_repos.enabled)
 
+#: The GitHub CLI probe's hint when ``gh auth status`` timed out or could not run.
+GH_NO_ANSWER = "gh auth status did not answer."
+
 
 def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
-def _gh_status() -> dict[str, Any]:
+def _gh_status(timeout: float = HTTP_TEST_TIMEOUT) -> dict[str, Any]:
+    """``{cli, authenticated, login, hint}`` from ``gh auth status``.
+
+    Also the onboarding's GitHub fact (:mod:`nerve.onboarding_environment`),
+    which passes a shorter ``timeout`` to stay within its own budget.
+    """
     if not shutil.which("gh"):
         return {"cli": False, "authenticated": False, "login": None,
                 "hint": "Install gh and run gh auth login on the server to enable the GitHub source."}
     try:
-        result = _run(["gh", "auth", "status"], HTTP_TEST_TIMEOUT)
+        result = _run(["gh", "auth", "status"], timeout)
     except (subprocess.TimeoutExpired, OSError):
-        return {"cli": True, "authenticated": False, "login": None, "hint": "gh auth status did not answer."}
+        return {"cli": True, "authenticated": False, "login": None, "hint": GH_NO_ANSWER}
     text = (result.stdout or "") + (result.stderr or "")
     login = None
     for line in text.splitlines():

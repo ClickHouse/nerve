@@ -36,6 +36,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from nerve import onboarding as onboarding_flow
 from nerve import (
     boot,
     config_reload,
@@ -64,8 +65,11 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.accounts import instance_is_passwordless, setup_required
 from nerve.identity import Actor
+from nerve.onboarding_catalog import ITEMS as WORK_ITEMS
+from nerve.onboarding_catalog import CUSTOM_MAX, RULES_MAX, WorkSelection, in_catalog_order
 from nerve.setup_checklist import (
     BLOCKED_POLICY,
+    GITHUB_SWITCH,
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
     NO_LOCAL_SECRETS_TEXT,
@@ -83,7 +87,7 @@ from nerve.setup_checklist import (
     Facts,
     Step,
     derive,
-    onboarding_from_task,
+    managed_switch_reason,
     sources_available,
     steps_for_mode,
     summarize,
@@ -113,9 +117,11 @@ from nerve.setup_writer import (
     merge_settings_defaults,
     merge_settings_paths,
     plan_optional_crons,
+    render_work_description,
     replace_choices,
     settings_problem,
     task_description_from,
+    work_selection_from,
     workspace_mode,
 )
 
@@ -305,7 +311,6 @@ _NO_CONFIG_DIR = (
 )
 _BUSY = "Another check is running; try again in a moment."
 _RESTART_DELAY_SECONDS = 0.75
-_ONBOARDING_TITLE = "Cron: worker-onboarding"
 
 # How response bodies name the files the wizard writes: the display paths
 # the Review table uses (``setup_checklist.files_for``), never an absolute
@@ -460,72 +465,46 @@ def _bot_username(config: NerveConfig, state: SetupState, live: bool) -> str | N
     return state.telegram_bot_username
 
 
-_SESSION_STATUSES_TO_SCAN = [
-    "created", "idle", "pending", "active", "running",
-    "completed", "failed", "stopped", "killed", "error",
-]
+async def _onboarding(config: NerveConfig) -> tuple[str, str | None, str]:
+    """The onboarding status, its session id and its kind (:func:`nerve.onboarding.read_state`).
 
-
-def _onboarding_still_running(engine: Any, session_id: str) -> bool | None:
-    """Whether the engine is still driving the onboarding session.
-
-    ``None`` when there is no engine to ask (``nerve doctor``, a stand-in):
-    the stored row cannot say — a turn is marked running only in memory and
-    the row keeps the status it was created with — so the caller must not
-    claim the session ended.
+    Without a database (``nerve doctor``, a stand-in) a worker falls back to
+    the ``TASK.md`` marker and a personal install reads ``not_applicable``.
     """
-    if engine is None:
-        return None
-    task = getattr(engine, "_onboarding_task", None)
-    if task is not None and not task.done():
-        return True  # scheduled: between create_session and the first turn
-    running = getattr(engine, "is_session_running", None)
-    if not callable(running):
-        return None
     try:
-        return bool(running(session_id))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-async def _onboarding(config: NerveConfig, mode: str | None) -> tuple[str, str | None]:
-    """``not_applicable`` | ``pending`` | ``running`` | ``ended`` | ``done``.
-
-    ``ended``: the onboarding session exists and the engine is no longer
-    driving it, yet ``TASK.md`` still lacks a ``## Mission`` — it stopped
-    without writing a plan (a placeholder key, a crash). Reported with the
-    session id so the page can link to it instead of spinning.
-    """
-    status = onboarding_from_task(config.workspace, mode)
-    if status != "pending":
-        return status, None
-    try:
-        deps = get_deps()
-        db = deps.db
-        rows = await db.get_sessions_by_status(_SESSION_STATUSES_TO_SCAN)
-    except Exception:  # noqa: BLE001 — no DB (doctor), or a stand-in
-        return status, None
-    try:
-        engine = get_deps().engine
+        db = get_deps().db
     except RuntimeError:
-        engine = None
-    # Several onboarding rows can exist: "Try again" starts a new session and
-    # the ended one stays in the table. A row the engine still drives wins
-    # over any ended one regardless of the table's order; among ended rows
-    # the newest is named, so the link points at the latest attempt.
-    ended: tuple[str, str] | None = None  # (created_at, id)
-    for row in rows:
-        if row.get("source") != "cron" or row.get("title") != _ONBOARDING_TITLE:
-            continue
-        live = _onboarding_still_running(engine, row["id"])
-        if live is not False:
-            return "running", row["id"]
-        created = str(row.get("created_at") or "")
-        if ended is None or created >= ended[0]:
-            ended = (created, row["id"])
-    if ended is not None:
-        return "ended", ended[1]
-    return status, None
+        db = None
+    if db is None:
+        from nerve.setup_checklist import onboarding_from_task
+
+        status = onboarding_from_task(config.workspace, workspace_mode(config.workspace))
+        return status, None, onboarding_flow.CONVERSATION
+    state = await onboarding_flow.read_state(db, Path(config.workspace))
+    return state.status, state.session_id, state.kind
+
+
+def _onboarding_awaiting(status: str, session_id: str | None) -> str | None:
+    """What the running onboarding session waits for from the person.
+
+    ``plan`` while an ``ExitPlanMode`` decision is pending, ``question`` while
+    an ``AskUserQuestion`` card or an ``ask_form`` form is (the ``form``
+    interaction), else ``None`` (also for other pauses, and whenever
+    onboarding is not running). A plan wins over a question.
+    """
+    if status != onboarding_flow.RUNNING or not session_id:
+        return None
+    from nerve.agent.interactive import get_handler
+
+    handler = get_handler(session_id)
+    if handler is None:
+        return None
+    waiting = handler.pending_interaction_types()
+    if "plan_exit" in waiting:
+        return "plan"
+    if "question" in waiting or "form" in waiting:
+        return "question"
+    return None
 
 
 async def _context(actor: Actor) -> _Context:
@@ -546,9 +525,8 @@ async def _context(actor: Actor) -> _Context:
             username = (account or {}).get("username")
     state = setup_state.load_state()
     setup_state.retire_on_boot(state)
-    mode = workspace_mode(config.workspace)
     live = _telegram_live(config)
-    onboarding, onboarding_id = await _onboarding(config, mode)
+    onboarding, onboarding_id, onboarding_kind = await _onboarding(config)
     env_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     env_oauth = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
     try:
@@ -559,6 +537,7 @@ async def _context(actor: Actor) -> _Context:
         available = ()
     facts = Facts(
         credential_sources=setup_provenance.credential_sources(config),
+        machine_switches=setup_provenance.machine_switches(config),
         hosted_gateway=_hosted_gateway_status(config),
         telegram_session_present=setup_telegram_login.session_present(),
         config=config,
@@ -575,6 +554,8 @@ async def _context(actor: Actor) -> _Context:
         env_oauth_only=env_oauth and not env_key,
         onboarding=onboarding,
         onboarding_session_id=onboarding_id,
+        onboarding_kind=onboarding_kind,
+        onboarding_awaiting=_onboarding_awaiting(onboarding, onboarding_id),
         display_name=actor.display_name,
         bot_username=_bot_username(config, state, live),
         account_username=username,
@@ -621,7 +602,12 @@ def _refuse_managed(ctx: _Context, path: str, field: str) -> None:
     """409 ``{detail, field}`` when the value at ``path`` came from somewhere
     the page may not overwrite: the environment (a variable Nerve reads, or a
     ``${VAR}`` reference in a layer), the configuration repository, or the
-    channel gateway. A value from a file on this machine is replaceable."""
+    channel gateway — or, for a switch, a machine layer the operator holds it
+    in (:func:`nerve.setup_checklist.managed_switch_reason`). A value from a
+    file on this machine is replaceable."""
+    reason = managed_switch_reason(ctx.facts, path)
+    if reason is not None:
+        raise SetupFieldError(field, reason, status_code=409)
     source = ctx.facts.credential_sources.get(path)
     if source in (None, setup_provenance.SOURCE_FILE):
         return
@@ -939,8 +925,21 @@ _LIST = 200           # allowlists, accounts, crons, agents
 _USER_IDS = 1000      # Telegram user ids
 
 
+class WorkRequest(BaseModel):
+    """What a worker should do: catalog ids, custom work, rules (each optional)."""
+
+    items: list[Annotated[str, Field(max_length=64)]] | None = Field(default=None, max_length=64)
+    custom: str | None = Field(default=None, max_length=8000)
+    rules: str | None = Field(default=None, max_length=4000)
+
+
 class ModeRequest(BaseModel):
     mode: str = Field(max_length=32)
+    work: WorkRequest | None = None
+    # Older clients' free-text note, an alias for ``work.custom``:
+    # ``task_description`` is what the shipped page sends, ``note`` the
+    # contract's name for it.
+    note: str | None = Field(default=None, max_length=8000)
     task_description: str | None = Field(default=None, max_length=8000)
 
 
@@ -1045,13 +1044,14 @@ async def get_setup(actor: Actor = Depends(require_person)):
 #  PUT /api/setup/mode                                                         #
 # --------------------------------------------------------------------------- #
 
-_TASK_MIN, _TASK_MAX = 20, 4000
 TASK_LOCK_REASON = (
     "The task description was written to TASK.md when the mode was chosen, and "
     "the worker reads and maintains that file itself. To change the task, edit "
     "TASK.md in the workspace (or tell the worker in chat); the Mode step is "
     "chosen once."
 )
+# Unknown ids named in one refusal, at most.
+_UNKNOWN_ITEMS_SHOWN = 3
 
 
 def _task_description_on_disk(task_path: Path) -> str | None:
@@ -1065,12 +1065,55 @@ def _task_description_on_disk(task_path: Path) -> str | None:
     return task_description_from(text)
 
 
+def _work_from_request(req: ModeRequest, mode: str) -> WorkSelection:
+    """The work a Mode ``PUT`` chooses, checked (``400`` naming the field).
+
+    ``work.custom`` wins over the older clients' ``note`` and
+    ``task_description``, and a refused length names the field the text came
+    in. A body with a note and no ``work`` is a free-text selection, written
+    as before: a plain paragraph. Ids are kept once each, in catalog order;
+    an unknown one is refused, and so is any item for a personal install,
+    whose custom work and rules are checked and, as before, written nowhere.
+    """
+    work = req.work
+    if work is not None and work.custom is not None:
+        custom, custom_field = work.custom, "work.custom"
+    elif req.note is not None:
+        custom, custom_field = req.note, "note"
+    elif req.task_description is not None:
+        custom, custom_field = req.task_description, "task_description"
+    else:
+        custom, custom_field = "", "work.custom"
+    custom = custom.strip()
+    rules = ((work.rules if work is not None else None) or "").strip()
+    ids = [i.strip() for i in ((work.items if work is not None else None) or []) if i.strip()]
+    unknown = sorted({i for i in ids if i not in WORK_ITEMS})
+    if unknown:
+        shown = ", ".join(unknown[:_UNKNOWN_ITEMS_SHOWN]) + (", …" if len(unknown) > _UNKNOWN_ITEMS_SHOWN else "")
+        raise SetupFieldError("work.items", f"Unknown work item: {shown}.")
+    if ids and mode != "worker":
+        raise SetupFieldError(
+            "work.items",
+            "A personal assistant takes no work items: choose Worker for this work, or "
+            "describe it to the agent in the onboarding conversation.",
+        )
+    if len(custom) > CUSTOM_MAX:
+        what = "the task description" if custom_field == "task_description" else "the custom work"
+        raise SetupFieldError(custom_field, f"Keep {what} under {CUSTOM_MAX} characters.")
+    if len(rules) > RULES_MAX:
+        raise SetupFieldError("work.rules", f"Keep what it must know or never do under {RULES_MAX} characters.")
+    return WorkSelection(items=in_catalog_order(ids), custom=custom, rules=rules, free_text=work is None)
+
+
 @router.put("/api/setup/mode")
 async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
     mode = (req.mode or "").strip().lower()
     if mode not in ("personal", "worker"):
         raise SetupFieldError("mode", "Choose personal or worker.")
-    task = (req.task_description or "").strip()
+    selection = _work_from_request(req, mode)
+    # A worker's choice becomes the description section of its TASK.md; a
+    # personal install has no TASK.md.
+    task = render_work_description(selection) if mode == "worker" else ""
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
@@ -1080,29 +1123,26 @@ async def set_mode(req: ModeRequest, actor: Actor = Depends(require_person)):
         if current is not None and current != mode:
             raise HTTPException(status_code=409, detail=MODE_LOCK_REASON)
         if current == "worker" and task and (ws / "TASK.md").exists():
-            # Chosen once: the same mode again is a no-op, and a *different*
-            # description is refused rather than silently replacing what a
-            # stale tab or a second person did not see. Only a worker whose
-            # TASK.md is still absent (templates arrived from a config
-            # repository) — or still the bare template, with no description
-            # in it — gets it written here.
+            # Chosen once: the same choice again is a no-op (nothing is
+            # rewritten), and a *different* one is refused rather than
+            # silently replacing what a stale tab or a second person did not
+            # see. The same items, custom work and rules are the same choice
+            # in either form (a selection, or an older client's note). Only a
+            # worker whose TASK.md is still absent (templates arrived from a
+            # config repository) — or still the bare template, with no
+            # description in it — gets it written here.
             on_disk = _task_description_on_disk(ws / "TASK.md")
-            if on_disk is None or (on_disk and on_disk != task):
+            if on_disk is None or (on_disk and work_selection_from(on_disk) != selection):
                 raise HTTPException(status_code=409, detail=TASK_LOCK_REASON)
-        if mode == "worker" and current is None:
-            if len(task) < _TASK_MIN:
-                raise SetupFieldError(
-                    "task_description",
-                    "Describe the task in at least one full sentence (20+ characters).",
-                )
-        if len(task) > _TASK_MAX:
-            raise SetupFieldError("task_description", "Keep the task description under 4000 characters.")
+            if on_disk:
+                task = ""
         if current is None and locked:
             steps = {s["id"]: s for s in summarize(ctx.facts)["steps"]}
             raise HTTPException(status_code=409, detail=steps[STEP_MODE]["blocked_reason"])
         try:
             outcome = apply_mode(
                 ws, mode, task, in_container=daemon.in_container(), locked=locked,
+                memory_backend=ctx.config.memory.backend,
             )
         except ModeRefused as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
@@ -1607,6 +1647,15 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
 # --------------------------------------------------------------------------- #
 
 
+# Under memory.backend: loom the Memory step has nothing to store.
+_LOOM_MEMORY_REFUSAL = "Memory is kept in Loom on this instance: there is nothing to set up here."
+
+
+def _refuse_loom_memory(ctx: Any) -> None:
+    if ctx.config.memory.backend == "loom":
+        raise HTTPException(status_code=409, detail=_LOOM_MEMORY_REFUSAL)
+
+
 @router.put("/api/setup/memory")
 async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person)):
     key_given = "openai_api_key" in req.model_fields_set
@@ -1620,6 +1669,7 @@ async def set_memory(req: MemoryRequest, actor: Actor = Depends(require_person))
         ctx = await _context(actor)
         _require_claimed(ctx)
         _require_writable(ctx)
+        _refuse_loom_memory(ctx)
         # The step exists to store an OpenAI key. Without local secrets it is
         # closed outright — "no embeddings" is what the instance does anyway.
         _refuse_without_local_secrets(ctx)
@@ -1917,7 +1967,8 @@ def _refuse_closed_sources(ctx: _Context, req: SourcesRequest) -> list[str]:
     credentials — so nothing goes through (409, the policy's two sentences),
     except GitHub when the channel gateway polls it or its token comes from
     the environment: that switch stores nothing, and the Gmail and Telegram
-    fields alone are refused, by name, with the step's reason."""
+    fields alone are refused, by name, with the step's reason. A GitHub switch
+    the operator holds is never on offer (the handler refuses it first)."""
     available, unavailable_reason = sources_available(ctx.facts)
     if not available:
         _refuse_without_local_secrets(ctx)
@@ -1936,6 +1987,16 @@ async def set_sources(req: SourcesRequest, actor: Actor = Depends(require_person
         if workspace_mode(config.workspace) == "worker":
             raise HTTPException(status_code=409, detail="Sources do not apply to a worker instance.")
         _require_writable(ctx)
+        # The GitHub switch while the operator holds it in a machine layer
+        # (hosted, ``sync.github.enabled`` in config.yaml or config.local.yaml):
+        # this page writes settings.yaml, which that layer outranks, so the
+        # save would change nothing the loader reads. A request that names the
+        # field is refused whole, by name, as one that names a credential the
+        # operator provides is: nothing it carries is applied, so no save lands
+        # halfway, and a request without it still writes the other sources.
+        # Ahead of the policy, which would answer without naming the field.
+        if "github" in req.model_fields_set:
+            _refuse_managed(ctx, GITHUB_SWITCH, "github")
         # The policy first, ranked above the wait for a mode as the checklist
         # ranks it: choosing a mode would not open a closed step, so that is
         # not the answer to give.
@@ -2371,6 +2432,7 @@ async def setup_models(actor: Actor = Depends(require_person)):
 @router.post("/api/setup/memory/test")
 async def memory_test(req: MemoryTestRequest, actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
+    _refuse_loom_memory(ctx)
     # Refused with the step it belongs to, unlike the provider test: a Bedrock
     # or environment credential is still worth testing there, whereas the only
     # thing to do with a working OpenAI key here is to save it, which is refused.
@@ -2708,26 +2770,36 @@ async def finish(actor: Actor = Depends(require_person)):
         ctx = await _context(actor)
         facts = ctx.facts
         onboarding = {"status": facts.onboarding, "session_id": facts.onboarding_session_id}
-        provider_ready = facts.config.credential_available()
-        # ``ended`` (the session stopped without writing a plan) is retried on
-        # an explicit Finish: the engine's wrapper is idempotent while a run
-        # is in flight, so this cannot start two.
-        if (
-            workspace_mode(facts.workspace) == "worker" and facts.onboarding in ("pending", "ended")
-            and provider_ready and not facts.restart_pending and not facts.state.debts
-        ):
+        restart = bool(facts.restart_pending or facts.state.debts)
+        if facts.onboarding == onboarding_flow.PENDING:
+            # The conversation opens now, for this person, when the agent can
+            # answer; otherwise the next daemon start opens it. Finish always
+            # opens the conversation, also for a worker that waits for its
+            # autonomous onboarding.
             try:
-                engine = get_deps().engine
-                if engine is not None and hasattr(engine, "ensure_worker_onboarding"):
-                    engine.ensure_worker_onboarding()
-                    await asyncio.sleep(0)
-                    status, session_id = await _onboarding(facts.config, "worker")
-                    onboarding = {"status": status, "session_id": session_id}
+                deps = get_deps()
+                if restart or not facts.config.credential_available() or deps.engine is None:
+                    await onboarding_flow.request(deps.db, facts.workspace, actor_id=actor.actor_id)
+                else:
+                    state = await onboarding_flow.start(
+                        deps.engine, facts.workspace, actor=actor, cause=actor,
+                    )
+                    onboarding = {"status": state.status, "session_id": state.session_id}
+                    ctx = await _context(actor)
             except Exception as e:  # noqa: BLE001
-                logger.warning("Setup: worker onboarding could not be scheduled: %s", e)
-        action = "restart_required" if (facts.restart_pending or facts.state.debts) else "reloaded"
+                logger.warning("Setup: the onboarding conversation could not be opened: %s", e)
+        action = "restart_required" if restart else "reloaded"
         warning = _warning_from(summary, True)
         return {"state": _render(ctx, warning=warning), "action": action, "onboarding": onboarding}
+
+
+@router.post("/api/setup/onboarding/skip")
+async def skip_onboarding(actor: Actor = Depends(require_person)):
+    """Skip the onboarding conversation. The session stays in the list."""
+    async with _loop_lock("state"):
+        ctx = await _claimed_context(actor)
+        await onboarding_flow.skip(get_deps().db, Path(ctx.config.workspace), actor_id=actor.actor_id)
+        return _render(await _context(actor))
 
 
 class RestartResponse(BaseModel):

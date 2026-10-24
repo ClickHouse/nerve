@@ -109,6 +109,25 @@ def _no_ambient_provider_credential(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
 
+#: What the stand-in GitHub CLI probe below answers: no ``gh`` on the machine.
+NO_GITHUB_CLI = {"cli": False, "authenticated": False, "login": None, "hint": None}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_github_cli(monkeypatch):
+    """Never run the developer's GitHub CLI for the onboarding's facts.
+
+    Every onboarding start gathers facts about the instance, ``gh auth
+    status`` included (:mod:`nerve.onboarding_environment`). A test that opens
+    the conversation (directly, or through Finish) must neither wait for nor
+    depend on whoever is signed in on the machine running the suite: the probe
+    answers "not installed" unless a test replaces it.
+    """
+    from nerve import onboarding_environment
+
+    monkeypatch.setattr(onboarding_environment, "_github_cli", lambda timeout: dict(NO_GITHUB_CLI))
+
+
 @pytest.fixture(autouse=True)
 def _reset_setup_process_state(monkeypatch):
     """The setup modules keep per-process memory (detection caches, the last

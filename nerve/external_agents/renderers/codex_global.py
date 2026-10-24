@@ -24,6 +24,7 @@ from nerve.external_agents.renderers.base import (
     StyleRenderer,
     read_workspace_file,
 )
+from nerve.memory import loom_prompts
 
 
 HEADER = """\
@@ -78,13 +79,15 @@ class CodexGlobalRenderer(StyleRenderer):
     ```
     """
 
-    def render(self, target: FileTarget, *, workspace: Path) -> str:
-        parts: list[str] = [HEADER.rstrip(), FIRST_ACTION.rstrip()]
+    def render(self, target: FileTarget, *, workspace: Path, memory_backend: str = "memu") -> str:
+        loom = memory_backend == "loom"
+        first = loom_prompts.EXTERNAL_AGENT_MEMORY if loom else FIRST_ACTION
+        parts: list[str] = [HEADER.rstrip(), first.rstrip()]
         body = self._concat_includes(target, workspace, with_headings=True)
         if body:
             parts.append(body)
 
-        footer = self._render_footer(workspace)
+        footer = self._render_footer(workspace, loom=loom)
         if footer:
             parts.append(footer)
 
@@ -92,12 +95,18 @@ class CodexGlobalRenderer(StyleRenderer):
 
     # ---- Internals ------------------------------------------------
 
-    def _render_footer(self, workspace: Path) -> str:
+    def _render_footer(self, workspace: Path, *, loom: bool = False) -> str:
         """Short footer reminding the agent how to keep memory hot.
 
         We also surface the workspace path so the agent doesn't have
         to guess it from environment variables.
         """
+        if loom:
+            return (
+                "# Workspace\n\n"
+                f"- **Path:** `{workspace}`\n"
+                + loom_prompts.EXTERNAL_AGENT_FOOTER_MEMORY
+            )
         return (
             "# Workspace\n\n"
             f"- **Path:** `{workspace}`\n"

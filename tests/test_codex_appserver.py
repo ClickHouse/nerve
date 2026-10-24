@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -215,6 +216,101 @@ async def test_effective_api_key_auth_controls_billing(tmp_path, monkeypatch):
         await client.disconnect()
 
 
+_ENDPOINT = "http://127.0.0.1:4000/v1"
+_PROVIDER = [
+    'model_provider="nerve-endpoint"',
+    'model_providers.nerve-endpoint.name="Nerve endpoint"',
+    f'model_providers.nerve-endpoint.base_url="{_ENDPOINT}"',
+    'model_providers.nerve-endpoint.wire_api="responses"',
+]
+_ENV_KEY = 'model_providers.nerve-endpoint.env_key="NERVE_CODEX_ENDPOINT_KEY"'
+
+
+def test_endpoint_provider_overrides_and_key(tmp_path, monkeypatch):
+    """codex.base_url selects a custom provider. The only key source is
+    codex.api_key: not the variable that codex.api_key_env names, not
+    openai_api_key. The key goes into the child environment through
+    env_key, never into argv."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env")
+    cfg = _config(tmp_path, base_url=_ENDPOINT + "/")
+    cfg.openai_api_key = "sk-openai-only"
+    assert cfg.codex.api_key_env == "OPENAI_API_KEY"
+    assert cfg.codex.base_url == _ENDPOINT
+    backend = CodexBackend(_deps(cfg))
+    overrides = backend.build_config_overrides(_spec(cfg))
+    assert all(line in overrides for line in _PROVIDER)
+    assert _ENV_KEY not in overrides
+    assert "NERVE_CODEX_ENDPOINT_KEY" not in backend.build_env(_spec(cfg))
+
+    cfg.codex.api_key = "sk-endpoint-test"
+    overrides = backend.build_config_overrides(_spec(cfg))
+    assert _ENV_KEY in overrides
+    assert not any("sk-" in line for line in overrides)
+    assert backend.build_env(_spec(cfg))["NERVE_CODEX_ENDPOINT_KEY"] == "sk-endpoint-test"
+
+    cfg.codex.base_url = ""
+    assert not any(
+        line.startswith("model_provider")
+        for line in backend.build_config_overrides(_spec(cfg))
+    )
+    assert "NERVE_CODEX_ENDPOINT_KEY" not in backend.build_env(_spec(cfg))
+
+
+@pytest.mark.asyncio
+async def test_endpoint_mode_needs_no_codex_login(tmp_path, monkeypatch):
+    """With a custom provider Codex reports no account. Preflight passes
+    with the same provider overrides, the session does not log in, and
+    turns are API-billed from codex.pricing."""
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path, base_url=_ENDPOINT, auth="api_key", api_key="sk-endpoint-test")
+    backend = CodexBackend(_deps(cfg))
+    status = await backend.preflight(force=True)
+    assert status["available"] is True, status
+    assert status["base_url"] == _ENDPOINT
+    # "unknown": the fake saw the provider override and reported no account.
+    assert status["auth"] == "unknown"
+    assert status["auth_mismatch"] is False
+
+    client = await backend.create_client(_spec(cfg))
+    try:
+        await client.start_turn(TurnInput(text="hello"))
+        done = (await _collect_turn(client))[-1]
+        assert isinstance(done, ev.TurnCompleted)
+        assert done.total_cost_usd == pytest.approx(0.003)
+        assert done.estimated_cost_usd is None
+        assert done.cost_basis == "api_billed"
+    finally:
+        await client.disconnect()
+    assert not (tmp_path / "codex-home" / "login_calls").exists()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_mode_turns_ultracode_off(tmp_path, monkeypatch, caplog):
+    """Ultracode workers do not use the endpoint. With both settings the
+    config loads with a warning, and Ultracode is off: no install, no
+    worker environment."""
+    _mode(monkeypatch, "basic")
+
+    async def no_install(config):
+        raise AssertionError("Ultracode must not be installed")
+
+    monkeypatch.setattr(
+        "nerve.agent.backends.codex.backend.ensure_ultracode_installed", no_install,
+    )
+    with caplog.at_level(logging.WARNING, logger="nerve.config"):
+        cfg = _config(tmp_path, base_url=_ENDPOINT, ultracode={"enabled": True})
+    assert "codex.ultracode.enabled is ignored" in caplog.text
+    assert cfg.codex.ultracode.enabled is False
+    backend = CodexBackend(_deps(cfg))
+    client = await backend.create_client(_spec(cfg))
+    try:
+        env = client._transport._env
+        assert "CODEX_CLI_PATH" not in env
+        assert "NERVE_CODEX_CHILD_CONFIG" not in env
+    finally:
+        await client.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_config_overrides_carry_mcp_bridge(tmp_path, monkeypatch):
     _mode(monkeypatch, "basic")
@@ -391,6 +487,86 @@ async def test_approval_declined_on_noninteractive_source(tmp_path, monkeypatch)
         assert isinstance(events[-1], ev.TurnCompleted)
     finally:
         await client.disconnect()
+
+
+class _QueueTransport:
+    """The app-server transport as ``receive_turn`` reads it."""
+
+    def __init__(self):
+        self.notifications: asyncio.Queue = asyncio.Queue()
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def _queue_client(cfg: NerveConfig, hub: InteractiveToolHandler):
+    from nerve.agent.backends.codex.backend import CodexClient
+
+    spec = _spec(cfg, idle_timeout=0.05)
+    spec.interactive = hub
+    client = CodexClient(CodexBackend(_deps(cfg)), spec)
+    client._transport = _QueueTransport()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_waits_while_an_approval_is_pending(tmp_path, caplog):
+    """An app-server waiting on an approval may stay silent until the person
+    decides: past the idle timeout the turn keeps waiting instead of
+    reporting a hung app-server, and later notifications still arrive."""
+    cfg = _config(tmp_path)
+    sent = _Broadcasts()
+    hub = InteractiveToolHandler("s1", sent, interactive_capable=True)
+    client = _queue_client(cfg, hub)
+    approval = asyncio.create_task(
+        client._approval("command_approval", {"itemId": "c1"}),
+    )
+    turn = None
+    try:
+        with caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+            turn = asyncio.create_task(_collect_turn(client))
+            await asyncio.sleep(0.4)  # eight idle timeouts, approval pending
+            assert hub.has_pending
+            assert not turn.done()
+            notes = client._transport.notifications
+            notes.put_nowait({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "still here"},
+            })
+            notes.put_nowait({
+                "method": "turn/completed",
+                "params": {"turn": {"status": "completed"}},
+            })
+            events = await asyncio.wait_for(turn, timeout=2)
+        (interaction,) = [m for _sid, m in sent.messages if m["type"] == "interaction"]
+        assert hub.resolve(interaction["interaction_id"], {})
+        assert await approval == {"decision": "accept"}
+    finally:
+        hub.cancel_all()
+        for task in (approval, turn):
+            if task is not None:
+                task.cancel()
+
+    assert "".join(e.text for e in events if isinstance(e, ev.TextDelta)) == "still here"
+    assert isinstance(events[-1], ev.TurnCompleted)
+    assert [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ] == [
+        "idle timeout deferred for session s1: waiting for the person "
+        "(command_approval pending)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_idle_timeout_with_nothing_pending(tmp_path):
+    """With nothing waiting for the person, a silent app-server is still
+    reported hung after the idle timeout."""
+    cfg = _config(tmp_path)
+    hub = InteractiveToolHandler("s1", _Broadcasts(), interactive_capable=True)
+    client = _queue_client(cfg, hub)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(_collect_turn(client), timeout=2)
 
 
 @pytest.mark.asyncio

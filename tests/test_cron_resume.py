@@ -24,6 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron import service as cron_service
+from nerve.cron.gates import CronGate
 from nerve.cron.jobs import CronJob
 from nerve.cron.service import CronService
 from nerve.sources.models import IngestResult
@@ -518,6 +519,113 @@ async def test_a_catch_up_is_gated_like_a_scheduled_run(held_service):
     svc.engine.run_cron.assert_not_awaited()
     svc.db.log_cron_start.assert_not_awaited()
     assert svc.scheduler.get_job("planner").next_run_time > resumed
+
+
+class _Gate(CronGate):
+    """A gate that gives *answer* to its forecast and to its check alike, and
+    records the time each forecast was for and how many checks ran."""
+
+    type = "fixed"
+
+    def __init__(self, answer: bool) -> None:
+        self.answer = answer
+        self.forecast_for: list[datetime] = []
+        self.checks = 0
+
+    async def is_satisfied(self, ctx) -> bool:
+        self.checks += 1
+        return self.answer
+
+    async def forecast(self, ctx, at: datetime) -> bool:
+        self.forecast_for.append(at)
+        return self.answer
+
+    def describe(self) -> str:
+        return f"answers {self.answer}"
+
+    @classmethod
+    def from_config(cls, _config: dict) -> _Gate:
+        return cls(answer=True)
+
+
+@pytest.mark.asyncio
+async def test_a_run_its_gates_would_have_skipped_is_not_missed(held_service, caplog):
+    """Without catchup, a run that came due during the pause and that its gate
+    would have skipped is skipped as at a scheduled fire: no ``missed`` row,
+    a log line, and the schedule listeners hear of it."""
+    job = CronJob(
+        id="planner", schedule="0 * * * *", prompt="p", catchup=False,
+        run_if=[{"type": "tasks", "status": "pending"}],
+    )
+    svc = await held_service([job])
+    svc.db.count_tasks = AsyncMock(return_value=0)
+    heard = MagicMock()
+    svc.add_schedule_listener(heard)
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("planner", next_run_time=resumed - timedelta(hours=1))
+
+    with caplog.at_level(logging.DEBUG, logger="nerve.cron.service"):
+        assert svc._on_clock_step(paused, resumed) is None  # nothing to catch up
+        heard.assert_called_once_with()  # the trigger moved past the pause
+        await _wait_for(
+            lambda: svc.db.log_cron_missed.await_count or heard.call_count > 1,
+        )
+        await asyncio.sleep(0.05)
+
+    svc.db.log_cron_missed.assert_not_awaited()
+    assert heard.call_count == 2  # and again for the run its gate skipped
+    svc.db.count_tasks.assert_awaited()
+    svc.engine.run_cron.assert_not_awaited()
+    svc.db.log_cron_start.assert_not_awaited()
+    assert "Skipping cron job planner" in caplog.text
+    assert "gate 'tasks' not satisfied" in caplog.text
+    assert svc.scheduler.get_job("planner").next_run_time > resumed
+
+
+@pytest.mark.asyncio
+async def test_a_run_its_gates_would_have_let_through_is_missed(held_service):
+    """The gate open, the run is missed as before. The gate was asked for its
+    forecast for the time the run came due; its check, which may keep state
+    for a run it lets through, does not run for a run that never happened."""
+    job = CronJob(id="planner", schedule="0 * * * *", prompt="p", catchup=False)
+    svc = await held_service([job])
+    gate = _Gate(answer=True)
+    job.gates = [gate]
+    paused, resumed = _pause_window()
+    came_due = _first_fire_after("0 * * * *", paused)
+    svc.scheduler.modify_job("planner", next_run_time=came_due)
+
+    assert svc._on_clock_step(paused, resumed) is None
+
+    await _wait_for(lambda: svc.db.log_cron_missed.await_count)
+    svc.db.log_cron_missed.assert_awaited_once()
+    job_id, due = svc.db.log_cron_missed.await_args.args
+    assert (job_id, due) == ("planner", came_due.strftime("%Y-%m-%d %H:%M:%S"))
+    assert svc.db.log_cron_missed.await_args.kwargs["error"] == cron_service._PAUSED_MISS
+    assert gate.forecast_for == [came_due]
+    assert gate.checks == 0
+    svc.engine.run_cron.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [False, True])
+async def test_a_catch_up_job_leaves_its_gates_to_the_catch_up_run(held_service, answer):
+    """With catchup, the catch-up run checks the gates as a scheduled run does,
+    once, and the pause asks them nothing more: no forecast, nothing missed."""
+    job = CronJob(id="planner", schedule="0 * * * *", prompt="p")
+    svc = await held_service([job])
+    gate = _Gate(answer)
+    job.gates = [gate]
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("planner", next_run_time=resumed - timedelta(hours=1))
+
+    await _resume(svc, paused, resumed)
+    await asyncio.sleep(0.05)
+
+    assert gate.checks == 1
+    assert gate.forecast_for == []
+    assert svc.engine.run_cron.await_count == (1 if answer else 0)
+    svc.db.log_cron_missed.assert_not_awaited()
 
 
 def _first_run_waits_for(release: asyncio.Event, order: list[str]):

@@ -2,8 +2,9 @@ import { create } from 'zustand';
 import {
   api,
   type AgentsDetect, type HostLogin, type RestartResponse, type SetupEnvironment,
-  type SetupFinishResponse, type SetupModelsResponse, type SetupState, type SetupStep,
-  type SetupStepId, type SourcesPreflight,
+  type SetupFinishResponse, type SetupModeDetail, type SetupModelsResponse, type SetupOnboarding,
+  type SetupOnboardingAwaiting, type SetupOnboardingKind, type SetupState, type SetupStep, type SetupStepId,
+  type SourcesPreflight, type WorkCatalogItem, type WorkSelection,
 } from '../api/client';
 import { ApiError, clearUnavailable } from '../api/hosted';
 import { errorDetail } from './accountStore';
@@ -38,6 +39,13 @@ export interface SetupFieldError {
   detail: string;
 }
 
+/** What a form held when a 409 refused its save, and the etag of the step it was opened on. */
+export interface UnsavedForm {
+  step: SetupStepId;
+  etag: string | null;
+  values: unknown;
+}
+
 export interface SetupStoreState {
   state: SetupState | null;
   loading: boolean;
@@ -55,15 +63,30 @@ export interface SetupStoreState {
   overlayDismissed: boolean;
   /** A step just saved that wants to say so before the person moves on. */
   savedNotice: SetupStepId | null;
+  /**
+   * What a form held when a 409 refused its save. The store re-reads the
+   * state then, and a read that finds the step changed remounts the form,
+   * which would start again from the server's values; the form mounted in
+   * its place starts from these instead (`unsavedFor`), so the refusal does
+   * not also discard the person's changes. Dropped once taken, by a read that
+   * finds the step unchanged (nothing is remounted), by the next write and by
+   * `reset()`.
+   */
+  unsaved: UnsavedForm | null;
   preflight: SourcesPreflight | null;
   agentsDetected: AgentsDetect | null;
   environment: SetupEnvironment | null;
   models: SetupModelsResponse | null;
   hostLogin: HostLogin | null;
   load: () => Promise<void>;
-  save: (step: SetupStepId, run: () => Promise<SetupState>) => Promise<boolean>;
+  /** One write. `unsaved` is what the form holds, kept for it if a 409 refuses the write. */
+  save: (step: SetupStepId, run: () => Promise<SetupState>, unsaved?: unknown) => Promise<boolean>;
   skip: (step: SetupStepId, skipped: boolean) => Promise<boolean>;
   finish: () => Promise<SetupFinishResponse | null>;
+  /** Open the onboarding conversation (Finish, which is idempotent). Its session id, or null. */
+  startOnboarding: () => Promise<string | null>;
+  /** End the onboarding conversation without its setup. */
+  skipOnboarding: () => Promise<boolean>;
   restart: () => Promise<boolean>;
   waitForGeneration: (before: string, timeoutMs: number) => Promise<boolean>;
   /** Another bounded wait on the generation the last restart reported. */
@@ -77,6 +100,7 @@ export interface SetupStoreState {
   dismissRestartOverlay: () => void;
   noteSaved: (step: SetupStepId) => void;
   clearSavedNotice: () => void;
+  dropUnsaved: () => void;
   clearError: () => void;
   reset: () => void;
 }
@@ -147,6 +171,46 @@ export function setupNotStarted(s: SetupStoreState): boolean {
   return setupIsUnfinished(s) && stepById(s, 'mode')?.status === 'pending';
 }
 
+/**
+ * The onboarding, from the Mode step's detail, and what its agent waits for
+ * (`awaiting`, from the state's `onboarding` block; `null` while it is not
+ * running, and from an older backend).
+ */
+export function onboardingOf(state: SetupState | null): {
+  status: SetupOnboarding; sessionId: string | null; kind: SetupOnboardingKind;
+  awaiting: SetupOnboardingAwaiting | null;
+} {
+  const detail = state?.steps.find((x) => x.id === 'mode')?.detail as SetupModeDetail | undefined;
+  const status = detail?.onboarding ?? 'not_applicable';
+  return {
+    status,
+    sessionId: detail?.onboarding_session_id ?? null,
+    kind: detail?.onboarding_kind ?? 'conversation',
+    awaiting: status === 'running' ? state?.onboarding?.awaiting ?? null : null,
+  };
+}
+
+/**
+ * A worker's work, from the Mode step's detail: the server's catalog, in
+ * display order, and the saved selection. `selection` is `null` unless the
+ * mode is `worker`, and from an older backend (which sends neither).
+ */
+export function workOf(state: SetupState | null): {
+  catalog: WorkCatalogItem[]; selection: WorkSelection | null;
+} {
+  const detail = state?.steps.find((x) => x.id === 'mode')?.detail as SetupModeDetail | undefined;
+  return {
+    catalog: detail?.work_catalog ?? [],
+    selection: detail?.mode === 'worker' ? detail.work ?? null : null,
+  };
+}
+
+/** Setup is complete and the onboarding conversation can start now. */
+export function onboardingCanStart(state: SetupState | null): boolean {
+  const { status, kind } = onboardingOf(state);
+  return !!state?.finished && status === 'pending' && kind === 'conversation';
+}
+
 export function stepsLeft(s: SetupStoreState): number {
   return s.state?.steps_left ?? 0;
 }
@@ -160,6 +224,16 @@ export function providerConfigured(s: SetupStoreState): boolean | null {
 
 export function stepById(s: SetupStoreState, id: string): SetupStep | undefined {
   return s.state?.steps.find((x) => x.id === id);
+}
+
+/**
+ * What a refused save left for the form now mounted for `step` (`unsaved`),
+ * or `null`. Only a form the read after the refusal remounted takes it: its
+ * step's etag is not the one the refused form was opened on.
+ */
+export function unsavedFor(step: SetupStep): unknown {
+  const kept = useSetupStore.getState().unsaved;
+  return kept && kept.step === step.id && kept.etag !== step.etag ? kept.values : null;
 }
 
 /** Which wait is the current one; an older wait that wakes up stops. */
@@ -204,6 +278,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   bannerDismissed: false,
   overlayDismissed: false,
   savedNotice: null,
+  unsaved: null,
   preflight: null,
   agentsDetected: null,
   environment: null,
@@ -213,6 +288,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   clearError: () => set({ error: null, fieldError: null }),
   noteSaved: (step) => set({ savedNotice: step }),
   clearSavedNotice: () => set((s) => (s.savedNotice === null ? s : { savedNotice: null })),
+  dropUnsaved: () => set((s) => (s.unsaved === null ? s : { unsaved: null })),
 
   reset: () => {
     waitToken += 1;
@@ -221,7 +297,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       state: null, loading: true, busy: null, error: null, fieldError: null,
       reconnecting: false, reconnectElapsedMs: 0, reconnectFailed: false,
       restartOutcome: null, bannerDismissed: false, overlayDismissed: false,
-      savedNotice: null,
+      savedNotice: null, unsaved: null,
       preflight: null, agentsDetected: null, environment: null, models: null,
       hostLogin: null,
     });
@@ -238,7 +314,11 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
       // A mutation started meanwhile: its answer is newer than this read,
       // whichever arrives last. The next load() (step change) re-reads.
       if (seq !== mutationSeq) return;
-      set({ state, loading: false, bannerDismissed: readBannerDismissed() });
+      // What a refused save kept waits for the form this read remounts; a
+      // step found unchanged remounts nothing, so nothing would take it.
+      const kept = get().unsaved;
+      const remounts = kept !== null && state.steps.some((s) => s.id === kept.step && s.etag !== kept.etag);
+      set({ state, loading: false, bannerDismissed: readBannerDismissed(), unsaved: remounts ? kept : null });
     } catch (e) {
       if (!asked()) return;
       if (seq !== mutationSeq) return;
@@ -251,10 +331,10 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     }
   },
 
-  save: async (step, run) => {
+  save: async (step, run, unsaved) => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: step, error: null, fieldError: null });
+    set({ busy: step, error: null, fieldError: null, unsaved: null });
     try {
       const state = await run();
       if (!asked()) return false;
@@ -268,14 +348,18 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     } catch (e) {
       if (!asked()) return false;
       const fieldError = fieldErrorOf(e);
+      const refused = statusOf(e) === 409;
       set({
         fieldError,
         error: fieldError ? null : errorDetail(e, 'Could not save that'),
+        // Kept before the re-read below, which may remount the form.
+        unsaved: refused && unsaved !== undefined
+          ? { step, etag: stepById(get(), step)?.etag ?? null, values: unsaved } : null,
       });
       // Somebody else got there first, or the step is read-only now: show
       // the server's sentence verbatim and re-read, rather than trust the view
       // this form was opened on.
-      if (statusOf(e) === 409) void get().load();
+      if (refused) void get().load();
       return false;
     } finally {
       if (asked()) set({ busy: null });
@@ -285,7 +369,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   skip: async (step, skipped) => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: step, error: null, fieldError: null });
+    set({ busy: step, error: null, fieldError: null, unsaved: null });
     try {
       const state = await api.setupSkip(step, skipped);
       if (!asked()) return false;
@@ -303,7 +387,7 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
   finish: async () => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: 'finish', error: null, fieldError: null });
+    set({ busy: 'finish', error: null, fieldError: null, unsaved: null });
     try {
       const response = await api.setupFinish();
       if (!asked()) return null;
@@ -318,10 +402,34 @@ export const useSetupStore = create<SetupStoreState>((set, get) => ({
     }
   },
 
+  startOnboarding: async () => {
+    const response = await get().finish();
+    const { status, session_id: sessionId } = response?.onboarding ?? {};
+    return status === 'running' ? sessionId ?? null : null;
+  },
+
+  skipOnboarding: async () => {
+    const asked = bindRequest();
+    mutationSeq += 1;
+    set({ busy: 'onboarding', error: null, fieldError: null });
+    try {
+      const state = await api.setupSkipOnboarding();
+      if (!asked()) return false;
+      set({ state });
+      return true;
+    } catch (e) {
+      if (!asked()) return false;
+      set({ error: errorDetail(e, 'Could not skip onboarding') });
+      return false;
+    } finally {
+      if (asked()) set({ busy: null });
+    }
+  },
+
   restart: async () => {
     const asked = bindRequest();
     mutationSeq += 1;
-    set({ busy: 'restart', error: null, fieldError: null, overlayDismissed: false });
+    set({ busy: 'restart', error: null, fieldError: null, unsaved: null, overlayDismissed: false });
     let outcome: RestartResponse;
     try {
       outcome = await api.restartSystem();

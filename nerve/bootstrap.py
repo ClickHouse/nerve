@@ -50,6 +50,7 @@ from nerve.setup_writer import (
     apply_task_md,
     bedrock_geo_prefix,
     build_config_layers,
+    existing_memory_backend,
     # Re-exported under its old private name: this module has been its import
     # site since the wizard was written, and `nerve init` is not the only
     # caller that expands a workspace path the way the loader does.
@@ -424,8 +425,13 @@ def _ensure_docker_files(
 class SetupWizard:
     """Interactive first-run setup wizard."""
 
-    def __init__(self, config_dir: Path, inside_docker: bool = False):
+    def __init__(
+        self, config_dir: Path, inside_docker: bool = False, memory_backend: str | None = None,
+    ):
         self.config_dir = config_dir
+        # ``nerve init --memory-backend``: the backend the workspace is worded
+        # for; None reads it from an existing configuration.
+        self._memory_backend = memory_backend
         self.choices = SetupChoices()
         self._inside_docker = inside_docker
         self._step_counter = 0
@@ -1367,7 +1373,9 @@ class SetupWizard:
         click.echo()
         click.secho(
             "In worker mode, Nerve needs to know what to do. Describe\n"
-            "your task — what to monitor, what to fix, what to report.\n\n"
+            "your task: what to monitor, what to fix, what to report.\n"
+            "Or leave it empty and set the worker up in a conversation\n"
+            "in the web UI after the first start.\n\n"
             "Examples:\n"
             '  "Monitor CI for repo X and fix flaky tests"\n'
             '  "Review PRs in org/repo and suggest improvements"\n'
@@ -1375,16 +1383,26 @@ class SetupWizard:
             dim=True,
         )
         click.echo()
-        self.choices.task_description = click.prompt("Describe your task")
+        self.choices.task_description = click.prompt(
+            "Describe your task (optional)", default="", show_default=False,
+        ).strip()
         click.echo()
-        click.secho(
-            "  This will be saved to TASK.md in your workspace.\n\n"
-            "  On first boot, a setup agent will run with full tool\n"
-            "  access to research your task, create a structured\n"
-            "  TASK.md, generate custom cron jobs and skills, then\n"
-            "  notify you when setup is complete.",
-            dim=True,
-        )
+        if self.choices.task_description:
+            click.secho(
+                "  This will be saved to TASK.md in your workspace.\n\n"
+                "  On first boot, a setup agent will run with full tool\n"
+                "  access to research your task, create a structured\n"
+                "  TASK.md, generate custom cron jobs and skills, then\n"
+                "  notify you when setup is complete.",
+                dim=True,
+            )
+        else:
+            click.secho(
+                "  After the first start, open the web UI. A notice there\n"
+                "  leads you to the onboarding conversation, where the\n"
+                "  worker asks what to do and sets itself up.",
+                dim=True,
+            )
         click.echo()
 
     # --- Step: External Agents (Codex, Claude Code, ...) ---
@@ -1538,8 +1556,9 @@ class SetupWizard:
             click.secho(f"  │  Timezone:   {self.choices.timezone:<33}│")
         else:
             task_preview = self.choices.task_description[:30] + "..." if len(self.choices.task_description) > 33 else self.choices.task_description
-            click.secho(f"  │  Task:       {task_preview:<33}│")
-            click.secho("  │  Setup:      on first boot (agent session)     │")
+            setup = "on first boot (agent session)" if task_preview else "conversation in the web UI"
+            click.secho(f"  │  Task:       {task_preview or 'none':<33}│")
+            click.secho(f"  │  Setup:      {setup:<33}│")
 
         click.secho("  └──────────────────────────────────────────────┘", dim=True)
         click.echo()
@@ -1570,17 +1589,22 @@ class SetupWizard:
     def _apply(self) -> None:
         click.echo()
 
-        # 1. Create workspace from templates (TASK.md is written in step 5)
+        # 1. Create workspace from templates (TASK.md is written in step 5),
+        # worded for the memory backend an existing configuration names.
         click.echo("  Creating workspace...", nl=False)
         ws_path = self._workspace_dir()
+        self.choices.memory_backend = (
+            self._memory_backend or existing_memory_backend(self.config_dir, ws_path)
+        )
         created = initialize_workspace(
             ws_path, self.choices.mode, skip=WRITER_OWNED_TEMPLATES,
+            memory_backend=self.choices.memory_backend,
         )
         click.secho(" ✓", fg="green")
 
         # 2. Install bundled skills
         click.echo("  Installing bundled skills...", nl=False)
-        install_bundled_skills(ws_path)
+        install_bundled_skills(ws_path, memory_backend=self.choices.memory_backend)
         click.secho(" ✓", fg="green")
 
         # 2b. Scaffold the git-syncable config subtree (workspace/config/)
@@ -1607,7 +1631,7 @@ class SetupWizard:
 
         # 5. Worker: TASK.md from the template with the description in place —
         #    the same writer the web Mode step uses, so every install path
-        #    produces one file for the onboarding session to fill in.
+        #    produces one file for the onboarding conversation to fill in.
         if self.choices.mode == "worker":
             apply_task_md(ws_path, self.choices.task_description)
 
@@ -2096,6 +2120,9 @@ class SlimFlags:
     start: bool = True
     browser: bool | None = None
     clipboard: bool = True
+    # The memory backend the skeleton is worded for (``--memory-backend``);
+    # None reads it from an existing configuration.
+    memory_backend: str | None = None
 
 
 @dataclass
@@ -2450,6 +2477,9 @@ class SlimSetup:
                 self.config_dir, str(self._host_workspace),
                 port=self.choices.gateway_port, bind=self.bind,
             )
+        self.choices.memory_backend = (
+            self.flags.memory_backend or existing_memory_backend(self.config_dir, host_ws)
+        )
         outcome = write_slim_install(
             self.choices, self.config_dir, host_workspace=host_ws if docker else None,
         )
@@ -2498,8 +2528,11 @@ class SlimSetup:
 # --- Non-interactive mode ---
 
 
-def run_non_interactive(config_dir: Path) -> SetupChoices:
-    """Non-interactive setup using environment variables. For Docker."""
+def run_non_interactive(config_dir: Path, *, memory_backend: str | None = None) -> SetupChoices:
+    """Non-interactive setup using environment variables. For Docker.
+
+    ``memory_backend`` (``nerve init --memory-backend``) words the workspace
+    for that memory backend."""
     choices = SetupChoices()
 
     # Provider detection — check before API key requirements.
@@ -2598,7 +2631,7 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
 
     # The mode's default optional crons — the set the web Mode step writes too.
     # Personal: inbox-processor and task-planner. Worker: the two skill jobs;
-    # its task-planner stays off until the onboarding session enables it.
+    # its task-planner stays off until the onboarding conversation enables it.
     if choices.mode in DEFAULT_CRONS:
         choices.enabled_crons = list(DEFAULT_CRONS[choices.mode])
 
@@ -2620,11 +2653,13 @@ def run_non_interactive(config_dir: Path) -> SetupChoices:
             "NERVE_EXTERNAL_AGENTS_CONFLICT", "backup",
         )
 
-    # Worker task description (setup agent runs on first boot, not during init)
+    # Worker task description. With one, the autonomous onboarding runs at the
+    # first start; without one, the worker waits for the onboarding
+    # conversation in the web UI (nerve.onboarding).
     if choices.mode == "worker":
         choices.task_description = os.environ.get("NERVE_TASK", "")
 
-    wizard = SetupWizard(config_dir, inside_docker=is_docker)
+    wizard = SetupWizard(config_dir, inside_docker=is_docker, memory_backend=memory_backend)
     wizard.choices = choices
 
     click.echo("Running non-interactive setup...")

@@ -35,6 +35,7 @@ from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
+from nerve.db.base import check_database_file
 from nerve.gateway.auth import (
     ACTOR_CONTEXT_HEADER,
     AUTH_MODE_EXTERNAL,
@@ -984,6 +985,13 @@ async def lifespan(app: FastAPI):
         # background task so a (possibly long) resumed turn never blocks startup;
         # the engine, notification service and channels are all wired by now.
         asyncio.create_task(_engine.resume_enrolled_sessions())
+
+        # Open the onboarding conversation when setup asked for it before a
+        # restart. The gateway does this, not AgentEngine.initialize, so the
+        # one-shot engines of `nerve cron` and `nerve sync` never open it.
+        from nerve import onboarding as onboarding_flow
+
+        asyncio.create_task(onboarding_flow.start_on_boot(_engine, Path(config.workspace)))
     except BaseException:
         # The shutdown code after the yield will not run, so stop what started
         # here, then re-raise the original error.
@@ -1539,6 +1547,12 @@ def create_app() -> FastAPI:
     # a restart to know when the *new* process is answering.
     from nerve import boot as _boot
 
+    # The git commit of the running code, read once here at startup. It is
+    # cached, so the signed-in diagnostics and the backup manifest name the
+    # code this process loaded, even after a later ``git pull``, and no
+    # request waits on git. /health answers anyone and does not report it.
+    _boot.source_commit()
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "version": "0.1.0", "generation": _boot.boot_id()}
@@ -1806,11 +1820,21 @@ class _DrainingServer(uvicorn.Server):
 
 
 def run_server(config: NerveConfig | None = None) -> None:
-    """Run the Nerve server with uvicorn."""
+    """Run the Nerve server with uvicorn.
+
+    Raises :class:`SchemaNewerThanCodeError` before uvicorn starts when the
+    database is newer than this code. The lifespan would refuse it as well,
+    but uvicorn reports a failed lifespan as a traceback and exit status 3.
+    Raised here, the CLI prints one line and exits with
+    ``NEWER_SCHEMA_EXIT_CODE``. State files that other users can write to are
+    not read here; the lifespan's open refuses them.
+    """
     from uvicorn.main import STARTUP_FAILURE
 
     if config is None:
         config = get_config()
+
+    asyncio.run(check_database_file(paths.db_path()))
 
     ssl_config = {}
     if config.gateway.ssl.enabled:

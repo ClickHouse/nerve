@@ -19,7 +19,7 @@ import socket
 import stat
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -27,7 +27,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI
 
-from nerve import boot, config_reload, daemon, setup_checks, setup_state, setup_telegram_login, setup_token
+from nerve import boot, config_reload, daemon, onboarding, setup_checks, setup_state, setup_telegram_login, setup_token
 from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, get_config, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
@@ -42,7 +42,10 @@ from nerve.gateway.auth import (
 from nerve.gateway.routes import _deps as deps_module
 from nerve.gateway.routes import auth as auth_routes
 from nerve.gateway.routes import setup as setup_routes
-from nerve.setup_writer import SetupChoices, apply_mode, merge_settings_paths, write_slim_install
+from nerve.onboarding_catalog import work_catalog
+from nerve.setup_writer import (
+    SetupChoices, apply_mode, merge_settings_paths, task_description_from, write_slim_install,
+)
 from tests.rate_limited_upstream import RateLimitedUpstream
 
 _PASSWORD = "correct horse battery staple"
@@ -417,11 +420,17 @@ class TestModeLock:
             assert other.status_code == 409
             assert "workspace" in other.json()["detail"]
 
-    async def test_worker_needs_a_task_description(self, claimed):
+    async def test_a_worker_needs_no_task_description(self, claimed):
         async with claimed.client() as http:
-            short = await http.put("/api/setup/mode", json={"mode": "worker", "task_description": "x"})
-            assert short.status_code == 400
-            assert short.json() == {"detail": "Describe the task in at least one full sentence (20+ characters).", "field": "task_description"}
+            state = (await http.put("/api/setup/mode", json={"mode": "worker"})).json()
+        assert state["mode"] == "worker"
+        assert step(state, "mode")["detail"]["task_present"] is True
+        task_md = (claimed.workspace / "TASK.md").read_text()
+        assert task_md.startswith("# Task\n<!-- nerve:onboarding pending")
+        assert task_description_from(task_md) == "" and "{{TASK_DESCRIPTION}}" not in task_md
+
+    async def test_worker_with_a_task_description(self, claimed):
+        async with claimed.client() as http:
             state = (await http.put("/api/setup/mode", json={
                 "mode": "worker",
                 "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything.",
@@ -441,7 +450,7 @@ class TestModeLock:
         assert "{{TASK_DESCRIPTION}}" not in task_md
         assert step(state, "profile")["title"] == "Operator"
         # A worker's defaults: no quiet hours, stated in the tracked settings,
-        # and task-planner offered but off until the onboarding session decides.
+        # and task-planner offered but off until the onboarding conversation decides.
         assert (claimed.settings_yaml()["quiet_start"], claimed.settings_yaml()["quiet_end"]) == ("", "")
         profile = step(state, "profile")["detail"]
         assert (profile["quiet_enabled"], profile["quiet_start"], profile["quiet_end"]) == (False, "", "")
@@ -515,6 +524,174 @@ class TestModeLock:
             assert bare.status_code == 200
         assert (claimed.workspace / "TASK.md").read_bytes() == task_before
         assert other not in (claimed.workspace / "TASK.md").read_text()
+
+
+_NOTHING = {"items": [], "custom": "", "rules": ""}
+_CHOSEN = {"items": ["triage-issues", "review-prs"], "custom": " also watch the release branch ",
+           "rules": "never merge anything"}
+_CHOSEN_TEXT = (
+    "<!-- nerve:work review-prs, triage-issues -->\n"
+    "Work: Review pull requests; Triage issues\n"
+    "Also: also watch the release branch\n"
+    "Must know or never do: never merge anything"
+)
+
+
+@pytest.mark.asyncio
+class TestModeWork:
+    """The worker's checkboxes: ``work`` in, ``TASK.md`` written, the
+    catalog and the selection back in every body."""
+
+    async def test_every_body_carries_the_catalog_and_the_selection(self, claimed):
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "mode")["detail"]
+            personal = step((await http.put("/api/setup/mode", json={"mode": "personal"})).json(), "mode")["detail"]
+        for detail in (before, personal):
+            assert detail["work_catalog"] == work_catalog()
+            assert detail["work"] == _NOTHING
+
+    async def test_a_worker_with_items_custom_work_and_rules(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})).json()
+            again = (await http.get("/api/setup")).json()
+        expected = {"items": ["review-prs", "triage-issues"], "custom": "also watch the release branch",
+                    "rules": "never merge anything"}
+        assert step(state, "mode")["detail"]["work"] == expected
+        assert step(again, "mode")["detail"]["work"] == expected
+        assert step(again, "mode")["etag"] == step(state, "mode")["etag"]
+        task_md = (claimed.workspace / "TASK.md").read_text()
+        assert task_md.startswith("# Task\n<!-- nerve:onboarding pending")
+        assert f"## Task description (as given)\n{_CHOSEN_TEXT}\n\n## Identity\n" in task_md
+        assert task_description_from(task_md) == _CHOSEN_TEXT
+
+    async def test_nothing_ticked_is_valid(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _NOTHING})).json()
+        assert step(state, "mode")["status"] == "done"
+        assert step(state, "mode")["detail"]["work"] == _NOTHING
+        assert task_description_from((claimed.workspace / "TASK.md").read_text()) == ""
+
+    async def test_an_unknown_item_is_a_field_error_and_writes_nothing(self, claimed):
+        async with claimed.client() as http:
+            response = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["review-prs", "make-coffee"], "custom": "", "rules": ""},
+            })
+        assert response.status_code == 400
+        assert response.json()["field"] == "work.items" and "make-coffee" in response.json()["detail"]
+        assert not (claimed.workspace / "SOUL.md").exists()
+
+    async def test_a_personal_install_takes_no_items_and_keeps_custom_work_and_rules_to_itself(self, claimed):
+        async with claimed.client() as http:
+            refused = await http.put("/api/setup/mode", json={
+                "mode": "personal", "work": {"items": ["research-reports"]},
+            })
+            assert refused.status_code == 400 and refused.json()["field"] == "work.items"
+            assert not (claimed.workspace / "SOUL.md").exists()
+            state = (await http.put("/api/setup/mode", json={
+                "mode": "personal", "work": {"items": [], "custom": "Plan my week.", "rules": "No calls."},
+            })).json()
+        assert state["mode"] == "personal"
+        assert not (claimed.workspace / "TASK.md").exists()
+        assert step(state, "mode")["detail"]["work"] == _NOTHING
+
+    @pytest.mark.parametrize("body, field", [
+        ({"work": {"custom": "x" * 4001}}, "work.custom"),
+        ({"work": {"rules": "x" * 2001}}, "work.rules"),
+        ({"note": "x" * 4001}, "note"),
+        ({"task_description": "x" * 4001}, "task_description"),
+    ])
+    async def test_a_long_text_names_the_field_it_came_in(self, claimed, body, field):
+        async with claimed.client() as http:
+            response = await http.put("/api/setup/mode", json={"mode": "worker", **body})
+            assert response.status_code == 400
+            assert response.json()["field"] == field
+            assert not (claimed.workspace / "SOUL.md").exists()
+            # At the limit it is accepted.
+            at_limit = {
+                key: ({k: v[: (2000 if k == "rules" else 4000)] for k, v in value.items()}
+                      if isinstance(value, dict) else value[:4000])
+                for key, value in body.items()
+            }
+            assert (await http.put("/api/setup/mode", json={"mode": "worker", **at_limit})).status_code == 200
+
+    async def test_the_older_note_is_an_alias_for_custom_work(self, claimed):
+        """An older page's note (``note``, or the shipped ``task_description``)
+        stays a plain paragraph in ``TASK.md`` and reads back as custom work."""
+        note = "Watch the nightly build for example/repo and propose fixes."
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "note": note})).json()
+        assert f"## Task description (as given)\n{note}\n" in (claimed.workspace / "TASK.md").read_text()
+        assert step(state, "mode")["detail"]["work"] == {"items": [], "custom": note, "rules": ""}
+
+    async def test_custom_work_wins_over_the_older_note(self, claimed):
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["ci-health"], "custom": "Watch main only."},
+                "note": "Something else.",
+            })).json()
+        assert step(state, "mode")["detail"]["work"] == {
+            "items": ["ci-health"], "custom": "Watch main only.", "rules": "",
+        }
+        assert "Something else" not in (claimed.workspace / "TASK.md").read_text()
+
+    async def test_chosen_once_the_same_choice_is_a_no_op_and_another_is_refused(self, claimed):
+        async with claimed.client() as http:
+            await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})
+            before = (claimed.workspace / "TASK.md").read_bytes()
+            same = await http.put("/api/setup/mode", json={"mode": "worker", "work": {
+                "items": ["review-prs", "triage-issues", "review-prs"], "custom": "also watch the release branch",
+                "rules": " never merge anything\n",
+            }})
+            assert same.status_code == 200
+            other = await http.put("/api/setup/mode", json={"mode": "worker", "work": {
+                **_CHOSEN, "items": ["review-prs"],
+            }})
+            assert other.status_code == 409 and "chosen once" in other.json()["detail"]
+            bare = await http.put("/api/setup/mode", json={"mode": "worker"})
+            assert bare.status_code == 200
+        assert (claimed.workspace / "TASK.md").read_bytes() == before
+
+    async def test_an_older_note_and_the_same_custom_work_are_one_choice(self, claimed):
+        note = "Watch the nightly build for example/repo and propose fixes."
+        async with claimed.client() as http:
+            await http.put("/api/setup/mode", json={"mode": "worker", "task_description": note})
+            before = (claimed.workspace / "TASK.md").read_bytes()
+            same = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": [], "custom": note, "rules": ""},
+            })
+            more = await http.put("/api/setup/mode", json={
+                "mode": "worker", "work": {"items": ["ci-health"], "custom": note, "rules": ""},
+            })
+        assert same.status_code == 200 and more.status_code == 409
+        assert (claimed.workspace / "TASK.md").read_bytes() == before
+
+    async def test_locked_the_selection_waits_for_the_templates(self, claimed, monkeypatch):
+        _lock(claimed, monkeypatch)
+        async with claimed.client() as http:
+            refused = await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})
+            assert refused.status_code == 409
+            assert not (claimed.workspace / "SOUL.md").exists()
+        # Templates arrive from the repository; TASK.md is runtime state.
+        apply_mode(claimed.workspace, "worker")
+        async with claimed.client() as http:
+            state = (await http.put("/api/setup/mode", json={"mode": "worker", "work": _CHOSEN})).json()
+        assert statuses(state)["mode"] == "done"
+        assert task_description_from((claimed.workspace / "TASK.md").read_text()) == _CHOSEN_TEXT
+
+    async def test_finish_opens_the_conversation_on_the_chosen_work(self, claimed, monkeypatch):
+        choose(claimed, "worker", _CHOSEN_TEXT)
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            body = (await http.post("/api/setup/finish")).json()
+        assert body["onboarding"]["status"] == "running"
+        assert step(body["state"], "mode")["detail"]["work"]["items"] == ["review-prs", "triage-issues"]
+        await asyncio.sleep(0)
+        message = engine.run.await_args.kwargs["user_message"]
+        assert "## What the operator chose at setup" in message and "wrote at setup" not in message
+        assert "- Review pull requests — Reads diffs, runs targeted checks, posts review comments." in message
+        assert "Must know or never do:\n> never merge anything" in message
 
 
 # --------------------------------------------------------------------------- #
@@ -1049,6 +1226,19 @@ class TestMemory:
         assert "openai_api_key" not in claimed.local_yaml()
         assert step(state, "memory")["status"] == "done"
         assert step(state, "memory")["summary"] == "LLM-ranked recall (chosen)"
+
+    async def test_memory_kept_in_loom_needs_nothing_and_takes_nothing(self, claimed):
+        merge_settings_paths(claimed.workspace, {"memory.backend": "loom"})
+        claimed.reload()
+        async with claimed.client() as http:
+            memory = step((await http.get("/api/setup")).json(), "memory")
+            assert memory["status"] == "done" and memory["summary"] == "Kept in Loom"
+            assert memory["detail"]["backend"] == "loom"
+            refused = await http.put("/api/setup/memory", json={"openai_api_key": _OPENAI})
+            assert refused.status_code == 409 and "kept in Loom" in refused.json()["detail"]
+            tested = await http.post("/api/setup/memory/test", json={"openai_api_key": _OPENAI})
+            assert tested.status_code == 409
+        assert "openai_api_key" not in claimed.local_yaml()
 
     async def test_same_value_twice_changes_no_bytes_and_adds_no_debt(self, claimed):
         async with claimed.client() as http:
@@ -2069,74 +2259,186 @@ class TestFinish:
             body = (await http.post("/api/setup/finish")).json()
         assert body["action"] == "restart_required"
 
-    async def test_an_ended_onboarding_session_is_reported_and_retried(self, claimed, monkeypatch):
-        """The session exists, the engine no longer drives it, TASK.md still
-        has no plan: ``ended`` with the session id (not a forever-spinner),
-        and an explicit Finish schedules it again."""
-        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
-        engine = MagicMock()
-        engine.channel = lambda name: None
-        engine.is_session_running = lambda sid: False
-        engine._onboarding_task = None
-        engine.ensure_worker_onboarding = MagicMock(return_value=True)
-        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
-        await claimed.db.create_session(
-            "cron:worker-onboarding", title="Cron: worker-onboarding", source="cron", actor=None,
-        )
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-            assert step(state, "mode")["detail"]["onboarding"] == "ended"
-            assert step(state, "mode")["detail"]["onboarding_session_id"] == "cron:worker-onboarding"
-            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
-            body = (await http.post("/api/setup/finish")).json()
-        assert engine.ensure_worker_onboarding.call_count == 1
-        assert body["onboarding"]["session_id"] == "cron:worker-onboarding"
-        # Still being driven: running, not ended.
-        engine.is_session_running = lambda sid: True
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "running"
-
-        # "Try again": the engine starts a *new* session; the ended row stays
-        # in the table. Whatever order the table returns them in, the row the
-        # engine drives wins — every tab reads running with the new id — and
-        # while none runs, the latest attempt is the one named as ended.
-        new_id = "cron:worker-onboarding:2"
-        await claimed.db.create_session(new_id, title="Cron: worker-onboarding", source="cron", actor=None)
-        driven: set[str] = set()
-        engine.is_session_running = lambda sid: sid in driven
-        engine.ensure_worker_onboarding = MagicMock(side_effect=lambda: driven.add(new_id))
-        async with claimed.client() as http:
-            idle = (await http.get("/api/setup")).json()
-            assert step(idle, "mode")["detail"]["onboarding"] == "ended"
-            retried = (await http.post("/api/setup/finish")).json()
-            assert retried["onboarding"] == {"status": "running", "session_id": new_id}
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "running"
-        assert step(state, "mode")["detail"]["onboarding_session_id"] == new_id
-        # Neither driven any more: ended again, naming the latest attempt.
-        driven.clear()
-        async with claimed.client() as http:
-            state = (await http.get("/api/setup")).json()
-        assert step(state, "mode")["detail"]["onboarding"] == "ended"
-        assert step(state, "mode")["detail"]["onboarding_session_id"] == new_id
-
-    async def test_finish_schedules_worker_onboarding(self, claimed, monkeypatch):
-        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
-        engine = MagicMock()
-        engine.channel = lambda name: None
-        engine.is_session_running = lambda sid: False
-        engine.ensure_worker_onboarding = MagicMock(return_value=True)
+    async def test_finish_opens_one_onboarding_conversation(self, claimed, monkeypatch):
+        """Finish opens one web session for the person who finished setup; a
+        second Finish names the same session; Skip ends the reminders."""
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
         monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
         async with claimed.client() as http:
-            # No provider: nothing is scheduled.
-            body = (await http.post("/api/setup/finish")).json()
-            assert body["onboarding"]["status"] == "pending"
-            assert engine.ensure_worker_onboarding.call_count == 0
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            first = (await http.post("/api/setup/finish")).json()
+            second = (await http.post("/api/setup/finish")).json()
+            state = (await http.get("/api/setup")).json()
+        session_id = first["onboarding"]["session_id"]
+        assert first["onboarding"]["status"] == "running" and session_id.startswith("onboarding-")
+        assert second["onboarding"] == first["onboarding"]
+        assert step(state, "mode")["detail"]["onboarding"] == "running"
+        assert step(state, "mode")["detail"]["onboarding_session_id"] == session_id
+        row = await claimed.db.get_session(session_id)
+        assert (row["title"], row["source"]) == ("Onboarding", "web")
+        assert row["caused_by_actor_id"] == row["created_by_actor_id"] is not None
+        await asyncio.sleep(0)
+        assert engine.run.await_count == 1
+        call = engine.run.await_args.kwargs
+        assert call["internal"] is True and call["session_id"] == session_id
+        assert "## Your first message" in call["user_message"]
+
+        async with claimed.client() as http:
+            skipped = (await http.post("/api/setup/onboarding/skip")).json()
+            again = (await http.post("/api/setup/finish")).json()
+        assert step(skipped, "mode")["detail"]["onboarding"] == "skipped"
+        assert again["onboarding"]["status"] == "skipped"
+        assert engine.run.await_count == 1
+
+    async def test_finish_opens_the_conversation_for_a_worker_from_nerve_init(self, claimed, monkeypatch):
+        """``nerve init`` asked for the autonomous onboarding; Finish in the
+        browser opens the conversation instead."""
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        assert await onboarding.request_autonomous(claimed.db, claimed.workspace)
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
+            before = step((await http.get("/api/setup")).json(), "mode")["detail"]
             await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
             body = (await http.post("/api/setup/finish")).json()
-        assert engine.ensure_worker_onboarding.call_count == 1
-        assert body["action"] == "reloaded"
+        assert (before["onboarding"], before["onboarding_kind"]) == ("pending", "autonomous")
+        detail = step(body["state"], "mode")["detail"]
+        assert (detail["onboarding"], detail["onboarding_kind"]) == ("running", "conversation")
+        await asyncio.sleep(0)
+        assert engine.run.await_args.kwargs["internal"] is True
+
+    async def test_finish_without_a_model_asks_the_next_start(self, claimed, monkeypatch):
+        choose(claimed, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+        async with claimed.client() as http:
+            body = (await http.post("/api/setup/finish")).json()
+        assert body["onboarding"] == {"status": "pending", "session_id": None}
+        assert engine.run.await_count == 0
+        assert (await claimed.db.get_onboarding())["status"] == "requested"
+
+    async def test_the_onboarding_block_says_what_the_agent_waits_for(self, claimed, monkeypatch):
+        """``onboarding.awaiting`` is ``question`` while an AskUserQuestion card
+        waits in the onboarding session, ``plan`` while an ExitPlanMode decision
+        does (a plan wins), ``null`` for anything else and once it stops running."""
+        from nerve.agent.interactive import InteractiveToolHandler, register_handler, unregister_handler
+
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+        assert state["onboarding"] == {
+            "status": "not_applicable", "session_id": None, "kind": "conversation", "awaiting": None,
+        }
+
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+
+        async def _quiet(channel, message):
+            pass
+
+        async def _awaiting(http) -> str | None:
+            state = (await http.get("/api/setup")).json()
+            assert state["onboarding"]["status"] == step(state, "mode")["detail"]["onboarding"]
+            return state["onboarding"]["awaiting"]
+
+        async def _pause(handler, tool, count):
+            task = asyncio.create_task(
+                handler.request_approval(tool, {}) if tool == "command_approval"
+                else handler.request_interaction(tool, {}),
+            )
+            for _ in range(200):
+                if len(handler.pending_interaction_types()) == count:
+                    return task
+                await asyncio.sleep(0.005)
+            raise AssertionError(f"{tool} never paused")
+
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            finished = (await http.post("/api/setup/finish")).json()
+            session_id = finished["onboarding"]["session_id"]
+            assert finished["state"]["onboarding"] == {
+                "status": "running", "session_id": session_id, "kind": "conversation", "awaiting": None,
+            }
+            handler = InteractiveToolHandler(session_id, _quiet, interactive_capable=True)
+            register_handler(session_id, handler)
+            try:
+                assert await _awaiting(http) is None
+                approval = await _pause(handler, "command_approval", 1)
+                assert await _awaiting(http) is None
+                question = await _pause(handler, "AskUserQuestion", 2)
+                assert await _awaiting(http) == "question"
+                plan = await _pause(handler, "ExitPlanMode", 3)
+                assert await _awaiting(http) == "plan"
+                handler.cancel_all()
+                await asyncio.gather(approval, question, plan)
+                assert await _awaiting(http) is None
+
+                plan = await _pause(handler, "ExitPlanMode", 1)
+                skipped = (await http.post("/api/setup/onboarding/skip")).json()
+                assert skipped["onboarding"]["status"] == "skipped"
+                assert skipped["onboarding"]["awaiting"] is None
+                handler.cancel_all()
+                await plan
+            finally:
+                unregister_handler(session_id)
+
+    async def test_a_form_waits_as_a_question(self, claimed, monkeypatch):
+        """An ``ask_form`` form (the ``form`` interaction) is a question for
+        ``onboarding.awaiting``, so the banner says the agent has one; a plan
+        still wins."""
+        from nerve.agent.interactive import InteractiveToolHandler, register_handler, unregister_handler
+
+        choose(claimed, "personal")
+        engine = _onboarding_engine(claimed.db)
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=claimed.db))
+
+        async def _quiet(channel, message):
+            pass
+
+        async def _awaiting(http) -> str | None:
+            return (await http.get("/api/setup")).json()["onboarding"]["awaiting"]
+
+        async def _pause(handler, tool, count):
+            task = asyncio.create_task(handler.request_interaction(tool, {}))
+            for _ in range(200):
+                if len(handler.pending_interaction_types()) == count:
+                    return task
+                await asyncio.sleep(0.005)
+            raise AssertionError(f"{tool} never paused")
+
+        async with claimed.client() as http:
+            await http.put("/api/setup/provider", json={"type": "anthropic", "anthropic_api_key": _API_KEY})
+            session_id = (await http.post("/api/setup/finish")).json()["onboarding"]["session_id"]
+            handler = InteractiveToolHandler(session_id, _quiet, interactive_capable=True)
+            register_handler(session_id, handler)
+            try:
+                form = await _pause(handler, "ask_form", 1)
+                assert handler.pending_interaction_types() == ["form"]
+                assert await _awaiting(http) == "question"
+                plan = await _pause(handler, "ExitPlanMode", 2)
+                assert await _awaiting(http) == "plan"
+                handler.cancel_all()
+                await asyncio.gather(form, plan)
+                assert await _awaiting(http) is None
+            finally:
+                unregister_handler(session_id)
+
+
+def _onboarding_engine(db) -> MagicMock:
+    """An engine whose sessions are real rows and whose turns do nothing."""
+    engine = MagicMock()
+    engine.db = db
+    engine.channel = lambda name: None
+    engine.run = AsyncMock(return_value="")
+
+    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
+        await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
+        return await db.get_session(session_id)
+
+    engine.sessions.get_or_create = _get_or_create
+    engine.register_task = lambda session_id, task: None
+    return engine
 
 
 # --------------------------------------------------------------------------- #
@@ -3290,6 +3592,41 @@ class TestManagedValues:
         assert claimed.machine_yaml()["slack"] == {"enabled": False}
         assert "slack" not in claimed.local_yaml()
 
+    async def test_a_github_switch_the_operator_holds_is_refused_and_the_other_sources_still_save(self, claimed):
+        """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml, which
+        outranks the settings.yaml the page writes. Gmail and Telegram stay on
+        offer; a save that names the GitHub switch is refused whole, by name,
+        and writes nothing, and the same save without it goes through."""
+        choose(claimed, "personal")
+        _hold_github_on_the_machine(claimed)
+        async with claimed.client() as http:
+            sources = step((await http.get("/api/setup")).json(), "sources")
+            assert sources["status"] == "done" and sources["read_only"] is False
+            assert sources["detail"]["available"] == ["gmail", "telegram"]
+            assert sources["detail"]["unavailable_reason"] == _GITHUB_MANAGED
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["github"]["managed"] is True
+            settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+            machine_before = (claimed.config_dir / "config.yaml").read_bytes()
+            body = {"github": False, "gmail": True, "gmail_accounts": ["alice@example.com"], "telegram": False}
+            refused = await http.put("/api/setup/sources", json=body)
+            assert refused.status_code == 409, refused.text
+            assert refused.json() == {"detail": _GITHUB_MANAGED, "field": "github"}
+            assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+            assert (claimed.config_dir / "config.yaml").read_bytes() == machine_before
+            assert "sources" not in setup_state.load_state().answered
+            del body["github"]
+            saved = await http.put("/api/setup/sources", json=body)
+            assert saved.status_code == 200, saved.text
+            sources = step(saved.json(), "sources")
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["gmail"]["enabled"] is True
+        assert "sources" in setup_state.load_state().answered
+        settings = claimed.settings_yaml()["sync"]
+        assert settings["gmail"]["enabled"] is True and settings["telegram"]["enabled"] is False
+        # The slim install's GitHub switch and the events source are as they were.
+        assert settings["github"]["enabled"] is False and settings["github_events"]["enabled"] is False
+        assert claimed.machine_yaml()["sync"]["gmail"]["accounts"] == ["alice@example.com"]
+        assert claimed.local_yaml()["sync"]["github"] == {"mode": "hosted", "enabled": True}
+
 
 # --------------------------------------------------------------------------- #
 #  Instances that keep no credentials on disk                                  #
@@ -3299,6 +3636,10 @@ class TestManagedValues:
 _NO_SECRETS = "This instance does not store credentials entered here. Connections are provided by the operator of this deployment."
 _GITHUB_ONLY = "GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance."
 _GITHUB_HOSTED = "GitHub comes from the channel gateway of this deployment; Gmail and Telegram are not available on this instance."
+_GITHUB_MANAGED = (
+    "GitHub arrives from the channel gateway of this deployment once a GitHub credential is connected "
+    "to this agent; nothing to switch here."
+)
 
 
 def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
@@ -3312,6 +3653,17 @@ def _set_local_secrets(install: Install, allowed: bool, **settings) -> None:
 def _keep_no_secrets(install: Install, **settings) -> None:
     """``setup.local_secrets: false`` in the tracked settings."""
     _set_local_secrets(install, False, **settings)
+
+
+def _hold_github_on_the_machine(install: Install, enabled: bool = True) -> None:
+    """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml, as an
+    operator's provisioning writes it, then reloaded."""
+    from nerve.setup_writer import merge_private_paths
+
+    merge_private_paths(
+        install.config_dir / "config.local.yaml", {"sync.github.mode": "hosted", "sync.github.enabled": enabled},
+    )
+    config_reload.remember_startup_config(install.reload())
 
 
 @pytest.mark.asyncio
@@ -3529,6 +3881,47 @@ class TestNoLocalSecrets:
         settings = claimed.settings_yaml()["sync"]
         assert settings["github"] == {"enabled": False, "mode": "hosted"}
         assert settings["github_events"]["enabled"] is False
+
+    async def test_a_github_switch_the_operator_holds_leaves_nothing_on_offer_and_is_refused_by_name(self, claimed):
+        """Hosted GitHub with ``sync.github.enabled`` in config.local.yaml: the
+        settings.yaml the page writes cannot change it, so the step offers
+        nothing and reads done because the operator switched GitHub on. A save
+        that names the switch is refused by name whatever it says, with the
+        reason about that field alone, and nothing is written; one without it
+        gets the policy's answer, as before."""
+        choose(claimed, "personal")
+        _hold_github_on_the_machine(claimed)
+        _keep_no_secrets(claimed)
+        held = _GITHUB_MANAGED + " Gmail and Telegram are not available on this instance."
+        settings_before = (claimed.workspace / "config" / "settings.yaml").read_bytes()
+        local_before = (claimed.config_dir / "config.local.yaml").read_bytes()
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            sources = step(state, "sources")
+            assert sources["status"] == "done" and sources["read_only"] is True
+            assert sources["read_only_reason"] == held
+            assert sources["detail"]["available"] == [] and sources["detail"]["unavailable_reason"] == held
+            assert sources["detail"]["github"]["enabled"] is True and sources["detail"]["github"]["managed"] is True
+            assert sources["summary"] == (
+                "GitHub · waiting for the channel gateway — if no GitHub credential is connected "
+                "to this agent yet, connect one where your operator manages it"
+            )
+            assert state["steps_left"] == 3  # provider, profile, automation
+            for body in (
+                {"github": False}, {"github": True}, {"github": None},
+                {"github": False, "gmail": False, "telegram": False},
+            ):
+                refused = await http.put("/api/setup/sources", json=body)
+                assert refused.status_code == 409, (body, refused.text)
+                assert refused.json() == {"detail": _GITHUB_MANAGED, "field": "github"}, body
+            refused = await http.put("/api/setup/sources", json={"gmail": False})
+            assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS
+            # Done already: a skip records nothing.
+            skipped = await http.post("/api/setup/steps/sources/skip")
+            assert skipped.status_code == 200 and setup_state.load_state().skipped == set()
+        assert (claimed.workspace / "config" / "settings.yaml").read_bytes() == settings_before
+        assert (claimed.config_dir / "config.local.yaml").read_bytes() == local_before
+        assert claimed.config.sync.github.enabled is True
 
     async def test_the_github_toggle_waits_for_a_mode_and_can_be_skipped(self, claimed, monkeypatch):
         """Open, the step behaves like any other: it waits for the Mode step

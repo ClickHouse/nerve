@@ -40,6 +40,10 @@ export type TabView = 'facts' | 'timeline' | 'sources' | 'log';
 interface MemoryState {
   // Data
   available: boolean;
+  /** The memory backend when the server names it: `loom` keeps memory in a
+   * Loom service, whose own dashboard (`dashboardUrl`) browses it. */
+  backend: string | null;
+  dashboardUrl: string | null;
   categories: Category[];
   items: MemoryItem[];
   resources: Resource[];
@@ -77,6 +81,8 @@ interface MemoryState {
 
 export const useMemoryStore = create<MemoryState>((set, get) => ({
   available: false,
+  backend: null,
+  dashboardUrl: null,
   categories: [],
   items: [],
   resources: [],
@@ -99,6 +105,8 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
       const data = await api.getMemuData();
       set({
         available: data.available,
+        backend: data.backend ?? null,
+        dashboardUrl: data.dashboard_url ?? null,
         categories: data.categories || [],
         items: data.items || [],
         resources: data.resources || [],

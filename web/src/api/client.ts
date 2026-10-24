@@ -80,11 +80,65 @@ export interface SetupClaimDetail {
 }
 
 /**
- * A worker's onboarding session. `ended` is a session that stopped without
- * writing a plan into TASK.md (a placeholder key, a crash): the page links
- * to it and offers to try again instead of waiting for it.
+ * The onboarding conversation: `pending` until it opens (setup not finished,
+ * or a restart first), `running` while it waits for the person, then `done`
+ * or `skipped`. `not_applicable` before a mode is chosen.
  */
-export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'ended' | 'done';
+export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' | 'skipped';
+/**
+ * How the agent is set up: in a web chat with a person, or, for a worker set
+ * up with `nerve init` and a task description, in one session without a person.
+ */
+export type SetupOnboardingKind = 'conversation' | 'autonomous';
+/**
+ * What the onboarding agent waits for in its conversation: an answer to its
+ * question (`AskUserQuestion`), or a decision on its setup proposal (the plan
+ * of `ExitPlanMode`).
+ */
+export type SetupOnboardingAwaiting = 'question' | 'plan';
+
+/** The onboarding at a glance; the Mode step's detail carries the same status, session and kind. */
+export interface SetupOnboardingState {
+  status: SetupOnboarding;
+  session_id: string | null;
+  kind: SetupOnboardingKind;
+  /** `null` unless `status` is `running` and the agent waits for the person. */
+  awaiting: SetupOnboardingAwaiting | null;
+}
+
+/**
+ * One kind of work a worker can take on, from the server's catalog. The Mode
+ * step lists them as checkboxes; the onboarding conversation asks the chosen
+ * items' `follow_ups`.
+ */
+export interface WorkCatalogItem {
+  id: string;
+  /** `code`, `operations`, `communication` or `knowledge`. */
+  group: string;
+  label: string;
+  /** One line. */
+  description: string;
+  /** What the work depends on: `github`, `alerts`, `slack-or-telegram` or `web`. */
+  needs: string;
+  follow_ups: string[];
+  /**
+   * A caveat shown under the description: what the work needs that the
+   * instance may lack (alerts: an alert source). Empty for most items;
+   * absent when the description carries it.
+   */
+  note?: string;
+}
+
+/**
+ * What a worker was set up to do: catalog ids, other work in the person's
+ * own words, and what it must know or never do. All empty when nothing was
+ * chosen.
+ */
+export interface WorkSelection {
+  items: string[];
+  custom: string;
+  rules: string;
+}
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -92,6 +146,12 @@ export interface SetupModeDetail {
   task_present: boolean;
   onboarding: SetupOnboarding;
   onboarding_session_id: string | null;
+  /** Absent from an older backend: `conversation`. */
+  onboarding_kind?: SetupOnboardingKind;
+  /** The worker work catalog, in display order. Absent from an older backend. */
+  work_catalog?: WorkCatalogItem[];
+  /** The saved selection (from `TASK.md`). Absent from an older backend. */
+  work?: WorkSelection;
 }
 
 export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';
@@ -154,6 +214,8 @@ export interface SetupProfileDetail {
 }
 
 export interface SetupMemoryDetail {
+  /** `memory.backend`: under `loom` there is nothing to set up here. */
+  backend?: string;
   openai_api_key: SecretOut;
   embeddings_chosen: boolean;
   embed_model: string;
@@ -216,7 +278,17 @@ export interface TelegramSyncSessionSummary {
 export type SetupSourceId = 'github' | 'gmail' | 'telegram';
 
 export interface SetupSourcesDetail {
-  github: { enabled: boolean; source?: CredentialSource | null };
+  github: {
+    enabled: boolean;
+    source?: CredentialSource | null;
+    /**
+     * `true` while the channel gateway polls GitHub and the operator holds
+     * the source's switch in the machine's configuration: the page shows the
+     * source and offers no switch (`available` leaves it out). Absent
+     * otherwise, and from an older backend.
+     */
+    managed?: boolean;
+  };
   gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
   telegram: {
     enabled: boolean;
@@ -230,7 +302,8 @@ export interface SetupSourcesDetail {
    * instance that keeps no credentials on disk (`local_secrets: false`): a
    * GitHub token from the environment keeps the GitHub toggle alone on
    * offer (`['github']`); otherwise nothing is (`[]`, the step is closed).
-   * Absent from an older backend, which offers all three.
+   * GitHub is left out either way while the operator holds its switch
+   * (`github.managed`). Absent from an older backend, which offers all three.
    */
   available?: SetupSourceId[];
   /** Why the others are not offered — the server's sentence, shown on the step. */
@@ -250,10 +323,12 @@ export interface SetupCronJob {
   default?: boolean;
   /**
    * Whether the mode's first-run default turns this optional job on. A
-   * worker's `task-planner` is off until its onboarding session decides.
+   * worker's `task-planner` is off until its onboarding conversation decides.
    * Absent from an older backend.
    */
   default_enabled?: boolean;
+  /** Set in `jobs.yaml`, which replaces the built-in job; `enabled` is that job's. */
+  overridden?: boolean;
 }
 
 export interface SetupAutomationDetail {
@@ -320,6 +395,8 @@ export interface SetupState {
   steps_left: number;
   warning: string | null;
   steps: SetupStep[];
+  /** Absent from an older backend. */
+  onboarding?: SetupOnboardingState;
 }
 
 export interface RestartResponse {
@@ -1121,6 +1198,9 @@ export const api = {
     request<SetupState>(`/setup/${encodeURIComponent(step)}`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+
+  setupSkipOnboarding: () =>
+    request<SetupState>('/setup/onboarding/skip', { method: 'POST', body: '{}' }),
 
   setupSkip: (step: SetupStepId, skipped: boolean) =>
     request<SetupState>(

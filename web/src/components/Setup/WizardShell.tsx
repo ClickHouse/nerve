@@ -8,6 +8,7 @@ import { ShieldCheck } from '../ui/icons';
 import {
   REVIEW, closedByPolicy, nextStop, previousStop, stepOf, stepTitle, stopPath, stopPosition, type WizardStop,
 } from './navigation';
+import { OnboardingPanel } from './OnboardingPanel';
 import { Overview } from './Overview';
 import { ProgressRail } from './ProgressRail';
 import { RestartOverlay } from './RestartOverlay';
@@ -131,7 +132,7 @@ export function WizardShell() {
         </div>
       );
   } else if (!current) {
-    body = <Overview state={state} />;
+    body = <div className="flex flex-col gap-6"><OnboardingPanel state={state} /><Overview state={state} /></div>;
   } else if (current === REVIEW) {
     body = <ReviewStep state={state} />;
   } else {
@@ -146,7 +147,7 @@ export function WizardShell() {
       const key = `${viewerId}:${step.etag}`;
       switch (step.id) {
         case 'claim': body = <ClaimDoneStep key={key} step={step} />; break;
-        case 'mode': body = <ModeStep key={key} step={step} state={state} />; break;
+        case 'mode': body = <ModeStep key={key} step={step} />; break;
         case 'provider': body = <ProviderStep key={key} step={step} state={state} />; break;
         case 'profile': body = <ProfileStep key={key} step={step} state={state} />; break;
         case 'memory': body = <MemoryStep key={key} step={step} state={state} />; break;

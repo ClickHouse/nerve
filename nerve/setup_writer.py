@@ -42,7 +42,9 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -66,12 +68,16 @@ from nerve.config import (
     _interpolate_str,
     workspace_settings_file,
 )
+from nerve.onboarding_catalog import ITEMS as WORK_ITEMS
+from nerve.onboarding_catalog import WorkSelection, in_catalog_order
 from nerve.workspace import (
     initialize_workspace,
     install_bundled_skills,
     install_config_scaffold,
     template_file,
 )
+
+logger = logging.getLogger(__name__)
 
 # --- Cron definitions for the wizard ---
 
@@ -152,12 +158,13 @@ PRODUCTIVITY_CRONS = [
         "run_if": [{"type": "tasks", "status": "pending"}],
         "prompt": (
             "You are a proactive planning agent. Your job is to find a task worth working on and produce an implementation plan.\n\n"
-            "1. Use task_list to browse open tasks\n"
+            "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
             "2. Use plan_list to see which tasks already have plans — skip those\n"
             "3. Pick ONE task and explore the relevant codebase\n"
             "4. Call plan_propose(task_id, content) with your plan\n\n"
             "If all tasks have plans or none are actionable, say so and stop.\n\n"
-            "After proposing a plan, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to the plan. "
+            "Do not send another notification about it.\n"
         ),
     },
     {
@@ -177,7 +184,8 @@ PRODUCTIVITY_CRONS = [
             "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
             "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
             "If no candidates found, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n"
         ),
     },
     {
@@ -198,7 +206,8 @@ PRODUCTIVITY_CRONS = [
             "4. Check quality (clear descriptions, good trigger phrases)\n"
             "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
             "If all skills look good, say so and stop.\n"
-            "After proposing, use `notify` to alert the user.\n"
+            "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n"
         ),
     },
 ]
@@ -206,8 +215,8 @@ PRODUCTIVITY_CRONS = [
 # The optional crons each mode switches on when nobody chose otherwise: what
 # ``nerve init --non-interactive`` writes, and what the web Mode step writes
 # into a fresh ``system.yaml``. A worker's ``task-planner`` is not among them:
-# whether the worker plans through the approval loop is the onboarding
-# session's decision, and it enables the job (overridden by id in
+# whether the worker plans through the approval loop is decided in the
+# onboarding conversation, which enables the job (overridden by id in
 # ``jobs.yaml``, scoped to the worker's tag) when the answer is yes.
 DEFAULT_CRONS: dict[str, list[str]] = {
     "personal": ["inbox-processor", "task-planner"],
@@ -376,6 +385,10 @@ class SetupChoices:
     # init` asks.
     gateway_host: str = "0.0.0.0"
     gateway_port: int = 8900
+    # The instance's memory.backend (the web setup passes the running
+    # config's). Under "loom" the workspace templates and the built-in jobs
+    # name Loom's memory tools instead of Nerve's.
+    memory_backend: str = "memu"
 
 
 def bedrock_geo_prefix(region: str) -> str:
@@ -1215,6 +1228,76 @@ def write_cron_jobs(choices: SetupChoices) -> CronOutcome:
     )
 
 
+def _cron_prompt(cron: dict[str, Any], memory_backend: str) -> str:
+    """A built-in job's prompt; under Loom, worded for Loom's memory tools."""
+    prompt = cron["prompt"]
+    if memory_backend != "loom":
+        return prompt
+    from nerve.memory import loom_prompts
+
+    if cron["id"] == "memory-maintenance":
+        return loom_prompts.MAINTENANCE_PROMPT
+    if cron["id"] == "inbox-processor":
+        return loom_prompts.apply_edits(
+            prompt, (loom_prompts.INBOX_MEMORIZE_EDIT,), name="the inbox-processor prompt",
+        )
+    return prompt
+
+
+def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
+    if memory_backend == "loom" and cron["id"] == "memory-maintenance":
+        from nerve.memory import loom_prompts
+
+        return loom_prompts.MAINTENANCE_DESCRIPTION
+    return cron["description"]
+
+
+def loom_wording_of_shipped_job(
+    job_id: str, prompt: str, description: str,
+) -> tuple[str, str] | None:
+    """The Loom prompt and description of a built-in job whose prompt is the
+    one Nerve writes for memU, as a ``system.yaml`` written before
+    ``memory.backend`` became ``loom`` holds it; None for an edited prompt or
+    a job with no Loom wording. Run under memU's prompt, ``memory-maintenance``
+    would prune memories through Loom's tools."""
+    shipped = next((c for c in (*CORE_CRONS, *PRODUCTIVITY_CRONS) if c["id"] == job_id), None)
+    if shipped is None or prompt.strip() != shipped["prompt"].strip():
+        return None
+    loom_prompt = _cron_prompt(shipped, "loom")
+    if loom_prompt == shipped["prompt"]:
+        return None
+    if description.strip() == str(shipped["description"]).strip():
+        description = _cron_description(shipped, "loom")
+    return loom_prompt, description
+
+
+def existing_memory_backend(config_dir: Path, workspace: Path | None = None) -> str:
+    """The ``memory.backend`` an existing configuration names, else ``memu``:
+    what ``nerve init`` words the templates, skills and jobs for when no
+    ``--memory-backend`` says (that flag wins: a platform that switches the
+    instance after its first ``nerve init`` passes it). Read from the
+    configuration when one loads, else from the workspace's
+    ``config/settings.yaml`` alone."""
+    from nerve.config import MEMORY_BACKENDS, load_config
+
+    try:
+        if (Path(config_dir) / "config.yaml").exists():
+            backend = load_config(Path(config_dir)).memory.backend
+            return backend if backend in MEMORY_BACKENDS else "memu"
+    except Exception as e:  # noqa: BLE001 — setup goes on with the default
+        logging.getLogger(__name__).warning("Could not read memory.backend from %s: %s", config_dir, e)
+    if workspace is not None:
+        try:
+            raw = yaml.safe_load(workspace_settings_file(Path(workspace)).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            raw = None
+        memory = raw.get("memory") if isinstance(raw, dict) else None
+        backend = str(memory.get("backend") or "").strip().lower() if isinstance(memory, dict) else ""
+        if backend in MEMORY_BACKENDS:
+            return backend
+    return "memu"
+
+
 def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
     """The ``system.yaml`` job list this install's answers produce."""
     jobs: list[dict[str, Any]] = []
@@ -1224,8 +1307,8 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
         jobs.append({
             "id": cron["id"],
             "schedule": cron["schedule"],
-            "prompt": cron["prompt"],
-            "description": cron["description"],
+            "prompt": _cron_prompt(cron, choices.memory_backend),
+            "description": _cron_description(cron, choices.memory_backend),
             "model": cron.get("model", ""),
             "session_mode": cron.get("session_mode", "isolated"),
             "enabled": True,
@@ -1238,7 +1321,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             job: dict[str, Any] = {
                 "id": cron["id"],
                 "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
+                "prompt": _cron_prompt(cron, choices.memory_backend),
                 "description": cron["description"],
                 "model": cron.get("model", ""),
                 "session_mode": cron.get("session_mode", "isolated"),
@@ -1255,7 +1338,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
         # Workers get skill crons — they create skills during onboarding
         # and those skills should be maintained automatically. task-planner
         # is catalogued too but on only when chosen (DEFAULT_CRONS leaves it
-        # to the onboarding session); other jobs are added during onboarding.
+        # to the onboarding conversation); other jobs are added during onboarding.
         for cron in PRODUCTIVITY_CRONS:
             if cron["id"] not in _WORKER_CRONS:
                 continue
@@ -1263,7 +1346,7 @@ def build_cron_jobs(choices: SetupChoices) -> list[dict[str, Any]]:
             job = {
                 "id": cron["id"],
                 "schedule": cron["schedule"],
-                "prompt": cron["prompt"],
+                "prompt": _cron_prompt(cron, choices.memory_backend),
                 "description": cron["description"],
                 "model": cron.get("model", ""),
                 "session_mode": cron.get("session_mode", "isolated"),
@@ -1318,6 +1401,9 @@ class CronToggle:
     enabled: bool
     schedule: str = ""
     requires: str | None = None
+    #: ``jobs.yaml`` has a job with this id, which replaces the ``system.yaml``
+    #: job: ``enabled`` is that job's, and the checklist cannot change it.
+    overridden: bool = False
 
 
 @dataclass(frozen=True)
@@ -1394,8 +1480,24 @@ def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str
     return document, raw, ""
 
 
+def _user_cron_jobs(workspace: Path) -> list[Any]:
+    """The jobs of ``jobs.yaml`` beside ``system.yaml`` that the scheduler loads.
+
+    Gates are built, as the scheduler builds them: a job whose gate does not
+    build is left out, and the ``system.yaml`` job with its id runs instead.
+    """
+    from nerve.cron.jobs import load_jobs
+
+    path = system_cron_file(workspace).parent / "jobs.yaml"
+    return load_jobs(path) if path.exists() else []
+
+
 def list_optional_crons(workspace: Path) -> list[CronToggle]:
     """The optional crons this install actually has, and whether each is on.
+
+    ``enabled`` is the effective state, the one the scheduler runs: a job in
+    ``jobs.yaml`` with the same id replaces the ``system.yaml`` job
+    (:func:`nerve.cron.jobs.merge_jobs`).
 
     Empty when the file is missing or unreadable: the checklist then says the
     step has nothing to offer rather than inventing jobs that were never
@@ -1409,15 +1511,21 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
         for job in document["jobs"]
         if isinstance(job, dict) and job.get("id")
     }
+    from nerve.cron.jobs import load_jobs, merge_jobs
+
+    user = _user_cron_jobs(workspace)
+    overridden = {job.id for job in user}
+    effective = {job.id: job for job in merge_jobs(load_jobs(system_cron_file(workspace)), user)}
     known = {cron["id"]: cron for cron in PRODUCTIVITY_CRONS}
     return [
         CronToggle(
             id=cron_id,
             name=str(known[cron_id].get("display_name") or known[cron_id].get("name") or cron_id),
             description=str(known[cron_id].get("description") or ""),
-            enabled=present[cron_id],
+            enabled=bool(effective[cron_id].enabled) if cron_id in effective else present[cron_id],
             schedule=str(known[cron_id].get("schedule") or ""),
             requires=known[cron_id].get("requires"),
+            overridden=cron_id in overridden,
         )
         for cron_id in OPTIONAL_CRON_IDS
         if cron_id in present
@@ -1439,11 +1547,14 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
 
     enabled, disabled = [], []
     changed = False
+    # A job that ``jobs.yaml`` replaces keeps its ``system.yaml`` entry: a
+    # change there would not change what runs.
+    overridden = {job.id for job in _user_cron_jobs(workspace)}
     for job in document["jobs"]:
         if not isinstance(job, dict):
             continue
         job_id = str(job.get("id") or "")
-        if job_id not in OPTIONAL_CRON_IDS:
+        if job_id not in OPTIONAL_CRON_IDS or job_id in overridden:
             continue
         wanted = job_id in enabled_ids
         (enabled if wanted else disabled).append(job_id)
@@ -1571,7 +1682,7 @@ def write_slim_install(
     # W: directories, scaffold, bundled skills, cron gates dir.
     workspace.mkdir(parents=True, exist_ok=True)
     install_config_scaffold(workspace)
-    install_bundled_skills(workspace)
+    install_bundled_skills(workspace, memory_backend=choices.memory_backend)
     (workspace / "config" / "cron" / "gates").mkdir(parents=True, exist_ok=True)
 
     # M: this box.
@@ -1645,13 +1756,14 @@ class ModeOutcome:
 
 # --- A worker's TASK.md -------------------------------------------------------
 #
-# The contract with ``nerve/templates/worker/TASK.md`` (and with the first-boot
-# onboarding session, whose prompt restates it): line 1 is the ``# Task``
-# heading, line 2 the marker comment, and the operator's description sits under
+# The contract with ``nerve/templates/worker/TASK.md`` (and with the onboarding
+# conversation, whose prompt restates it): line 1 is the ``# Task`` heading,
+# line 2 the marker comment, and the operator's description sits under
 # ``## Task description (as given)`` where the template has the token. The
-# onboarding session fills the other sections in place and deletes the marker
-# line last — so "marker present" is "onboarding still pending", for the
-# installers, the setup checklist and the engine's start-up check alike.
+# onboarding conversation fills the other sections in place, and
+# ``onboarding_done`` deletes the marker line (:mod:`nerve.onboarding`). An
+# install from before the onboarding state keeps "marker present" as
+# "onboarding still pending".
 _TASK_HEADER = "# Task\n"
 TASK_ONBOARDING_MARKER = "<!-- nerve:onboarding pending"
 TASK_DESCRIPTION_TOKEN = "{{TASK_DESCRIPTION}}"
@@ -1663,7 +1775,7 @@ WRITER_OWNED_TEMPLATES = ("TASK.md",)
 
 
 def task_onboarding_pending(text: str) -> bool:
-    """Whether a ``TASK.md`` body is still waiting for the onboarding session.
+    """Whether a ``TASK.md`` body is still waiting for onboarding.
 
     The marker comment decides. Files written by older versions carry no
     marker: those are the raw ``# Task`` form until onboarding gave them a
@@ -1681,7 +1793,7 @@ def task_description_from(text: str) -> str | None:
     The section under ``## Task description (as given)`` up to the next ``##``
     heading; for the legacy raw form, everything after the ``# Task`` line.
     ``""`` when the file is pending but holds no description yet (the template
-    token still in place). ``None`` once the onboarding session owns the file.
+    token still in place). ``None`` once onboarding has completed the file.
     """
     if not task_onboarding_pending(text):
         return None
@@ -1711,8 +1823,96 @@ def render_task_md(task_description: str) -> str:
     return template.replace(TASK_DESCRIPTION_TOKEN, task_description.strip(), 1)
 
 
+# --- What the operator chose at setup -----------------------------------------
+#
+# The Mode step's selection (:mod:`nerve.onboarding_catalog`) is written as the
+# ``## Task description (as given)`` section: one comment line a program reads,
+# then one line each for people, each left out when empty:
+#
+#     <!-- nerve:work review-prs, triage-issues -->
+#     Work: Review pull requests; Triage issues
+#     Also: <custom text>
+#     Must know or never do: <rules>
+#
+# The comment line opens every selection, also one without items
+# (``<!-- nerve:work -->``): it is what tells a selection from a free-text
+# note (an older client, ``nerve init --terminal``, ``NERVE_TASK``), which
+# stays a plain paragraph and reads back as ``custom``.
+WORK_MARKER = "<!-- nerve:work"
+_WORK_COMMENT = re.compile(r"^<!-- nerve:work(?:\s+(?P<ids>.*?))?\s*-->$")
+_WORK_LINE = "Work:"
+_ALSO_LINE = "Also:"
+_RULES_LINE = "Must know or never do:"
+
+
+def render_work_description(selection: WorkSelection) -> str:
+    """The ``## Task description (as given)`` text for ``selection``.
+
+    ``""`` when nothing was chosen; the note itself for a free-text
+    selection. Items are written once each, in catalog order; an id the
+    catalog does not know is left out.
+    """
+    custom, rules = selection.custom.strip(), selection.rules.strip()
+    if selection.free_text:
+        return custom
+    items = in_catalog_order(selection.items)
+    if not (items or custom or rules):
+        return ""
+    lines = [f"{WORK_MARKER} {', '.join(items)} -->" if items else f"{WORK_MARKER} -->"]
+    if items:
+        lines.append(f"{_WORK_LINE} " + "; ".join(WORK_ITEMS[i].label for i in items))
+    if custom:
+        lines.append(f"{_ALSO_LINE} {custom}")
+    if rules:
+        lines.append(f"{_RULES_LINE} {rules}")
+    return "\n".join(lines)
+
+
+def work_selection_from(text: str | None) -> WorkSelection:
+    """The selection a ``## Task description (as given)`` text holds.
+
+    ``text`` is :func:`task_description_from`'s result (``None`` and ``""``
+    read as nothing chosen). The ids come from the comment line; the custom
+    work and the rules from their lines, each running on until a line that
+    opens a later one (the order is ``Work:``, ``Also:``, ``Must know or
+    never do:``), so a custom text may hold lines of its own. The ``Work:``
+    line is for people and is not read. An id the catalog does not know is
+    dropped with a warning. A text without the comment line is a free-text
+    note: all of it is ``custom``.
+    """
+    body = (text or "").strip()
+    if not body:
+        return WorkSelection()
+    lines = body.splitlines()
+    match = _WORK_COMMENT.match(lines[0].strip())
+    if match is None:
+        return WorkSelection(custom=body, free_text=True)
+    ids = [part.strip() for part in (match.group("ids") or "").split(",") if part.strip()]
+    for unknown in sorted({i for i in ids if i not in WORK_ITEMS}):
+        logger.warning("TASK.md names the work item %r, which the catalog does not know; it is left out", unknown)
+    order = (_WORK_LINE, _ALSO_LINE, _RULES_LINE)
+    parts: dict[str, list[str]] = {_ALSO_LINE: [], _RULES_LINE: []}
+    stage = -1
+    current: list[str] | None = None
+    for line in lines[1:]:
+        opened = next((i for i, p in enumerate(order) if i > stage and line.startswith(p)), None)
+        if opened is None:
+            if current is not None:
+                current.append(line)
+            continue
+        stage, prefix = opened, order[opened]
+        current = parts.get(prefix)
+        if current is not None:
+            current.append(line[len(prefix):].lstrip())
+    return WorkSelection(
+        items=in_catalog_order(ids),
+        custom="\n".join(parts[_ALSO_LINE]).strip(),
+        rules="\n".join(parts[_RULES_LINE]).strip(),
+    )
+
+
 def _task_is_placeholder(path: Path) -> bool:
-    """A ``TASK.md`` the onboarding session has not completed (or none at all)."""
+    """A ``TASK.md`` that onboarding has not completed (or none at all)."""
     if not path.exists():
         return True
     return task_onboarding_pending(path.read_text(encoding="utf-8"))
@@ -1722,16 +1922,15 @@ def apply_task_md(workspace: Path, task_description: str) -> bool:
     """Write a worker's ``TASK.md`` from the template while it is still pending.
 
     The one writer behind the web Mode step, ``nerve init --terminal`` and
-    ``--non-interactive``, so the three paths produce the same file. Nothing is
-    written without a description, and never over a file the onboarding
-    session has completed (marker gone, or a legacy file with ``## Mission``).
-    Returns whether it wrote.
+    ``--non-interactive``, so the three paths produce the same file. Never
+    over a file the onboarding conversation has completed (marker gone, or a
+    legacy file with ``## Mission``). Without a description it writes only a
+    missing file, with an empty description section that the onboarding
+    conversation fills. Returns whether it wrote.
     """
     description = (task_description or "").strip()
-    if not description:
-        return False
     path = Path(workspace) / "TASK.md"
-    if not _task_is_placeholder(path):
+    if not _task_is_placeholder(path) or (not description and path.exists()):
         return False
     publish_text(path, render_task_md(description))
     return True
@@ -1744,6 +1943,7 @@ def apply_mode(
     *,
     in_container: bool = False,
     locked: bool = False,
+    memory_backend: str = "memu",
 ) -> ModeOutcome:
     """Choose the mode: templates, ``TASK.md``, settings defaults, ``system.yaml``.
 
@@ -1758,6 +1958,10 @@ def apply_mode(
     templates are already present the one remaining effect — a worker's
     ``TASK.md`` — is still applied, because ``TASK.md`` is runtime state the
     agent itself maintains.
+
+    ``memory_backend`` is the instance's ``memory.backend``: under ``loom``
+    the templates, the bundled skills and ``system.yaml`` name Loom's memory
+    tools.
     """
     if mode not in ("personal", "worker"):
         raise ValueError(f"mode must be personal or worker, got {mode!r}")
@@ -1778,8 +1982,10 @@ def apply_mode(
         )
 
     ws.mkdir(parents=True, exist_ok=True)
-    created = tuple(initialize_workspace(ws, mode, skip=WRITER_OWNED_TEMPLATES))
-    install_bundled_skills(ws)
+    created = tuple(initialize_workspace(
+        ws, mode, skip=WRITER_OWNED_TEMPLATES, memory_backend=memory_backend,
+    ))
+    install_bundled_skills(ws, memory_backend=memory_backend)
     install_config_scaffold(ws)
 
     task_written = mode == "worker" and apply_task_md(ws, task_description)
@@ -1819,6 +2025,7 @@ def apply_mode(
     if not system_cron_file(ws).exists():
         write_cron_jobs(SetupChoices(
             mode=mode, workspace_path=ws, enabled_crons=list(DEFAULT_CRONS[mode]),
+            memory_backend=memory_backend,
         ))
         cron_written = True
 

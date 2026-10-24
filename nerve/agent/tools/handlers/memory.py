@@ -27,7 +27,7 @@ from nerve.agent.tools.schemas import (
     MEMORY_UPDATE_SCHEMA,
     SESSION_CONTEXT_SCHEMA,
 )
-from nerve.memory.memu_bridge import MemoryBackendUnavailable
+from nerve.memory.backend import MemoryBackendUnavailable
 
 logger = logging.getLogger(__name__)
 

@@ -1172,6 +1172,8 @@ class AgentConfig:
     # the existing CLI-crash retry path.  Set to 0 to disable (legacy
     # behaviour: turns can hang forever).  900s comfortably covers a 10-min
     # Bash tool call plus SDK round-trips while still catching real hangs.
+    # Silence while a question or plan decision waits for the person never
+    # counts (the interaction timeout bounds that wait).
     cli_idle_timeout_seconds: int = 900
     # Upper bound on ONE stream-json message read from the CLI subprocess (the
     # Agent SDK's ``max_buffer_size``).  The SDK's own default is 1 MiB and a
@@ -2205,8 +2207,54 @@ class MemoryCategoryConfig:
         return cls(name=d["name"], description=d.get("description", ""))
 
 
+# The backends ``memory.backend`` accepts: ``memu`` runs memU inside the
+# process; ``loom`` keeps memory in a Loom service that agents reach as the
+# ``loom`` server of the MCP gateway's catalog (``mcp_gateway_url``).
+MEMORY_BACKENDS: tuple[str, ...] = ("memu", "loom")
+DEFAULT_MEMORY_BACKEND = "memu"
+
+
+# Loom's names: a namespace is lowercase letters, digits and hyphens, starting
+# with a letter or digit, at most 128 characters; an org name is checked as
+# loosely, without whitespace or a slash.
+_LOOM_NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
+_LOOM_ORG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
+
+
+@dataclass
+class LoomMemoryConfig:
+    """Optional settings of the Loom memory backend (``memory.backend: loom``).
+
+    Nerve reaches Loom through the MCP gateway (``mcp_gateway_url``) as the
+    agent the gateway serves, so none of these is needed. ``org`` and
+    ``namespace`` name the Loom workspace Nerve's own calls address, when it
+    should not be the one Loom resolves for the agent's credential;
+    ``dashboard_url`` is where people open Loom's dashboard (no link without
+    it). ``defer_extraction`` queues conversation extraction in Loom instead
+    of waiting for it: Loom then gives up on a batch after three tries within
+    about a minute, and Nerve cannot see that.
+    """
+
+    org: str = ""
+    namespace: str = ""
+    dashboard_url: str = ""
+    defer_extraction: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> LoomMemoryConfig:
+        return cls(
+            org=str(d.get("org") or "").strip(),
+            namespace=str(d.get("namespace") or "").strip(),
+            dashboard_url=str(d.get("dashboard_url") or "").strip(),
+            defer_extraction=d.get("defer_extraction", False),
+        )
+
+
 @dataclass
 class MemoryConfig:
+    # Which backend keeps the agent's memory: "memu" or "loom".
+    backend: str = DEFAULT_MEMORY_BACKEND
     recall_model: str = DEFAULT_RECALL_MODEL  # Recall routing
     memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
     fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
@@ -2215,6 +2263,7 @@ class MemoryConfig:
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
     categories: list[MemoryCategoryConfig] = field(default_factory=list)
+    loom: LoomMemoryConfig = field(default_factory=LoomMemoryConfig)
 
     @classmethod
     @_coerced
@@ -2222,7 +2271,15 @@ class MemoryConfig:
         default_dsn = f"sqlite:///{paths.memu_sqlite()}"
         raw_cats = d.get("categories", [])
         categories = [MemoryCategoryConfig.from_dict(c) for c in raw_cats]
+        raw_loom = d.get("loom")
+        if raw_loom is not None and not isinstance(raw_loom, dict):
+            logger.warning(
+                "memory.loom must be a mapping of settings, got %s; using the defaults",
+                type(raw_loom).__name__,
+            )
+            raw_loom = None
         return cls(
+            backend=str(d.get("backend") or DEFAULT_MEMORY_BACKEND).strip().lower(),
             recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
             memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
             fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
@@ -2231,6 +2288,7 @@ class MemoryConfig:
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
             categories=categories,
+            loom=LoomMemoryConfig.from_dict(raw_loom or {}),
         )
 
 
@@ -3175,7 +3233,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.156.0"            # exclusive
+    max_version: str = "0.165.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -3187,6 +3245,9 @@ class CodexConfig:
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
     api_key_env: str = "OPENAI_API_KEY"     # env fallback when auth=api_key
+    # OpenAI-compatible endpoint that serves the Responses API, with the
+    # version path (http://127.0.0.1:4000/v1). Empty: Codex's own provider.
+    base_url: str = ""
     sandbox: str = "danger-full-access"     # read-only | workspace-write | danger-full-access
     approval_policy: str = "never"          # never | on-request | untrusted
     # nerve effort vocabulary -> codex reasoning effort string
@@ -3232,10 +3293,24 @@ class CodexConfig:
         raw_effort = d.get("effort_map") or {}
         if isinstance(raw_effort, dict):
             effort_map.update({str(k): str(v) for k, v in raw_effort.items()})
+        # Checked at load also while codex is not a selected backend:
+        # workflow runs and review-loop legs can start Codex sessions.
+        base_url = str(d.get("base_url") or "").strip()
+        _checked_http_url(base_url, "codex.base_url")
+        base_url = base_url.removesuffix("/")
+        ultracode = UltracodeConfig.from_dict(d.get("ultracode"))
+        if base_url and ultracode.enabled:
+            # Ultracode workers do not use the endpoint. A warning and not an
+            # error, so that this setting cannot stop Nerve from starting.
+            logger.warning(
+                "codex.ultracode.enabled is ignored because codex.base_url is "
+                "set: Ultracode workers do not use the endpoint"
+            )
+            ultracode.enabled = False
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.156.0")),
+            max_version=str(d.get("max_version", "0.165.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
@@ -3245,6 +3320,7 @@ class CodexConfig:
             auth=str(d.get("auth", "chatgpt")).strip().lower(),
             api_key=str(d.get("api_key") or ""),
             api_key_env=str(d.get("api_key_env", "OPENAI_API_KEY")),
+            base_url=base_url,
             sandbox=str(d.get("sandbox", "danger-full-access")),
             approval_policy=str(d.get("approval_policy", "never")),
             effort_map=effort_map,
@@ -3255,7 +3331,7 @@ class CodexConfig:
             ),
             pricing=pricing,
             extra_config=dict(d.get("extra_config") or {}),
-            ultracode=UltracodeConfig.from_dict(d.get("ultracode")),
+            ultracode=ultracode,
         )
 
     def validate(self) -> list[str]:
@@ -3347,6 +3423,13 @@ def _normalize_mcp_gateway_url(value: Any) -> str:
     is not an http or https URL with a host, or that has credentials, a query,
     a fragment or whitespace. The URL goes into logs.
     """
+    return _checked_http_url(value, "mcp_gateway_url")
+
+
+def _checked_http_url(value: Any, key: str) -> str:
+    """``value`` as an http or https URL without a trailing ``/``, for the
+    setting ``key``; empty stays empty. Raises :class:`ConfigError` naming
+    ``key`` for anything else (see :func:`_normalize_mcp_gateway_url`)."""
     url = "" if value is None else str(value).strip()
     if not url:
         return ""
@@ -3367,7 +3450,7 @@ def _normalize_mcp_gateway_url(value: Any) -> str:
         valid = False
     if not valid:
         raise ConfigError(
-            "mcp_gateway_url must be an http:// or https:// URL with a host "
+            f"{key} must be an http:// or https:// URL with a host "
             "and no credentials, query or fragment"
         )
     return url.rstrip("/")
@@ -3921,7 +4004,39 @@ class NerveConfig:
         config = cls._build_from_dict(d)
         config._validate_backend_config()
         config._validate_anthropic_base_url()
+        config._validate_memory_backend()
         return config
+
+    def _validate_memory_backend(self) -> None:
+        """Refuse an unknown ``memory.backend``, and check ``memory.loom``
+        when Loom is the backend.
+
+        A typo in the backend name is a hard error, as it is for
+        ``agent.backend``: falling back to memU would boot an instance with
+        an empty memory and nothing to say why. The ``memory.loom`` section
+        is checked only while it is in use, so a stale value there cannot
+        stop a memU instance from starting.
+        """
+        backend = self.memory.backend
+        if backend not in MEMORY_BACKENDS:
+            raise ValueError(
+                f"memory.backend must be one of {MEMORY_BACKENDS}, got {backend!r}"
+            )
+        if backend == "loom":
+            loom = self.memory.loom
+            loom.dashboard_url = _checked_http_url(loom.dashboard_url, "memory.loom.dashboard_url")
+            if loom.namespace and not _LOOM_NAMESPACE_RE.fullmatch(loom.namespace):
+                raise ConfigError(
+                    "memory.loom.namespace must be a Loom namespace name: lowercase "
+                    "letters, digits and hyphens, starting with a letter or digit, "
+                    "at most 128 characters"
+                )
+            if loom.org and not _LOOM_ORG_RE.fullmatch(loom.org):
+                raise ConfigError(
+                    "memory.loom.org must be a Loom org name: letters, digits and "
+                    "'.', '_', ':', '@' or '-', starting with a letter or digit, "
+                    "at most 128 characters"
+                )
 
     def _validate_anthropic_base_url(self) -> None:
         """Refuse ``anthropic_base_url`` together with another endpoint setting.

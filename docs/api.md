@@ -249,6 +249,7 @@ Response: {
   "finished": false,
   "steps_left": 2,
   "warning": null,
+  "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d", "kind": "conversation", "awaiting": "question" },
   "steps": [
     { "id": "claim", "title": "Claim", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "blocked_kind": null, "read_only": false, "read_only_reason": null, "etag": "0a1b2c3d4e5f",
@@ -260,7 +261,15 @@ Response: {
       "etag": "…", "summary": "Personal assistant",
       "files": ["workspace/SOUL.md", "workspace/IDENTITY.md", "…", "workspace/config/cron/system.yaml"],
       "detail": { "mode": "personal", "templates_present": ["SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md", "MEMORY.md"],
-                  "task_present": false, "onboarding": "not_applicable", "onboarding_session_id": null } },
+                  "task_present": false, "onboarding": "running", "onboarding_session_id": "onboarding-1a2b3c4d",
+                  "onboarding_kind": "conversation",
+                  "work_catalog": [
+                    { "id": "review-prs", "group": "code", "label": "Review pull requests",
+                      "description": "Reads diffs, runs targeted checks, posts review comments.", "needs": "github",
+                      "follow_ups": ["which repositories", "which account it acts as", "…"], "note": "" },
+                    { "id": "triage-issues", "…": "…" }
+                  ],
+                  "work": { "items": [], "custom": "", "rules": "" } } },
     { "id": "provider", "title": "Model", "status": "done", "required": true, "can_skip": false,
       "blocked_reason": null, "read_only": false, "read_only_reason": null, "etag": "…",
       "summary": "Anthropic API key (…ab12) · claude-opus-5-5 · effort xhigh",
@@ -300,6 +309,7 @@ Response: {
 | `finished` | every required step is `done` or `blocked`, every other step is `done`, `skipped` or `blocked`, and nothing waits on a restart |
 | `steps_left` | the number of `pending` steps plus the steps blocked only because the Mode step has not been answered yet (`blocked_kind: "sequencing"`) — they are still work left to do, so the count only ever goes down as a person progresses. Steps blocked by lockdown (`blocked_kind: "lockdown"`) are never counted |
 | `warning` | set when configuration was written but the state file could not be saved or a reload reported errors (`Saved. Reload reported: cron: error: …`) |
+| `onboarding` | the onboarding in one place: `status`, `session_id` and `kind` as the Mode step's `detail.onboarding`, `onboarding_session_id` and `onboarding_kind` (see [`POST /api/setup/finish`](#post-apisetupfinish)), plus `awaiting` — what the running onboarding session waits for from the person: `question` while an `AskUserQuestion` card or an `ask_form` form (the `form` interaction) waits for an answer, `plan` while an `ExitPlanMode` decision does (a plan wins over a question), otherwise `null`. Always `null` unless `status` is `running`. Read live from the session's pending interactions, never stored; the global `session_awaiting_input` event tells a client when to read again |
 
 Each step carries `id`, a short `title`, a `status` (`done`, `pending`,
 `skipped`, `blocked`), `required`, `can_skip`, `blocked_reason`, `blocked_kind`
@@ -327,6 +337,20 @@ there). Steps: `claim` (local only), `mode`, `provider`, `profile` (titled
 `Operator` for a worker), `memory`, `channels`, `sources` (personal),
 `automation`, `agents` (personal).
 
+`detail.mode.work_catalog` is what a worker can be set up to do, in display
+order (grouped: `code`, `operations`, `communication`, `knowledge`): each
+item's `id`, `group`, `label`, one-line `description`, the connection it
+`needs` (`github`, `alerts`, `slack-or-telegram` or `web`), the `follow_ups`
+the onboarding conversation settles for it, and a `note` shown with it (empty
+except for `alert-response`: it needs an alert source). Every body carries it,
+in both modes. `detail.mode.work` is what was chosen: `items` (catalog ids, in
+catalog order), `custom` (work in the operator's own words) and `rules`
+(anything it must know or never do), read back from a worker's `TASK.md`
+while onboarding is due; all empty when nothing was chosen, for a personal
+install, and once onboarding completed the file. A free-text description from
+an older client or `nerve init --terminal` reads as `custom`. `work` is part
+of the step's `etag`; `work_catalog` is not.
+
 `detail.provider.credential` is `bedrock`, `proxy`, `api_key`, `oauth_token`,
 `environment` or `none`; `detail.provider.warning` is `oauth_background_jobs`
 when the only credential is a subscription token (memory, titles and cron
@@ -341,8 +365,9 @@ default: `02:00`–`08:00` for a personal install, none for a worker. Each job i
 `detail.automation.optional` carries `id`, `name`, `description`, `schedule`
 and `schedule_text`, `requires` and `requirement_met`, `enabled`, and
 `default_enabled`: whether the mode's default set switches it on (`false` for
-a worker's `task-planner`, which the onboarding session decides on; `default`
-is the older name for the same value).
+a worker's `task-planner`, which the onboarding conversation decides on; `default`
+is the older name for the same value), and `overridden`: a job with the same id
+in `jobs.yaml` replaces this one, and `enabled` is that job's.
 
 **Where a value came from.** Every masked secret is
 `{"configured": bool, "last4": str | null, "source": str | null}`. `source`
@@ -365,9 +390,18 @@ credential that exists only in the gateway's environment reads
 `credential: "environment"`. `detail.sources.available` lists the sources the
 page may switch here — all three, or on an instance that keeps no credentials
 (`setup.local_secrets: false`, [setup.md](setup.md#instances-that-keep-no-credentials))
-`["github"]` when the GitHub token comes from the environment and `[]` when
-the step is closed — with the server's sentence in
-`detail.sources.unavailable_reason` (`null` when every source is on offer).
+`["github"]` when the GitHub token comes from the environment or the channel
+gateway polls GitHub, and `[]` when the step is closed — with the server's
+sentence in `detail.sources.unavailable_reason` (`null` when every source is
+on offer). While the channel gateway polls GitHub (`sync.github.mode:
+hosted`), `detail.sources.github` also carries `"mode": "hosted"` and a
+`gateway` object shaped like the hosted Slack one below. When `config.yaml`
+or `config.local.yaml` then states `sync.github.enabled`, the operator holds
+that switch ([sources.md](sources.md#hosted-github-source)):
+`detail.sources.github.managed` is `true` (the key is absent otherwise),
+GitHub is left out of `available` — `["gmail", "telegram"]`, or `[]` on an
+instance that keeps no credentials — and `unavailable_reason` says whether
+the operator holds GitHub on or off.
 
 `detail.channels.slack.gateway` is `{"streams": n, "connected": bool,
 "last_event_at": iso | null}` when `slack.mode` is `hosted` — what the stream
@@ -397,6 +431,8 @@ stays owner-only. After every write the configuration is hot-reloaded. One
 mutation runs at a time.
 
 ```json
+PUT /api/setup/mode        { "mode": "worker", "work": { "items": ["review-prs", "triage-issues"], "custom": "Also watch the release branch.",
+                                                     "rules": "Never merge anything." } }
 PUT /api/setup/mode        { "mode": "worker", "task_description": "Watch the nightly build for example/repo and propose fixes before changing anything." }
 PUT /api/setup/provider    { "type": "anthropic", "anthropic_api_key": "sk-ant-REPLACE", "model": "claude-opus-5-5", "effort": "high" }
 PUT /api/setup/provider    { "type": "oauth", "claude_oauth_token": "sk-ant-oat01-REPLACE" }
@@ -420,12 +456,12 @@ PUT /api/setup/agents      { "agents": ["codex"], "conflict_policy": "backup" }
 
 | Step | Rules |
 |---|---|
-| `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker needs `task_description` (20–4000 characters → `400`, `field: task_description`). Once `TASK.md` exists, the same mode with a **different** description is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); only a worker whose templates exist but whose `TASK.md` is still absent gets it written by a later PUT. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
+| `mode` | `mode` is `personal` or `worker`. Once chosen, another mode is `409` with the read-only reason; the same mode again is a no-op (`200`, nothing rewritten). A worker's `work` is optional, and so is each of its keys: `items` (ids from `detail.mode.work_catalog`; an unknown one is `400` `field: work.items`; kept once each, in catalog order), `custom` (at most 4000 characters, `field: work.custom`) and `rules` (at most 2000, `field: work.rules`); nothing chosen is valid. `note` and the older `task_description` are aliases for `work.custom` from older clients (`work.custom` wins; a too-long one names the field it came in); a body with one of them and no `work` is written as before, as a plain paragraph. A personal install takes no `items` (`400` `field: work.items`); its `custom` and `rules` are checked and written nowhere, as before. The choice lands in `TASK.md` under "Task description (as given)": a `<!-- nerve:work <ids> -->` comment line, then `Work: <labels>`, `Also: <custom>` and `Must know or never do: <rules>`, each line left out when empty. Once `TASK.md` exists, the same mode with a **different** choice is `409` too — the task is chosen once, and changed by editing `TASK.md` (or by telling the worker); the same items, custom work and rules again are a no-op, in either form. Only a worker whose templates exist but whose `TASK.md` is still absent (or the bare template) gets it written by a later PUT, also under lockdown. Writes the templates, a worker's `TASK.md`, mode defaults in `settings.yaml` where absent, and `config/cron/system.yaml` with the mode's default jobs if missing |
 | `provider` | `type` is `anthropic`, `oauth`, `host_login` or `bedrock`, optional when only `model`/`effort` change. `anthropic_api_key` must start with `sk-ant-`; `aws_region` must look like a region; `effort` is `low`, `medium`, `high`, `xhigh` or `max`; `model` must be in the catalogue for these credentials or be a Claude id. `host_login` is accepted only when `GET /api/setup/provider/host-login` finds one (`409` otherwise; `429` while other checks are running) and copies that credential into `config.local.yaml`; the value is never returned. In external authentication mode `host_login` is `409` unless the operator set `NERVE_SETUP_HOST_LOGIN=1` (see the host-login endpoint). Switching the credential type deletes the other secret; leaving Bedrock drops the region-scoped model ids. A credential whose `source` is not `file` (provisioned from the environment or the configuration repository) is neither replaced nor removed from here: `409` with `field: anthropic_api_key` / `claude_oauth_token` (`host_login` too); a `model`/`effort`-only save still works. The model catalogue and the host-login detection run before the write lock is taken, so other people's reads and saves never wait on them. No catalogue reset after a save: the cache is keyed by the credentials' fingerprint, so a new key finds the catalogue the provider test warmed for it. A `model` writes both `agent.model` and `agent.cron_model`, also when it equals the current model (the setup page sends the picker's model after a live test on a pending step and on the Continue that follows a credential save, so the preselected default counts as the choice — but not on a save that moves into or out of Bedrock, whose ids come from the server); an `effort`-only or credential-only save leaves `agent.cron_model` alone; a switch into or out of Bedrock without a `model` resets both to the installer's defaults |
 | `profile` | `timezone` must be an IANA name; `quiet_start`/`quiet_end` are `HH:MM`; `name` ≤ 80, `agent_name` ≤ 40, `language` ≤ 40, `about` ≤ 600 characters. Every field becomes one line of a file the agent reads: `name`, `language`, `agent_name`, `agent_emoji` refuse control characters and line breaks (`400` with the `field`), and `about` is folded to a single line. A `null` time zone or quiet time is treated as omitted (nothing written, no decision recorded). `quiet_enabled` switches quiet hours: `false` writes both times empty (no quiet hours; the personal `USER.md` line reads `none`) and ignores any times sent with it; `true` needs both times (`400` naming the missing or invalid one), or neither, which keeps the window configured now or else uses `02:00`–`08:00`; omitted or `null` changes nothing, except that times sent alone switch quiet hours on with those times (the other time is kept, or set to its `02:00`–`08:00` default when there was none). Writes `timezone`/`quiet_*` to `settings.yaml`, the still-pristine template lines of `USER.md`/`IDENTITY.md` (personal), and — local mode only — the display name on your account. In external mode the name goes to `USER.md` alone; no account is touched. Under lockdown (local) only `name` is accepted; any other key is `409` with that `field` and the lockdown reason (a read-only state, not a validation error) |
 | `memory` | `openai_api_key` must start with `sk-`. Adding, changing or removing it records that embeddings start after a restart. `{"openai_api_key": null}` alone removes the key; `"embeddings": false` records "continue without" as a decision. A key whose `source` is not `file` is `409` `field: openai_api_key` |
 | `channels` | A Telegram `bot_token` must look like one from BotFather, and when the channel would be enabled it is **verified against Telegram before anything is written**: rejected → `400` `field: bot_token` `Telegram rejected this token: …`; unreachable → `400` `The server could not reach api.telegram.org to verify the token; nothing was saved. Try again.` The verification runs *before* the write lock is taken (a probe can take 10–20 s and must not stall other people's reads and saves); inside the lock the decision is recomputed against the configuration as it is then, and a token that was not the one verified — the stored token changed meanwhile — is verified again. `enabled` defaults to true when a token is given; `"bot_token": null` removes the token and disables the channel; `enabled: true` without a token is `409`. `allowed_users` replaces the allow-list, `allowed_users_add` appends; not both. Slack tokens need the `xoxb-`/`xapp-` prefixes, `enabled` needs both, and they are verified the same way (`auth_test` and a Socket Mode connection). With `slack.mode: hosted` only `enabled` is accepted (`409` for tokens). A token whose `source` is not `file` (environment, configuration repository) is `409` with `field: bot_token` / `app_token`, before any verification runs |
-| `sources` | personal mode only (`409` for a worker). `gmail: true` needs at least one address in `gmail_accounts`; `telegram: true` needs `telegram_api_id` (positive) and `telegram_api_hash`. The two Telegram credentials follow the secret rules independently — omitted keeps, blank is omitted, `null` removes — and a hash without an id (new or stored) is `400` `field: telegram_api_id` rather than being dropped. A credential or address list whose `source` is not `file` is `409` with `field: telegram_api_id` / `telegram_api_hash` / `gmail_accounts`. Sending all three booleans records the decision, so "none of these" counts as answered. On an instance that keeps no credentials (`setup.local_secrets: false`) the write is `409` — unless the GitHub token comes from the environment: then `github` is accepted and alone records the decision, while any `gmail`/`gmail_accounts`/`telegram`/`telegram_api_id`/`telegram_api_hash` key is `409` with that `field` and the step's `unavailable_reason`. The credentials alone do not make the Telegram sync work — see the sign-in endpoints below |
+| `sources` | personal mode only (`409` for a worker). `gmail: true` needs at least one address in `gmail_accounts`; `telegram: true` needs `telegram_api_id` (positive) and `telegram_api_hash`. The two Telegram credentials follow the secret rules independently — omitted keeps, blank is omitted, `null` removes — and a hash without an id (new or stored) is `400` `field: telegram_api_id` rather than being dropped. A credential or address list whose `source` is not `file` is `409` with `field: telegram_api_id` / `telegram_api_hash` / `gmail_accounts`. Sending a boolean for every source in `available` (all three, where every source is on offer) records the decision, so "none of these" counts as answered. On an instance that keeps no credentials (`setup.local_secrets: false`) the write is `409` — unless the GitHub token comes from the environment or the channel gateway polls GitHub: then `github` is accepted and alone records the decision, while any `gmail`/`gmail_accounts`/`telegram`/`telegram_api_id`/`telegram_api_hash` key is `409` with that `field` and the step's `unavailable_reason`. While the operator holds the GitHub switch (`detail.sources.github.managed`), a request that carries `github`, `null` included, is `409` `{"detail", "field": "github"}` with the step's sentence about GitHub, before any other field is checked, and nothing in it is applied; a request without `github` saves the other sources as before. The credentials alone do not make the Telegram sync work — see the sign-in endpoints below |
 | `automation` | `crons` is the full set of enabled optional job ids; an unknown id is `400` `field: crons`. Always records the decision; the scheduler reloads |
 | `agents` | personal mode only. `agents` names from the registry (`codex`, `claude-code`); `conflict_policy` is `backup`, `skip` or `merge`. Writes each agent's config file (per-agent failures are reported in `warning`, the others still apply) and `external_agents.*`/`mcp_endpoint.enabled` in `config.yaml`. `[]` is a decision too |
 
@@ -660,26 +696,37 @@ reports as `restart_mode`, `restart_message` and `restart_command`.
 
 #### `POST /api/setup/finish`
 
-Body `{}`. Reloads the configuration, recomputes the checklist and, for a
-worker whose `TASK.md` still carries the onboarding marker (the comment on its
-second line, deleted by the onboarding session when the file is complete), a
-provider is configured and nothing waits on a restart, starts the onboarding
-session. Idempotent; allowed under lockdown (it writes nothing).
+Body `{}`. Reloads the configuration and recomputes the checklist. While
+onboarding is `pending`, it opens the onboarding conversation for the caller:
+one web session titled `Onboarding`, whose hidden first message makes the
+agent speak first. When a restart is pending or no model is configured, it
+records the request instead, and the next start of the daemon opens the
+conversation. Idempotent: a second call, also at the same time, names the same
+session. When the agent's first turn fails, the status goes back to `pending`.
+Allowed under lockdown.
 
 ```json
-Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "cron:worker-onboarding:…" } }
+Response: { "state": { "…": "the GET /api/setup body" }, "action": "reloaded",         "onboarding": { "status": "running", "session_id": "onboarding-1a2b3c4d" } }
 Response: { "state": { "…": "the GET /api/setup body" }, "action": "restart_required", "onboarding": { "status": "pending", "session_id": null } }
 ```
 
-`onboarding.status` (and `mode.detail.onboarding` in `GET /api/setup`) is
-`not_applicable`, `pending`, `running`, `ended` or `done`. `ended` means the
-onboarding session exists but the engine is no longer driving it while
-`TASK.md` still carries the onboarding marker — it stopped before completing
-the file (a placeholder key, a crash); the session id is carried so the page
-can link to it instead of waiting. Calling `finish` again schedules the session anew; the
-ended row stays in the table, and a session the engine is driving always wins
-over an ended one (among several ended ones the newest is named), so every
-tab reads `running` with the new id.
+`onboarding.status` (and, in `GET /api/setup`, `onboarding.status` and
+`mode.detail.onboarding`) is
+`not_applicable` (no mode chosen), `pending`, `running` (the session id is
+carried), `done` or `skipped`. The agent sets `done` with the
+`onboarding_done` tool, from the onboarding session only. A worker whose
+`TASK.md` no longer carries the onboarding marker is `done`. A running
+conversation whose session was deleted reads `pending` again.
+`mode.detail.onboarding_kind` (`onboarding.kind`) is `conversation`, or
+`autonomous` for a worker
+that `nerve init` set up with a task description: the next start of the daemon
+runs its onboarding in one session without a person (source `cron`). While
+onboarding is `pending`, Finish opens the conversation for either kind.
+
+#### `POST /api/setup/onboarding/skip`
+
+Body `{}`. Sets onboarding to `skipped` while it is `pending` or `running`; the
+session stays. Answers the `GET /api/setup` body.
 
 #### `POST /api/system/restart`
 
@@ -1496,7 +1543,7 @@ System health and status, including task/FTS index health.
 
 ```json
 Response: {
-  "system": { "hostname": "...", "memory_mb": 65.2, "disk_free_gb": 180.5 },
+  "system": { "hostname": "...", "commit": "9f2c4e1a7b3d5f60812c4e6a8b0d2f4618a3c5e7", "memory_mb": 65.2, "disk_free_gb": 180.5 },
   "tasks": { "total": 92, "active": 16, "done": 76, "fts_indexed": 92, "fts_ok": true },
   "sync": { "github": { "cursor": "...", "last_run": "...", "records_fetched": 3, "records_processed": 3, "error": null } },
   "recent_cron_logs": [...],
@@ -1506,6 +1553,11 @@ Response: {
   }
 }
 ```
+
+`system.commit` is the git commit of the code the process runs. It is read
+once at start (`git rev-parse HEAD` in the checkout Nerve runs from), so it
+stays the same after a later `git pull` until the restart. It is `null` when
+unknown: the install is not a git checkout, or there is no `git` to ask.
 
 In every usage row, `input_tokens` counts only uncached input. Cache reads
 (`cache_read`) and cache writes (`cache_creation`) are separate fields, so
@@ -1563,15 +1615,17 @@ gates forecast for its next run, judged from what is known now. `next` is the
 earliest, within 7 days, of: the first run of each enabled cron job that its
 gates forecast will happen (its next run, or one of its next few runs when a
 gate that reasons about the time skips the next one), the next run of each
-source runner, and the earliest pending session wakeup — never the cleanup job
-or the wakeup sweep; `null` when nothing is due. `at` is UTC, and can be a
+source runner whose source does not run when records are delivered, and the
+earliest pending session wakeup — never the cleanup job or the wakeup sweep;
+`null` when nothing is due. `at` is UTC, and can be a
 little in the past for a session wakeup that came due but has not fired yet;
 `kind` is `cron`, `source` or `wakeup`; `name` is the job id, `source:<name>` or
 `wakeup:<first 8 characters of the session id>`, limited to `[A-Za-z0-9._:-]`
 and 64 characters. `jobs` has the jobs of
 `GET /api/cron/jobs`: `forecast` is `run` or `skip` for a job with a next run and
-`null` otherwise, and `reason` says why a skip. See
-[What runs next](cron.md#what-runs-next).
+`null` otherwise, and `reason` says why a skip (for a source that runs when
+records are delivered, the scheduled run still fires but is not counted in
+`next`). See [What runs next](cron.md#what-runs-next).
 
 ```json
 Response: {
@@ -1598,6 +1652,10 @@ tells the new process from the old one still answering as it shuts down,
 which is what makes `POST /api/system/restart` observable: the setup page
 polls `/health` until the value changes. Deliberately opaque — an uptime or
 a counter would tell an anonymous caller how long the box has been up.
+
+For the same reason, `/health` does not say which build runs: `version` is
+fixed, and the commit is reported only to signed-in callers, as
+`system.commit` of [`GET /api/diagnostics`](#get-apidiagnostics).
 
 ## WebSocket Protocol
 
@@ -1640,7 +1698,22 @@ fresh.
 // reason "resume" for the connection's person)
 { type: "resume", session_id: "abc123" }
 
-// Answer an interactive tool (AskUserQuestion, plan approval)
+// Answer an interactive tool (AskUserQuestion, plan approval, an ask_form
+// form). denied: true refuses it, and message reaches the agent verbatim as
+// the refusal: for ExitPlanMode that is "Request changes" — the agent stays in
+// plan mode, revises the plan and calls ExitPlanMode again (a new
+// interaction). For ExitPlanMode, result: null approves the plan as it is, and
+// result: { plan: "<text>" } approves the person's edit of it: the CLI saves
+// the text to the plan file and tells the agent the plan was edited.
+// For a form (interaction_type "form"), result: { answers: { <question id>:
+// "text" | ["item", …] } }: a string for choice, text and url questions, a
+// list for multi, list and repos (choice: the option's label, or the Other…
+// text; multi: the labels, with the Other… text as one more item). Leave out
+// an optional question the person left empty; "", [] and blanks count as
+// left empty too. The server trims every value, drops blank and repeated
+// items, cuts a value to 4000 characters, and leaves out what breaks the
+// question's rules (a repos item that is not owner/name, a url that is not
+// http(s)://host, a value that is not an option when allow_other is false)
 { type: "answer_interaction", session_id: "main", interaction_id: "uuid", result?: { … }, denied?: false, message?: "" }
 
 // Keep-alive
@@ -1724,7 +1797,8 @@ those for another session. Events marked *global* go to every socket.
 // Session resumed
 { type: "session_resumed", session_id: "abc123" }
 
-// Plan file updated (Write/Edit to .claude/plans/, also by a sub-agent)
+// Plan file updated (Write/Edit to the CLI's plans directory — ~/.claude/plans/,
+// or $CLAUDE_CONFIG_DIR/plans/ — also by a sub-agent)
 { type: "plan_update", session_id: "main", content: "# Plan\n..." }
 
 // The serving model changed (a capacity fallback and back)
@@ -1747,9 +1821,36 @@ those for another session. Events marked *global* go to every socket.
 { type: "file_changed", session_id: "main", path: "/home/user/project/foo.py", operation: "edit", tool_use_id: "toolu_..." }
 
 // Interactive tool waiting for user input (AskUserQuestion, ExitPlanMode,
-// EnterPlanMode, Codex approvals). agent names the sub-agent that asked;
-// null for the orchestrator. agent_id is null when no record is known.
-{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "plan_exit" | "plan_enter" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
+// Nerve's ask_form tool, Codex approvals; EnterPlanMode never waits). agent
+// names the sub-agent that asked; null for the orchestrator (always null for
+// ask_form: an MCP call does not say which agent made it). agent_id is null
+// when no record is known.
+// For ExitPlanMode the Claude CLI puts the plan into tool_input: plan (the
+// plan file's text, read again at every call) and planFilePath.
+// For ask_form (interaction_type "form", tool_name "ask_form"; the chat's
+// tool block names it mcp__nerve__ask_form) tool_input is the form,
+// normalized, every key present: { title: "" | "…", questions: [{ id (as the
+// agent sent it), kind: "choice" | "multi" | "text" | "list" | "repos" |
+// "url", label (at most 40 characters), question, help, placeholder,
+// required, options: [{ label, description }] (2–8 for choice and multi, []
+// otherwise), allow_other (false unless choice or multi), default: null |
+// "…" | ["…"] }] } — 1 to 6 questions, unique ids and option labels. The tool
+// result the agent gets is one line per question, "<label>: <answer>" (a list
+// joined with ", ", "(skipped)" for none, continuation lines indented by two
+// spaces), after the line "The person answered the form.", then a blank line
+// and the answers as one line of JSON: {"answers": {<id>: "…" | ["…"]},
+// "skipped": [<id>]}. A refusal, a stop, no answer within the hour (the
+// interaction's timeout), a channel without forms and an invalid call are
+// error results without JSON
+{ type: "interaction", session_id: "main", interaction_id: "uuid", interaction_type: "question" | "form" | "plan_exit" | "command_approval" | "file_approval" | "permission_approval", tool_name: "AskUserQuestion", tool_input: { ... }, agent: { agent_id: "ag_…" | null, task_id: "a1b2…", label: "build-api" } | null }
+// ... for a plan_exit interaction, once: a short summary of tool_input.plan for
+// the decision card, written by agent.title_model after the interaction event
+// (within about 20 s; the pause never waits for it). ok: up to six plain
+// sentences of at most 25 words each. unavailable, with no bullets: no
+// credential the server's own model client can use, an empty plan, an error or
+// a timeout. Replayed with the interaction in a running turn's buffered_events;
+// not stored.
+{ type: "plan_summary", session_id: "main", interaction_id: "uuid", bullets: ["Scans org/repo-a for new pull requests every 30 minutes.", "…"], status: "ok" | "unavailable" }
 // ... and settled (any client answered, or it was cancelled)
 { type: "interaction_resolved", session_id: "main", interaction_id: "uuid" }
 // A session waits for input, or no longer does (global)

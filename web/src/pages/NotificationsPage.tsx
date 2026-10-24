@@ -5,6 +5,7 @@ import { Badge, Button, IconButton, TextField, type BadgeTone, type ButtonVarian
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 import { PageHeader } from '../components/ui/PageHeader';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
+import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -210,13 +211,14 @@ function NotificationCard({ notif }: { notif: Notification }) {
             <h3 className="font-medium text-base text-text">{notif.title}</h3>
           </div>
           {notif.body && (
-            <p className="text-sm text-text-muted mt-1 whitespace-pre-wrap">{notif.body}</p>
+            <NotificationBody body={notif.body} className="text-sm text-text-muted mt-1" />
           )}
           {isApproval && notif.target_kind && notif.target_id && (
             <p className="text-xs text-text-faint mt-1 font-mono">
               {notif.target_kind}: {notif.target_id}
             </p>
           )}
+          <NotificationLinks notif={notif} />
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0 order-0 sm:order-none">
           {(notif.redelivery_count ?? 0) > 0 && (

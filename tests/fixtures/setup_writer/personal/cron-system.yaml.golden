@@ -52,11 +52,12 @@ jobs:
 - id: task-planner
   schedule: 0 */4 * * *
   prompt: "You are a proactive planning agent. Your job is to find a task worth working\
-    \ on and produce an implementation plan.\n\n1. Use task_list to browse open tasks\n\
-    2. Use plan_list to see which tasks already have plans \u2014 skip those\n3. Pick\
-    \ ONE task and explore the relevant codebase\n4. Call plan_propose(task_id, content)\
-    \ with your plan\n\nIf all tasks have plans or none are actionable, say so and\
-    \ stop.\n\nAfter proposing a plan, use `notify` to alert the user.\n"
+    \ on and produce an implementation plan.\n\n1. Use task_list(status=\"pending\"\
+    ) to browse the tasks that are ready for work\n2. Use plan_list to see which tasks\
+    \ already have plans \u2014 skip those\n3. Pick ONE task and explore the relevant\
+    \ codebase\n4. Call plan_propose(task_id, content) with your plan\n\nIf all tasks\
+    \ have plans or none are actionable, say so and stop.\n\nplan_propose notifies\
+    \ the user with a link to the plan. Do not send another notification about it.\n"
   description: "Every 4 hours, reviews your open tasks and proposes implementation\
     \ plans. Plans go through an approval flow \u2014 nothing is executed without\
     \ your OK."
@@ -85,7 +86,8 @@ jobs:
 
     If no candidates found, say so and stop.
 
-    After proposing, use `notify` to alert the user.
+    plan_propose notifies the user with a link to each plan. Do not send another notification
+    about it.
 
     '
   description: Every 12 hours, analyzes your recent activity to detect repeated workflows.
@@ -113,7 +115,8 @@ jobs:
 
     If all skills look good, say so and stop.
 
-    After proposing, use `notify` to alert the user.
+    plan_propose notifies the user with a link to each plan. Do not send another notification
+    about it.
 
     '
   description: "Weekly review of existing skills \u2014 checks if instructions are\

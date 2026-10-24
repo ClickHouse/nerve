@@ -450,7 +450,7 @@ Jobs with `session_mode: persistent` maintain SDK conversation context across ru
 
 - **First trigger**: Creates a fresh generation session (`cron:{job_id}:{run_id}`, the same ID form as an isolated run) and runs the prompt.
 - **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs of this generation in-context.
-- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memU, cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
+- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memory (memU, or Loom with `memory.backend: loom`), cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
 
 > **Upgrade note.** Installs that predate generation chats used the stable id
 > `cron:{job_id}`. That session is adopted as the current generation on the
@@ -517,15 +517,15 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
 
 **Mode defaults:**
-- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
-- **Worker** — `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided by the onboarding session, which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs with `enabled: false` as well — set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
+- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
 Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
 
@@ -585,7 +585,10 @@ them start late or be dropped as [late runs](#late-runs):
   Run gates and `lock` apply as for a scheduled run, and the run is logged as
   usual.
 - Jobs with `catchup: false` only move on; the run each one skipped is recorded
-  in `cron_logs` with status `missed`. The wakeup sweep only moves on too:
+  in `cron_logs` with status `missed`. A run that the job's gates would have
+  skipped, going by their [forecast](#forecasts) for the time it came due, is
+  not missed: it is skipped like a scheduled run that its gates skip, with no
+  row. The wakeup sweep only moves on too:
   session wakeups (`ScheduleWakeup`) that came due fire on its next pass, within
   20 seconds.
 - The daemon log gets one INFO line per pause, with the size of the jump, the
@@ -643,7 +646,9 @@ in when they arrive, and goes on without them after 10 seconds.
   will be reached, say), and counts the first one forecast to happen. A gate on
   the default forecast is asked once: it answers the same for any time, so if it
   says no, so does every later run;
-- the next run of each source runner;
+- the next run of each source runner, except a source that runs when records
+  are delivered (the hosted GitHub source, `Source.push_fed`): its scheduled
+  run is a fallback and does not count;
 - the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
   with "Run later").
 
@@ -662,7 +667,9 @@ timezone-aware, or it raises `ValueError`.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);
-`reason` says why a run is forecast to be skipped.
+`reason` says why a run is forecast to be skipped. For a source that runs when
+records are delivered, `skip` means the scheduled run is not counted in
+`next`; the run itself still fires.
 
 Forecasts are judged from what is known when you ask. Code that keeps the answer
 around can register a schedule listener (`CronService.add_schedule_listener`) to
@@ -716,7 +723,10 @@ started by hand starts as it always does. A catch-up queued before the run does
 not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
 schedule, and the schedules stay the fallback for everything. The setting is
-read for each delivery, so a reload applies it.
+read for each delivery, so a reload applies it. A scheduled run of a source
+that runs on delivery is not counted as the next scheduled task (see
+[What runs next](#what-runs-next)): it normally finds nothing, so a platform
+that parks the machine is not told to wake it for that run.
 
 ## Logging
 

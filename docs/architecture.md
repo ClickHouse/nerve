@@ -60,7 +60,7 @@ FastAPI application serving:
 Claude Agent SDK wrapper providing:
 - Agent configuration (model, tools, system prompt)
 - Agentic loop execution (tool calls → results → continuation)
-- **Interactive tool handler** — `can_use_tool` callback replaces `bypassPermissions`; pauses the agent mid-turn for tools that need user input (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`), auto-approves everything else. Answers routed via WebSocket `answer_interaction` messages. See `interactive.py`.
+- **Interactive tool handler** — `can_use_tool` callback replaces `bypassPermissions`; pauses the agent mid-turn for tools that need user input (`AskUserQuestion`, `ExitPlanMode`; `EnterPlanMode` is allowed without a pause), auto-approves everything else. Answers routed via WebSocket `answer_interaction` messages. See `interactive.py`.
 - **File snapshot hooks** — `PreToolUse` hook on `Edit|Write|NotebookEdit` captures original file content to `session_file_snapshots` table before the tool executes. Enables session-scoped unified diffs without git. See `engine.py::_build_snapshot_hooks()`.
 - **Diff computation** — `gateway/diff.py` computes structured unified diffs (hunks with line numbers) using `difflib.unified_diff` from stored snapshots vs current file on disk.
 - Streaming bridge to broadcast events to all interfaces (bounded buffers, max 10k events)
@@ -142,7 +142,7 @@ Cursor-based data ingestion with agent processing:
 ### Memory (`nerve/memory/`)
 Dual-layer memory:
 - **File-based** — MEMORY.md, identity files (curated source of truth, loaded into system prompt)
-- **memU** — Semantic index over conversations and files (SQLite-persisted at `~/.nerve/memu.sqlite`)
+- **memU** — Semantic index over conversations and files (SQLite-persisted at `~/.nerve/memu.sqlite`); with `memory.backend: loom`, a Loom memory service reached through the MCP gateway instead ([memory.md](memory.md#loom-backend))
 - **Knowledge quality filtering** — Custom extraction prompt + post-extraction Haiku filter + semantic deduplication prevent generic CS/DevOps facts from polluting memory
 - **Session rotation** — Main session rotates daily; conversations are indexed into memU on close
 - **Session resume** — SDK session IDs stored as dedicated DB columns; sessions resume with full context via `--resume` flag
@@ -213,6 +213,15 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 6. Streaming events broadcast to Telegram (edit-in-place) and any WebSocket clients
 7. Final response stored in SQLite
 
+The system prompt in step 4 also takes `platform.md` from the config directory
+(next to `config.yaml`) when that file exists and is not empty. In it, whoever
+runs the instance, an operator or a hosting platform, tells the agent about the
+instance. Nerve never writes the file. Its content goes in as written, after
+`TOOLS.md` and before `MEMORY.md`, and at most 16 KiB of it is used: a longer
+file is cut there and ends with `[platform notes truncated at 16 KiB]`. The
+file is read whenever a session's prompt is built, so a change applies to new
+sessions.
+
 ### User Message (Web UI)
 1. User sends message via WebSocket
 2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept
@@ -242,7 +251,8 @@ nerve/db/
 │   ├── runner.py      # Discovers and applies vNNN_*.py files in order
 │   ├── v001_initial.py
 │   ├── ...
-│   └── v016_mcp_servers.py
+│   ├── v016_mcp_servers.py
+│   └── fork/          # A fork's own migrations; empty upstream (see Migrations)
 ├── sessions.py        # SessionStore mixin
 ├── messages.py        # MessageStore mixin
 ├── tasks.py           # TaskStore mixin
@@ -260,9 +270,18 @@ The `Database` class in `base.py` inherits all domain mixins, preserving a singl
 
 ### Migrations
 
-Migrations are individual Python files in `nerve/db/migrations/` named `vNNN_description.py`. Each exports an `async def up(db)` function. The runner discovers them by scanning the directory, applies pending ones in version order, and wraps each in a transaction. `SCHEMA_VERSION` is derived dynamically from the highest migration file number.
+Migrations are individual Python files named `vNNN_description.py`. Each exports an `async def up(db)` function. They come in two tracks. Each track is numbered on its own and recorded in its own version table:
 
-To add a new migration: create `nerve/db/migrations/vNNN_your_feature.py` with an `up()` function, numbered above the highest version on `main`: the runner skips versions at or below the database's current one, and CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not.
+| Track | Files | Version table | Highest shipped |
+|---|---|---|---|
+| upstream | `nerve/db/migrations/vNNN_*.py` | `schema_version` | `SCHEMA_VERSION` |
+| fork | `nerve/db/migrations/fork/vNNN_*.py` | `fork_schema_version`, created when the first fork migration runs | `FORK_SCHEMA_VERSION` (0 upstream) |
+
+Every database open runs the runner: the gateway's start and every CLI command that uses the database. The runner applies the pending upstream migrations in version order, then the pending fork migrations. A migration is recorded in its track's table once `up()` returns. Nothing wraps a migration in a transaction (`executescript()` commits as it goes), so a migration that is interrupted runs again from the start on the next open. Write migrations to be idempotent (`CREATE TABLE IF NOT EXISTS`, check a column before adding it).
+
+**Numbering.** Within a track, the runner skips every version at or below the database's current one. To add a migration upstream, create `nerve/db/migrations/vNNN_your_feature.py` numbered above the highest version on `main`. CI (`scripts/check_migration_numbers.py`) fails a PR whose new migration is not numbered that way, or that gives two migrations the same number. Upstream never ships a fork migration: `fork/` holds only its package files, and the same check fails on any migration there. A fork of Nerve adds its own migrations only under `fork/`, numbered from `v001` on their own (`nerve/db/migrations/fork/README.md`). A fork's number therefore never shadows an upstream migration that ships later, and the fork runs the check with `--fork`.
+
+**Newer-schema guard.** Before anything is applied, each track's version in the database is compared with the highest migration this code ships for that track. If the database is ahead on either track, a newer Nerve or a fork migrated it, and the database is refused untouched. The gateway process (`nerve start --foreground`, which a supervisor runs) and every CLI command that opens the database print one line that names the track and both versions, then exit with status 65 (`NEWER_SCHEMA_EXIT_CODE` in `nerve/db/migrations/runner.py`). That status differs from any other failure, so a supervisor can stop restarting on it (systemd: `RestartPreventExitStatus=65`). The daemonizing `nerve start` does not pass it on: it checks the process it started once, a second later, and exits with status 1 if that process has exited by then. `NERVE_ALLOW_NEWER_SCHEMA=1` starts anyway, with a warning. See [Going back to an older Nerve](setup.md#going-back-to-an-older-nerve).
 
 ### Schema
 
@@ -302,14 +321,14 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 ## Startup Sequence
 
 1. Load config (`settings.yaml` + `config.yaml` + `config.local.yaml` deep merge). The loaded object is remembered as the *startup configuration*: the setup page later compares it with what is on disk to say whether a restart is pending. The previous process's setup notes (restart debts, start-up errors) are retired
-2. Run database migrations (file-based migration system in `nerve/db/migrations/`); bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
+2. Run database migrations (the upstream track, then the fork track; see [Migrations](#migrations)). A database newer than the code stops the start before uvicorn runs, with exit status 65. Bootstrap the owner account and the setup token (local mode) or delete a leftover token (external mode)
 3. Initialize memory system (memU SQLite, load categories). With no model credential yet the warm-up is skipped and recall answers empty; nothing calls out
 4. Start CLIProxyAPI proxy if enabled (download binary if missing, authenticate, start subprocess)
 5. Recover orphan sessions (active in DB but no live client → idle or stopped)
 6. Start cron service (load system.yaml + jobs.yaml, register source runners, catch up missed jobs). Sources the installer left `enabled: false` are not scheduled. Then the activity reporter, which does nothing unless the platform's local activity socket exists ([platform-activity.md](platform-activity.md))
 7. Start gateway (FastAPI + uvicorn, WebSocket, static files or the "web UI not built" page)
 8. Start Telegram bot if configured. A token Telegram rejects does not stop the boot: the failure is logged with the token scrubbed, recorded for the setup page and `nerve doctor`, and the gateway runs without the bot
-9. **Worker onboarding** — if worker mode and TASK.md lacks `## Mission`, run the setup agent session (the setup page's Finish also starts it when no restart is needed)
+9. **Onboarding**: the gateway opens the onboarding when the `onboarding` row asks for it, and only with a model credential: the conversation, when setup finished before a restart, or the autonomous session of a worker that `nerve init` set up with a task description (`nerve/onboarding.py`; the setup page's Finish opens the conversation when no restart is needed). One-shot CLI commands never open it
 
 The gateway boots and serves `/setup` with nothing configured — no mode, no provider — and stays idle rather than failing, so the browser setup can do its work against a running instance.
 

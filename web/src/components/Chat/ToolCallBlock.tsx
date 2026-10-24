@@ -15,6 +15,8 @@ import { SourceToolBlock } from './tools/SourceToolBlock';
 import { AgentLine } from './agents/AgentLine';
 import { WorkflowToolBlock } from './tools/WorkflowToolBlock';
 import { QuestionBlock } from './tools/QuestionBlock';
+import { FormBlock } from './tools/FormBlock';
+import { isAskFormTool } from './tools/formQuestions';
 import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
 import { PlanToolBlock } from './tools/PlanToolBlock';
 import { SkillToolBlock } from './tools/SkillToolBlock';
@@ -80,6 +82,12 @@ export function ToolCallBlock({
     case 'ExitPlanMode':
     case 'EnterPlanMode':
       return <PlanApprovalBlock block={block} />;
+  }
+
+  // Nerve's ask_form (`mcp__nerve__ask_form`) — the form card; a call with
+  // no question to show stays a plain tool call.
+  if (isAskFormTool(block.tool)) {
+    return <FormBlock block={block} fallback={<GenericToolBlock block={block} />} />;
   }
 
   // send_file — render as inline download card, no tool chrome

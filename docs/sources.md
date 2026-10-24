@@ -147,7 +147,7 @@ visible rather than failing the fetch.
 - **Paging:** every page since the cursor is read in one run (`gh api --paginate`), so a backlog after downtime is ingested in full; `batch_size` does not cap this source
 - **First run:** Fetches from the last 24 hours
 - **Subsequent runs:** Uses `since=<cursor>` (inclusive: the cursor's own second is listed again, and an unchanged re-listed thread is skipped by storage) with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
-- **Filter:** `participating=true` (assigned, review requested, mentioned). Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` with `all=true`, 0 with `participating=true`)
+- **Filter:** `participating=true` (assigned, review requested, mentioned) and `all=true` (read threads too). GitHub marks a thread read as soon as a mail client renders the notification email with its images, which can happen seconds after the notification, so a listing of unread threads alone can miss a thread before anyone has seen it; a re-listed thread whose stored record is unchanged is skipped by storage, and the record carries no read state. A thread that GitHub lists as read and that was last read more than a minute before its update is left out: GitHub moves the thread of the account's own merge or review and leaves it read. Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` listed with `all=true` alone, 0 once `participating=true` is added)
 - **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
 - **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
 - **Default schedule:** `*/15 * * * *` (every 15 min)
@@ -158,10 +158,10 @@ visible rather than failing the fetch.
 With `sync.github.mode: hosted`, this process does not poll GitHub and needs no
 `gh` login. The shared channel gateway (the one that serves
 [hosted Slack](config.md#hosted-mode), set up with the same `channels.hosted`
-settings) polls GitHub for the agent with its own credential, builds each record
-the way the polling source does, enrichment included, and keeps the records
-until Nerve reads them, also while Nerve is not running. Nerve reads them over
-the hosted channel streams.
+settings) polls GitHub for the agent with the GitHub credential connected to
+that agent, builds each record the way the polling source does, enrichment
+included, and keeps the records until Nerve reads them, also while Nerve is not
+running. Nerve reads them over the hosted channel streams.
 
 - **What arrives:** `github_notification` records, one for each notification
   thread whose `updated_at` moved, with the summary, content and metadata of the
@@ -176,6 +176,25 @@ the hosted channel streams.
   `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
   actor, reason and CI branch lists are not checked for it (see
   [Pull request activity records](#github-pull-request-activity-records)).
+- **The credential is the switch.** The gateway polls GitHub for an agent only
+  while a GitHub credential is connected to that agent and Nerve subscribes,
+  which it does while `enabled` is true. Your operator can therefore set
+  `sync.github.enabled: true` in `config.yaml` or `config.local.yaml`, which
+  outrank the `settings.yaml` that the setup page writes. GitHub then arrives
+  once a GitHub credential is connected to the agent and stops when it is
+  removed, with nothing to switch in Nerve. The Sources step of the setup page
+  shows GitHub as managed by the channel gateway, with no switch, and refuses a
+  save that includes it (`409`, naming `github`); Gmail and Telegram work as
+  before. Until a gateway stream opens, the step says that it is waiting for
+  the channel gateway and that a GitHub credential may still need to be
+  connected: Nerve cannot tell those two cases apart. Once a stream is open,
+  it says that the stream is connected and that records arrive once a GitHub
+  credential is connected to the agent, and never that GitHub is connected,
+  also when the page holds the switch: the streams carry every hosted
+  provider, so a hosted Slack opens them too, and Nerve cannot see whether a
+  credential is connected. A `false` in either file keeps GitHub off the same
+  way. Without the key in either file, the Sources step switches GitHub as
+  before.
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
@@ -199,7 +218,8 @@ the hosted channel streams.
   `source:github` runner drains it. The drop hook, `condense`, health checks,
   consumer cursors, `messages` gates and the Sources page work as they do for
   the polling source. The drain also runs on `sync.github.schedule`, as a
-  fallback.
+  fallback; that run is not the instance's next scheduled task, so a platform
+  that parks the machine does not wake it for the fallback.
 - **Runs on delivery.** As soon as records arrive, the runner drains them, and
   the jobs gated on `messages` for `github`, or for any source, run once
   `cron.delivery_debounce_seconds` (default 60) after the first record of a
