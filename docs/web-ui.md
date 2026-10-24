@@ -390,3 +390,4 @@ Uses Zustand for lightweight state management:
 - `agentStore` — The active session's agent roster (records keyed by id, newest `rev` wins), summary and capabilities, the turn queue and pending sends, open agent transcripts (live items by `seq`, gaps refetched), the stop escalation and dialogs, and the seen set. Hydrated from `session_status` and `GET /api/sessions/{id}/agents`, kept current by `agent_update`, `agent_event` and `queue_update`.
 - `taskStore` — Task list, search, filters, detail view with content editing
 - `skillsStore` — Skills list with usage stats, detail view with SKILL.md editor, create/update/delete/toggle, filesystem sync
+  - A platform skill has a **Platform** badge. Its detail view is read only, without Save or Delete.

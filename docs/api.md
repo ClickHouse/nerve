@@ -1378,14 +1378,19 @@ List all skills with aggregated usage statistics.
 Response: {
   "skills": [{
     "id": "my-skill", "name": "my-skill", "description": "Query database...",
-    "version": "1.0.0", "enabled": true, "total_invocations": 5, "success_count": 5,
+    "version": "1.0.0", "enabled": true, "source": "workspace",
+    "total_invocations": 5, "success_count": 5,
     "avg_duration_ms": 12, "last_used": "2026-03-06T21:00:00"
   }]
 }
 ```
 
+`source` is `workspace` for a skill in `workspace/skills/` and `platform` for a
+read-only skill in `skills/` in the config directory
+([platform skills](architecture.md#platform-skills)).
+
 #### `GET /api/skills/{id}`
-Get full skill content, metadata, references, and usage stats.
+Get full skill content, metadata (including `source`), references, and usage stats.
 
 #### `POST /api/skills`
 Create a new skill.
@@ -1395,6 +1400,8 @@ Request:  { "name": "code-review", "description": "This skill should be used whe
 Response: { "id": "code-review", "name": "code-review", "created": true }
 ```
 
+When a platform skill has the id that the name gives, the request gets HTTP 403.
+
 #### `PUT /api/skills/{id}`
 Update a skill's SKILL.md content (full raw file including frontmatter).
 
@@ -1403,8 +1410,12 @@ Request:  { "content": "---\nname: code-review\ndescription: ...\n---\n\n# Instr
 Response: { "id": "code-review", "name": "code-review", "updated": true }
 ```
 
+A platform skill gets HTTP 403 with
+`{"detail": "This skill is provided by the platform and cannot be changed here."}`.
+
 #### `DELETE /api/skills/{id}`
-Delete a skill (removes directory and DB record).
+Delete a skill (removes directory and DB record). A platform skill gets HTTP 403,
+as for `PUT`.
 
 #### `PATCH /api/skills/{id}/toggle`
 Enable or disable a skill.
@@ -1421,7 +1432,7 @@ Get usage history and aggregate stats for a skill.
 Aggregate usage stats across all skills.
 
 #### `POST /api/skills/sync`
-Re-scan the `workspace/skills/` directory and sync to DB. Discovers new skills, removes deleted ones, preserves enabled state.
+Re-scan the `workspace/skills/` directory and the platform skills directory, and sync to DB. Discovers new skills, removes deleted ones, preserves enabled state.
 
 ### MCP Servers
 

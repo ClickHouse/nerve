@@ -841,7 +841,9 @@ class AgentEngine:
         await self._xmemory_bridge.initialize()
 
         # Initialize skill manager and discover skills from filesystem
-        self._skill_manager = SkillManager(self.config.workspace, self.db)
+        self._skill_manager = SkillManager(
+            self.config.workspace, self.db, config_dir=self.config.config_dir,
+        )
         try:
             skills = await self._skill_manager.discover()
             logger.info("Skills system initialized: %d skills discovered", len(skills))

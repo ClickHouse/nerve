@@ -1,12 +1,19 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 
+/**
+ * Where a skill comes from. `platform`: the operator or the hosting platform
+ * wrote it in the config directory, and it is read only here.
+ */
+export type SkillSource = 'workspace' | 'platform';
+
 export interface Skill {
   id: string;
   name: string;
   description: string;
   version: string;
   enabled: boolean;
+  source: SkillSource;
   user_invocable: boolean;
   model_invocable: boolean;
   allowed_tools: string[] | null;
