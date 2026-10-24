@@ -350,6 +350,8 @@ class RecordingRouter:
     would end up doing.
     """
 
+    accepting_turns = True
+
     def __init__(self, reply_text: str | None = None):
         self.messages: list[Any] = []
         self.observed: list[Any] = []

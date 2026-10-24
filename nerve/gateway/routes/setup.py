@@ -2836,6 +2836,8 @@ async def restart_system(actor: Actor = Depends(require_person)):
                 command=None, timeout_hint_seconds=0,
             )
         mode, message, command, hint = _restart_decision(ctx.facts)
+        # The old daemon drains running turns before it stops.
+        hint += max(0, config.gateway.drain_timeout_seconds)
         how = daemon.restart_mode()
         if how == "refuse":
             return RestartResponse(
@@ -2854,6 +2856,7 @@ async def restart_system(actor: Actor = Depends(require_person)):
                 await asyncio.to_thread(
                     daemon.restart_daemon, Path(config.config_dir),
                     old_pid=os.getpid(), delay_seconds=_RESTART_DELAY_SECONDS,
+                    drain_timeout_seconds=config.gateway.drain_timeout_seconds,
                 )
         except OSError as e:
             logger.exception("Restart requested by %s could not start", actor.actor_id)

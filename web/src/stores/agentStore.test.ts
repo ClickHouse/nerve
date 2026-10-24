@@ -419,6 +419,28 @@ describe('queue', () => {
     expect(store().composerInsert).toMatchObject({ text: 'second', mode: 'append' });
   });
 
+  it('restores the text of a send that the server refused', () => {
+    store().addPendingSend(pending('c-1', 'deploy after the restart'));
+
+    store().applyQueueUpdate({
+      type: 'queue_update', session_id: SID, queue: [],
+      removed: [{ queue_id: 'q_1', client_msg_id: 'c-1', reason: 'refused' }],
+    });
+
+    expect(store().pendingSends).toEqual({});
+    expect(store().composerInsert).toMatchObject({ text: 'deploy after the restart', mode: 'append' });
+  });
+
+  it('refusePendingSend drops only a send this tab has', () => {
+    store().addPendingSend(pending('c-1', 'mine'));
+
+    expect(store().refusePendingSend('not-mine')).toBe(false);
+    expect(store().composerInsert).toBeNull();
+    expect(store().refusePendingSend('c-1')).toBe(true);
+    expect(store().pendingSends).toEqual({});
+    expect(store().composerInsert).toMatchObject({ text: 'mine', mode: 'append' });
+  });
+
   it('cancels a queued message and restores its text once', async () => {
     const entry = fx.makeQueueEntry({ queue_id: 'q_own', client_msg_id: 'c-own' });
     store().hydrate(fx.makeSnapshot([], { queue: [entry] }));

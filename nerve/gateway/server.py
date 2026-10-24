@@ -6,17 +6,22 @@ Single entry point for the entire Nerve gateway.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import os
 import re
+import socket
+import sys
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 from typing import Any, Callable
 
+import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -26,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
 from nerve.agent.agents.emitter import agent_channel
-from nerve.agent.engine import AgentEngine
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.agent.streaming import broadcaster
 from nerve.config import NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
@@ -166,6 +171,19 @@ def _connections_changed() -> None:
 # tasks; these keep them alive until they finish (Stop finds a run through
 # the session's turn task, not through this set).
 _ws_runs: set[asyncio.Task] = set()
+
+
+def _ws_run_done(task: asyncio.Task) -> None:
+    """Forget a finished WebSocket run. A run refused by a drain is no error."""
+    _ws_runs.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if isinstance(exc, NotAcceptingTurnsError):
+        # The engine already told the session's clients.
+        logger.info("Draining: refused a queued web turn")
+    elif exc is not None:
+        logger.error("Web turn failed", exc_info=exc)
 
 # Agent transcript channels one socket may follow at once; subscribing to one
 # more drops the oldest.
@@ -985,6 +1003,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Refuse new turns while the services below stop. The server's drain
+    # (see _DrainingServer) usually did this already.
+    _engine.stop_accepting_turns()
+
     # Stop the loopback listener before the manager so no new requests
     # arrive while the MCP task group is shutting down.
     if mcp_loopback_server is not None:
@@ -1133,6 +1155,13 @@ def create_app() -> FastAPI:
     from nerve.gateway.routes.setup import install_handlers as _install_setup_handlers
 
     _install_setup_handlers(app)
+
+    # A route that starts a turn during a drain: the turn did not run.
+    @app.exception_handler(NotAcceptingTurnsError)
+    async def _not_accepting_turns_handler(  # noqa: ANN001
+        request, exc: NotAcceptingTurnsError,
+    ):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     # FastAPI validation errors echo the rejected input, which can include the
     # setup token. Return them without the input.
@@ -1291,6 +1320,19 @@ def create_app() -> FastAPI:
                         await broadcaster.register(active_session, client_id, ws_broadcast)
                         await router.switch_session("web:default", session_id)
 
+                    # During a drain, tell this client only. Other tabs get
+                    # no echo of a message that will not run. With the
+                    # client_msg_id, a tab that queued the message behind a
+                    # running turn keeps its view of that turn.
+                    if not _engine.accepting_turns:
+                        await websocket.send_json({
+                            "type": "error",
+                            "session_id": session_id,
+                            "error": str(NotAcceptingTurnsError()),
+                            "client_msg_id": client_msg_id,
+                        })
+                        continue
+
                     # Load uploaded files if any
                     images = None
                     image_refs = None
@@ -1335,7 +1377,7 @@ def create_app() -> FastAPI:
                         )
                     )
                     _ws_runs.add(task)
-                    task.add_done_callback(_ws_runs.discard)
+                    task.add_done_callback(_ws_run_done)
 
                 elif msg_type == "stop":
                     # User wants to stop the running agent
@@ -1722,6 +1764,61 @@ def uvicorn_log_config() -> dict[str, Any]:
     return config
 
 
+class _DrainingServer(uvicorn.Server):
+    """A uvicorn server that drains running turns before it shuts down.
+
+    On the first SIGTERM or SIGINT, the engine stops accepting new turns and
+    waits up to ``gateway.drain_timeout_seconds`` for the running turns to
+    end. The server continues to serve during the wait, so clients still get
+    the stream of a running turn. Then the usual uvicorn shutdown starts. A
+    second signal starts it immediately.
+    """
+
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self._drain_signal: int | None = None
+        self._drain_task: asyncio.Task | None = None
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        # This runs as a signal handler, so it only sets state. on_tick
+        # starts the drain on the event loop. Do not call the base method
+        # before the drain ends: sse_starlette patches it to close every SSE
+        # stream, and a running Codex turn calls its MCP tools over SSE.
+        if self._drain_signal is None and not self.should_exit:
+            self._drain_signal = sig
+            return
+        super().handle_exit(sig, frame)
+
+    async def on_tick(self, counter: int) -> bool:
+        if self._drain_signal is not None and self._drain_task is None:
+            self._drain_task = asyncio.create_task(self._drain())
+        return await super().on_tick(counter)
+
+    async def _drain(self) -> None:
+        try:
+            timeout = get_config().gateway.drain_timeout_seconds
+            if _engine is not None and timeout > 0:
+                logger.info(
+                    "Shutdown requested: draining for up to %ss. "
+                    "Send the signal again to shut down now.", timeout,
+                )
+                await _engine.drain(timeout)
+        except Exception:
+            logger.exception("Drain failed; shutting down now")
+        # A second signal can set should_exit while the drain ends. Calling
+        # handle_exit again then would force the exit and skip the lifespan
+        # shutdown.
+        if not self.should_exit:
+            super().handle_exit(self._drain_signal, None)
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        if self._drain_task is not None and not self._drain_task.done():
+            self._drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._drain_task
+        await super().shutdown(sockets)
+
+
 def run_server(config: NerveConfig | None = None) -> None:
     """Run the Nerve server with uvicorn.
 
@@ -1732,7 +1829,7 @@ def run_server(config: NerveConfig | None = None) -> None:
     ``NEWER_SCHEMA_EXIT_CODE``. State files that other users can write to are
     not read here; the lifespan's open refuses them.
     """
-    import uvicorn
+    from uvicorn.main import STARTUP_FAILURE
 
     if config is None:
         config = get_config()
@@ -1746,7 +1843,7 @@ def run_server(config: NerveConfig | None = None) -> None:
             "ssl_keyfile": str(config.gateway.ssl.key),
         }
 
-    uvicorn.run(
+    server = _DrainingServer(uvicorn.Config(
         create_app(),
         host=config.gateway.host,
         port=config.gateway.port,
@@ -1757,4 +1854,11 @@ def run_server(config: NerveConfig | None = None) -> None:
         log_level="info",
         log_config=uvicorn_log_config(),
         **ssl_config,
-    )
+    ))
+    # The same exit handling as uvicorn.run.
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        sys.exit(STARTUP_FAILURE)

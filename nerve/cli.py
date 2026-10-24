@@ -1061,11 +1061,19 @@ def stop(ctx: click.Context) -> None:
         click.echo("Nerve is not running")
         return
 
-    click.echo(f"Stopping Nerve (PID {pid})...")
+    drain = config.gateway.drain_timeout_seconds
+    if drain > 0:
+        click.echo(
+            f"Stopping Nerve (PID {pid}). Running turns get up to {drain}s to end..."
+        )
+    else:
+        click.echo(f"Stopping Nerve (PID {pid})...")
     os.kill(pid, signal.SIGTERM)
 
-    # Wait for graceful shutdown (up to 15 seconds)
-    for i in range(30):
+    from nerve import daemon
+
+    # Wait for graceful shutdown: the drain, then up to 15 seconds
+    for i in range(daemon.shutdown_wait_ticks(drain)):
         time.sleep(0.5)
         if not pidfile.pid_exists(pid):
             _remove_pid()
@@ -1156,6 +1164,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     outcome = daemon.restart_daemon(
         config_dir, verbose=ctx.obj["verbose"],
         old_pid=old_pid if running else None, systemd=False,
+        drain_timeout_seconds=config.gateway.drain_timeout_seconds,
     )
     click.echo(outcome.message)
 

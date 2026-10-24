@@ -87,7 +87,7 @@ export interface StopAgentResponse { agent: AgentView; stopping: string[] }
 
 export interface AutoTurnTrigger { agent_id: string; label: string; kind: AgentKind; status: AgentStatus }
 export interface InteractionAgentRef { agent_id: string | null; task_id: string; label: string }
-export interface QueueRemoval { queue_id: string | null; client_msg_id: string | null; reason: 'started' | 'cancelled' | 'duplicate' }
+export interface QueueRemoval { queue_id: string | null; client_msg_id: string | null; reason: 'started' | 'cancelled' | 'duplicate' | 'refused' }
 
 export type AgentWSMessage =
   | { type: 'agent_update'; session_id: string; agents: AgentView[]; summary: AgentSummary }

@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.access import Decision, Identity, PatternGate, needs_name_resolution
 from nerve.channels.base import (
     BaseChannel,
@@ -747,9 +748,16 @@ class HostedChannel(BaseChannel):
         """Whether the channel runs, is still switched on, and has room for a turn.
 
         The provider section is read per call, so turning the provider off
-        by a reload stops intake until it is turned on again.
+        by a reload stops intake until it is turned on again. Intake also
+        stops while the engine drains: the gateway keeps the events, and the
+        next start reads them.
         """
-        return self._running and self._switched_on() and len(self._inflight) < self._max_inflight
+        return (
+            self._running
+            and self._switched_on()
+            and len(self._inflight) < self._max_inflight
+            and self.router.accepting_turns
+        )
 
     async def deliver(self, event: Event) -> Disposition:
         """Dispatch one admitted event and say what happened to it."""
@@ -976,6 +984,9 @@ class HostedChannel(BaseChannel):
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a hosted %s turn for %s", self._provider, message.sender_id)
         except Exception as error:  # noqa: BLE001 - one turn must not stop intake
             logger.error(
                 "Agent error for hosted %s target %s: %s",

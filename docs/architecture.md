@@ -332,6 +332,17 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 
 The gateway boots and serves `/setup` with nothing configured — no mode, no provider — and stays idle rather than failing, so the browser setup can do its work against a running instance.
 
+## Shutdown Sequence
+
+The first SIGTERM or SIGINT starts a drain:
+
+1. The engine stops accepting new turns. A turn that starts after this is refused, also one that was queued behind a running turn: a queued message leaves the queue with the reason `refused`, the web UI shows an error, REST routes that wait for the turn return 503, and Telegram and Slack reply with the error. The user message is not stored. Hosted channels stop reading their inbox, so the channel gateway keeps those events and the next start reads them. An answer to a question, a plan approval and a plan revision request are refused before they are stored, because the turn that delivers them would be refused: the question or plan stays pending. An answer that was stored before the drain and waits behind a running turn is still refused when that turn ends.
+2. Cron jobs, session wakeups, queued workflow runs and the notification expiry sweep do not start. After the restart, the cron catch-up runs each missed job that has `catchup` on, the wakeup sweep fires the due wakeups, and the expiry sweep expires the stale questions. Queued workflow runs stay pending, and the recovery pass at the next start marks them failed (see [Workflow runs](workflow-runs.md)).
+3. The gateway waits up to `gateway.drain_timeout_seconds` for running turns to end. It continues to serve during the wait, so clients still get the stream of a running turn. A background task that finishes during the wait can start a continuation turn, and the wait includes that turn.
+4. The usual shutdown follows: uvicorn closes connections, then the lifespan stops the services and the engine. Turns that are still running end when the engine disconnects their clients.
+
+A second signal skips the rest of the wait. `drain_timeout_seconds` is 0 by default, which skips step 3. Under Kubernetes, set it below `terminationGracePeriodSeconds` so step 4 can finish before the SIGKILL. `nerve stop`, `nerve restart` and the setup page's restart wait `drain_timeout_seconds` plus 15 seconds before they send SIGKILL. Under systemd or Docker, set `TimeoutStopSec` or `stop_grace_period` to cover the same time.
+
 ## Security
 
 - JWT authentication for all API/WebSocket access. The signing secret is `auth.jwt_secret` or, when unset, one generated on first start and kept in `nerve.db`. There is no unauthenticated mode. The one unauthenticated write — the first-account claim — requires the setup token, which never appears in a URL, response, log, state file or browser storage; every other setup endpoint needs a signed-in person, and system or MCP tokens cannot drive setup
