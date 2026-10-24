@@ -21,6 +21,7 @@ function SkillCard({ skill }: { skill: Skill }) {
           <div className="flex items-center gap-2">
             <h3 className="text-sm font-medium text-text truncate">{skill.name}</h3>
             <Badge>v{skill.version}</Badge>
+            {skill.source === 'platform' && <Badge tone="accent">Platform</Badge>}
           </div>
           <p className="text-xs text-text-muted mt-1 line-clamp-2">{skill.description}</p>
         </div>

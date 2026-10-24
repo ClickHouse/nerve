@@ -245,7 +245,7 @@ A reload is always explicit. Two things cause one:
 | Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters and `pr_watch` are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
-| Skills (`skills/`) | ✅ re-scanned |
+| Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
 | Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
@@ -733,6 +733,10 @@ Two things to know about `NERVE_LOCKDOWN`:
   the skill index picks up on the next reload, and the root files are the system
   prompt the agent starts every turn from. `memory/`, `tasks/`, `TASK.md` and
   ordinary workspace files are outside it and stay writable.
+- **Platform skills are not read.** The skills in `skills/` in the config
+  directory ([platform skills](architecture.md#platform-skills)) are
+  machine-local, and no reviewer saw them, so a locked instance leaves them out
+  and logs this when the directory exists.
 - **Runtime edits to the reviewed surface are blocked.** Creating, updating,
   deleting or toggling a skill, Telegram pairing, writing a workspace file that
   lands in that surface, and other config mutations fail with a "locked" error

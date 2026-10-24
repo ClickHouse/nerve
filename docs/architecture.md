@@ -159,6 +159,33 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
+- Platform skills: read-only skills in `<config_dir>/skills/<name>/SKILL.md` (see below)
+
+#### Platform skills
+
+The operator or the hosting platform can give the agent skills that the person
+who uses the instance cannot change. They go in `skills/` in the config
+directory, next to `config.yaml` and `platform.md`, with the same layout as
+workspace skills. Nerve never writes this directory, and a missing directory
+is not an error.
+
+- Nerve reads them at startup, on a reload and on `POST /api/skills/sync`,
+  together with `workspace/skills/`.
+- They are marked `source: "platform"` in the API, and workspace skills are
+  marked `source: "workspace"`. `skill_list` marks them
+  `[platform, read only]`, and `skill_get` shows `Source: platform (read only)`.
+  The Skills page shows a **Platform** badge and no edit or delete controls.
+- They are read only. `skill_update`, `PUT /api/skills/{id}` and
+  `DELETE /api/skills/{id}` refuse them with "This skill is provided by the
+  platform and cannot be changed here." (HTTP 403). `skill_create` and
+  `POST /api/skills` refuse a name whose id the platform provides. A person can
+  still enable and disable them.
+- `skill_read_reference` and `skill_run_script` read from the platform's
+  directory, with the same path checks as for workspace skills.
+- When both directories have a skill with the same id, the platform skill is
+  the one in effect, and Nerve logs a warning.
+- A locked instance does not read them (see
+  [lockdown](config.md#when-locked)).
 
 ### House of Agents (retired)
 The houseofagents multi-agent runtime was retired in favor of **workflow runs** (`nerve/workflows/`, the `workflow_run_*` tools) — budget-capped multi-agent runs with journals, live spend tracking, and run-scoped kill. See [workflow-runs.md](workflow-runs.md). The `hoa_*` tool names remain registered as deprecation stubs (gated by `houseofagents.enabled`) that point callers at `workflow_run_start`.

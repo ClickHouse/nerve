@@ -446,7 +446,7 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
         except Exception as e:  # noqa: BLE001
             summary["mcp"] = f"{_ERROR_PREFIX}{e}"
 
-    # 4. Skills (re-scan the workspace skills dir).
+    # 4. Skills (re-scan the workspace and platform skill dirs).
     mgr = getattr(engine, "_skill_manager", None) if engine is not None else None
     if mgr is not None:
         try:

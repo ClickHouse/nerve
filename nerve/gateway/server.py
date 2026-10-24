@@ -1128,6 +1128,14 @@ def create_app() -> FastAPI:
     async def _skill_id_handler(request, exc: SkillIdError):  # noqa: ANN001
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    # A platform skill is read only: the operator or the hosting platform
+    # writes it in the config directory, not the person using this instance.
+    from nerve.skills.manager import PlatformSkillError
+
+    @app.exception_handler(PlatformSkillError)
+    async def _platform_skill_handler(request, exc: PlatformSkillError):  # noqa: ANN001
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
     # Setup field errors render as ``{"detail", "field"}`` so the wizard can
     # attach the message to the input it is about.
     from nerve.gateway.routes.setup import install_handlers as _install_setup_handlers
