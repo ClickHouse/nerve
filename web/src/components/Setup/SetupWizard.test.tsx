@@ -2495,6 +2495,73 @@ describe('the steps a person can take, the operator\'s and the hidden ones', () 
     }
   });
 
+  it('the Mode step and the Account stay in the list on a locked instance, never under the operator\'s steps', async () => {
+    current = makeState({
+      lockdown: true, writable: false, read_only_reason: LOCK, steps_left: 1,
+      steps: [
+        // A backend that marks the claim read-only too must not move the Account.
+        step('claim', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'alice · password set' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON, summary: 'Personal assistant' }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Anthropic API key' }),
+        step('profile', {}, { writable_fields: ['name'] }),
+        step('memory', { status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK }),
+      ],
+    });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem').map((row) => within(row).getAllByRole('link')[0].textContent)).toEqual([
+      'Account', 'Mode', 'About you',
+    ]);
+    // The mode was the person's choice: Done, with the lock, and no Change.
+    const mode = rows.getByRole('link', { name: 'Mode' }).closest('li')!;
+    expect(mode).toHaveTextContent('Done');
+    expect(within(mode).queryByRole('link', { name: 'Change' })).not.toBeInTheDocument();
+    expect(rows.getByRole('link', { name: 'Accounts' })).toHaveAttribute('href', '/accounts');
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model']);
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getByRole('link', { name: /^Mode(?!l)/ })).toBeInTheDocument();
+    expect(nav.getByRole('link', { name: /^Account/ })).toBeInTheDocument();
+  });
+
+  it('with no step left for the person, the overview and the review say that the operator configured every step', async () => {
+    // External mode under lockdown before a mode is chosen: no claim, the
+    // Mode step is closed, and every other step is the operator's or closed.
+    useHostedStore.setState({ mode: 'external' });
+    const locked = (id: Parameters<typeof step>[0]) => step(id, {
+      status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+    });
+    current = makeState({
+      auth_mode: 'external', mode: null, lockdown: true, writable: false, read_only_reason: LOCK,
+      finished: true, steps_left: 0,
+      steps: [
+        step('mode', {
+          status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+        }, { mode: null, templates_present: [] }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Credential from the environment' }),
+        locked('profile'),
+        step('memory', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Kept in Loom' }),
+        locked('channels'), locked('sources'), locked('automation'), locked('agents'),
+      ],
+    });
+    const view = renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText('Your operator has configured every step on this instance.')).toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: 'Steps' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/steps done/)).not.toBeInTheDocument();
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model', 'Memory']);
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(screen.queryByRole('region', { name: 'Checklist' })).not.toBeInTheDocument();
+    expect(screen.getByText('Your operator has configured every step on this instance.')).toBeInTheDocument();
+  });
+
   it('the phone\'s position line counts the own steps', async () => {
     window.matchMedia = ((query: string) => ({
       matches: query === '(max-width: 767px)',

@@ -8,9 +8,9 @@ import { copyToClipboard } from '../../../utils/clipboard';
 import { Badge, Button } from '../../ui';
 import { Check, Copy, Loader2, RefreshCw } from '../../ui/icons';
 import {
-  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, HTTPS_HINT, PASSWORDLESS_LAN_HINT, PROVIDER_LAST_TEST_FAILED,
-  QUIET_HOURS_LINE, RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN, REVIEW_DECIDE_FIRST,
-  REVIEW_HEADING, WORK_REVIEW_ALSO, WORK_REVIEW_ITEMS, WORK_REVIEW_NONE, WORK_REVIEW_RULES,
+  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, ALL_STEPS_OPERATOR, HTTPS_HINT, PASSWORDLESS_LAN_HINT,
+  PROVIDER_LAST_TEST_FAILED, QUIET_HOURS_LINE, RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN,
+  REVIEW_DECIDE_FIRST, REVIEW_HEADING, WORK_REVIEW_ALSO, WORK_REVIEW_ITEMS, WORK_REVIEW_NONE, WORK_REVIEW_RULES,
   describeRestartReason, isFirstRunRestart,
 } from '../copy';
 import { ownSteps, stepTitle, stopPath } from '../navigation';
@@ -210,50 +210,54 @@ export function ReviewStep({ state }: { state: SetupState }) {
         </div>
       </section>
 
-      <section aria-label="Checklist" className="flex flex-col gap-1">
-        <h2 className="text-sm font-medium text-text">Checklist</h2>
-        <ul className="flex flex-col gap-1">
-          {own.map((step) => (
-            <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
-              <div className="min-w-0">
-                <p className="text-sm text-text">{stepTitle(step)}</p>
-                {step.summary && (
-                  <p className="text-xs text-text-dim truncate">
-                    {step.summary}
-                    {lastTestFailed(step) && <span className="text-hue-amber"> · {PROVIDER_LAST_TEST_FAILED}</span>}
-                  </p>
-                )}
-                {step.id === 'mode' && work.selection && (
-                  <WorkLines catalog={work.catalog} selection={work.selection} />
-                )}
-                {/* Before a mode is chosen the times are the config's
-                    fallback, which the mode is about to replace. */}
-                {step.id === 'profile' && state.mode !== null && (
-                  <p className="text-xs text-text-dim">{quietHoursLine(step)}</p>
-                )}
-                {step.id === 'claim' && (
-                  <p className="text-xs text-text-dim">
-                    {ACCOUNT_ROW_TEXT}{' '}
-                    <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
-                  </p>
-                )}
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <StatusBadge step={step} />
-                {!step.read_only && step.status !== 'blocked' && step.id !== 'claim' && (
-                  <Link
-                    to={stopPath(step.id)}
-                    state={RETURN_HERE}
-                    className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
-                  >
-                    {step.status === 'done' ? 'Change' : 'Open'}
-                  </Link>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
-      </section>
+      {/* No step left for the person (external mode under lockdown, before
+          a mode is chosen): the sentence in place of an empty checklist. */}
+      {own.length === 0 ? <p className="text-sm text-text-muted">{ALL_STEPS_OPERATOR}</p> : (
+        <section aria-label="Checklist" className="flex flex-col gap-1">
+          <h2 className="text-sm font-medium text-text">Checklist</h2>
+          <ul className="flex flex-col gap-1">
+            {own.map((step) => (
+              <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
+                <div className="min-w-0">
+                  <p className="text-sm text-text">{stepTitle(step)}</p>
+                  {step.summary && (
+                    <p className="text-xs text-text-dim truncate">
+                      {step.summary}
+                      {lastTestFailed(step) && <span className="text-hue-amber"> · {PROVIDER_LAST_TEST_FAILED}</span>}
+                    </p>
+                  )}
+                  {step.id === 'mode' && work.selection && (
+                    <WorkLines catalog={work.catalog} selection={work.selection} />
+                  )}
+                  {/* Before a mode is chosen the times are the config's
+                      fallback, which the mode is about to replace. */}
+                  {step.id === 'profile' && state.mode !== null && (
+                    <p className="text-xs text-text-dim">{quietHoursLine(step)}</p>
+                  )}
+                  {step.id === 'claim' && (
+                    <p className="text-xs text-text-dim">
+                      {ACCOUNT_ROW_TEXT}{' '}
+                      <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <StatusBadge step={step} />
+                  {!step.read_only && step.status !== 'blocked' && step.id !== 'claim' && (
+                    <Link
+                      to={stopPath(step.id)}
+                      state={RETURN_HERE}
+                      className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
+                    >
+                      {step.status === 'done' ? 'Change' : 'Open'}
+                    </Link>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section aria-label="Server check-up" className="flex flex-col gap-2">
         <h2 className="text-sm font-medium text-text">Server check-up</h2>

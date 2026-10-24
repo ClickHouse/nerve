@@ -28,10 +28,23 @@ describe('stepPlace', () => {
     expect(stepPlace(step('memory', { status: 'blocked', blocked_reason: CLOSED }))).toBe('hidden');
   });
 
-  it('a done, read-only step is the operator\'s, except the Mode step', () => {
+  it('a done, read-only step is the operator\'s', () => {
     expect(stepPlace(step('channels', { status: 'done', read_only: true, read_only_reason: CLOSED }))).toBe('operator');
     expect(stepPlace(step('provider', { status: 'done', read_only: true, read_only_reason: LOCK }))).toBe('operator');
+  });
+
+  it('the Mode step is the person\'s own, chosen or not; a lockdown that closed it before the choice hides it', () => {
+    expect(stepPlace(step('mode', {}, { mode: null }))).toBe('own');
     expect(stepPlace(step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }))).toBe('own');
+    expect(stepPlace(step('mode', { status: 'done', read_only: true, read_only_reason: LOCK }))).toBe('own');
+    expect(stepPlace(step('mode', {
+      status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+    }, { mode: null }))).toBe('hidden');
+  });
+
+  it('the claim (the Account) is the person\'s own, also if a backend marks it read-only', () => {
+    expect(stepPlace(step('claim', { status: 'done' }))).toBe('own');
+    expect(stepPlace(step('claim', { status: 'done', read_only: true, read_only_reason: LOCK }))).toBe('own');
   });
 });
 

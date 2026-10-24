@@ -815,7 +815,9 @@ Configure this step from the config repository."), and does not count it as
 "left to do". The setup page does not show it. A locked instance that has
 everything provisioned reads as finished and the banner stays quiet. A step
 that is done is read-only, and the Overview lists it under **Your operator
-has configured**. What still works: the claim (it writes to `nerve.db`), a
+has configured**; the Mode step and your account stay in your own list. When
+no step is left for you, the Overview says that the operator configured every
+step. What still works: the claim (it writes to `nerve.db`), a
 worker's `TASK.md` once the templates have arrived from the repository, your
 display name (local mode), skipping, finishing and restarting.
 

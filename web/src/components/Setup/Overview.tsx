@@ -5,7 +5,8 @@ import { ArrowRight, RefreshCw } from '../ui/icons';
 import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import {
-  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, OPERATOR_SECTION_HEADING, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED,
+  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, ALL_STEPS_OPERATOR, OPERATOR_SECTION_HEADING, OVERVIEW_SUBLINE,
+  OVERVIEW_SUBLINE_FINISHED,
 } from './copy';
 import { firstPendingStop, operatorSteps, ownSteps, stepTitle, stopPath } from './navigation';
 import { Notice } from './Notice';
@@ -21,7 +22,9 @@ import { useWizardNav } from './wizardContext';
  * pending step. "Change" opens a done step to edit it: Save and Back come
  * straight back here. Under the list, "Your operator has configured" names
  * the done steps that the person cannot change here, with their summaries.
- * A step that a lockdown or the instance's policy closed is not shown.
+ * A step that a lockdown or the instance's policy closed is not shown. When
+ * no step is left for the person (external mode under lockdown, before a
+ * mode is chosen), the page says so in place of the count and the list.
  */
 export function Overview({ state }: { state: SetupState }) {
   const nav = useWizardNav();
@@ -58,11 +61,15 @@ export function Overview({ state }: { state: SetupState }) {
       </div>
 
       <div className="rounded-lg border border-border bg-surface-raised p-4 flex flex-col gap-2 text-sm text-text-muted">
-        <p>
-          Each step saves when you continue.
-          {external && ' These settings apply to everyone who uses this instance, not only to you.'}
-        </p>
-        <p><strong className="text-text">{count}</strong>.</p>
+        {own.length === 0 ? <p>{ALL_STEPS_OPERATOR}</p> : (
+          <>
+            <p>
+              Each step saves when you continue.
+              {external && ' These settings apply to everyone who uses this instance, not only to you.'}
+            </p>
+            <p><strong className="text-text">{count}</strong>.</p>
+          </>
+        )}
       </div>
 
       {state.lockdown && (
@@ -80,37 +87,39 @@ export function Overview({ state }: { state: SetupState }) {
 
       {state.warning && <Notice tone="warning">{state.warning}</Notice>}
 
-      <ol className="flex flex-col gap-1" aria-label="Steps">
-        {own.map((step) => (
-          <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
-            <div className="min-w-0">
-              <Link to={stopPath(step.id)} className="text-sm text-text hover:underline underline-offset-2">
-                {stepTitle(step)}
-              </Link>
-              {step.summary && <p className="text-xs text-text-dim truncate">{step.summary}</p>}
-              {/* The account's page is read-only; what can be changed lives in Accounts. */}
-              {step.id === 'claim' && (
-                <p className="text-xs text-text-dim">
-                  {ACCOUNT_ROW_TEXT}{' '}
-                  <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
-                </p>
-              )}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <StatusBadge step={step} />
-              {step.status === 'done' && !step.read_only && step.id !== 'claim' && (
-                <Link
-                  to={stopPath(step.id)}
-                  state={{ returnTo: '/setup' }}
-                  className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
-                >
-                  Change
+      {own.length > 0 && (
+        <ol className="flex flex-col gap-1" aria-label="Steps">
+          {own.map((step) => (
+            <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
+              <div className="min-w-0">
+                <Link to={stopPath(step.id)} className="text-sm text-text hover:underline underline-offset-2">
+                  {stepTitle(step)}
                 </Link>
-              )}
-            </div>
-          </li>
-        ))}
-      </ol>
+                {step.summary && <p className="text-xs text-text-dim truncate">{step.summary}</p>}
+                {/* The account's page is read-only; what can be changed lives in Accounts. */}
+                {step.id === 'claim' && (
+                  <p className="text-xs text-text-dim">
+                    {ACCOUNT_ROW_TEXT}{' '}
+                    <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <StatusBadge step={step} />
+                {step.status === 'done' && !step.read_only && step.id !== 'claim' && (
+                  <Link
+                    to={stopPath(step.id)}
+                    state={{ returnTo: '/setup' }}
+                    className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
+                  >
+                    Change
+                  </Link>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
 
       {operator.length > 0 && (
         <section aria-labelledby="setup-operator-heading" className="flex flex-col gap-1">

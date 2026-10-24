@@ -180,9 +180,13 @@ person's **own** steps. A done step that the server marks read-only (under
 lockdown, or a step the operator provided on an instance that keeps no
 credentials) is the **operator's**: the Overview lists it under "Your operator
 has configured", with its title and summary and no Change link. The Mode step
-is read-only once chosen, but it stays an own step. A step that a lockdown or
-the policy closed and that is not done is **hidden**: the page does not show
-it. A link to an operator's or a hidden step goes to the Overview.
+and the Account (the claim) are never the operator's: the person chose them.
+The Mode step is read-only once chosen, but it stays an own step. A step that
+a lockdown or the policy closed and that is not done is **hidden**: the page
+does not show it (also the Mode step, when a lockdown closed it before a mode
+was chosen). A link to an operator's or a hidden step goes to the Overview.
+When no step is left for the person, the Overview and the Review say that the
+operator configured every step, in place of the count and the list.
 
 Step forms (`steps/*.tsx`) open on the server's values and are keyed by
 `${viewer.id}:${step.etag}`, so another person's save — or a restart —

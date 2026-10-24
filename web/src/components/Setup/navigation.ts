@@ -19,16 +19,23 @@ function wizardStops(state: SetupState): WizardStop[] {
  * - `operator`: a done step that the person cannot change here. The server
  *   makes a done step read-only under lockdown and, on an instance that
  *   keeps no credentials, when the operator provided it. The Overview lists
- *   it under "Your operator has configured", with no Change link. The Mode
- *   step is read-only once chosen, but the person chose it, so it stays `own`.
+ *   it under "Your operator has configured", with no Change link.
  * - `hidden`: a step that a lockdown or the instance's policy closed and
  *   that is not done. The page does not show it.
+ *
+ * The Mode step and the claim (the Account) are never the operator's: a
+ * person chose the mode and created the account. The Mode step is read-only
+ * once chosen and stays `own`; under a lockdown that closed it before a mode
+ * was chosen, it is `hidden` like any closed step.
  */
 export type StepPlace = 'own' | 'operator' | 'hidden';
 
+/** The steps whose value a person gave on this page, whatever `read_only` says. */
+const PERSON_STEPS: ReadonlySet<SetupStepId> = new Set<SetupStepId>(['mode', 'claim']);
+
 export function stepPlace(step: SetupStep): StepPlace {
   if (!appliesHere(step)) return 'hidden';
-  if (step.status === 'done' && step.read_only && step.id !== 'mode') return 'operator';
+  if (step.status === 'done' && step.read_only && !PERSON_STEPS.has(step.id)) return 'operator';
   return 'own';
 }
 

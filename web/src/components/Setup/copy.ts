@@ -493,6 +493,8 @@ export const OVERVIEW_SUBLINE = 'The Mode and Model steps are required. You can 
 export const OVERVIEW_SUBLINE_FINISHED = 'Use Change next to a step to edit it.';
 /** The Overview's section of the done steps that the person cannot change here. */
 export const OPERATOR_SECTION_HEADING = 'Your operator has configured';
+/** The Overview and the Review when no step is left for the person to take. */
+export const ALL_STEPS_OPERATOR = 'Your operator has configured every step on this instance.';
 /** The claim row's secondary text; the last word is the link to Accounts. */
 export const ACCOUNT_ROW_TEXT = 'Manage people and passwords in';
 export const ACCOUNT_ROW_LINK = 'Accounts';
