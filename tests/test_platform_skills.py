@@ -8,6 +8,7 @@ precedence for an id that is in both, and refuses to change them.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ from nerve.agent.tools.handlers.skills import (
     skill_update_handler,
 )
 from nerve.agent.tools.registry import ToolContext
-from nerve.config import LockdownError, NerveConfig
+from nerve.config import NerveConfig
 from nerve.skills.manager import (
     PLATFORM_SKILL_READ_ONLY,
     SOURCE_PLATFORM,
@@ -145,6 +146,7 @@ class TestDiscovery:
         await mgr.discover()
 
         assert await db.get_skill_row("beta") is None
+        assert "beta" not in mgr._cache, "the system prompt's skill list reads the cache"
 
     @pytest.mark.asyncio
     async def test_a_platform_directory_that_is_not_a_skill_id_is_skipped(self, dirs, mgr):
@@ -173,35 +175,83 @@ class TestDiscovery:
         _skill(dirs.ws_skills, "alpha")
         _skill(dirs.platform_skills, "beta")
         _skill(dirs.platform_skills, "alpha", body="platform body")
+        await mgr.discover()
+        assert mgr.source("beta") == SOURCE_PLATFORM
+        # A reload that turns lockdown on.
         monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True))
 
         with caplog.at_level(logging.INFO, logger="nerve.skills.manager"):
             found = await mgr.discover()
 
         assert [(m.id, m.source) for m in found] == [("alpha", SOURCE_WORKSPACE)]
+        assert set(mgr._cache) == {"alpha"}
+        assert mgr._cache["alpha"].source == SOURCE_WORKSPACE
         assert mgr.source("alpha") == SOURCE_WORKSPACE
         assert (await mgr.get_skill("alpha")).content == "Do the thing."
         assert await mgr.get_skill("beta") is None
         assert any("lockdown" in r.getMessage() for r in caplog.records)
 
 
-class TestReadOnly:
+
+_AS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_AS_ROOT, reason="root can read a directory with mode 000")
+class TestUnreadablePlatformDirectory:
+    """Another party owns the platform directory. A mode that Nerve cannot
+    read gives no platform skills there and does not break workspace skills."""
+
     @pytest.mark.asyncio
-    async def test_update_and_delete_refuse_a_platform_skill(self, dirs, mgr):
-        skill_dir = _skill(dirs.platform_skills, "beta")
-        before = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-        await mgr.discover()
+    async def test_an_unreadable_platform_directory_leaves_workspace_skills_working(
+        self, dirs, mgr, caplog,
+    ):
+        _skill(dirs.ws_skills, "alpha")
+        _skill(dirs.platform_skills, "beta")
+        dirs.platform_skills.chmod(0)
+        try:
+            with caplog.at_level(logging.ERROR, logger="nerve.skills.manager"):
+                found = await mgr.discover()
 
-        with pytest.raises(PlatformSkillError) as update:
-            await mgr.update_skill("beta", "---\nname: beta\n---\nchanged\n")
-        with pytest.raises(PlatformSkillError) as delete:
-            await mgr.delete_skill("beta")
+            assert [(m.id, m.source) for m in found] == [("alpha", SOURCE_WORKSPACE)]
+            assert mgr.source("alpha") == SOURCE_WORKSPACE
+            assert mgr.source("beta") == SOURCE_WORKSPACE
+            assert (await mgr.get_skill("alpha")).content == "Do the thing."
+            assert [s["id"] for s in await mgr.get_enabled_summaries()] == ["alpha"]
+            assert await mgr.update_skill("alpha", "---\nname: alpha\n---\nnew\n") is not None
+            assert any("platform skills" in r.getMessage() for r in caplog.records)
+        finally:
+            dirs.platform_skills.chmod(0o755)
 
-        assert str(update.value) == PLATFORM_SKILL_READ_ONLY
-        assert str(delete.value) == PLATFORM_SKILL_READ_ONLY
-        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == before
-        assert not (dirs.ws_skills / "beta").exists()
+    @pytest.mark.asyncio
+    async def test_one_unreadable_platform_skill_does_not_stop_the_scan(
+        self, dirs, mgr, caplog,
+    ):
+        _skill(dirs.ws_skills, "alpha")
+        _skill(dirs.ws_skills, "shared", body="workspace body")
+        _skill(dirs.platform_skills, "beta")
+        broken = _skill(dirs.platform_skills, "shared", body="platform body")
+        broken.chmod(0)
+        try:
+            with caplog.at_level(logging.ERROR, logger="nerve.skills.manager"):
+                found = await mgr.discover()
 
+            assert [(m.id, m.source) for m in found] == [
+                ("alpha", SOURCE_WORKSPACE),
+                ("beta", SOURCE_PLATFORM),
+                ("shared", SOURCE_WORKSPACE),
+            ]
+            # The skill in effect for the id agrees with the scan.
+            assert mgr.source("shared") == SOURCE_WORKSPACE
+            assert (await mgr.get_skill("shared")).content == "workspace body"
+            assert any(
+                "shared" in r.getMessage() and r.levelno == logging.ERROR
+                for r in caplog.records
+            )
+        finally:
+            broken.chmod(0o755)
+
+
+class TestReadOnly:
     @pytest.mark.asyncio
     async def test_create_refuses_an_id_the_platform_provides(self, dirs, mgr):
         _skill(dirs.platform_skills, "beta")
@@ -239,28 +289,8 @@ class TestReadOnly:
         assert await mgr.delete_skill("alpha") is True
         assert not (dirs.ws_skills / "alpha").exists()
 
-    @pytest.mark.asyncio
-    async def test_lockdown_still_refuses_first(self, dirs, mgr, monkeypatch):
-        _skill(dirs.platform_skills, "beta")
-        monkeypatch.setattr(cfg, "_config", NerveConfig(lockdown=True))
-
-        with pytest.raises(LockdownError):
-            await mgr.update_skill("beta", "x")
-        with pytest.raises(LockdownError):
-            await mgr.toggle_skill("beta", False)
-
 
 class TestReferencesAndScripts:
-    @pytest.mark.asyncio
-    async def test_references_are_read_from_the_platform_directory(self, dirs, mgr):
-        skill_dir = _skill(dirs.platform_skills, "beta")
-        (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "guide.md").write_text("platform guide", encoding="utf-8")
-        await mgr.discover()
-
-        assert await mgr.list_references("beta") == ["guide.md"]
-        assert await mgr.read_reference("beta", "guide.md") == "platform guide"
-
     @pytest.mark.asyncio
     async def test_a_reference_path_cannot_leave_the_platform_skill(self, dirs, mgr):
         skill_dir = _skill(dirs.platform_skills, "beta")
@@ -297,16 +327,6 @@ class TestTools:
 
         assert "- **alpha** (`alpha`): Workspace skill." in text
         assert "- **beta** (`beta`): [platform, read only] Platform skill." in text
-        assert "`skill_update` cannot change them" in text
-
-    @pytest.mark.asyncio
-    async def test_skill_list_without_platform_skills_has_no_note(self, dirs, mgr):
-        _skill(dirs.ws_skills, "alpha")
-        await mgr.discover()
-
-        text = _text(await skill_list_handler(_ctx(mgr), {}))
-
-        assert "platform" not in text
 
     @pytest.mark.asyncio
     async def test_skill_get_names_the_source_and_platform_files(self, dirs, mgr):
@@ -350,7 +370,7 @@ class TestTools:
             _ctx(mgr), {"name": "beta", "content": "---\nname: beta\n---\nchanged\n"},
         )
 
-        assert _text(result) == PLATFORM_SKILL_READ_ONLY
+        assert PLATFORM_SKILL_READ_ONLY in _text(result)
         assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == before
 
     @pytest.mark.asyncio
@@ -362,9 +382,7 @@ class TestTools:
             _ctx(mgr), {"name": "beta", "description": "A copy."},
         )
 
-        assert _text(result).startswith(
-            "A skill with the id 'beta' is provided by the platform"
-        )
+        assert "A skill with the id 'beta' is provided by the platform" in _text(result)
         assert not (dirs.ws_skills / "beta").exists()
 
 

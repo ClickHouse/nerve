@@ -159,7 +159,6 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
-- Platform skills: read-only skills in `<config_dir>/skills/<name>/SKILL.md` (see below)
 
 #### Platform skills
 
@@ -167,7 +166,8 @@ The operator or the hosting platform can give the agent skills that the person
 who uses the instance cannot change. They go in `skills/` in the config
 directory, next to `config.yaml` and `platform.md`, with the same layout as
 workspace skills. Nerve never writes this directory, and a missing directory
-is not an error.
+is not an error. When Nerve cannot read the directory or a skill in it, it logs
+an error and leaves those skills out. The workspace skills still load.
 
 - Nerve reads them at startup, on a reload and on `POST /api/skills/sync`,
   together with `workspace/skills/`.

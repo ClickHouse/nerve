@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -180,12 +181,18 @@ class SkillManager:
         return self.platform_dir
 
     def _platform_skill_dir(self, skill_id: str) -> Path | None:
-        """The platform's directory for ``skill_id`` when it has a SKILL.md."""
+        """The platform's directory for ``skill_id`` when it has a SKILL.md.
+
+        Another party owns this directory. ``os.path.isfile`` gives False for
+        a path that Nerve cannot search, where ``Path.exists`` raises
+        ``PermissionError``, so such a path means "no platform skill" and the
+        lookup of every other skill still works.
+        """
         root = self._platform_root()
         if root is None or not _SKILL_ID_RE.match(skill_id):
             return None
         skill_dir = root / skill_id
-        return skill_dir if (skill_dir / "SKILL.md").exists() else None
+        return skill_dir if os.path.isfile(skill_dir / "SKILL.md") else None
 
     def skill_dir(self, skill_id: str) -> Path:
         """The directory of the skill in effect for ``skill_id``: the
@@ -216,7 +223,11 @@ class SkillManager:
         discovered: list[SkillMeta] = []
         found_ids: set[str] = set()
         platform_root = self._platform_root()
-        if platform_root is None and self.platform_dir is not None and self.platform_dir.is_dir():
+        if (
+            platform_root is None
+            and self.platform_dir is not None
+            and os.path.isdir(self.platform_dir)
+        ):
             logger.info(
                 "This instance is in lockdown: platform skills in %s are not read",
                 self.platform_dir,
@@ -233,6 +244,23 @@ class SkillManager:
                 logger.error("Failed to read platform skills in %s: %s", root, e)
                 return []
 
+        def _is_platform_skill(sdir: Path) -> bool:
+            """Whether ``sdir`` holds a platform skill to index. An entry
+            that cannot be read is logged and skipped: it never stops the
+            scan, so the workspace skills still load."""
+            try:
+                if not (sdir / "SKILL.md").is_file():
+                    return False
+            except OSError as e:
+                logger.error("Failed to read platform skill %s: %s", sdir.name, e)
+                return False
+            if not _SKILL_ID_RE.match(sdir.name):
+                logger.warning(
+                    "Skipping platform skill %r: not a valid skill id", sdir.name,
+                )
+                return False
+            return True
+
         def _scan_skill_dirs() -> list[tuple[Path, str, str]]:
             """Collect (skill_dir, raw SKILL.md, source) off the event loop.
 
@@ -246,16 +274,11 @@ class SkillManager:
             out: list[tuple[Path, str, str]] = []
             for root, source in roots:
                 for sdir in _skill_dirs(root, source):
-                    if not sdir.is_dir():
-                        continue
                     smd = sdir / "SKILL.md"
-                    if not smd.exists():
-                        continue
-                    if source == SOURCE_PLATFORM and not _SKILL_ID_RE.match(sdir.name):
-                        logger.warning(
-                            "Skipping platform skill %r: not a valid skill id",
-                            sdir.name,
-                        )
+                    if source == SOURCE_PLATFORM:
+                        if not _is_platform_skill(sdir):
+                            continue
+                    elif not sdir.is_dir() or not smd.exists():
                         continue
                     if sdir.name in claimed:
                         logger.warning(
@@ -352,6 +375,9 @@ class SkillManager:
             if db_skill["id"] not in found_ids:
                 logger.info("Removing stale skill from DB: %s", db_skill["id"])
                 await self.db.delete_skill_row(db_skill["id"])
+        # The system prompt's skill list reads the cache.
+        for skill_id in set(self._cache) - found_ids:
+            del self._cache[skill_id]
 
         logger.info("Discovered %d skills", len(discovered))
         return discovered
