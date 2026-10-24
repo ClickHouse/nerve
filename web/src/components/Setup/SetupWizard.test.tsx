@@ -283,6 +283,32 @@ describe('rail and overview', () => {
     expect(field).not.toHaveAccessibleDescription(/Prefilled from/);
   });
 
+  it('the agent name the environment gives stands in and is saved on Continue', async () => {
+    // A hosted deployment seeds the agent's display name; IDENTITY.md has no
+    // name yet, so the prefill differs from what the file holds and is sent.
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: null, agent_name_prefill: 'Ada',
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Ada');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.objectContaining({ agent_name: 'Ada' }));
+  });
+
+  it('a saved agent name is not sent again, prefill or not', async () => {
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: 'Lovelace', agent_name_prefill: null,
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Lovelace');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.not.objectContaining({ agent_name: expect.anything() }));
+  });
+
   it('the model picker names the server default instead of "keep the current model"', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-sonnet-4-6', effort: 'high',

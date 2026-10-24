@@ -222,10 +222,16 @@ A few things worth knowing per step:
   defaults, as before).
 - **About you** prefills the time zone from your browser. Quiet hours are
   optional: on a personal install the switch starts on with 22:00–07:00 while
-  the instance still has the defaults; a worker's starts off. Continuing
-  accepts what the form shows; the step counts as decided. Nerve records quiet
-  hours for the agent and does not hold messages back itself (see
-  [Configuration → Quiet Hours](config.md#quiet-hours)).
+  the instance still has the defaults; a worker's starts off. The agent's name
+  is prefilled from the name the environment gives the agent
+  (`NERVE_DISPLAY_NAME`, which a hosted deployment seeds from its own record)
+  while `IDENTITY.md`'s name line is still the template's; Continuing writes
+  it there like a typed name, and from then on the file is the source. A name
+  the step would refuse — over 40 characters, or not a single line — is not
+  offered, and nothing is offered under lockdown.
+  Continuing accepts what the form shows; the step counts as decided. Nerve
+  records quiet hours for the agent and does not hold messages back itself
+  (see [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the

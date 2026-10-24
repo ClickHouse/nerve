@@ -68,7 +68,9 @@ from nerve.identity import Actor
 from nerve.onboarding_catalog import ITEMS as WORK_ITEMS
 from nerve.onboarding_catalog import CUSTOM_MAX, RULES_MAX, WorkSelection, in_catalog_order
 from nerve.setup_checklist import (
+    AGENT_NAME_MAX_CHARS,
     BLOCKED_POLICY,
+    CONTROL_CHARS_RE,
     GITHUB_SWITCH,
     LOCKDOWN_TEXT,
     MODE_LOCK_REASON,
@@ -86,6 +88,7 @@ from nerve.setup_checklist import (
     STEP_SOURCES,
     Facts,
     Step,
+    agent_display_name_from_environment,
     derive,
     managed_switch_reason,
     sources_available,
@@ -265,7 +268,7 @@ def install_handlers(app) -> None:
 # (USER.md, IDENTITY.md) or into a header: a control character would start a
 # new line inside a file that is loaded into the system prompt, or an illegal
 # HTTP header value in a probe. ``\x7f`` and C1 controls included.
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_RE = CONTROL_CHARS_RE
 _SINGLE_LINE_DETAIL = "Use a single line without control characters."
 
 
@@ -558,6 +561,7 @@ async def _context(actor: Actor) -> _Context:
         onboarding_kind=onboarding_kind,
         onboarding_awaiting=_onboarding_awaiting(onboarding, onboarding_id),
         display_name=actor.display_name,
+        agent_display_name=agent_display_name_from_environment(),
         bot_username=_bot_username(config, state, live),
         account_username=username,
         account_passwordless=passwordless,
@@ -1548,7 +1552,7 @@ async def set_profile(req: ProfileRequest, actor: Actor = Depends(require_person
         value = given.get(field_name)
         if isinstance(value, str):
             _reject_control_chars(field_name, value)
-    limits = {"name": 80, "agent_name": 40, "language": 40, "about": 600}
+    limits = {"name": 80, "agent_name": AGENT_NAME_MAX_CHARS, "language": 40, "about": 600}
     for field_name, limit in limits.items():
         value = about if field_name == "about" else given.get(field_name)
         if isinstance(value, str) and len(value.strip()) > limit:

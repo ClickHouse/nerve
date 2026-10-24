@@ -286,7 +286,7 @@ Response: {
       "detail": { "name": "Alice", "name_source": "account", "display_name_editable": true, "writable_fields": null,
                   "timezone": "Europe/Berlin", "timezone_is_default": false,
                   "quiet_enabled": true, "quiet_start": "02:00", "quiet_end": "08:00", "quiet_is_default": true,
-                  "language": null, "agent_name": null, "agent_emoji": null, "about_set": false,
+                  "language": null, "agent_name": null, "agent_name_prefill": null, "agent_emoji": null, "about_set": false,
                   "user_md_pristine": { "name": true, "timezone": false, "language": true, "quiet_hours": true, "work": true },
                   "identity_md_pristine": { "name": true, "emoji": true } } },
     { "id": "memory", "…": "…" },
@@ -358,7 +358,12 @@ when the only credential is a subscription token (memory, titles and cron
 need an API key). `detail.channels.telegram.start_error` carries the scrubbed
 reason when the bot failed to start at this boot. In external mode
 `detail.profile.name_source` is `actor_header` and `display_name_editable` is
-`false`.
+`false`. `detail.profile.agent_name` is the name `IDENTITY.md` holds;
+`agent_name_prefill` is the name the environment gives the agent
+(`NERVE_DISPLAY_NAME`, which a hosted deployment seeds), offered while the
+file's name line is still the template's and the instance is not under
+lockdown, so the page shows it as the field's value and sends it on Continue
+like a typed name; a name outside the bounds of a typed one is not offered.
 
 `detail.profile.quiet_enabled` is `true` when both quiet times are set; both
 empty means no quiet hours. `quiet_is_default` compares with the mode's

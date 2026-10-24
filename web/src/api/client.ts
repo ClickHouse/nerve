@@ -207,6 +207,13 @@ export interface SetupProfileDetail {
   quiet_is_default: boolean;
   language: string | null;
   agent_name: string | null;
+  /**
+   * The name the environment gives the agent, offered while IDENTITY.md's
+   * name line is still the template's; the form shows it as the field's
+   * value and sends it on Continue like a typed name. Absent from an older
+   * backend.
+   */
+  agent_name_prefill?: string | null;
   agent_emoji: string | null;
   about_set: boolean;
   user_md_pristine: Record<string, boolean>;
