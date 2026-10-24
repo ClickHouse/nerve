@@ -38,7 +38,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 **Notifications and delivery**
 - `notify`: fire-and-forget; priority `low`/`normal`/`high`/`urgent`; a silence rule can suppress it (`force=true` overrides)
 - `ask_user`: async question with optional buttons; the answer lands in this session
-- `ask_form`: web chat only; a form of up to six questions (`choice`, `multi`, `text`, `list`, `repos`, `url`) that waits up to an hour and returns the answers as lines and JSON; elsewhere it fails, so use `ask_user`
+- `ask_form`: web chat only; a form of up to six questions (`choice`, `multi`, `text`, `list`, `repos`, `url`) with an optional `intro` shown above them (the explanation goes there, since the person does not see your thinking), that waits up to an hour and returns the answers as lines and JSON; elsewhere it fails, so use `ask_user`
 - `propose_action`: Approve/Decline/Snooze card dispatched server-side by `target_kind`; the answer is not injected
 - `notification_silence`: `add`/`list`/`remove` silence rules; only on explicit instruction or a recorded ruling
 - `react`/`send_sticker`: emoji reaction on the last message (Telegram, Slack); Telegram sticker by `file_id`

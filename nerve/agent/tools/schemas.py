@@ -718,6 +718,8 @@ FORM_SINGLE_KINDS = frozenset({"choice", "text", "url"})
 FORM_OPTION_KINDS = frozenset({"choice", "multi"})
 FORM_MAX_QUESTIONS = 6
 FORM_LABEL_MAX = 40
+#: The intro, the text the card shows above the questions.
+FORM_INTRO_MAX = 1500
 FORM_MIN_OPTIONS = 2
 FORM_MAX_OPTIONS = 8
 #: A question's id: a slug, the key of its answer. Taken verbatim, never
@@ -730,6 +732,17 @@ ASK_FORM_SCHEMA = {
         "title": {
             "type": "string",
             "description": "Optional heading shown above the questions.",
+            "default": "",
+        },
+        "intro": {
+            "type": "string",
+            "maxLength": FORM_INTRO_MAX,
+            "description": (
+                "What the person reads before the questions, as Markdown: what you "
+                "understood, what you intend to do and why you ask. The card shows it "
+                "above the questions. The person does not see your thinking, so write "
+                "the explanation here."
+            ),
             "default": "",
         },
         "questions": {

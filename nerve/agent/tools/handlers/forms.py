@@ -37,6 +37,7 @@ from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     ASK_FORM_SCHEMA,
     FORM_ID_PATTERN,
+    FORM_INTRO_MAX,
     FORM_KINDS,
     FORM_LABEL_MAX,
     FORM_MAX_OPTIONS,
@@ -83,7 +84,8 @@ Answer = str | list[str]
 def validate_form(args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """The form the web shows, normalized, and what is wrong with the call.
 
-    The form is ``{"title", "questions"}``; every question has every key:
+    The form is ``{"title", "intro", "questions"}``, ``title`` and ``intro``
+    stripped (``""`` when absent); every question has every key:
     ``id`` verbatim; ``kind``; ``label``, ``question``, ``help`` and
     ``placeholder`` stripped (``""`` when absent); ``required`` (default
     true); ``options`` as ``{"label", "description"}`` (``[]`` unless the kind
@@ -101,7 +103,16 @@ def validate_form(args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     elif not isinstance(title, str):
         problems.append("title: must be a string")
         title = ""
-    form: dict[str, Any] = {"title": title.strip(), "questions": []}
+    intro = args.get("intro")
+    if intro is None:
+        intro = ""
+    elif not isinstance(intro, str):
+        problems.append("intro: must be a string")
+        intro = ""
+    intro = intro.strip()
+    if len(intro) > FORM_INTRO_MAX:
+        problems.append(f"intro: at most {FORM_INTRO_MAX} characters (got {len(intro)})")
+    form: dict[str, Any] = {"title": title.strip(), "intro": intro, "questions": []}
     raw_questions = args.get("questions")
     if not isinstance(raw_questions, list):
         problems.append(f"questions: a list of 1 to {FORM_MAX_QUESTIONS} questions")
@@ -446,6 +457,9 @@ ASK_FORM_SPEC = ToolSpec(
         "help. For choice and multi, put the recommended option first with "
         "'(recommended)' at the end of its label; Other… lets the person type an "
         "answer of their own unless allow_other is false.\n"
+        "Put what the person should read first (what you understood, what you "
+        "intend, why you ask) in intro: the card shows it above the questions, and "
+        "the person does not see your thinking.\n"
         "The result has one line per question ('Repositories: org/repo-a, "
         "org/repo-b') and ends with the same answers as JSON: "
         '{"answers": {<id>: string | [string]}, "skipped": [<id>]}: a string for '

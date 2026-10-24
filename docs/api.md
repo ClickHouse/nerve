@@ -1825,7 +1825,8 @@ those for another session. Events marked *global* go to every socket.
 // plan file's text, read again at every call) and planFilePath.
 // For ask_form (interaction_type "form", tool_name "ask_form"; the chat's
 // tool block names it mcp__nerve__ask_form) tool_input is the form,
-// normalized, every key present: { title: "" | "…", questions: [{ id (as the
+// normalized, every key present: { title: "" | "…", intro: "" | "…" (Markdown,
+// at most 1500 characters, shown above the card), questions: [{ id (as the
 // agent sent it), kind: "choice" | "multi" | "text" | "list" | "repos" |
 // "url", label (at most 40 characters), question, help, placeholder,
 // required, options: [{ label, description }] (2–8 for choice and multi, []
