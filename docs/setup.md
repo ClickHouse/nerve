@@ -455,8 +455,11 @@ Nerve to apply your setup" when only the restart is left). The count
 includes the steps that are waiting for the Mode step, so it only ever goes
 down; steps a lockdown makes read-only are never counted. The
 chat page's empty state points at the Model step until a provider is
-configured. On the Overview every done step has a **Change** link; a skipped
-step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
+configured. On the Overview every done step of your own has a **Change**
+link; a skipped step offers **Undo skip**. A done step that you cannot change
+here, because the operator configured it, is listed under **Your operator has
+configured**, with its summary and no Change link. A step that a lockdown or
+the instance's policy closed is not shown. The CLI reports the same checklist: `nerve status`
 prints `Setup checklist: N steps left — http://…/setup`, and `nerve doctor`
 prints `[OK] Setup checklist complete` or
 `[WARN] Setup checklist incomplete (steps: provider, profile) — finish at /setup`.
@@ -771,8 +774,9 @@ the setup page works the same way with these differences:
   environment.
 - **The wizard starts at Mode**, with an overview that says who you are
   ("Signed in as Alice Example through your organisation's sign-in"), what the
-  wizard does, and what is already configured. It configures the instance for
-  everyone who uses it; nothing in it is personal to your account.
+  wizard does, and what your operator has configured. It configures the
+  instance for everyone who uses it; nothing in it is personal to your
+  account.
 - **Any signed-in person may run setup.** There is no owner. Several people
   may have it open; the state is server-side, every save returns the whole
   checklist, and the last writer wins per step.
@@ -804,12 +808,14 @@ the setup page works the same way with these differences:
 
 Under [lockdown](config.md#lockdown-remote-only-read-only) configuration
 arrives by pull request, so the wizard is read-only for anything it would
-write to configuration or to a reviewed workspace file. Such steps read
-**blocked**, each with the reason ("Configuration is managed from the config
-repository on this instance; changes arrive by PR and sync. Configure this
-step from the config repository."), and are not counted as "left to do" —
-a locked instance that has everything provisioned reads as finished and the
-banner stays quiet. What still works: the claim (it writes to `nerve.db`), a
+write to configuration or to a reviewed workspace file. `GET /api/setup`
+marks such a step **blocked**, with the reason ("Configuration is managed
+from the config repository on this instance; changes arrive by PR and sync.
+Configure this step from the config repository."), and does not count it as
+"left to do". The setup page does not show it. A locked instance that has
+everything provisioned reads as finished and the banner stays quiet. A step
+that is done is read-only, and the Overview lists it under **Your operator
+has configured**. What still works: the claim (it writes to `nerve.db`), a
 worker's `TASK.md` once the templates have arrived from the repository, your
 display name (local mode), skipping, finishing and restarting.
 
@@ -835,11 +841,11 @@ something else) stops the configuration from loading, as it does for
 on every request, so a reload applies it. The wizard then says so instead of
 offering the fields:
 
-- **Memory**, **Sources** and **Agents** read "Not available on this
-  instance", with the reason: *This instance does not store credentials
-  entered here. Connections are provided by the operator of this
-  deployment.* They are not counted as left to do, so the checklist can
-  finish without them.
+- **Memory**, **Sources** and **Agents** are closed, with the reason: *This
+  instance does not store credentials entered here. Connections are
+  provided by the operator of this deployment.* The setup page does not show
+  them. They are not counted as left to do, so the checklist can finish
+  without them.
   Recall is LLM-ranked, as it is on any instance without an OpenAI key.
 - **Sources** stays open for one toggle when the operator provides the
   GitHub token from the environment (`GH_TOKEN` or `GITHUB_TOKEN` in the
@@ -864,7 +870,7 @@ offering the fields:
   server.
 - A step the operator provided — an OpenAI key or a bot token as a `${VAR}`
   reference, a source switched on in the tracked settings — stays done and
-  reads read-only.
+  read-only, and the Overview lists it under **Your operator has configured**.
 - The writes behind those steps answer `409` with the same two sentences:
   the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
   mode and the GitHub switch with a token from the environment excepted), the

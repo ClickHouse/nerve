@@ -155,9 +155,9 @@ left alone, and a partially set-up instance — Mode chosen, steps left — gets
 the banner instead.
 
 The wizard is a `PageHeader` ("Set up Nerve"), a progress rail
-(`ProgressRail`: `<nav aria-label="Setup steps">` with an ordered list,
-`aria-current="step"`, a status badge per step — done, To do, Skipped,
-Blocked with the reason as helper text, a lock on read-only steps) and the
+(`ProgressRail`: `<nav aria-label="Setup steps">` with an ordered list of the
+person's own steps and Review, `aria-current="step"`, a status badge per step:
+Done, To do, Skipped, After Mode, a lock on a read-only step) and the
 current step. On desktop the rail is a 220 px column; on phones it lives in a
 drawer opened from the header and a line under the header reads "Step 3 of 9 ·
 Model". Every step is a `<form aria-label>` with an `<h1 tabIndex={-1}>` that
@@ -171,9 +171,18 @@ Back on a dirty form asks "Leave without saving?" inline (`role="alertdialog"`).
 The **Overview** orients: "Signed in as alice" (in external mode: "Signed in
 as Alice Example through your organisation's sign-in"), what the wizard does,
 N of M steps done, the step list with badges and Change links, a notice when a
-restart is pending, and Continue to the first pending step. M counts only the
-steps that apply on this instance: a step closed by policy ("Not available on
-this instance") or by a lockdown stays in the list but is not counted.
+restart is pending, and Continue to the first pending step.
+
+`stepPlace` in `navigation.ts` puts each step in one of three places, and every
+list and walk of the steps uses it: the rail, the Overview list and its count,
+the Review, Back/Continue and the phone's position line show only the
+person's **own** steps. A done step that the server marks read-only (under
+lockdown, or a step the operator provided on an instance that keeps no
+credentials) is the **operator's**: the Overview lists it under "Your operator
+has configured", with its title and summary and no Change link. The Mode step
+is read-only once chosen, but it stays an own step. A step that a lockdown or
+the policy closed and that is not done is **hidden**: the page does not show
+it. A link to an operator's or a hidden step goes to the Overview.
 
 Step forms (`steps/*.tsx`) open on the server's values and are keyed by
 `${viewer.id}:${step.etag}`, so another person's save — or a restart —
@@ -209,7 +218,7 @@ worker should plan through the approval loop; a job that `jobs.yaml` replaces
 shows that file's state, read-only, with a note; Agents default-checks what is
 installed.
 
-**Review** (`steps/ReviewStep.tsx`) lists the checklist with Change links,
+**Review** (`steps/ReviewStep.tsx`) lists the own steps as a checklist with Change links,
 runs the server check-up (`GET /api/setup/environment`) with its hints — an
 HTTPS warning when the page is served over plain HTTP from a non-loopback
 address, a passwordless-on-LAN warning — shows what was written where from

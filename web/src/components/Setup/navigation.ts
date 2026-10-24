@@ -1,5 +1,4 @@
 import type { SetupState, SetupStep, SetupStepId } from '../../api/client';
-import { NO_LOCAL_SECRETS_TEXT } from './copy';
 
 /** The route segment of the review screen; a frontend route, not a server step. */
 export const REVIEW = 'review';
@@ -7,8 +6,40 @@ export const REVIEW = 'review';
 export type WizardStop = SetupStepId | typeof REVIEW;
 
 /** The ordered stops: the server's steps, then Review. */
-export function wizardStops(state: SetupState): WizardStop[] {
+function wizardStops(state: SetupState): WizardStop[] {
   return [...state.steps.map((s) => s.id), REVIEW];
+}
+
+/**
+ * Where the setup page shows a step.
+ *
+ * - `own`: a step that the person can take here. The rail, the Overview
+ *   list and its count, the Review, Back/Continue and the phone's position
+ *   line use these steps only.
+ * - `operator`: a done step that the person cannot change here. The server
+ *   makes a done step read-only under lockdown and, on an instance that
+ *   keeps no credentials, when the operator provided it. The Overview lists
+ *   it under "Your operator has configured", with no Change link. The Mode
+ *   step is read-only once chosen, but the person chose it, so it stays `own`.
+ * - `hidden`: a step that a lockdown or the instance's policy closed and
+ *   that is not done. The page does not show it.
+ */
+export type StepPlace = 'own' | 'operator' | 'hidden';
+
+export function stepPlace(step: SetupStep): StepPlace {
+  if (!appliesHere(step)) return 'hidden';
+  if (step.status === 'done' && step.read_only && step.id !== 'mode') return 'operator';
+  return 'own';
+}
+
+/** The steps that the person can take here, in the server's order. */
+export function ownSteps(state: SetupState): SetupStep[] {
+  return state.steps.filter((s) => stepPlace(s) === 'own');
+}
+
+/** The done steps that the operator configured, in the server's order. */
+export function operatorSteps(state: SetupState): SetupStep[] {
+  return state.steps.filter((s) => stepPlace(s) === 'operator');
 }
 
 export function stepOf(state: SetupState, id: string): SetupStep | undefined {
@@ -28,12 +59,14 @@ export function stepTitle(step: Pick<SetupStep, 'id' | 'title'>): string {
 }
 
 /**
- * Whether Back/Continue pass through a step. Blocked steps are skipped, and
+ * Whether Back/Continue pass through a step. A step that is not one of
+ * the person's own is skipped, a blocked step is skipped, and
  * so is the claim once it is done: it is a read-only card, and Back from
  * Mode — the first step a local first-time user sees — should land on the
  * Overview, exactly as it does in external mode. The rail still lists it.
  */
 function passesThrough(step: SetupStep): boolean {
+  if (stepPlace(step) !== 'own') return false;
   if (step.status === 'blocked') return false;
   if (step.id === 'claim' && step.status === 'done') return false;
   return true;
@@ -64,19 +97,20 @@ export function previousStop(state: SetupState, id: WizardStop): WizardStop | nu
   return null;
 }
 
-/** Where "Continue" on the Overview goes: the first pending step, else Review. */
+/** Where "Continue" on the Overview goes: the first pending step of the person's own, else Review. */
 export function firstPendingStop(state: SetupState): WizardStop {
-  const pending = state.steps.find((s) => s.status === 'pending');
+  const pending = ownSteps(state).find((s) => s.status === 'pending');
   return pending ? pending.id : REVIEW;
 }
 
 /**
- * One-based position of a *step*, for "Step 3 of 9". Review is not a step
- * (it is a frontend route), so it has no position.
+ * One-based position of a *step* among the person's own steps, for "Step 3
+ * of 9". Review is not a step (it is a frontend route), so it has no position.
  */
 export function stopPosition(state: SetupState, id: WizardStop): { index: number; total: number } | null {
-  const index = state.steps.findIndex((s) => s.id === id);
-  return index < 0 ? null : { index: index + 1, total: state.steps.length };
+  const steps = ownSteps(state);
+  const index = steps.findIndex((s) => s.id === id);
+  return index < 0 ? null : { index: index + 1, total: steps.length };
 }
 
 /** The prefix the server uses for "this step waits on the Mode step". */
@@ -92,25 +126,15 @@ export function waitsForMode(step: Pick<SetupStep, 'status' | 'blocked_reason'>)
 }
 
 /**
- * A step the instance has closed because it keeps no credentials on disk
- * and the step's only purpose is to store one. Nothing on the page can
- * open it, so it reads "Not available" and shows the reason, not a form.
- * The sentence is matched too, for a backend that sends no `blocked_kind`.
- */
-export function closedByPolicy(step: Pick<SetupStep, 'status' | 'blocked_kind' | 'blocked_reason'>): boolean {
-  return step.status === 'blocked'
-    && (step.blocked_kind === 'policy' || step.blocked_reason === NO_LOCAL_SECRETS_TEXT);
-}
-
-/**
  * A step that a person can complete on this instance, now or after the
  * Mode step. A step that the instance closed by policy or by a lockdown
- * does not apply: the server never counts it as left to do, and the
- * Overview does not count it in "N of M steps done". On a locked instance
- * a step can wait for Mode and still be `lockdown`: nothing on the page
- * can answer Mode there, so that step does not apply either.
+ * does not apply: the server never counts it as left to do, and the page
+ * does not show it. On a locked instance a step can wait for Mode and
+ * still be `lockdown`: nothing on the page can answer Mode there, so that
+ * step does not apply either. Any other `blocked` step, also from a
+ * backend that sends no `blocked_kind`, does not apply.
  */
-export function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason' | 'blocked_kind'>): boolean {
+function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason' | 'blocked_kind'>): boolean {
   return step.status !== 'blocked' || (waitsForMode(step) && step.blocked_kind !== 'lockdown');
 }
 

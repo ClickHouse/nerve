@@ -2,14 +2,13 @@ import { Link } from 'react-router-dom';
 import type { SetupState } from '../../api/client';
 import { Badge } from '../ui';
 import { ListChecks } from '../ui/icons';
-import { REVIEW, stepTitle, stopPath, waitsForMode, type WizardStop } from './navigation';
+import { REVIEW, ownSteps, stepTitle, stopPath, type WizardStop } from './navigation';
 import { StatusBadge } from './StatusBadge';
 
 /**
- * The progress rail: an ordered list of the steps with their status, the
- * current one marked `aria-current="step"`. Items are ordinary links and
- * ordinary tab stops; a blocked step shows its reason as helper text —
- * except the four that merely wait for Mode, whose badge already says so.
+ * The progress rail: an ordered list of the person's own steps with their
+ * status, then Review, the current one marked `aria-current="step"`. Items
+ * are ordinary links and ordinary tab stops.
  */
 export function ProgressRail({ state, current, onNavigate }: {
   state: SetupState;
@@ -20,7 +19,7 @@ export function ProgressRail({ state, current, onNavigate }: {
   return (
     <nav aria-label="Setup steps" className="flex flex-col gap-1">
       <ol className="flex flex-col gap-0.5">
-        {state.steps.map((step) => {
+        {ownSteps(state).map((step) => {
           const active = current === step.id;
           return (
             <li key={step.id}>
@@ -35,9 +34,6 @@ export function ProgressRail({ state, current, onNavigate }: {
                   <span className="text-sm">{stepTitle(step)}</span>
                   <StatusBadge step={step} />
                 </span>
-                {step.status === 'blocked' && step.blocked_reason && !waitsForMode(step) && (
-                  <span className="text-2xs text-text-dim leading-snug">{step.blocked_reason}</span>
-                )}
               </Link>
             </li>
           );

@@ -13,7 +13,7 @@ import {
   REVIEW_HEADING, WORK_REVIEW_ALSO, WORK_REVIEW_ITEMS, WORK_REVIEW_NONE, WORK_REVIEW_RULES,
   describeRestartReason, isFirstRunRestart,
 } from '../copy';
-import { stepTitle, stopPath } from '../navigation';
+import { ownSteps, stepTitle, stopPath } from '../navigation';
 import { Notice } from '../Notice';
 import { quietEnabled } from '../payload';
 import { ReadyScreen } from '../ReadyScreen';
@@ -108,7 +108,8 @@ export function ReviewStep({ state }: { state: SetupState }) {
     : state.restart_message;
   const anyBusy = busy !== null || reconnecting;
   const work = workOf(state);
-  const pendingSteps = state.steps.filter((s) => s.status === 'pending');
+  const own = ownSteps(state);
+  const pendingSteps = own.filter((s) => s.status === 'pending');
   const canFinish = pendingSteps.length === 0;
 
   // A fresh install always carries "memory: changed" from the Mode step and
@@ -212,7 +213,7 @@ export function ReviewStep({ state }: { state: SetupState }) {
       <section aria-label="Checklist" className="flex flex-col gap-1">
         <h2 className="text-sm font-medium text-text">Checklist</h2>
         <ul className="flex flex-col gap-1">
-          {state.steps.map((step) => (
+          {own.map((step) => (
             <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
               <div className="min-w-0">
                 <p className="text-sm text-text">{stepTitle(step)}</p>
