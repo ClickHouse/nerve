@@ -29,7 +29,7 @@ from typing import Any
 
 import yaml
 
-from nerve.config import NerveConfig
+from nerve.config import FALLBACK_TIMEZONE, NerveConfig
 from nerve.onboarding_catalog import WorkSelection, work_catalog
 from nerve.setup_provenance import SOURCE_ENVIRONMENT, SOURCE_FILE, SOURCE_GATEWAY
 from nerve.setup_state import SetupState
@@ -192,10 +192,6 @@ PAIRING_AFTER_RESTART = (
     "Pairing is offered there."
 )
 
-# What `nerve init` writes when nobody chose one (nerve/config.py's own
-# default). A timezone that differs from it is an answer somebody gave.
-DEFAULT_TIMEZONE = NerveConfig().timezone
-
 # The persisted-config subset of each step's detail. Volatile fields (a test
 # result, whether the bot is live, pairing counts, onboarding progress) are
 # excluded so a reload on `visibilitychange` never remounts a form someone is
@@ -254,6 +250,10 @@ class Facts:
     env_credential: bool = False
     #: The environment carries only an OAuth token (no API key).
     env_oauth_only: bool = False
+    #: The time zone Nerve uses when no settings layer names one
+    #: (:func:`nerve.config.default_timezone`). A time zone that differs from
+    #: it is an answer somebody gave.
+    default_timezone: str = FALLBACK_TIMEZONE
     #: ``not_applicable`` | ``pending`` | ``running`` | ``done`` | ``skipped``
     #: (:func:`nerve.onboarding.read_state`; ``nerve doctor`` reads only the
     #: worker's ``TASK.md``, see :func:`onboarding_from_task`).
@@ -617,7 +617,7 @@ def _profile_detail(facts: Facts, mode: str | None) -> tuple[dict[str, Any], str
         "display_name_editable": not facts.external_auth,
         "writable_fields": writable_fields,
         "timezone": config.timezone,
-        "timezone_is_default": config.timezone == DEFAULT_TIMEZONE,
+        "timezone_is_default": config.timezone == facts.default_timezone,
         "quiet_enabled": bool(quiet[0] and quiet[1]),
         "quiet_start": quiet[0],
         "quiet_end": quiet[1],
@@ -1072,7 +1072,7 @@ def derive(facts: Facts) -> list[Step]:
             ]["name"]
             done = bool(
                 STEP_PROFILE in answered
-                or config.timezone != DEFAULT_TIMEZONE
+                or config.timezone != facts.default_timezone
                 or name_filled
             )
             if done:

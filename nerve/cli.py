@@ -442,6 +442,7 @@ def _setup_summary(config) -> dict | None:
         return None
     try:
         from nerve import setup_checklist, setup_provenance, setup_state, setup_telegram_login
+        from nerve.config import default_timezone
         from nerve.db.accounts import read_setup_required
         from nerve.setup_writer import workspace_mode
 
@@ -466,6 +467,7 @@ def _setup_summary(config) -> dict | None:
             env_oauth_only=bool(
                 os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not os.environ.get("ANTHROPIC_API_KEY")
             ),
+            default_timezone=default_timezone(),
             onboarding=setup_checklist.onboarding_from_task(
                 Path(config.workspace), workspace_mode(Path(config.workspace)),
             ),

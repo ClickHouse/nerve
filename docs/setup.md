@@ -569,7 +569,7 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 |---|---|---|
 | `NERVE_MODE` | `personal` | `personal` or `worker` — this is how an unattended install chooses the mode |
 | `NERVE_WORKSPACE` | `~/nerve-workspace` | Workspace directory |
-| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
+| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone, written to `settings.yaml`. An empty value or a value that is not a time zone name gives `America/New_York`. When the variable is also in the environment of the Nerve process, it is the default time zone ([Configuration](config.md#core)) |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
 | `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
@@ -583,7 +583,9 @@ worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
 empty) and `task-planner` disabled until onboarding enables it.
 The browser checklist afterwards shows what the environment decided as done —
 the mode, the provider, the time zone, a Telegram token — and leaves the rest
-to skip or fill in.
+to skip or fill in. A time zone that is equal to `NERVE_TIMEZONE` in the
+environment of the Nerve process is the default, not an answer: About you
+stays pending.
 
 A re-run over an existing install keeps the configuration and only upgrades the code.
 

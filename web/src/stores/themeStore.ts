@@ -40,7 +40,7 @@ function applyTheme(pref: ThemePreference) {
 function getInitialPreference(): ThemePreference {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored === 'light' || stored === 'dark' || stored === 'system') return stored;
-  return 'dark';
+  return 'system';
 }
 
 export const useThemeStore = create<ThemeState>((set, get) => {

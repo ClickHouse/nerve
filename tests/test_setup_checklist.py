@@ -181,6 +181,18 @@ class TestDoneRules:
         skipped = facts(personal, state=SetupState(skipped={"profile"}))
         assert statuses(skipped)["profile"] == "done", "done beats skipped"
 
+    def test_profile_compares_the_time_zone_with_the_default_it_is_given(self, personal):
+        """The default (``NERVE_TIMEZONE`` or the fallback) is not an answer."""
+        berlin = cfg(personal, timezone="Europe/Berlin")
+        s = step(facts(personal, berlin, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "pending"
+        assert s["detail"]["timezone"] == "Europe/Berlin"
+        assert s["detail"]["timezone_is_default"] is True
+        new_york = cfg(personal, timezone="America/New_York")
+        s = step(facts(personal, new_york, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "done"
+        assert s["detail"]["timezone_is_default"] is False
+
     def test_profile_is_never_derived_from_local_account_facts(self, personal):
         """Only config and workspace facts: a display name on the account changes nothing."""
         with_name = facts(personal, display_name="Alice", account_username="alice")

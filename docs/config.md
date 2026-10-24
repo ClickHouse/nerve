@@ -965,7 +965,7 @@ Backups follow the same rule:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `workspace` | path | `~/nerve-workspace` | Path to workspace directory |
-| `timezone` | string | `America/New_York` | Local timezone for scheduling |
+| `timezone` | string | `$NERVE_TIMEZONE`, else `America/New_York` | Local timezone for scheduling. When no configuration file names it, Nerve uses `NERVE_TIMEZONE` from its environment if that is an IANA time zone name (for example `Europe/Berlin`). An empty variable counts as unset. For any other value (`Local`, a path, an unknown name), Nerve uses `America/New_York` and logs one warning. A hosted platform can set the variable for each agent. The setup page does not count this default as an answer: the About you step stays pending and prefills the browser's time zone |
 | `lockdown` | bool | `false` | [Remote-only, read-only mode](#lockdown-remote-only-read-only). Honored only in `workspace/config/settings.yaml`; an unreadable value is an error, not a default. |
 | `deployment` | string | `server` | `server` (bare metal) or `docker`. Set during `nerve init`; determines whether CLI commands run directly or proxy to `docker compose`. |
 
