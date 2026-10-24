@@ -55,6 +55,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nerve.agent.backends.codex import lifecycle as codex_lifecycle
 from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
@@ -162,6 +163,8 @@ class WorkflowRunService:
                 "survive the restart; restart them explicitly if still needed.",
                 priority="high",
             )
+        # Reap Codex workflow-run scopes left by the previous daemon.
+        await self._reconcile_codex_lifecycle()
         interval = max(5, int(self.config.workflows.poll_interval_seconds))
         self._monitor_task = asyncio.create_task(self._monitor_loop(interval))
         logger.info(
@@ -760,6 +763,41 @@ class WorkflowRunService:
         return str((run or {}).get("created_by") or "").startswith("review-loop:")
 
     # ------------------------------------------------------------------ #
+    #  Codex workflow-run descendant containment (cgroup lifecycle)       #
+    # ------------------------------------------------------------------ #
+
+    async def _reconcile_codex_lifecycle(self) -> None:
+        """Reap scopes recorded by earlier runs, in every mode. Errors are
+        logged."""
+        try:
+            results = await asyncio.to_thread(
+                codex_lifecycle.reconcile, self.runs_dir(),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("codex lifecycle reconciliation failed")
+            return
+        stuck = [rid for rid, rc in results if not rc.is_complete()]
+        if stuck:
+            logger.warning(
+                "codex lifecycle reconciliation could not confirm cleanup for: %s",
+                ", ".join(stuck),
+            )
+
+    async def _reap_codex_lifecycle(self, run_id: str) -> None:
+        """Reap one terminal run's contained descendants from its record."""
+        try:
+            receipt = await asyncio.to_thread(codex_lifecycle.reap, self.runs_dir() / run_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("codex lifecycle reap failed for %s", run_id)
+            return
+        if receipt.outcome not in ("complete", "no_scope"):
+            logger.warning(
+                "codex lifecycle reap for %s did not complete (%s: %s); "
+                "the next startup reconciliation will retry",
+                run_id, receipt.outcome, receipt.error,
+            )
+
+    # ------------------------------------------------------------------ #
     #  Budget monitor                                                     #
     # ------------------------------------------------------------------ #
 
@@ -985,6 +1023,9 @@ class WorkflowRunService:
             )
         except Exception:  # noqa: BLE001
             logger.exception("client teardown failed for %s", session_id)
+        # Closing a contained client stops its scope; this reaps one the close
+        # left behind (no-op without a record).
+        await self._reap_codex_lifecycle(run_id)
 
     async def _stop_session_hard(self, run_id: str) -> None:
         """Graceful interrupt → grace window → force client discard.

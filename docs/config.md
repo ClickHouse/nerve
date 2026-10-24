@@ -1049,7 +1049,23 @@ codex:                     # active when a codex backend is selected
     max_concurrency: 2          # hard cap, even if a workflow asks for more
     default_token_budget: 250000 # default and maximum per workflow
     max_agents: 8               # lifetime worker cap per workflow
+  lifecycle:
+    mode: disabled              # disabled | strict (workflow-run cgroup containment)
 ```
+
+`codex.lifecycle.mode: strict` launches each Codex workflow run's app-server
+inside a transient systemd user scope (`systemd-run --user --scope`). Sandboxed
+commands that `setsid` or double-fork out of the app-server's process group stay
+in that cgroup. Closing the run's client stops the scope, which kills them as
+well. Interactive and cron Codex sessions are not affected.
+
+`strict` needs Linux, cgroup v2, and a systemd user manager that the daemon can
+reach (`systemctl --user show-environment` succeeds as the daemon's user).
+Docker containers and the system-level unit in [setup](setup.md) usually have
+no user manager. There `strict` fails every Codex workflow run at launch rather
+than run it uncontained, so leave it `disabled` on those hosts. Each contained
+run writes `lifecycle.json` in its run directory. On startup, Nerve stops any
+scope still recorded there in either mode, which cleans up after a crash.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep
