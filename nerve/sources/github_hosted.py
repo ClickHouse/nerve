@@ -24,7 +24,7 @@ Buffered payload (one row per record)::
                 "metadata": [{"key", "value", "values"}, ...]}}
 
 Metadata values arrive as strings. ``actors`` and ``changes`` are lists, and
-``unread`` becomes the boolean the polling source stores.
+``unread`` becomes a boolean.
 """
 
 from __future__ import annotations

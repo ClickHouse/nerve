@@ -107,6 +107,67 @@ def _source(monkeypatch) -> GitHubSource:
 
 
 @pytest.mark.asyncio
+async def test_the_listing_asks_for_read_threads_too(monkeypatch):
+    """A mail client that renders the notification email marks the thread
+    read, which can happen within seconds of the notification, so a listing
+    of unread threads alone can miss a thread before anyone has seen it."""
+    argv_seen: list[tuple] = []
+
+    async def fake_exec(*argv, **kwargs):
+        argv_seen.append(argv)
+        return _FakeProc(b"")
+
+    monkeypatch.setattr("nerve.sources.github.asyncio.create_subprocess_exec", fake_exec)
+    src = _source(monkeypatch)
+
+    await src.fetch(None, limit=30)
+
+    assert len(argv_seen) == 1
+    query = parse_qs(urlsplit(argv_seen[0][2]).query)
+    assert query["all"] == ["true"]
+    assert query["participating"] == ["true"]
+    assert "since" in query
+
+
+@pytest.mark.asyncio
+async def test_a_thread_read_after_it_was_listed_is_not_stored_again(monkeypatch, db):
+    """The newest thread is re-listed on every run until a newer one arrives.
+    Its read state must not be part of the record, or a thread read between
+    two runs is stored and delivered a second time."""
+    state = {"t1": _thread("t1", 0)}
+    _install_fake_gh(monkeypatch, state)
+    src = _source(monkeypatch)
+
+    first = await src.fetch(_ts(-10), limit=30)
+    assert await db.insert_source_messages(first.records, source="github") == ["t1"]
+
+    state["t1"]["unread"] = False
+    second = await src.fetch(first.next_cursor, limit=30)
+
+    assert [r.id for r in second.records] == ["t1"]
+    assert await db.insert_source_messages(second.records, source="github") == []
+
+
+@pytest.mark.asyncio
+async def test_a_read_thread_moved_long_after_its_last_read_is_left_out(monkeypatch):
+    """GitHub moves the thread of the account's own merge or review and leaves
+    it read. A thread read within the minute before its update, as a mail
+    client's read of the notification email is stamped, is kept, and so is an
+    unread thread."""
+    own = _thread("own", 0)
+    own.update(unread=False, last_read_at=_ts(-3600))
+    beacon = _thread("beacon", 0)
+    beacon.update(unread=False, last_read_at=_ts(-20))
+    fresh = _thread("fresh", 0)
+    _install_fake_gh(monkeypatch, {t["id"]: t for t in (own, beacon, fresh)})
+    src = _source(monkeypatch)
+
+    result = await src.fetch(_ts(-10), limit=30)
+
+    assert sorted(r.id for r in result.records) == ["beacon", "fresh"]
+
+
+@pytest.mark.asyncio
 async def test_backlog_with_updated_at_ahead_of_listing_key_is_never_skipped(monkeypatch):
     displaced = {5, 25, 45, 65, 85}
     threads = [
