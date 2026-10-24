@@ -17,7 +17,7 @@ from nerve.agent.tools.schemas import (
     SKILL_RUN_SCRIPT_SCHEMA,
     SKILL_UPDATE_SCHEMA,
 )
-from nerve.skills.manager import SOURCE_PLATFORM, PlatformSkillError
+from nerve.skills.manager import SOURCE_PLATFORM
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +32,9 @@ async def skill_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
             return ToolResult.text("No skills available.")
 
         lines = [f"**{len(summaries)} skill(s) available:**\n"]
-        platform = False
         for s in summaries:
-            mark = ""
-            if s.get("source") == SOURCE_PLATFORM:
-                mark = "[platform, read only] "
-                platform = True
+            mark = "[platform, read only] " if s.get("source") == SOURCE_PLATFORM else ""
             lines.append(f"- **{s['name']}** (`{s['id']}`): {mark}{s['description'][:200]}")
-        if platform:
-            lines.append(
-                "\nThe platform provides the skills marked [platform, read only]. "
-                "`skill_update` cannot change them."
-            )
 
         return ToolResult.text("\n".join(lines))
     except Exception as e:
@@ -163,8 +154,6 @@ async def skill_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             f"Skill created: **{meta.name}** (`{meta.id}`)\n"
             f"Path: {ctx.skill_manager.skills_dir / meta.id}/SKILL.md"
         )
-    except PlatformSkillError as e:
-        return ToolResult.text(str(e))
     except Exception as e:
         logger.error("skill_create failed: %s", e)
         return ToolResult.text(f"Error creating skill: {e}")
@@ -188,8 +177,6 @@ async def skill_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(
             f"Skill updated: **{meta.name}** (`{meta.id}`) v{meta.version}"
         )
-    except PlatformSkillError as e:
-        return ToolResult.text(str(e))
     except Exception as e:
         logger.error("skill_update failed: %s", e)
         return ToolResult.text(f"Error updating skill: {e}")

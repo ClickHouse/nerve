@@ -38,7 +38,7 @@ export function SkillDetailPage() {
   }, [selectedSkill]);
 
   const handleSave = async () => {
-    if (!selectedSkill || !hasChanges || selectedSkill.source === 'platform') return;
+    if (!selectedSkill || !hasChanges) return;
     await updateSkill(selectedSkill.id, editContent);
     setHasChanges(false);
   };
