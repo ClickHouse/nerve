@@ -1567,22 +1567,7 @@ def create_app() -> FastAPI:
     # Serve static web UI files if built
     web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
     if web_dist.exists():
-        from fastapi.responses import FileResponse
-
-        # Mount static assets (js, css, etc.)
-        app.mount("/assets", StaticFiles(directory=str(web_dist / "assets")), name="assets")
-
-        # SPA catch-all: serve index.html for any non-API, non-asset route
-        @app.get("/{path:path}")
-        async def spa_fallback(path: str):
-            # Serve actual built files if they exist (robots.txt, manifest, ...).
-            # Not the favicon: that has its own route above and is served from
-            # tracked config rather than the bundle, so it never gets here.
-            file_path = web_dist / path
-            if file_path.is_file():
-                return FileResponse(str(file_path))
-            # Otherwise serve index.html for SPA routing
-            return FileResponse(str(web_dist / "index.html"))
+        _serve_web_ui(app, web_dist)
     else:
         # No built UI: a dead URL after `nerve init` is the worst first
         # impression, so / and /setup answer with a static page that says what
@@ -1595,6 +1580,53 @@ def create_app() -> FastAPI:
             return HTMLResponse(_UI_NOT_BUILT_PAGE, status_code=200)
 
     return app
+
+
+def _bundle_file(web_dist: Path, path: str) -> Path | None:
+    """The built file under ``web_dist`` that a request path names, or None.
+
+    The SPA catch-all captures the whole request path, and it answers before
+    anyone has signed in — the login page is part of the bundle. Joined onto
+    ``web_dist`` as-is, that path would name any file the process can read:
+    ``..`` segments climb out of the bundle (uvicorn hands them over as sent),
+    and an absolute path makes ``Path.__truediv__`` discard the left side
+    altogether, so a ``//etc/hosts`` request read ``/etc/hosts``. The candidate
+    is resolved and has to land inside the resolved bundle directory; anything
+    else — a symlink that leaves it included — is not a bundle file, and the
+    caller answers with index.html as it does for any SPA route.
+    """
+    root = web_dist.resolve()
+    try:
+        candidate = (root / path).resolve()
+        if candidate == root or not candidate.is_relative_to(root):
+            return None
+        if not candidate.is_file():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        # A name too long, a symlink loop, an embedded NUL byte: not a file.
+        return None
+    return candidate
+
+
+def _serve_web_ui(app: FastAPI, web_dist: Path) -> None:
+    """Serve the built frontend: /assets from the bundle, index.html elsewhere."""
+    from fastapi.responses import FileResponse
+
+    # Mount static assets (js, css, etc.)
+    app.mount("/assets", StaticFiles(directory=str(web_dist / "assets")), name="assets")
+
+    # SPA catch-all: serve index.html for any non-API, non-asset route
+    @app.get("/{path:path}")
+    async def spa_fallback(path: str):
+        # Serve actual built files if they exist (robots.txt, manifest, ...) —
+        # and only those; _bundle_file says what the raw path could otherwise
+        # name. Not the favicon: that has its own route above and is served
+        # from tracked config rather than the bundle, so it never gets here.
+        file_path = _bundle_file(web_dist, path)
+        if file_path is not None:
+            return FileResponse(str(file_path))
+        # Otherwise serve index.html for SPA routing
+        return FileResponse(str(web_dist / "index.html"))
 
 
 _UI_NOT_BUILT_PAGE = """<!doctype html>
