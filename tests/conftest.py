@@ -78,6 +78,9 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     """
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
+    # A hosted VM seeds the agent's display name into the environment; the
+    # suite must not inherit it as the profile step's prefill.
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
     _repoint_import_time_state_paths(monkeypatch)
 
 
@@ -199,6 +202,16 @@ def _no_ambient_system_principal(monkeypatch):
     from nerve.identity import SYSTEM_PRINCIPAL_ENV
 
     monkeypatch.delenv(SYSTEM_PRINCIPAL_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_timezone(monkeypatch):
+    """Strip ``NERVE_TIMEZONE`` from the developer shell.
+
+    Nerve uses it as the default time zone when no settings layer names one.
+    Tests about it set the variable themselves.
+    """
+    monkeypatch.delenv(nerve.config.TIMEZONE_ENV, raising=False)
 
 
 @pytest.fixture(scope="session", autouse=True)

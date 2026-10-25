@@ -219,6 +219,7 @@ workspace/skills/
 - `skill-extractor` cron proposes new skills from repeated workflows
 - `skill-reviser` cron reviews existing skills for accuracy
 - Usage statistics tracked per skill
+- Platform skills: an operator or a hosting platform can add read-only skills in `skills/` in the config directory ([details](docs/architecture.md#platform-skills))
 
 ### 📐 Plans
 

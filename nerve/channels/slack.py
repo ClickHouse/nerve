@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.access import (
     Decision,
     Identity,
@@ -1242,6 +1243,9 @@ class SlackChannel(BaseChannel):
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a message from %s", target)
         except Exception as e:
             logger.error("Agent error for %s: %s", target, e, exc_info=True)
             await self._post(target, f"Error: {e}")
@@ -1294,6 +1298,9 @@ class SlackChannel(BaseChannel):
         )
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a reaction from %s", target)
         except Exception as e:
             logger.error("Agent error for reaction in %s: %s", target, e, exc_info=True)
 
@@ -2162,12 +2169,16 @@ class SlackChannel(BaseChannel):
                 "Notification service not available.",
             )
             return
-        result = await self._notification_service.answer_latest_question(
-            answer,
-            channel="slack",
-            target=channel_id,
-            actor=user_id,
-        )
+        try:
+            result = await self._notification_service.answer_latest_question(
+                answer,
+                channel="slack",
+                target=channel_id,
+                actor=user_id,
+            )
+        except NotAcceptingTurnsError as exc:
+            await self._respond_ephemeral(channel_id, user_id, str(exc))
+            return
         await self._respond_ephemeral(
             channel_id,
             user_id,
@@ -2405,13 +2416,20 @@ class SlackChannel(BaseChannel):
         # would stop matching that record the moment somebody replied under
         # the card, and every later press would read as already answered.
         target = format_target((payload.get("channel") or {}).get("id") or "")
-        result = await self._notification_service.answer_delivered_notification(
-            notification_id,
-            answer,
-            channel="slack",
-            target=target,
-            actor=actor,
-        )
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notification_id,
+                answer,
+                channel="slack",
+                target=target,
+                actor=actor,
+            )
+        except NotAcceptingTurnsError as exc:
+            # The question stays pending, so the card keeps its buttons.
+            await self._respond_ephemeral(
+                (payload.get("channel") or {}).get("id") or "", actor, str(exc),
+            )
+            return
         if not result:
             await self._replace_via_url(
                 response_url,

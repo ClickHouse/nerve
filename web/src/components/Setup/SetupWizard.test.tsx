@@ -283,6 +283,32 @@ describe('rail and overview', () => {
     expect(field).not.toHaveAccessibleDescription(/Prefilled from/);
   });
 
+  it('the agent name the environment gives stands in and is saved on Continue', async () => {
+    // A hosted deployment seeds the agent's display name; IDENTITY.md has no
+    // name yet, so the prefill differs from what the file holds and is sent.
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: null, agent_name_prefill: 'Ada',
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Ada');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.objectContaining({ agent_name: 'Ada' }));
+  });
+
+  it('a saved agent name is not sent again, prefill or not', async () => {
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: 'Lovelace', agent_name_prefill: null,
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Lovelace');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.not.objectContaining({ agent_name: expect.anything() }));
+  });
+
   it('the model picker names the server default instead of "keep the current model"', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-sonnet-4-6', effort: 'high',
@@ -325,7 +351,7 @@ describe('rail and overview', () => {
     await heading('Everything is set up');
     expect(screen.getAllByRole('link', { name: 'Change' }).length).toBeGreaterThan(0);
     expect(screen.getByText('7 done · 2 skipped')).toBeInTheDocument();
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
     // Done means chat: the primary action goes there; the review is a link.
     expect(screen.getByRole('link', { name: 'Open review' })).toHaveAttribute('href', '/setup/review');
     await userEvent.click(screen.getByRole('button', { name: /Back to chat/ }));
@@ -343,22 +369,15 @@ describe('rail and overview', () => {
     expect(within(nav).queryByRole('link', { name: /^Claim/ })).not.toBeInTheDocument();
   });
 
-  it('"Already configured" names only steps whose configuration provably came from outside the wizard', async () => {
-    // A credential from the server's environment is such a step.
+  it('a done step that the person can still change stays in the list, also with a credential from the environment', async () => {
+    // The model and effort picker stays open beside the operator's credential.
     current = withStep(makeState(), step('provider', { status: 'done' }, { credential: 'environment' }));
-    const view = renderAt('/setup');
-    await heading(/^Welcome, /);
-    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Model.');
-    view.unmount();
-
-    // A key pasted into this wizard — a minute ago, after a reload, or by
-    // somebody else — is not, whatever this tab happened to read first.
-    useSetupStore.getState().reset();
-    current = withStep(makeState(), step('provider', { status: 'done' }, { credential: 'api_key', anthropic_api_key: on('ab12') }));
     renderAt('/setup');
     await heading(/^Welcome, /);
+    const row = within(screen.getByRole('list', { name: 'Steps' })).getByRole('link', { name: 'Model' }).closest('li')!;
+    expect(within(row).getByRole('link', { name: 'Change' })).toHaveAttribute('href', '/setup/provider');
     expect(screen.getByText(/3 of 9 steps done/)).toBeInTheDocument();
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
   });
 
   it('the Account row points at Accounts instead of a Change that changes nothing', async () => {
@@ -1754,17 +1773,23 @@ describe('pre-configured connections', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: true, telegram: true }));
   });
 
-  it('"Already configured" names the steps whose credentials the operator provided', async () => {
+  it('steps with a connection the operator provided stay in the list while the server lets the person change them', async () => {
     current = makeState({
       steps: makeState().steps.map((s) => (
         s.id === 'memory' ? step('memory', { status: 'done' }, { openai_api_key: on('ab12', 'environment') })
           : s.id === 'channels' ? step('channels', { status: 'done' }, { telegram: CHANNELS.telegram, slack: { ...CHANNELS.slack, mode: 'hosted', enabled: true } })
-            : s
+            : s.id === 'sources' ? githubHeld()
+              : s
       )),
     });
     renderAt('/setup');
     await heading(/^Welcome, /);
-    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Memory, Channels.');
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    for (const [title, path] of [['Memory', '/setup/memory'], ['Channels', '/setup/channels'], ['Sources', '/setup/sources']]) {
+      const row = rows.getByRole('link', { name: title }).closest('li')!;
+      expect(within(row).getByRole('link', { name: 'Change' })).toHaveAttribute('href', path);
+    }
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
   });
 
   it('a GitHub switch the operator holds shows the source with no switch, and the save leaves it out', async () => {
@@ -1786,14 +1811,7 @@ describe('pre-configured connections', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
   });
 
-  it('a GitHub the operator switched on counts as already configured', async () => {
-    current = withStep(makeState(), githubHeld());
-    renderAt('/setup');
-    await heading(/^Welcome, /);
-    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Sources.');
-  });
-
-  it('a GitHub the operator switched off has no card, is said once, and does not count as configured', async () => {
+  it('a GitHub the operator switched off has no card, is said once, and the step stays the person\'s', async () => {
     m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
     // "None of these" answered earlier: done, with Gmail and Telegram still on offer.
     current = withStep(makeState(), githubHeld({ summary: 'None' }, {
@@ -1810,11 +1828,12 @@ describe('pre-configured connections', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
     view.unmount();
 
-    // Nothing the operator provides is on, so the Overview does not name Sources.
+    // The person can still change the step, so the Overview lists it as theirs.
     useSetupStore.getState().reset();
     renderAt('/setup');
     await heading(/^Welcome, /);
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getByRole('link', { name: 'Sources' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
   });
 
   it('a save refused for a GitHub switch the operator took over meanwhile says so and keeps the other choices', async () => {
@@ -2025,8 +2044,8 @@ describe('telegram message sync sign-in', () => {
   });
 
   it('the ready screen lists an unsigned Telegram sync with a way back to the step', () => {
-    const sync = (session: TelegramSyncSessionSummary) =>
-      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done' }, {
+    const sync = (session: TelegramSyncSessionSummary, overrides: Partial<SetupStep> = {}) =>
+      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done', ...overrides }, {
         telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session },
       }));
     const view = render(<MemoryRouter><ReadyScreen state={sync({ present: false, authorized: false, user: null })} /></MemoryRouter>);
@@ -2038,8 +2057,20 @@ describe('telegram message sync sign-in', () => {
     expect(screen.queryByText(/in effect/)).not.toBeInTheDocument();
     view.unmount();
 
-    render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
+    const signedIn = render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
     expect(screen.queryByText(/not signed in/)).not.toBeInTheDocument();
+    signedIn.unmount();
+
+    // A Sources step that the operator configured is not on the setup page:
+    // the line stays, with no link to the step.
+    const operators = sync(
+      { present: false, authorized: false, user: null },
+      { read_only: true, read_only_reason: 'Configuration is managed from the config repository on this instance.' },
+    );
+    render(<MemoryRouter><ReadyScreen state={operators} /></MemoryRouter>);
+    const lockedSummary = screen.getByRole('list', { name: 'Summary' });
+    expect(lockedSummary).toHaveTextContent('Telegram message sync: not signed in');
+    expect(within(lockedSummary).queryByRole('link', { name: 'Sign in' })).not.toBeInTheDocument();
   });
 });
 
@@ -2084,20 +2115,43 @@ describe('lockdown', () => {
     });
   }
 
-  it('shows Lock badges, Next on blocked steps, and a notice on the overview', async () => {
+  it('leaves the locked steps out, keeps the notice on the overview, and counts what is left', async () => {
     current = lockedState();
-    renderAt('/setup');
+    const view = renderAt('/setup');
     await heading(/^Welcome, /);
     expect(screen.getAllByRole('status').some((el) => el.textContent?.includes(LOCK))).toBe(true);
-    const nav = screen.getByRole('navigation', { name: 'Setup steps' });
-    expect(within(nav).getAllByText('Blocked')).toHaveLength(6);
-    // Nothing on the page can complete a locked step, so the count leaves it out.
+    // Nothing on the page can complete a locked step, so the page does not show it.
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getAllByRole('link').map((link) => link.textContent)).toEqual([
+      expect.stringMatching(/^Account/), expect.stringMatching(/^Mode/), expect.stringMatching(/^About you/), 'Review',
+    ]);
+    expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem')).toHaveLength(3);
+    expect(screen.queryByText(/Configure this step from the config repository/)).not.toBeInTheDocument();
     expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+    view.unmount();
 
-    await userEvent.click(within(nav).getByRole('link', { name: /Model/ }));
-    await heading('Connect a model');
-    expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Continue/ })).not.toBeInTheDocument();
+    // A link to a locked step lands on the Overview.
+    useSetupStore.getState().reset();
+    renderAt('/setup/provider');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { level: 1, name: 'Connect a model' })).not.toBeInTheDocument();
+  });
+
+  it('lists a step that arrived from the config repository under "Your operator has configured"', async () => {
+    current = withStep(lockedState(), step('provider', {
+      status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Anthropic API key · claude-opus-5-5 · effort high',
+    }));
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getByText('Model')).toBeInTheDocument();
+    expect(section.getByText('Anthropic API key · claude-opus-5-5 · effort high')).toBeInTheDocument();
+    expect(section.queryByRole('link')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Model')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('navigation', { name: 'Setup steps' })).queryByText('Model')).not.toBeInTheDocument();
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
   });
 
   it('does not count a locked step that waits for Mode', async () => {
@@ -2146,26 +2200,30 @@ describe('instances that keep no credentials on disk', () => {
     });
   }
 
-  it('the overview says which steps are not available on this instance, and why', async () => {
+  it('the overview, the rail and the review leave out the steps this instance closed', async () => {
     current = keylessState();
-    renderAt('/setup');
+    const view = renderAt('/setup');
     await heading(/^Welcome, /);
     const rows = within(screen.getByRole('list', { name: 'Steps' }));
-    expect(rows.getAllByText('Not available on this instance')).toHaveLength(4);
-    expect(rows.getAllByText(CLOSED)).toHaveLength(4);
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
     for (const title of ['Memory', 'Channels', 'Sources', 'Agents']) {
-      const row = rows.getByRole('link', { name: title }).closest('li')!;
-      expect(row).toHaveTextContent('Not available on this instance');
-      expect(within(row).queryByText('Blocked')).not.toBeInTheDocument();
-      expect(within(row).queryByText('To do')).not.toBeInTheDocument();
+      expect(rows.queryByRole('link', { name: title })).not.toBeInTheDocument();
+      expect(nav.queryByRole('link', { name: new RegExp(`^${title}`) })).not.toBeInTheDocument();
     }
     expect(rows.getByRole('link', { name: 'Model' }).closest('li')).toHaveTextContent('To do');
-    // Not "already configured" either: nothing was configured, the steps are closed.
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
-    // The rail says the same in a chip, with a lock, and never calls it a chore.
-    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
-    expect(nav.getAllByText('Not available')).toHaveLength(4);
-    expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+    expect(screen.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Not available/)).not.toBeInTheDocument();
+    // Nothing was configured either: the steps are closed, not the operator's.
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const checklist = within(screen.getByRole('region', { name: 'Checklist' }));
+    expect(checklist.getAllByRole('listitem')).toHaveLength(5);
+    expect(checklist.queryByText('Memory')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Still to do' })).getAllByRole('listitem')).toHaveLength(3);
   });
 
   it('the overview counts only the steps that apply here', async () => {
@@ -2176,7 +2234,7 @@ describe('instances that keep no credentials on disk', () => {
     expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
     view.unmount();
 
-    // Finished: the closed steps stay in the list, and the count is whole.
+    // Finished: the count is whole, and the closed steps are still not shown.
     useSetupStore.getState().reset();
     current = keylessState({
       finished: true, steps_left: 0,
@@ -2185,23 +2243,22 @@ describe('instances that keep no credentials on disk', () => {
     renderAt('/setup');
     await heading('Everything is set up');
     expect(screen.getByText('5 of 5 steps done')).toBeInTheDocument();
-    expect(within(screen.getByRole('list', { name: 'Steps' })).getAllByText('Not available on this instance')).toHaveLength(4);
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getAllByRole('listitem')).toHaveLength(5);
   });
 
-  it('opening a closed step shows the sentence instead of the form and reads Next', async () => {
+  it('a link to a closed step lands on the overview, and Continue passes over the closed steps', async () => {
     current = keylessState();
-    renderAt('/setup/memory');
-    await heading('Memory');
-    expect(screen.getByText('Not available on this instance.')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(CLOSED);
+    const view = renderAt('/setup/memory');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
     expect(screen.queryByRole('radiogroup', { name: 'Memory recall' })).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('OpenAI API key')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Test key/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Skip for now/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /Next/ }));
-    // Continue passes over the closed steps: Memory → Automation.
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/profile');
+    await heading('About you');
+    await userEvent.click(continueButton());
+    // About you → Automation: Memory, Channels and Sources are closed.
     expect(await heading('Scheduled jobs')).toBeInTheDocument();
-    expect(api.setupStep).not.toHaveBeenCalled();
   });
 
   it('the model step offers Bedrock and says why a key cannot be entered', async () => {
@@ -2256,25 +2313,33 @@ describe('instances that keep no credentials on disk', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('channels', { slack: { enabled: false } }));
   });
 
-  it('a bot token the operator provided says the sentence once', async () => {
-    // Done and read-only: the frame shows the read-only reason, which is the
-    // sentence. The step must not say it again, and the pairing card (whose
-    // server-side reason would be the sentence a third time) is not shown.
-    const provided = step('channels', { status: 'done', read_only: true, read_only_reason: CLOSED }, {
+  it('a bot token the operator provided puts Channels under "Your operator has configured"', async () => {
+    // Done and read-only: nothing on the step can change it.
+    const provided = step('channels', {
+      status: 'done', read_only: true, read_only_reason: CLOSED, summary: 'Telegram @example_bot · 1 paired',
+    }, {
       telegram: {
         ...CHANNELS.telegram, enabled: true, bot_token: on('', 'environment'), bot_username: 'example_bot', live: true,
         pairing_available: false, pairing_unavailable_reason: CLOSED,
       },
     });
     current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'channels' ? provided : s)) });
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem')).toHaveLength(1);
+    expect(section.getByText('Channels')).toBeInTheDocument();
+    expect(section.getByText('Telegram @example_bot · 1 paired')).toBeInTheDocument();
+    expect(section.queryByRole('link', { name: 'Change' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Channels')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('navigation', { name: 'Setup steps' })).queryByText('Channels')).not.toBeInTheDocument();
+    // The count is of the person's own steps.
+    expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
     renderAt('/setup/channels');
-    await heading('Connect Telegram or Slack');
-    const form = within(screen.getByRole('form', { name: 'Connect Telegram or Slack' }));
-    expect(form.getAllByText(CLOSED)).toHaveLength(1);
-    expect(form.getByRole('region', { name: 'Telegram' })).toHaveTextContent('@example_bot');
-    expect(form.queryByLabelText(/Telegram user id/)).not.toBeInTheDocument();
-    expect(form.queryByRole('button', { name: /Test token|Also connect Slack/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
   });
 
   const GITHUB_ONLY = 'GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance.';
@@ -2324,34 +2389,203 @@ describe('instances that keep no credentials on disk', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
   });
 
-  it('the overview counts the open GitHub toggle as a step to do, beside the three closed steps', async () => {
+  it('the overview counts the open GitHub toggle as a step to do, and leaves out the three closed steps', async () => {
     current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
     renderAt('/setup');
     await heading(/^Welcome, /);
     const rows = within(screen.getByRole('list', { name: 'Steps' }));
-    expect(rows.getAllByText('Not available on this instance')).toHaveLength(3);
+    expect(rows.getAllByRole('listitem')).toHaveLength(6);
     expect(rows.getByRole('link', { name: 'Sources' }).closest('li')).toHaveTextContent('To do');
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(screen.getByText('2 of 6 steps done')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
   });
 
-  it('a GitHub switch the operator holds leaves nothing on offer and says why once', async () => {
-    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+  it('a GitHub switch the operator holds, with nothing else on offer, puts Sources under "Your operator has configured"', async () => {
     const reason = `${GITHUB_HELD} Gmail and Telegram are not available on this instance.`;
-    const held = githubHeld({ read_only: true, read_only_reason: reason }, { available: [], unavailable_reason: reason });
+    const held = githubHeld({ read_only: true, read_only_reason: reason, summary: 'GitHub' }, { available: [], unavailable_reason: reason });
     current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? held : s)) });
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getByText('Sources')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Sources')).not.toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/sources');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+});
+
+describe('the steps a person can take, the operator\'s and the hidden ones', () => {
+  const CLOSED = 'This instance does not store credentials entered here. Connections are provided by the operator of this deployment.';
+  const LOCK = 'Configuration is managed from the config repository on this instance; changes arrive by PR and sync.';
+
+  /**
+   * Memory is the operator's (done, read-only); Channels is closed by the
+   * policy and Agents by a lockdown reason (both hidden); the other six
+   * steps are the person's own, two of them done.
+   */
+  function mixedState() {
+    return makeState({
+      local_secrets: false,
+      steps: [
+        step('claim', { status: 'done' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }),
+        step('provider'),
+        step('profile'),
+        step('memory', { status: 'done', read_only: true, read_only_reason: CLOSED, summary: 'Kept in Loom' }, { backend: 'loom' }),
+        step('channels', { status: 'blocked', blocked_kind: 'policy', blocked_reason: CLOSED, read_only: true, read_only_reason: CLOSED }),
+        step('sources'),
+        step('automation'),
+        step('agents', { status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK }),
+      ],
+    });
+  }
+
+  beforeEach(() => { current = mixedState(); });
+
+  it('the overview lists the own steps, counts only them, and names the operator\'s steps apart', async () => {
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem').map((row) => within(row).getAllByRole('link')[0].textContent)).toEqual([
+      'Account', 'Mode', 'Model', 'About you', 'Sources', 'Automation',
+    ]);
+    expect(screen.getByText('2 of 6 steps done')).toBeInTheDocument();
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem')).toHaveLength(1);
+    expect(section.getByRole('listitem')).toHaveTextContent('MemoryKept in Loom');
+    expect(section.queryByRole('link')).not.toBeInTheDocument();
+    // The hidden steps are nowhere, and neither are their reasons.
+    expect(screen.queryByText('Channels')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agents')).not.toBeInTheDocument();
+    expect(screen.queryByText(CLOSED)).not.toBeInTheDocument();
+    // Continue goes to the first pending own step.
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(await heading('Connect a model')).toBeInTheDocument();
+  });
+
+  it('the rail lists the own steps and Review, nothing else', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getAllByRole('link').map((link) => link.getAttribute('href'))).toEqual([
+      '/setup/claim', '/setup/mode', '/setup/provider', '/setup/profile', '/setup/sources', '/setup/automation', '/setup/review',
+    ]);
+  });
+
+  it('the review lists the own steps only', async () => {
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const checklist = within(screen.getByRole('region', { name: 'Checklist' }));
+    expect(checklist.getAllByRole('listitem')).toHaveLength(6);
+    for (const title of ['Memory', 'Channels', 'Agents']) expect(checklist.queryByText(title)).not.toBeInTheDocument();
+    const todo = within(screen.getByRole('list', { name: 'Still to do' }));
+    expect(todo.getAllByRole('listitem').map((row) => row.textContent)).toEqual([
+      expect.stringMatching(/^Model/), expect.stringMatching(/^About you/), expect.stringMatching(/^Sources/), expect.stringMatching(/^Automation/),
+    ]);
+  });
+
+  it('Continue and Back pass over the operator\'s and the hidden steps', async () => {
+    renderAt('/setup/profile');
+    await heading('About you');
+    await userEvent.click(continueButton());
+    // About you → Sources: Memory is the operator's, Channels is hidden.
+    expect(await heading('Choose what Nerve reads')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await heading('About you')).toBeInTheDocument();
+  });
+
+  it('a link to an operator\'s or a hidden step lands on the overview', async () => {
+    for (const id of ['memory', 'channels', 'agents']) {
+      useSetupStore.getState().reset();
+      const view = renderAt(`/setup/${id}`);
+      expect(await heading(/^Welcome, /)).toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it('the Mode step and the Account stay in the list on a locked instance, never under the operator\'s steps', async () => {
+    current = makeState({
+      lockdown: true, writable: false, read_only_reason: LOCK, steps_left: 1,
+      steps: [
+        // A backend that marks the claim read-only too must not move the Account.
+        step('claim', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'alice · password set' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON, summary: 'Personal assistant' }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Anthropic API key' }),
+        step('profile', {}, { writable_fields: ['name'] }),
+        step('memory', { status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK }),
+      ],
+    });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem').map((row) => within(row).getAllByRole('link')[0].textContent)).toEqual([
+      'Account', 'Mode', 'About you',
+    ]);
+    // The mode was the person's choice: Done, with the lock, and no Change.
+    const mode = rows.getByRole('link', { name: 'Mode' }).closest('li')!;
+    expect(mode).toHaveTextContent('Done');
+    expect(within(mode).queryByRole('link', { name: 'Change' })).not.toBeInTheDocument();
+    expect(rows.getByRole('link', { name: 'Accounts' })).toHaveAttribute('href', '/accounts');
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model']);
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getByRole('link', { name: /^Mode(?!l)/ })).toBeInTheDocument();
+    expect(nav.getByRole('link', { name: /^Account/ })).toBeInTheDocument();
+  });
+
+  it('with no step left for the person, the overview and the review say that there is nothing to set up', async () => {
+    // External mode under lockdown before a mode is chosen: no claim, the
+    // Mode step is closed, and every other step is the operator's or closed.
+    // The sentence does not say that every step is configured: the mode is not.
+    const NO_OWN = 'There is nothing for you to set up on this page. Your operator sets up this instance.';
+    useHostedStore.setState({ mode: 'external' });
+    const locked = (id: Parameters<typeof step>[0]) => step(id, {
+      status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+    });
+    current = makeState({
+      auth_mode: 'external', mode: null, lockdown: true, writable: false, read_only_reason: LOCK,
+      finished: true, steps_left: 0,
+      steps: [
+        step('mode', {
+          status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+        }, { mode: null, templates_present: [] }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Credential from the environment' }),
+        locked('profile'),
+        step('memory', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Kept in Loom' }),
+        locked('channels'), locked('sources'), locked('automation'), locked('agents'),
+      ],
+    });
+    const view = renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: 'Steps' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/steps done/)).not.toBeInTheDocument();
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model', 'Memory']);
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(screen.queryByRole('region', { name: 'Checklist' })).not.toBeInTheDocument();
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
+  });
+
+  it('the phone\'s position line counts the own steps', async () => {
+    window.matchMedia = ((query: string) => ({
+      matches: query === '(max-width: 767px)',
+      media: query, onchange: null,
+      addListener: () => {}, removeListener: () => {},
+      addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
     renderAt('/setup/sources');
     await heading('Choose what Nerve reads');
-    const form = within(screen.getByRole('form', { name: 'Choose what Nerve reads' }));
-    expect(form.getAllByText(reason)).toHaveLength(1);
-    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
-    const card = within(screen.getByRole('region', { name: 'GitHub' }));
-    expect(card.queryByRole('checkbox')).not.toBeInTheDocument();
-    expect(card.getByText('On · managed by the channel gateway')).toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Gmail' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Turn all off|Skip for now/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /Next/ }));
-    expect(api.setupStep).not.toHaveBeenCalled();
+    expect(screen.getByText('Step 5 of 6 · Sources')).toBeInTheDocument();
   });
 });
 

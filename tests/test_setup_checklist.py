@@ -181,6 +181,18 @@ class TestDoneRules:
         skipped = facts(personal, state=SetupState(skipped={"profile"}))
         assert statuses(skipped)["profile"] == "done", "done beats skipped"
 
+    def test_profile_compares_the_time_zone_with_the_default_it_is_given(self, personal):
+        """The default (``NERVE_TIMEZONE`` or the fallback) is not an answer."""
+        berlin = cfg(personal, timezone="Europe/Berlin")
+        s = step(facts(personal, berlin, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "pending"
+        assert s["detail"]["timezone"] == "Europe/Berlin"
+        assert s["detail"]["timezone_is_default"] is True
+        new_york = cfg(personal, timezone="America/New_York")
+        s = step(facts(personal, new_york, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "done"
+        assert s["detail"]["timezone_is_default"] is False
+
     def test_profile_is_never_derived_from_local_account_facts(self, personal):
         """Only config and workspace facts: a display name on the account changes nothing."""
         with_name = facts(personal, display_name="Alice", account_username="alice")
@@ -192,6 +204,34 @@ class TestDoneRules:
         assert s["detail"]["name"] == "Alice Example"
         assert s["detail"]["name_source"] == "actor_header"
         assert s["detail"]["display_name_editable"] is False
+
+    def test_profile_offers_the_environments_agent_name_while_identity_md_is_pristine(self, personal, tmp_path):
+        offered = step(facts(personal, agent_display_name="Ada"), "profile")["detail"]
+        assert offered["agent_name"] is None and offered["agent_name_prefill"] == "Ada"
+        # Nothing is offered under lockdown, in local or external mode, nor to
+        # a worker, whose step has no agent name; without a name from the
+        # environment there is nothing to offer.
+        assert step(facts(personal, agent_display_name="Ada", lockdown=True), "profile")["detail"]["agent_name_prefill"] is None
+        locked_external = facts(personal, agent_display_name="Ada", lockdown=True, external_auth=True, display_name="Alice Example")
+        assert step(locked_external, "profile")["detail"]["agent_name_prefill"] is None
+        worker = tmp_path / "worker"
+        apply_mode(worker, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        assert step(facts(worker, agent_display_name="Ada"), "profile")["detail"]["agent_name_prefill"] is None
+        assert step(facts(personal), "profile")["detail"]["agent_name_prefill"] is None
+        # Once IDENTITY.md holds a name, the file is the source.
+        apply_profile_templates(personal, agent_name="Lovelace")
+        named = step(facts(personal, agent_display_name="Ada"), "profile")["detail"]
+        assert named["agent_name"] == "Lovelace" and named["agent_name_prefill"] is None
+
+    def test_agent_display_name_from_environment_keeps_the_bounds_of_a_typed_name(self, monkeypatch):
+        for value, want in (
+            ("  Ada  ", "Ada"), ("x" * 40, "x" * 40), ("x" * 41, None), ("", None), ("   ", None),
+            ("Ada\nLovelace", None), ("Ada\x07", None), ("Ada\x7f", None), ("Ada\x85Bot", None),
+        ):
+            monkeypatch.setenv("NERVE_DISPLAY_NAME", value)
+            assert checklist.agent_display_name_from_environment() == want, repr(value)
+        monkeypatch.delenv("NERVE_DISPLAY_NAME")
+        assert checklist.agent_display_name_from_environment() is None
 
     def test_memory(self, personal):
         assert statuses(facts(personal))["memory"] == "pending"

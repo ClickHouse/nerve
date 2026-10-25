@@ -134,6 +134,27 @@ class TestNonInteractiveSetup:
         assert (ws / "config" / "cron" / "jobs.yaml").exists()
         assert (ws / "config" / "cron" / "gates").is_dir()
 
+    @pytest.mark.parametrize(("value", "written"), [
+        ("", "America/New_York"),
+        ("Local", "America/New_York"),
+        (" Europe/Berlin ", "Europe/Berlin"),
+    ])
+    def test_time_zone_follows_the_default_time_zone_rules(self, tmp_path: Path, value: str, written: str) -> None:
+        """The installer reads ``NERVE_TIMEZONE`` as the config does: an empty
+        or refused value gives the fallback, and spaces are removed."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey123",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "workspace"),
+            "NERVE_TIMEZONE": value,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load(
+            (tmp_path / "workspace" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["timezone"] == written
+
     def test_worker_mode(self, tmp_path: Path) -> None:
         """Worker mode should create minimal workspace."""
         env = {
@@ -251,6 +272,23 @@ class TestNonInteractiveSetup:
         # No hard-coded sources → the generic "any source" form.
         assert "sources" not in spec
         assert isinstance(build_gate(spec), MessagesGate)
+
+
+class TestTerminalWizardTimeZone:
+    def test_the_prompt_offers_the_default_time_zone(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("NERVE_TIMEZONE", "Europe/Berlin")
+        defaults: dict[str, str] = {}
+
+        def prompt(text, default=None, **kwargs):
+            defaults[text] = default
+            return default
+
+        monkeypatch.setattr(click, "prompt", prompt)
+        monkeypatch.setattr(click, "clear", lambda: None)
+        wizard = SetupWizard(tmp_path)
+        wizard._step_identity()
+        assert defaults["Your timezone"] == "Europe/Berlin"
+        assert wizard.choices.timezone == "Europe/Berlin"
 
 
 class TestDeferredWrites:

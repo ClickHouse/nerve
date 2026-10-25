@@ -11,7 +11,8 @@ export type WSMessage =
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
   | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number }
   | { type: 'stopped'; session_id: string }
-  | { type: 'error'; session_id: string; error: string }
+  // client_msg_id: the refused message, when the error refuses a message (Nerve is shutting down).
+  | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
@@ -60,7 +61,11 @@ export type WSMessage =
   // Global (session_id is always null): a task row changed anywhere — the
   // API, another tab, or the agent in an unrelated session. Deliberately
   // NOT view-scoped; the board reflects all of them.
-  | { type: 'task_updated'; session_id: null; event: 'created' | 'updated' | 'moved' | 'done'; task: Task }
+  | {
+      type: 'task_updated'; session_id: null;
+      event: 'created' | 'updated' | 'moved' | 'done' | 'commented' | 'comment_deleted';
+      task: Task;
+    }
   | { type: 'wakeup'; session_id: string }
   // `triggers` names the agents whose settling started the turn (`more` counts the rest).
   | { type: 'auto_turn'; session_id: string; triggers?: AutoTurnTrigger[]; more?: number }

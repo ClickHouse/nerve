@@ -28,7 +28,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, onboarding, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, get_config, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -1021,6 +1021,7 @@ class TestProfile:
         assert profile["detail"]["quiet_start"] == "22:00"
         assert profile["detail"]["language"] == "English"
         assert profile["detail"]["agent_name"] == "Nerve" and profile["detail"]["agent_emoji"] == "⚡"
+        assert profile["detail"]["agent_name_prefill"] is None
         assert profile["detail"]["about_set"] is True
         assert profile["detail"]["user_md_pristine"]["name"] is False
         user_md = (claimed.workspace / "USER.md").read_text()
@@ -1203,6 +1204,21 @@ class TestProfile:
             assert response.status_code == 400 and response.json()["field"] == "timezone"
             response = await http.put("/api/setup/profile", json={"quiet_start": "25:99"})
             assert response.status_code == 400 and response.json()["field"] == "quiet_start"
+
+    async def test_the_time_zone_from_the_environment_is_the_default(self, claimed, monkeypatch):
+        """``NERVE_TIMEZONE`` is the default, not an answer: the step stays
+        pending, so the page prefills the browser's zone. A save records it."""
+        monkeypatch.setenv("NERVE_TIMEZONE", "Europe/Berlin")
+        choose(claimed, "personal")
+        async with claimed.client() as http:
+            state = (await http.get("/api/setup")).json()
+            profile = step(state, "profile")
+            assert profile["status"] == "pending"
+            assert profile["detail"]["timezone"] == "Europe/Berlin"
+            assert profile["detail"]["timezone_is_default"] is True
+            state = (await http.put("/api/setup/profile", json={"timezone": "Europe/Berlin"})).json()
+        assert step(state, "profile")["status"] == "done"
+        assert claimed.settings_yaml()["timezone"] == "Europe/Berlin"
 
 
 # --------------------------------------------------------------------------- #
@@ -2022,7 +2038,18 @@ class TestTheRestartStep:
         assert calls[0][0] == claimed.config_dir
         assert calls[0][1]["old_pid"] == os.getpid()
         assert calls[0][1]["delay_seconds"] == 0.75
+        assert calls[0][1]["drain_timeout_seconds"] == 0
         assert second.status_code == 409
+
+    async def test_helper_restart_waits_for_the_drain(self, claimed, monkeypatch):
+        await self._make_pending(claimed)
+        monkeypatch.setattr(get_config().gateway, "drain_timeout_seconds", 60)
+        calls = []
+        monkeypatch.setattr(daemon, "restart_daemon", lambda config_dir, **kw: calls.append(kw) or daemon.RestartOutcome("helper", "ok", kw.get("old_pid")))
+        async with claimed.client() as http:
+            body = (await http.post("/api/system/restart")).json()
+        assert body["mode"] == "restart" and body["timeout_hint_seconds"] == 180
+        assert calls[0]["drain_timeout_seconds"] == 60
 
     async def test_docker_exits_for_the_supervisor(self, claimed, monkeypatch):
         await self._make_pending(claimed)
@@ -2489,6 +2516,57 @@ class TestExternalMode:
         async with external_install.client() as http:
             alice_again = (await http.get("/api/setup")).json()
         assert step(alice_again, "profile")["etag"] == step(after, "profile")["etag"]
+
+    async def test_seeded_display_name_is_the_agent_name_prefill_while_identity_md_is_pristine(
+        self, external_install, monkeypatch,
+    ):
+        # A hosted deployment seeds the agent's display name into the service
+        # environment; the step offers it beside the name IDENTITY.md holds
+        # (none yet) until the person saves one, after which the file is the
+        # source: as with every template line, a filled name is never written
+        # over by the step again.
+        monkeypatch.setenv("NERVE_DISPLAY_NAME", "  Ada  ")
+        choose(external_install, "personal")
+        async with external_install.client() as http:
+            before = (await http.get("/api/setup")).json()
+            confirmed = (await http.put("/api/setup/profile", json={"agent_name": "Ada"})).json()
+            await http.put("/api/setup/profile", json={"agent_name": "Lovelace"})
+            after = (await http.get("/api/setup")).json()
+        pristine = step(before, "profile")["detail"]
+        assert pristine["agent_name"] is None and pristine["agent_name_prefill"] == "Ada"
+        assert pristine["identity_md_pristine"]["name"] is True
+        saved = step(confirmed, "profile")["detail"]
+        assert saved["agent_name"] == "Ada" and saved["agent_name_prefill"] is None
+        assert "- **Name:** Ada" in (external_install.workspace / "IDENTITY.md").read_text()
+        kept = step(after, "profile")["detail"]
+        assert kept["agent_name"] == "Ada" and kept["agent_name_prefill"] is None
+
+    async def test_a_typed_agent_name_wins_over_the_prefill(self, external_install, monkeypatch):
+        monkeypatch.setenv("NERVE_DISPLAY_NAME", "Ada")
+        choose(external_install, "personal")
+        async with external_install.client() as http:
+            state = (await http.put("/api/setup/profile", json={"agent_name": "Lovelace"})).json()
+        detail = step(state, "profile")["detail"]
+        assert detail["agent_name"] == "Lovelace" and detail["agent_name_prefill"] is None
+        assert "- **Name:** Lovelace" in (external_install.workspace / "IDENTITY.md").read_text()
+
+    async def test_agent_name_prefill_only_within_the_bounds_of_a_typed_name(self, external_install, monkeypatch):
+        # A name the step would refuse on Continue is not offered: a name
+        # nobody chose is not cut to fit either.
+        choose(external_install, "personal")
+        for value in ("", "   ", "x" * 41, "Ada\nLovelace", "Ada\x07", "Ada\x85Bot"):
+            monkeypatch.setenv("NERVE_DISPLAY_NAME", value)
+            async with external_install.client() as http:
+                detail = step((await http.get("/api/setup")).json(), "profile")["detail"]
+            assert detail["agent_name_prefill"] is None, repr(value)
+        monkeypatch.setenv("NERVE_DISPLAY_NAME", "x" * 40)
+        async with external_install.client() as http:
+            detail = step((await http.get("/api/setup")).json(), "profile")["detail"]
+        assert detail["agent_name_prefill"] == "x" * 40
+        monkeypatch.delenv("NERVE_DISPLAY_NAME")
+        async with external_install.client() as http:
+            detail = step((await http.get("/api/setup")).json(), "profile")["detail"]
+        assert detail["agent_name"] is None and detail["agent_name_prefill"] is None
 
     async def test_a_second_person_sees_the_same_state_and_any_person_may_write(self, external_install):
         async with external_install.client() as http:

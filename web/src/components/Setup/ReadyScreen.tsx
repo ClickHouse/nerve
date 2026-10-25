@@ -15,7 +15,7 @@ import {
   READY_TELEGRAM_SYNC_UNSIGNED, SAY_HELLO,
 } from './copy';
 import { providerManaged, secretManaged } from './credentialSource';
-import { stepOf, stopPath } from './navigation';
+import { stepOf, stepPlace, stopPath } from './navigation';
 import { PairingWidget } from './PairingWidget';
 import { personNameFor } from './personName';
 
@@ -85,16 +85,19 @@ export function ReadyScreen({ state }: { state: SetupState }) {
       text: `${botName ? `Telegram: @${botName}` : 'Telegram bot ready to pair'}${source ? ` · ${MANAGED_SOURCE_SHORT[source]}` : ''}`,
     });
   }
-  const sources = stepOf(state, 'sources')?.detail as SetupSourcesDetail | undefined;
+  const sourcesStep = stepOf(state, 'sources');
+  const sources = sourcesStep?.detail as SetupSourcesDetail | undefined;
   if (sources?.telegram.enabled && sources.telegram.session?.authorized === false) {
+    // The way back only to a Sources step that the setup page shows.
+    const ownSources = !!sourcesStep && stepPlace(sourcesStep) === 'own';
     summary.push({
       key: 'telegram-sync',
-      text: (
+      text: ownSources ? (
         <>
           {READY_TELEGRAM_SYNC_UNSIGNED} ·{' '}
           <Link to={stopPath('sources')} className="underline underline-offset-2 hover:text-text">{READY_TELEGRAM_SYNC_LINK}</Link>
         </>
-      ),
+      ) : READY_TELEGRAM_SYNC_UNSIGNED,
     });
   }
   const memory = stepOf(state, 'memory');

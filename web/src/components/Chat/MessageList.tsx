@@ -4,8 +4,9 @@ import type { ChatMessage } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useChatStore } from '../../stores/chatStore';
-import { providerConfigured, useSetupStore } from '../../stores/setupStore';
-import { CHAT_EMPTY_NO_PROVIDER } from '../Setup/copy';
+import { providerConfigured, stepById, useSetupStore } from '../../stores/setupStore';
+import { CHAT_EMPTY_NO_PROVIDER, CHAT_EMPTY_PROVIDER_CLOSED } from '../Setup/copy';
+import { stepPlace } from '../Setup/navigation';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
@@ -42,6 +43,10 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // `false` only when the server says no provider is configured; unknown
   // (`null`) keeps the ordinary empty state, so a failed read never nags.
   const needsProvider = useSetupStore(providerConfigured) === false;
+  // A Model step that a lockdown closed is not on the setup page, so the
+  // empty state gives the server's reason and no link to the step.
+  const providerStep = useSetupStore((s) => stepById(s, 'provider'));
+  const providerClosed = !!providerStep && stepPlace(providerStep) !== 'own';
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
@@ -67,10 +72,21 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
       {messages.length === 0 && !isStreaming && (
         needsProvider ? (
           <div role="status" className="flex flex-col items-center justify-center h-full gap-2 text-center px-6">
-            <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
-            <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
-              Finish setup
-            </Link>
+            {providerClosed ? (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_PROVIDER_CLOSED}</p>
+                {providerStep?.blocked_reason && (
+                  <p className="text-sm text-text-muted max-w-md">{providerStep?.blocked_reason}</p>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
+                <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
+                  Finish setup
+                </Link>
+              </>
+            )}
           </div>
         ) : (
           <div className="flex items-center justify-center h-full text-text-faint text-lg">

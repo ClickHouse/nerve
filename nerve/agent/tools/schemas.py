@@ -176,6 +176,18 @@ TASK_DONE_SCHEMA = {
     "required": ["task_id"],
 }
 
+TASK_COMMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string", "description": "Task ID"},
+        "body": {
+            "type": "string",
+            "description": "Comment text, in markdown. At most 10000 characters.",
+        },
+    },
+    "required": ["task_id", "body"],
+}
+
 TASK_STATUS_LIST_SCHEMA = {
     "type": "object",
     "properties": {},

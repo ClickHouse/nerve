@@ -286,7 +286,7 @@ Response: {
       "detail": { "name": "Alice", "name_source": "account", "display_name_editable": true, "writable_fields": null,
                   "timezone": "Europe/Berlin", "timezone_is_default": false,
                   "quiet_enabled": true, "quiet_start": "02:00", "quiet_end": "08:00", "quiet_is_default": true,
-                  "language": null, "agent_name": null, "agent_emoji": null, "about_set": false,
+                  "language": null, "agent_name": null, "agent_name_prefill": null, "agent_emoji": null, "about_set": false,
                   "user_md_pristine": { "name": true, "timezone": false, "language": true, "quiet_hours": true, "work": true },
                   "identity_md_pristine": { "name": true, "emoji": true } } },
     { "id": "memory", "…": "…" },
@@ -323,7 +323,8 @@ and a `detail` object with the current values, secrets masked.
 A step is `done` because a fact says so — `mode` when `SOUL.md` exists;
 `provider` when a credential is configured (including one from the gateway's
 environment, reported as `"credential": "environment"`); `profile` when the
-time zone differs from the default or `USER.md` carries a name; `channels`
+time zone differs from the default (`NERVE_TIMEZONE`, else `America/New_York`;
+see [config.md](config.md#core)) or `USER.md` carries a name; `channels`
 when a Telegram or Slack token is stored; `sources`/`agents`/`automation`
 when something is enabled or the step was answered — so an instance set up at
 the terminal or from the environment shows the same list. `done` beats
@@ -357,7 +358,12 @@ when the only credential is a subscription token (memory, titles and cron
 need an API key). `detail.channels.telegram.start_error` carries the scrubbed
 reason when the bot failed to start at this boot. In external mode
 `detail.profile.name_source` is `actor_header` and `display_name_editable` is
-`false`.
+`false`. `detail.profile.agent_name` is the name `IDENTITY.md` holds;
+`agent_name_prefill` is the name the environment gives the agent
+(`NERVE_DISPLAY_NAME`, which a hosted deployment seeds), offered while the
+file's name line is still the template's and the instance is not under
+lockdown, so the page shows it as the field's value and sends it on Continue
+like a typed name; a name outside the bounds of a typed one is not offered.
 
 `detail.profile.quiet_enabled` is `true` when both quiet times are set; both
 empty means no quiet hours. `quiet_is_default` compares with the mode's
@@ -1281,6 +1287,35 @@ whose behalf, both actor ids for [`GET /api/actors`](#actors) and `null` on
 rows from before they were recorded. See
 [Status History](tasks.md#status-history).
 
+#### `GET /api/tasks/{id}/comments`
+A task's comments, oldest first. `404` when the task does not exist.
+
+```json
+Response: { "comments": [
+  { "id": 1, "task_id": "...", "body": "Can you check Safari?", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
+] }
+```
+
+#### `POST /api/tasks/{id}/comments`
+Add a comment as the person who sends the request. The body is markdown,
+at most 10,000 characters, and leading and trailing whitespace is removed.
+`404` when the task does not exist, `422` for an empty or too long body.
+
+```json
+Request:  { "body": "Can you check Safari?" }
+Response: { "comment": { "id": 1, "task_id": "...", "body": "Can you check Safari?", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." } }
+```
+
+Status `201`. See [Comments](tasks.md#comments).
+
+#### `DELETE /api/tasks/{id}/comments/{comment_id}`
+Delete a comment. Only its author can: `403` for anybody else, `404` when the
+task has no such comment.
+
+```json
+Response: { "id": 1, "deleted": true }
+```
+
 #### `POST /api/tasks/{id}/move`
 Place a task in a lane — the board's drag-and-drop write. Send *intent*
 ("between these two cards"), not a computed rank: the server resolves the
@@ -1373,14 +1408,19 @@ List all skills with aggregated usage statistics.
 Response: {
   "skills": [{
     "id": "my-skill", "name": "my-skill", "description": "Query database...",
-    "version": "1.0.0", "enabled": true, "total_invocations": 5, "success_count": 5,
+    "version": "1.0.0", "enabled": true, "source": "workspace",
+    "total_invocations": 5, "success_count": 5,
     "avg_duration_ms": 12, "last_used": "2026-03-06T21:00:00"
   }]
 }
 ```
 
+`source` is `workspace` for a skill in `workspace/skills/` and `platform` for a
+read-only skill in `skills/` in the config directory
+([platform skills](architecture.md#platform-skills)).
+
 #### `GET /api/skills/{id}`
-Get full skill content, metadata, references, and usage stats.
+Get full skill content, metadata (including `source`), references, and usage stats.
 
 #### `POST /api/skills`
 Create a new skill.
@@ -1390,6 +1430,8 @@ Request:  { "name": "code-review", "description": "This skill should be used whe
 Response: { "id": "code-review", "name": "code-review", "created": true }
 ```
 
+When a platform skill has the id that the name gives, the request gets HTTP 403.
+
 #### `PUT /api/skills/{id}`
 Update a skill's SKILL.md content (full raw file including frontmatter).
 
@@ -1398,8 +1440,12 @@ Request:  { "content": "---\nname: code-review\ndescription: ...\n---\n\n# Instr
 Response: { "id": "code-review", "name": "code-review", "updated": true }
 ```
 
+A platform skill gets HTTP 403 with
+`{"detail": "This skill is provided by the platform and cannot be changed here."}`.
+
 #### `DELETE /api/skills/{id}`
-Delete a skill (removes directory and DB record).
+Delete a skill (removes directory and DB record). A platform skill gets HTTP 403,
+as for `PUT`.
 
 #### `PATCH /api/skills/{id}/toggle`
 Enable or disable a skill.
@@ -1416,7 +1462,7 @@ Get usage history and aggregate stats for a skill.
 Aggregate usage stats across all skills.
 
 #### `POST /api/skills/sync`
-Re-scan the `workspace/skills/` directory and sync to DB. Discovers new skills, removes deleted ones, preserves enabled state.
+Re-scan the `workspace/skills/` directory and the platform skills directory, and sync to DB. Discovers new skills, removes deleted ones, preserves enabled state.
 
 ### MCP Servers
 
@@ -1457,13 +1503,14 @@ Response: { "reloaded": 2, "servers": [...] }
 ### Memory Files
 
 #### `GET /api/memory/files`
-List markdown files in workspace.
+List the memory files: markdown files at the workspace root and under `memory/`.
 
 #### `GET /api/memory/file/{path}`
-Read a memory file.
+Read a memory file. Any other path gets 403.
 
 #### `PUT /api/memory/file/{path}`
-Write a memory file.
+Write a memory file. Any other path gets 403. On a locked instance, the
+reviewed root files (`SOUL.md`, `AGENTS.md` and the others) also get 403.
 
 ```json
 Request: { "content": "# Updated content..." }
@@ -1742,6 +1789,10 @@ those for another session. Events marked *global* go to every socket.
 // Turn stopped by a user / error
 { type: "stopped", session_id: "main" }
 { type: "error", session_id: "main", error: "..." }
+// A message refused because Nerve is shutting down, sent to its sender only.
+// With client_msg_id, a tab that queued the message behind a running turn
+// puts the text back in the composer and keeps streaming that turn.
+{ type: "error", session_id: "main", error: "...", client_msg_id: "4b6f…" | null }
 
 // An autonomous turn starts (the runtime resumed after background work
 // settled). triggers names the agents that settled since the last turn
@@ -1776,7 +1827,8 @@ those for another session. Events marked *global* go to every socket.
 // Live-agent counts changed between turns (global, debounced 1 s)
 { type: "session_agents", session_id: "s-1234", background_count: 5, has_background_tasks: true }
 // The turn queue: the full queue, plus what just left it (never buffered)
-{ type: "queue_update", session_id: "s-1234", queue: [QueueEntryView], removed?: [{ queue_id: "q_9c1d2e3f" | null, client_msg_id: "4b6f…" | null, reason: "started" | "cancelled" | "duplicate" }] }
+{ type: "queue_update", session_id: "s-1234", queue: [QueueEntryView], removed?: [{ queue_id: "q_9c1d2e3f" | null, client_msg_id: "4b6f…" | null, reason: "started" | "cancelled" | "duplicate" | "refused" }] }
+// "refused": Nerve is shutting down and did not run the message (an error event follows)
 // Kept for one release for tabs from before the agent roster (ignored by
 // the current UI): status is running | done | failed
 { type: "background_tasks_update", session_id: "s-1234", tasks: [{ task_id: "a1b2…", label: "build-api", tool: "Agent", status: "running" }] }

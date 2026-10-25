@@ -160,6 +160,33 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
 
+#### Platform skills
+
+The operator or the hosting platform can give the agent skills that the person
+who uses the instance cannot change. They go in `skills/` in the config
+directory, next to `config.yaml` and `platform.md`, with the same layout as
+workspace skills. Nerve never writes this directory, and a missing directory
+is not an error. When Nerve cannot read the directory or a skill in it, it logs
+an error and leaves those skills out. The workspace skills still load.
+
+- Nerve reads them at startup, on a reload and on `POST /api/skills/sync`,
+  together with `workspace/skills/`.
+- They are marked `source: "platform"` in the API, and workspace skills are
+  marked `source: "workspace"`. `skill_list` marks them
+  `[platform, read only]`, and `skill_get` shows `Source: platform (read only)`.
+  The Skills page shows a **Platform** badge and no edit or delete controls.
+- They are read only. `skill_update`, `PUT /api/skills/{id}` and
+  `DELETE /api/skills/{id}` refuse them with "This skill is provided by the
+  platform and cannot be changed here." (HTTP 403). `skill_create` and
+  `POST /api/skills` refuse a name whose id the platform provides. A person can
+  still enable and disable them.
+- `skill_read_reference` and `skill_run_script` read from the platform's
+  directory, with the same path checks as for workspace skills.
+- When both directories have a skill with the same id, the platform skill is
+  the one in effect, and Nerve logs a warning.
+- A locked instance does not read them (see
+  [lockdown](config.md#when-locked)).
+
 ### House of Agents (retired)
 The houseofagents multi-agent runtime was retired in favor of **workflow runs** (`nerve/workflows/`, the `workflow_run_*` tools) — budget-capped multi-agent runs with journals, live spend tracking, and run-scoped kill. See [workflow-runs.md](workflow-runs.md). The `hoa_*` tool names remain registered as deprecation stubs (gated by `houseofagents.enabled`) that point callers at `workflow_run_start`.
 
@@ -331,6 +358,17 @@ memU SQLite (`~/.nerve/memu.sqlite`):
 9. **Onboarding**: the gateway opens the onboarding when the `onboarding` row asks for it, and only with a model credential: the conversation, when setup finished before a restart, or the autonomous session of a worker that `nerve init` set up with a task description (`nerve/onboarding.py`; the setup page's Finish opens the conversation when no restart is needed). One-shot CLI commands never open it
 
 The gateway boots and serves `/setup` with nothing configured — no mode, no provider — and stays idle rather than failing, so the browser setup can do its work against a running instance.
+
+## Shutdown Sequence
+
+The first SIGTERM or SIGINT starts a drain:
+
+1. The engine stops accepting new turns. A turn that starts after this is refused, also one that was queued behind a running turn: a queued message leaves the queue with the reason `refused`, the web UI shows an error, REST routes that wait for the turn return 503, and Telegram and Slack reply with the error. The user message is not stored. Hosted channels stop reading their inbox, so the channel gateway keeps those events and the next start reads them. An answer to a question, a plan approval and a plan revision request are refused before they are stored, because the turn that delivers them would be refused: the question or plan stays pending. An answer that was stored before the drain and waits behind a running turn is still refused when that turn ends.
+2. Cron jobs, session wakeups, queued workflow runs and the notification expiry sweep do not start. After the restart, the cron catch-up runs each missed job that has `catchup` on, the wakeup sweep fires the due wakeups, and the expiry sweep expires the stale questions. Queued workflow runs stay pending, and the recovery pass at the next start marks them failed (see [Workflow runs](workflow-runs.md)).
+3. The gateway waits up to `gateway.drain_timeout_seconds` for running turns to end. It continues to serve during the wait, so clients still get the stream of a running turn. A background task that finishes during the wait can start a continuation turn, and the wait includes that turn.
+4. The usual shutdown follows: uvicorn closes connections, then the lifespan stops the services and the engine. Turns that are still running end when the engine disconnects their clients.
+
+A second signal skips the rest of the wait. `drain_timeout_seconds` is 0 by default, which skips step 3. Under Kubernetes, set it below `terminationGracePeriodSeconds` so step 4 can finish before the SIGKILL. `nerve stop`, `nerve restart` and the setup page's restart wait `drain_timeout_seconds` plus 15 seconds before they send SIGKILL. Under systemd or Docker, set `TimeoutStopSec` or `stop_grace_period` to cover the same time.
 
 ## Security
 

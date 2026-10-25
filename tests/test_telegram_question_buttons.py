@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.telegram import MAX_MSG_LEN, TelegramChannel, _fit_text
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.notifications.service import NotificationService
@@ -153,6 +154,23 @@ async def test_approval_buttons_keep_their_canonical_value(service, bot):
 # ----------------------------------------------------------------------
 #  Taps
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_tap_during_a_drain_keeps_the_question_and_its_buttons(
+    service, channel, db, bot, engine,
+):
+    nid = await _ask(service, ["Yes", "No"])
+    engine.accepting_turns = False
+
+    update, query = _tap(_buttons(bot)[0].callback_data)
+    await channel._handle_callback_query(update, None)
+
+    assert (await db.get_notification(nid))["status"] == "pending"
+    engine.run.assert_not_called()
+    query.answer.assert_awaited_once_with(str(NotAcceptingTurnsError()), show_alert=True)
+    query.edit_message_text.assert_not_awaited()
+    query.edit_message_reply_markup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -245,10 +245,11 @@ A reload is always explicit. Two things cause one:
 | Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters and `pr_watch` are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
-| Skills (`skills/`) | ✅ re-scanned |
+| Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
 | Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
+| `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -733,6 +734,10 @@ Two things to know about `NERVE_LOCKDOWN`:
   the skill index picks up on the next reload, and the root files are the system
   prompt the agent starts every turn from. `memory/`, `tasks/`, `TASK.md` and
   ordinary workspace files are outside it and stay writable.
+- **Platform skills are not read.** The skills in `skills/` in the config
+  directory ([platform skills](architecture.md#platform-skills)) are
+  machine-local, and no reviewer saw them, so a locked instance leaves them out
+  and logs this when the directory exists.
 - **Runtime edits to the reviewed surface are blocked.** Creating, updating,
   deleting or toggling a skill, Telegram pairing, writing a workspace file that
   lands in that surface, and other config mutations fail with a "locked" error
@@ -965,7 +970,7 @@ Backups follow the same rule:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `workspace` | path | `~/nerve-workspace` | Path to workspace directory |
-| `timezone` | string | `America/New_York` | Local timezone for scheduling |
+| `timezone` | string | `$NERVE_TIMEZONE`, else `America/New_York` | Local timezone for scheduling. When no configuration file names it, Nerve uses `NERVE_TIMEZONE` from its environment if that is an IANA time zone name (for example `Europe/Berlin`). An empty variable counts as unset. For any other value (`Local`, a path, an unknown name), Nerve uses `America/New_York` and logs one warning. A hosted platform can set the variable for each agent. The setup page does not count this default as an answer: the About you step stays pending and prefills the browser's time zone |
 | `lockdown` | bool | `false` | [Remote-only, read-only mode](#lockdown-remote-only-read-only). Honored only in `workspace/config/settings.yaml`; an unreadable value is an error, not a default. |
 | `deployment` | string | `server` | `server` (bare metal) or `docker`. Set during `nerve init`; determines whether CLI commands run directly or proxy to `docker compose`. |
 
@@ -2200,7 +2205,7 @@ reason.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps read "Not available on this instance" and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference) — the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off — one-way, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
+| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps are closed, the setup page does not show them, and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference); the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off, one way only, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
 
 ## API Keys (config.local.yaml)
 

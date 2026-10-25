@@ -222,10 +222,16 @@ A few things worth knowing per step:
   defaults, as before).
 - **About you** prefills the time zone from your browser. Quiet hours are
   optional: on a personal install the switch starts on with 22:00–07:00 while
-  the instance still has the defaults; a worker's starts off. Continuing
-  accepts what the form shows; the step counts as decided. Nerve records quiet
-  hours for the agent and does not hold messages back itself (see
-  [Configuration → Quiet Hours](config.md#quiet-hours)).
+  the instance still has the defaults; a worker's starts off. The agent's name
+  is prefilled from the name the environment gives the agent
+  (`NERVE_DISPLAY_NAME`, which a hosted deployment seeds from its own record)
+  while `IDENTITY.md`'s name line is still the template's; Continuing writes
+  it there like a typed name, and from then on the file is the source. A name
+  the step would refuse — over 40 characters, or not a single line — is not
+  offered, and nothing is offered under lockdown.
+  Continuing accepts what the form shows; the step counts as decided. Nerve
+  records quiet hours for the agent and does not hold messages back itself
+  (see [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the
@@ -468,8 +474,11 @@ Nerve to apply your setup" when only the restart is left). The count
 includes the steps that are waiting for the Mode step, so it only ever goes
 down; steps a lockdown makes read-only are never counted. The
 chat page's empty state points at the Model step until a provider is
-configured. On the Overview every done step has a **Change** link; a skipped
-step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
+configured. On the Overview every done step of your own has a **Change**
+link; a skipped step offers **Undo skip**. A done step that you cannot change
+here, because the operator configured it, is listed under **Your operator has
+configured**, with its summary and no Change link. A step that a lockdown or
+the instance's policy closed is not shown. The CLI reports the same checklist: `nerve status`
 prints `Setup checklist: N steps left — http://…/setup`, and `nerve doctor`
 prints `[OK] Setup checklist complete` or
 `[WARN] Setup checklist incomplete (steps: provider, profile) — finish at /setup`.
@@ -588,7 +597,7 @@ Anything the setup wizard would ask comes from the environment. Authentication i
 |---|---|---|
 | `NERVE_MODE` | `personal` | `personal` or `worker` — this is how an unattended install chooses the mode |
 | `NERVE_WORKSPACE` | `~/nerve-workspace` | Workspace directory |
-| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone |
+| `NERVE_TIMEZONE` | `America/New_York` | Schedule timezone, written to `settings.yaml`. An empty value or a value that is not a time zone name gives `America/New_York`. When the variable is also in the environment of the Nerve process, it is the default time zone ([Configuration](config.md#core)) |
 | `NERVE_PROVIDER` | `anthropic` | `anthropic` or `bedrock` |
 | `NERVE_AWS_REGION` | `$AWS_REGION`, else `us-east-1` | Bedrock region; sets the model geo-prefix |
 | `NERVE_PASSWORD` | unset | Web UI password. Setting it completes setup |
@@ -602,7 +611,9 @@ worker's defaults changed: quiet hours off (`quiet_start` and `quiet_end`
 empty) and `task-planner` disabled until onboarding enables it.
 The browser checklist afterwards shows what the environment decided as done —
 the mode, the provider, the time zone, a Telegram token — and leaves the rest
-to skip or fill in.
+to skip or fill in. A time zone that is equal to `NERVE_TIMEZONE` in the
+environment of the Nerve process is the default, not an answer: About you
+stays pending.
 
 A re-run over an existing install keeps the configuration and only upgrades the code.
 
@@ -782,8 +793,9 @@ the setup page works the same way with these differences:
   environment.
 - **The wizard starts at Mode**, with an overview that says who you are
   ("Signed in as Alice Example through your organisation's sign-in"), what the
-  wizard does, and what is already configured. It configures the instance for
-  everyone who uses it; nothing in it is personal to your account.
+  wizard does, and what your operator has configured. It configures the
+  instance for everyone who uses it; nothing in it is personal to your
+  account.
 - **Any signed-in person may run setup.** There is no owner. Several people
   may have it open; the state is server-side, every save returns the whole
   checklist, and the last writer wins per step.
@@ -815,12 +827,16 @@ the setup page works the same way with these differences:
 
 Under [lockdown](config.md#lockdown-remote-only-read-only) configuration
 arrives by pull request, so the wizard is read-only for anything it would
-write to configuration or to a reviewed workspace file. Such steps read
-**blocked**, each with the reason ("Configuration is managed from the config
-repository on this instance; changes arrive by PR and sync. Configure this
-step from the config repository."), and are not counted as "left to do" —
-a locked instance that has everything provisioned reads as finished and the
-banner stays quiet. What still works: the claim (it writes to `nerve.db`), a
+write to configuration or to a reviewed workspace file. `GET /api/setup`
+marks such a step **blocked**, with the reason ("Configuration is managed
+from the config repository on this instance; changes arrive by PR and sync.
+Configure this step from the config repository."), and does not count it as
+"left to do". The setup page does not show it. A locked instance that has
+everything provisioned reads as finished and the banner stays quiet. A step
+that is done is read-only, and the Overview lists it under **Your operator
+has configured**; the Mode step and your account stay in your own list. When
+no step is left for you, the Overview says that the operator configured every
+step. What still works: the claim (it writes to `nerve.db`), a
 worker's `TASK.md` once the templates have arrived from the repository, your
 display name (local mode), skipping, finishing and restarting.
 
@@ -846,11 +862,11 @@ something else) stops the configuration from loading, as it does for
 on every request, so a reload applies it. The wizard then says so instead of
 offering the fields:
 
-- **Memory**, **Sources** and **Agents** read "Not available on this
-  instance", with the reason: *This instance does not store credentials
-  entered here. Connections are provided by the operator of this
-  deployment.* They are not counted as left to do, so the checklist can
-  finish without them.
+- **Memory**, **Sources** and **Agents** are closed, with the reason: *This
+  instance does not store credentials entered here. Connections are
+  provided by the operator of this deployment.* The setup page does not show
+  them. They are not counted as left to do, so the checklist can finish
+  without them.
   Recall is LLM-ranked, as it is on any instance without an OpenAI key.
 - **Sources** stays open for one toggle when the operator provides the
   GitHub token from the environment (`GH_TOKEN` or `GITHUB_TOKEN` in the
@@ -875,7 +891,7 @@ offering the fields:
   server.
 - A step the operator provided — an OpenAI key or a bot token as a `${VAR}`
   reference, a source switched on in the tracked settings — stays done and
-  reads read-only.
+  read-only, and the Overview lists it under **Your operator has configured**.
 - The writes behind those steps answer `409` with the same two sentences:
   the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
   mode and the GitHub switch with a token from the environment excepted), the
@@ -998,7 +1014,7 @@ Nerve has built-in daemon management. No systemd required for basic usage.
 
 ```bash
 nerve start           # Start as background daemon (nerve init already did this once)
-nerve stop            # Stop the daemon (graceful, 15s timeout)
+nerve stop            # Stop the daemon (graceful: gateway.drain_timeout_seconds + 15s)
 nerve restart         # Stop + start
 nerve status          # Show PID, memory, uptime, setup state
 nerve status -f       # Show status then tail logs

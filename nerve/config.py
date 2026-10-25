@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from nerve import paths
 from nerve.coerce import FALSY, TRUTHY
@@ -932,6 +933,11 @@ class GatewayConfig:
     # rates. ``uvloop``/``auto`` remain available for a deployment that wants
     # them. Takes effect at startup only.
     loop: str = "asyncio"
+    # On SIGTERM or SIGINT, how long to wait for running turns to end before
+    # the shutdown. New turns are refused during the wait. 0 means no wait.
+    # Under Kubernetes, set it below terminationGracePeriodSeconds so the
+    # shutdown that follows can finish. Read when the signal arrives.
+    drain_timeout_seconds: int = 0
 
     @classmethod
     @_coerced
@@ -946,6 +952,7 @@ class GatewayConfig:
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
             loop=loop,
+            drain_timeout_seconds=d.get("drain_timeout_seconds", 0),
         )
 
 
@@ -3641,10 +3648,60 @@ class XmemoryConfig:
         )
 
 
+#: The time zone when no settings layer names ``timezone`` and the
+#: environment gives no usable one.
+FALLBACK_TIMEZONE = "America/New_York"
+#: The environment variable that sets the default time zone. A hosted
+#: platform can set it for each agent.
+TIMEZONE_ENV = "NERVE_TIMEZONE"
+# The refused values of TIMEZONE_ENV that this process logged already: the
+# default is resolved each time a config is built.
+_refused_env_timezones: set[str] = set()
+
+
+def _is_zone_name(name: str) -> bool:
+    """Whether ``ZoneInfo`` loads ``name`` as a time zone name.
+
+    ``localtime`` is refused: on many systems it is a link to the machine's
+    own zone file, not the name of a zone.
+    """
+    if not name or name.lower() == "localtime":
+        return False
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return False
+    return True
+
+
+def default_timezone() -> str:
+    """The time zone Nerve uses when no settings layer names ``timezone``.
+
+    This is ``NERVE_TIMEZONE`` from the environment when ``ZoneInfo`` loads
+    it as a time zone name (an IANA name such as ``Europe/Berlin``), else
+    :data:`FALLBACK_TIMEZONE`. An unset or empty variable gives the fallback.
+    Any other value that is not a time zone name (``Local``, a path, an
+    unknown name) also gives the fallback, with one warning per value.
+    """
+    raw = os.environ.get(TIMEZONE_ENV, "")
+    name = raw.strip()
+    if not name:
+        return FALLBACK_TIMEZONE
+    if _is_zone_name(name):
+        return name
+    if raw not in _refused_env_timezones:
+        _refused_env_timezones.add(raw)
+        logger.warning(
+            "%s=%r is not a time zone name; the default time zone is %s",
+            TIMEZONE_ENV, raw, FALLBACK_TIMEZONE,
+        )
+    return FALLBACK_TIMEZONE
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
-    timezone: str = "America/New_York"
+    timezone: str = field(default_factory=default_timezone)
     # Remote-only, read-only mode. When set (in workspace/config/settings.yaml —
     # the tracked file the remote controls), config comes ONLY from the workspace
     # + ${ENV_VAR}; machine config.yaml/config.local.yaml overrides and legacy
@@ -4061,7 +4118,7 @@ class NerveConfig:
         locked = _as_lockdown(d.get("lockdown"))
         return cls(
             workspace=workspace,
-            timezone=d.get("timezone", "America/New_York"),
+            timezone=d["timezone"] if "timezone" in d else default_timezone(),
             lockdown=locked,
             deployment=d.get("deployment", "server"),
             quiet_start=d.get("quiet_start", "02:00"),

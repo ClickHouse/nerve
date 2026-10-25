@@ -9,7 +9,11 @@ import { api, type Task } from '../../api/client';
 import { TaskDetailBody } from './TaskDetailBody';
 
 vi.mock('../../api/client', () => ({
-  api: { updateTask: vi.fn(), getTaskPlans: vi.fn(async () => ({ plans: [] })) },
+  api: {
+    updateTask: vi.fn(),
+    getTaskPlans: vi.fn(async () => ({ plans: [] })),
+    listTaskComments: vi.fn(async () => ({ comments: [] })),
+  },
   // The timeline's actor labels read the viewer through the auth store,
   // which wires these on import.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),

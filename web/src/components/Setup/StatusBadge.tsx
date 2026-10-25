@@ -1,18 +1,16 @@
 import type { SetupStep } from '../../api/client';
 import { Badge } from '../ui';
 import { Check, CircleDashed, Lock } from '../ui/icons';
-import { closedByPolicy, waitsForMode } from './navigation';
 
 /**
  * A step's status, as a chip with a glyph — so no state is colour-only.
  * A read-only done step (the mode, once chosen) carries a lock as well.
  *
- * Three kinds of `blocked`: a step that merely waits for Mode to be chosen
- * reads "After Mode" without a lock (sequencing); one the instance has
- * closed because it keeps no credentials on disk reads "Not available";
- * lockdown and "no config dir" keep the lock and "Blocked".
+ * The page shows a badge only for the person's own steps (`stepPlace`). A
+ * `blocked` step among them only waits for Mode to be chosen: that is
+ * sequencing, so it reads "After Mode" without a lock.
  */
-export function StatusBadge({ step }: { step: Pick<SetupStep, 'status' | 'read_only' | 'blocked_reason' | 'blocked_kind'> }) {
+export function StatusBadge({ step }: { step: Pick<SetupStep, 'status' | 'read_only'> }) {
   if (step.status === 'done') {
     return (
       <Badge tone="success">
@@ -21,10 +19,6 @@ export function StatusBadge({ step }: { step: Pick<SetupStep, 'status' | 'read_o
     );
   }
   if (step.status === 'skipped') return <Badge tone="neutral">Skipped</Badge>;
-  if (step.status === 'blocked') {
-    if (waitsForMode(step)) return <Badge tone="neutral">After Mode</Badge>;
-    if (closedByPolicy(step)) return <Badge tone="neutral"><Lock size={11} />Not available</Badge>;
-    return <Badge tone="neutral"><Lock size={11} />Blocked</Badge>;
-  }
+  if (step.status === 'blocked') return <Badge tone="neutral">After Mode</Badge>;
   return <Badge tone="warning"><CircleDashed size={11} />To do</Badge>;
 }

@@ -20,6 +20,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 - `task_update`: status, deadline, tags, title, or a dated note
 - `task_read`/`task_write`: read or overwrite the markdown; `task_write` needs a prior `task_read`
 - `task_done`: moves the file to `done/` and the task's implementing plans to done
+- `task_comment`: a comment on a task, signed as you; `task_read` shows the newest 50
 - `task_status_list`/`task_status_create`: configured statuses; create only on request
 
 **Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
