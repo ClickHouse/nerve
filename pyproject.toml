@@ -89,7 +89,7 @@ nerve = "nerve.cli:main"
 # unpinned backend is a hole in "reproducible install". A major bound stops the
 # breaking-change class; exact pinning would need --build-constraint, which the
 # plain-pip path wouldn't honour anyway.
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling>=1.32.4,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
