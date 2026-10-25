@@ -13,6 +13,7 @@ import os
 import sqlite3
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -214,15 +215,16 @@ class TestTheCliRefusesANewerSchema:
     def test_the_gateway_refuses_before_uvicorn_starts(
         self, tmp_path, monkeypatch, table, track,
     ):
-        import uvicorn
-
         from nerve import cli
+        from nerve.gateway import server
 
         config_dir = _config_dir(tmp_path)
         _migrated_but_unbootstrapped_db()
         version = _ahead_of_the_code(table)
         monkeypatch.setattr(cli, "_get_daemon_status", lambda: (False, None))
-        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("uvicorn started"))
+        monkeypatch.setattr(
+            server._DrainingServer, "run", lambda self: pytest.fail("uvicorn started"),
+        )
 
         result = CliRunner().invoke(cli.main, ["-c", str(config_dir), "start", "-f"])
         _assert_one_line_refusal(result, track, version)
@@ -248,9 +250,11 @@ class TestTheCliRefusesANewerSchema:
         _ahead_of_the_code("fork_schema_version")
         monkeypatch.setattr(cli, "_get_daemon_status", lambda: (False, None))
         monkeypatch.setattr(server, "create_app", lambda: None)
+        monkeypatch.setattr(uvicorn, "Config", lambda app, **kw: SimpleNamespace(**kw))
         # The lifespan opens the database before it starts anything else.
         monkeypatch.setattr(
-            uvicorn, "run", lambda *a, **k: asyncio.run(init_db(paths.db_path())),
+            server._DrainingServer, "run",
+            lambda self: asyncio.run(init_db(paths.db_path())),
         )
         os.chmod(db_path.parent, 0o777)
         try:

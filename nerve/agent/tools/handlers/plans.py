@@ -290,6 +290,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     HTTP route and the Telegram ``/plans`` command. Exceptions are mapped
     here to user-facing text.
     """
+    from nerve.agent.engine import NotAcceptingTurnsError
     from nerve.agent.plan_service import (
         PlanNotFound,
         PlanNotPending,
@@ -316,7 +317,7 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(f"Plan not found: {plan_id}")
     except TaskNotFound:
         return ToolResult.text("Task not found for this plan.")
-    except PlanNotPending as exc:
+    except (PlanNotPending, NotAcceptingTurnsError) as exc:
         return ToolResult.text(str(exc))
 
     return ToolResult.text(
@@ -367,6 +368,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     the MCP tool surface and the HTTP route. Exceptions are mapped here to
     user-facing text; the HTTP layer maps them to status codes.
     """
+    from nerve.agent.engine import NotAcceptingTurnsError
     from nerve.agent.plan_service import (
         PlanNotFound,
         PlanNotPending,
@@ -393,7 +395,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult.text(f"Plan not found: {plan_id}")
     except TaskNotFound:
         return ToolResult.text("Task not found for this plan.")
-    except PlanNotPending as exc:
+    except (PlanNotPending, NotAcceptingTurnsError) as exc:
         return ToolResult.text(str(exc))
 
     return ToolResult.text(
