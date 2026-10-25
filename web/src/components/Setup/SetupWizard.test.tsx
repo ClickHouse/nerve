@@ -2044,8 +2044,8 @@ describe('telegram message sync sign-in', () => {
   });
 
   it('the ready screen lists an unsigned Telegram sync with a way back to the step', () => {
-    const sync = (session: TelegramSyncSessionSummary) =>
-      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done' }, {
+    const sync = (session: TelegramSyncSessionSummary, overrides: Partial<SetupStep> = {}) =>
+      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done', ...overrides }, {
         telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session },
       }));
     const view = render(<MemoryRouter><ReadyScreen state={sync({ present: false, authorized: false, user: null })} /></MemoryRouter>);
@@ -2057,8 +2057,20 @@ describe('telegram message sync sign-in', () => {
     expect(screen.queryByText(/in effect/)).not.toBeInTheDocument();
     view.unmount();
 
-    render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
+    const signedIn = render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
     expect(screen.queryByText(/not signed in/)).not.toBeInTheDocument();
+    signedIn.unmount();
+
+    // A Sources step that the operator configured is not on the setup page:
+    // the line stays, with no link to the step.
+    const operators = sync(
+      { present: false, authorized: false, user: null },
+      { read_only: true, read_only_reason: 'Configuration is managed from the config repository on this instance.' },
+    );
+    render(<MemoryRouter><ReadyScreen state={operators} /></MemoryRouter>);
+    const lockedSummary = screen.getByRole('list', { name: 'Summary' });
+    expect(lockedSummary).toHaveTextContent('Telegram message sync: not signed in');
+    expect(within(lockedSummary).queryByRole('link', { name: 'Sign in' })).not.toBeInTheDocument();
   });
 });
 
@@ -2526,9 +2538,11 @@ describe('the steps a person can take, the operator\'s and the hidden ones', () 
     expect(nav.getByRole('link', { name: /^Account/ })).toBeInTheDocument();
   });
 
-  it('with no step left for the person, the overview and the review say that the operator configured every step', async () => {
+  it('with no step left for the person, the overview and the review say that there is nothing to set up', async () => {
     // External mode under lockdown before a mode is chosen: no claim, the
     // Mode step is closed, and every other step is the operator's or closed.
+    // The sentence does not say that every step is configured: the mode is not.
+    const NO_OWN = 'There is nothing for you to set up on this page. Your operator sets up this instance.';
     useHostedStore.setState({ mode: 'external' });
     const locked = (id: Parameters<typeof step>[0]) => step(id, {
       status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
@@ -2548,7 +2562,7 @@ describe('the steps a person can take, the operator\'s and the hidden ones', () 
     });
     const view = renderAt('/setup');
     await heading('Everything is set up');
-    expect(screen.getByText('Your operator has configured every step on this instance.')).toBeInTheDocument();
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
     expect(screen.queryByRole('list', { name: 'Steps' })).not.toBeInTheDocument();
     expect(screen.queryByText(/steps done/)).not.toBeInTheDocument();
     const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
@@ -2559,7 +2573,7 @@ describe('the steps a person can take, the operator\'s and the hidden ones', () 
     renderAt('/setup/review');
     await heading('Review and finish');
     expect(screen.queryByRole('region', { name: 'Checklist' })).not.toBeInTheDocument();
-    expect(screen.getByText('Your operator has configured every step on this instance.')).toBeInTheDocument();
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
   });
 
   it('the phone\'s position line counts the own steps', async () => {

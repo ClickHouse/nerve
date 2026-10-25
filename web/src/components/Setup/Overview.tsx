@@ -5,7 +5,7 @@ import { ArrowRight, RefreshCw } from '../ui/icons';
 import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import {
-  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, ALL_STEPS_OPERATOR, OPERATOR_SECTION_HEADING, OVERVIEW_SUBLINE,
+  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, NO_OWN_STEPS, OPERATOR_SECTION_HEADING, OVERVIEW_SUBLINE,
   OVERVIEW_SUBLINE_FINISHED,
 } from './copy';
 import { firstPendingStop, operatorSteps, ownSteps, stepTitle, stopPath } from './navigation';
@@ -61,7 +61,7 @@ export function Overview({ state }: { state: SetupState }) {
       </div>
 
       <div className="rounded-lg border border-border bg-surface-raised p-4 flex flex-col gap-2 text-sm text-text-muted">
-        {own.length === 0 ? <p>{ALL_STEPS_OPERATOR}</p> : (
+        {own.length === 0 ? <p>{NO_OWN_STEPS}</p> : (
           <>
             <p>
               Each step saves when you continue.

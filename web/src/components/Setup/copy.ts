@@ -474,6 +474,8 @@ export const BANNER_RESTART = 'Restart Nerve to apply your setup';
 
 /** The same verb as the Model step's heading, the same noun as the usual empty state. */
 export const CHAT_EMPTY_NO_PROVIDER = 'Connect a model to start a conversation';
+/** The chat's empty state when the instance closed the Model step (a lockdown); the step's reason follows. */
+export const CHAT_EMPTY_PROVIDER_CLOSED = 'No model is connected';
 
 /**
  * The first screen. The route and the API keep saying "claim"; the person
@@ -493,8 +495,12 @@ export const OVERVIEW_SUBLINE = 'The Mode and Model steps are required. You can 
 export const OVERVIEW_SUBLINE_FINISHED = 'Use Change next to a step to edit it.';
 /** The Overview's section of the done steps that the person cannot change here. */
 export const OPERATOR_SECTION_HEADING = 'Your operator has configured';
-/** The Overview and the Review when no step is left for the person to take. */
-export const ALL_STEPS_OPERATOR = 'Your operator has configured every step on this instance.';
+/**
+ * The Overview and the Review when no step is left for the person to take.
+ * That occurs before a mode is chosen (external mode under lockdown), so
+ * the sentence does not say that every step is configured.
+ */
+export const NO_OWN_STEPS = 'There is nothing for you to set up on this page. Your operator sets up this instance.';
 /** The claim row's secondary text; the last word is the link to Accounts. */
 export const ACCOUNT_ROW_TEXT = 'Manage people and passwords in';
 export const ACCOUNT_ROW_LINK = 'Accounts';

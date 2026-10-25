@@ -8,7 +8,7 @@ import { copyToClipboard } from '../../../utils/clipboard';
 import { Badge, Button } from '../../ui';
 import { Check, Copy, Loader2, RefreshCw } from '../../ui/icons';
 import {
-  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, ALL_STEPS_OPERATOR, HTTPS_HINT, PASSWORDLESS_LAN_HINT,
+  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, HTTPS_HINT, NO_OWN_STEPS, PASSWORDLESS_LAN_HINT,
   PROVIDER_LAST_TEST_FAILED, QUIET_HOURS_LINE, RESTART_EXPLAINER, RESTART_HEADLINE, RESTART_HEADLINE_FIRST_RUN,
   REVIEW_DECIDE_FIRST, REVIEW_HEADING, WORK_REVIEW_ALSO, WORK_REVIEW_ITEMS, WORK_REVIEW_NONE, WORK_REVIEW_RULES,
   describeRestartReason, isFirstRunRestart,
@@ -212,7 +212,7 @@ export function ReviewStep({ state }: { state: SetupState }) {
 
       {/* No step left for the person (external mode under lockdown, before
           a mode is chosen): the sentence in place of an empty checklist. */}
-      {own.length === 0 ? <p className="text-sm text-text-muted">{ALL_STEPS_OPERATOR}</p> : (
+      {own.length === 0 ? <p className="text-sm text-text-muted">{NO_OWN_STEPS}</p> : (
         <section aria-label="Checklist" className="flex flex-col gap-1">
           <h2 className="text-sm font-medium text-text">Checklist</h2>
           <ul className="flex flex-col gap-1">

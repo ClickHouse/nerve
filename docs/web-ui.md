@@ -185,8 +185,12 @@ The Mode step is read-only once chosen, but it stays an own step. A step that
 a lockdown or the policy closed and that is not done is **hidden**: the page
 does not show it (also the Mode step, when a lockdown closed it before a mode
 was chosen). A link to an operator's or a hidden step goes to the Overview.
-When no step is left for the person, the Overview and the Review say that the
-operator configured every step, in place of the count and the list.
+The chat's empty state and the Ready screen's Telegram sync line do not link
+to a step that is not one of the person's own. When no step is
+left for the person (external mode under lockdown, before a mode is chosen),
+the Overview and the Review say that there is nothing to set up on the page
+and that the operator sets up the instance, in place of the count and the
+list.
 
 Step forms (`steps/*.tsx`) open on the server's values and are keyed by
 `${viewer.id}:${step.etag}`, so another person's save — or a restart —
@@ -279,6 +283,8 @@ finished. Then a gear button labelled "Setup" in the footer of the nav rail
 opens `/setup`. On a phone the entry stays in the **More** drawer. The
 chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
+When a lockdown closed the Model step, it reads "No model is connected" with
+the step's reason from the server, and no link.
 
 **External authentication.** `/setup` and `/setup/:stepId` are registered in
 the hosted frontend too; only the claim form is local-only, and the switch
