@@ -655,6 +655,18 @@ export interface TaskEvent {
   created_at: string;
 }
 
+export interface TaskComment {
+  id: number;
+  task_id: string;
+  /** Markdown. */
+  body: string;
+  /** Who wrote the comment: a person, or the system actor for the agent. */
+  actor_id: string | null;
+  /** On whose behalf it was written. `null` when unknown. */
+  caused_by_actor_id: string | null;
+  created_at: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -667,6 +679,8 @@ export interface Task {
   position: number;
   created_at: string;
   updated_at: string;
+  /** Number of comments. Server-maintained. */
+  comment_count?: number;
   content?: string;
 }
 
@@ -1526,6 +1540,16 @@ export const api = {
     }),
   listTaskEvents: (id: string) =>
     request<{ events: TaskEvent[] }>(`/tasks/${id}/events`),
+  listTaskComments: (id: string) =>
+    request<{ comments: TaskComment[] }>(`/tasks/${id}/comments`),
+  addTaskComment: (id: string, body: string) =>
+    request<{ comment: TaskComment }>(`/tasks/${id}/comments`, {
+      method: 'POST', body: JSON.stringify({ body }),
+    }),
+  deleteTaskComment: (id: string, commentId: number) =>
+    request<{ id: number; deleted: boolean }>(`/tasks/${id}/comments/${commentId}`, {
+      method: 'DELETE',
+    }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;

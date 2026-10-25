@@ -1286,6 +1286,35 @@ whose behalf, both actor ids for [`GET /api/actors`](#actors) and `null` on
 rows from before they were recorded. See
 [Status History](tasks.md#status-history).
 
+#### `GET /api/tasks/{id}/comments`
+A task's comments, oldest first. `404` when the task does not exist.
+
+```json
+Response: { "comments": [
+  { "id": 1, "task_id": "...", "body": "Can you check Safari?", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." }
+] }
+```
+
+#### `POST /api/tasks/{id}/comments`
+Add a comment as the person who sends the request. The body is markdown,
+at most 10,000 characters, and leading and trailing whitespace is removed.
+`404` when the task does not exist, `422` for an empty or too long body.
+
+```json
+Request:  { "body": "Can you check Safari?" }
+Response: { "comment": { "id": 1, "task_id": "...", "body": "Can you check Safari?", "actor_id": "…", "caused_by_actor_id": "…", "created_at": "..." } }
+```
+
+Status `201`. See [Comments](tasks.md#comments).
+
+#### `DELETE /api/tasks/{id}/comments/{comment_id}`
+Delete a comment. Only its author can: `403` for anybody else, `404` when the
+task has no such comment.
+
+```json
+Response: { "id": 1, "deleted": true }
+```
+
 #### `POST /api/tasks/{id}/move`
 Place a task in a lane — the board's drag-and-drop write. Send *intent*
 ("between these two cards"), not a computed rank: the server resolves the
