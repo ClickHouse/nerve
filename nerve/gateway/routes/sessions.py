@@ -17,6 +17,7 @@ from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.gateway.routes.files import session_upload_dir
 from nerve.identity import Actor, attribution_for
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 
@@ -35,9 +36,8 @@ async def _cleanup_uploaded_files(db: object, session_id: str) -> None:
             except Exception:
                 pass
         # Try to remove session upload dir if empty
-        config = get_config()
-        session_dir = config.workspace / ".uploads" / session_id
-        if session_dir.exists():
+        session_dir = session_upload_dir(session_id)
+        if session_dir is not None and session_dir.exists():
             try:
                 session_dir.rmdir()
             except OSError:

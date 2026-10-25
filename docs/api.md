@@ -1473,13 +1473,14 @@ Response: { "reloaded": 2, "servers": [...] }
 ### Memory Files
 
 #### `GET /api/memory/files`
-List markdown files in workspace.
+List the memory files: markdown files at the workspace root and under `memory/`.
 
 #### `GET /api/memory/file/{path}`
-Read a memory file.
+Read a memory file. Any other path gets 403.
 
 #### `PUT /api/memory/file/{path}`
-Write a memory file.
+Write a memory file. Any other path gets 403. On a locked instance, the
+reviewed root files (`SOUL.md`, `AGENTS.md` and the others) also get 403.
 
 ```json
 Request: { "content": "# Updated content..." }

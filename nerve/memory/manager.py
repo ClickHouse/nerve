@@ -14,6 +14,33 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 
+def memory_file_path(workspace: Path, relative_path: str) -> Path | None:
+    """The memory file that ``relative_path`` names, or None if it is not one.
+
+    A memory file is a markdown file at the workspace root or under
+    ``memory/``. These are the files that the memory listings show. The path
+    is resolved first, so ``..`` segments, an absolute path and symlinks are
+    judged by the file that they name. The file does not have to exist.
+
+    The callers get the path from a request. The workspace also holds files
+    that the daemon runs: git runs ``core.fsmonitor`` from ``.git/config``,
+    and the notification dispatcher runs ``scripts/``. A memory editor must
+    not write to them.
+    """
+    root = Path(workspace).resolve()
+    try:
+        candidate = (root / relative_path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # A name that is too long, a symlink loop, a NUL byte: not a file.
+        return None
+    if not candidate.is_relative_to(root) or candidate.suffix != ".md":
+        return None
+    parts = candidate.relative_to(root).parts
+    if len(parts) == 1 or parts[0] == "memory":
+        return candidate
+    return None
+
+
 class MemoryManager:
     """Manages file-based memory in the workspace."""
 
@@ -102,21 +129,18 @@ class MemoryManager:
         return files
 
     def read_file(self, relative_path: str) -> str | None:
-        """Read any file in the workspace by relative path."""
-        full_path = self.workspace / relative_path
-        # Security: ensure it's within workspace
-        try:
-            full_path.resolve().relative_to(self.workspace.resolve())
-        except ValueError:
-            logger.warning("Attempted path traversal: %s", relative_path)
+        """Read a memory file (see :func:`memory_file_path`) by relative path."""
+        path = memory_file_path(self.workspace, relative_path)
+        if path is None:
+            logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return None
 
-        if full_path.exists() and full_path.is_file():
-            return full_path.read_text(encoding="utf-8")
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
         return None
 
     def write_file(self, relative_path: str, content: str) -> bool:
-        """Write a file in the workspace by relative path.
+        """Write a memory file (see :func:`memory_file_path`) by relative path.
 
         Raises :class:`~nerve.config.LockdownError` for a path inside the tracked
         config subtree on a locked instance — the caller supplies the path, so
@@ -124,14 +148,12 @@ class MemoryManager:
         """
         from nerve.config import ensure_path_not_tracked_config
 
-        full_path = self.workspace / relative_path
-        try:
-            full_path.resolve().relative_to(self.workspace.resolve())
-        except ValueError:
-            logger.warning("Attempted path traversal: %s", relative_path)
+        ensure_path_not_tracked_config(self.workspace / relative_path, "write")
+        path = memory_file_path(self.workspace, relative_path)
+        if path is None:
+            logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return False
-        ensure_path_not_tracked_config(full_path, "write")
 
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
         return True
