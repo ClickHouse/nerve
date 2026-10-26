@@ -25,6 +25,7 @@ from nerve.channels.hosted.contract.model import (
     MessageTarget,
     ThreadReference,
     byte_length,
+    valid_identifier,
 )
 
 # One code point is at most four UTF-8 bytes, so a part of this many code
@@ -37,15 +38,6 @@ CUSTOM_REACTION_PREFIX = "custom:"
 # Longer emoji names do not fit the gateway's reaction name limit.
 _MAX_EMOJI_BYTES = 128
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
-
-
-def valid_identifier(value: str, maximum: int = MAX_IDENTIFIER_BYTES) -> bool:
-    """Whether the gateway takes *value* as an ID or a label.
-
-    That is 1 to *maximum* UTF-8 bytes, not only white space, and no control
-    characters.
-    """
-    return bool(value.strip()) and byte_length(value) <= maximum and not _CONTROL_RE.search(value)
 
 
 def file_name(name: str) -> str:

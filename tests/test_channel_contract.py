@@ -243,19 +243,49 @@ class TestOperationResults:
         assert self.refused(self.READ, kind="file_read", outcome="succeeded") == "malformed_frame"
         validate_operation_result(self.SEND, self.result(kind="send", outcome="forbidden"))
 
-    def test_a_successful_notify_names_the_conversation_that_the_gateway_chose(self):
-        notify = Operation(kind="notify", deadline_millis=30000, notify=NotifyOperation())
-        target = {"conversation": {"id": "C0NOTICES"}, "message": {"id": "1.2"}}
+    NOTIFY = Operation(kind="notify", deadline_millis=30000, notify=NotifyOperation())
+    NOTIFY_TARGET: dict[str, Any] = {"conversation": {"id": "C0NOTICES"}, "message": {"id": "1.2"}}
 
-        result = self.result(kind="notify", outcome="succeeded", target=target)
-        validate_operation_result(notify, result)
+    def test_a_successful_notify_names_the_conversation_that_the_gateway_chose(self):
+        result = self.result(kind="notify", outcome="succeeded", target=self.NOTIFY_TARGET)
+
+        validate_operation_result(self.NOTIFY, result)
         assert (result.target.conversation.id, result.target.message.id) == ("C0NOTICES", "1.2")
-        assert self.refused(notify, kind="notify", outcome="succeeded") == "malformed_frame"
-        assert self.refused(
-            notify, kind="notify", outcome="succeeded", target={"message": {"id": "1.2"}},
-        ) == "malformed_frame"
-        assert self.refused(notify, kind="send", outcome="succeeded", target=target) == "scope_mismatch"
-        validate_operation_result(notify, self.result(kind="notify", outcome="forbidden", reason_code="invalid_target"))
+        assert self.refused(self.NOTIFY, kind="send", outcome="succeeded", target=self.NOTIFY_TARGET) == (
+            "scope_mismatch"
+        )
+        validate_operation_result(
+            self.NOTIFY, self.result(kind="notify", outcome="forbidden", reason_code="invalid_target"),
+        )
+
+    def test_a_notify_message_may_root_its_own_thread(self):
+        target = {**self.NOTIFY_TARGET, "thread": {"id": "1.2"}}
+
+        validate_operation_result(self.NOTIFY, self.result(kind="notify", outcome="succeeded", target=target))
+
+    def test_a_successful_notify_needs_a_target(self):
+        assert self.refused(self.NOTIFY, kind="notify", outcome="succeeded") == "malformed_frame"
+
+    @pytest.mark.parametrize(("change", "expected"), [
+        ({"message": {}}, "malformed_frame"),
+        ({"message": {"id": ""}}, "malformed_frame"),
+        ({"message": {"id": "1" * 257}}, "malformed_frame"),
+        ({"message": {"id": "1.\x072"}}, "malformed_frame"),
+        ({"message": {"id": "   "}}, "malformed_frame"),
+        ({"conversation": {}}, "malformed_frame"),
+        ({"conversation": {"id": "C0NOTICES", "kind": "channel"}}, "malformed_frame"),
+        ({"conversation": {"id": "C0NOTICES", "display_name": "notices"}}, "malformed_frame"),
+        ({"thread": {"id": ""}}, "malformed_frame"),
+        ({"thread": {"id": "1.1"}}, "scope_mismatch"),
+        ({"topic": {"id": "T1"}}, "scope_mismatch"),
+    ], ids=[
+        "no_message", "empty_message", "long_message", "control_character", "blank_message", "no_conversation",
+        "conversation_kind", "conversation_name", "empty_thread", "another_thread", "topic",
+    ])
+    def test_a_notify_target_that_the_gateway_would_refuse_is_refused(self, change, expected):
+        target = {**self.NOTIFY_TARGET, **change}
+
+        assert self.refused(self.NOTIFY, kind="notify", outcome="succeeded", target=target) == expected
 
     def test_results_and_transfers_name_their_connection(self):
         assert reason(frame("operation_result", {"kind": "send", "outcome": "forbidden"})) == "scope_mismatch"
