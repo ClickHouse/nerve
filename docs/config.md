@@ -1418,7 +1418,7 @@ takes precedence. Nerve uses `notify` only when exactly one connection
 advertises it. A gateway that does not advertise it gets no card, and Nerve
 logs no warning about the missing `notifications.slack_channel_id`. When the
 console sets no notification channel, the gateway refuses the card, and Nerve
-logs a warning for each card.
+logs one INFO line for each card. Any other failure logs one warning.
 
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`

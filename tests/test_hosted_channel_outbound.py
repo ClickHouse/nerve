@@ -1096,12 +1096,20 @@ async def unaddressed(tmp_path, db, monkeypatch, caplog):
         await stop_hosted(harness)
 
 
-async def notify_stream(hosted: Hosted, operations: list[str] = NOTIFY_OPERATIONS):
-    """A stream whose connection advertises *operations*, ready to send."""
+async def notify_stream(hosted: Hosted, operations: list[str] = NOTIFY_OPERATIONS, **limits: int):
+    """A stream whose connection advertises *operations* and *limits*, ready to send."""
     stream = await hosted.stream(advertise=False)
-    await stream.advertise(operations=operations)
+    await stream.advertise(operations=operations, **limits)
     await hosted.gateway.wait_for(lambda: hosted.runtime.streams.connections("send"))
     return stream
+
+
+def logged(caplog, level: int) -> list[str]:
+    """The messages of the hosted channel and its operation runner at *level*."""
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelno == level and record.name.startswith("nerve.channels.hosted.")
+    ]
 
 
 async def notify_card(hosted: Hosted) -> str:
@@ -1190,7 +1198,7 @@ class TestGatewayNotificationConversation:
         assert unaddressed.gateway.operations == []
         assert "No notifications.slack_channel_id" not in caplog.text
 
-    async def test_a_refused_notify_gives_no_card_and_one_warning(self, unaddressed, caplog):
+    async def test_no_channel_in_the_console_gives_no_card_and_one_info_line(self, unaddressed, caplog):
         unaddressed.gateway.notification_conversation = ""
         await notify_stream(unaddressed)
 
@@ -1198,9 +1206,41 @@ class TestGatewayNotificationConversation:
 
         assert posted is None
         assert len(records(unaddressed, "notify")) == 1
-        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
-        assert [record.getMessage() for record in warnings] == [
+        assert logged(caplog, logging.WARNING) == []
+        assert [line for line in logged(caplog, logging.INFO) if "n1" in line] == [
             "Hosted slack notification n1 was not posted: notify operation forbidden (invalid_target)",
+        ]
+
+    @pytest.mark.parametrize("reply", [
+        {"outcome": "forbidden", "reason_code": "policy_denied"},
+        {"outcome": "unavailable", "reason_code": "provider_unavailable"},
+        {"outcome": "ambiguous"},
+    ], ids=["forbidden_by_policy", "unavailable", "ambiguous_at_the_gateway"])
+    async def test_another_refusal_gives_no_card_and_one_warning(self, unaddressed, caplog, reply):
+        await notify_stream(unaddressed)
+        unaddressed.gateway.script("notify", reply)
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
+
+        assert posted is None
+        assert len(records(unaddressed, "notify")) == 1
+        [warning] = logged(caplog, logging.WARNING)
+        assert warning.startswith(f"Hosted slack notification n1 was not posted: notify operation {reply['outcome']}")
+
+    @pytest.mark.parametrize("reply", ["close", "hold"], ids=["stream_closed", "no_result_in_time"])
+    async def test_a_lost_result_gives_no_card_and_one_warning(self, unaddressed, caplog, reply):
+        await notify_stream(unaddressed, operation_deadline_millis=200)
+        unaddressed.gateway.script("notify", reply)
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
+
+        assert posted is None
+        assert len(records(unaddressed, "notify")) == 1
+        [warning] = logged(caplog, logging.WARNING)
+        assert "notify operation on connection" in warning and "it is not sent again" in warning
+        assert [line for line in logged(caplog, logging.INFO) if "n1" in line] == [
+            "Hosted slack notification n1 was not posted: notify operation ambiguous: "
+            + ("stream closed" if reply == "close" else "no result in time"),
         ]
 
     async def test_several_connections_with_notify_get_no_card(self, unaddressed, caplog):

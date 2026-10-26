@@ -179,6 +179,21 @@ def _why(error: Exception) -> str:
     return getattr(error, "detailed", None) or str(error)
 
 
+def _expected_card_failure(error: OperationFailed) -> bool:
+    """Whether a card that was not posted is logged at INFO, not as a warning.
+
+    The gateway refuses ``notify`` with ``invalid_target`` while the agent
+    has no notification channel, which is the default. For an ambiguous
+    outcome that Nerve decided, the operation runner already logged a
+    warning.
+    """
+    no_channel = (
+        error.kind == "notify" and error.outcome == "forbidden"
+        and error.reason_code == "invalid_target" and not error.local
+    )
+    return no_channel or (error.outcome == "ambiguous" and error.local)
+
+
 def _origin(event: Event) -> MessageTarget:
     """The full target of an event's message."""
     return MessageTarget(
@@ -673,9 +688,8 @@ class HostedChannel(BaseChannel):
                 lambda body: self._perform(connection, kind, card(body)),
             )
         except OperationFailed as error:
-            logger.warning(
-                "Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error),
-            )
+            log = logger.info if _expected_card_failure(error) else logger.warning
+            log("Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error))
             return None
         located = result.target
         conversation = target or located.conversation.id
