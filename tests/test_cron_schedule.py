@@ -267,6 +267,7 @@ def _mock_db(pending_wakeups=()) -> AsyncMock:
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
     db.list_pending_wakeups = AsyncMock(return_value=list(pending_wakeups))
     db.count_tasks = AsyncMock(return_value=0)
+    db.get_sync_cursor = AsyncMock(return_value=None)
     mock_system_principal(db)
     return db
 
@@ -376,11 +377,11 @@ async def test_a_source_runner_counts(held):
 
 
 @pytest.mark.asyncio
-async def test_a_source_that_runs_on_delivery_never_counts(held):
+async def test_a_source_that_runs_on_delivery_is_not_counted_with_nothing_waiting(held):
     """The hosted GitHub source reads a buffer that fills when records are
-    delivered, and it runs then. Its scheduled run is a fallback, so it is not
-    the next scheduled task, and a platform that parks the machine is not told
-    to wake it for that run."""
+    delivered, and it runs then. With nothing waiting in the buffer its
+    scheduled run is not the next scheduled task, and a platform that parks the
+    machine is not told to wake it for that run."""
     now = datetime.now(UTC)
     drain = _runner("github")
     drain.source.push_fed = True
@@ -412,9 +413,110 @@ async def test_a_source_that_runs_on_delivery_alone_schedules_nothing(held):
     assert await svc.next_scheduled(now=now) is None
 
 
+def _channel_drain(rows=()) -> SimpleNamespace:
+    """A ``slack:observed`` runner over a real ChannelSource whose buffer holds *rows*."""
+    db = AsyncMock()
+    db.read_channel_observations = AsyncMock(return_value=list(rows))
+    drain = _runner("slack:observed")
+    drain.source = ChannelSource("slack", db)
+    return drain
+
+
+@pytest.mark.asyncio
+async def test_a_channel_drain_with_nothing_waiting_is_never_the_next_tick(held):
+    """Only the running instance writes a channel drain's buffer, so nothing is
+    added to it while the machine is parked. With nothing waiting, the drain is
+    not the next scheduled task, and a platform that parks the machine is not
+    kept up, or woken, for each scheduled drain. A pull source and a cron job
+    still count."""
+    now = datetime.now(UTC)
+    drain = _channel_drain()
+    db = _mock_db()
+    db.get_sync_cursor = AsyncMock(return_value="3")
+    svc = await held([_job("digest")], [_runner("mail"), drain], db=db)
+    _due(svc, "digest", now + timedelta(minutes=30))
+    _due(svc, "source:mail", now + timedelta(minutes=10))
+    _due(svc, "source:slack:observed", now + timedelta(minutes=5))
+
+    tick = await svc.next_scheduled(now=now)
+
+    assert tick == ScheduledTick(
+        at=now + timedelta(minutes=10), name="source:mail", kind="source",
+    )
+    by_id = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert by_id["source:slack:observed"]["forecast"] == "skip"
+    assert by_id["source:slack:observed"]["reason"] == cron_service._PUSH_FED_REASON
+    assert by_id["source:slack:observed"]["next_run"] == (now + timedelta(minutes=5)).isoformat()
+    db.get_sync_cursor.assert_awaited_with("slack:observed")
+    drain.source._db.read_channel_observations.assert_awaited_with("slack", after_id=3, limit=1)
+
+
+@pytest.mark.asyncio
+async def test_a_channel_drain_with_messages_waiting_counts(held):
+    """A message buffered since the last drain is work the next drain will do,
+    so that drain counts, and the machine is kept up, or woken, to take it."""
+    now = datetime.now(UTC)
+    drain = _channel_drain([(4, {"text": "hi"})])
+    svc = await held([_job("digest")], [_runner("mail"), drain])
+    _due(svc, "digest", now + timedelta(minutes=30))
+    _due(svc, "source:mail", now + timedelta(minutes=10))
+    _due(svc, "source:slack:observed", now + timedelta(minutes=5))
+
+    tick = await svc.next_scheduled(now=now)
+
+    assert tick == ScheduledTick(
+        at=now + timedelta(minutes=5), name="source:slack:observed", kind="source",
+    )
+    by_id = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert by_id["source:slack:observed"]["forecast"] == "run"
+
+
+@pytest.mark.asyncio
+async def test_a_buffer_check_that_fails_leaves_the_drain_uncounted(held):
+    now = datetime.now(UTC)
+    drain = _channel_drain()
+    drain.source._db.read_channel_observations = AsyncMock(side_effect=RuntimeError("db"))
+    svc = await held([], [drain])
+    _due(svc, "source:slack:observed", now + timedelta(minutes=5))
+
+    assert await svc.next_scheduled(now=now) is None
+
+
+@pytest.mark.asyncio
+async def test_a_cursor_that_cannot_be_read_leaves_the_drain_uncounted(held):
+    """The forecast never fails for the buffer check: a cursor read that fails
+    answers no, even with a message waiting."""
+    now = datetime.now(UTC)
+    drain = _channel_drain([(4, {})])
+    db = _mock_db()
+    db.get_sync_cursor = AsyncMock(side_effect=RuntimeError("db"))
+    svc = await held([], [drain], db=db)
+    _due(svc, "source:slack:observed", now + timedelta(minutes=5))
+
+    assert await svc.next_scheduled(now=now) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make", "channel"),
+    [(lambda db: ChannelSource("slack", db), "slack"), (HostedGitHubSource, "github")],
+)
+async def test_push_fed_sources_look_past_their_cursor_for_waiting_records(make, channel):
+    db = AsyncMock()
+    db.read_channel_observations = AsyncMock(return_value=[(8, {})])
+    source = make(db)
+
+    assert await source.has_undrained("7") is True
+    db.read_channel_observations.assert_awaited_once_with(channel, after_id=7, limit=1)
+
+    db.read_channel_observations = AsyncMock(return_value=[])
+    assert await source.has_undrained(None) is False
+    db.read_channel_observations.assert_awaited_once_with(channel, after_id=0, limit=1)
+
+
 @pytest.mark.parametrize(
     ("source", "fed"),
-    [(HostedGitHubSource, True), (ChannelSource, False), (GitHubSource, False)],
+    [(HostedGitHubSource, True), (ChannelSource, True), (GitHubSource, False)],
 )
 def test_the_sources_say_whether_deliveries_feed_them(source, fed):
     assert source.push_fed is fed

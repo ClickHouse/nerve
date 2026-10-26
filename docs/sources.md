@@ -218,8 +218,9 @@ running. Nerve reads them over the hosted channel streams.
   `source:github` runner drains it. The drop hook, `condense`, health checks,
   consumer cursors, `messages` gates and the Sources page work as they do for
   the polling source. The drain also runs on `sync.github.schedule`, as a
-  fallback; that run is not the instance's next scheduled task, so a platform
-  that parks the machine does not wake it for the fallback.
+  fallback; that run is not the instance's next scheduled task while nothing
+  waits in the buffer (normally the drain on delivery has taken everything), so
+  a platform that parks the machine does not wake it for the fallback.
 - **Runs on delivery.** As soon as records arrive, the runner drains them, and
   the jobs gated on `messages` for `github`, or for any source, run once
   `cron.delivery_debounce_seconds` (default 60) after the first record of a
@@ -308,6 +309,18 @@ A chat channel can feed the inbox with the group traffic it already receives.
   [config.md](config.md). The runner carries its own `schedule` because there
   is no `config.sync.<name>` section to look one up in.
 - **Default schedule:** `*/5 * * * *`
+- **Not the next scheduled task while nothing waits.** Only the running
+  instance writes the buffer, so nothing is added to it while the machine is
+  parked; what arrives meanwhile is delivered after the next wake. A scheduled
+  drain with nothing waiting is therefore not counted in `next` of
+  [What runs next](cron.md#what-runs-next) nor in the platform activity
+  report's `nextScheduledAt` (it is still listed, with forecast `skip`), so a
+  platform that parks an idle machine is not kept up, or woken, for each
+  scheduled drain. A drain with messages waiting since the last one counts
+  from the next forecast on (a buffered message is not announced, so at most
+  one activity report interval later): the machine stays up, or is woken, to
+  take them, and the jobs gated on `<channel>:observed` run after it as before.
+  While the instance runs, the schedule drains the buffer as it always did.
 - **Cursor:** the buffer's autoincrement row id. `AUTOINCREMENT` is
   load-bearing: the buffer is pruned, and a plain SQLite rowid is reused after
   the highest row is deleted, which would reissue ids the cursor has already

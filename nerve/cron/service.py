@@ -196,9 +196,14 @@ class _Forecast:
     runs_at: datetime | None = None
 
 
-# The forecast reason of a source runner whose source runs when records are
-# delivered (``Source.push_fed``): its scheduled run is a fallback.
-_PUSH_FED_REASON = "the source runs when records are delivered; the scheduled run is a fallback"
+# The forecast reason of a source runner whose source reads a buffer only the
+# running instance writes (``Source.push_fed``) while nothing delivered waits
+# in it: the scheduled run is not counted as the next task.
+_PUSH_FED_REASON = (
+    "the source drains only what is delivered while the instance runs, and no "
+    "delivered records were found waiting; the scheduled run is not counted as the "
+    "next task"
+)
 
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
@@ -2388,11 +2393,13 @@ class CronService:
 
         Not every change is announced. A session that records a wakeup
         (``ScheduleWakeup``) does so inside its turn, which has no reference to
-        this service; and tasks created, moved or edited from a chat turn, the
+        this service; tasks created, moved or edited from a chat turn, the
         web UI or the API change what a ``tasks`` gate forecasts without any
-        call here. Those count from the next :meth:`next_scheduled` on, so a
-        caller that keeps the answer should also refresh it periodically, and
-        when a turn ends.
+        call here; and a message a channel buffers for its
+        ``<channel>:observed`` drain makes that drain count (see
+        :meth:`_undrained`) without one. Those count from the next
+        :meth:`next_scheduled` on, so a caller that keeps the answer should
+        also refresh it periodically, and when a turn ends.
         """
         self._schedule_listeners.append(callback)
 
@@ -2441,8 +2448,9 @@ class CronService:
         :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
         is forecast to skip, one of its next few runs (see
         :meth:`_forecast_job`); the next run of each source runner, except
-        one whose source runs when records are delivered (``Source.push_fed``),
-        whose scheduled run is a fallback; the earliest pending session
+        one whose source reads a buffer only the running instance writes
+        (``Source.push_fed``: the hosted sources, the channel drains) while
+        nothing delivered waits in it; the earliest pending session
         wakeup. Cleanup and the wakeup sweep are housekeeping and never
         count. ``None`` when nothing falls within *horizon* of *now*
         (default: the current time), which must be
@@ -2504,10 +2512,11 @@ class CronService:
             next_run = getattr(sched_job, "next_run_time", None)
             if sched_job.func == self._run_source_wrapper:
                 runner = sched_job.args[0]
-                if getattr(runner.source, "push_fed", False) is True:
-                    # The source runs when records are delivered, and its
-                    # scheduled run is a fallback that normally finds nothing,
-                    # so it is not work the instance will start on its own.
+                push_fed = getattr(runner.source, "push_fed", False) is True
+                if push_fed and not await self._undrained(runner):
+                    # Only the running instance writes the source's buffer,
+                    # and nothing delivered waits in it, so the scheduled run
+                    # is not work the instance will start on its own.
                     forecasts[sched_job.id] = _Forecast(
                         "source", next_run, runs=False, reason=_PUSH_FED_REASON,
                     )
@@ -2518,6 +2527,23 @@ class CronService:
             elif sched_job.func == self._run_job_wrapper:
                 forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
         return forecasts
+
+    async def _undrained(self, runner) -> bool:
+        """Whether a push-fed runner's source has delivered records waiting
+        past the runner's cursor (:meth:`Source.has_undrained`), so its
+        scheduled run is work and counts. A source without the check, or a
+        check that fails, answers no: a forecast never fails for it."""
+        check = getattr(runner.source, "has_undrained", None)
+        if check is None:
+            return False
+        try:
+            cursor = await self.db.get_sync_cursor(runner.source.source_name)
+            return bool(await check(cursor))
+        except Exception:  # the forecast must not fail for a buffer check
+            logger.debug(
+                "Forecast: the buffer check of %s failed", runner.job_id, exc_info=True,
+            )
+            return False
 
     async def _forecast_job(self, sched_job, limit: datetime) -> _Forecast:
         """What the gates of a scheduled cron job forecast for its next run.

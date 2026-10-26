@@ -84,18 +84,35 @@ class HostedGitHubSource(Source):
             has_more=len(rows) >= limit,
         )
 
+    async def has_undrained(self, cursor: str | None) -> bool:
+        """Whether a record waits in the buffer past *cursor*.
 
-def _buffer_position(cursor: str | None) -> int:
+        Normally none does: the cron service drains the buffer as records are
+        delivered. One row is enough to know; a failed read answers no, so a
+        forecast never fails for it.
+        """
+        try:
+            rows = await self._db.read_channel_observations(
+                BUFFER_CHANNEL, after_id=_buffer_position(cursor, quiet=True), limit=1,
+            )
+        except Exception:
+            logger.debug("Hosted GitHub source: checking the buffer failed", exc_info=True)
+            return False
+        return bool(rows)
+
+
+def _buffer_position(cursor: str | None, *, quiet: bool = False) -> int:
     """The buffer row ID that *cursor* names, or 0."""
     if not cursor:
         return 0
     try:
         return int(cursor)
     except ValueError:
-        logger.info(
-            "Hosted GitHub source: cursor %r is not a buffer position (a cursor of "
-            "the polling source); draining from the start of the buffer", cursor,
-        )
+        if not quiet:
+            logger.info(
+                "Hosted GitHub source: cursor %r is not a buffer position (a cursor of "
+                "the polling source); draining from the start of the buffer", cursor,
+            )
         return 0
 
 
