@@ -33,6 +33,7 @@ from nerve.channels.hosted.contract import (
     Subscriptions,
 )
 from nerve.channels.hosted.contract.model import MAX_SUBSCRIPTION_PATTERNS
+from nerve.channels.hosted.contract.wire import dumps
 from nerve.channels.hosted.runtime import (
     HostedChannelRuntime,
     hosted_channel_providers,
@@ -105,6 +106,47 @@ class TestSettings:
 
         assert config.sync.github.mode == "poll"
         assert "sync.github.mode" in caplog.text
+
+    def test_the_inbox_is_participating_by_default_and_all_is_read(self):
+        assert NerveConfig().sync.github.inbox == "participating"
+        assert GitHubSyncConfig.from_dict({}).inbox == "participating"
+        config = NerveConfig.from_dict({"sync": {"github": {"mode": "hosted", "inbox": " All "}}})
+
+        assert config.sync.github.inbox == "all"
+        assert validate_config_keys({"sync": {"github": {"inbox": "all"}}}) == []
+
+    @pytest.mark.parametrize("blank", ["", "   ", None])
+    def test_a_blank_inbox_means_unset(self, blank):
+        assert GitHubSyncConfig.from_dict({"inbox": blank}).inbox == "participating"
+
+    @pytest.mark.parametrize(("value", "shown"), [
+        ("everything", "'everything'"), ("subscribed", "'subscribed'"), (True, "'true'"),
+    ])
+    def test_an_unknown_inbox_is_refused_with_the_two_accepted_values(self, value, shown):
+        with pytest.raises(ValueError) as refused:
+            NerveConfig.from_dict({"sync": {"github": {"inbox": value}}})
+
+        assert str(refused.value) == (
+            f"sync.github.inbox must be one of ('participating', 'all'), got {shown}"
+        )
+
+    def test_an_unknown_inbox_fails_the_load_and_the_validation(self, tmp_path):
+        from nerve.config_validate import validate_config_bundle
+
+        (tmp_path / "config.yaml").write_text(
+            "sync:\n  github:\n    inbox: everything\n", encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match=r"sync\.github\.inbox must be one of"):
+            config_module.load_config(tmp_path)
+        errors = validate_config_bundle(tmp_path).errors
+        assert any("sync.github.inbox must be one of ('participating', 'all')" in e for e in errors)
+
+    def test_the_inbox_follows_a_reload(self):
+        after = NerveConfig()
+        after.sync.github = GitHubSyncConfig(inbox="all")
+
+        assert config_reload.restart_required(NerveConfig(), after) == []
 
     @pytest.mark.parametrize(("value", "expected"), [
         (None, 60), (0, 0), (15, 15), ("120", 120), (900, 900), (-5, 0), ("soon", 60),
@@ -188,6 +230,19 @@ class TestSubscriptionsBuilder:
         config.sync.github = hosted_github(enabled=False)
 
         assert subscriptions_for(config, ["github"]) == Subscriptions(version="1")
+
+    def test_the_inbox_is_published_only_when_it_is_all(self):
+        def frame(**settings: Any) -> str:
+            config = NerveConfig()
+            config.sync.github = hosted_github(**settings)
+            return dumps(subscriptions_for(config, ["github"]))
+
+        assert frame() == frame(inbox="participating") == (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        )
+        assert frame(inbox="all") == (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true,"inbox":"all"}]}'
+        )
 
     def test_an_allow_list_the_gateway_cannot_take_is_published_empty(self, caplog):
         patterns = [f"owner/repo-{n}" for n in range(MAX_SUBSCRIPTION_PATTERNS + 1)]
@@ -376,6 +431,31 @@ class TestRegistry:
         runner = self.runner(NerveConfig(), db)
 
         assert isinstance(runner.source, GitHubSource)
+
+    @pytest.mark.parametrize(("inbox", "participating"), [("participating", True), ("all", False)])
+    async def test_poll_mode_lists_the_inbox_that_the_setting_names(self, db, monkeypatch, inbox, participating):
+        seen = TestPollingCursor.listings(monkeypatch)
+        config = NerveConfig.from_dict({"sync": {"github": {"inbox": inbox}}})
+
+        await self.runner(config, db).source.fetch(None)
+
+        assert ("&participating=true" in seen[0]) is participating
+        assert seen[0].endswith("&all=true")
+
+    async def test_a_source_reload_hands_a_changed_inbox_to_the_polling_source(self, db, monkeypatch):
+        seen = TestPollingCursor.listings(monkeypatch)
+        service = CronService(NerveConfig(), AsyncMock(), db)
+        service.scheduler.start(paused=True)
+        try:
+            service._register_source_runners()
+            service.config = NerveConfig.from_dict({"sync": {"github": {"inbox": "all"}}})
+            await service.reload_sources()
+            (runner,) = [r for r in service._source_runners if r.job_id == "source:github"]
+            await runner.source.fetch(None)
+        finally:
+            service.scheduler.shutdown(wait=False)
+
+        assert len(seen) == 1 and "participating" not in seen[0]
 
     async def test_a_switched_off_source_has_no_runner(self, db):
         config = NerveConfig()
@@ -656,6 +736,7 @@ class TestStreams:
         await hosted.subscriptions(2)
         hosted.config.sync.github.deny_reasons = ["subscribed", "comment"]
         hosted.config.sync.github.pr_watch = False
+        hosted.config.sync.github.inbox = "all"
         engine = SimpleNamespace(get_channel_runtime={"hosted": hosted.runtime}.get)
 
         outcome = await config_reload._republish_hosted_subscriptions(engine)
@@ -664,6 +745,7 @@ class TestStreams:
         latest = (await hosted.subscriptions(4))[-1]
         assert latest["sources"][0]["filters"]["deny_reasons"] == ["subscribed", "comment"]
         assert "pr_watch" not in latest["sources"][0]
+        assert latest["sources"][0]["inbox"] == "all"
 
     async def test_a_config_reload_publishes_the_reloaded_settings(self, tmp_path, db, monkeypatch):
         harness = await start(
@@ -675,6 +757,7 @@ class TestStreams:
             reloaded = copy.deepcopy(harness.config)
             reloaded.sync.github.deny_reasons = ["subscribed", "comment"]
             reloaded.sync.github.pr_watch = False
+            reloaded.sync.github.inbox = "all"
             monkeypatch.setattr(config_module, "load_config", lambda config_dir=None: reloaded)
             engine = SimpleNamespace(
                 get_channel_runtime={"hosted": harness.runtime}.get,
@@ -688,6 +771,7 @@ class TestStreams:
             latest = (await harness.subscriptions(2))[-1]
             assert latest["sources"][0]["filters"]["deny_reasons"] == ["subscribed", "comment"]
             assert "pr_watch" not in latest["sources"][0]
+            assert latest["sources"][0]["inbox"] == "all"
         finally:
             await stop(harness)
 
@@ -1028,8 +1112,13 @@ class TestDoctor:
 
         assert (
             "[OK] GitHub notifications come from the channel gateway: filters published "
-            "from sync.github, PR watch off"
+            "from sync.github, PR watch off, inbox participating\n"
         ) in report
+
+    def test_the_inbox_is_reported(self, tmp_path):
+        report = doctor_report(doctor_config(tmp_path, inbox="all"))
+
+        assert "from sync.github, PR watch on, inbox all\n" in report
 
     def test_unusable_hosted_settings_are_errors(self, tmp_path):
         config = doctor_config(tmp_path)

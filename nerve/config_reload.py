@@ -358,8 +358,10 @@ def _reload_hosted_keys(engine) -> str | None:
 async def _republish_hosted_subscriptions(engine) -> str | None:
     """Send the hosted source subscriptions to the gateway again.
 
-    The filters and ``pr_watch`` follow a reload this way; the gateway keeps
-    the newest subscription it received. ``None`` without hosted sources.
+    The filters, ``pr_watch`` and ``inbox`` follow a reload this way; the
+    gateway keeps the newest subscription it received. (In poll mode
+    ``inbox`` follows with the rebuilt source runner.) ``None`` without
+    hosted sources.
     """
     if engine is None:
         return None

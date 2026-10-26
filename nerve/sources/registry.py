@@ -167,7 +167,7 @@ def build_source_runners(
         else:
             from nerve.sources.github import GitHubSource
 
-            source = GitHubSource()
+            source = GitHubSource(config={"inbox": gh.inbox})
         gh_filter = github_inbox_filter(gh)
         gh_runner = SourceRunner(
             source=source,

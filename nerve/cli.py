@@ -1666,7 +1666,8 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     elif github.enabled:
         lines.append(
             "[OK] GitHub notifications come from the channel gateway: filters "
-            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}"
+            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}, "
+            f"inbox {github.inbox}"
         )
     if github.enabled and config.slack.mode == "hosted" and not config.slack.enabled:
         warnings.append(

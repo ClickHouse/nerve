@@ -86,6 +86,10 @@ def github_subscription(settings: GitHubSyncConfig) -> SourceSubscription:
     allow list goes empty and a deny list keeps the patterns that fit. The
     gateway then stores records that Nerve's inbox filter still drops, which
     costs a wake but loses nothing.
+
+    ``sync.github.inbox`` is published as ``inbox`` only when it is ``all``.
+    The gateway reads a missing one as ``participating``, so the frame of an
+    agent that keeps the default stays exactly as it was.
     """
     return SourceSubscription(
         provider=GITHUB,
@@ -99,6 +103,7 @@ def github_subscription(settings: GitHubSyncConfig) -> SourceSubscription:
             deny_ci_branches=_deny_list("deny_ci_branches", settings.deny_ci_branches),
         ),
         pr_watch=bool(settings.pr_watch),
+        inbox="all" if settings.inbox == "all" else "",
     )
 
 

@@ -147,7 +147,7 @@ visible rather than failing the fetch.
 - **Paging:** every page since the cursor is read in one run (`gh api --paginate`), so a backlog after downtime is ingested in full; `batch_size` does not cap this source
 - **First run:** Fetches from the last 24 hours
 - **Subsequent runs:** Uses `since=<cursor>` (inclusive: the cursor's own second is listed again, and an unchanged re-listed thread is skipped by storage) with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
-- **Filter:** `participating=true` (assigned, review requested, mentioned) and `all=true` (read threads too). GitHub marks a thread read as soon as a mail client renders the notification email with its images, which can happen seconds after the notification, so a listing of unread threads alone can miss a thread before anyone has seen it; a re-listed thread whose stored record is unchanged is skipped by storage, and the record carries no read state. A thread that GitHub lists as read and that was last read more than a minute before its update is left out: GitHub moves the thread of the account's own merge or review and leaves it read. Note it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source at all (verified against a live account: 25 `ci_activity` listed with `all=true` alone, 0 once `participating=true` is added)
+- **Filter:** `sync.github.inbox` decides which threads are listed. `participating` (the default) sends `participating=true`: only the threads the account takes part in (assigned, review requested, mentioned, its own, commented on). `all` leaves that parameter out, so GitHub lists the account's whole inbox as its GitHub watch settings produce it: the participating threads plus `subscribed` threads of watched repositories (new issues and pull requests, per the repository's watch or Custom watch setting), `ci_activity` for the account's own workflow runs, and whatever else GitHub puts in the inbox; the guardrails pick within it (see [GitHub reason guardrail](#github-reason-guardrail)). Both modes send `all=true` (read threads too). GitHub marks a thread read as soon as a mail client renders the notification email with its images, which can happen seconds after the notification, so a listing of unread threads alone can miss a thread before anyone has seen it; a re-listed thread whose stored record is unchanged is skipped by storage, and the record carries no read state. A thread that GitHub lists as read and that was last read more than a minute before its update is left out: GitHub moves the thread of the account's own merge or review and leaves it read. Note that in participating mode it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source in participating mode (verified against a live account: 25 `ci_activity` listed with `all=true` alone, 0 once `participating=true` is added)
 - **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
 - **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
 - **Default schedule:** `*/15 * * * *` (every 15 min)
@@ -198,9 +198,9 @@ running. Nerve reads them over the hosted channel streams.
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
-  `deny_ci_branches`) and `pr_watch` whenever a stream opens and again on every
-  reload. The gateway keeps the newest set and applies it before it stores a
-  record, so a record that the filters drop never reaches this agent and is
+  `deny_ci_branches`), `pr_watch` and `inbox` whenever a stream opens and again
+  on every reload. The gateway keeps the newest set and applies it before it
+  stores a record, so a record that the filters drop never reaches this agent and is
   never a reason to start it. The guardrail still runs here too. A list that the
   gateway cannot take — more than 256 patterns, or a pattern longer than 256
   bytes or with a control character — goes to the gateway wider, never
@@ -214,6 +214,13 @@ running. Nerve reads them over the hosted channel streams.
 - **The gateway must know the subscriptions.** A gateway that predates hosted
   sources closes a stream that publishes them, hosted Slack traffic included,
   so update the gateway before an agent switches to `mode: hosted`.
+- **`inbox: all` needs a gateway that supports it.** The gateway lists the
+  threads that `inbox` names, as the polling source does. Nerve leaves the
+  `inbox` member out of the subscription unless it is `all`, and the gateway
+  reads a missing one as `participating`, so with the default nothing changes
+  and an older gateway is unaffected. A gateway that predates `inbox` refuses a
+  subscription that carries it and closes the stream, hosted Slack traffic
+  included, so update the gateway before you set `inbox: all` in hosted mode.
 - **Same source, same name.** The records go to a local buffer, and the
   `source:github` runner drains it. The drop hook, `condense`, health checks,
   consumer cursors, `messages` gates and the Sources page work as they do for
@@ -482,6 +489,7 @@ sync:
     enabled: true
     mode: poll                    # poll = gh CLI here; hosted = the channel gateway polls (restart-only)
     pr_watch: true                # Hosted mode: also a record when one of your open PRs changes
+    inbox: participating          # participating = threads you take part in; all = the whole inbox (see "GitHub reason guardrail")
     schedule: "*/15 * * * *"
     batch_size: 30
     condense: true                # Haiku extraction for long notifications
@@ -620,6 +628,47 @@ a reason GitHub adds later would be silently dropped.
 | `github.allow_reasons` | list | `[]` | Allowlist of reason globs. Empty = all reasons pass |
 | `github.deny_reasons` | list | `[]` | Denylist of reason globs. Takes precedence over `allow_reasons` |
 
+#### Watched repositories: `inbox: all`
+
+With the default `inbox: participating` the source asks GitHub for participating threads
+only, so a new pull request that someone else opens in a repository the account watches
+never arrives: GitHub files it under `subscribed`, which `participating=true` leaves out.
+`inbox: all` lists the account's whole inbox instead, and the guardrails pick what
+reaches the agent:
+
+```yaml
+sync:
+  github:
+    inbox: all
+    deny_reasons: [ci_activity, comment, state_change]
+```
+
+That keeps the threads that are the account's or that call it by name (`author`,
+`mention`, `team_mention`, `assign`, `review_requested`) and adds the `subscribed` ones:
+the issues and pull requests of watched repositories, as the account's watch settings
+produce them, when they are opened and whenever GitHub notifies the account about them
+again. It drops the account's own workflow runs and the churn on threads it only
+commented on or whose state it changed. Two settings of the GitHub account matter
+here:
+
+- **Automatic watching.** GitHub's "Automatically watch repositories" is on by default:
+  every repository the account gets push access to is watched for all activity, and each
+  of its threads then arrives as `subscribed` (in poll mode, each costs a few GitHub API
+  calls for its content before the guardrail can drop it). Switch it off in the account's
+  notification settings, which leaves the repositories already watched as they are
+  (https://github.com/watching lists them), or watch the repositories that matter with a
+  Custom watch (for example Pull requests only).
+- **E-mail.** Independently of Nerve, GitHub also e-mails the notifications of watched
+  repositories unless the account's "Watching" notifications are set to web only ("On
+  GitHub"). Set that on the account, or its mailbox gets a mail for every watched thread.
+
+In hosted mode the channel gateway must support `inbox` (see
+[Hosted GitHub source](#hosted-github-source)).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github.inbox` | string | `participating` | `participating`: only the threads the account takes part in. `all`: its whole inbox as its watch settings produce it, for the guardrails to pick from |
+
 ### GitHub CI-branch guardrail
 
 Keeping `ci_activity` lets in every workflow-run notification, including default-branch
@@ -642,10 +691,11 @@ You keep CI failures on your own PR branches and drop the default-branch noise. 
 is **deny-only** by design — `ci_branch` is empty for non-CI records, and a non-empty allow
 list is fail-closed, so it would drop the entire feed.
 
-**Currently inert:** the fetch uses `participating=true`, which never returns `ci_activity`
-(see the GitHub adapter notes above), so no CheckSuite record reaches the guardrail today.
-The rule exists for the day that filter is relaxed — without it, dropping `participating`
-would flood the inbox with default-branch runs.
+**Inert in participating mode:** with `inbox: participating` (the default) the fetch uses
+`participating=true`, which never returns `ci_activity` (see the GitHub adapter notes
+above), so no CheckSuite record reaches the guardrail. With `inbox: all` the account's own
+workflow runs arrive as `ci_activity`, and this rule is what keeps the default-branch runs
+among them out; deny the `ci_activity` reason instead to drop every run.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

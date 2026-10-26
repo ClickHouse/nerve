@@ -64,6 +64,8 @@ SUBSCRIPTIONS_VERSION = "1"
 MAX_SUBSCRIPTION_SOURCES = 16
 MAX_SUBSCRIPTION_PATTERNS = 256
 MAX_SUBSCRIPTION_PATTERN_BYTES = 256
+# The inboxes that a source subscription may name; empty means participating.
+SUBSCRIPTION_INBOXES = ("", "participating", "all")
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
@@ -712,12 +714,16 @@ class SourceSubscription:
     """What the agent takes from one provider's hosted source.
 
     ``pr_watch`` asks for a record whenever one of the agent's own open pull
-    requests changes.
+    requests changes. ``inbox`` says which notification threads the gateway
+    lists: ``all`` for the account's whole inbox, ``participating`` or empty
+    for the threads it takes part in. Nerve sends it only as ``all``, so the
+    frame of an agent that keeps the default is unchanged.
     """
 
     provider: str = ""
     filters: SourceFilters = struct(SourceFilters)
     pr_watch: bool = omit_empty(False)
+    inbox: str = omit_empty("")
 
 
 @_record
@@ -735,7 +741,8 @@ class Subscriptions:
         """Check what the gateway checks, before Nerve sends it.
 
         The version, the number of sources, each provider name and that no
-        provider appears twice, and the bounds of every filter list.
+        provider appears twice, each inbox, and the bounds of every filter
+        list.
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -752,6 +759,8 @@ class Subscriptions:
             if source.provider in providers:
                 malformed("subscriptions repeat a provider")
             providers.add(source.provider)
+            if source.inbox not in SUBSCRIPTION_INBOXES:
+                malformed("source subscription inbox is not 'participating' or 'all'")
             for patterns in source.filters.pattern_lists().values():
                 if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
                     reject(RejectionReason.LIMIT_EXCEEDED, "source filter has too many patterns")
