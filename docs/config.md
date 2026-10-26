@@ -1356,6 +1356,14 @@ mention check and, as a thread reply, no local session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
 
+The gateway sends an observation only for a channel where the agent's channel
+policy allows observations, so the policy that the control plane keeps is
+already a grant. `slack.source.gateway_grant: true` makes it the local grant
+too: with `slack.source.enabled: true` and no `allow_channels`, Nerve collects
+every observation that the gateway sends. A non-empty `allow_channels` still
+narrows that, and `deny_channels` and `deny_senders` still apply. Outside
+hosted mode the switch is ignored, with a warning.
+
 Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
@@ -1548,6 +1556,7 @@ slack:
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
 | `slack.source.include_handled_messages` | bool | `false` | Also collect messages accepted for live routing |
+| `slack.source.gateway_grant` | bool | `false` | Hosted mode only: collect every channel that the gateway observes for the agent, with no local allow list (see [Hosted mode](#hosted-mode)) |
 | `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |

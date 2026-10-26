@@ -242,8 +242,14 @@ slack:
   #
   # Everything collected is untrusted input: the grant decides whose messages
   # are kept, not whether their contents can be believed. See docs/sources.md.
+  #
+  # In hosted mode (mode: hosted) the gateway sends an observation only for a
+  # channel that the agent's channel policy observes. gateway_grant: true makes
+  # that policy the grant here too, so no allow_channels is needed; the deny
+  # lists still apply. It is ignored in Socket Mode.
   # source:
   #   enabled: true
+  #   gateway_grant: false               # hosted mode only
   #   allow_channels: ["C0456DEF", "eng-*"]
   #   deny_channels: ["*-social"]
   #   deny_senders: ["*-bot"]

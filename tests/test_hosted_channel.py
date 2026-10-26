@@ -716,6 +716,55 @@ class TestObserve:
         assert await hosted.acknowledged(invoke, observe) == {invoke: "accepted", observe: "rejected"}
         assert await hosted.db.read_channel_observations("slack") == []
 
+    async def test_the_gateway_grant_collects_every_channel_the_gateway_observes(
+        self, tmp_path, db, monkeypatch,
+    ):
+        hosted = await start_hosted(tmp_path, db, monkeypatch, allow_conversations=[], gateway_grant=True)
+        try:
+            stream = await hosted.stream()
+            inbox_id = hosted.gateway.store(message_event(
+                purpose="observe", text="deploy at noon", conversation="C_FIXTURE_UNLISTED",
+                message_id="1700001300.000100",
+            ))
+
+            await stream.nudge("observe")
+
+            assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+            (runner,) = [
+                r for r in build_source_runners(hosted.config, hosted.db)
+                if r.source.source_name == "slack:observed"
+            ]
+            assert (await runner.run()).records_ingested == 1
+            record = await hosted.db.get_source_message(
+                "slack:observed", "C_FIXTURE_UNLISTED:1700001300.000100",
+            )
+            assert record["content"] == "deploy at noon"
+        finally:
+            await stop_hosted(hosted)
+
+    @pytest.mark.parametrize(("conversation", "kind", "deny"), [
+        ("C_FIXTURE_DENIED", "channel", ["C_FIXTURE_DENIED"]),
+        ("D0DIRECT", "direct", []),
+    ])
+    async def test_with_the_gateway_grant_denied_and_private_conversations_are_rejected(
+        self, tmp_path, db, monkeypatch, conversation, kind, deny,
+    ):
+        hosted = await start_hosted(
+            tmp_path, db, monkeypatch, allow_conversations=[], gateway_grant=True, deny_conversations=deny,
+        )
+        try:
+            stream = await hosted.stream()
+            inbox_id = hosted.gateway.store(message_event(
+                purpose="observe", conversation=conversation, conversation_kind=kind, message_id="1.6",
+            ))
+
+            await stream.nudge("observe")
+
+            assert (await hosted.acknowledged(inbox_id))[inbox_id] == "rejected"
+            assert await hosted.db.read_channel_observations("slack") == []
+        finally:
+            await stop_hosted(hosted)
+
 
 # ---------------------------------------------------------------------- #
 #  Pull delivery                                                          #

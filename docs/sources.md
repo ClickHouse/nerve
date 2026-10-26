@@ -367,6 +367,10 @@ of that table you land in:
   display name in the event, which can deny but never grant. Nerve
   acknowledges an observation to the gateway only after the buffer row is
   written.
+  With `slack.source.gateway_grant: true`, the gateway's own grant is enough:
+  it sends observations only for channels where the agent's channel policy
+  allows them, and Nerve collects all of them without a local allow list. A
+  local allow list still narrows that, and the deny lists still apply.
 
 **Never collected, whatever the config says:** direct and group DMs, the
 agent's own messages, other bots and apps, join/leave and similar service
@@ -376,7 +380,9 @@ records collapse to one inbox record on the `(source, id)` key.
 **The source is off by default and fail-closed.** An empty allow list collects
 nothing rather than everything — the inverse of the access rules, because this
 is a standing grant to record other people's messages. `enabled: true` with
-nothing listed logs a warning and registers no drain.
+nothing listed logs a warning and registers no drain. Hosted Slack with
+`gateway_grant: true` is the one exception: there the gateway's grant is the
+written one.
 
 #### Threat model
 
