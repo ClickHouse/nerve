@@ -221,6 +221,45 @@ describe('ask_form: answering', () => {
   });
 });
 
+describe('ask_form: intro', () => {
+  const INTRO = 'I will review **pull requests** in your repositories.\n\nThe answers set the scan job.';
+  const withIntro = (overrides: Partial<ToolCallBlockData> = {}) =>
+    form([REPOS, CADENCE], { input: { title: 'A few facts', intro: INTRO, questions: [REPOS, CADENCE] }, ...overrides });
+
+  it('shows the intro as Markdown above a waiting form', () => {
+    pause([REPOS, CADENCE]);
+    render(<FormBlock block={withIntro()} />);
+    const intro = screen.getByTestId('form-intro');
+    expect(within(intro).getByText('pull requests').tagName).toBe('STRONG');
+    expect(intro).toHaveTextContent('The answers set the scan job.');
+    // Above the card: it comes first in the document.
+    expect(intro.compareDocumentPosition(screen.getByRole('form')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('keeps the intro when the form is answered here and folds', async () => {
+    pause([REPOS, CADENCE]);
+    render(<FormBlock block={withIntro()} />);
+    await userEvent.type(fieldOf(REPOS), 'org/repo-a{Enter}');
+    await userEvent.click(screen.getByRole('button', { name: /^Hourly/ }));
+    await userEvent.click(submitButton());
+    expect(screen.queryByRole('form')).not.toBeInTheDocument();
+    expect(screen.getByTestId('form-intro')).toHaveTextContent('The answers set the scan job.');
+  });
+
+  it('shows the intro above a folded card after a reload', () => {
+    const result = resultOf(['Repositories: org/repo-a', 'Cadence: Daily'],
+      { answers: { repos: ['org/repo-a'], cadence: 'Daily' }, skipped: [] });
+    render(<FormBlock block={withIntro({ status: 'complete', result })} />);
+    expect(screen.getByTestId('form-intro')).toHaveTextContent('I will review pull requests in your repositories.');
+    expect(answerTo('Cadence')).toHaveTextContent('Daily');
+  });
+
+  it('shows nothing above the card without an intro', () => {
+    show([REPOS]);
+    expect(screen.queryByTestId('form-intro')).not.toBeInTheDocument();
+  });
+});
+
 describe('ask_form: repositories and lists', () => {
   it('marks an item that is not owner/name, and holds Submit until it is removed', async () => {
     show([REPOS]);

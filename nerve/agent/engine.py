@@ -329,6 +329,9 @@ class _TurnState:
     got_content: bool = False
     status: TurnStatus = "completed"
     error: str | None = None
+    # The run's ``drop_leading_thinking``: thinking before the turn's first
+    # text or tool call is neither broadcast nor stored.
+    drop_leading_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -3005,6 +3008,13 @@ class AgentEngine:
                 parent_tool_use_id=event.parent_tool_use_id,
             )
 
+        elif isinstance(event, ThinkingDelta) and st.drop_leading_thinking and not (
+            st.full_response_text or st.tool_calls_log
+        ):
+            # Thinking before the first text or tool call of a run with
+            # ``drop_leading_thinking``: not shown, not kept.
+            st.got_content = True
+
         elif isinstance(event, ThinkingDelta):
             st.got_content = True
             st.thinking_text += event.text
@@ -3640,6 +3650,7 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -3686,6 +3697,11 @@ class AgentEngine:
             origin: Label of where the message came from, shown on its queue
                       entry (``"web"``, ``"api"``, a channel name). Defaults
                       to ``source``.
+            drop_leading_thinking: If True, the thinking that comes before
+                      the turn's first text or tool call is neither broadcast
+                      nor stored with the reply. Thinking after that is kept.
+                      The onboarding conversation's first turn uses it, so
+                      that the chat opens with the greeting.
 
         Raises:
             NotAcceptingTurnsError: the engine is draining. The user message
@@ -3708,6 +3724,7 @@ class AgentEngine:
             cause=cause,
             client_msg_id=client_msg_id,
             origin=origin,
+            drop_leading_thinking=drop_leading_thinking,
         )).text
 
     async def _run_turn(
@@ -3727,6 +3744,7 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         """``run()`` plus how the invocation's turn ended."""
         # Resolved before the lock: an invalid cause fails here, before the
@@ -3803,6 +3821,7 @@ class AgentEngine:
                 images=images, image_refs=image_refs,
                 bump_updated_at=bump_updated_at, actor=actor,
                 cause_id=cause_id,
+                drop_leading_thinking=drop_leading_thinking,
             )
         finally:
             self.sessions.clear_turn_task(session_id, turn_task)
@@ -3823,6 +3842,7 @@ class AgentEngine:
         bump_updated_at: bool,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         """The turn of :meth:`run`, with the run lock held: framing
         (buffering, running state, ``session_running``) around
@@ -3862,6 +3882,7 @@ class AgentEngine:
                     bump_updated_at=bump_updated_at,
                     actor=actor,
                     cause_id=cause_id,
+                    drop_leading_thinking=drop_leading_thinking,
                 )
             finally:
                 self.sessions.mark_not_running(session_id)
@@ -3909,6 +3930,7 @@ class AgentEngine:
         *,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         # Ensure session exists in DB. ``cause_id`` applies only if the row
         # is created here.
@@ -3959,7 +3981,7 @@ class AgentEngine:
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
-        st = _TurnState()
+        st = _TurnState(drop_leading_thinking=drop_leading_thinking)
 
         # Wakeup turns (fired by the cron-service sweep) carry a leading
         # marker block so the UI shows a "scheduled wakeup" chip. Persisted

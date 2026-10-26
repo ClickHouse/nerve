@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -73,6 +74,9 @@ SESSION_TITLE = "Onboarding"
 
 #: How much longer than the facts' own budget a start waits for them.
 _FACTS_MARGIN_SECONDS = 2.0
+
+#: Nerve's form tool as a stored reply names it (both backends).
+_FORM_TOOL = "mcp__nerve__ask_form"
 
 # One start at a time in this process, so a second caller sees the session
 # that the first one created. One lock per event loop: tests run many loops.
@@ -152,6 +156,31 @@ def _prompt_inputs(workspace: Path, mode: str) -> "tuple[str, str, WorkSelection
     return description, read_worker_guide(), work_selection_from(description)
 
 
+#: The line of ``IDENTITY.md`` that names the agent.
+_IDENTITY_NAME = "- **Name:**"
+
+
+def _agent_name(workspace: Path) -> str:
+    """The name the agent gives itself in its first message, else ``""``.
+    Blocking file I/O.
+
+    The name line of ``IDENTITY.md`` once it is filled in (About you), else
+    ``NERVE_DISPLAY_NAME``, the agent's name that a hosting platform sets.
+    A template placeholder is no name.
+    """
+    try:
+        lines = (Path(workspace) / "IDENTITY.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith(_IDENTITY_NAME):
+            value = line[len(_IDENTITY_NAME):].strip()
+            if value and not value.startswith("*(") and "{{" not in value:
+                return value
+            break
+    return os.environ.get("NERVE_DISPLAY_NAME", "").strip()
+
+
 async def _instance_facts(engine: "AgentEngine", workspace: Path) -> "InstanceFacts | None":
     """What the conversation's agent knows about this instance from the start.
 
@@ -201,6 +230,24 @@ async def _person_name(db: "Database", cause: "ActorOrId | None") -> str:
     return ref.get("display_name") or ""
 
 
+async def _form_shown(db: "Database", session_id: str) -> bool:
+    """The session's stored replies hold an ``ask_form`` call that did not
+    fail: the person saw a form, answered or still open. An invalid call
+    shows nothing, so it does not count; in a session without the web chat
+    (the autonomous kind) every call fails."""
+    try:
+        messages = await db.get_messages(session_id)
+    except Exception:  # noqa: BLE001 - unknown counts as not shown
+        logger.debug("Onboarding: could not read the replies of %s", session_id, exc_info=True)
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_call"
+        and block.get("tool") == _FORM_TOOL and not block.get("is_error")
+        for message in messages if message.get("role") == "assistant"
+        for block in message.get("blocks") or ()
+    )
+
+
 async def start(
     engine: "AgentEngine",
     workspace: Path,
@@ -211,16 +258,20 @@ async def start(
 ) -> OnboardingState:
     """Open the onboarding if it is pending. Idempotent.
 
-    ``kind`` ``conversation`` opens a web chat with a hidden first message;
-    ``autonomous`` runs the worker's onboarding session without a person,
-    with its prompt in the transcript, as a ``cron`` source (the backend and
-    model of scheduled jobs).
+    ``kind`` ``conversation`` opens a web chat with a hidden first message,
+    and the chat shows no thinking from before the agent's first text or
+    tool call; ``autonomous`` runs the worker's onboarding session without a
+    person, with its prompt in the transcript, as a ``cron`` source (the
+    backend and model of scheduled jobs).
 
     Starts in this process run one at a time, and the claim of the row is a
     compare-and-set from the state that was read, so there is one session
     for each opening. The agent's first turn runs in the background. When
-    that turn fails (a model error), the row goes back to ``requested``:
-    the next Finish or daemon start opens a new one.
+    that turn fails (a model error) before the person saw a form, the row
+    goes back to ``requested``: the next Finish or daemon start opens a new
+    one. A conversation whose first turn fails after the person saw its
+    form (:func:`_form_shown`) stays ``running``: the turn goes on after the
+    form's answer, so the person continues in the same chat.
     """
     from nerve.agent.prompts import onboarding_prompt, worker_onboarding_prompt
 
@@ -243,6 +294,7 @@ async def start(
     description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
+        agent_name = await asyncio.to_thread(_agent_name, workspace)
         # The first turn calls no tool before its message: Nerve hands the
         # agent what is configured, and from where, instead.
         facts = await _instance_facts(engine, workspace)
@@ -252,6 +304,7 @@ async def start(
             github_access=facts.github_access if facts else "",
             work=work,
             memory_backend=engine.config.memory.backend,
+            agent_name=agent_name,
         )
     else:
         # The description as written: a free-text one from ``nerve init``,
@@ -266,16 +319,27 @@ async def start(
                     user_message=prompt,
                     source=source,
                     # Nerve composes this message. In the conversation,
-                    # ``internal`` keeps it out of the transcript, so the
-                    # agent's answer opens the chat.
+                    # ``internal`` keeps it out of the transcript, and the
+                    # thinking before the greeting is dropped, so the
+                    # agent's greeting opens the chat.
                     internal=kind == CONVERSATION,
+                    drop_leading_thinking=kind == CONVERSATION,
                     actor=db.system_actor,
                 )
             failed = turn.outcome is not None and turn.outcome.status == "failed"
         except Exception:
             logger.exception("Onboarding: the first turn in %s failed", session_id)
             failed = True
-        if failed and await db.set_onboarding(
+        if not failed:
+            return
+        if await _form_shown(db, session_id):
+            # The person has the chat and its form: they go on there, and
+            # its agent can still end the onboarding.
+            logger.warning(
+                "Onboarding: the first turn in %s failed after its form; the session stays open",
+                session_id,
+            )
+        elif await db.set_onboarding(
             REQUESTED, session_id=None, actor_id=actor_id, expect=(RUNNING, session_id),
         ):
             logger.warning("Onboarding: the first turn in %s failed; asked again", session_id)

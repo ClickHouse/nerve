@@ -11,6 +11,7 @@ Installs from before keep their worker rule: no ``TASK.md`` marker means done.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,16 +23,20 @@ import pytest_asyncio
 
 from nerve import onboarding, onboarding_environment
 from nerve.agent.prompts import (
-    ONBOARDING_OFFERS,
+    FIRST_FORM_LEAD,
     WORKER_GUIDE_URL,
+    first_form_arguments,
+    onboarding_opening,
     onboarding_prompt,
     worker_onboarding_prompt,
 )
+from nerve.agent.tools.handlers.forms import validate_form
 from nerve.agent.tools.handlers.onboarding import onboarding_done_handler
 from nerve.agent.tools.registry import ToolContext
 from nerve.config import NerveConfig
 from nerve.onboarding_catalog import (
     CATALOG,
+    FIRST_FORM_ITEMS,
     GROUP_LABELS,
     GROUPS,
     ITEMS,
@@ -55,8 +60,8 @@ from nerve.workspace import read_worker_guide
 from tests.actor_rows import ensure_actor_row, ensure_system_principal
 
 DESCRIPTION = "Watch the nightly build for example/repo and propose fixes."
-PERSONAL_ITEM = ONBOARDING_OFFERS[-1]
-LABELS = [item.label for item in CATALOG]
+# The catalog items of the first form, in order.
+FORM_LABELS = [ITEMS[item_id].label for item_id in FIRST_FORM_ITEMS]
 # What the Mode step's checkboxes chose: two items, custom work and rules.
 CHOSEN = WorkSelection(
     items=("review-prs", "triage-issues"), custom="also watch the release branch", rules="never merge anything",
@@ -78,6 +83,12 @@ FACTS = InstanceFacts(
     github_access="GitHub access: `gh` as `alice`.",
 )
 WITH_FACTS = {"environment": FACTS.section, "github_access": FACTS.github_access}
+# A stored first reply: the greeting, then the first form (still open).
+_GREETING = {"type": "text", "content": "Hello."}
+_FORM_CALL = {
+    "type": "tool_call", "tool": "mcp__nerve__ask_form", "input": first_form_arguments(False),
+    "tool_use_id": "toolu_form",
+}
 NONE_KNOWN = "GitHub access: none known — clone public URLs only; report what needs a credential."
 _REAL_GATHER = onboarding_environment.gather
 
@@ -101,14 +112,25 @@ def gathered(monkeypatch) -> list[Path]:
     return calls
 
 
-def _engine(db, *, outcome: str = "completed", slow: bool = False) -> MagicMock:
-    """Real session rows; turns that only record their arguments and end with ``outcome``."""
+@pytest.fixture(autouse=True)
+def _no_platform_agent_name(monkeypatch):
+    """No hosting platform names the agent unless a test sets it."""
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
+
+
+def _engine(
+    db, *, outcome: str = "completed", slow: bool = False, reply_blocks: list | None = None,
+) -> MagicMock:
+    """Real session rows; turns that only record their arguments and end with
+    ``outcome``, after storing a reply with ``reply_blocks`` when given."""
     engine = MagicMock()
     engine.db = db
     engine.config.credential_available.return_value = True
     turn = SimpleNamespace(outcome=None)
 
     async def _run(**kwargs):
+        if reply_blocks is not None:
+            await db.add_message(kwargs["session_id"], "assistant", "", blocks=reply_blocks, actor=None)
         turn.outcome = SimpleNamespace(status=outcome)
         return ""
 
@@ -180,20 +202,37 @@ def _names_no_work(prompt: str) -> str:
     return _between(_first_message(prompt), "**When the note names no work**")
 
 
-def _offered(text: str) -> list[str]:
-    """The labels of the list's items in ``text``, in order (``- <label> — <description>``)."""
-    labels = [line[2:].split(" — ", 1)[0] for line in text.splitlines() if line.startswith("- ")]
-    return [label for label in labels if label in ONBOARDING_OFFERS]
+def _form(text: str) -> dict | None:
+    """The ``ask_form`` arguments that ``text`` gives as JSON, else ``None``."""
+    if "```json\n" not in text:
+        return None
+    return json.loads(_between(text, "```json\n", "\n```"))
 
 
-def _menu(mode: str) -> list[str]:
-    """The list a first message offers: a personal install leads with the
-    personal assistant; a worker's list leaves it out."""
-    return LABELS if mode == "worker" else [PERSONAL_ITEM, *LABELS]
+def _form_labels(text: str) -> list[str]:
+    """The labels of the first form's options in ``text``, in order."""
+    form = _form(text)
+    return [option["label"] for option in form["questions"][0]["options"]] if form else []
+
+
+def _form_options(mode: str) -> list[str]:
+    """The first form's options: a personal install's end with the personal
+    assistant; a worker's leave it out."""
+    return FORM_LABELS if mode == "worker" else [*FORM_LABELS, PERSONAL_ASSISTANT]
+
+
+def _message_text(first: str) -> str:
+    """A first message's instructions, without the catalog reference."""
+    return first.split("### The work catalog", 1)[0]
+
+
+def _reference(text: str) -> str:
+    """The catalog reference after the first form."""
+    return _between(text, "### The work catalog: reference only, do not list\n")
 
 
 def _groups(text: str) -> dict[str, str]:
-    """Each offered label and the group heading above it."""
+    """Each listed label and the group heading above it."""
     heading, found = None, {}
     for line in text.splitlines():
         if line.startswith("**") and line.endswith("**"):
@@ -222,48 +261,106 @@ class TestPrompt:
     steps after it are shared."""
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
-    def test_without_a_description_the_first_message_offers_the_catalog_by_group(self, mode):
-        """The work catalog (the Mode step's checkboxes), by group in the
-        catalog's order, each item with its one-line description."""
+    def test_without_a_description_the_first_message_is_a_greeting_and_one_form(self, mode):
+        """The opening and the lead word for word, then one ``ask_form`` call
+        with fixed arguments: one ``multi`` question, its options in order,
+        Other… on, an answer required. The message lists nothing and does not
+        say that more than one may be chosen: the form's checkboxes say that.
+        After the answer, step 2's text is a message, not thinking."""
         prompt = onboarding_prompt(mode, "", GUIDE)
         first = _first_message(prompt)
-        assert _offered(first) == _menu(mode)
+        text = _flat(_message_text(first))
+        steps = [
+            "Open with this paragraph, word for word: “Hi, nice to meet you! I'm your Nerve agent, "
+            "and you can configure me by talking to me.”",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
+            "Then call `ask_form` once, with exactly these arguments:",
+            "Write no other text: no list of what you can do, and no other question.",
+            "This form has no intro: step 2's rule on the intro does not apply to it, and it is not "
+            "one of step 2's rounds.",
+            "The answer comes back as the result of the call, in this turn; then go on with steps 1 "
+            "and 2 below, where every form has an intro.",
+            "Change nothing in this first message.",
+        ]
+        positions = [text.index(step) for step in steps]
+        assert positions == sorted(positions)
+        form = _form(first)
+        assert form == first_form_arguments(mode == "worker")
+        assert "intro" not in form
+        (question,) = form["questions"]
+        assert question == {
+            "id": "work", "kind": "multi", "label": "Work",
+            "question": "What should I help you with?",
+            "help": "So that I set up only what you need.",
+            "options": question["options"], "allow_other": True, "required": True,
+        }
+        assert _form_labels(first) == _form_options(mode)
+        for option in question["options"][:len(FORM_LABELS)]:
+            item = next(item for item in CATALOG if item.label == option["label"])
+            assert option["description"] == item.description, item.id
+        # ask_form shows the form as given.
+        shown, problems = validate_form(form)
+        assert problems == []
+        assert [o["label"] for o in shown["questions"][0]["options"]] == _form_options(mode)
+        assert not [line for line in _message_text(first).splitlines() if line.startswith("- ")]
+        assert "more than one" not in prompt and "offer this list" not in prompt
+        # Without ask_form, the one fallback in Rules applies.
+        assert "Without `ask_form`" not in first
+        assert "Restate the work" not in prompt
+        assert "you speak first" in prompt
+        assert "chose at setup" not in prompt
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_the_catalog_follows_the_form_as_a_reference_never_listed(self, mode):
+        """The whole catalog, by group in the catalog's order, each item with
+        its one-line description, for answers given in Other…; the agent
+        lists none of it."""
+        first = _first_message(onboarding_prompt(mode, "", GUIDE))
+        assert first.index("```json") < first.index("### The work catalog")
+        reference = _reference(first)
+        assert (
+            "What Nerve can set up: use it to understand an answer given in Other… and to plan the "
+            "work. Never list it or offer it, in this message or later."
+        ) in _flat(reference)
         for item in CATALOG:
-            assert f"\n- {item.label} — {item.description}" in first, item.id
-            assert _groups(first)[item.label] == GROUP_LABELS[item.group], item.id
-        headings = [first.index(f"\n**{GROUP_LABELS[group]}**\n") for group in GROUPS]
+            assert f"\n- {item.label} — {item.description}" in reference, item.id
+            assert _groups(reference)[item.label] == GROUP_LABELS[item.group], item.id
+        headings = [reference.index(f"\n**{GROUP_LABELS[group]}**\n") for group in GROUPS]
         assert headings == sorted(headings)
         # The alert item carries the connection it needs.
         assert (
             "- First response to alerts — Reads where alerts land, does the first investigation, "
             "posts findings, escalates by rule. Needs an alert source; a Slack channel is the "
             "first-class one today.\n"
-        ) in first
-        for part in (
-            "Greet the person without a name. In two or three sentences",
-            "say that you are set up by talking to you, now and at any time later",
-            "offer this list, as it is, and ask which items apply",
-            "Change nothing in this first message.",
-        ):
-            assert part in first, part
-        assert "Restate the work" not in prompt
-        assert "you speak first" in prompt
-        assert "chose at setup" not in prompt
+        ) in reference
+        assert PERSONAL_ASSISTANT not in reference
 
-    def test_a_personal_install_leads_with_the_personal_assistant(self):
-        """The personal assistant is a personal install's menu item only: first
-        there, absent from a worker's list (and from the catalog)."""
-        lines = [line for line in onboarding_prompt("personal").splitlines() if line.startswith("- ")]
-        assert lines[0] == f"- {PERSONAL_ITEM}"
-        assert PERSONAL_ITEM == PERSONAL_ASSISTANT and PERSONAL_ITEM not in LABELS
-        assert "Worker Best Practices" not in onboarding_prompt("personal")
-        assert "## TASK.md" not in onboarding_prompt("personal")
+    def test_a_personal_installs_form_ends_with_the_personal_assistant(self):
+        """The personal assistant is the last option of a personal install's
+        form, and never a worker's (nor a catalog item)."""
+        personal = onboarding_prompt("personal")
+        assert _form(_first_message(personal))["questions"][0]["options"][-1] == {
+            "label": "Personal assistant", "description": "Inbox triage, reminders, planning your week.",
+        }
+        assert PERSONAL_ASSISTANT not in [item.label for item in CATALOG]
+        assert "Worker Best Practices" not in personal and "## TASK.md" not in personal
         worker = onboarding_prompt("worker", "", GUIDE)
-        assert _offered(_first_message(worker)) == LABELS
-        assert PERSONAL_ITEM not in worker
+        assert _form_labels(_first_message(worker)) == FORM_LABELS
+        assert PERSONAL_ASSISTANT not in worker
 
-    def test_the_offers_are_the_catalog_labels_and_the_personal_assistant(self):
-        assert ONBOARDING_OFFERS == (*LABELS, PERSONAL_ASSISTANT)
+    def test_a_personal_install_is_a_nerve_agent_and_a_worker_keeps_its_wording(self):
+        """No mode is chosen in the browser, so a personal install's prompt
+        does not call the agent a personal assistant."""
+        personal = _between(onboarding_prompt("personal"), "This is the", "## ")
+        assert personal.startswith(
+            " **onboarding conversation** of a Nerve agent. The person who set it up opens this chat."
+        )
+        assert "personal assistant" not in personal.lower()
+        worker = _between(onboarding_prompt("worker", "", GUIDE), "This is the", "## ")
+        assert worker.startswith(
+            " **onboarding conversation** of this Nerve agent, which is set up as a worker for a "
+            "team. The person who set it up opens this chat."
+        )
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
     def test_a_note_that_describes_work_is_explained_before_anything_is_asked(self, mode):
@@ -273,11 +370,11 @@ class TestPrompt:
         prompt = onboarding_prompt(mode, DESCRIPTION, GUIDE)
         work = _flat(_describes_work(prompt))
         assert f"> {DESCRIPTION}" in _between(prompt, "wrote at setup", "## Your first message")
-        assert not _offered(_describes_work(prompt))
+        assert _form(_describes_work(prompt)) is None
         assert "offer no menu" in work and "set up by talking to you" not in work
         steps = [
             "Write the message text first, before any tool call",
-            "1. Greet the person without a name.",
+            f"1. Open with this paragraph, word for word: “{onboarding_opening()}”",
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
@@ -288,26 +385,31 @@ class TestPrompt:
         positions = [work.index(step) for step in steps]
         assert positions == sorted(positions)
         assert "Targets the note leaves out you ask for as step 1 says" in work
+        assert FIRST_FORM_LEAD not in work
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
-    def test_a_note_that_names_no_work_still_gets_the_list(self, mode):
+    def test_a_note_that_names_no_work_gets_the_first_form(self, mode):
         """Only rules ("never merge anything") or only targets ("org/repo-a"):
-        the agent knows no work yet, so it offers the list, in the mode's
-        order, and carries the note into the plan."""
+        the agent knows no work yet, so it asks with the first form, the same
+        as without a note, and carries the note into the plan."""
         prompt = onboarding_prompt(mode, DESCRIPTION, GUIDE)
         no_work = _names_no_work(prompt)
-        assert _offered(no_work) == _offered(_first_message(onboarding_prompt(mode, "", GUIDE)))
-        assert _offered(no_work) == _menu(mode)
-        assert _groups(no_work) == _groups(_first_message(onboarding_prompt(mode, "", GUIDE)))
-        for part in (
+        blank = _first_message(onboarding_prompt(mode, "", GUIDE))
+        assert _form(no_work) == _form(blank) == first_form_arguments(mode == "worker")
+        assert _reference(no_work) == _reference(blank)
+        steps = [
             'only rules, such as "never merge anything"', 'only targets, such as "org/repo-a"',
-            "offer the list. Greet the person without a name, say in one sentence what you noted",
-            "say that you are set up by talking to you, now and at any time later",
-            "offer this list, as it is, and ask which items apply",
+            f"ask what the work is. Open with this paragraph, word for word: “{onboarding_opening()}”",
+            "Then say in one sentence what you noted.",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
+            "Then call `ask_form` once, with exactly these arguments:",
+            "Write no other text: no list of what you can do, and no other question.",
             "its rules become hard rules and approval boundaries",
             "its targets are what the explorer studies once the work is known",
-        ):
-            assert part in _flat(no_work), part
+        ]
+        positions = [_flat(no_work).index(step) for step in steps]
+        assert positions == sorted(positions)
+        assert not [line for line in _message_text(no_work).splitlines() if line.startswith("- ")]
 
     def test_a_blank_description_is_no_description(self):
         for mode in ("personal", "worker"):
@@ -395,19 +497,24 @@ class TestPrompt:
             assert part in ask, part
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
-    def test_every_turn_that_asks_explains_first(self, mode, description):
-        """A real run sent a question card with no text at all: the rule is an
-        explicit order (text, then the form), and the text asks nothing."""
+    def test_every_form_explains_in_its_intro(self, mode, description):
+        """Real runs sent a question card with no text: the explanation stayed
+        in the thinking, which the person does not see. It goes in the form's
+        intro, which the card shows, and asks nothing."""
         ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
-        explain = _flat(_between(ask, "Explain before you ask.", "Ask only what neither"))
+        explain = _flat(_between(ask, "Explain before you ask, in the form's `intro`", "Ask only what neither"))
         for part in (
-            "In every turn that asks, write the text first and call `ask_form` after it",
-            "a form without text before it is a mistake",
-            "The text says what you understood, what the explorer studies, how you intend to set "
+            "the card shows it above the questions",
+            "The person does not see your thinking, so an explanation that you only think is lost, "
+            "and a form without an intro is a mistake",
+            "the intro says what you understood, what the explorer studies, how you intend to set "
             "this up and why the questions matter",
-            "The questions go in the form, and the text explains and asks none of them",
+            "When the message before the form already says this (your first message), the intro "
+            "says in one line why these questions matter",
+            "The intro explains and asks none of the questions",
         ):
             assert part in explain, part
+        assert "It has no intro, so write the explanation as a message before the call" in _flat(ask)
         assert "Ask nothing in plain text" not in ask
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
@@ -513,9 +620,9 @@ class TestPrompt:
             "Pitch nothing that setup already configured (channels, sources, quiet hours, memory)",
             'the plan\'s last section, "Later, if you want": at most three one-liners',
             # No re-offer of the kinds of work the person passed over, in
-            # the Mode step's checkboxes or in the first message's list.
-            "none of them a kind of work from the list that the person saw, at setup or in your "
-            "first message, and did not choose",
+            # the Mode step's checkboxes or in the first message's form.
+            "none of them a kind of work from the options that the person saw, at setup or in the "
+            "form of your first message, and did not choose",
             "Outside it, pitch nothing",
         ):
             assert part in features, part
@@ -550,20 +657,42 @@ class TestPrompt:
         ) in intro
         assert "USER.md" not in _first_message(prompt)
 
+    def test_the_opening_names_the_person_and_the_agent(self):
+        assert onboarding_opening() == (
+            "Hi, nice to meet you! I'm your Nerve agent, and you can configure me by talking to me."
+        )
+        assert onboarding_opening("  Alice \n Example ", " Scout ") == (
+            "Hi Alice Example, nice to meet you! I'm Scout, and you can configure me by talking to me."
+        )
+        assert onboarding_opening(" \n ", " \n ") == onboarding_opening()
+        assert onboarding_opening("A" * 200, "B" * 100) == (
+            f"Hi {'A' * 80}, nice to meet you! I'm {'B' * 40}, and you can configure me by talking to me."
+        )
+        assert FIRST_FORM_LEAD == "Let's start with a few questions so I understand how I can help you."
+
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_the_person_is_greeted_by_the_name_given(self, mode, description):
         named = onboarding_prompt(mode, description, GUIDE, person_name="  Alice \n Example ")
         assert "The person's name is Alice Example." in _between(named, "This is the", "## ")
-        assert "Greet the person by name" in _first_message(named)
-        assert "without a name" not in named
+        assert f"“{onboarding_opening('Alice Example')}”" in _first_message(named)
+        assert "Hi, nice to meet you!" not in named
         unnamed = onboarding_prompt(mode, description, GUIDE)
         assert "The person's name is" not in unnamed
-        assert "Greet the person without a name" in _first_message(unnamed)
+        assert f"“{onboarding_opening()}”" in _first_message(unnamed)
         assert onboarding_prompt(mode, description, GUIDE, person_name=" \n ") == unnamed
         # The steps after the first message do not depend on the name.
         assert _shared(named) == _shared(unnamed)
         long = onboarding_prompt(mode, description, GUIDE, person_name="A" * 200)
         assert f"The person's name is {'A' * 80}." in long
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_agent_gives_the_name_given(self, mode, description):
+        named = onboarding_prompt(mode, description, GUIDE, agent_name=" Scout ")
+        assert f"“{onboarding_opening('', 'Scout')}”" in _first_message(named)
+        assert "your Nerve agent" not in named
+        unnamed = onboarding_prompt(mode, description, GUIDE)
+        assert _shared(named) == _shared(unnamed)
+        assert onboarding_prompt(mode, description, GUIDE, agent_name=" \n ") == unnamed
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_a_change_request_never_widens_what_was_allowed(self, mode, description):
@@ -672,11 +801,12 @@ class TestChosenWork:
             assert part in _flat(chosen), part
         # The first message: no menu, the work explained before anything is asked.
         first = _first_message(prompt)
-        assert not _offered(first) and "**Code**" not in prompt
+        assert _form(first) is None and "**Code**" not in prompt
+        assert "### The work catalog" not in prompt
         steps = [
             "offer no menu, and do not ask again what was chosen",
             "Write the message text first, before any tool call",
-            "1. Greet the person by name.",
+            f"1. Open with this paragraph, word for word: “{onboarding_opening('Alice Example')}”",
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
@@ -730,8 +860,9 @@ class TestChosenWork:
         assert "What follows Also is the work, in the operator's words" in chosen
         assert "Work:" not in chosen and "For all of the work, once:" not in chosen
         assert "Must know" not in chosen
+        assert _form(_first_message(prompt)) is None
         first = _flat(_first_message(prompt))
-        assert not _offered(first) and "offer no menu" in first
+        assert "offer no menu" in first
         assert "(step 2 below). The first round asks for the targets still missing" in first
         # Words that name no work: ask what the work is, still without a menu.
         assert (
@@ -740,7 +871,7 @@ class TestChosenWork:
             "the list of work at setup"
         ) in first
 
-    def test_rules_alone_get_the_menu_and_carry_the_rules(self):
+    def test_rules_alone_get_the_first_form_and_carry_the_rules(self):
         prompt = onboarding_prompt("worker", "", GUIDE, work=WorkSelection(rules="Never merge anything."))
         chosen = _chosen(prompt)
         assert "Nothing was ticked in the list of work Nerve offers." in chosen
@@ -748,16 +879,20 @@ class TestChosenWork:
         assert "become hard rules and approval boundaries in the plan" in chosen
         assert "Also:" not in chosen and "explorer's brief" not in chosen
         first = _first_message(prompt)
-        assert _offered(first) == LABELS
-        assert _groups(first) == _groups(_first_message(onboarding_prompt("worker", "", GUIDE)))
-        for part in (
-            "Nothing was ticked at setup, only rules. Greet the person without a name, "
-            "say in one sentence that you noted the rules",
-            "say that you are set up by talking to you, now and at any time later",
-            "offer this list, as it is, and ask which items apply",
+        blank = _first_message(onboarding_prompt("worker", "", GUIDE))
+        assert _form(first) == _form(blank) == first_form_arguments(True)
+        assert _reference(first) == _reference(blank)
+        steps = [
+            "Nothing was ticked at setup, only rules. Open with this paragraph, word for word: "
+            f"“{onboarding_opening()}”",
+            "Then say in one sentence that you noted the rules.",
+            f"Then write this paragraph, word for word: “{FIRST_FORM_LEAD}”",
+            "Then call `ask_form` once, with exactly these arguments:",
+            "Write no other text: no list of what you can do, and no other question.",
             "Change nothing in this first message.",
-        ):
-            assert part in _flat(first), part
+        ]
+        positions = [_flat(first).index(step) for step in steps]
+        assert positions == sorted(positions)
         assert "Restate the work" not in first
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
@@ -854,6 +989,8 @@ class TestStart:
         assert engine.run.await_count == 1
         assert gathered == [tmp_path], "the facts are gathered once, for the one opening"
         assert turn["internal"] is True and turn["source"] == "web"
+        # The chat opens with the greeting: no thinking from before it.
+        assert turn["drop_leading_thinking"] is True
         assert turn["actor"] == db.system_actor
         assert turn["user_message"] == onboarding_prompt("personal", **WITH_FACTS)
         assert (await db.get_session(states[0].session_id))["title"] == "Onboarding"
@@ -884,6 +1021,37 @@ class TestStart:
         again = await onboarding.start(_engine(db), tmp_path, actor=None, cause=None)
         assert again.status == "running" and again.session_id != state.session_id
 
+    @pytest.mark.parametrize("blocks, kept", [
+        pytest.param(None, False, id="nothing-stored"),
+        pytest.param([{"type": "text", "content": "Turn failed: overloaded"}], False, id="text-only"),
+        pytest.param([_GREETING, {**_FORM_CALL, "result": "ask_form: the call is invalid", "is_error": True}],
+                     False, id="invalid-form"),
+        pytest.param([_GREETING, _FORM_CALL], True, id="form-open"),
+        pytest.param([_GREETING, {**_FORM_CALL, "result": "The person answered the form.", "is_error": False},
+                      {"type": "text", "content": "Thanks."}], True, id="form-answered"),
+    ])
+    async def test_a_failed_first_turn_asks_again_only_before_its_form(self, db, tmp_path, blocks, kept):
+        """The first turn goes on after the person answers the form. A failure
+        before the person saw a form asks again; a failure after it keeps the
+        conversation running, so the person continues in the same chat and
+        its agent can still end the onboarding."""
+        apply_mode(tmp_path, "personal")
+        engine = _engine(db, outcome="failed", reply_blocks=blocks)
+        tasks: list[asyncio.Task] = []
+        engine.register_task = lambda session_id, task: tasks.append(task)
+        state = await onboarding.start(engine, tmp_path, actor=None, cause=None)
+        await tasks[0]
+        stored = await db.get_onboarding()
+        if not kept:
+            assert stored["status"] == "requested"
+            assert (await onboarding.read_state(db, tmp_path)).status == "pending"
+            return
+        assert (stored["status"], stored["session_id"]) == ("running", state.session_id)
+        assert (await onboarding.read_state(db, tmp_path)).session_id == state.session_id
+        ctx = ToolContext(session_id=state.session_id, workspace=tmp_path, db=db, actor=db.system_actor)
+        assert not (await onboarding_done_handler(ctx, {})).is_error
+        assert (await onboarding.read_state(db, tmp_path)).status == "done"
+
     async def test_a_worker_without_task_md_gets_the_template_first(self, db, tmp_path):
         apply_mode(tmp_path, "worker")
         (tmp_path / "TASK.md").unlink()
@@ -900,7 +1068,7 @@ class TestStart:
 
     async def test_a_workers_note_starts_on_the_work(self, db, tmp_path):
         """The note from the Mode step, read back from ``TASK.md``, picks the
-        first message that starts on the work (the list is kept only for a
+        first message that starts on the work (the first form is only for a
         note that names no work)."""
         apply_mode(tmp_path, "worker", DESCRIPTION)
         engine = _engine(db)
@@ -908,18 +1076,18 @@ class TestStart:
         message = (await _first_turn(engine))["user_message"]
         assert message == onboarding_prompt("worker", DESCRIPTION, read_worker_guide(), **WITH_FACTS)
         assert "Restate the work as you understand it" in message
-        assert not _offered(_describes_work(message))
-        assert _offered(_names_no_work(message)) == LABELS
+        assert _form(_describes_work(message)) is None
+        assert _form_labels(_names_no_work(message)) == FORM_LABELS
         # A free-text note keeps its section: it is no selection.
         assert f"## What the operator wrote at setup\n\n> {DESCRIPTION}" in message
         assert "chose at setup" not in message
 
-    async def test_a_worker_without_a_note_is_offered_the_list(self, db, tmp_path):
+    async def test_a_worker_without_a_note_gets_the_first_form(self, db, tmp_path):
         apply_mode(tmp_path, "worker")
         engine = _engine(db)
         await onboarding.start(engine, tmp_path, actor=None, cause=None)
         message = (await _first_turn(engine))["user_message"]
-        assert _offered(_first_message(message)) == LABELS
+        assert _form(_first_message(message)) == first_form_arguments(True)
         assert "> (no description was given at setup)" in message
 
     async def test_the_work_chosen_at_setup_opens_the_conversation(self, db, tmp_path):
@@ -936,7 +1104,7 @@ class TestStart:
         chosen = _chosen(message)
         assert "- Review pull requests — Reads diffs" in chosen and "- Triage issues — Labels" in chosen
         assert "> also watch the release branch" in chosen and "> never merge anything" in chosen
-        assert "wrote at setup" not in message and not _offered(_first_message(message))
+        assert "wrote at setup" not in message and _form(_first_message(message)) is None
         # TASK.md keeps the selection as written; the prompt only reads it.
         assert work_selection_from(render_work_description(CHOSEN)) == CHOSEN
 
@@ -959,7 +1127,32 @@ class TestStart:
         await onboarding.start(engine, tmp_path, actor=db.system_actor, cause=db.system_actor)
         message = (await _first_turn(engine))["user_message"]
         assert "The person's name is" not in message
-        assert "Greet the person without a name" in message
+        assert f"“{onboarding_opening()}”" in message
+
+    @pytest.mark.parametrize("identity, env, expected", [
+        ("- **Name:** Scout", "Console Name", "Scout"),
+        ("- **Name:** *(your name here)*", "Console Name", "Console Name"),
+        (None, "Console Name", "Console Name"),
+        ("- **Name:** *(your name here)*", None, ""),
+        (None, None, ""),
+    ], ids=["identity", "placeholder-env", "no-file-env", "placeholder", "nothing"])
+    async def test_the_agent_names_itself_from_identity_else_the_platform(
+        self, db, tmp_path, monkeypatch, identity, env, expected,
+    ):
+        """``IDENTITY.md``'s name once it is filled in, else the hosting
+        platform's ``NERVE_DISPLAY_NAME``, else no name."""
+        apply_mode(tmp_path, "personal")
+        path = tmp_path / "IDENTITY.md"
+        if identity is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(f"# IDENTITY.md\n\n{identity}\n- **Emoji:** *(optional)*\n", encoding="utf-8")
+        if env is not None:
+            monkeypatch.setenv("NERVE_DISPLAY_NAME", env)
+        engine = _engine(db)
+        await onboarding.start(engine, tmp_path, actor=db.system_actor, cause=db.system_actor)
+        message = (await _first_turn(engine))["user_message"]
+        assert f"“{onboarding_opening('', expected)}”" in message
 
     async def test_the_first_turn_knows_the_instance(self, db, tmp_path, monkeypatch, gathered):
         """The real builder, on the engine's configuration, with the GitHub CLI
@@ -1056,6 +1249,7 @@ class TestBoot:
         assert turn["user_message"] == worker_onboarding_prompt(DESCRIPTION, read_worker_guide())
         assert gathered == [], "the autonomous kind is unchanged: no facts are gathered for it"
         assert turn["internal"] is False and turn["source"] == "cron"
+        assert turn["drop_leading_thinking"] is False
         session = await db.get_session(state.session_id)
         assert session["source"] == "cron"
         assert session["caused_by_actor_id"] == db.system_actor.actor_id

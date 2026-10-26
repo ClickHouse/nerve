@@ -10,7 +10,8 @@ The one source of truth for three places:
   (:func:`nerve.setup_writer.work_selection_from`);
 - the onboarding conversation's hidden first message
   (:func:`nerve.agent.prompts.onboarding_prompt`): the chosen items with
-  their follow-up questions, or, with nothing chosen, the menu.
+  their follow-up questions, or, with nothing chosen, the first form
+  (:data:`FIRST_FORM_OPTIONS`) and the catalog as reference.
 
 Each item names the connection it needs, so the conversation can say what
 the instance lacks, and the questions the conversation settles. Three
@@ -56,9 +57,10 @@ SHARED_QUESTIONS = {
 CUSTOM_MAX = 4000
 RULES_MAX = 2000
 
-#: The conversation's menu item for a personal install (never a worker's):
-#: not a kind of team work, so not in the catalog.
-PERSONAL_ASSISTANT = "Personal assistant: inbox triage, reminders, planning your week"
+#: The first form's option for a personal install (never a worker's): not a
+#: kind of team work, so not in the catalog.
+PERSONAL_ASSISTANT = "Personal assistant"
+PERSONAL_ASSISTANT_DESCRIPTION = "Inbox triage, reminders, planning your week."
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,18 @@ CATALOG: tuple[WorkItem, ...] = (
 )
 
 ITEMS: dict[str, WorkItem] = {item.id: item for item in CATALOG}
+
+#: The catalog items of the onboarding conversation's first form, in order.
+FIRST_FORM_ITEMS = ("review-prs", "fix-issues", "ci-health", "research-reports")
+
+#: The first form's options, in order, as ``(label, description)``: the
+#: items of :data:`FIRST_FORM_ITEMS`, then :data:`PERSONAL_ASSISTANT`, which
+#: a worker's form leaves out. The agent reads an answer given in Other…
+#: against the whole catalog.
+FIRST_FORM_OPTIONS: tuple[tuple[str, str], ...] = (
+    *((ITEMS[item_id].label, ITEMS[item_id].description) for item_id in FIRST_FORM_ITEMS),
+    (PERSONAL_ASSISTANT, PERSONAL_ASSISTANT_DESCRIPTION),
+)
 
 
 def work_catalog() -> list[dict]:

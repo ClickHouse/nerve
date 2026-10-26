@@ -1,7 +1,8 @@
 """The worker work catalog: one source for the Mode step, TASK.md and the prompt.
 
 Integrity of :data:`nerve.onboarding_catalog.CATALOG` (ids, groups, needs,
-follow-up questions), its wire shape, and the :class:`WorkSelection` value.
+follow-up questions), its wire shape, the first form's options, and the
+:class:`WorkSelection` value.
 """
 
 from __future__ import annotations
@@ -12,11 +13,14 @@ import re
 from nerve.onboarding_catalog import (
     CATALOG,
     CUSTOM_MAX,
+    FIRST_FORM_ITEMS,
+    FIRST_FORM_OPTIONS,
     GROUP_LABELS,
     GROUPS,
     ITEMS,
     NEEDS,
     PERSONAL_ASSISTANT,
+    PERSONAL_ASSISTANT_DESCRIPTION,
     RULES_MAX,
     SHARED_QUESTIONS,
     WorkSelection,
@@ -115,6 +119,23 @@ class TestCatalog:
 
     def test_the_text_limits(self):
         assert (CUSTOM_MAX, RULES_MAX) == (4000, 2000)
+
+    def test_the_first_form_has_four_items_then_the_personal_assistant(self):
+        """The onboarding conversation's first form: four catalog items, in
+        this order, with their catalog labels and descriptions, then the
+        personal assistant."""
+        assert FIRST_FORM_ITEMS == ("review-prs", "fix-issues", "ci-health", "research-reports")
+        assert FIRST_FORM_OPTIONS == (
+            ("Review pull requests", ITEMS["review-prs"].description),
+            ("Fix issues and open pull requests", ITEMS["fix-issues"].description),
+            ("Keep CI healthy", ITEMS["ci-health"].description),
+            ("Research and reports", ITEMS["research-reports"].description),
+            ("Personal assistant", "Inbox triage, reminders, planning your week."),
+        )
+        assert (PERSONAL_ASSISTANT, PERSONAL_ASSISTANT_DESCRIPTION) == FIRST_FORM_OPTIONS[-1]
+        labels = [label for label, _ in FIRST_FORM_OPTIONS]
+        assert len(labels) == len(set(labels))
+        assert all(description.endswith(".") for _, description in FIRST_FORM_OPTIONS)
 
 
 class TestWorkSelection:

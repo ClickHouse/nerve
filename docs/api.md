@@ -708,7 +708,8 @@ one web session titled `Onboarding`, whose hidden first message makes the
 agent speak first. When a restart is pending or no model is configured, it
 records the request instead, and the next start of the daemon opens the
 conversation. Idempotent: a second call, also at the same time, names the same
-session. When the agent's first turn fails, the status goes back to `pending`.
+session. When the agent's first turn fails before it showed its first form,
+the status goes back to `pending`; after the form, it stays `running`.
 Allowed under lockdown.
 
 ```json
@@ -1876,7 +1877,8 @@ those for another session. Events marked *global* go to every socket.
 // plan file's text, read again at every call) and planFilePath.
 // For ask_form (interaction_type "form", tool_name "ask_form"; the chat's
 // tool block names it mcp__nerve__ask_form) tool_input is the form,
-// normalized, every key present: { title: "" | "…", questions: [{ id (as the
+// normalized, every key present: { title: "" | "…", intro: "" | "…" (Markdown,
+// at most 1500 characters, shown above the card), questions: [{ id (as the
 // agent sent it), kind: "choice" | "multi" | "text" | "list" | "repos" |
 // "url", label (at most 40 characters), question, help, placeholder,
 // required, options: [{ label, description }] (2–8 for choice and multi, []
