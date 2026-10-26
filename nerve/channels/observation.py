@@ -40,6 +40,12 @@ class ObservationPolicy:
     approved conversation". Narrowing it to specific people is possible but
     unusual; the interesting unit here is the room, not the speaker. A deny
     list is the common use: skip a noisy bot.
+
+    ``gateway_grant`` says that the grant was already written upstream: a
+    hosted channel's gateway sends an observation only for a conversation
+    that the agent's channel policy observes. An empty allow list then
+    approves every conversation the gateway sent. A non-empty one still
+    narrows it, and the deny lists still apply.
     """
 
     enabled: bool = False
@@ -47,17 +53,18 @@ class ObservationPolicy:
         default_factory=lambda: PatternGate("conversation"),
     )
     senders: PatternGate = field(default_factory=lambda: PatternGate("sender"))
+    gateway_grant: bool = False
 
     @property
     def active(self) -> bool:
         """Whether this policy can ever approve anything."""
-        return self.enabled and bool(self.conversations.allow)
+        return self.enabled and (self.gateway_grant or bool(self.conversations.allow))
 
     def check(self, conversation: Identity, sender: Identity) -> Decision:
         """Decide whether one message may be buffered."""
         if not self.enabled:
             return Decision(False, "the channel source is not enabled")
-        if not self.conversations.allow:
+        if not self.conversations.allow and not self.gateway_grant:
             return Decision(
                 False,
                 "no conversations are approved for the channel source",

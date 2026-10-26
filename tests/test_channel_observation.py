@@ -63,6 +63,7 @@ def _policy(**kwargs) -> ObservationPolicy:
             allow=kwargs.pop("allow_senders", []),
             deny=kwargs.pop("deny_senders", []),
         ),
+        gateway_grant=kwargs.pop("gateway_grant", False),
     )
 
 
@@ -168,6 +169,36 @@ class TestObservationPolicy:
         assert _policy().active
         assert not _policy(enabled=False).active
         assert not _policy(allow_conversations=[]).active
+
+    def test_the_gateway_grant_replaces_an_empty_allow_list(self):
+        # A hosted gateway sends only the conversations that the agent's
+        # channel policy observes: that policy is the written grant.
+        policy = _policy(allow_conversations=[], gateway_grant=True)
+
+        assert policy.active
+        assert policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
+
+    def test_the_gateway_grant_does_not_open_a_disabled_source(self):
+        policy = _policy(enabled=False, allow_conversations=[], gateway_grant=True)
+
+        assert not policy.active
+        assert "not enabled" in policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).reason
+
+    def test_with_the_gateway_grant_the_deny_lists_still_refuse(self):
+        policy = _policy(
+            allow_conversations=[], gateway_grant=True,
+            deny_conversations=["C0999ZZZZ"], deny_senders=["U0BOT"],
+        )
+
+        assert not policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
+        assert not policy.check(Identity(id="C0123ABCD"), Identity(id="U0BOT")).allowed
+        assert policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).allowed
+
+    def test_with_the_gateway_grant_an_allow_list_still_narrows(self):
+        policy = _policy(allow_conversations=["C0123ABCD"], gateway_grant=True)
+
+        assert policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).allowed
+        assert not policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
 
     def test_observation_is_not_the_access_policy(self):
         # Observing a room the agent takes no orders from is the point.

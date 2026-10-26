@@ -267,7 +267,7 @@ def build_source_runners(
         source_cfg = getattr(channel_config, "source", None)
         if source_cfg is None or not source_cfg.enabled:
             continue
-        if not source_cfg.allow_conversations:
+        if not source_cfg.collects:
             # ChannelSourceConfig.from_dict already warned. Don't build a
             # runner whose policy can never approve anything to drain.
             continue
@@ -307,9 +307,10 @@ def build_source_runners(
         ))
         logger.info(
             "Registered source: %s observations (batch=%d, schedule=%s, "
-            "conversations allow=%s deny=%s)",
+            "conversations allow=%s deny=%s, gateway grant=%s)",
             channel_name, source_cfg.batch_size, source_cfg.schedule,
             source_cfg.allow_conversations, source_cfg.deny_conversations or [],
+            source_cfg.gateway_grant,
         )
 
     return runners

@@ -14,8 +14,10 @@ takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
 Observe events go to the source inbox through ``router.observe`` under the
-provider's local source grant (for Slack, ``slack.source``). The display
-names in events are untrusted, so they can match only a deny rule.
+provider's local source grant (for Slack, ``slack.source``). With
+``gateway_grant`` on, the gateway's grant takes the place of an empty local
+allow list. The display names in events are untrusted, so they can match
+only a deny rule.
 
 Outbound messages are contract operations on the connection that the
 conversation's latest accepted event came on, or on the only connection that
@@ -1051,6 +1053,7 @@ class HostedChannel(BaseChannel):
                 allow=list(source.allow_senders),
                 deny=list(source.deny_senders),
             ),
+            gateway_grant=source.gateway_grant,
         )
         author = event.author
         verdict = policy.check(

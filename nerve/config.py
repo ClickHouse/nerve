@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -1426,6 +1426,13 @@ class ChannelSourceConfig:
     the short version is that a platform id always works, and a name works
     only where the platform, not the subject, controls it.
 
+    ``gateway_grant`` is for a hosted channel only (``slack.mode: hosted``).
+    There the gateway sends an observation only for a conversation that the
+    agent's channel policy observes, so that policy is already a written
+    grant. With the switch on, an empty allow list collects every
+    observation the gateway sends; a non-empty allow list still narrows it,
+    and the deny lists still apply. Anywhere else the switch is ignored.
+
     ``schedule`` is the drain cadence, not a poll: the messages are already
     in the buffer by the time it fires.
     """
@@ -1448,6 +1455,30 @@ class ChannelSourceConfig:
     # Off by default. Turn it on only when source consumers should receive the
     # same message later, such as when the source is an archive or digest.
     include_handled_messages: bool = False
+    # Hosted channels only: the gateway's observation grant counts as the
+    # local one. See the class docstring.
+    gateway_grant: bool = False
+
+    @property
+    def collects(self) -> bool:
+        """Whether this grant can ever approve a message."""
+        return self.enabled and (bool(self.allow_conversations) or self.gateway_grant)
+
+    def outside_hosted_mode(self, subject: str) -> ChannelSourceConfig:
+        """This grant for a channel that takes no events from a gateway.
+
+        ``gateway_grant`` stands for a gateway's grant, so it is dropped here,
+        with a warning. ``subject`` names the YAML keys, as in ``from_dict``.
+        """
+        if not self.gateway_grant:
+            return self
+        logger.warning(
+            "source.gateway_grant applies only to a channel in hosted mode "
+            "(slack.mode: hosted); ignored, so source.allow_%s alone decides "
+            "what is collected%s.",
+            subject, "" if self.allow_conversations else ", and it names nothing",
+        )
+        return replace(self, gateway_grant=False)
 
     @classmethod
     @_coerced
@@ -1459,14 +1490,18 @@ class ChannelSourceConfig:
         ``subject`` is the noun this transport calls the thing being watched
         — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
         the YAML keys and every warning, so an operator is told about the key
-        they actually wrote.
+        they actually wrote. ``gateway_grant`` is read as written; a channel
+        that is not hosted drops it through ``outside_hosted_mode``.
         """
         enabled = _as_bool(
             d.get("enabled", False), False, label="source.enabled",
         )
         allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
         allow = _pattern_list(d.get(allow_key), allow_key)
-        if enabled and not allow:
+        gateway_grant = _as_bool(
+            d.get("gateway_grant", False), False, label="source.gateway_grant",
+        )
+        if enabled and not allow and not gateway_grant:
             logger.warning(
                 "source.enabled is set but source.%s names nothing usable — "
                 "nothing will be collected. List the %s to watch; an empty "
@@ -1491,6 +1526,7 @@ class ChannelSourceConfig:
                 d.get("include_handled_messages", False), False,
                 label="source.include_handled_messages",
             ),
+            gateway_grant=gateway_grant,
         )
 
 
@@ -1554,7 +1590,7 @@ class TelegramConfig:
             dm_policy=dm_policy,
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
-            ),
+            ).outside_hosted_mode("chats"),
         )
 
 
@@ -1693,6 +1729,9 @@ class SlackConfig:
             if "enabled" in d
             else mode == "hosted" or (bool(bot_token and app_token) and not locked)
         )
+        source = ChannelSourceConfig.from_dict(d.get("source", {}), subject="channels")
+        if mode != "hosted":
+            source = source.outside_hosted_mode("channels")
         return cls(
             mode=mode,
             enabled=enabled,
@@ -1709,9 +1748,7 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
-            source=ChannelSourceConfig.from_dict(
-                d.get("source", {}), subject="channels",
-            ),
+            source=source,
         )
 
 

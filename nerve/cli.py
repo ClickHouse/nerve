@@ -1563,8 +1563,9 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     """Doctor lines for the local Slack settings that still apply in hosted mode.
 
     The gateway decides admission and where the agent may post, so only the
-    send tool switch, its local conversation limit, and the notification
-    conversation are reported. Slash commands do not reach Nerve.
+    send tool switch, its local conversation limit, the channel source's
+    local grant, and the notification conversation are reported. Slash
+    commands do not reach Nerve.
     """
     from nerve.channels.slack import is_slack_id, notification_target
     from nerve.config import SLACK_HOST_COMMANDS
@@ -1590,6 +1591,24 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             )
     else:
         lines.append("[OK] Slack send tool on; the gateway decides where it may post")
+    source = slack.source
+    rules = len(source.allow_conversations)
+    if not source.enabled:
+        lines.append("[--] Slack channel source off (slack.source.enabled is false)")
+    elif source.gateway_grant:
+        limit = f", limited to {rules} allow rule(s)" if rules else ""
+        lines.append(
+            f"[OK] Slack channel source on{limit}; the gateway decides which channels are observed"
+        )
+    elif rules:
+        lines.append(
+            f"[OK] Slack channel source on, {rules} allow rule(s); the gateway also decides"
+        )
+    else:
+        warnings.append(
+            "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
+            "or list channel ids in slack.source.allow_channels"
+        )
     target = notification_target(config)
     if target:
         lines.append(f"[OK] Slack notifications go to {target}")
