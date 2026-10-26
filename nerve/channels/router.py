@@ -142,14 +142,18 @@ class ChannelRouter:
         """False while the engine drains. handle_message then refuses the turn."""
         return self.engine.accepting_turns
 
-    async def actor_for_principal(self, principal_id: uuid.UUID) -> Actor | None:
+    async def actor_for_principal(
+        self, principal_id: uuid.UUID, display_name: str | None = None,
+    ) -> Actor | None:
         """The person that a channel gateway resolved for an event, or ``None``.
 
         Only external mode has gateway principals: in local mode, the ID names
         no local person. Adds the ``actor_refs`` row when it is absent, before
         the turn writes anything that refers to it, and keeps the display name
-        that a web request stored. The nil UUID, the system actor's ID, and a
-        failed write give ``None``: the event then has no actor.
+        that a web request stored. *display_name*, the name that the event
+        gives the person, is written only when the row has no name. The nil
+        UUID, the system actor's ID, and a failed write give ``None``: the
+        event then has no actor.
         """
         if not is_external_mode():
             return None
@@ -158,7 +162,7 @@ class ChannelRouter:
             return None
         actor_id = str(principal_id)
         try:
-            display_name = await self.engine.db.ensure_external_actor(actor_id)
+            stored_name = await self.engine.db.ensure_external_actor(actor_id, display_name)
         except sqlite3.IntegrityError:
             # A schema trigger refuses the system actor's ID.
             logger.warning(
@@ -174,7 +178,7 @@ class ChannelRouter:
             actor_id=actor_id,
             kind=ACTOR_KIND_HUMAN,
             account_id=None,
-            display_name=display_name,
+            display_name=stored_name,
         )
 
     # Debounce window (seconds) for collecting simultaneous messages

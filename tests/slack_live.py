@@ -388,7 +388,7 @@ class RecordingRouter:
     async def get_last_session(self, channel_key: str) -> str | None:
         return self._sessions.get(channel_key)
 
-    async def actor_for_principal(self, _principal_id: Any) -> None:
+    async def actor_for_principal(self, _principal_id: Any, display_name: str | None = None) -> None:
         """No person, as in local mode."""
         return None
 

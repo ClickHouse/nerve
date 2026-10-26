@@ -87,6 +87,11 @@ class ObservedMessage:
     Names are left empty when unresolved. Collection runs on the dispatch
     path and a display name costs an API call, so the channel buffers raw IDs
     and a reader resolves them later — or does not, if nothing asked.
+
+    ``principal_id`` and ``principal_name`` name the tenant person that a
+    channel gateway linked to the sender. They are attribution only: nothing
+    authorizes with them, and the sender rules match only ``sender_id`` and
+    ``sender_name``. A self-hosted channel leaves them empty.
     """
 
     channel_name: str                               # "slack", "telegram"
@@ -98,6 +103,8 @@ class ObservedMessage:
     timestamp: str                                  # ISO 8601
     conversation_title: str = ""                    # "" until resolved
     sender_name: str = ""                           # "" until resolved
+    principal_id: str = ""                          # "" when no person is linked
+    principal_name: str = ""                        # "" when no person or name
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

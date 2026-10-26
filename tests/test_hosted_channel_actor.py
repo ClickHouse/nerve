@@ -12,6 +12,12 @@ runs without an actor. Self-hosted channels set no actor.
 
 A batch of messages for one session runs as one turn for each consecutive run
 of messages from one actor.
+
+The author of an event can also name the person that the gateway linked to
+it. That person is attribution only. An observation stores and shows it, but
+the sender rules ignore it and it adds no actor. On an invoke event, its
+display name fills a missing name of the resolved person, only when it is
+that person.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from nerve.gateway import server as gateway_server
 from nerve.gateway.auth import AUTH_MODE_ENV, AUTH_MODE_EXTERNAL, pin_auth_mode
 from nerve.identity import ACTOR_KIND_HUMAN, Actor
 from nerve.inference_principal import CUSTOM_HEADERS_ENV
+from nerve.sources.registry import build_source_runners
 
 from tests.fake_channel_gateway import EVENT_TIMEOUT, FakeChannelGateway, NerveServer, message_event
 from tests.test_hosted_channel import (
@@ -139,6 +146,44 @@ class TestActorForPrincipal:
 
         assert actor is None
         assert await db.get_actor_ref(ADA) is None
+
+    async def test_the_event_name_names_a_new_person(self, db, external):
+        actor = await bare_router(db).actor_for_principal(uuid.UUID(ADA), display_name="Ada Lovelace")
+
+        assert actor == person(ADA, "Ada Lovelace")
+        assert (await db.get_actor_ref(ADA))["display_name"] == "Ada Lovelace"
+
+    async def test_the_event_name_fills_a_missing_name(self, db, external):
+        await bare_router(db).actor_for_principal(uuid.UUID(ADA))
+
+        actor = await bare_router(db).actor_for_principal(uuid.UUID(ADA), display_name="Ada Lovelace")
+
+        assert actor == person(ADA, "Ada Lovelace")
+
+    async def test_the_event_name_never_replaces_a_stored_name(self, db, external):
+        router = bare_router(db)
+        await db.upsert_external_actor(ADA, "Ada")
+        await router.actor_for_principal(uuid.UUID(BOB), display_name="Bob")
+
+        ada = await router.actor_for_principal(uuid.UUID(ADA), display_name="Ada Lovelace")
+        bob = await router.actor_for_principal(uuid.UUID(BOB), display_name="Robert")
+
+        assert (ada, bob) == (person(ADA, "Ada"), person(BOB, "Bob"))
+
+    async def test_a_web_request_replaces_the_event_name(self, db, external):
+        await bare_router(db).actor_for_principal(uuid.UUID(ADA), display_name="Ada Lovelace")
+
+        await db.upsert_external_actor(ADA, "Ada")
+
+        assert (await db.get_actor_ref(ADA))["display_name"] == "Ada"
+
+    async def test_the_system_actor_keeps_its_name(self, db, external):
+        before = await db.get_actor_ref(db.system_actor_id)
+
+        actor = await bare_router(db).actor_for_principal(uuid.UUID(db.system_actor_id), display_name="Mallory")
+
+        assert actor is None
+        assert await db.get_actor_ref(db.system_actor_id) == before
 
 
 # ---------------------------------------------------------------------- #
@@ -464,6 +509,184 @@ class TestHostedAnswers:
             assert hosted.turns.runs[0]["actor"] is None
         finally:
             await stop_hosted(hosted)
+
+
+# ---------------------------------------------------------------------- #
+#  The person that the gateway linked to the author                       #
+# ---------------------------------------------------------------------- #
+
+
+def linked_to(event: dict[str, Any], principal_id: str, display_name: str | None = None) -> dict[str, Any]:
+    linked = {"id": principal_id}
+    if display_name is not None:
+        linked["display_name"] = display_name
+    event["author"]["linked_principal"] = linked
+    return event
+
+
+OBSERVED_MESSAGE = "1700001000.000100"
+
+
+def observation(**changes: Any) -> dict[str, Any]:
+    return message_event(
+        purpose="observe", text="the build is red again", conversation="C_FIXTURE_OBSERVATION",
+        message_id=OBSERVED_MESSAGE, **changes,
+    )
+
+
+async def observe(hosted: Hosted, event: dict[str, Any]) -> str:
+    """Deliver an observation and return its acknowledgement outcome."""
+    stream = await hosted.stream()
+    inbox_id = hosted.gateway.store(event)
+    await stream.nudge("observe")
+    return (await hosted.acknowledged(inbox_id))[inbox_id]
+
+
+async def drained(hosted: Hosted) -> dict[str, Any] | None:
+    """Drain the observation buffer and return the inbox record of the observation."""
+    (runner,) = [
+        r for r in build_source_runners(hosted.config, hosted.db)
+        if r.source.source_name == "slack:observed"
+    ]
+    await runner.run()
+    return await hosted.db.get_source_message("slack:observed", f"C_FIXTURE_OBSERVATION:{OBSERVED_MESSAGE}")
+
+
+class TestObservedPerson:
+    async def test_an_observation_stores_and_shows_the_linked_person(self, hosted_external):
+        hosted = hosted_external
+
+        assert await observe(hosted, linked_to(observation(), ADA, "Ada Lovelace")) == "accepted"
+
+        ((_, stored),) = await hosted.db.read_channel_observations("slack")
+        assert (stored["principal_id"], stored["principal_name"]) == (ADA, "Ada Lovelace")
+        assert (stored["sender_id"], stored["sender_name"]) == ("U_FIXTURE_MEMBER", "Example Member")
+        record = await drained(hosted)
+        assert record["summary"] == "[deployments] Example Member (Ada Lovelace): the build is red again"
+        assert record["metadata"]["principal_id"] == ADA
+        assert record["metadata"]["principal_name"] == "Ada Lovelace"
+        assert record["metadata"]["sender_id"] == "U_FIXTURE_MEMBER"
+
+    async def test_an_observation_never_adds_an_actor(self, hosted_external):
+        hosted = hosted_external
+        before = await humans(hosted.db)
+
+        assert await observe(hosted, linked_to(observation(), ADA, "Ada Lovelace")) == "accepted"
+
+        await drained(hosted)
+        assert await humans(hosted.db) == before
+        assert await hosted.db.get_actor_ref(ADA) is None
+        assert hosted.turns.runs == []
+
+    async def test_an_observation_from_an_older_gateway_names_no_person(self, hosted_external):
+        hosted = hosted_external
+
+        assert await observe(hosted, observation()) == "accepted"
+
+        ((_, stored),) = await hosted.db.read_channel_observations("slack")
+        assert (stored["principal_id"], stored["principal_name"]) == ("", "")
+        record = await drained(hosted)
+        assert record["summary"] == "[deployments] Example Member: the build is red again"
+        assert "principal_id" not in record["metadata"]
+
+    async def test_a_linked_person_that_is_not_valid_is_left_out(self, hosted_external, caplog):
+        hosted = hosted_external
+
+        with caplog.at_level(logging.WARNING, logger="nerve.channels.hosted.channel"):
+            outcome = await observe(hosted, linked_to(observation(), NIL, "Ada Lovelace"))
+
+        assert outcome == "accepted"
+        ((_, stored),) = await hosted.db.read_channel_observations("slack")
+        assert (stored["principal_id"], stored["principal_name"]) == ("", "")
+        assert "not valid" in caplog.text
+        assert "Ada Lovelace" not in caplog.text
+
+    @pytest.mark.parametrize(("rules", "outcome"), [
+        ({"allow_senders": [ADA]}, "rejected"),
+        ({"allow_senders": ["Ada Lovelace"]}, "rejected"),
+        ({"allow_senders": ["U_FIXTURE_MEMBER"]}, "accepted"),
+        ({"deny_senders": [ADA]}, "accepted"),
+        ({"deny_senders": ["Ada*"]}, "accepted"),
+        ({"deny_senders": ["Example Member"]}, "rejected"),
+    ], ids=[
+        "allow_person_id", "allow_person_name", "allow_member_id",
+        "deny_person_id", "deny_person_name", "deny_member_name",
+    ])
+    async def test_sender_rules_match_only_the_provider_identity(
+        self, tmp_path, db, monkeypatch, external, rules, outcome,
+    ):
+        hosted = await start_hosted(tmp_path, db, monkeypatch, **rules)
+        try:
+            event = linked_to(observation(), ADA, "Ada Lovelace")
+
+            assert await observe(hosted, event) == outcome
+
+            record = await drained(hosted)
+            assert (record is not None) == (outcome == "accepted")
+        finally:
+            await stop_hosted(hosted)
+
+
+class TestInvokeName:
+    async def test_the_linked_name_fills_a_missing_name(self, hosted_external):
+        hosted = hosted_external
+
+        await deliver(hosted, linked_to(direct(ADA), ADA, "Ada Lovelace"))
+
+        await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["actor"] == person(ADA, "Ada Lovelace")
+        assert (await hosted.db.get_actor_ref(ADA))["display_name"] == "Ada Lovelace"
+
+    async def test_the_name_from_a_web_request_is_kept(self, hosted_external):
+        hosted = hosted_external
+        await hosted.db.upsert_external_actor(ADA, "Ada")
+
+        await deliver(hosted, linked_to(direct(ADA), ADA, "Ada Lovelace"))
+
+        await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["actor"] == person(ADA, "Ada")
+        assert (await hosted.db.get_actor_ref(ADA))["display_name"] == "Ada"
+
+    async def test_another_linked_person_gives_no_name_and_no_actor(self, hosted_external):
+        hosted = hosted_external
+
+        await deliver(hosted, linked_to(direct(ADA), BOB, "Bob"))
+
+        await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["actor"] == person(ADA)
+        assert await hosted.db.get_actor_ref(BOB) is None
+
+    async def test_a_linked_person_without_a_resolved_person_is_no_actor(self, hosted_external):
+        hosted = hosted_external
+
+        await deliver(hosted, linked_to(direct(NIL), ADA, "Ada Lovelace"))
+
+        await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["actor"] is None
+        assert await hosted.db.get_actor_ref(ADA) is None
+
+    async def test_local_mode_ignores_the_linked_person(self, hosted_local):
+        hosted = hosted_local
+
+        await deliver(hosted, linked_to(direct(ADA), ADA, "Ada Lovelace"))
+
+        await hosted.turns.wait_for(1)
+        assert hosted.turns.runs[0]["actor"] is None
+        assert await hosted.db.get_actor_ref(ADA) is None
+
+    async def test_a_press_fills_a_missing_name(self, noticed_external):
+        hosted = noticed_external
+        stream = await hosted.stream()
+        notification_id, message_id = await question_card(hosted)
+        press = invoked_by(interaction_event(f"notif:{notification_id}:yes", message_id=message_id), ADA)
+        inbox_id = hosted.gateway.store(linked_to(press, ADA, "Ada Lovelace"))
+
+        await stream.nudge("invoke")
+
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        notification = await hosted.db.get_notification(notification_id)
+        assert notification["answered_by_actor_id"] == ADA
+        assert (await hosted.db.get_actor_ref(ADA))["display_name"] == "Ada Lovelace"
 
 
 # ---------------------------------------------------------------------- #

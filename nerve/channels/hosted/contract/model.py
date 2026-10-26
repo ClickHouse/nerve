@@ -170,12 +170,45 @@ class MessageTarget:
 
 
 @_record
+class LinkedPrincipal:
+    """The tenant person that the gateway linked to a provider author.
+
+    ``display_name`` is untrusted presentation text, never an identity key.
+    """
+
+    id: uuid.UUID = NIL_UUID
+    display_name: str = omit_empty()
+
+
+@_record
 class AuthorReference:
-    """Provider authorship. It grants no authority."""
+    """Provider authorship. It grants no authority.
+
+    ``linked_principal`` is the tenant person that the agent's access snapshot
+    linked to the author when the gateway stored the event. It is attribution
+    only: nothing authorizes with it, and no turn runs as it. An older gateway
+    leaves it out. Read it through :attr:`linked_person`.
+    """
 
     id: str = ""
     kind: str = ""
     display_name: str = omit_empty()
+    linked_principal: LinkedPrincipal | None = omit_empty(None)
+
+    @property
+    def linked_person(self) -> LinkedPrincipal | None:
+        """The linked person, or ``None`` when it is absent or not valid.
+
+        A nil ID, or a display name that the gateway's check of a display name
+        refuses, gives ``None``. These values do not close the stream, because
+        the member is only attribution.
+        """
+        person = self.linked_principal
+        if person is None or person.id == NIL_UUID:
+            return None
+        if person.display_name and not valid_identifier(person.display_name, MAX_DISPLAY_NAME_BYTES):
+            return None
+        return person
 
 
 @_record

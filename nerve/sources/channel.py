@@ -133,12 +133,21 @@ def _as_id(cursor: str | None, *, quiet: bool = False) -> int:
 def _to_record(
     channel: str, source_name: str, payload: dict[str, Any],
 ) -> SourceRecord:
-    """Turn one buffered :class:`ObservedMessage` payload into a record."""
+    """Turn one buffered :class:`ObservedMessage` payload into a record.
+
+    When a channel gateway linked a person to the sender, the summary shows
+    the person's name after the sender, and the metadata names the person.
+    The drain's sender rule matches only ``sender_id``.
+    """
     conversation_id = payload.get("conversation_id") or ""
     message_id = payload.get("message_id") or ""
     text = payload.get("text") or ""
     title = payload.get("conversation_title") or conversation_id
     sender = payload.get("sender_name") or payload.get("sender_id") or "unknown"
+    principal_id = payload.get("principal_id") or ""
+    principal_name = (payload.get("principal_name") or "") if principal_id else ""
+    if principal_name and principal_name != sender:
+        sender = f"{sender} ({principal_name})"
 
     preview = text[:_SUMMARY_PREVIEW].replace("\n", " ")
     if len(text) > _SUMMARY_PREVIEW:
@@ -159,6 +168,8 @@ def _to_record(
             "conversation_title": payload.get("conversation_title") or "",
             "sender_id": payload.get("sender_id") or "",
             "sender_name": payload.get("sender_name") or "",
+            **({"principal_id": principal_id} if principal_id else {}),
+            **({"principal_name": principal_name} if principal_name else {}),
             "message_id": message_id,
             "channel_key": payload.get("channel_key") or "",
             **(payload.get("metadata") or {}),

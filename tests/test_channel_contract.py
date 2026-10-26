@@ -8,6 +8,7 @@ reads, the values that it branches on, and its size bounds.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,12 +17,14 @@ from typing import Any
 import pytest
 
 from nerve.channels.hosted.contract import (
+    AuthorReference,
     Drain,
     Envelope,
     Heartbeat,
     InboxAck,
     InboxAckItem,
     InboxRead,
+    LinkedPrincipal,
     MetadataEntry,
     Negotiation,
     Operation,
@@ -213,6 +216,84 @@ class TestInboxPages:
         result = decode(page(direct_message())).body
 
         validate_inbox_read_result(InboxRead(maximum_events=1, maximum_bytes=16384), result, 20000)
+
+
+PERSON_ID = "40306775-652f-4543-b432-4cb8ec5250c3"
+
+
+def linked(event: dict[str, Any], person: Any) -> dict[str, Any]:
+    event["author"]["linked_principal"] = person
+    return event
+
+
+def author_of(value: dict[str, Any]) -> AuthorReference:
+    return decode(value).body.events[0].author
+
+
+class TestLinkedPrincipal:
+    """The person that the gateway linked to the author: attribution only."""
+
+    @pytest.mark.parametrize("purpose", ["invoke", "observe"])
+    def test_a_linked_person_decodes(self, purpose):
+        event = direct_message() if purpose == "invoke" else message_event(purpose="observe")
+        event = linked(event, {"id": PERSON_ID, "display_name": "Ada Lovelace"})
+
+        author = author_of(page(event))
+
+        assert author.linked_person == LinkedPrincipal(id=uuid.UUID(PERSON_ID), display_name="Ada Lovelace")
+        assert (author.id, author.display_name) == ("U_FIXTURE_MEMBER", "Example Member")
+
+    def test_an_event_from_an_older_gateway_has_no_linked_person(self):
+        author = author_of(page(message_event(purpose="observe")))
+
+        assert (author.linked_principal, author.linked_person) == (None, None)
+
+    @pytest.mark.parametrize("person", [
+        {"id": PERSON_ID},
+        {"id": PERSON_ID, "display_name": ""},
+        {"id": PERSON_ID, "display_name": "é" * 128},
+        {"id": PERSON_ID, "display_name": "Ada", "email": "ada@example.com"},
+    ], ids=["no_name", "empty_name", "name_at_the_limit", "unknown_member"])
+    def test_a_linked_person_that_the_gateway_takes_is_kept(self, person):
+        author = author_of(page(linked(direct_message(), person)))
+
+        assert author.linked_person is not None
+        assert author.linked_person.id == uuid.UUID(PERSON_ID)
+
+    @pytest.mark.parametrize("person", [
+        {"id": "00000000-0000-0000-0000-000000000000", "display_name": "Ada"},
+        {"display_name": "Ada"},
+        {},
+        {"id": PERSON_ID, "display_name": "é" * 128 + "a"},
+        {"id": PERSON_ID, "display_name": "   "},
+        {"id": PERSON_ID, "display_name": "Ada\nLovelace"},
+    ], ids=["nil_id", "no_id", "empty", "name_above_the_limit", "blank_name", "control_character"])
+    def test_a_linked_person_that_is_not_valid_is_no_linked_person(self, person):
+        event = decode(page(linked(message_event(purpose="observe"), person))).body.events[0]
+
+        assert event.author.linked_principal is not None
+        assert event.author.linked_person is None
+        assert event.author.id == "U_FIXTURE_MEMBER"
+
+    @pytest.mark.parametrize("person", [
+        PERSON_ID,
+        {"id": "not-a-uuid"},
+        {"id": 7},
+        {"id": PERSON_ID, "display_name": 7},
+    ], ids=["not_an_object", "id_not_a_uuid", "id_not_a_string", "name_not_a_string"])
+    def test_a_member_of_another_type_is_malformed(self, person):
+        assert reason(page(linked(direct_message(), person))) == "malformed_frame"
+
+    def test_the_member_changes_nothing_else_that_nerve_reads(self):
+        plain = message_event(purpose="observe")
+        with_person = linked(copy.deepcopy(plain), {"id": PERSON_ID, "display_name": "Ada Lovelace"})
+
+        without, linked_event = (decode(page(event)).body.events[0] for event in (plain, with_person))
+
+        assert linked_event.author.linked_principal is not None
+        assert dataclasses.replace(linked_event, author=dataclasses.replace(
+            linked_event.author, linked_principal=None,
+        )) == without
 
 
 class TestOperationResults:

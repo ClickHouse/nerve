@@ -1371,8 +1371,16 @@ latest accepted event.
 Each event that starts a turn or answers a notification names the person that
 the gateway resolved from the Slack user. In external mode, the turn runs as
 that person, and a session that the turn starts has that person as its cause.
-See [External mode](accounts.md#external-mode). In local mode, these turns
-and answers have no actor.
+When the event also gives the display name of that person, and Nerve has no
+name for the person, Nerve stores it. See
+[External mode](accounts.md#external-mode). In local mode, these turns and
+answers have no actor.
+
+An observation can name the person that the gateway linked to the Slack user.
+The inbox record shows that person (see
+[Chat channels](sources.md#chat-channels-slack-telegram)). The person grants
+nothing: the `slack.source` sender rules match only the member ID and the
+display name in the event.
 
 `slack.enabled: false` pauses the hosted channel, at startup or after a
 reload. The stream endpoint still accepts streams, and events stay in the

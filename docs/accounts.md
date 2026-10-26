@@ -153,10 +153,16 @@ does.
 A hosted channel event that invokes the agent (a message, a reaction, or a
 button press) names the person that the channel gateway resolved from the
 provider user. Nerve adds the `actor_refs` row of that person when it is
-absent, and keeps the display name that a web request stored. A message or a
-reaction runs its turn as that person, and a button press answers its
-notification as that person. An event that names no person or the system actor
-has no actor. In local mode, hosted channel events have no actor.
+absent. When the event also gives the display name of that person, Nerve
+writes it only to a row that has no name, so it keeps the display name that a
+web request stored. A message or a reaction runs its turn as that person, and
+a button press answers its notification as that person. An event that names no
+person or the system actor has no actor. In local mode, hosted channel events
+have no actor.
+
+A hosted channel observation can name the person that the channel gateway
+linked to the provider user. Nerve shows that person in the inbox record only.
+It adds no `actor_refs` row and authorizes nothing with it.
 
 In external mode:
 
