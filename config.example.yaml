@@ -313,6 +313,11 @@ sync:
                                    # open PRs changes (state, commit, review, CI,
                                    # comment). Its reason is always "author", and
                                    # only allow_repos/deny_repos apply to it.
+    # inbox: participating         # participating = threads you are directly
+                                   # involved in; all = the whole inbox as your
+                                   # GitHub watch settings produce it, incl. new
+                                   # issues/PRs of watched repos and CI. Pick
+                                   # within it with the reason guardrails below.
     # Guardrails (case-insensitive globs; deny wins; non-empty allow is
     # fail-closed). allow_* = allowlist (empty = all pass).
     #   repo_name — the notification's repo full_name ("ClickHouse/nerve").

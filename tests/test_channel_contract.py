@@ -593,6 +593,28 @@ class TestSubscriptions:
         assert wide.sources == (SourceSubscription(provider="github", filters=SourceFilters(), pr_watch=True),)
         wide.validate()
 
+    def test_an_inbox_is_sent_as_its_sources_inbox_member_and_left_out_when_empty(self):
+        def sent(source: SourceSubscription) -> dict[str, Any]:
+            body = Subscriptions(version="1", sources=(source,))
+            envelope = Envelope(version="1", kind="subscriptions", request_id="o-2", payload=Payload(subscriptions=body))
+            return json.loads(encode_envelope(envelope))["payload"]["subscriptions"]["sources"][0]
+
+        assert sent(SourceSubscription(provider="github", inbox="all")) == {
+            "provider": "github", "filters": {}, "inbox": "all",
+        }
+        assert sent(SourceSubscription(provider="github")) == {"provider": "github", "filters": {}}
+
+    @pytest.mark.parametrize("inbox", ["", "participating", "all"])
+    def test_an_inbox_the_gateway_takes_is_valid(self, inbox):
+        Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox=inbox),)).validate()
+
+    def test_without_filters_keeps_the_inbox(self):
+        narrow = Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", filters=SourceFilters(allow_repos=("owner/*",)), inbox="all"),
+        ))
+
+        assert narrow.without_filters().sources == (SourceSubscription(provider="github", inbox="all"),)
+
     @pytest.mark.parametrize(("subscriptions", "expected"), [
         (Subscriptions(version="2"), "version_unsupported"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="github"),) * 17), "limit_exceeded"),
@@ -606,6 +628,8 @@ class TestSubscriptions:
         (Subscriptions(version="1", sources=(SourceSubscription(provider="git hub"),)), "malformed_frame"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="gitlab/self"),)), "malformed_frame"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="g" * 65),)), "limit_exceeded"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox="mentions"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox="All"),)), "malformed_frame"),
     ])
     def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
         with pytest.raises(Rejected) as error:

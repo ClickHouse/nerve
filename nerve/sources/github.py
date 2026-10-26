@@ -1,5 +1,11 @@
 """GitHub source — fetches notifications via the gh CLI.
 
+Which threads the ``/notifications`` listing returns follows
+``sync.github.inbox``: ``participating`` (the default) lists only the threads
+the account takes part in; ``all`` lists the account's whole GitHub inbox as
+its watch settings produce it, watched repositories and CI included, for the
+reason guardrail to pick from.
+
 Cursor semantics: ISO 8601 `updated_at` of the first notification in the last
 listing (GitHub lists the most recently notified thread first).
 On first run (no cursor), fetches from the last 24 hours.
@@ -283,7 +289,11 @@ def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseExcep
 
 
 class GitHubSource(Source):
-    """GitHub notification source using the gh CLI."""
+    """GitHub notification source using the gh CLI.
+
+    ``config["inbox"]`` is ``sync.github.inbox``: ``"all"`` lists the whole
+    inbox; anything else, or no config, the participating threads only.
+    """
 
     source_name = "github"
 
@@ -329,7 +339,16 @@ class GitHubSource(Source):
             # unchanged, which is why the record carries no read state. A
             # read thread that moved long after it was last read is left out
             # (see _own_update): that is the account's own merge or review.
-            endpoint = f"notifications?since={since}&participating=true&all=true"
+            # `participating=true` (inbox "participating", the default) keeps
+            # only the threads the account takes part in: it opened them, was
+            # mentioned, assigned or asked to review, or commented. Inbox
+            # "all" leaves it out, and GitHub lists the account's whole inbox
+            # as its watch settings produce it: also `subscribed` threads of
+            # watched repositories (new issues and pull requests) and
+            # `ci_activity` for the account's own workflow runs. The
+            # guardrail picks from that.
+            participating = "" if self._config.get("inbox") == "all" else "&participating=true"
+            endpoint = f"notifications?since={since}{participating}&all=true"
             # `since` filters on when a thread last notified, not on the
             # returned `updated_at`, so read every page of the window.
             proc = await asyncio.create_subprocess_exec(

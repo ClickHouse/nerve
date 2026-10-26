@@ -1959,6 +1959,10 @@ class ImapSyncConfig:
 # gh CLI, or a shared channel gateway polls it and streams the records here.
 GITHUB_SYNC_MODES: tuple[str, ...] = ("poll", "hosted")
 
+# Which notification threads the GitHub source lists: those the account takes
+# part in, or its whole GitHub inbox (see GitHubSyncConfig.inbox).
+GITHUB_INBOX_MODES: tuple[str, ...] = ("participating", "all")
+
 
 @dataclass
 class GitHubSyncConfig:
@@ -2018,6 +2022,15 @@ class GitHubSyncConfig:
     # pull requests and deliver a record when one changes (state, head
     # commit, review, CI, or a comment).
     pr_watch: bool = True
+    # Which notification threads are listed, in both modes.
+    # "participating": only the threads the account takes part in (GitHub's
+    # participating=true), such as mentions, assignments and review requests.
+    # "all": the account's whole GitHub inbox as its watch settings produce
+    # it, adding "subscribed" threads of watched repositories (new issues and
+    # PRs) and "ci_activity" for its own workflow runs; pick within it with
+    # the reason guardrails above. An unknown value
+    # refuses to load. Follows a reload.
+    inbox: str = "participating"
 
     @classmethod
     @_coerced
@@ -2029,9 +2042,15 @@ class GitHubSyncConfig:
                 mode, GITHUB_SYNC_MODES,
             )
             mode = "poll"
+        inbox = _setting_str(d.get("inbox"), "participating").lower()
+        if inbox not in GITHUB_INBOX_MODES:
+            raise ValueError(
+                f"sync.github.inbox must be one of {GITHUB_INBOX_MODES}, got {inbox!r}"
+            )
         return cls(
             mode=mode,
             pr_watch=d.get("pr_watch", True),
+            inbox=inbox,
             enabled=d.get("enabled", True),
             schedule=d.get("schedule", "*/15 * * * *"),
             processor=d.get("processor", "agent"),
