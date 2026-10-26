@@ -705,3 +705,40 @@ class TestEndToEndViaConfig:
             )
         assert "'j'" in str(exc.value)
         assert "never_loaded_gate" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# CLI processes load the plugins too
+# ---------------------------------------------------------------------------
+
+
+class TestCliLoadsGatePlugins:
+    def test_doctor_counts_a_job_gated_on_a_plugin(self, tmp_path, clean_registry, caplog):
+        """``nerve doctor`` runs outside the scheduler, which is where the
+        plugins used to be loaded: a job gated on a plugin type then failed to
+        build as "unknown gate type" and vanished from the report."""
+        from nerve import cli
+        from nerve.config import NerveConfig
+
+        plugins = tmp_path / "gates"
+        plugins.mkdir()
+        _write(plugins, "always.py", _VALID_PLUGIN)
+        jobs = tmp_path / "jobs.yaml"
+        jobs.write_text(
+            "jobs:\n"
+            "  - id: queue-check\n"
+            "    schedule: '0 3 * * *'\n"
+            "    prompt: Check the queue.\n"
+            "    run_if:\n"
+            "      - type: always_test\n",
+            encoding="utf-8",
+        )
+        config = NerveConfig()
+        config.cron.gate_plugins_dir = plugins
+        config.cron.jobs_file = jobs
+        config.cron.system_file = tmp_path / "system.yaml"  # absent
+
+        report = cli.doctor_report(config)
+
+        assert "[OK] Cron jobs: 1/1 enabled" in report
+        assert "unknown gate type" not in caplog.text

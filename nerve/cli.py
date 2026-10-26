@@ -1800,6 +1800,19 @@ def _platform_activity_line(config) -> str:
     return f"[--] Platform activity socket: not present ({path})"
 
 
+def _load_cron_gate_plugins(config) -> None:
+    """Register the workspace's drop-in gate plugins before cron jobs are read.
+
+    The scheduler does this at startup and on reload. A CLI process that reads
+    the jobs without it builds a job gated on a plugin type as "unknown gate
+    type" and drops it, so doctor undercounts the jobs and ``nerve cron`` does
+    not find it. Never raises: a broken plugin is logged and skipped.
+    """
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    load_gate_plugins(config.cron.gate_plugins_dir)
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -2320,6 +2333,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     try:
         from nerve.cron.jobs import describe_reserved_job_ids, is_reserved_job_id, load_jobs
 
+        _load_cron_gate_plugins(config)
         system_jobs = load_jobs(config.cron.system_file) if _ws_path_exists(config.cron.system_file) else []
         user_jobs = load_jobs(config.cron.jobs_file) if _ws_path_exists(config.cron.jobs_file) else []
 
@@ -3159,6 +3173,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
         engine = None
         try:
             engine = await _start_one_shot_engine(config, db)
+            _load_cron_gate_plugins(config)
 
             if job_id:
                 from nerve.cron.service import CronService
