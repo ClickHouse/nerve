@@ -1800,6 +1800,26 @@ def _platform_activity_line(config) -> str:
     return f"[--] Platform activity socket: not present ({path})"
 
 
+def _load_cron_gate_plugins(config) -> None:
+    """Register the workspace's drop-in gate plugins before cron jobs are read.
+
+    The daemon does this at startup and on reload. The ``doctor`` and ``cron``
+    commands run outside it: without this, a job gated on a plugin type builds
+    as "unknown gate type" and is dropped, so doctor undercounts the jobs and
+    ``nerve cron`` does not find it. For those CLI processes only — inside the
+    daemon the registry is the reload's business. A broken plugin is logged and
+    skipped by the loader; a directory it cannot read is logged here.
+    """
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    try:
+        load_gate_plugins(config.cron.gate_plugins_dir)
+    except OSError as e:
+        logging.getLogger(__name__).warning(
+            "Could not read the cron gate plugins in %s: %s", config.cron.gate_plugins_dir, e,
+        )
+
+
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
     """Run doctor checks and return the report as a plain-text string.
 
@@ -2455,6 +2475,12 @@ def doctor(ctx: click.Context) -> None:
             f"[ERR] config failed to load: {ctx.obj.get('config_error')}", fg="red"
         )
         ctx.exit(1)
+    # The report reads the cron files (the setup checklist first, then the job
+    # count), so the plugins must be registered before it, as the daemon does
+    # before it parses the jobs. Here rather than in doctor_report: the
+    # daemon's own /doctor runs that too, and there the registry is the
+    # reload's business.
+    _load_cron_gate_plugins(config)
     report = doctor_report(
         config,
         config_source=ctx.obj.get("config_source", ""),
@@ -3159,6 +3185,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
         engine = None
         try:
             engine = await _start_one_shot_engine(config, db)
+            _load_cron_gate_plugins(config)
 
             if job_id:
                 from nerve.cron.service import CronService
