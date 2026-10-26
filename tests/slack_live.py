@@ -388,6 +388,10 @@ class RecordingRouter:
     async def get_last_session(self, channel_key: str) -> str | None:
         return self._sessions.get(channel_key)
 
+    async def actor_for_principal(self, _principal_id: Any) -> None:
+        """No person, as in local mode."""
+        return None
+
     # The registry half of ChannelRouter, which SlackRuntime uses: it
     # refuses to start while a channel is already registered, and hands
     # the one it builds to the router itself.

@@ -14,6 +14,7 @@ from enum import Flag, auto
 from typing import Any
 
 from nerve.channels.access import Decision
+from nerve.identity import Actor
 
 
 class ChannelCapability(Flag):
@@ -47,7 +48,13 @@ class ChannelConstraints:
 
 @dataclass
 class InboundMessage:
-    """A message received from a channel, normalized for the router."""
+    """A message received from a channel, normalized for the router.
+
+    ``actor`` is the person who wrote the message, and the router runs the
+    turn as that person. A self-hosted channel has no mapping from a provider
+    user to a person, so it leaves ``actor`` empty. A hosted channel sets the
+    person that the channel gateway resolved.
+    """
 
     channel_name: str                               # "telegram", "web", "discord"
     channel_key: str                                # "telegram:12345", "web:default"
@@ -55,6 +62,7 @@ class InboundMessage:
     text: str                                       # The message content
     session_id: str | None = None                   # Explicit session override (web sends this)
     metadata: dict[str, Any] = field(default_factory=dict)
+    actor: Actor | None = None
 
 
 @dataclass

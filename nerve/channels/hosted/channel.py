@@ -13,6 +13,11 @@ direct message, a mention of the agent, a reply in a thread that the agent
 takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
+An invoke event names the person that the gateway resolved from its author.
+In external mode, a message or reaction turn runs as that person, and an
+interaction answers its notification as that person. In local mode, the
+person is not a local actor, so the turn and the answer have no actor.
+
 Observe events go to the source inbox through ``router.observe`` under the
 provider's local source grant (for Slack, ``slack.source``). With
 ``gateway_grant`` on, the gateway's grant takes the place of an empty local
@@ -868,7 +873,6 @@ class HostedChannel(BaseChannel):
             "message_id": event.message.id,
             "author_id": event.author.id,
             "connection_id": str(event.connection_id),
-            "principal_id": str(event.admission.invoke.resolved_principal_id),
         }
         logger.info(
             "Hosted %s message in %s: %s", self._provider, target,
@@ -882,7 +886,7 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=body if event.attachments else text,
             metadata=metadata,
-        ), event if event.attachments else None)
+        ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:
         """Read the event's attachments into the message text and images."""
@@ -932,10 +936,14 @@ class HostedChannel(BaseChannel):
         key = (event.conversation.id, event.message.id)
         result: dict[str, Any] | None = None
         if self._notifications is not None:
+            answerer = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+            )
             try:
                 result = await self._notifications.answer_delivered_notification(
                     notification_id, answer,
                     channel=self._provider, target=event.conversation.id, actor=actor,
+                    answerer=answerer,
                 )
             except Exception as error:  # noqa: BLE001 - the row is read again later
                 logger.warning(
@@ -1018,24 +1026,28 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=f'[Reaction: {label} on message: "{snippet}"]',
             metadata={},
-        ))
+        ), event)
 
-    def _dispatch(self, message: InboundMessage, attachments: Event | None = None) -> Disposition:
+    def _dispatch(self, message: InboundMessage, event: Event, *, attachments: bool = False) -> Disposition:
         """Start the turn as a task. Acceptance does not wait for the turn.
 
-        With *attachments*, the task reads that event's attachments first.
+        The task first resolves the event's person into the message's actor.
+        With *attachments*, it also reads the event's attachments.
         """
         if not self.can_accept():
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
-        task = asyncio.create_task(self._run_turn(message, attachments))
+        task = asyncio.create_task(self._run_turn(message, event, attachments))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
         return Disposition.accepted()
 
-    async def _run_turn(self, message: InboundMessage, attachments: Event | None = None) -> None:
+    async def _run_turn(self, message: InboundMessage, event: Event, attachments: bool) -> None:
         try:
-            if attachments is not None:
-                await self._add_attachments(message, attachments)
+            message.actor = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+            )
+            if attachments:
+                await self._add_attachments(message, event)
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise

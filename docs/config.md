@@ -1368,6 +1368,12 @@ Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
 
+Each event that starts a turn or answers a notification names the person that
+the gateway resolved from the Slack user. In external mode, the turn runs as
+that person, and a session that the turn starts has that person as its cause.
+See [External mode](accounts.md#external-mode). In local mode, these turns
+and answers have no actor.
+
 `slack.enabled: false` pauses the hosted channel, at startup or after a
 reload. The stream endpoint still accepts streams, and events stay in the
 gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
