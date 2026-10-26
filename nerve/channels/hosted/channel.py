@@ -31,10 +31,12 @@ a send is a refusal, not a transport failure.
 Files go out through ``file_send``. The attachments of a message that starts
 a turn are read through ``file_read`` before the turn and use the
 self-hosted extraction rules. A notification is a message with one button
-for each answer. A button press arrives as an invoke ``interaction`` event:
-it answers the notification when the card was delivered in that
-conversation, and the ``interaction`` operation then replaces the card
-without its buttons.
+for each answer. It goes to the conversation that the config names. When the
+config names none, it goes through ``notify``, and the gateway chooses the
+conversation that the control plane set for the agent. A button press
+arrives as an invoke ``interaction`` event: it answers the notification when
+the card was delivered in that conversation, and the ``interaction``
+operation then replaces the card without its buttons.
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ from nerve.channels.hosted.contract.model import (
     InteractionOperation,
     InteractionTarget,
     MessageTarget,
+    NotifyOperation,
     Reaction,
     ReactionOperation,
     SendOperation,
@@ -174,6 +177,21 @@ def describe_attachments(event: Event) -> str:
 def _why(error: Exception) -> str:
     """The log text of an error, with a failed operation's reason and detail."""
     return getattr(error, "detailed", None) or str(error)
+
+
+def _expected_card_failure(error: OperationFailed) -> bool:
+    """Whether a card that was not posted is logged at INFO, not as a warning.
+
+    The gateway refuses ``notify`` with ``invalid_target`` while the agent
+    has no notification channel, which is the default. For an ambiguous
+    outcome that Nerve decided, the operation runner already logged a
+    warning.
+    """
+    no_channel = (
+        error.kind == "notify" and error.outcome == "forbidden"
+        and error.reason_code == "invalid_target" and not error.local
+    )
+    return no_channel or (error.outcome == "ambiguous" and error.local)
 
 
 def _origin(event: Event) -> MessageTarget:
@@ -634,34 +652,69 @@ class HostedChannel(BaseChannel):
     ) -> tuple[str, str] | None:
         """Post a notification card: its text and one button for each option.
 
-        The card goes to the same conversation as with the self-hosted
-        channel. Returns ``(target, message_id)``, or ``None`` when there is
-        no such conversation or the send fails.
+        When the config names a conversation, the card goes there with
+        ``send``, the same as with the self-hosted channel. Otherwise the
+        card goes with ``notify`` to the conversation that the gateway
+        chooses, when exactly one connection advertises ``notify``. Returns
+        ``(target, message_id)``, where the target is the card's
+        conversation, or ``None`` when there is no conversation or the post
+        fails.
         """
         config = self._config()
         target = self._notification_target(config) if self._notification_target else None
-        if not target or not self.is_available:
+        if not self.is_available:
             return None
         actions = notification_actions(notification_id, options, self._button_style)
+
+        def card(body: str) -> SendOperation | NotifyOperation:
+            content = _markdown(body) + actions
+            if target:
+                return SendOperation(destination=container_for(target, None), content=content)
+            return NotifyOperation(content=content)
+
         try:
-            connection = await self._connection(target, "send")
+            if target:
+                kind, connection = "send", await self._connection(target, "send")
+            else:
+                kind, connection = "notify", self._notify_connection()
+            if connection is None:
+                logger.debug(
+                    "Hosted %s notification %s has no conversation: the config names none, "
+                    "and no connection advertises notify", self._provider, notification_id,
+                )
+                return None
             result, body = await self._fitting(
-                "send", truncate_text(text, self._limits(connection).text_characters),
-                lambda body: self._perform(connection, "send", SendOperation(
-                    destination=container_for(target, None), content=_markdown(body) + actions,
-                )),
+                kind, truncate_text(text, self._limits(connection).text_characters),
+                lambda body: self._perform(connection, kind, card(body)),
             )
         except OperationFailed as error:
-            logger.warning(
-                "Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error),
-            )
+            log = logger.info if _expected_card_failure(error) else logger.warning
+            log("Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error))
             return None
         located = result.target
+        conversation = target or located.conversation.id
         message_id = located.message.id
-        _remember(self._targets, (target, message_id), (connection, located), _TARGET_CACHE_MAX)
-        _remember(self._notification_texts, (target, message_id), body, _TARGET_CACHE_MAX)
-        self.remember_message(target, message_id, target, body)
-        return target, message_id
+        _remember(self._targets, (conversation, message_id), (connection, located), _TARGET_CACHE_MAX)
+        _remember(self._notification_texts, (conversation, message_id), body, _TARGET_CACHE_MAX)
+        self.remember_message(conversation, message_id, conversation, body)
+        return conversation, message_id
+
+    def _notify_connection(self) -> uuid.UUID | None:
+        """The only connection that advertises ``notify`` now, else ``None``.
+
+        It does not wait for a stream. The caller first makes sure that a
+        stream can send, and a gateway without ``notify`` never advertises
+        it. Raises :class:`OperationFailed` when several connections
+        advertise it, because Nerve cannot tell which connection the card
+        is for.
+        """
+        candidates = self._operations.streams.connections("notify") if self._operations else set()
+        if len(candidates) > 1:
+            raise OperationFailed(
+                "notify", "unavailable", "invalid_target", local=True,
+                detail=f"several {self._provider} connections advertise notify",
+            )
+        return next(iter(candidates), None)
 
     async def expire_notification(self, target: str, message_id: str, text: str) -> None:
         """Replace a notification card with *text* and no buttons."""

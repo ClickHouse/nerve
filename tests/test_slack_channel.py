@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -291,6 +292,17 @@ class TestNotificationDelivery:
         delivery = await channel.post_notification("n1", "Hello")
 
         assert delivery == ("D0123ABC", "1.1")
+
+    @pytest.mark.asyncio
+    async def test_without_a_target_the_card_is_skipped_with_a_warning(self, caplog):
+        channel = _channel(allow_channels=["engineering-*"])
+
+        with caplog.at_level(logging.WARNING, logger="nerve.channels.slack"):
+            delivery = await channel.post_notification("n1", "Hello")
+
+        assert delivery is None
+        channel._web.chat_postMessage.assert_not_awaited()
+        assert "No notifications.slack_channel_id is set" in caplog.text
 
     @pytest.mark.asyncio
     async def test_a_quiescing_channel_refuses_external_delivery(self):

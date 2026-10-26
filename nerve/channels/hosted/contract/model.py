@@ -82,6 +82,19 @@ def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
         reject(RejectionReason.KIND_UNSUPPORTED, f"unknown {name} {value!r}")
 
 
+def valid_identifier(value: str, maximum: int = MAX_IDENTIFIER_BYTES) -> bool:
+    """Whether the gateway takes *value* as an ID or a label.
+
+    That is 1 to *maximum* UTF-8 bytes, not only white space, and no control
+    characters.
+    """
+    return (
+        bool(value.strip())
+        and byte_length(value) <= maximum
+        and not any(unicodedata.category(character) == "Cc" for character in value)
+    )
+
+
 def valid_pattern(pattern: str) -> bool:
     """Whether the gateway takes *pattern* in a subscription filter.
 
@@ -525,6 +538,17 @@ class SendOperation:
 
 
 @_record
+class NotifyOperation:
+    """Content for the agent's notification conversation.
+
+    The control plane sets that conversation, and the gateway chooses it.
+    Nerve names no conversation.
+    """
+
+    content: tuple[ContentPart, ...] = ()
+
+
+@_record
 class EditOperation:
     target: MessageTarget = struct(MessageTarget)
     content: tuple[ContentPart, ...] = ()
@@ -590,6 +614,7 @@ class Operation:
     kind: str = ""
     deadline_millis: int = 0
     send: SendOperation | None = omit_empty(None)
+    notify: NotifyOperation | None = omit_empty(None)
     edit: EditOperation | None = omit_empty(None)
     delete: DeleteOperation | None = omit_empty(None)
     reaction: ReactionOperation | None = omit_empty(None)
@@ -628,8 +653,30 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
         return
     if operation.kind == "send" and result.target is None:
         malformed("successful send has no message target")
+    if operation.kind == "notify":
+        _validate_notify_target(result.target)
     if operation.kind == "file_read" and result.transfer is None:
         malformed("successful file read has no transfer")
+
+
+def _validate_notify_target(target: MessageTarget | None) -> None:
+    """Check the new message that a successful notify names, as the gateway does.
+
+    The gateway chooses the conversation, so Nerve stores the conversation
+    and the message from this target. The conversation carries only its ID,
+    and every ID is valid. The message is outside threads and topics; a
+    thread is permitted only when the message roots it.
+    """
+    if target is None:
+        malformed("successful notify has no message target")
+    conversation = target.conversation
+    if conversation.kind or conversation.display_name:
+        malformed("notify target conversation carries descriptive members")
+    references = (conversation, target.message, target.thread, target.topic)
+    if not all(valid_identifier(reference.id) for reference in references if reference is not None):
+        malformed("notify target has an ID that is missing, too long, or not valid")
+    if target.topic is not None or (target.thread is not None and target.thread.id != target.message.id):
+        reject(RejectionReason.SCOPE_MISMATCH, "notify target is in a thread or topic")
 
 
 # ---------------------------------------------------------------------- #

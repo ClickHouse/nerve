@@ -162,12 +162,14 @@ def is_slack_id(pattern: str) -> bool:
     return bool(_SLACK_ID_RE.match(pattern))
 
 
-def notification_target(config: NerveConfig) -> str | None:
+def notification_target(config: NerveConfig, *, warn_unset: bool = True) -> str | None:
     """The conversation for notification cards, or ``None``.
 
     That is ``notifications.slack_channel_id``, else the first literal
     conversation ID in ``slack.allow_channels``. The hosted channel uses the
-    same choice.
+    same choice first. When the config names no conversation, the channel
+    gateway can choose one, so the hosted channel sets *warn_unset* to
+    false: then no warning is logged for that case.
     """
     configured = config.notifications.slack_channel_id.strip()
     if configured:
@@ -181,10 +183,11 @@ def notification_target(config: NerveConfig) -> str | None:
     for entry in config.slack.allow_channels:
         if is_slack_id(entry) and entry[0] in "CG":
             return entry
-    logger.warning(
-        "No notifications.slack_channel_id is set and slack.allow_channels "
-        "has no literal conversation id",
-    )
+    if warn_unset:
+        logger.warning(
+            "No notifications.slack_channel_id is set and slack.allow_channels "
+            "has no literal conversation id",
+        )
     return None
 
 

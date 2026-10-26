@@ -1564,8 +1564,10 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
 
     The gateway decides admission and where the agent may post, so only the
     send tool switch, its local conversation limit, the channel source's
-    local grant, and the notification conversation are reported. Slash
-    commands do not reach Nerve.
+    local grant, and the notification conversation are reported. A config
+    without a notification conversation is not a problem: the gateway can
+    then post the cards in the notification channel set in the console.
+    Slash commands do not reach Nerve.
     """
     from nerve.channels.slack import is_slack_id, notification_target
     from nerve.config import SLACK_HOST_COMMANDS
@@ -1609,13 +1611,18 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
             "or list channel ids in slack.source.allow_channels"
         )
-    target = notification_target(config)
+    target = notification_target(config, warn_unset=False)
     if target:
         lines.append(f"[OK] Slack notifications go to {target}")
-    else:
+    elif config.notifications.slack_channel_id.strip():
         warnings.append(
-            "[WARN] Slack notifications have no conversation: set "
-            "notifications.slack_channel_id"
+            "[WARN] notifications.slack_channel_id is not a Slack conversation id; "
+            "the gateway chooses the notification conversation instead"
+        )
+    else:
+        lines.append(
+            "[--] Slack notifications: the config names no conversation; the gateway "
+            "can post them in the notification channel set in the console"
         )
     lines.append("[--] Slack /nerve commands are not available in hosted mode")
     host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
