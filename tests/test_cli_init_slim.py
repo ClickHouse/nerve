@@ -505,6 +505,55 @@ class TestStatusAndDoctor:
         assert "Telegram bot failed to start at the last boot: InvalidToken" in report
         assert "<token>" in report
 
+    def test_doctor_counts_a_job_gated_on_a_plugin(self, tmp_path, no_daemon, clean_registry, caplog):
+        """``nerve doctor`` runs outside the daemon, where the gate plugins used
+        to be registered: a job gated on a plugin type then failed to build as
+        "unknown gate type" and vanished from the count."""
+        from nerve.cron.jobs import load_jobs
+
+        config_dir = tmp_path / "config"
+        ws = tmp_path / "ws"
+        assert _init(config_dir, "--workspace", str(ws), "--port", "8977", "--no-start", *_FLAGS).exit_code == 0
+        cron = load_config(config_dir).cron
+        cron.gate_plugins_dir.mkdir(parents=True, exist_ok=True)
+        (cron.gate_plugins_dir / "always.py").write_text(
+            "from nerve.cron.gates import CronGate\n"
+            "\n"
+            "\n"
+            "class AlwaysGate(CronGate):\n"
+            "    type = 'always_test'\n"
+            "\n"
+            "    async def is_satisfied(self, ctx):\n"
+            "        return True\n"
+            "\n"
+            "    def describe(self):\n"
+            "        return 'always (test plugin)'\n"
+            "\n"
+            "    @classmethod\n"
+            "    def from_config(cls, spec):\n"
+            "        return cls()\n",
+            encoding="utf-8",
+        )
+        cron.jobs_file.write_text(
+            "jobs:\n"
+            "  - id: queue-check\n"
+            "    schedule: '0 3 * * *'\n"
+            "    prompt: Check the queue.\n"
+            "    run_if:\n"
+            "      - type: always_test\n",
+            encoding="utf-8",
+        )
+        system_jobs = load_jobs(cron.system_file, build_gates=False) if cron.system_file.exists() else []
+
+        result = CliRunner().invoke(cli.main, ["-c", str(config_dir), "doctor"])
+
+        line = next((l for l in result.output.splitlines() if "Cron jobs:" in l), None)
+        assert line, result.output
+        total = int(line.split("Cron jobs: ")[1].split(" enabled")[0].split("/")[1])
+        assert total == len(system_jobs) + 1, line
+        assert "unknown gate type" not in caplog.text
+        assert "unknown gate type" not in result.output
+
     def test_doctor_reads_the_time_zone_from_the_environment_as_the_default(self, tmp_path, no_daemon, monkeypatch):
         """``NERVE_TIMEZONE`` is the default, not an answer: About you stays open."""
         from nerve import setup_state
