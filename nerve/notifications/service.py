@@ -477,11 +477,13 @@ class NotificationService:
         channel: str,
         target: str,
         actor: str | None = None,
+        answerer: Actor | None = None,
     ) -> dict[str, Any] | None:
         """Answer an explicit notification within its delivery scope.
 
-        The post-answer row lets an adapter render the result without reaching
-        through the service to its database.
+        ``actor`` and ``answerer`` have the meaning that they have in
+        :meth:`handle_answer`. The post-answer row lets an adapter render the
+        result without reaching through the service to its database.
         """
         delivery = await self.db.get_notification_delivery(
             notification_id, channel, target,
@@ -493,6 +495,7 @@ class NotificationService:
             answer,
             answered_by=channel,
             actor=actor,
+            answerer=answerer,
         )
         if not accepted:
             return None
@@ -534,12 +537,13 @@ class NotificationService:
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
         ``answerer`` is the person who answered: the signed-in actor of the
-        web answer route. A channel answer names a provider user and no
-        person, so it passes ``None``. The row records the answerer in
-        ``answered_by_actor_id``; the answer relayed into the asking session
-        is a message written by the answerer, and the agent's work in that
-        turn has the session's cause; an approval dispatcher receives the
-        answerer as its ``actor``.
+        web answer route, or the person that a channel gateway resolved for
+        a hosted channel answer. A self-hosted channel answer names a
+        provider user and no person, so it passes ``None``. The row records
+        the answerer in ``answered_by_actor_id``; the answer relayed into the
+        asking session is a message written by the answerer, and the agent's
+        work in that turn has the session's cause; an approval dispatcher
+        receives the answerer as its ``actor``.
 
         - For ``type=approval`` rows: claim the row, look up the
           dispatcher in the handler registry, run it, audit-log the

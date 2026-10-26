@@ -387,6 +387,12 @@ of that table you land in:
   display name in the event, which can deny but never grant. Nerve
   acknowledges an observation to the gateway only after the buffer row is
   written.
+  An observation can also name the person that the gateway linked to the
+  Slack user. The inbox record then shows the person's name after the sender
+  (`[deployments] ada (Ada Lovelace): ...`), and its metadata has
+  `principal_id` and `principal_name`. The person is for attribution only: the
+  sender rules match only the member ID and the display name in the event, and
+  the observation adds no actor.
   With `slack.source.gateway_grant: true`, the gateway's own grant is enough:
   it sends observations only for channels where the agent's channel policy
   allows them, and Nerve collects all of them without a local allow list. A

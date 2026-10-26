@@ -13,11 +13,20 @@ direct message, a mention of the agent, a reply in a thread that the agent
 takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
+An invoke event names the person that the gateway resolved from its author.
+In external mode, a message or reaction turn runs as that person, and an
+interaction answers its notification as that person. In local mode, the
+person is not a local actor, so the turn and the answer have no actor. When
+the author's linked person is the resolved person, its display name fills a
+missing name of that actor.
+
 Observe events go to the source inbox through ``router.observe`` under the
 provider's local source grant (for Slack, ``slack.source``). With
 ``gateway_grant`` on, the gateway's grant takes the place of an empty local
 allow list. The display names in events are untrusted, so they can match
-only a deny rule.
+only a deny rule. The stored observation names the person that the gateway
+linked to the author, for attribution only: the sender rules do not see it,
+and it adds no actor.
 
 Outbound messages are contract operations on the connection that the
 conversation's latest accepted event came on, or on the only connection that
@@ -78,6 +87,7 @@ from nerve.channels.hosted.contract.model import (
     FileUpload,
     InteractionOperation,
     InteractionTarget,
+    LinkedPrincipal,
     MessageTarget,
     NotifyOperation,
     Reaction,
@@ -202,6 +212,36 @@ def _origin(event: Event) -> MessageTarget:
         topic=event.topic,
         message=event.message,
     )
+
+
+def _linked_person(event: Event) -> LinkedPrincipal | None:
+    """The person that the gateway linked to the event's author, or ``None``.
+
+    The person is attribution only. A linked person that is not valid is
+    logged and gives ``None``.
+    """
+    author = event.author
+    if author is None or author.linked_principal is None:
+        return None
+    person = author.linked_person
+    if person is None:
+        logger.warning(
+            "Hosted event %s links its author to a person that is not valid, so it has no linked person",
+            event.event_id,
+        )
+    return person
+
+
+def _invoke_person_name(event: Event) -> str | None:
+    """The display name that an invoke event gives its resolved person, or ``None``.
+
+    Only a linked person with the resolved principal's ID gives a name. The
+    name is presentation text, never an identity key.
+    """
+    person = _linked_person(event)
+    if person is None or person.id != event.admission.invoke.resolved_principal_id:
+        return None
+    return person.display_name or None
 
 
 def _snoozed_until(notification: dict[str, Any]) -> str | None:
@@ -868,7 +908,6 @@ class HostedChannel(BaseChannel):
             "message_id": event.message.id,
             "author_id": event.author.id,
             "connection_id": str(event.connection_id),
-            "principal_id": str(event.admission.invoke.resolved_principal_id),
         }
         logger.info(
             "Hosted %s message in %s: %s", self._provider, target,
@@ -882,7 +921,7 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=body if event.attachments else text,
             metadata=metadata,
-        ), event if event.attachments else None)
+        ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:
         """Read the event's attachments into the message text and images."""
@@ -932,10 +971,15 @@ class HostedChannel(BaseChannel):
         key = (event.conversation.id, event.message.id)
         result: dict[str, Any] | None = None
         if self._notifications is not None:
+            answerer = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+                display_name=_invoke_person_name(event),
+            )
             try:
                 result = await self._notifications.answer_delivered_notification(
                     notification_id, answer,
                     channel=self._provider, target=event.conversation.id, actor=actor,
+                    answerer=answerer,
                 )
             except Exception as error:  # noqa: BLE001 - the row is read again later
                 logger.warning(
@@ -1018,24 +1062,29 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=f'[Reaction: {label} on message: "{snippet}"]',
             metadata={},
-        ))
+        ), event)
 
-    def _dispatch(self, message: InboundMessage, attachments: Event | None = None) -> Disposition:
+    def _dispatch(self, message: InboundMessage, event: Event, *, attachments: bool = False) -> Disposition:
         """Start the turn as a task. Acceptance does not wait for the turn.
 
-        With *attachments*, the task reads that event's attachments first.
+        The task first resolves the event's person into the message's actor.
+        With *attachments*, it also reads the event's attachments.
         """
         if not self.can_accept():
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
-        task = asyncio.create_task(self._run_turn(message, attachments))
+        task = asyncio.create_task(self._run_turn(message, event, attachments))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
         return Disposition.accepted()
 
-    async def _run_turn(self, message: InboundMessage, attachments: Event | None = None) -> None:
+    async def _run_turn(self, message: InboundMessage, event: Event, attachments: bool) -> None:
         try:
-            if attachments is not None:
-                await self._add_attachments(message, attachments)
+            message.actor = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+                display_name=_invoke_person_name(event),
+            )
+            if attachments:
+                await self._add_attachments(message, event)
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise
@@ -1128,6 +1177,7 @@ class HostedChannel(BaseChannel):
             return Disposition.rejected("admission_rejected", "the message carries no text")
 
         thread_id = event.thread.id if event.thread is not None else ""
+        person = _linked_person(event)
         observed = ObservedMessage(
             channel_name=self._provider,
             channel_key=f"{self._provider}:{self._target(event)}",
@@ -1138,6 +1188,8 @@ class HostedChannel(BaseChannel):
             timestamp=event.occurred_at.astimezone(timezone.utc).isoformat(),
             conversation_title=event.conversation.display_name,
             sender_name=author.display_name if author else "",
+            principal_id=str(person.id) if person else "",
+            principal_name=person.display_name if person else "",
             metadata={
                 "thread_ts": thread_id,
                 "connection_id": str(event.connection_id),
