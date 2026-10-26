@@ -646,9 +646,12 @@ in when they arrive, and goes on without them after 10 seconds.
   will be reached, say), and counts the first one forecast to happen. A gate on
   the default forecast is asked once: it answers the same for any time, so if it
   says no, so does every later run;
-- the next run of each source runner, except a source that runs when records
-  are delivered (the hosted GitHub source, `Source.push_fed`): its scheduled
-  run is a fallback and does not count;
+- the next run of each source runner, except a source whose buffer only the
+  running instance writes, as records are delivered to it (the hosted GitHub
+  source and the channel drains `<channel>:observed`, `Source.push_fed`), while
+  nothing delivered waits in that buffer: nothing is added to it while the
+  machine is parked, so the scheduled run is not counted; a run with delivered
+  records waiting counts;
 - the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
   with "Run later").
 
@@ -667,9 +670,10 @@ timezone-aware, or it raises `ValueError`.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);
-`reason` says why a run is forecast to be skipped. For a source that runs when
-records are delivered, `skip` means the scheduled run is not counted in
-`next`; the run itself still fires.
+`reason` says why a run is forecast to be skipped. For a `Source.push_fed`
+source (the hosted GitHub source, the channel drains), `skip` means the
+scheduled run is not counted in `next` because nothing delivered waits in its
+buffer; the run itself still fires.
 
 Forecasts are judged from what is known when you ask. Code that keeps the answer
 around can register a schedule listener (`CronService.add_schedule_listener`) to
@@ -679,10 +683,11 @@ session wakeup is claimed; when triggers move past a pause; and when a source is
 synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
 
 Not every change is announced. A wakeup that a session records during its turn,
-and tasks created, moved or edited from a chat turn, the web UI or the API (which
-can change what a `tasks` gate forecasts), count only from the next time the
-schedule is read. Code that keeps the answer should therefore also refresh it
-periodically, and when a turn ends.
+tasks created, moved or edited from a chat turn, the web UI or the API (which
+can change what a `tasks` gate forecasts), and a message a channel buffers for
+its `<channel>:observed` drain (which makes that drain count) count only from
+the next time the schedule is read. Code that keeps the answer should therefore
+also refresh it periodically, and when a turn ends.
 
 ## Source Runners
 
@@ -724,9 +729,16 @@ not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
 schedule, and the schedules stay the fallback for everything. The setting is
 read for each delivery, so a reload applies it. A scheduled run of a source
-that runs on delivery is not counted as the next scheduled task (see
-[What runs next](#what-runs-next)): it normally finds nothing, so a platform
-that parks the machine is not told to wake it for that run.
+that runs on delivery is not counted as the next scheduled task while nothing
+waits in its buffer (see [What runs next](#what-runs-next)): it normally finds
+nothing, so a platform that parks the machine is not told to wake it for that
+run. The channel drains (`<channel>:observed`) are not counted in `next` either
+while nothing waits in their buffer: only the running instance writes it, so
+nothing is added while the machine is parked, and what arrives meanwhile is
+delivered after the next wake. They are not run on delivery: messages buffered
+since the last drain are taken by the next scheduled drain, and from the next
+forecast on (at most one activity report interval later) that drain counts, so
+a platform keeps the machine up, or wakes it, for them.
 
 ## Logging
 

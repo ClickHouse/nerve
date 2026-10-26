@@ -17,14 +17,29 @@ class Source(abc.ABC):
 
     source_name: str = ""
 
-    # True for a source that reads a buffer another component fills as records
-    # arrive and that the cron service runs as soon as they do: the hosted
-    # sources. A scheduled run of such a source is a fallback that normally
-    # finds nothing, so the cron schedule does not count it as work the
-    # instance will start on its own, and a platform that parks the machine
-    # is not told to wake it for the run. A source whose buffer is drained
-    # only on its schedule, like the channel drains, keeps the default.
+    # True for a source that reads a buffer only this process writes, as
+    # records are delivered to it: the hosted sources, which the cron service
+    # also runs as soon as records arrive, and the channel drains, whose buffer
+    # the channel transport fills. Nothing is added to such a buffer while the
+    # machine is parked, so the cron schedule does not count the source's
+    # scheduled run as work the instance will start on its own — unless
+    # delivered records wait in the buffer (see has_undrained) — and a platform
+    # that parks the machine is not told to wake it for the run. A source that
+    # polls a remote service on its schedule keeps the default: its run is the
+    # only way its records come in.
     push_fed: bool = False
+
+    async def has_undrained(self, cursor: str | None) -> bool:
+        """Whether a run from *cursor* would find delivered records waiting.
+
+        Asked by the cron schedule about a ``push_fed`` source. Delivered
+        records that wait in the buffer are work the scheduled run will do, so
+        that run counts as the next scheduled task, and a platform that parks
+        the machine keeps it up, or wakes it, for them; with nothing waiting
+        the run is not counted. The default answers no; a source that can look
+        at its buffer cheaply overrides it. Must not raise.
+        """
+        return False
 
     @abc.abstractmethod
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:

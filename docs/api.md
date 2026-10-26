@@ -1663,7 +1663,9 @@ gates forecast for its next run, judged from what is known now. `next` is the
 earliest, within 7 days, of: the first run of each enabled cron job that its
 gates forecast will happen (its next run, or one of its next few runs when a
 gate that reasons about the time skips the next one), the next run of each
-source runner whose source does not run when records are delivered, and the
+source runner, except one whose source reads a buffer only the running
+instance writes (`Source.push_fed`: the hosted GitHub source, the channel
+drains) while nothing delivered waits in it, and the
 earliest pending session wakeup — never the cleanup job or the wakeup sweep;
 `null` when nothing is due. `at` is UTC, and can be a
 little in the past for a session wakeup that came due but has not fired yet;
@@ -1671,9 +1673,9 @@ little in the past for a session wakeup that came due but has not fired yet;
 `wakeup:<first 8 characters of the session id>`, limited to `[A-Za-z0-9._:-]`
 and 64 characters. `jobs` has the jobs of
 `GET /api/cron/jobs`: `forecast` is `run` or `skip` for a job with a next run and
-`null` otherwise, and `reason` says why a skip (for a source that runs when
-records are delivered, the scheduled run still fires but is not counted in
-`next`). See [What runs next](cron.md#what-runs-next).
+`null` otherwise, and `reason` says why a skip (for a `Source.push_fed` source
+with nothing waiting in its buffer, the scheduled run still fires but is not
+counted in `next`). See [What runs next](cron.md#what-runs-next).
 
 ```json
 Response: {
